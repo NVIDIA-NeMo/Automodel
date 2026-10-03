@@ -50,7 +50,6 @@ from nemo_automodel.components.models.llama.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_fused,
 )
-from nemo_automodel.components.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
 __all__ = ["Qwen3ForCausalLM"]
@@ -356,8 +355,6 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
         self.model = Qwen3Model(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = Qwen3StateDictAdapter(config=self.config)
         self.post_init()
         if config.dtype is not None:
             cast_model_to_dtype(self, config.dtype)

@@ -368,8 +368,23 @@ def dsv4_sparse_attention(
     sm_scale: float,
     *,
     backend: Dsv4SparseAttentionBackend,
+    reference_rounding: bool = False,
 ) -> torch.Tensor:
-    """Run DSV4 sparse attention through Miles TileLang kernels or torch fallback."""
+    """Run sparse attention with an optional original-inference rounding mode.
+
+    Args:
+        q: BF16 queries [batch, sequence, heads, head_dim].
+        kv: Shared keys/values [batch, kv_sequence, head_dim].
+        sinks: FP32 denominator biases [heads].
+        topk_idxs: Sparse indices [batch, sequence, slots], with -1 masked.
+        sm_scale: Query/key score multiplier.
+        backend: Sparse execution backend.
+        reference_rounding: Scale logits before max reduction and use the
+            original inference exponent arithmetic. Requires TileLang.
+
+    Returns:
+        Attention output [batch, sequence, heads, head_dim], with q's dtype.
+    """
     use_tilelang = _should_use_tilelang(
         backend,
         available=_HAS_MILES_SPARSE_ATTN,
@@ -397,10 +412,16 @@ def dsv4_sparse_attention(
         if q.shape[2] > max_heads_per_kernel:
             if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
                 raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
-            output = _miles_sparse_attn_tilelang_head_chunked(q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale)
+            kwargs = {"reference_rounding": True} if reference_rounding else {}
+            output = _miles_sparse_attn_tilelang_head_chunked(
+                q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale, **kwargs
+            )
         else:
-            output = _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale)
+            kwargs = {"reference_rounding": True} if reference_rounding else {}
+            output = _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale, **kwargs)
         return output[:, :, :original_heads, :]
+    if reference_rounding:
+        raise ValueError("Original-inference sparse attention rounding requires the TileLang backend")
     return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
 
 

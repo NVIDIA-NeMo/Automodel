@@ -101,6 +101,11 @@ def collate_fn_production(batch: List[Dict]) -> Dict:
             if key in variable_length_text_keys:
                 sequence_length_multiple = 8 if key == "prompt_embeds" else 1
                 output[key] = _stack_or_pad_text_tensors(tensors, sequence_length_multiple=sequence_length_multiple)
+                if key == "prompt_embeds" and tensors[0].ndim >= 2:
+                    # Valid-token mask for the right-padded sequence axis.
+                    lengths = torch.tensor([tensor.shape[0] for tensor in tensors])
+                    positions = torch.arange(output[key].shape[1])
+                    output["prompt_embeds_mask"] = positions.unsqueeze(0) < lengths.unsqueeze(1)
             else:
                 output[key] = torch.stack(tensors)
 
@@ -143,6 +148,8 @@ def collate_fn_text_to_image(batch: List[Dict]) -> Dict:
     if "prompt_embeds" in production_batch:
         # Pre-encoded text embeddings
         image_batch["text_embeddings"] = production_batch["prompt_embeds"]
+        if "prompt_embeds_mask" in production_batch:
+            image_batch["text_attention_mask"] = production_batch["prompt_embeds_mask"]
         # Include optional model-specific fields if present
         if "pooled_prompt_embeds" in production_batch:
             image_batch["pooled_prompt_embeds"] = production_batch["pooled_prompt_embeds"]

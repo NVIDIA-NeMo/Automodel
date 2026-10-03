@@ -476,6 +476,102 @@ def make_tulu3_dataset(
     return dataset.map(_convert_sharegpt_to_conversation, remove_columns=dataset.column_names)
 
 
+# User-turn template shared by the text-to-SQL datasets: the database schema followed by the question.
+TEXT_TO_SQL_PROMPT = "Given the SQL schema:\n{context}\n\nWrite the SQL query that answers this question: {question}"
+
+
+def _load_hf_or_local(path_or_dataset: str, split: str, **kwargs):
+    """``load_dataset`` for an HF Hub id or a local ``.json``/``.jsonl``/``.parquet`` file."""
+    suffix = os.path.splitext(str(path_or_dataset))[1].lower()
+    if suffix in (".json", ".jsonl", ".parquet"):
+        builder = "parquet" if suffix == ".parquet" else "json"
+        return load_dataset(builder, data_files=str(path_or_dataset), split=split, **kwargs)
+    return load_dataset(path_or_dataset, split=split, **kwargs)
+
+
+def spider_schema_to_ddl(schema_row: dict) -> str:
+    """Render one ``richardr1126/spider-schema`` row as ``CREATE TABLE`` statements.
+
+    The schema dataset lists every database as ``table : col (type) , col (type) | table : ...`` plus
+    ``Primary Keys`` (``table : col | ...``) and ``Foreign Keys`` (``t1 : c1 equals t2 : c2 | ...``).
+    Column and table names are emitted with spaces replaced by underscores, which is how the Spider
+    SQL queries reference them.
+    """
+
+    def ident(name: str) -> str:
+        return name.strip().replace(" ", "_")
+
+    pks: dict[str, list[str]] = {}
+    for part in filter(None, (p.strip() for p in (schema_row.get("Primary Keys") or "").split("|"))):
+        table, _, col = part.partition(":")
+        pks.setdefault(ident(table), []).append(ident(col))
+    fks: dict[str, list[str]] = {}
+    for part in filter(None, (p.strip() for p in (schema_row.get("Foreign Keys") or "").split("|"))):
+        left, _, right = part.partition(" equals ")
+        t1, _, c1 = left.partition(":")
+        t2, _, c2 = right.partition(":")
+        fks.setdefault(ident(t1), []).append(f"FOREIGN KEY ({ident(c1)}) REFERENCES {ident(t2)}({ident(c2)})")
+    statements = []
+    for table_block in filter(None, (t.strip() for t in schema_row["Schema (values (type))"].split("|"))):
+        table, _, cols = table_block.partition(":")
+        table = ident(table)
+        columns = []
+        for col in filter(None, (c.strip() for c in cols.split(","))):
+            name, _, col_type = col.rpartition(" (")
+            columns.append(f"{ident(name)} {col_type.rstrip(')').strip().upper()}")
+        if table in pks:
+            columns.append(f"PRIMARY KEY ({', '.join(pks[table])})")
+        columns.extend(fks.get(table, []))
+        statements.append(f"CREATE TABLE {table} ({', '.join(columns)})")
+    return "\n".join(statements)
+
+
+def make_spider_dataset(
+    path_or_dataset: str = "xlangai/spider",
+    split: str = "train",
+    schema_dataset: str = "richardr1126/spider-schema",
+    limit_dataset_samples: int | None = None,
+    **kwargs,
+):
+    """Load Spider (``xlangai/spider``) as text-only conversations for cross-domain text-to-SQL.
+
+    Spider rows carry only ``db_id`` / ``question`` / ``query``; the database schemas come from
+    ``richardr1126/spider-schema`` and are rendered as ``CREATE TABLE`` statements with
+    :func:`spider_schema_to_ddl`. The user turn presents the full schema of the row's database and the
+    question with :data:`TEXT_TO_SQL_PROMPT`; the assistant turn is the gold SQL query with its
+    whitespace collapsed to single spaces. Spider's ``validation`` split uses 20 databases that never
+    appear in ``train``, so it measures generalization to unseen schemas.
+
+    Args:
+        path_or_dataset: HF Hub id of the Spider split files, or a local ``.parquet``/``.json`` file.
+        split: ``"train"`` (7,000 rows, 140 databases) or ``"validation"`` (1,034 rows, 20 databases),
+            optionally sliced (``"validation[:20]"``).
+        schema_dataset: HF Hub id, or local ``.json`` file, of the per-database schema table.
+        limit_dataset_samples: Optional cap on the number of samples (applied as a split slice).
+        **kwargs: Ignored. Accepted so recipe-level dataset keys forwarded to the dataset target do
+            not raise.
+
+    Returns:
+        datasets.Dataset: Rows with a single ``conversation`` column of text-only user/assistant turns.
+    """
+    if limit_dataset_samples is not None:
+        split = f"{split}[:{limit_dataset_samples}]"
+    dataset = _load_hf_or_local(path_or_dataset, split)
+    schemas = {row["db_id"]: spider_schema_to_ddl(row) for row in _load_hf_or_local(schema_dataset, "train")}
+
+    def format(example):
+        prompt = TEXT_TO_SQL_PROMPT.format(context=schemas[example["db_id"]], question=example["question"].strip())
+        answer = re.sub(r"\s+", " ", example["query"]).strip()
+        return {
+            "conversation": [
+                {"role": "user", "content": [{"type": "text", "text": prompt}]},
+                {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+            ],
+        }
+
+    return dataset.map(format, remove_columns=dataset.column_names)
+
+
 @dataclass
 class UnimmChatDatasetConfig:
     """Construction-time configuration for the UniMM-Chat dataset."""

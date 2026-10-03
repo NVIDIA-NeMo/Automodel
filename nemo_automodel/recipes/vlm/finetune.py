@@ -31,10 +31,18 @@ import time
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Protocol
 
-import mlflow
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_MLFLOW, mlflow = safe_import(
+    "mlflow",
+    msg="mlflow is not installed. To enable MLflow experiment tracking, run: uv add nemo-automodel[mlflow]. For the full MLflow stack: uv add nemo-automodel[mlflow-full]",
+)
 import torch
 import torch.nn as nn
-import wandb
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers.processing_utils import ProcessorMixin
@@ -57,6 +65,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 )
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -65,10 +74,17 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
+from nemo_automodel.components.loss.utils import (
+    _count_label_tokens,
+    _get_lm_head_module,
+    _get_loss_ignore_index,
+    calculate_loss,
+    prepare_lm_weight,
+)
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -365,14 +381,17 @@ def build_dataloader(
         if "cp" in getattr(device_mesh, "mesh_dim_names", ()):
             cp_size = device_mesh["cp"].size()
 
-    from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+    from nemo_automodel.components.models.common.packing import (
+        get_attn_implementation,
+        validate_flash_packing_support,
+    )
 
     packing_attn_implementation = config.resolve_packing_attn_implementation(
         model_attn_implementation=get_attn_implementation(cfg_model),
         cp_size=cp_size,
     )
     if config.packing is not None and config.packing.packing_format != "thd":
-        configure_packing(attn_implementation=packing_attn_implementation)
+        validate_flash_packing_support(attn_implementation=packing_attn_implementation)
 
     with ScopedRNG(seed=seed, ranked=True):
         result = config.build(
@@ -552,8 +571,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
+            if isinstance(self.loss_fn, ChunkedCrossEntropy):
+                raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-            self.loss_fn = MaskedCrossEntropy()
+            self.loss_fn = MaskedCrossEntropy(
+                ignore_index=_get_loss_ignore_index(self.loss_fn),
+                reduction=getattr(self.loss_fn, "reduction", "sum"),
+            )
+
+        if isinstance(self.loss_fn, ChunkedCrossEntropy):
+            self.loss_fn.validate_lm_head(
+                _get_lm_head_module(capability_model), model_config=getattr(capability_model, "config", None)
+            )
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -600,14 +629,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
             packing_enabled=dataloader_config.packing is not None,
             cp_size=self.mesh_context.cp_size,
         )
-        from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+        from nemo_automodel.components.models.common.packing import (
+            get_attn_implementation,
+            validate_flash_packing_support,
+        )
 
         packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
             model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),
             cp_size=self.mesh_context.cp_size,
         )
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
-            configure_packing(attn_implementation=packing_attn_implementation)
+            validate_flash_packing_support(attn_implementation=packing_attn_implementation, model=self.model_parts[0])
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
@@ -880,9 +912,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.device_mesh,
             batch,
             padding_token_id=_padding_id,
+            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
             invoke_pre_embed=True,
         )
         model = self.model_parts[0]
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         mtp_cp_enabled = _cp_active and not self.pp_enabled and model.supports.mtp_enabled
         mtp_cp_inputs = None
         if mtp_cp_enabled:
@@ -893,7 +927,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 )
             mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
                 batch,
-                ignore_index=self.cfg.mtp.ignore_index,
+                ignore_index=ignore_index,
             )
         train_ctx, batch = cp_sharder.shard(batch)
         mtp_per_depth_targets = None
@@ -909,7 +943,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 cp_sharder.shard_token_tensor(mask, seq_dim=1, fill=False) for mask in mtp_cp_inputs.valid_masks
             )
             mtp_per_depth_targets = tuple(
-                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
+                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
         labels = batch.pop("labels")
@@ -954,12 +988,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
             with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
+                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. "
+                            f"{type(self.loss_fn).__name__} requires the model to output hidden states. "
                             "Set `model.text_config.output_hidden_states=True` in the config."
                         )
                 else:
@@ -967,11 +1001,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
                 shared_lm_weight = (
-                    self.loss_fn.materialize_lm_weight(
-                        _get_lm_head_weight(model),
+                    prepare_lm_weight(
+                        self.loss_fn,
+                        model,
                         grad_reduce_group=grad_reduce_group,
                     )
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy)
+                    if isinstance(self.loss_fn, LinearCrossEntropy)
                     else None
                 )
                 local_loss = calculate_loss(
@@ -1004,8 +1039,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         model=model,
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
-                        ignore_index=mtp_cfg.ignore_index,
+                        ignore_index=ignore_index,
                         lm_weight=shared_lm_weight,
+                        logits_dtype=out.logits.dtype,
                         grad_reduce_group=grad_reduce_group,
                         cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
                     )
@@ -1057,8 +1093,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
@@ -1087,6 +1124,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             if i == 0:
                 prepare_after_first_microbatch()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,
             model_parts=self.model_parts,
@@ -1100,6 +1138,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+            grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
@@ -1196,7 +1235,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                     for k, v in batch.items()
                 }
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                num_label_tokens = _count_label_tokens(
+                    batch["labels"], _get_loss_ignore_index(getattr(self, "loss_fn", None))
+                )
 
                 cp_sharder = ContextParallelSharder(
                     self.model_parts[0],
@@ -1208,8 +1249,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 labels = batch.pop("labels")
                 with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = self.model_parts[0](logits_to_keep=1, **batch)
+                    if isinstance(self.loss_fn, LinearCrossEntropy):
+                        out = self.model_parts[0](**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     else:
                         out = self.model_parts[0](**batch)
                     local_loss = calculate_loss(
@@ -1271,10 +1312,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self.dist_env.is_main or log_data is None:
             return
 
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
 
-        if mlflow.active_run() is not None:
+        if _HAS_MLFLOW and mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
 
         # JSONL validation log
@@ -1304,9 +1345,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Log to remote services (WandB, MLflow) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
-            if mlflow.active_run() is not None:
+            if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=self.step_scheduler.step)
 
         # JSONL training log (always log for detailed local records)

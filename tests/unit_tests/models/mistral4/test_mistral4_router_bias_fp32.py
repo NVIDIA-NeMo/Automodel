@@ -35,7 +35,7 @@ def _tiny_text_config() -> Mistral4Config:
         num_attention_heads=1,
         num_key_value_heads=1,
         n_shared_experts=1,
-        n_routed_experts=2,
+        n_routed_experts=4,
         kv_lora_rank=2,
         q_lora_rank=None,
         qk_rope_head_dim=2,
@@ -43,7 +43,7 @@ def _tiny_text_config() -> Mistral4Config:
         qk_nope_head_dim=2,
         n_group=1,
         topk_group=1,
-        num_experts_per_tok=1,
+        num_experts_per_tok=2,
         max_position_embeddings=16,
         torch_dtype=torch.float32,
     )
@@ -76,6 +76,63 @@ def test_text_initialize_weights_bf16_keeps_router_bias_fp32() -> None:
 
     _assert_router_biases_are_fp32(model)
     assert model.lm_head.weight.dtype == torch.bfloat16
+
+
+def test_default_training_preserves_hf_router_choices() -> None:
+    from unittest.mock import patch
+
+    from transformers.models.mistral4.configuration_mistral4 import Mistral4Config as HFConfig
+    from transformers.models.mistral4.modeling_mistral4 import Mistral4MoE
+
+    config = _tiny_text_config()
+    model = Mistral4ForCausalLM(config, backend=_torch_backend()).train()
+    gate = model.model.layers["0"].mlp.gate
+    reference = Mistral4MoE(HFConfig(**config.to_dict()))
+    with torch.no_grad():
+        gate.weight.zero_()
+        for parameter in reference.parameters():
+            parameter.zero_()
+    hidden = torch.ones(8, config.hidden_size)
+    token_mask = torch.ones(8, dtype=torch.bool)
+    # The experts' input contract is stable across HF's router refactoring.
+    with patch.object(reference.experts, "forward", wraps=reference.experts.forward) as experts_forward:
+        reference(hidden)
+    _, expected_indices, expected_weights = experts_forward.call_args.args
+    for _ in range(7):
+        gate(hidden, token_mask, None)
+        model.update_moe_gate_bias()
+    weights, indices, _ = gate(hidden, token_mask, None)
+
+    torch.testing.assert_close(indices, expected_indices)
+    torch.testing.assert_close(weights, expected_weights)
+    torch.testing.assert_close(gate.e_score_correction_bias, torch.zeros(config.n_routed_experts))
+    assert gate.weight.requires_grad
+
+
+def test_explicit_adaptive_router_bias_remains_supported() -> None:
+    config = _tiny_text_config()
+    model = Mistral4ForCausalLM(
+        config, backend=_torch_backend(), moe_overrides={"gate_bias_update_factor": 1e-3}
+    ).train()
+    gate = model.model.layers["0"].mlp.gate
+    with torch.no_grad():
+        gate.weight.zero_()
+    hidden = torch.ones(8, config.hidden_size)
+    token_mask = torch.ones(8, dtype=torch.bool)
+    _, before_indices, _ = gate(hidden, token_mask, None)
+    model.update_moe_gate_bias()
+    _, after_indices, _ = gate(hidden, token_mask, None)
+
+    assert not torch.equal(before_indices, after_indices)
+    assert torch.count_nonzero(gate.e_score_correction_bias) == config.n_routed_experts
+
+    restored = Mistral4ForCausalLM(config, backend=_torch_backend()).train()
+    restored.load_state_dict(model.state_dict())
+    restored.update_moe_gate_bias()
+    restored_gate = restored.model.layers["0"].mlp.gate
+    _, restored_indices, _ = restored_gate(hidden, token_mask, None)
+    torch.testing.assert_close(restored_gate.e_score_correction_bias, gate.e_score_correction_bias)
+    torch.testing.assert_close(restored_indices, after_indices)
 
 
 @pytest.mark.skipif(not _HF_MISTRAL3_AVAILABLE, reason="transformers Mistral3 model is unavailable")

@@ -31,6 +31,10 @@ import torch.nn as nn
 import nemo_automodel.components.distributed.context_parallel.magi as mu
 from nemo_automodel.components.distributed.context_parallel.magi import AttnMaskSpec, MagiState, setup_magi
 
+# Over the default 5s budget on purpose: the MagiAttention CUDA parity test spends about 205s in cold compilation.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(300)
+
 
 class _FakeCfg:
     """Minimal stand-in for the recipe ConfigNode (dotted ``.get``)."""

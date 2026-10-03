@@ -24,7 +24,7 @@ Key differences that can cause divergence:
 
 ```python
 from transformers import AutoModelForCausalLM
-from nemo.collections.llm import NeMoAutoModelForCausalLM
+from nemo_automodel import NeMoAutoModelForCausalLM
 ```
 
 The HF model is the reference. The NeMo AutoModel is the implementation under test.
@@ -63,7 +63,8 @@ nemo_model = nemo_model.to(device=device, dtype=dtype).eval()
 
 ### Level 1: State Dict Round-Trip (CPU/float32)
 
-This is the fastest and most fundamental check. If the state dict adapter cannot perfectly round-trip weights, nothing else will work.
+Verify loaded and exported weights match exactly. Most custom models need an
+adapter round-trip; models with matching HF layouts use their state dict directly.
 
 ```python
 hf_model = AutoModelForCausalLM.from_pretrained(
@@ -73,12 +74,14 @@ nemo_model = NeMoAutoModelForCausalLM.from_pretrained(
     "meta-llama/Llama-3.2-1B", torch_dtype=torch.float32, device_map="cpu"
 )
 
-adapter = nemo_model.state_dict_adapter
+adapter = getattr(nemo_model, "state_dict_adapter", None)
 hf_sd = hf_model.state_dict()
 
-# Convert HF -> custom format -> back to HF format
-custom_sd = adapter.from_hf(hf_sd)
-roundtrip_sd = adapter.to_hf(custom_sd)
+# Inspect weights actually loaded into the model, including when no adapter exists.
+native_sd = nemo_model.state_dict()
+roundtrip_sd = adapter.to_hf(native_sd) if adapter is not None else native_sd
+# Module metadata is not part of the HF weight dictionary.
+roundtrip_sd = {key: value for key, value in roundtrip_sd.items() if not key.endswith("_extra_state")}
 
 # Check no missing or extra keys
 assert set(roundtrip_sd.keys()) == set(hf_sd.keys()), (
@@ -89,6 +92,8 @@ assert set(roundtrip_sd.keys()) == set(hf_sd.keys()), (
 
 # Check all values are exactly equal (max_diff must be 0.0)
 for key in hf_sd:
+    assert roundtrip_sd[key].shape == hf_sd[key].shape
+    assert roundtrip_sd[key].dtype == hf_sd[key].dtype
     max_diff = (hf_sd[key] - roundtrip_sd[key]).abs().max().item()
     assert max_diff == 0.0, f"Round-trip mismatch for {key}: max_diff={max_diff}"
 
@@ -99,6 +104,9 @@ print("Level 1 PASSED: state dict round-trip is exact.")
 - All keys present in both dicts (no missing, no extra).
 - Every tensor value matches exactly (max_diff == 0.0). Combined projection adapters must perfectly split and recombine weights.
 - Tied weight keys (e.g., `lm_head.weight` aliasing `model.embed_tokens.weight`) are handled correctly.
+
+Also check weights and ties after real HF export and native save/reload;
+see `tests/unit_tests/checkpoint/test_native_hf_state_dict.py`.
 
 ### Level 2: Component Parity (CPU/float32)
 
@@ -122,8 +130,9 @@ nemo_model = NeMoAutoModelForCausalLM.from_config(config).to(dtype=torch.float32
 
 # Load the same weights into both
 hf_sd = hf_model.state_dict()
-adapter = nemo_model.state_dict_adapter
-nemo_model.load_state_dict(adapter.from_hf(hf_sd))
+adapter = getattr(nemo_model, "state_dict_adapter", None)
+native_sd = adapter.from_hf(hf_sd) if adapter is not None else hf_sd
+nemo_model.load_state_dict(native_sd)
 ```
 
 **Forward pass with identical seeded inputs:**
@@ -266,12 +275,16 @@ Run Level 2 component tests. Determine which component (attention, MLP, norm, Ro
 
 ### Step 2: If component fails, check weight loading
 
-Verify the state dict adapter round-trip (Level 1). If round-trip is not exact, the bug is in the adapter's `from_hf()` or `to_hf()` method.
+Verify the loaded and exported weights (Level 1). If they differ, inspect the
+checkpoint load/save path and, when present, the adapter's `from_hf()` and
+`to_hf()` methods.
 
 ```python
 # Quick check: load NeMo model, export its weights back to HF format, compare
 nemo_sd = nemo_model.state_dict()
-exported_hf_sd = adapter.to_hf(nemo_sd)
+adapter = getattr(nemo_model, "state_dict_adapter", None)
+exported_hf_sd = adapter.to_hf(nemo_sd) if adapter is not None else nemo_sd
+exported_hf_sd = {key: value for key, value in exported_hf_sd.items() if not key.endswith("_extra_state")}
 compare_state_dicts(hf_sd, exported_hf_sd, prefix="weight_check: ")
 ```
 
@@ -342,7 +355,7 @@ for (hf_name, hf_param), (nemo_name, nemo_param) in zip(
 ## Testing Rules
 
 1. **Always test on CPU/float32 first.** GPU and lower precision introduce noise that masks real bugs.
-2. **Test both fresh load and save/reload cycle.** A model that works after `from_pretrained` may break after `save_pretrained` + `from_pretrained` if the state dict adapter has asymmetries.
+2. **Test both fresh load and save/reload cycle.** Loading successfully does not prove export and reload preserve weights, metadata, or ties. Test these paths with and without a state dict adapter, as applicable to the model.
 3. **Never modify reference HF code.** The HF model is the ground truth. Only modify the NeMo AutoModel implementation.
 4. **Use deterministic inputs (torch.manual_seed).** Every test must be reproducible.
 5. **Compare all outputs, not just loss.** Loss can match by coincidence even when logits diverge. Always compare logits, hidden states, and attention weights where possible.
@@ -356,7 +369,7 @@ These are the key source files relevant to parity testing:
 
 | Component | Path |
 |---|---|
-| State dict adapter base | `components/models/common/combined_projection/state_dict_adapter.py` |
+| State dict adapter base | `components/checkpoint/state_dict_adapter.py` |
 | Model registry | `_transformers/registry.py` |
 | AutoModel entry point | `_transformers/auto_model.py` |
 | Kernel patches | `_transformers/kernel_patches.py` |

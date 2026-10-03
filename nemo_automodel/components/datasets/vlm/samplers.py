@@ -114,8 +114,8 @@ class LengthGroupedSampler(Sampler):
         # rare case where the heuristic underestimates the true tokenized length.
         all_indices = range(len(dataset))
         if max_length is not None:
-            # Use 1.2x headroom: the estimated length is a heuristic, so only
-            # drop samples that are clearly overlong.  Borderline samples are
+            # Fixed 512-token headroom: the estimated length is a heuristic, so
+            # only drop samples that are clearly overlong.  Borderline samples are
             # left to PreTokenizedDatasetWrapper's precise tokenize-and-retry.
             filter_threshold = max_length + 512
             kept = [i for i in all_indices if self.lengths[i] <= filter_threshold]
@@ -123,7 +123,7 @@ class LengthGroupedSampler(Sampler):
             if n_dropped:
                 logger.info(
                     "LengthGroupedSampler: pre-filtered %d/%d samples with "
-                    "estimated length > %.0f tokens (1.2 * max_length %d).",
+                    "estimated length > %d tokens (max_length %d + 512 headroom).",
                     n_dropped,
                     len(dataset),
                     filter_threshold,

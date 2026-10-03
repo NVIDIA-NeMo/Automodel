@@ -68,6 +68,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
         ),
         (
+            "DeepseekV41ForCausalLM",
+            ("nemo_automodel.components.models.deepseek_v41.model", "DeepseekV41ForCausalLM"),
+        ),
+        (
             "DiffusionGemmaForBlockDiffusion",
             ("nemo_automodel.components.models.diffusion_gemma.model", "DiffusionGemmaForBlockDiffusion"),
         ),
@@ -171,6 +175,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "MiMoV2FlashForCausalLM",
             ("nemo_automodel.components.models.mimo_v2_flash.model", "MiMoV2FlashForCausalLM"),
+        ),
+        (
+            "MiMoV2ForCausalLM",
+            ("nemo_automodel.components.models.mimo_v2_flash.model", "MiMoV2ForCausalLM"),
+        ),
+        (
+            "MiMoV25ForCausalLM",
+            ("nemo_automodel.components.models.mimo_v25.model", "MiMoV2ForCausalLM"),
         ),
         (
             "LagunaForCausalLM",
@@ -349,6 +361,9 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
+    "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41Config"),
+    "deepseek_v41_text": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41TextConfig"),
+    "deepseek_v41_vision": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41VisionConfig"),
     "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
     "glm5_next": ("nemo_automodel.components.models.glm5_next.config", "Glm5NextConfig"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
@@ -360,8 +375,10 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "kimi_linear_48b_a3b": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinear48BConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "laguna": ("nemo_automodel.components.models.laguna.config", "LagunaConfig"),
+    "llama_nemotron_vl": ("nemo_automodel.components.models.llama_nemotron_vl.model", "LlamaNemotronVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
+    "mimo_v2": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2Config"),
     "minimax_m3_vl": ("nemo_automodel.components.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
     "ministral3_bidirec": (
         "nemo_automodel.components.models.ministral_bidirectional.model",
@@ -385,6 +402,11 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     ),
     "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
+}
+
+# Checkpoint model_type to local image/text processor implementation.
+_CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
+    "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
 }
 
 # model_types whose custom model implementation should win over a transformers
@@ -439,7 +461,21 @@ def _register_custom_configs() -> None:
             logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
 
 
+def _register_custom_processors() -> None:
+    """Attach local processor implementations to their registered HF config classes."""
+    from transformers import AutoProcessor
+
+    for model_type, (module_path, cls_name) in _CUSTOM_PROCESSOR_REGISTRATIONS.items():
+        config_cls = resolve_custom_config_cls(model_type)
+        if config_cls is None:
+            continue
+        module = importlib.import_module(module_path)
+        processor_cls = getattr(module, cls_name)
+        AutoProcessor.register(config_cls, processor_cls, exist_ok=True)
+
+
 _register_custom_configs()
+_register_custom_processors()
 
 
 class _LazyArchMapping:

@@ -62,25 +62,16 @@ else
     done
 fi
 
-# Install opt-in media extras (kept out of the default media-free image) per folder.
-case ",$TEST_NAME," in
-    *,hf_transformer_vlm,*) MEDIA_EXTRA="vlm-media" ;;
-    # The parallelism suite runs VLM proxies, so it needs the same media extras.
-    *,parallelism,*) MEDIA_EXTRA="vlm-media" ;;
-    *) MEDIA_EXTRA="" ;;
-esac
-if [[ -n "$MEDIA_EXTRA" ]]; then
-    uv pip install ".[$MEDIA_EXTRA]"
-fi
+# Test dependencies, including vlm-media for VLM and parallelism suites, are
+# installed when building the CI image.
 
+# Default pytest capture reports module progress and includes stdout, stderr, and logs only for failed tests.
 coverage run \
     -m pytest \
     --durations 32 \
     --durations-min=0 \
     "${TEST_DIRS[@]}" \
-    -o log_cli=true \
-    -o log_cli_level=INFO \
-    -vs -m "not pleasefixme" --tb=short -rA \
+    -m "not pleasefixme" --tb=short -rfE \
     $SHARD_ARGS \
     $ADDITIONAL_ARGS
 coverage combine -q

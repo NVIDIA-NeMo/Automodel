@@ -48,7 +48,12 @@ _HAS_QWEN3_5 = importlib.util.find_spec("transformers.models.qwen3_5") is not No
 # the full package (several seconds per test on the CPU unit-test job); the sharding they
 # exercise is a multi-GPU context-parallel feature, so keep them off the CPU job like the
 # other 2-rank gloo CP tests.
-pytestmark = pytest.mark.run_only_on("GPU")
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = [
+    pytest.mark.timeout(70),
+    pytest.mark.run_only_on("GPU"),
+]
 
 
 def _free_port() -> int:
@@ -302,7 +307,7 @@ def _divergent_count_worker(rank: int, world_size: int, port: int) -> None:
     than hanging CI.
     """
     try:
-        _init_gloo(rank, world_size, port, timeout=timedelta(seconds=60))
+        _init_gloo(rank, world_size, port, timeout=timedelta(seconds=70))
         torch.set_num_threads(1)
         from nemo_automodel.components.distributed import cp_vision_frame_shard as vs
 

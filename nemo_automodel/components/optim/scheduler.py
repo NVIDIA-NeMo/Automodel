@@ -15,6 +15,41 @@ _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
 
 
+def _as_float(value: Any) -> float | None:
+    """Return ``value`` as a float, or None when it is not numeric (e.g. relative-step Adafactor's ``lr=None``)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _set_group_mults(optimizer: Optimizer) -> None:
+    """Store each param group's constructed ``lr`` / ``weight_decay`` as ``lr_mult`` / ``wd_mult`` relative to group 0.
+
+    :meth:`OptimizerParamScheduler.step` rewrites every group's ``lr`` and ``weight_decay`` from the schedule, so a
+    group built with its own values (a no-decay group, a separate head LR) would otherwise be reset to the base
+    schedule. ``LRSchedulerConfig.build`` reads the schedule's base values from group 0, so each group keeps its ratio
+    to group 0 as a multiplier. The multipliers live in the param groups, so they are saved with the optimizer and
+    restored on resume instead of being recomputed from the resumed run's config.
+
+    A group that already carries ``lr_mult`` (or a per-group ``max_lr`` / ``min_lr``) or ``wd_mult`` keeps it
+    unchanged. Every other group, group 0 included, gets both keys so the saved param-group layout does not depend
+    on which groups happen to differ from group 0. The multiplier is 1.0 when group 0's value is zero or non-numeric
+    (e.g. relative-step Adafactor's ``lr=None``).
+
+    Args:
+        optimizer: Optimizer whose param groups still hold their constructed values.
+    """
+    base_lr = _as_float(optimizer.param_groups[0]["lr"])
+    base_wd = _as_float(optimizer.param_groups[0].get("weight_decay", 0.0))
+    for group in optimizer.param_groups:
+        lr, wd = _as_float(group["lr"]), _as_float(group.get("weight_decay", 0.0))
+        if "lr_mult" not in group and "max_lr" not in group and "min_lr" not in group:
+            group["lr_mult"] = lr / base_lr if base_lr and lr is not None else 1.0
+        if "wd_mult" not in group:
+            group["wd_mult"] = wd / base_wd if base_wd and wd is not None else 1.0
+
+
 class OptimizerParamScheduler:
     """
     Anneals learning rate and weight decay.
@@ -114,6 +149,9 @@ class OptimizerParamScheduler:
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
         if self.override_opt_param_scheduler:
             assert not self.use_checkpoint_opt_param_scheduler, "both override and use-checkpoint are set."
+
+        # Record each group's own lr / weight_decay as multipliers before step(0) overwrites them.
+        _set_group_mults(optimizer)
 
         # Set the learning rate
         self.step(0)
@@ -248,7 +286,9 @@ class OptimizerParamScheduler:
 
     def step(self, increment: int) -> None:
         """
-        Set lr for all parameters groups.
+        Set lr and weight decay for all parameter groups.
+
+        Each group gets the scheduled value times its ``lr_mult`` / ``wd_mult`` (see :func:`_set_group_mults`).
 
         Args:
             increment (int): number of steps to increment
@@ -304,6 +344,11 @@ class OptimizerParamScheduler:
         """
         Load the state dict.
 
+        Every restored field is applied before the final :meth:`step` call, so the
+        learning rate and weight decay written into ``optimizer.param_groups`` both
+        reflect the checkpoint's schedule rather than the constructor's.  The step
+        count is treated as absolute, so loading is idempotent.
+
         Args:
             state_dict (dict): state dict to be load
         """
@@ -337,12 +382,6 @@ class OptimizerParamScheduler:
             lr_decay_style_ = state_dict["lr_decay_style"]
         self.lr_decay_style = self._check_and_set(self.lr_decay_style, lr_decay_style_, "learning rate decay style")
 
-        if "num_iters" in state_dict:
-            num_steps = state_dict["num_iters"]
-        else:
-            num_steps = state_dict["num_steps"]
-        self.step(increment=num_steps)
-
         if "start_wd" in state_dict:
             self.start_wd = self._check_and_set(self.start_wd, state_dict["start_wd"], "start weight decay")
             self.end_wd = self._check_and_set(self.end_wd, state_dict["end_wd"], "end weight decay")
@@ -354,3 +393,13 @@ class OptimizerParamScheduler:
             self.wd_incr_style = self._check_and_set(
                 self.wd_incr_style, state_dict["wd_incr_style"], "weight decay incr style"
             )
+
+        if "num_iters" in state_dict:
+            num_steps = state_dict["num_iters"]
+        else:
+            num_steps = state_dict["num_steps"]
+        # ``step`` writes the resolved LR and weight decay into the optimizer, so it runs
+        # last, once every restored field is in place.  ``num_steps`` is an absolute count,
+        # so replay it from zero instead of folding it into whatever has been counted here.
+        self.num_steps = 0
+        self.step(increment=num_steps)

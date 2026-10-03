@@ -53,6 +53,7 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
 from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
@@ -762,6 +763,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 process_group=dp_process_group,
             )
         self.trainer_module = trainer_module
+        # DDP broadcasts only inside the DP subgroup. The draft is replicated
+        # across TP, so align those independently initialized copies before the
+        # optimizer captures them and TP replica gradients are averaged.
+        broadcast_tp_replicas([self.trainer_module], self.device_mesh)
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
@@ -2066,6 +2071,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     if pending_micro_batches == self.grad_accumulation_steps:
                         if getattr(self, "cp_group", None) is not None:
                             self._all_reduce_draft_grads_over_cp()
+                        synchronize_tp_replica_gradients(
+                            [self.trainer_module],
+                            getattr(self, "device_mesh", None),
+                        )
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.lr_scheduler.step()
@@ -2159,6 +2168,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 # cp replicas of the draft desync permanently from here on.
                 if getattr(self, "cp_group", None) is not None:
                     self._all_reduce_draft_grads_over_cp()
+                synchronize_tp_replica_gradients(
+                    [self.trainer_module],
+                    getattr(self, "device_mesh", None),
+                )
                 scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                 for p in self.trainer_module.parameters():
                     if p.grad is not None:

@@ -250,6 +250,32 @@ def test_legacy_freeze_alias_uses_substring_matching(dummy_model):
     assert not _any_requires_grad(dummy_model.visual_extra)
 
 
+def test_legacy_freeze_alias_skips_none_attributes():
+    """Optional tower attributes set to None do not prevent pattern-based freezing."""
+
+    class ModelWithOptionalTowers(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.vision_tower = None
+            self.audio_tower = None
+            self.language_model = None
+            self.audio_encoder = nn.Linear(4, 4)
+            self.other = nn.Linear(4, 4)
+
+    model = ModelWithOptionalTowers()
+    model_utils.apply_parameter_freezing(
+        model,
+        model_utils.FreezeConfig(
+            freeze_vision_tower=True,
+            freeze_audio_tower=True,
+            freeze_language_model=True,
+        ),
+    )
+
+    assert not _any_requires_grad(model.audio_encoder)
+    assert _all_requires_grad(model.other)
+
+
 def test_generic_selectors_disable_implicit_legacy_vision_freeze(dummy_model):
     """Explicit-selector configurations do not implicitly freeze vision modules."""
     model_utils.apply_parameter_freezing(

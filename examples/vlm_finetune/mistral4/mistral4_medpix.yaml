@@ -123,10 +123,18 @@ ci:
   checkpoint_robustness:
     # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
     step_scheduler.local_batch_size: 4
-    # Independent-process AutoModel and HF reloads show measured long-context
-    # BF16 drift for this PP4/EP8 routed-MoE topology; source parity stays standard.
+    # Promote HF RMSNorm, RoPE, router scoring, and expert accumulation to FP32.
+    # Corroborated by vLLM CUDA norm/router/expert-sum and FlashInfer RoPE paths.
+    # Projections, activations, and checkpoint storage retain their native dtypes.
+    # The reference context selects eager experts for both source and reload.
+    # Reference precision audit: https://linear.app/nvidia/issue/AM-821
+    hf_reference_compute_fp32: true
+    # BF16 fused expert arithmetic and equivalent reduction orders perturb
+    # hard top-k choices across 36 layers, even with aligned FP32 scoring.
+    # Full-depth router replay passes standard; independent HF arithmetic
+    # variants reproduce the remaining drift. Keep AutoModel reload standard.
     parity_tolerance_profile_overrides:
-      automodel_reload: relaxed
+      source_load: relaxed
       hf_reload: relaxed
     hf_device_map_auto: true
     # Transformers' load-time dequantization leaves Mistral4 expert weights in

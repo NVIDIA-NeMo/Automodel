@@ -67,7 +67,6 @@ from nemo_automodel.components.models.llama.rope_utils import (
     apply_rotary_pos_emb_fused,
     apply_rotary_pos_emb_quack,
 )
-from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator, safe_import_from
 
 check_model_inputs = get_check_model_inputs_decorator()
@@ -572,8 +571,6 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Create state_dict_adapter
-        self.state_dict_adapter = LlamaStateDictAdapter(config=self.config)
         # Initialize weights and apply final processing
         self.post_init()
 

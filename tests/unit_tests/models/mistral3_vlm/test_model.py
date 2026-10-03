@@ -23,14 +23,17 @@ These tests avoid instantiating the full 128B model. They validate:
     class's own __init__
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 import torch.nn as nn
+import yaml
 from transformers import Mistral3Config
 
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport, reject_tie_word_embeddings_flip
 from nemo_automodel.components.models.mistral3.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
@@ -39,6 +42,8 @@ from nemo_automodel.components.models.mistral3_vlm.model import (
     Mistral3FP8VLMForConditionalGeneration,
     _rotary_reinit_self_hook,
 )
+from nemo_automodel.components.optim.optimizer import AdamConfig
+from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, parse_freeze_config
 
 
 # --------------------------------------------------------------------------- #
@@ -283,6 +288,33 @@ def _tiny_vlm_config(tie_word_embeddings: bool) -> Mistral3Config:
         tie_word_embeddings=tie_word_embeddings,
         image_token_index=1,
     )
+
+
+@pytest.mark.parametrize("recipe_name", ["ministral3_3b_squad.yaml", "ministral3_3b_squad_peft.yaml"])
+def test_squad_recipe_excludes_visual_parameters_from_optimizer(recipe_name: str) -> None:
+    """Text-only recipes exclude both the vision tower and its sibling projector."""
+    recipe_path = Path(__file__).resolve().parents[4] / "examples/llm_finetune/mistral" / recipe_name
+    config = yaml.safe_load(recipe_path.read_text())
+    model = Mistral3FP8VLMForConditionalGeneration(_tiny_vlm_config(tie_word_embeddings=True))
+    peft_config = config.get("peft")
+    if peft_config is not None:
+        apply_lora_to_linear_modules(model, PeftConfig(**{k: v for k, v in peft_config.items() if k != "_target_"}))
+    apply_parameter_freezing(model, parse_freeze_config(config["freeze_config"]))
+
+    optimizer = AdamConfig().build(model, is_peft=peft_config is not None)[0]
+    optimizer_param_ids = {id(param) for group in optimizer.param_groups for param in group["params"]}
+    for module in (model.model.vision_tower, model.model.multi_modal_projector):
+        assert list(module.parameters())
+        assert all(not param.requires_grad for param in module.parameters())
+        assert all(id(param) not in optimizer_param_ids for param in module.parameters())
+
+    language_params = {
+        name: param for name, param in model.model.language_model.named_parameters() if param.requires_grad
+    }
+    assert language_params
+    assert all(id(param) in optimizer_param_ids for param in language_params.values())
+    if peft_config is not None:
+        assert all("lora_" in name for name in language_params)
 
 
 class TestTieWordEmbeddings:

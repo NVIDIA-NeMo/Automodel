@@ -22,6 +22,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import _has_chat_te
 
 GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_unified")
 DEEPSEEK_V4_MODEL_TYPE = "deepseek_v4"
+DEEPSEEK_V41_MODEL_TYPE = "deepseek_v41"
 GLM_5_2_MODEL_TYPE = "glm_moe_dsa"
 MINIMAX_M3_MODEL_TYPES = ("minimax_m3_vl",)
 KIMI_K3_MODEL_TYPES = ("kimi_k3", "kimi_linear")

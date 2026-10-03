@@ -24,16 +24,10 @@ from torch.distributed.tensor import DTensor
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
-    _AllGatherConcatVarlenFn,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.shared.utils import dtype_from_str
-
-try:
-    from grouped_gemm import ops
-except ImportError:
-    ops = None
 
 
 def _to_local(proj):
@@ -153,6 +147,18 @@ class GroupedExpertsLoRA(GroupedExperts):
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
 
+    def materialize_effective_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the grouped expert weights with the LoRA updates folded in.
+
+        Returns:
+            A pair containing the input-projection tensor of shape
+            [experts, expert_dim, fused_intermediate] and the down-projection
+            tensor of shape [experts, intermediate, expert_dim].
+        """
+        gate_and_up_delta = torch.bmm(self.lora_gate_and_up_A, self.lora_gate_and_up_B) * self.scale
+        down_delta = torch.bmm(self.lora_down_A, self.lora_down_B) * self.scale
+        return self.gate_and_up_projs + gate_and_up_delta, self.down_projs + down_delta
+
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """Forward pass for GroupedExpertsLoRA with LoRA injection.
 
@@ -185,31 +191,10 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         local_num_tokens = x.size(0)
         if ep_size > 1:
-            # Variable-length EP gather, mirroring GroupedExperts.forward.
-            # DTensor.from_local(..., Shard(0)).full_tensor() assumes identical local shapes on
-            # every EP rank; with ragged (unpacked / unpadded) batches each rank infers a different
-            # global shape and the all_gather never completes. Exchange lengths, pad, gather, narrow.
             ep_group = ep_mesh.get_group()
-            local_len_t = torch.tensor([local_num_tokens], device=x.device, dtype=torch.int64)
-            gathered_len_t = [torch.zeros_like(local_len_t) for _ in range(ep_size)]
-            dist.all_gather(gathered_len_t, local_len_t, group=ep_group)
-            gathered_lens = [int(t.item()) for t in gathered_len_t]
-            max_len = max(gathered_lens)
-
-            def _gather_var(t: torch.Tensor, *, differentiable: bool) -> torch.Tensor:
-                if differentiable:
-                    return _AllGatherConcatVarlenFn.apply(t, ep_group, gathered_lens, max_len)
-                if max_len > t.size(0):
-                    pad = torch.zeros((max_len - t.size(0),) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
-                    t = torch.cat([t, pad], dim=0)
-                gathered = [torch.empty_like(t) for _ in range(ep_size)]
-                dist.all_gather(gathered, t, group=ep_group)
-                return torch.cat([g[:n] for g, n in zip(gathered, gathered_lens)], dim=0)
-
-            x = _gather_var(x, differentiable=True)
-            weights = _gather_var(weights.float(), differentiable=True)
-            indices = _gather_var(indices, differentiable=False)
-            token_mask = _gather_var(token_mask, differentiable=False)
+            x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
+                x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
+            )
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
@@ -436,7 +421,6 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.ep_size = getattr(orig_module, "ep_size", 1)
         self.ep_rank = getattr(orig_module, "ep_rank", 0)
         self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
-        self.use_torch_mm = getattr(orig_module, "use_torch_mm", False)
         self.use_mxfp8 = getattr(orig_module, "use_mxfp8", False)
 
         GroupedExpertsDeepEPLoRA._init_adapter(
@@ -520,15 +504,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         assert not isinstance(x, DTensor)
         assert self.n_routed_experts % self.ep_size == 0
 
-        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
-
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
-            hidden_states=x,
-            num_local_tokens=x.size(0),
-            token_probs=weights,
-            token_indices=indices,
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
+            x, token_mask, weights, indices
         )
-        permuted_probs = permuted_probs.unsqueeze(-1)
 
         compute_dtype = x.dtype
         gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
@@ -539,69 +517,34 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
         if torch.count_nonzero(tokens_per_expert) > 0:
-            if self.use_torch_mm:
-                lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
-                    lora_gate_and_up_A, lora_gate_and_up_B
-                )
-                lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
-                tokens_per_expert_gpu = tokens_per_expert.to(
-                    device=permuted_local_hidden_states.device, non_blocking=True
-                )
-                offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
+            lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
+                lora_gate_and_up_A, lora_gate_and_up_B
+            )
+            lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
+            tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
+            offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
 
-                # Gate+Up projection + LoRA
-                output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
-                lora_out1_A = torch._grouped_mm(permuted_local_hidden_states, lora_gate_and_up_A, offs=offs)
-                lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
-                output1 = output1 + lora_out1 * self.scale
+            # Gate+Up projection + LoRA
+            output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
+            lora_out1_A = torch._grouped_mm(permuted_local_hidden_states, lora_gate_and_up_A, offs=offs)
+            lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
+            output1 = output1 + lora_out1 * self.scale
 
-                if self.expert_bias:
-                    gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
-                    output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+            if self.expert_bias:
+                gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
+                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-                output1 = self.expert_activation(output1, permuted_probs)
+            output1 = self.expert_activation(output1, permuted_probs)
 
-                # Down projection + LoRA
-                output2 = torch._grouped_mm(output1, down_projs, offs=offs)
-                lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
-                lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
-                output2 = output2 + lora_out2 * self.scale
+            # Down projection + LoRA
+            output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+            lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
+            lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
+            output2 = output2 + lora_out2 * self.scale
 
-                if self.expert_bias:
-                    down_bias = _to_local(self.down_proj_bias)
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
-            else:
-                # Gate+Up projection + LoRA
-                output1 = ops.gmm(
-                    permuted_local_hidden_states,
-                    gate_and_up_projs,
-                    tokens_per_expert,
-                    trans_b=False,
-                )
-                lora_out1_A = ops.gmm(
-                    permuted_local_hidden_states,
-                    lora_gate_and_up_A,
-                    tokens_per_expert,
-                    trans_b=False,
-                )
-                lora_out1 = ops.gmm(lora_out1_A, lora_gate_and_up_B, tokens_per_expert, trans_b=False)
-                output1 = output1 + lora_out1 * self.scale
-
-                if self.expert_bias:
-                    gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
-                    output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
-
-                output1 = self.expert_activation(output1, permuted_probs)
-
-                # Down projection + LoRA
-                output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
-                lora_out2_A = ops.gmm(output1, lora_down_A, tokens_per_expert, trans_b=False)
-                lora_out2 = ops.gmm(lora_out2_A, lora_down_B, tokens_per_expert, trans_b=False)
-                output2 = output2 + lora_out2 * self.scale
-
-                if self.expert_bias:
-                    down_bias = _to_local(self.down_proj_bias)
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+            if self.expert_bias:
+                down_bias = _to_local(self.down_proj_bias)
+                output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
             # Dummy computation for gradient flow
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])

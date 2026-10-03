@@ -413,7 +413,7 @@ class TestExtractTargetModules:
         """
 
         class _RenamingAdapter(_StubStateDictAdapter):
-            def map_peft_target_module_to_hf(self, name):
+            def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
                 return name.replace(".mlp.experts.", ".block_sparse_moe.experts.")
 
         model = _make_model_with_named_modules(

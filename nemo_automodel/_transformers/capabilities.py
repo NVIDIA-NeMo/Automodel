@@ -112,7 +112,10 @@ def _is_deepseek_v4(model: "nn.Module") -> bool:
     backend rather than the generic TE/SDPA/Magi paths.
     """
     config = getattr(model, "config", None)
-    return getattr(config, "model_type", None) == "deepseek_v4" or type(model).__name__.startswith("DeepseekV4")
+    if getattr(config, "model_type", None) == "deepseek_v4":
+        return True
+    # Exact names: sibling architectures such as ``DeepseekV41*`` do not own a CP attention path.
+    return type(model).__name__ in ("DeepseekV4ForCausalLM", "DeepseekV4Model")
 
 
 def _is_glm_moe_dsa(model: "nn.Module") -> bool:

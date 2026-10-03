@@ -86,6 +86,9 @@ class GenerationConfig:
     max_new_tokens: int
     temperature: float
     top_p: float
+    # 0 disables the truncation. Not sent to the server unless set: the engines
+    # spell "no top-k" as -1, so a literal 0 would be read as "keep 0 tokens".
+    top_k: int = 0
     reasoning: str = "none"
 
 
@@ -111,8 +114,14 @@ def _build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "top_k": args.top_k,
         "reasoning": args.reasoning,
     }
+
+
+# Manifest keys introduced after the format shipped, with the value older runs
+# implicitly used. Consulted only when resuming against an existing manifest.
+_MANIFEST_BACKFILL: dict[str, Any] = {"top_k": 0}
 
 
 def _manifest_path(output_dir: Path) -> Path:
@@ -163,6 +172,11 @@ def _ensure_manifest_compatible(
         return
 
     existing_manifest = json.loads(path.read_text(encoding="utf-8"))
+    # Keys added after a run started are absent from its manifest; fill them with
+    # the value that run effectively used so --resume keeps working instead of
+    # failing on a field the user never set.
+    for key, default in _MANIFEST_BACKFILL.items():
+        existing_manifest.setdefault(key, default)
     if existing_manifest != manifest:
         raise ValueError(
             f"--resume was requested for {output_dir}, but {_MANIFEST_NAME} does not match the current run "
@@ -312,6 +326,10 @@ async def _regenerate_one(
         "temperature": gen_cfg.temperature,
         "top_p": gen_cfg.top_p,
     }
+    # See bench_common._run_workload: the engines read -1, not 0, as "no top-k",
+    # so the key is omitted rather than sent at its disabled default.
+    if gen_cfg.top_k > 0:
+        payload["top_k"] = gen_cfg.top_k
     if gen_cfg.reasoning == "disable":
         # Must be a top-level body field: "extra_body" is an OpenAI Python-client
         # convenience, and this raw-JSON POST would send it literally for the
@@ -407,6 +425,7 @@ async def _run(args: argparse.Namespace) -> int:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
         reasoning=args.reasoning,
     )
     url = args.target_server.rstrip("/") + "/chat/completions"
@@ -509,6 +528,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Default 0.0 = greedy, matches what EAGLE drafters are usually trained against.",
     )
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=0, help="0 disables top-k truncation.")
     parser.add_argument("--timeout-s", type=float, default=600.0, help="Per-request timeout in seconds.")
     parser.add_argument("--max-retries", type=int, default=3, help="Retries on 5xx / 429 / transport errors.")
     parser.add_argument(

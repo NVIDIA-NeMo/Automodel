@@ -14,6 +14,7 @@
 
 import math
 
+import numpy as np
 import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
@@ -28,6 +29,12 @@ def batchify(tensor, default_tensor_cls=torch.LongTensor):
     Returns:
         torch.Tensor:  The tensor with an extra dimension added if it was originally 1-dimensional.
         Otherwise, the tensor is returned as-is.
+
+    Warning:
+        A 1-D tensor is unsqueezed **in place** and returned as the same object, so the
+        caller's tensor is reshaped from ``[S]`` to ``[1, S]`` as a side effect. Do not
+        pass a tensor owned by someone else -- add the batch axis with ``unsqueeze(0)``
+        instead.
     """
     if not isinstance(tensor, torch.Tensor):
         tensor = default_tensor_cls(tensor)
@@ -49,6 +56,25 @@ def extract_key_from_dicts(batch, key):
         the dictionaries in the input batch.
     """
     return list(map(lambda x: x[key], batch))
+
+
+def is_scalar_field(value) -> bool:
+    """Return whether a batch field holds one scalar per example.
+
+    Blended pretraining datasets attach per-sample provenance (``dataset_id``)
+    as a bare numpy/Python scalar alongside sequence-valued fields. Such a field
+    must be stacked to ``[B]``, not padded as a ragged sequence -- ``len()`` of a
+    numpy scalar raises ``TypeError``.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.ndim == 0
+    if isinstance(value, (str, bytes)):
+        return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    return getattr(value, "ndim", None) == 0
 
 
 def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
@@ -234,7 +260,8 @@ def default_collater(
             sequence length, and becomes ``[B, S]`` after padding, where ``B`` is the number of examples and
             ``S`` is the padded maximum. A tensor-valued field is already batched as ``[B_i, ...]`` with
             arbitrary trailing axes and becomes ``[sum_i(B_i), ...]``. The optional
-            ``___PAD_TOKEN_IDS___`` entry is removed from the first input mapping in place.
+            ``___PAD_TOKEN_IDS___`` entry is removed from the first input mapping in place. Apart from
+            that removal, the input examples and their tensors are left unmodified.
         pad_seq_len_divisible: If set, round padded ``S`` up to a multiple of this value.
 
     Returns:
@@ -247,12 +274,22 @@ def default_collater(
     # key: str (e.g., "input_ids", "attention_mask", "labels", "loss_mask")
     # value: list[list[int]] (e.g., [[1, 2, 3], [4, 5, 6]])
     ans = {}
+    scalar_keys = set()
     for key in batch[0].keys():
         values = extract_key_from_dicts(batch, key)
-        if all(isinstance(v, torch.Tensor) for v in values):
+        if all(isinstance(v, torch.Tensor) and v.ndim > 0 for v in values):
             # Pre-batched fields: each value is a [batch_size, seq_len] tensor; concatenate along the
             # batch dim rather than treating it as a ragged list[int] to be padded.
-            ans[key] = torch.cat([batchify(v) for v in values], dim=0)
+            # These tensors belong to the caller's examples, so add the batch axis
+            # out-of-place: ``batchify`` unsqueezes 1-D input in place, which would
+            # reshape the dataset's own sample from [S] to [1, S] as a side effect.
+            ans[key] = torch.cat([v.unsqueeze(0) if v.ndim == 1 else v for v in values], dim=0)
+        elif all(is_scalar_field(v) for v in values):
+            # One scalar per example (e.g. dataset_id from a blended dataset):
+            # stack to [B]. Padding this as a ragged sequence raises, and
+            # batchify would turn [B] into [1, B].
+            ans[key] = torch.as_tensor(np.asarray(values))
+            scalar_keys.add(key)
         else:
             ans[key] = pad_within_micro(
                 values,
@@ -261,7 +298,10 @@ def default_collater(
             )
 
     # convert to tensors (already-tensor fields are passed through batchify unchanged)
-    result = {k: batchify(v if isinstance(v, torch.Tensor) else torch.LongTensor(v)) for k, v in ans.items()}
+    result = {
+        k: v if k in scalar_keys else batchify(v if isinstance(v, torch.Tensor) else torch.LongTensor(v))
+        for k, v in ans.items()
+    }
 
     # Add padding_mask. Prefer the real attention_mask: matching the pad token *value*
     # (input_ids == pad_token_id) misclassifies real tokens as padding whenever pad_token_id
@@ -504,15 +544,24 @@ def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tens
 def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -> dict:
     """Collater for neat-packed LLM sequences.
 
-    Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
-    indexed ``attention_mask`` to the format required by the attention backend.
+    Stacks ``input_ids``, ``labels``, ``position_ids`` and turns the indexed
+    ``attention_mask`` (``[B, S]`` document map, ``0`` = padding) into the form
+    each attention backend consumes:
 
-    For flash attention (``flash_attention_2`` / ``flash_attention_3`` /
-    ``flash_attention_4``): keeps the indexed 2D mask ``[B, S]``.
-    For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
+    - Flash attention (``flash_attention_2`` / ``flash_attention_3`` /
+      ``flash_attention_4``): emits typed packed-sequence metadata as
+      ``FlashAttentionKwargs`` (``cu_seq_lens_q``/``cu_seq_lens_k``/
+      ``max_length_q``/``max_length_k``) so HuggingFace routes the batch through
+      ``flash_attn_varlen_func``. No ``attention_mask`` is emitted so HF takes the
+      varlen-kwargs branch; the per-document map is preserved as ``_packed_seq_ids``
+      for loss and context-parallel consumers.
+    - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
 
     Args:
-        batch: List of sample dicts produced by ``neat_pack_dataset``.
+        batch: List of sample dicts produced by ``neat_pack_dataset``. Each holds
+            1-D ``input_ids``/``labels``/``position_ids``/``attention_mask``
+            tensors of shape ``[sequence]``; ``attention_mask`` is the indexed
+            document map.
         attn_implementation: Attention backend (``"flash_attention_2"``,
             ``"sdpa"``, or ``"eager"``).
 
@@ -527,19 +576,29 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
 
-    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
-        mask_out = attention_mask
-    else:
-        mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
-
     result = {
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
-        "attention_mask": mask_out,
     }
-    if attention_mask.max() > 1:
-        result["_packed_seq_ids"] = attention_mask
+
+    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
+        # No attention_mask: HF then takes its varlen-kwargs branch, not the binary-mask unpad path.
+        from nemo_automodel.components.datasets.packed_seq import (
+            packed_seq_params_from_doc_ids,
+            to_flash_attention_kwargs,
+        )
+
+        params = packed_seq_params_from_doc_ids(attention_mask)
+        result.update(to_flash_attention_kwargs(params))
+        # Emitted only for 2+ docs, matching the sdpa path; consumed by loss / CP.
+        if attention_mask.max() > 1:
+            result["_packed_seq_ids"] = attention_mask
+    else:
+        result["attention_mask"] = _indexed_mask_to_4d_block_causal(attention_mask)
+        if attention_mask.max() > 1:
+            result["_packed_seq_ids"] = attention_mask
+
     return result
 
 
