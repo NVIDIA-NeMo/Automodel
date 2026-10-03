@@ -8,7 +8,10 @@
 # tflops_per_sec_per_gpu automatically, alongside MFU. FLOPs come from the
 # existing model formula evaluated for every microbatch's actual input shape.
 # step_time includes data loading, forward/backward, optimizer work and metric
-# reductions. Logging, validation and checkpointing between steps are excluded.
+# reductions, ending at the existing loss readback without extra CUDA syncs.
+# The window is one optimizer step, matching the console/JSONL logging cadence.
+# Host time spent logging, validating and checkpointing between steps is excluded;
+# pending asynchronous work may overlap the next step.
 # These are full-parameter model FLOPs estimates; activation recomputation is
 # excluded. LoRA/frozen weights are not adjusted, and packed inputs retain the
 # estimator's dense-shape approximation. This Llama formula discounts causal

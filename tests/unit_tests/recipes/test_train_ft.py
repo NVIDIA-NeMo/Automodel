@@ -1333,7 +1333,13 @@ def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, exp
         assert result.ignore_index == 0
 
 
-def test_run_train_validation_loop_calls_gc_hook_once_per_step():
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_run_train_validation_loop_calls_gc_without_device_sync(
+    monkeypatch: pytest.MonkeyPatch, device_type: str
+) -> None:
+    synchronize = MagicMock(side_effect=AssertionError("Throughput timing must not drain all CUDA streams"))
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+
     class _OneStepScheduler:
         def __init__(self):
             self.step = 0
@@ -1350,7 +1356,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
             yield ["dummy-batch"]
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
-    trainer.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    trainer.dist_env = SimpleNamespace(device=torch.device(device_type))
     trainer.model_parts = [MagicMock()]
     trainer.step_scheduler = _OneStepScheduler()
     trainer.max_grad_norm = 1.0
@@ -1372,6 +1378,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer.run_train_validation_loop()
 
     trainer._maybe_collect_garbage.assert_called_once()
+    synchronize.assert_not_called()
 
 
 def test_run_train_validation_loop_reports_weighted_domain_validation():

@@ -1114,8 +1114,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
-                if self.dist_env.device.type == "cuda":
-                    torch.cuda.synchronize(self.dist_env.device)
                 self.timestamp = time.perf_counter()
                 # The step scheduler yields a list of batches with the following properties:
                 # 1. len(batches) == grad_acc_steps
@@ -1176,10 +1174,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             best_metric_key=self.best_metric_key,
                         )
                     self._maybe_collect_garbage()
-                    # Start before fetching the next batch, after logging,
-                    # validation, checkpointing and any pending GPU work.
-                    if self.dist_env.device.type == "cuda":
-                        torch.cuda.synchronize(self.dist_env.device)
+                    # Exclude host time spent between steps. Let asynchronous work
+                    # overlap the next step rather than draining all CUDA streams.
                     self.timestamp = time.perf_counter()
         finally:
             if pbar is not None:
@@ -1564,7 +1560,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
 
         reporting_loss = reporting_loss.cpu().item()
-        # Reading the reduced loss on the CPU waits for the training work.
+        # Like TorchTitan, time after the existing loss readback rather than
+        # adding a device-wide synchronization for throughput measurement.
         # Include data loading and metric reductions in the same step window.
         time_delta = time.perf_counter() - self.timestamp
         tps = num_tokens_in_batch / time_delta
