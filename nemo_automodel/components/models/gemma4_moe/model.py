@@ -27,6 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate
+from torch.nn.attention.flex_attention import BlockMask
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
@@ -501,7 +502,7 @@ def _build_unpacked_gemma4_causal_mask_mapping(
     pixel_values: torch.Tensor | None,
     *,
     is_training: bool,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | BlockMask | None]:
     """Build full and sliding masks for an unpacked Gemma4 batch.
 
     Args:
@@ -523,9 +524,31 @@ def _build_unpacked_gemma4_causal_mask_mapping(
     Returns:
         Mapping from ``full_attention`` and ``sliding_attention`` to tensors of
         shape ``[batch, 1, query, key]`` or equivalent block masks produced by
-        the active Transformers implementation.
+        the active Transformers implementation. A plain causal FFPA mask may
+        be ``None``; a padded FFPA mask has shape ``[batch, sequence]``.
     """
+    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
     from transformers.models.gemma4 import modeling_gemma4
+
+    mask_kwargs = {
+        "config": config,
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+    }
+    if (
+        config._attn_implementation == "ffpa"
+        and pixel_values is None
+        and (mm_token_type_ids is None or not bool(((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).any()))
+    ):
+        # An empty vision overlay is mathematically causal, but its composed
+        # predicate makes FFPA select FlexAttention even on full-attention layers.
+        # Preserve padding and position metadata while omitting only that overlay.
+        return {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+        }
 
     legacy_mask_mapping = getattr(modeling_gemma4, "create_causal_mask_mapping", None)
     if legacy_mask_mapping is not None:
@@ -540,19 +563,10 @@ def _build_unpacked_gemma4_causal_mask_mapping(
             is_training=is_training,
         )
 
-    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-
     block_sequence_ids = torch.full(inputs_embeds.shape[:2], -1, device=inputs_embeds.device)
     if mm_token_type_ids is not None:
         block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, device=inputs_embeds.device)
-    mask_kwargs = {
-        "config": config,
-        "inputs_embeds": inputs_embeds,
-        "attention_mask": attention_mask,
-        "past_key_values": past_key_values,
-        "position_ids": position_ids,
-        "block_sequence_ids": block_sequence_ids,
-    }
+    mask_kwargs["block_sequence_ids"] = block_sequence_ids
     return {
         "full_attention": create_causal_mask(**mask_kwargs),
         "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
