@@ -105,6 +105,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         hc_mult: int = 4,
         hc_sinkhorn_iters: int = 20,
         hc_eps: float = 1e-6,
+        hc_impl: str = "torch",
         engram_layer_ids: list[int] | None = None,
         engram_num_embeddings: list[int] | None = None,
         engram_max_ngram_size: int = 4,
@@ -183,6 +184,10 @@ class DeepseekV41TextConfig(PretrainedConfig):
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
+        # "torch": eager fp32 mHC math (released reference); "compile": the projection, collapse and expand
+        # cores wrapped once per process with torch.compile (layers.compile_hc_cores) — allclose, not bitwise,
+        # static shapes. Persisted by save_pretrained like every config field.
+        self.hc_impl = hc_impl
         self.engram_layer_ids = [1, 14] if engram_layer_ids is None else list(engram_layer_ids)
         self.engram_num_embeddings = (
             ([384006168, 384016682] if self.engram_layer_ids else [])
@@ -267,6 +272,8 @@ class DeepseekV41TextConfig(PretrainedConfig):
                 raise ValueError(f"{name} must be finite and positive, got {value!r}")
         if not 0 <= self.attention_dropout < 1:
             raise ValueError("attention_dropout must lie in [0, 1)")
+        if self.hc_impl not in ("torch", "compile"):
+            raise ValueError(f"hc_impl must be 'torch' or 'compile', got {self.hc_impl!r}")
         if self.num_nextn_predict_layers < 0 or self.dspark_block_size < 0:
             raise ValueError("num_nextn_predict_layers and dspark_block_size must be non-negative")
         if self.engram_layer_ids:

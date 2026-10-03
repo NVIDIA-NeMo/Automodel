@@ -465,7 +465,7 @@ class BackendConfig:
             mixing chain is compiled as well. Compiled numerics are allclose to eager but
             not bitwise-identical.
         compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
-            (currently Kimi K3), fusing cast/pow/mean/rsqrt/mul into one kernel.
+            (currently Kimi K3 and DeepSeek V4.1), fusing cast/pow/mean/rsqrt/mul into one kernel.
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
             allclose to eager but not bitwise-identical.
         shared_expert_overlap: run the shared experts of opted-in MoE models (currently Kimi K3)
@@ -529,8 +529,8 @@ class BackendConfig:
     # Kimi K3): fused whole-tensor weighted-SiTU forward/backward, the dense SituAndMul core
     # and the attn-res chain. Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_situ: bool = False
-    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3),
-    # same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
+    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3 and
+    # DeepSeek V4.1), same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
     # not bitwise-identical. Default False.
     compile_norm: bool = False
     # When True, models that opt in (currently Kimi K3) run their shared experts on a side CUDA
