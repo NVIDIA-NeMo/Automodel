@@ -18,11 +18,12 @@ import json
 import os
 import shutil
 from dataclasses import dataclass
+from typing import Literal
 
 from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
 from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, ProcessorMixin
 from transformers.utils import logging
 
 _SENTENCE_TRANSFORMER_POOLING_KEYS = {
@@ -89,10 +90,12 @@ class SentenceTransformerExportConfig:
     Attributes:
         query_prompt: Exact prompt prepended to queries, or None when no prompt is configured yet.
         document_prompt: Exact prompt prepended to documents, or None when no prompt is configured yet.
+        input_mode: Standard input contract represented by the exported Transformer module.
     """
 
     query_prompt: str | None = None
     document_prompt: str | None = None
+    input_mode: Literal["text", "structured_multimodal"] = "text"
 
 
 @dataclass(frozen=True)
@@ -350,15 +353,31 @@ def _cache_hub_source_legal_assets(model_name_or_path: str, config, hf_kwargs: d
         return None
 
 
-def _supports_standard_sentence_transformer_export(model: nn.Module, pooling: str) -> bool:
+def _resolve_effective_text_config(model_part: nn.Module) -> object | None:
+    """Return the Transformers-defined config for the text tower."""
+    config = getattr(model_part, "config", None)
+    if config is None:
+        return None
+    get_text_config = getattr(config, "get_text_config", None)
+    return get_text_config() if callable(get_text_config) else config
+
+
+def _supports_standard_sentence_transformer_export(
+    model: nn.Module,
+    pooling: str,
+    export_config: SentenceTransformerExportConfig | None = None,
+) -> bool:
     """Return whether a backbone can be represented by the standard text module stack."""
-    config = getattr(model, "config", None)
+    export_config = export_config or SentenceTransformerExportConfig()
+    outer_config = getattr(model, "config", None)
+    if bool(getattr(outer_config, "is_composition", False)) and export_config.input_mode == "text":
+        return False
+    config = _resolve_effective_text_config(model)
     hidden_size = getattr(config, "hidden_size", None)
     return (
         pooling in _SENTENCE_TRANSFORMER_POOLING_KEYS
         and getattr(model, "main_input_name", "input_ids") == "input_ids"
         and isinstance(config, PretrainedConfig)
-        and not bool(getattr(config, "is_composition", False))
         and isinstance(hidden_size, int)
         and hidden_size > 0
     )
@@ -477,16 +496,17 @@ def _resolve_sentence_transformer_max_seq_length(
     """Resolve deployment sequence length without using training-time truncation."""
     source_max_seq_length = _read_source_sentence_transformer_max_seq_length(original_model_path)
     if source_max_seq_length is not None:
-        model_max_seq_length = getattr(getattr(model_part, "config", None), "max_position_embeddings", None)
+        model_max_seq_length = getattr(_resolve_effective_text_config(model_part), "max_position_embeddings", None)
         if model_max_seq_length is not None:
             model_max_seq_length = int(model_max_seq_length)
             if 0 < model_max_seq_length < 1_000_000_000 and source_max_seq_length > model_max_seq_length:
                 raise ValueError("Source Sentence Transformers max_seq_length exceeds max_position_embeddings.")
         return source_max_seq_length
 
+    text_tokenizer = tokenizer.tokenizer if isinstance(tokenizer, ProcessorMixin) else tokenizer
     candidates = [
-        getattr(tokenizer, "model_max_length", None),
-        getattr(getattr(model_part, "config", None), "max_position_embeddings", None),
+        getattr(text_tokenizer, "model_max_length", None),
+        getattr(_resolve_effective_text_config(model_part), "max_position_embeddings", None),
     ]
     finite_candidates = []
     for candidate in candidates:
@@ -504,19 +524,39 @@ def _validate_sentence_transformer_export(
     model_part: nn.Module,
     tokenizer,
     original_model_path: str | None = None,
+    export_config: SentenceTransformerExportConfig | None = None,
 ) -> None:
     """Validate generated metadata inputs before rank-zero-only checkpoint I/O."""
+    export_config = export_config or SentenceTransformerExportConfig()
+    input_mode = getattr(export_config, "input_mode", "text")
     pooling = getattr(model_part, "pooling", None)
     if pooling not in _SENTENCE_TRANSFORMER_POOLING_KEYS:
         raise ValueError(f"Pooling mode {pooling!r} cannot be represented by standard Sentence Transformers metadata.")
 
-    model_config = getattr(model_part, "config", None)
+    model_config = _resolve_effective_text_config(model_part)
     embedding_dimension = getattr(model_config, "hidden_size", None)
     if not isinstance(embedding_dimension, int) or embedding_dimension <= 0:
         raise ValueError("Bi-encoder config must expose a positive hidden_size for Sentence Transformers export.")
 
     if tokenizer is None:
         raise ValueError("A tokenizer is required to export a loadable Sentence Transformers checkpoint.")
+
+    if input_mode == "structured_multimodal":
+        if getattr(tokenizer, "tokenizer", None) is None:
+            raise ValueError("Structured multimodal export requires a processor with a tokenizer.")
+        if getattr(tokenizer, "image_processor", None) is None:
+            raise ValueError("Structured multimodal export requires a processor with an image processor.")
+        if not getattr(tokenizer, "chat_template", None):
+            raise ValueError("Structured multimodal export requires a processor with a chat template.")
+        if not isinstance(tokenizer, ProcessorMixin):
+            raise TypeError("Structured multimodal export requires a Transformers ProcessorMixin instance.")
+        if not callable(getattr(tokenizer, "save_pretrained", None)):
+            raise TypeError("Structured multimodal export requires a processor with save_pretrained().")
+        if not callable(getattr(tokenizer, "apply_chat_template", None)):
+            raise TypeError("Structured multimodal export requires a processor with apply_chat_template().")
+        get_hf_export_processor = getattr(tokenizer, "get_hf_export_processor", None)
+        if callable(get_hf_export_processor):
+            get_hf_export_processor()
 
     _resolve_sentence_transformer_max_seq_length(model_part, tokenizer, original_model_path)
 
@@ -529,9 +569,10 @@ def _save_generated_sentence_transformer_assets(
     tokenizer,
 ) -> None:
     """Generate Sentence Transformers metadata from the effective bi-encoder behavior."""
-    _validate_sentence_transformer_export(model_part, tokenizer, original_model_path)
+    _validate_sentence_transformer_export(model_part, tokenizer, original_model_path, export_config)
+    input_mode = getattr(export_config, "input_mode", "text")
     pooling = getattr(model_part, "pooling", None)
-    model_config = getattr(model_part, "config", None)
+    model_config = _resolve_effective_text_config(model_part)
     embedding_dimension = getattr(model_config, "hidden_size", None)
 
     query_prompt = export_config.query_prompt or ""
@@ -582,13 +623,24 @@ def _save_generated_sentence_transformer_assets(
             "similarity_fn_name": similarity_fn_name,
         },
     )
+    transformer_config = {"max_seq_length": max_seq_length, "do_lower_case": False}
+    if input_mode == "structured_multimodal":
+        forward_output = {"method": "forward", "method_output_name": "last_hidden_state"}
+        transformer_config["modality_config"] = {
+            "text": forward_output,
+            "image": forward_output,
+            "message": {**forward_output, "format": "structured"},
+        }
+        transformer_config["module_output_name"] = "token_embeddings"
     _write_json(
         os.path.join(hf_metadata_dir, "sentence_bert_config.json"),
-        {"max_seq_length": max_seq_length, "do_lower_case": False},
+        transformer_config,
     )
     _write_json(os.path.join(hf_metadata_dir, "1_Pooling", "config.json"), pooling_config)
-    _restore_source_tokenizer_serialization_state(original_model_path, hf_metadata_dir, tokenizer)
-    _remove_stale_text_processor_assets(hf_metadata_dir)
+    text_tokenizer = tokenizer.tokenizer if input_mode == "structured_multimodal" else tokenizer
+    _restore_source_tokenizer_serialization_state(original_model_path, hf_metadata_dir, text_tokenizer)
+    if input_mode == "text":
+        _remove_stale_text_processor_assets(hf_metadata_dir)
     _copy_source_legal_assets(
         original_model_path,
         hf_metadata_dir,
@@ -610,7 +662,12 @@ class _SentenceTransformerMetadataExporter:
 
     def validate(self, *, tokenizer, original_model_path: str | None) -> None:
         """Validate export inputs on every distributed rank before filesystem writes."""
-        _validate_sentence_transformer_export(self.model_part, tokenizer, self._source_model_path(original_model_path))
+        _validate_sentence_transformer_export(
+            self.model_part,
+            tokenizer,
+            self._source_model_path(original_model_path),
+            self.export_config,
+        )
 
     def save(
         self,
@@ -618,6 +675,7 @@ class _SentenceTransformerMetadataExporter:
         hf_metadata_dir: str,
         tokenizer,
         original_model_path: str | None,
+        v4_compatible: bool,
     ) -> None:
         """Write deployable Hugging Face metadata plus standard Sentence Transformers assets."""
         from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
@@ -629,7 +687,7 @@ class _SentenceTransformerMetadataExporter:
             source_model_path,
             hf_metadata_dir,
             tokenizer,
-            v4_compatible=False,
+            v4_compatible=v4_compatible,
             model_config=deploy_config,
             save_custom_model_code=bool(getattr(deploy_config, "auto_map", None)),
         )
@@ -639,4 +697,72 @@ class _SentenceTransformerMetadataExporter:
             source_model_path,
             hf_metadata_dir,
             tokenizer,
+        )
+
+
+class _CrossEncoderMetadataExporter:
+    """Export raw sequence-classification scores through a single Transformer module."""
+
+    def __init__(self, model_part: nn.Module) -> None:
+        self.model_part = model_part
+
+    def validate(self, *, tokenizer: object, original_model_path: str | None) -> None:
+        """Validate the processor contract before any rank writes checkpoint assets."""
+        if self.model_part._sentence_transformer_input_mode == "structured_multimodal":
+            if not isinstance(tokenizer, ProcessorMixin) or not tokenizer.chat_template:
+                raise ValueError("Multimodal CrossEncoder export requires a processor with a chat template.")
+        else:
+            if tokenizer is None:
+                raise ValueError("CrossEncoder export requires a tokenizer.")
+
+    def _save_sentence_transformer_assets(
+        self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None
+    ) -> None:
+        """Write metadata from the wrapper's effective raw-score inference contract."""
+        forward_output = {"method": "forward", "method_output_name": "logits"}
+        transformer_config = {
+            "transformer_task": "sequence-classification",
+            "modality_config": {"text": forward_output},
+            "module_output_name": "scores",
+            "unpad_inputs": False,
+        }
+        if self.model_part._sentence_transformer_input_mode == "structured_multimodal":
+            transformer_config["modality_config"]["message"] = {**forward_output, "format": "structured"}
+        elif isinstance(getattr(tokenizer, "chat_template", None), dict) and "reranking" in tokenizer.chat_template:
+            transformer_config["modality_config"]["message"] = {**forward_output, "format": "flat"}
+            transformer_config["processing_kwargs"] = {"chat_template": {"chat_template": "reranking"}}
+        _write_json(
+            os.path.join(hf_metadata_dir, "modules.json"),
+            [{"idx": 0, "name": "0", "path": "", "type": _SENTENCE_TRANSFORMER_EXPORT_MODULE_TYPES["transformer"]}],
+        )
+        _write_json(
+            os.path.join(hf_metadata_dir, "config_sentence_transformers.json"),
+            {
+                "model_type": "CrossEncoder",
+                "activation_fn": "torch.nn.modules.linear.Identity",
+                "prompts": {},
+                "default_prompt_name": None,
+            },
+        )
+        _write_json(os.path.join(hf_metadata_dir, "sentence_bert_config.json"), transformer_config)
+        _copy_source_legal_assets(original_model_path, hf_metadata_dir)
+
+    def save(
+        self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None, v4_compatible: bool
+    ) -> None:
+        """Write custom model/processor code and CrossEncoder metadata for consolidation."""
+        from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
+
+        # Native retrieval wrappers record the implementation directory here;
+        # copying the source checkpoint instead can resurrect stale model code.
+        _save_generated_hf_assets(
+            self.model_part.model,
+            self.model_part.name_or_path or original_model_path,
+            hf_metadata_dir,
+            tokenizer,
+            v4_compatible=v4_compatible,
+            model_config=self.model_part.config,
+        )
+        self._save_sentence_transformer_assets(
+            hf_metadata_dir=hf_metadata_dir, tokenizer=tokenizer, original_model_path=original_model_path
         )

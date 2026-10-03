@@ -137,8 +137,9 @@ class _ConsolidatedHFMetadataExporter(Protocol):
         hf_metadata_dir: str,
         tokenizer: object,
         original_model_path: str | None,
+        v4_compatible: bool,
     ) -> None:
-        """Write model-specific metadata into the shared Hugging Face metadata directory."""
+        """Write model-specific metadata, honoring the requested v4 config layout."""
         ...
 
 
@@ -161,6 +162,7 @@ class ConsolidatedHFAddon:
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
             original_model_path (str | None): Authoritative source checkpoint snapshot.
+            v4_compatible (bool): Preserve the source config beside the generated v5 config when available.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
@@ -194,6 +196,7 @@ class ConsolidatedHFAddon:
                     hf_metadata_dir=hf_metadata_dir,
                     tokenizer=tokenizer,
                     original_model_path=original_model_path,
+                    v4_compatible=kwargs.get("v4_compatible", False),
                 )
             else:
                 _save_generated_hf_assets(
@@ -696,8 +699,11 @@ def _maybe_save_custom_model_code(
     hub id (e.g. ``nvidia/Nemotron-Flash-1B``) and the loaded model has ``auto_map`` custom
     code, copy the ``.py`` files from the cached ``transformers_modules`` directory so the
     consolidated checkpoint carries ``modeling_*.py`` locally and reloads without needing
-    ``trust_remote_code=True``.
+    ``trust_remote_code=True``. Models marked for stock export intentionally skip this copy.
     """
+    if model_part is not None and getattr(model_part, "_export_as_stock_model", False):
+        return
+
     copied: set[str] = set()
 
     def _copy_py_tree(src_dir: str) -> None:
