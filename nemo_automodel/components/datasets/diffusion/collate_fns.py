@@ -30,7 +30,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderBuild
 
 from .sampler import SequentialBucketSampler
-from .text_to_image_dataset import TextToImageDatasetConfig
+from .text_to_image_dataset import PROMPT_TOKEN_ID_KEYS, TextToImageDatasetConfig
 from .text_to_video_dataset import TextToVideoDatasetConfig, collate_optional_video_fields
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,11 @@ def collate_fn_production(batch: List[Dict]) -> Dict:
             else:
                 output[key] = torch.stack(tensors)
 
+    # Variable-length token ids stay a per-sample list; the model adapter builds the padded sequence.
+    for key in PROMPT_TOKEN_ID_KEYS:
+        if key in batch[0]:
+            output[key] = [item[key] for item in batch]
+
     return output
 
 
@@ -155,6 +160,11 @@ def collate_fn_text_to_image(batch: List[Dict]) -> Dict:
             image_batch["pooled_prompt_embeds"] = production_batch["pooled_prompt_embeds"]
         if "clip_hidden" in production_batch:
             image_batch["clip_hidden"] = production_batch["clip_hidden"]
+    elif PROMPT_TOKEN_ID_KEYS[0] in production_batch:
+        # The model embeds the prompt tokens itself.
+        for key in PROMPT_TOKEN_ID_KEYS:
+            if key in production_batch:
+                image_batch[key] = production_batch[key]
     else:
         # Tokenized - need to encode during training (not supported yet)
         image_batch["t5_tokens"] = production_batch["t5_tokens"]

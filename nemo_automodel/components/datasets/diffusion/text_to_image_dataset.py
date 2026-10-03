@@ -22,6 +22,9 @@ import torch
 
 from .base_dataset import BaseMultiresolutionDataset
 
+PROMPT_TOKEN_ID_KEYS = ("prompt_input_ids", "uncond_prompt_input_ids", "prompt_suffix_ids")
+"""Per-sample 1D token-id tensors of models that embed the prompt themselves (e.g. HunyuanImage-3.0)."""
+
 
 @dataclass
 class TextToImageDatasetConfig:
@@ -94,5 +97,9 @@ class TextToImageDataset(BaseMultiresolutionDataset):
                 output["pooled_prompt_embeds"] = data["pooled_prompt_embeds"].squeeze(0)
             if "prompt_embeds" in data:
                 output["prompt_embeds"] = data["prompt_embeds"].squeeze(0)
+        # Models that read the prompt as their own token ids (no external text encoder).
+        for key in PROMPT_TOKEN_ID_KEYS:
+            if key in data:
+                output[key] = data[key]
 
         return output
