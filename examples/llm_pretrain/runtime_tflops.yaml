@@ -1,0 +1,83 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Licensed under the Apache License, Version 2.0 (the "License");
+#
+# Small, checkpoint-free demonstration of runtime model TFLOPs/s logging:
+#   automodel examples/llm_pretrain/runtime_tflops.yaml --nproc-per-node 2
+#
+# Training logs and training.jsonl report tflops_per_sec and
+# tflops_per_sec_per_gpu automatically, alongside MFU. FLOPs come from the
+# existing model formula evaluated for every microbatch's actual input shape.
+# step_time includes data loading, forward/backward, optimizer work and metric
+# reductions. Logging, validation and checkpointing between steps are excluded.
+# These are full-parameter model FLOPs estimates; activation recomputation is
+# excluded. LoRA/frozen weights are not adjusted, and packed inputs retain the
+# estimator's dense-shape approximation. This Llama formula discounts causal
+# attention like Megatron; TorchTitan counts the full attention square.
+# Unsupported formulas yield null metrics. No hardware-peak value is required
+# for TFLOPs/s; mfu.peak_tflops only overrides the theoretical peak used for MFU.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 42
+
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 1
+  max_steps: 4
+  num_epochs: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  dtype: float32
+  config:
+    _target_: transformers.LlamaConfig
+    architectures: [LlamaForCausalLM]
+    vocab_size: 1024
+    hidden_size: 128
+    intermediate_size: 256
+    num_hidden_layers: 2
+    num_attention_heads: 4
+    num_key_value_heads: 2
+    max_position_embeddings: 1024
+    pad_token_id: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  vocab_size: 1024
+  seq_len: 128
+  num_samples: 64
+  exclude_token_ids: [0]
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: null
+  num_workers: 0
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.0001
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/runtime_tflops
