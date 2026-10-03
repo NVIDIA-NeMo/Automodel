@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -105,7 +106,10 @@ def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
 
 
 @pytest.mark.parametrize("use_ddp", [False, True])
-def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, use_ddp):
+@pytest.mark.parametrize("v4_compatible", [False, True])
+def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(
+    tmp_path: Path, use_ddp: bool, v4_compatible: bool
+) -> None:
     metadata_dir = tmp_path / "metadata"
     metadata_dir.mkdir()
     exporter = SimpleNamespace(validate=MagicMock(), save=MagicMock())
@@ -123,7 +127,7 @@ def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, us
         fqn_to_file_index_mapping={"w": 1},
         fqn_to_dtype_mapping=None,
         original_model_path="/source",
-        v4_compatible=True,
+        v4_compatible=v4_compatible,
     )
 
     exporter.validate.assert_called_once_with(tokenizer=tokenizer, original_model_path="/source")
@@ -131,6 +135,7 @@ def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, us
         hf_metadata_dir=str(metadata_dir),
         tokenizer=tokenizer,
         original_model_path="/source",
+        v4_compatible=v4_compatible,
     )
 
 

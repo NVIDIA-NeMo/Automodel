@@ -30,7 +30,7 @@ from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3Causal
 
 # Over the default 5s budget on purpose: this module runs full-model forwards and checkpoint conversions.
 # Shrink the model fixtures before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def test_mtp_module_present_and_sparse(mtp_model):

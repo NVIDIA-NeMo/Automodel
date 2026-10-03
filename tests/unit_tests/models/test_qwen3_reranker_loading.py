@@ -24,6 +24,7 @@ from tokenizers.models import WordLevel
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
+    AutoTokenizer,
     PreTrainedTokenizerFast,
     Qwen3Config,
     Qwen3ForCausalLM,
@@ -31,10 +32,12 @@ from transformers import (
 )
 
 from nemo_automodel._transformers import retrieval
+from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
 from nemo_automodel.components.models.qwen3_reranker.model import (
     Qwen3RerankerConfig,
     Qwen3RerankerForCausalReranking,
 )
+from nemo_automodel.recipes.retrieval.train_cross_encoder import TrainCrossEncoderRecipe
 
 
 @pytest.fixture
@@ -130,6 +133,8 @@ def test_causal_loading_resolves_tokens_and_preserves_scores(tmp_path, tiny_conf
     ).eval()
 
     assert type(loaded.model) is Qwen3RerankerForCausalReranking
+    assert loaded.effective_score_temperature == 1.0
+    TrainCrossEncoderRecipe({"temperature": 0.3})._validate_model(loaded)
     assert loaded.config.yes_token_id == 5
     assert loaded.config.no_token_id == 7
     assert (loaded.model.lm_head.weight is loaded.model.model.embed_tokens.weight) is saved_tied
@@ -216,6 +221,40 @@ def test_causal_checkpoint_default_labels_do_not_change_single_score(tmp_path, t
     with torch.no_grad():
         logits = reference(**_inputs()).logits[:, -1]
         torch.testing.assert_close(loaded(_inputs()).logits[:, 0], logits[:, 5] - logits[:, 7])
+
+
+@pytest.mark.parametrize("consolidated", [False, True])
+def test_causal_export_with_tokenizer_preserves_causal_lm_contract(tmp_path, tiny_config, consolidated):
+    reference = Qwen3ForCausalLM(tiny_config).eval()
+    reference.save_pretrained(tmp_path)
+    _save_tokenizer(tmp_path)
+    tokenizer = AutoTokenizer.from_pretrained(tmp_path, local_files_only=True)
+    encoder = retrieval.CrossEncoderModel.build(str(tmp_path), local_files_only=True).eval()
+    export_path = tmp_path / "export"
+    if consolidated:
+        # Exercise the production consolidated metadata writer with real tiny weights.
+        encoder.model.save_pretrained(export_path)
+        ConsolidatedHFAddon().pre_save(
+            model_state=SimpleNamespace(model=[encoder]),
+            hf_metadata_dir=str(export_path),
+            fqn_to_file_index_mapping={},
+            original_model_path=str(tmp_path),
+            tokenizer=tokenizer,
+        )
+    else:
+        encoder.save_pretrained(export_path, tokenizer=tokenizer)
+
+    exported = json.loads((export_path / "config.json").read_text())
+    assert exported["architectures"] == ["Qwen3ForCausalLM"]
+    assert "auto_map" not in exported
+    # Sequence-classification metadata would select a fresh classifier instead of the LM head.
+    for filename in ("modules.json", "config_sentence_transformers.json", "sentence_bert_config.json"):
+        assert not (export_path / filename).exists()
+    reloaded = AutoModelForCausalLM.from_pretrained(export_path, local_files_only=True).eval()
+    torch.testing.assert_close(reloaded.state_dict(), reference.state_dict(), rtol=0, atol=0)
+    with torch.no_grad():
+        logits = reloaded(**_inputs()).logits[:, -1]
+        torch.testing.assert_close(encoder(_inputs()).logits[:, 0], logits[:, 5] - logits[:, 7])
 
 
 def test_extracted_decoder_keeps_classification_fallback(tmp_path, tiny_config, monkeypatch):

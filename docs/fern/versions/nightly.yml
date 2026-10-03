@@ -458,6 +458,8 @@ navigation:
                 path: ../../model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
               - page: "MiMo-V2.5-Pro"
                 path: ../../model-coverage/llm/xiaomimimo/mimo-v2-5-pro.mdx
+              - page: "MiMo-V2.6-Pro-RL"
+                path: ../../model-coverage/llm/xiaomimimo/mimo-v2-6-pro-rl.mdx
           - section: "Z.ai"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRhgCAABXRUJQVlA4TAsCAAAvE8AEEA0oaNtGSvYff8oHIqL/uf6kJj7SAHQRAxH9DxOQnG3bsUfX87zfFxurdGBnbTaQbY7snbG2nnKmA9uqwPan9x7XwKBtG0HOAXqKz3xl0LaNIOf0DJ4/1dVtZNtOs3jbI6FVhOoglEtpUWQyT2iasGT2i16qN2fHG6DHQAL+BYHYnJrj1fdvr3y7/y6iggTYRgXY+LeAm0o37kaRIEbCIAAAAnAIAIAII1BgP1FAAkllogAAZFIJ5htSCIhQh8oIiJwg7+KoWYsSARGGd8vaOIuHeLDcW55iE19gDpAEvHuc2KxHEcmICOPE0l/2QhCEV+hxMkEwMgCRE3swjNS8e6wsF6JAiQwlli5fwo2AaCAYRGE7jqx0xs3ohlBAOH8ASRQNoABsKLYBHh9xfWMQHMJNNIyWwyCDgFgAhmAk8QEbGyAYKnzDMBK0eKqwjXpADAyCCeNb9OIKrAChHpsArdIAYIcedsgAYAAlLmICggEsADShYdQLBgAgCIIDnIRQwCBMogevkCICCIIgAMGQYwoFMpQo0Y0+FKhHCWCIAABECCDDcwiCAOawiieIcJRIcQAZHBGCj48o8Qz38ACP0ItreFEEwVAhQQygRRASJGiAIcARAGqQAgAADAYHAJFP4O8Jg+O3BA6DAwAAgBEQ4idejv8BfxM3cYWb8TbC8I+/psMJh9gAAA=="/></svg>'
             slug: thudm
