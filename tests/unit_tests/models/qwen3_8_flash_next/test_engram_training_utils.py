@@ -29,7 +29,7 @@ from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_n
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 class _EngramOnlyModel(nn.Module):

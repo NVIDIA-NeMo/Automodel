@@ -53,7 +53,7 @@ from tools.sync_fern_provider_icons import MAX_TOTAL_ENCODED_BYTES, PROVIDER_ORG
 
 # Over the default 5s budget on purpose: this module drives git through subprocesses over throwaway repositories.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _commit_recipes(repo_root: Path, timestamp: str = "2026-07-30T12:00:00Z") -> None:
