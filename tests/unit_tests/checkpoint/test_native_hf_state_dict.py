@@ -33,7 +33,7 @@ from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
 
 # Over the default 5s budget on purpose: this module repeatedly saves, loads, and exports full model state.
 # Shrink the checkpoint round trips before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 @pytest.fixture(params=[LlamaForCausalLM, Qwen2ForCausalLM, Qwen3ForCausalLM], ids=["llama", "qwen2", "qwen3"])

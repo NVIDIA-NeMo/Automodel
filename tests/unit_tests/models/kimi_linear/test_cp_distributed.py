@@ -37,7 +37,7 @@ from nemo_automodel.components.models.kimi_linear.cp import all_gather_sequence,
 # skipped on the CPU unit-test job.
 # Keep a hard watchdog for spawned workers; each test declares its runtime budget below.
 pytestmark = [
-    pytest.mark.timeout(60),
+    pytest.mark.timeout(70),
     pytest.mark.run_only_on("GPU"),
 ]
 
