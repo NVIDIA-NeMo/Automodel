@@ -39,7 +39,7 @@ def test_qwen3_5_moe_122b_example_declares_scaling_contract() -> None:
     assert raw_config["distributed"]["activation_checkpointing"] is True
     assert raw_config["freeze_config"]["freeze_vision_tower"] is False
     assert raw_config["packed_sequence"]["pack_size"] == 131072
-    assert raw_config["packed_sequence"]["attn_implementation"] == "sdpa"
+    assert "attn_implementation" not in raw_config["packed_sequence"]
     assert raw_config["step_scheduler"]["global_batch_size"] == 4
     assert raw_config["step_scheduler"]["max_steps"] == 10
 

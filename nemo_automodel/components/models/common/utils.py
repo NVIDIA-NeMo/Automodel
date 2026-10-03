@@ -409,12 +409,21 @@ class MoKBackendConfig:
         )
 
 
+AttentionBackend = Literal["torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "magi"]
+
+
 @dataclass(kw_only=True)
 class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or "cudnn").
+        attn: Attention backend ("torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", or "magi").
+            "fa4" selects native FlashAttention-4 (CuTe) and requires an
+            INSTALL_FA4=true image. HF-dispatched models use "flash_attention_4". A rank-2 binary
+            padding mask is converted to varlen metadata, while dense/block masks and indexed
+            document masks without explicit packed metadata are rejected.
+            Inputs must use BSHD layout; pre-packed THD is unsupported. Packed
+            Qwen3Next and DeepSeek V3.2 sparse attention do not support FA4.
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
@@ -498,9 +507,7 @@ class BackendConfig:
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
-        "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
-    )
+    attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     sparse_attn: Literal["generic", "msa"] = "generic"
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
@@ -1476,6 +1483,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
 
 
 __all__ = [
+    "AttentionBackend",
     "BackendConfig",
     "Float32RMSNorm",
     "TEFp8Config",

@@ -158,20 +158,62 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
         unchanged. With an active CP mesh the boundaries describe the global
         packed row, so they are stashed for :meth:`_forward_with_cp` and the
         inherited dispatcher sees no ``cu_seqlens``.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden]. Packed
+                non-CP inputs have one physical row; a padded tail must be its own segment.
+            **kwargs: Arguments with the tensor layouts documented by
+                :meth:`CPAwareGatedDeltaNet.forward`. ``cu_seqlens`` contains
+                document boundaries of shape [documents + 1], global under CP;
+                ``attention_mask`` has shape [batch, sequence], with document-ID
+                change points matching ``cu_seqlens``. IDs and ``indices`` are
+                normalized to consecutive documents covering the full row.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+
+        Raises:
+            ValueError: If non-CP boundaries do not strictly partition one row
+                or the supplied document mask disagrees with those boundaries.
         """
         cu_seqlens = kwargs.pop("cu_seqlens", None)
         cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
         if not cp_active or cu_seqlens is None:
-            if cu_seqlens is not None and kwargs.get("attention_mask") is None:
-                # The inherited packed conv path reads per-token document IDs
-                # from ``attention_mask``. Synthesize them from the boundaries
-                # for cu_seqlens-only packed batches.
-                boundaries = cu_seqlens.reshape(-1).to(device=hidden_states.device, dtype=torch.long)
-                document_ids = torch.repeat_interleave(
-                    torch.arange(boundaries.numel() - 1, device=hidden_states.device),
-                    boundaries.diff(),
+            if cu_seqlens is not None:
+                boundaries = cu_seqlens.to(device=hidden_states.device, dtype=torch.long)
+                if (
+                    hidden_states.shape[0] != 1
+                    or boundaries.ndim != 1
+                    or boundaries.numel() < 2
+                    or int(boundaries[0]) != 0
+                    or int(boundaries[-1]) != hidden_states.shape[1]
+                    or bool((boundaries.diff() <= 0).any())
+                ):
+                    raise ValueError(
+                        "Packed Qwen3.8 GDN cu_seqlens must strictly partition one unpadded row "
+                        "from zero through the full sequence length."
+                    )
+                document_ids = (
+                    torch.repeat_interleave(
+                        torch.arange(boundaries.numel() - 1, device=hidden_states.device),
+                        boundaries.diff(),
+                    )
+                    .unsqueeze(0)
+                    .to(torch.int32)
                 )
-                kwargs["attention_mask"] = document_ids.unsqueeze(0).to(torch.int32)
+                attention_mask = kwargs.get("attention_mask")
+                if attention_mask is not None and (
+                    attention_mask.shape != document_ids.shape
+                    or not torch.equal(
+                        attention_mask[:, 1:] != attention_mask[:, :-1],
+                        document_ids[:, 1:] != document_ids[:, :-1],
+                    )
+                ):
+                    raise ValueError("Packed Qwen3.8 GDN attention_mask document boundaries must match cu_seqlens.")
+                # Kernels compare document IDs for equality inside their convolution
+                # window. Canonical IDs prevent reused labels joining disjoint documents.
+                kwargs["attention_mask"] = document_ids
+                kwargs["indices"] = torch.arange(hidden_states.shape[1], device=hidden_states.device)
             return super().forward(hidden_states, cu_seqlens=cu_seqlens, **kwargs)
         self._packed_global_cu_seqlens = cu_seqlens
         try:

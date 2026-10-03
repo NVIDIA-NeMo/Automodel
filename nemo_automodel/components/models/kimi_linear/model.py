@@ -34,7 +34,10 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
+from nemo_automodel.components.models.common.packing import (
+    flatten_packed_sequence_metadata,
+    is_indexed_packed_mask,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -594,11 +597,25 @@ class KimiDeltaAttention(nn.Module):
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden]; the sequence axis
                 holds this rank's contiguous shard under context parallelism.
-            attention_mask: Optional binary padding mask of shape [batch, sequence] where 1 marks valid tokens.
+            attention_mask: Optional tensor of shape [batch, sequence]. Without
+                packed metadata this is a binary validity mask (1 means valid).
+                With packed metadata it may hold 1-based document IDs and zero
+                for padding. Non-2D masks are not consumed directly; the legacy
+                fallback reads ``padding_mask`` instead.
             packed_context: Optional document layout of the batch, required under
                 context parallelism and used to reset the recurrent state at every
                 packed-document boundary.
-            **kwargs: Optional KDA kwargs, including ``cu_seqlens`` for packed sequences.
+            **kwargs: Optional KDA metadata. ``packed_token_indices`` contains
+                row-local valid-token positions of shape [batch, sequence] with
+                -1 padding, or flat positions of shape [tokens]. ``cu_seqlens``
+                contains row-local boundaries of shape [batch, max_documents + 1]
+                with -1 unused entries, or flat boundaries of shape [documents + 1].
+                With token indices, boundaries address the unpadded valid-token
+                stream; alone, flat boundaries address one physical row only when
+                neither a document mask nor ``_packed_seq_ids`` is supplied.
+                ``_packed_seq_ids`` optionally carries document IDs of shape
+                [batch, sequence]; ``padding_mask`` is boolean with the same
+                shape, where True marks padding.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
@@ -606,7 +623,13 @@ class KimiDeltaAttention(nn.Module):
         if packed_context is not None and packed_context.cp_enabled:
             return self._forward_with_cp(hidden_states, packed_context)
 
-        if attention_mask is not None:
+        packed_seq_ids = kwargs.get("_packed_seq_ids")
+        packed_document_ids = packed_seq_ids if packed_seq_ids is not None else attention_mask
+        has_dataset_packing = kwargs.get("packed_token_indices") is not None or (
+            packed_document_ids is not None
+            and (is_indexed_packed_mask(packed_document_ids) or kwargs.get("cu_seqlens") is not None)
+        )
+        if not has_dataset_packing and attention_mask is not None:
             if attention_mask.dim() != 2:
                 attention_mask = kwargs.get("padding_mask")
             if attention_mask is not None and attention_mask.dim() != 2:
@@ -616,10 +639,25 @@ class KimiDeltaAttention(nn.Module):
 
         cu_seqlens = kwargs.get("cu_seqlens")
         indices = None
-        if is_indexed_packed_mask(attention_mask):
+        if has_dataset_packing:
             # Packed rows: unpad to a single flat sequence and reset the recurrent
             # state per document instead of per row.
-            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
+            indices = kwargs.get("packed_token_indices")
+            if indices is None or cu_seqlens is None:
+                raise ValueError(
+                    "Packed Kimi Linear inputs require dataset-provided packed_token_indices and cu_seqlens."
+                )
+            indices, cu_seqlens = flatten_packed_sequence_metadata(
+                indices,
+                cu_seqlens,
+                batch_size=batch_size,
+                sequence_length=q_len,
+            )
+            indices = indices.to(device=hidden_states.device, dtype=torch.long)
+            if int(cu_seqlens[-1].item()) != indices.numel():
+                raise ValueError("Packed Kimi Linear token indices and cu_seqlens describe different token counts.")
+            if indices.numel() and (int(indices[0].item()) < 0 or int(indices[-1].item()) >= batch_size * q_len):
+                raise ValueError("Packed Kimi Linear token indices are outside the current batch layout.")
             hidden_states = _index_first_axis(hidden_states.reshape(batch_size * q_len, -1), indices).unsqueeze(0)
         elif attention_mask is not None and getattr(self.config, "kda_unpad_inputs", True):
             indices, cu_seqlens, _ = _get_unpad_data(attention_mask[:, -q_len:])
@@ -1035,7 +1073,13 @@ class KimiLinear48BModel(nn.Module):
             kimi_packed_context: Optional document layout attached by
                 :func:`~nemo_automodel.components.models.kimi_linear.cp.shard_batch_for_kimi_cp`;
                 required under context parallelism and otherwise derived here.
-            **attn_kwargs: Additional attention kwargs used by packed or THD execution.
+            **attn_kwargs: Packed or THD metadata: ``_packed_seq_ids`` has shape
+                [batch, sequence] with 1-based document IDs and zero padding.
+                ``packed_token_indices`` has shape [batch, sequence] with row-local
+                positions and -1 padding, or [tokens] indexing flattened batch
+                and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
+                with row-local boundaries and -1 padding, or [documents + 1] for
+                flattened/THD inputs. ``max_seqlen`` is an integer document length.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
@@ -1048,12 +1092,22 @@ class KimiLinear48BModel(nn.Module):
         if cache_position is None:
             cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
 
+        packed_seq_ids = attn_kwargs.get("_packed_seq_ids")
+        has_packed_inputs = (
+            packed_seq_ids is not None
+            or attn_kwargs.get("packed_token_indices") is not None
+            or attn_kwargs.get("cu_seqlens") is not None
+        )
         packed_context = kimi_packed_context or _packed_context_from_inputs(
             inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=packed_seq_ids if packed_seq_ids is not None else attention_mask,
             cu_seqlens=attn_kwargs.get("cu_seqlens"),
         )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
+        # Packed attention consumes document metadata, but MoE routing still
+        # needs a separate mask for padding tokens, including in full-attention layers.
+        if padding_mask is None and packed_context is not None:
+            padding_mask = packed_context.local_doc_ids == 0
+        linear_attn_mask = None if has_packed_inputs else self._update_linear_attn_mask(attention_mask, cache_position)
         causal_mask = (
             None
             if packed_context is not None and packed_context.cp_enabled
@@ -1064,7 +1118,7 @@ class KimiLinear48BModel(nn.Module):
         for decoder_layer in self.layers.values():
             layer_mask = linear_attn_mask if decoder_layer.is_linear_attn else causal_mask
             layer_padding_mask = padding_mask
-            if decoder_layer.is_linear_attn and layer_mask is not None:
+            if decoder_layer.is_linear_attn and layer_mask is not None and layer_padding_mask is None:
                 layer_padding_mask = layer_mask.bool().logical_not()
             hidden_states = decoder_layer(
                 hidden_states,
@@ -1106,6 +1160,8 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
     # Kimi Linear owns context parallelism end to end: it shards the batch itself
     # (contiguous slices, as FLA's CP kernels require) and each layer type carries
     # its own transport, so CP does not depend on the attention backend.
+    requires_packed_sequence_metadata = True
+    packed_mask_type = "document_ids"
     _owns_cp_attention = True
     # Packed documents are masked by the model itself: MLA gets a document-blocked
     # causal mask and KDA resets its recurrent state on per-document ``cu_seqlens``.
@@ -1206,7 +1262,13 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
             padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
             logits_to_keep: Number of trailing sequence logits to compute, or tensor indices.
             output_hidden_states: Whether to include hidden states in the output.
-            **attn_kwargs: Additional attention kwargs used by packed or THD execution.
+            **attn_kwargs: Packed or THD metadata: ``_packed_seq_ids`` has shape
+                [batch, sequence] with 1-based document IDs and zero padding.
+                ``packed_token_indices`` has shape [batch, sequence] with row-local
+                positions and -1 padding, or [tokens] indexing flattened batch
+                and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
+                with row-local boundaries and -1 padding, or [documents + 1] for
+                flattened/THD inputs. ``max_seqlen`` is an integer document length.
 
         Returns:
             Causal LM output whose logits have shape [batch, sequence, vocab] unless ``logits_to_keep`` trims sequence.

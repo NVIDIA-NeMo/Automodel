@@ -118,6 +118,8 @@ def test_vlm_kd_teacher_forward_uses_scoped_offloading_when_enabled(monkeypatch)
 
 
 class _Cfg:
+    vlm_dataloader = None
+
     def __init__(self, **values):
         self._values = values
 

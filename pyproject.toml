@@ -576,6 +576,36 @@ ignore_imports = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "Datasets must not directly import models or attention"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.datasets"]
+forbidden_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel.components.attention",
+]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Models and attention must not directly import datasets"
+type = "forbidden"
+source_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel.components.attention",
+]
+forbidden_modules = ["nemo_automodel.components.datasets"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Models must not import recipe configuration"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.models"]
+forbidden_modules = [
+    "nemo_automodel.components.config",
+    "nemo_automodel.recipes",
+]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
 name = "Distributed infrastructure must not import model implementations"
 type = "forbidden"
 source_modules = ["nemo_automodel.components.distributed"]
