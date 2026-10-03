@@ -643,6 +643,56 @@ class TestSequentialBucketSamplerCPU:
 
             assert first_half + second_half == full_batches, f"Resume failed for rank {rank}"
 
+    def test_resume_twice_within_epoch(self, simple_dataset):
+        """Test a checkpoint taken after a resume still resumes at the right batch.
+
+        Run 1 stops after ``k1`` batches and checkpoints. Run 2 resumes, stops after
+        ``k2`` more batches and checkpoints again. Run 3 resumes from that second
+        checkpoint. The three runs together must replay the epoch exactly once.
+        """
+        seed = 42
+        batch_size = 2
+
+        def make_sampler():
+            return SequentialBucketSampler(
+                simple_dataset,
+                base_batch_size=batch_size,
+                num_replicas=1,
+                rank=0,
+                seed=seed,
+            )
+
+        full_sampler = make_sampler()
+        full_sampler.set_epoch(0)
+        full_batches = list(full_sampler)
+        k1, k2 = 3, 2
+        assert len(full_batches) > k1 + k2, "Need enough batches to resume twice"
+
+        consumed = []
+
+        run1 = make_sampler()
+        run1.set_epoch(0)
+        for batch in run1:
+            consumed.append(batch)
+            if len(consumed) == k1:
+                break
+        state1 = run1.state_dict()
+
+        run2 = make_sampler()
+        run2.load_state_dict(state1)
+        for batch in run2:
+            consumed.append(batch)
+            if len(consumed) == k1 + k2:
+                break
+        state2 = run2.state_dict()
+        assert state2["batches_yielded"] == k1 + k2
+
+        run3 = make_sampler()
+        run3.load_state_dict(state2)
+        consumed.extend(run3)
+
+        assert consumed == full_batches
+
     def test_batches_yielded_resets_each_iteration(self, simple_dataset):
         """Test _batches_yielded resets to 0 at the start of each __iter__."""
         sampler = SequentialBucketSampler(
@@ -1346,3 +1396,45 @@ class TestDataloaderIntegration:
 
         for i, (expected, actual) in enumerate(zip(full_latents, all_latents)):
             assert torch.equal(expected, actual), f"Batch {i} latents differ after resume"
+
+    def test_stateful_dataloader_resume_twice_within_epoch(self, simple_dataset):
+        """Test two mid-epoch save/load cycles replay every batch exactly once."""
+
+        def make_dataloader():
+            dataloader, sampler = _build_multiresolution_dataloader_core(
+                collate_fn=collate_fn_production,
+                dataset=simple_dataset,
+                batch_size=2,
+                dp_rank=0,
+                dp_world_size=1,
+                num_workers=0,
+                pin_memory=False,
+            )
+            sampler.set_epoch(0)
+            return dataloader
+
+        full_paths = [tuple(batch["image_path"]) for batch in make_dataloader()]
+        k1, k2 = 3, 2
+        assert len(full_paths) > k1 + k2
+
+        seen = []
+        run1 = make_dataloader()
+        for batch in run1:
+            seen.append(tuple(batch["image_path"]))
+            if len(seen) == k1:
+                break
+        state = run1.state_dict()
+
+        run2 = make_dataloader()
+        run2.load_state_dict(state)
+        for batch in run2:
+            seen.append(tuple(batch["image_path"]))
+            if len(seen) == k1 + k2:
+                break
+        state = run2.state_dict()
+
+        run3 = make_dataloader()
+        run3.load_state_dict(state)
+        seen.extend(tuple(batch["image_path"]) for batch in run3)
+
+        assert seen == full_paths
