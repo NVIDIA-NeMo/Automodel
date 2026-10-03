@@ -17,19 +17,21 @@
 import pytest
 import torch
 
+from nemo_automodel.components.attention import fa4 as shared_fa4
 from nemo_automodel.components.models.qwen3_8_flash_next import fa4_qsa
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     gathered_qsa_gqa_attention,
     qsa_gqa_attention,
+    select_qsa_cuda_kernel,
 )
 
 
-def test_cpu_cute_dispatch_keeps_oracle(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cpu_fa4_dispatch_keeps_oracle(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(4)
     inputs = [torch.randn(1, 7, heads, 4, requires_grad=True) for heads in (4, 2, 2)]
     routes = torch.arange(7).view(1, 1, 7).expand(1, 7, 7)
-    monkeypatch.setattr(fa4_qsa, "safe_import", lambda *args: pytest.fail("CPU must not load FA4"))
-    actual = qsa_gqa_attention(*inputs, routes, backend="cute")
+    monkeypatch.setattr(fa4_qsa, "import_fa4_modules", lambda *args: pytest.fail("CPU must not load FA4"))
+    actual = qsa_gqa_attention(*inputs, routes, cuda_kernel=select_qsa_cuda_kernel("fa4"))
     expected = gathered_qsa_gqa_attention(*inputs, routes)
     dy = torch.randn_like(actual)
     grads = torch.autograd.grad(actual, inputs, dy)
@@ -40,8 +42,8 @@ def test_cpu_cute_dispatch_keeps_oracle(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_missing_optional_dependency_has_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:
     fa4_qsa._load_fa4.cache_clear()
-    monkeypatch.setattr(fa4_qsa, "safe_import", lambda name: (False, None))
-    with pytest.raises(ImportError, match="FlashAttention.*SM90"):
+    monkeypatch.setattr(shared_fa4, "safe_import", lambda name: (False, None))
+    with pytest.raises(ImportError, match="FlashAttention 4.*could not import flash_attn.cute.interface"):
         fa4_qsa._load_fa4()
     fa4_qsa._load_fa4.cache_clear()
 
@@ -49,7 +51,7 @@ def test_missing_optional_dependency_has_actionable_error(monkeypatch: pytest.Mo
 @pytest.mark.parametrize(
     "case", ["rank", "batch", "kv_shape", "head_dim", "gqa", "empty", "routes", "route_dtype", "dtype", "cpu"]
 )
-def test_cute_contract_rejects_invalid_inputs(case: str) -> None:
+def test_fa4_contract_rejects_invalid_inputs(case: str) -> None:
     q = torch.empty(1, 3, 4, 256, dtype=torch.bfloat16)
     k = torch.empty(1, 5, 2, 256, dtype=torch.bfloat16)
     v = torch.empty_like(k)

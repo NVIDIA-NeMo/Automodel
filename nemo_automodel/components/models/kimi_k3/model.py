@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.attention.fa4 import causal_fa4_attention, document_causal_fa4_attention
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     postprocess_output_for_attn,
@@ -436,7 +437,7 @@ class KimiMLAAttention(nn.Module):
             )
         self.attn_module = None
         self.attn_func = None
-        if backend.attn != "eager":
+        if backend.attn not in ("eager", "fa4"):
             if backend.attn not in ("te", "sdpa"):
                 raise ValueError(f"Kimi K3 MLA does not support backend.attn={backend.attn!r}.")
             attention_kwargs = {"attention_dropout": self.attention_dropout} if backend.attn == "te" else {}
@@ -452,6 +453,14 @@ class KimiMLAAttention(nn.Module):
                 **attention_kwargs,
             )
         self._cp_mesh = None
+        # backend.attn="fa4" runs MLA through FlashAttention 4 on both the CP and non-CP paths (components/attention/fa4.py);
+        # the other backends keep FlexAttention under context parallelism.
+        self.use_fa4 = backend.attn == "fa4"
+        if self.use_fa4 and self.attention_dropout != 0.0:
+            raise ValueError(
+                f"Kimi K3 MLA with backend.attn='fa4' does not support attention dropout "
+                f"(attention_dropout={self.attention_dropout}); set attention_dropout to 0 or use backend.attn='te'."
+            )
 
     def setup_cp_attention(self, cp_mesh) -> None:
         """Attach the context-parallel mesh used to gather full-sequence keys and values.
@@ -513,7 +522,26 @@ class KimiMLAAttention(nn.Module):
 
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
-        if self.backend.attn == "eager":
+        if self.use_fa4:
+            if packed_context is None and padding_mask is not None:
+                # A standalone padding mask carries the same document map as a binary attention mask.
+                packed_context = KimiPackedContext(doc_ids=doc_ids_from_attention_mask(padding_mask.logical_not()))
+            if packed_context is not None:
+                # Any document map (packed rows, left or right padding) goes through the document-causal varlen path
+                # so valid queries never attend to padding keys; plain causal is only for unmasked batches.
+                attn_output = document_causal_fa4_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    q_doc_ids=packed_context.doc_ids,
+                    kv_doc_ids=packed_context.doc_ids,
+                    q_global_start=0,
+                    scale=self.scaling,
+                )
+            else:
+                attn_output = causal_fa4_attention(query_states, key_states, value_states, scale=self.scaling)
+            attn_output = attn_output.transpose(1, 2).contiguous()
+        elif self.backend.attn == "eager":
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
             if attention_mask is not None:
                 attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
@@ -597,8 +625,8 @@ class KimiMLAAttention(nn.Module):
         Queries stay local while the compressed KV latent -- ``kv_lora_rank +
         qk_rope_head_dim`` values per token, far smaller than the expanded per-head
         keys and values -- is all-gathered across the context-parallel group and
-        expanded locally. Attention then runs as FlexAttention with a causal,
-        per-document block mask over the full sequence.
+        expanded locally. Attention then runs as FlexAttention (or FA4 with
+        ``backend.attn="fa4"``) with a causal, per-document mask over the full sequence.
 
         Args:
             hidden_states: Tensor of shape [batch, local_sequence, hidden].
@@ -637,7 +665,11 @@ class KimiMLAAttention(nn.Module):
         key_states = torch.cat((k_pass, k_rot), dim=-1)
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, full_seq_length)
 
-        attn_output = document_causal_flex_attention(
+        if self.use_fa4:
+            document_causal_attention = document_causal_fa4_attention
+        else:
+            document_causal_attention = document_causal_flex_attention
+        attn_output = document_causal_attention(
             query_states,
             key_states,
             value_states,

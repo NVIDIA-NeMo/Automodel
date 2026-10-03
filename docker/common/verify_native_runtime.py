@@ -15,6 +15,7 @@
 """Verify native-extension compatibility while building the container image."""
 
 import importlib
+import os
 import tempfile
 from importlib.metadata import version
 
@@ -66,6 +67,18 @@ def main() -> None:
     if not callable(getattr(flash_mla, "flash_mla_sparse_fwd", None)):
         raise RuntimeError("FlashMLA does not provide the required flash_mla_sparse_fwd kernel")
 
+    # FlashAttention 4 (flash_attn.cute) backs BackendConfig.attn="fa4". It is installed outside the uv lock, so
+    # check it survived uv sync here instead of failing at a model's first forward. INSTALL_FA4 is the Docker build arg.
+    if os.environ.get("INSTALL_FA4", "true") == "true":
+        fa4 = importlib.import_module("flash_attn.cute.interface")
+        for entry_point in ("flash_attn_func", "flash_attn_varlen_func"):
+            if not callable(getattr(fa4, entry_point, None)):
+                raise RuntimeError(f"FlashAttention 4 (flash_attn.cute) does not provide {entry_point}")
+        cutlass_dsl_version = Version(version("nvidia-cutlass-dsl"))
+        if cutlass_dsl_version < Version("4.6.2"):
+            raise RuntimeError(
+                f"FlashAttention 4 requires nvidia-cutlass-dsl 4.6.2 or later, found {cutlass_dsl_version}"
+            )
     # MoK recipes import both modules; loading them also checks the compiled
     # mok._C extension against the final image's PyTorch/CUDA libraries.
     importlib.import_module("mok.functional")

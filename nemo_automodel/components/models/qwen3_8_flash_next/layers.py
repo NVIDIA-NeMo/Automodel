@@ -47,6 +47,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     qsa_gqa_attention,
     qsa_route_replay,
     qsa_route_selection_region,
+    select_qsa_cuda_kernel,
 )
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
 from nemo_automodel.components.moe.layers import MoE
@@ -550,6 +551,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
         self.backend = backend
         self.attn_module = None
         self.attn_func = None
+        self.qsa_cuda_kernel = select_qsa_cuda_kernel(backend.attn)
         self._cp_mesh: DeviceMesh | None = None
         self.indexer = Qwen3_8_FlashNextQSAIndexer(config, backend)
         self.reuse_routes_on_recompute = bool(getattr(config, "qsa_reuse_routes_on_recompute", True))
@@ -661,7 +663,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             key,
             value,
             selected_token_ids,
-            backend=self.backend.attn,
+            cuda_kernel=self.qsa_cuda_kernel,
             softmax_scale=self.scaling,
             flex_mask=flex_mask,
         )

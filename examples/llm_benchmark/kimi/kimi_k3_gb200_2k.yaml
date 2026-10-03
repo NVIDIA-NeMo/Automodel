@@ -43,6 +43,17 @@
 # compile_norm is on: the fp32 RMSNorm chain is the remaining per-token launch
 # tax at this scale (see kimi_k3_gb200.yaml); the figures above include it.
 #
+# MLA attention runs on FlashAttention 4 (backend.attn: fa4, #4023; native
+# QK/V 192/128, no S x S score tensor). A/B of this file on 64 GB200 nodes,
+# 2026-09-27, both variants back to back in one Slurm job on the same nodes
+# and image, steady-state means from the per-iteration MFU lines:
+#   attn: eager  14.54% MFU, 578 tok/s/GPU, 56.7 s/iteration, peak 150.0 GiB
+#   attn: fa4    16.10% MFU, 640 tok/s/GPU, 51.2 s/iteration, peak 140.4 GiB
+# i.e. +1.56 pp MFU (+10.7%), -9.7% iteration time, -9.5 GiB, with rank-0
+# loss within 2e-4 of eager. The absolute figures above this paragraph were
+# measured earlier with attn: eager on a different image; compare within a run.
+# attn: fa4 needs flash_attn.cute (installed by docker/Dockerfile, INSTALL_FA4).
+#
 # Other benchmark regime notes match examples/llm_benchmark/kimi/kimi_k3_gb200.yaml.
 #
 #   To run on 64 GB200 NVL72 nodes:
@@ -89,7 +100,7 @@ model:
   use_sdpa_patching: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: eager
+    attn: fa4   # MLA on FlashAttention 4; see header
     linear: torch
     rms_norm: torch_fp32
     experts: te

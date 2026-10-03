@@ -428,7 +428,11 @@ class BackendConfig:
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
-            CUDA BF16; CPU execution retains the PyTorch numerical oracle.
+            CUDA BF16 and "fa4" selects FlashAttention 4 sparse GQA (SM90 BF16);
+            CPU execution retains the PyTorch numerical oracle. For Kimi K3,
+            "fa4" runs MLA through FlashAttention 4 (varlen, with and without
+            context parallelism). "fa4" requires the optional flash_attn.cute
+            package; models without an FA4 path reject it.
         sparse_attn: Sparse-attention backend. "generic" preserves each model's
             existing sparse mask plus ``attn`` path; "msa" selects the optional
             SM100 MSA kernels a model provides for its sparse layers only.
