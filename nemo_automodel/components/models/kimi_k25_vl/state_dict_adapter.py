@@ -201,7 +201,11 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         quantization = kwargs.get("quantization", False)
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
-        if fqn.startswith("model."):
+        # The outer "model." belongs to the native wrapper and is dropped on export.
+        # Adapter keys keep it: they are saved in native layout, and until now that was
+        # decided by them arriving under "base_model.", which the boundary is taking
+        # ownership of. ".lora_" asks the same question without depending on the prefix.
+        if ".lora_" not in fqn and fqn.startswith("model."):
             fqn = fqn[6:]
 
         if fqn.startswith("multi_modal_projector."):

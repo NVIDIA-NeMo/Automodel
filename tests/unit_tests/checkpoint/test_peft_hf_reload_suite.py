@@ -55,6 +55,42 @@ _BACKEND = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch_fp32", rop
 _INPUT_IDS = torch.tensor([[1, 2, 3, 4]])
 
 
+def _save_pretrained(model: nn.Module, path: Path) -> None:
+    """Lay down the base checkpoint the exporter points at.
+
+    Transformers models write one from the model itself. AutoModel's own classes carry a
+    ``save_pretrained`` from a checkpointing mixin that takes a checkpointer instead, so
+    those families supply their own via ``_Family.save_source``.
+    """
+    model.save_pretrained(path)
+
+
+def _causal_lm_logits(model: nn.Module) -> torch.Tensor:
+    """Run the model and return the tensor the reload comparison is made on.
+
+    Causal LMs answer with ``.logits``. Families whose forward has another shape -- an
+    encoder returns pooled embeddings, and takes its inputs as a dict -- supply their own
+    via ``_Family.forward``.
+    """
+    return model(_INPUT_IDS, use_cache=False).logits
+
+
+def _save_config_only(model: nn.Module, path: Path) -> None:
+    """Lay down a source directory for a model whose ``save_pretrained`` is not Transformers'.
+
+    AutoModel's native classes take that name from a checkpointing mixin that wants a
+    checkpointer. The exporter only reads this directory for metadata it can resolve, and
+    a randomly initialized model has no original snapshot to point at, so the directory
+    just has to exist.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _bi_encoder_embeddings(model: nn.Module) -> torch.Tensor:
+    """The bi-encoder takes its inputs as one dict and answers with pooled embeddings."""
+    return model({"input_ids": _INPUT_IDS, "attention_mask": torch.ones_like(_INPUT_IDS)})
+
+
 def _moe_config(*, dim: int, moe_inter_dim: int, n_routed_experts: int, gated: bool) -> MoEConfig:
     """Minimal MoE description for the adapters that convert fused expert tensors."""
     return MoEConfig(
@@ -179,6 +215,187 @@ def _build_minimax_m2():
     config._attn_implementation = "sdpa"
     moe_config = _moe_config(dim=16, moe_inter_dim=8, n_routed_experts=2, gated=True)
     return MiniMaxM2ForCausalLM(config), MiniMaxM2StateDictAdapter(config, moe_config, _BACKEND)
+
+
+def _build_kimi_k25_vl():
+    """Native VL model: the LLM nests under ``language_model.`` and experts are grouped.
+
+    There is no Transformers KimiK25VL, so this builds the AutoModel class itself. It
+    runs on CPU with the expert backend on torch; the compiled expert kernels still need
+    a C compiler, which CI has.
+    """
+    from nemo_automodel.components.models.kimi_k25_vl.model import (
+        KimiK25VLConfig,
+        KimiK25VLForConditionalGeneration,
+        MoonViT3dConfig,
+    )
+
+    vision_config = MoonViT3dConfig(
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        patch_size=14,
+        init_pos_emb_height=4,
+        init_pos_emb_width=4,
+    )
+    config = KimiK25VLConfig(
+        text_config=dict(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            n_shared_experts=1,
+            first_k_dense_replace=0,
+            max_position_embeddings=64,
+            n_group=1,
+            topk_group=1,
+        ),
+        vision_config=vision_config.to_dict(),
+    )
+    config._attn_implementation = "sdpa"
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    model = KimiK25VLForConditionalGeneration.from_config(config, backend=backend, dtype=torch.float32)
+    return model, getattr(model, "state_dict_adapter", None)
+
+
+def _build_bidirectional():
+    """Bi-encoder: the adapter's whole job is the outer ``model.`` prefix.
+
+    Not a causal LM, so the reload comparison runs through ``_bi_encoder_embeddings``
+    rather than the default logits path.
+    """
+    from transformers.models.llama.configuration_llama import LlamaConfig
+
+    from nemo_automodel._transformers.retrieval import BiEncoderModel
+    from nemo_automodel.components.models.llama_bidirectional.model import LlamaBidirectionalModel
+
+    config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+    )
+    config._attn_implementation = "sdpa"
+    encoder = BiEncoderModel(model=LlamaBidirectionalModel(config), pooling="avg")
+    return encoder, getattr(encoder, "state_dict_adapter", None)
+
+
+def _build_qwen2_5_omni():
+    """Dense multimodal sibling of qwen3_omni_moe: same ``thinker.`` namespacing, no experts."""
+    from transformers.models.qwen2_5_omni import (
+        Qwen2_5OmniBigVGANConfig,
+        Qwen2_5OmniConfig,
+        Qwen2_5OmniDiTConfig,
+        Qwen2_5OmniTalkerConfig,
+        Qwen2_5OmniTextConfig,
+        Qwen2_5OmniToken2WavConfig,
+    )
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+        Qwen2_5OmniThinkerForConditionalGeneration,
+    )
+
+    from nemo_automodel.components.models.qwen2_5_omni.state_dict_adapter import Qwen2_5OmniStateDictAdapter
+
+    thinker_config = dict(
+        text_config=dict(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            # Multimodal rope splits the head dim three ways and the sections have to
+            # sum to half of it; head_dim is 32/4 here.
+            rope_scaling={"rope_type": "default", "mrope_section": [2, 1, 1]},
+        ),
+        vision_config=dict(
+            depth=1,
+            hidden_size=32,
+            num_heads=4,
+            out_hidden_size=32,
+            intermediate_size=64,
+            patch_size=14,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        ),
+        audio_config=dict(
+            d_model=32,
+            encoder_layers=1,
+            encoder_attention_heads=4,
+            encoder_ffn_dim=64,
+            num_mel_bins=128,
+            output_dim=32,
+            max_source_positions=64,
+        ),
+    )
+    config = Qwen2_5OmniConfig(
+        thinker_config=thinker_config,
+        # The talker's nested text_config is not coerced from a dict the way the
+        # thinker's is, and a plain dict there fails when the full model builds its
+        # generation config. It is only here so the reload target exists.
+        talker_config=Qwen2_5OmniTalkerConfig(
+            # The talker carries its own sizes as well as a nested text_config, and its
+            # defaults are a 28-layer 3584-wide stack: 6.6B parameters if left alone.
+            vocab_size=64,
+            embedding_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+            text_config=Qwen2_5OmniTextConfig(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=64,
+            ),
+        ),
+        # Same coercion gap as the talker, and the defaults here are a 22-layer DiT and
+        # a 1536-channel vocoder, which is far too much to build for a naming test.
+        token2wav_config=Qwen2_5OmniToken2WavConfig(
+            dit_config=Qwen2_5OmniDiTConfig(
+                hidden_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                emb_dim=32,
+                head_dim=8,
+                num_embeds=64,
+                max_position_embeddings=64,
+                mel_dim=8,
+                enc_emb_dim=16,
+                enc_dim=16,
+                enc_attention_channels=8,
+                enc_se_channels=8,
+            ),
+            bigvgan_config=Qwen2_5OmniBigVGANConfig(mel_dim=8, upsample_initial_channel=32),
+        ),
+    )
+    config._attn_implementation = "sdpa"
+    thinker = Qwen2_5OmniThinkerForConditionalGeneration(config.thinker_config)
+    return thinker, Qwen2_5OmniStateDictAdapter(config, _BACKEND, dtype=torch.float32)
+
+
+def _build_qwen2_5_omni_reference():
+    """The reload target: the full model whose layout the exported names describe."""
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniForConditionalGeneration
+
+    _, adapter = _build_qwen2_5_omni()
+    return Qwen2_5OmniForConditionalGeneration(adapter.config)
 
 
 def _build_qwen3_omni_moe():
@@ -309,6 +526,10 @@ class _Family:
             a Transformers v4 layout this environment cannot build. The legacy artifact is
             then checked for internal consistency instead of reloaded -- see
             ``test_legacy_export_names_one_namespace``.
+        save_source: Writes the base checkpoint, when ``save_pretrained`` is not the
+            Transformers one. Defaults to ``_save_pretrained``.
+        forward: Runs the model and returns the tensor the reload comparison is made on,
+            when the family is not a causal LM. Defaults to ``_causal_lm_logits``.
         xfail: Issue reference when this family has a known, filed export defect.
     """
 
@@ -318,6 +539,8 @@ class _Family:
     build_reference: Callable[[], nn.Module] | None = None
     reference_path: str | None = None
     legacy_namespace: str | None = None
+    save_source: Callable[[nn.Module, Path], None] = _save_pretrained
+    forward: Callable[[nn.Module], torch.Tensor] = _causal_lm_logits
     xfail: str | None = None
 
 
@@ -340,6 +563,13 @@ _FAMILIES = (
         _build_qwen3_omni_moe,
         {"target_modules": ["*.q_proj", "*.v_proj"]},
         build_reference=_build_qwen3_omni_moe_reference,
+        reference_path="thinker",
+    ),
+    _Family(
+        "qwen2_5_omni",
+        _build_qwen2_5_omni,
+        {"target_modules": ["*.q_proj", "*.v_proj"]},
+        build_reference=_build_qwen2_5_omni_reference,
         reference_path="thinker",
     ),
     # Same adapter, thinker-only base: the namespace the full layout requires is exactly
@@ -388,7 +618,7 @@ def _adapted_model(family: _Family, source: Path):
     torch.manual_seed(1234)
     source_model, adapter = family.build()
     source_model = source_model.eval()
-    source_model.save_pretrained(source)
+    family.save_source(source_model, source)
 
     if family.build_reference is None:
         reference = family.build()[0].eval()
@@ -494,8 +724,8 @@ def test_exported_adapter_loads_into_hf_peft(family: _Family, v4_compatible: boo
     if family.reference_path is not None:
         adapted = getattr(adapted, family.reference_path)
     with torch.no_grad():
-        expected = model(_INPUT_IDS, use_cache=False).logits
-        actual = adapted(_INPUT_IDS, use_cache=False).logits
+        expected = family.forward(model)
+        actual = family.forward(adapted)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 

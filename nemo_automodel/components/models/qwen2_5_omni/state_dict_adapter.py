@@ -137,10 +137,20 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
         return key.removeprefix(_THINKER_PREFIX)
 
     def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
-        """Namespace adapter_config.json target_modules under ``thinker.``.
+        """Namespace adapter_config.json target_modules the way the tensors are namespaced.
 
-        Without it, PEFT's suffix matching on the full omni model also hits
-        the talker's structurally identical submodules and injects adapter
-        modules the saved file has no weights for.
+        On the full omni layout the namespace is required: PEFT suffix-matches
+        target_modules against the receiving model, so an entry without it also hits
+        the talker's structurally identical submodules and injects adapters the saved
+        file has no weights for. On a thinker-only base the namespace does not exist on
+        the receiving model, and adding it makes PEFT reject the adapter outright, so
+        this follows ``_uses_thinker_prefix`` exactly as the tensor exporters do.
+
+        Args:
+            name: A target-module name in native layout.
+            v4_compatible: Legacy export selection; omni uses one module layout for both.
+
+        Returns:
+            Target-module name in the layout the exported tensors use.
         """
-        return _THINKER_PREFIX + name
+        return self._add_thinker_prefix(name) if self._uses_thinker_prefix else name

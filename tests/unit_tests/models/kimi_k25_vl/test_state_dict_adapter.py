@@ -1694,3 +1694,67 @@ class TestConvertSingleTensorToHFQuantizationPaths:
 
         first_call_mesh = MockDTensor.from_local.call_args_list[0][0][1]
         assert first_call_mesh is mock_mesh
+
+
+class TestPeftOuterPrefixIsNotLoadBearing:
+    """The adapter must answer the same whether or not the PEFT outer prefix is present.
+
+    ``ModelState`` owns ``base_model.model.`` (stateful_wrappers.py adds it on save and
+    drops it on load). Adapters are meant to translate model paths, not to depend on
+    that wrapper being there, and issue #3867 moves the add/strip so they stop seeing it
+    at all. Anything here that reads the prefix to make a decision breaks under that
+    move, silently, by renaming adapter tensors it should have left alone.
+    """
+
+    _PREFIX = "base_model.model."
+
+    @pytest.fixture
+    def adapter(self):
+        config = KimiK25VLConfig()
+        moe_config = create_mock_moe_config()
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
+        return KimiK25VLStateDictAdapter(config, moe_config, backend, dtype=torch.bfloat16)
+
+    @staticmethod
+    def _peft_state_dict(prefix: str) -> dict[str, torch.Tensor]:
+        """A PEFT save's shape: adapter factors on an attention leaf, in native layout."""
+        base = f"{prefix}model.language_model.model.layers.0.self_attn.o_proj"
+        return {
+            f"{base}.lora_A.weight": torch.randn(2, 8),
+            f"{base}.lora_B.weight": torch.randn(8, 2),
+        }
+
+    def _strip(self, state_dict: dict) -> dict:
+        return {key.removeprefix(self._PREFIX): value for key, value in state_dict.items()}
+
+    def _restore(self, state_dict: dict) -> dict:
+        return {f"{self._PREFIX}{key}": value for key, value in state_dict.items()}
+
+    def test_to_hf_does_not_read_the_prefix(self, adapter):
+        """Exporting bare keys and re-adding the prefix has to match exporting prefixed ones."""
+        prefixed = self._peft_state_dict(self._PREFIX)
+
+        direct = adapter.to_hf(dict(prefixed))
+        through_boundary = self._restore(adapter.to_hf(self._strip(prefixed)))
+
+        assert set(direct) == set(through_boundary), (
+            f"to_hf reads the outer prefix; direct_only={sorted(set(direct) - set(through_boundary))} "
+            f"boundary_only={sorted(set(through_boundary) - set(direct))}"
+        )
+
+    def test_from_hf_does_not_read_the_prefix(self, adapter):
+        """Loading bare keys and re-adding the prefix has to match loading prefixed ones.
+
+        ``from_hf`` used the prefix as its only signal for "this is an adapter key, leave
+        the name alone". The same question is already asked by ``.lora_`` on the export
+        side of this file, and that answer survives the boundary owning the prefix.
+        """
+        prefixed = self._peft_state_dict(self._PREFIX)
+
+        direct = adapter.from_hf(dict(prefixed))
+        through_boundary = self._restore(adapter.from_hf(self._strip(prefixed)))
+
+        assert set(direct) == set(through_boundary), (
+            f"from_hf reads the outer prefix; direct_only={sorted(set(direct) - set(through_boundary))} "
+            f"boundary_only={sorted(set(through_boundary) - set(direct))}"
+        )
