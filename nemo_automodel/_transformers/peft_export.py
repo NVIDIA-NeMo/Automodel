@@ -45,9 +45,9 @@ def _merge_and_get_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
             by ``model.state_dict_adapter``.
 
     Returns:
-        Canonical Hugging Face state mapping. Every tensor retains the dtype of
-        the corresponding model weight; model-family adapters may split grouped
-        tensors into canonical per-expert tensors.
+        Canonical Hugging Face state mapping on host memory. Every tensor
+        retains the dtype of the corresponding model weight; model-family
+        adapters may split grouped tensors into canonical per-expert tensors.
     """
     state_dict = dict(model.state_dict())
     dtensor_keys = [key for key, tensor in state_dict.items() if isinstance(tensor, DTensor)]
@@ -91,6 +91,15 @@ def _merge_and_get_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         for key, tensor in state_dict.items()
         if not _is_lora_state_key(key) and not key.endswith("_extra_state")
     }
+
+    # Move the merged tensors to host memory before the canonical-HF layout
+    # conversion. ``to_hf`` allocates a full copy of the state dict on the
+    # input device while the model stays resident for the whole export, so
+    # converting on the model's device needs ~2x the model bytes there: a
+    # 61 GiB bf16 model cannot export on a single 80 GiB GPU
+    # (torch.OutOfMemoryError at 78.45 GiB). Conversion and serialization
+    # are pure state-dict work; host memory is sized for the extra copy.
+    state_dict = {key: tensor.to("cpu") for key, tensor in state_dict.items()}
 
     adapter = getattr(model, "state_dict_adapter", None)
     if adapter is not None:
