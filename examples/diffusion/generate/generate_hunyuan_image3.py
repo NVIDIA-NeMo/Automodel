@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Text-to-image generation with the native HunyuanImage-3.0 model under expert parallelism.
+"""Text-to-image generation with Automodel's HunyuanImage-3.0 model under expert parallelism.
 
-The MoE backbone runs natively (sharded with EP + FSDP2 across all ranks), loaded from the base release or from a
+The MoE backbone is Automodel's implementation (sharded with EP + FSDP2 across all ranks), loaded from the base release or from a
 consolidated training checkpoint. Everything else follows the released sampler: the release input builder (chat
 template, size tokens, classifier-free-guidance pair, attention mask), its flow-matching scheduler and guidance, and
 its VAE decode. Each step runs the full sequence (the release reuses a KV cache after the first step; the result is the
@@ -44,7 +44,7 @@ import torch
 import torch.distributed as dist
 from transformers import AutoConfig, AutoTokenizer
 
-from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel import NeMoAutoModelForDiffusion
 from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
@@ -54,17 +54,17 @@ from nemo_automodel.components.models.hunyuan_image3.rope import build_2d_positi
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 
 
-def load_release_builder(model_dir: str, device: torch.device):
+def load_release_builder(model_dir: str, device: torch.device) -> torch.nn.Module:
     """Release model without decoder layers: input builder, scheduler, guidance, VAE and image post-processing."""
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-    # Use the release classes directly. Once nemo_automodel registers its native config for this model_type, the
-    # Auto factories resolve to it, and it lacks the release's image/tokenizer defaults.
+    # Use the release classes directly: nemo_automodel registers its own config for this model_type, so the Auto
+    # factories would resolve to it, and it lacks the release's image/tokenizer defaults.
     release_cls = get_class_from_dynamic_module("hunyuan.HunyuanImage3ForCausalMM", model_dir)
     config = release_cls.config_class.from_pretrained(model_dir)
     config.num_hidden_layers = 0
     for key in ("moe_topk", "moe_intermediate_size", "num_shared_expert"):
-        if isinstance(getattr(config, key, None), list):
+        if isinstance(config.to_dict()[key], list):
             setattr(config, key, [])
     config.moe_impl = "eager"
     builder = release_cls.from_pretrained(
@@ -84,8 +84,10 @@ def load_peft_config(peft_checkpoint: str) -> PeftConfig:
     return PeftConfig.from_dict(config)
 
 
-def load_native_model(model_dir: str, weights: str | None, world_size: int, peft_checkpoint: str | None = None):
-    """Native backbone sharded with EP across all ranks.
+def load_custom_model(
+    model_dir: str, weights: str | None, world_size: int, peft_checkpoint: str | None = None
+) -> torch.nn.Module:
+    """Automodel's HunyuanImage-3.0 backbone sharded with EP across all ranks.
 
     ``weights`` overrides the base checkpoint location; ``peft_checkpoint`` loads a training LoRA checkpoint on top.
     """
@@ -103,9 +105,10 @@ def load_native_model(model_dir: str, weights: str | None, world_size: int, peft
     )
     setup = create_distributed_setup_from_config(cfg, world_size=world_size)
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=False)
+    # The VAE and sampler come from the release builder; weights may come from a finetuned export.
     config.include_vae_and_vision = False
     config.remote_code_dir = model_dir
-    config._name_or_path = weights or model_dir
+    config.name_or_path = weights or model_dir
     backend = BackendConfig(
         attn="sdpa",
         linear="torch",
@@ -116,8 +119,8 @@ def load_native_model(model_dir: str, weights: str | None, world_size: int, peft
         enable_hf_state_dict_adapter=True,
     )
     peft_config = load_peft_config(peft_checkpoint) if peft_checkpoint else None
-    model = NeMoAutoModelForCausalLM.from_config(
-        config=config,
+    model = NeMoAutoModelForDiffusion.from_config(
+        config,
         backend=backend,
         distributed_setup=setup,
         load_base_model=True,
@@ -144,7 +147,7 @@ def load_native_model(model_dir: str, weights: str | None, world_size: int, peft
 
 @torch.no_grad()
 def generate(model, builder, prompt: str, seed: int, height: int, width: int, steps: int, guidance: float, device):
-    """Release sampler with the native model predicting the flow velocity; returns a PIL image (rank 0)."""
+    """Release sampler with Automodel's model predicting the flow velocity; returns a PIL image (rank 0)."""
     from importlib import import_module
 
     pipe = builder.pipeline
@@ -192,16 +195,15 @@ def generate(model, builder, prompt: str, seed: int, height: int, width: int, st
         latents = pipe.scheduler.step(pred, t, latents, return_dict=False)[0]
 
     vae = builder.vae
+    # The release VAE scales latents by scaling_factor and has no shift factor.
     latents = latents / vae.config.scaling_factor
-    if getattr(vae.config, "shift_factor", None):
-        latents = latents + vae.config.shift_factor
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         image = vae.decode(latents.unsqueeze(2), return_dict=False)[0].squeeze(2)
     return pipe.image_processor.postprocess(image, output_type="pil", do_denormalize=[True])[0]
 
 
 def main():
-    """Parse arguments, load the native model and the release builder, and generate one image per prompt."""
+    """Parse arguments, load the model and the release builder, and generate one image per prompt."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, help="Release checkpoint directory (config, remote code, tokenizer, VAE).")
     p.add_argument("--weights", default=None, help="Optional directory of HF-layout safetensors to load instead.")
@@ -218,7 +220,7 @@ def main():
     a = p.parse_args()
 
     info = initialize_distributed("nccl", timeout_minutes=60)
-    model = load_native_model(a.model, a.weights, info.world_size, a.peft_checkpoint)
+    model = load_custom_model(a.model, a.weights, info.world_size, a.peft_checkpoint)
     builder = load_release_builder(a.model, info.device)
     if info.is_main:
         os.makedirs(a.output_dir, exist_ok=True)

@@ -14,21 +14,26 @@
 
 """Configuration for tencent/HunyuanImage-3.0 (``model_type: hunyuan_image_3_moe``)."""
 
-from typing import Any
+from typing import TypeVar
 
 from transformers import PretrainedConfig
 
+T = TypeVar("T")
 
-def per_layer(value: Any, layer_idx: int) -> Any:
+
+def per_layer(value: T | list[T] | tuple[T, ...], layer_idx: int) -> T:
     """HunyuanImage-3.0 stores some MoE fields either as a scalar or as a per-layer list."""
     return value[layer_idx] if isinstance(value, (list, tuple)) else value
 
 
 class HunyuanImage3Config(PretrainedConfig):
-    """Backbone fields used by the native implementation.
+    """Backbone fields used by the Automodel implementation.
 
     Everything else in the released ``config.json`` (``vae``, ``vit``, ``vit_aligner``, tokenizer and image-size
-    fields) is kept verbatim as attributes and forwarded to the image-side modules.
+    fields) is kept verbatim as attributes and forwarded to the image-side modules. Two fields are Automodel's
+    own: ``include_vae_and_vision`` (training on cached latents does not need the VAE and vision tower) and
+    ``remote_code_dir`` (where the release code that builds the image-side modules lives; defaults to the
+    checkpoint the config was loaded from).
     """
 
     model_type = "hunyuan_image_3_moe"
@@ -60,6 +65,8 @@ class HunyuanImage3Config(PretrainedConfig):
         patch_embed_hidden_dim: int = 1024,
         img_proj_type: str = "unet",
         tie_word_embeddings: bool = False,
+        include_vae_and_vision: bool = True,
+        remote_code_dir: str | None = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -86,4 +93,6 @@ class HunyuanImage3Config(PretrainedConfig):
         self.patch_size = patch_size
         self.patch_embed_hidden_dim = patch_embed_hidden_dim
         self.img_proj_type = img_proj_type
+        self.include_vae_and_vision = include_vae_and_vision
+        self.remote_code_dir = remote_code_dir
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)

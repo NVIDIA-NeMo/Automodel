@@ -14,14 +14,12 @@
 
 """Decoder layers of the HunyuanImage-3.0 MoE backbone."""
 
-from typing import Any
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
-from nemo_automodel.components.models.hunyuan_image3.config import per_layer
+from nemo_automodel.components.models.hunyuan_image3.config import HunyuanImage3Config, per_layer
 from nemo_automodel.components.models.hunyuan_image3.rope import apply_rope
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
@@ -67,7 +65,7 @@ class HunyuanImage3MLP(nn.Module):
 class HunyuanImage3Attention(nn.Module):
     """GQA attention with a fused QKV projection grouped per KV head, RoPE applied before per-head QK RMSNorm."""
 
-    def __init__(self, config: Any, backend: BackendConfig):
+    def __init__(self, config: HunyuanImage3Config, backend: BackendConfig):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
@@ -137,7 +135,7 @@ class HunyuanImage3Attention(nn.Module):
 class HunyuanImage3Block(nn.Module):
     """Pre-norm decoder layer: attention, then routed MoE plus an always-on shared expert MLP."""
 
-    def __init__(self, layer_idx: int, config: Any, moe_config: MoEConfig, backend: BackendConfig):
+    def __init__(self, layer_idx: int, config: HunyuanImage3Config, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
         hidden = config.hidden_size
         self.layer_idx = layer_idx

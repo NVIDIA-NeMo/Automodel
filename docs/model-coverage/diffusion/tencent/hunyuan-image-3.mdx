@@ -33,9 +33,9 @@ slug: model-coverage/diffusion/tencent/HunyuanImage-3.0
 
 HunyuanImage-3.0 is a single Mixture-of-Experts transformer that generates both text and images. It has 32 layers, each with 64 routed experts (8 active per token) and one shared expert. To generate an image, the model embeds noisy VAE latents into image slots of the prompt's token sequence. It runs the sequence with causal attention for text and bidirectional attention inside the image block, then decodes the image slots into a flow-matching velocity.
 
-NeMo AutoModel implements the MoE backbone natively, so the diffusion recipe shards the experts with expert parallelism (`fsdp.ep_size`) and the rest of the model with FSDP2. The image-side modules (VAE, patch embedding, final layer, timestep embedders) are built from the checkpoint's own remote code at runtime. Their numerics therefore match the release.
+NeMo AutoModel implements the MoE backbone itself (a custom model in `ModelRegistry`), so the diffusion recipe shards the experts with expert parallelism (`fsdp.ep_size`) and the rest of the model with FSDP2. The image-side modules (VAE, patch embedding, final layer, timestep embedders) are built from the checkpoint's own remote code at runtime. Their numerics therefore match the release.
 
-The native model matches the release implementation: next-token logits have a mean KL divergence of about 6e-5 (top-1 agreement 100%), and image velocity predictions have a cosine similarity of 0.99999 under 8-way expert parallelism in bf16.
+The Automodel implementation matches the release: next-token logits have a mean KL divergence of about 6e-5 (top-1 agreement 100%), and image velocity predictions have a cosine similarity of 0.99999 under 8-way expert parallelism in bf16.
 
 ## Prepare the Dataset
 
@@ -74,7 +74,7 @@ The `hunyuan_image3` adapter runs each sample as its own model call. Every rank 
 
 ## Generate Images
 
-Generation runs the native model with expert parallelism across the GPUs of one node, with the release's classifier-free guidance and sampler:
+Generation runs the Automodel implementation with expert parallelism across the GPUs of one node, with the release's classifier-free guidance and sampler:
 
 ```bash
 uv run torchrun --nproc-per-node=8 examples/diffusion/generate/generate_hunyuan_image3.py \

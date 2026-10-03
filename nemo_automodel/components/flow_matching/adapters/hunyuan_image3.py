@@ -31,7 +31,6 @@ pipeline; its timestep input is ``sigma * 1000``.
 """
 
 import random
-from typing import Any, Dict
 
 import torch
 import torch.nn as nn
@@ -49,13 +48,13 @@ def text_causal_image_bidirectional_mask(seq_len: int, image_start: int, image_l
 
 
 class HunyuanImage3Adapter(ModelAdapter):
-    """Flow-matching adapter for the native HunyuanImage-3.0 model.
+    """Flow-matching adapter for Automodel's HunyuanImage-3.0 model.
 
     Every sample is run as its own forward call: samples differ in sequence length, and the call count must equal the
     local batch size on every rank so FSDP/EP collectives stay aligned.
     """
 
-    def prepare_inputs(self, context: FlowMatchingContext) -> Dict[str, Any]:
+    def prepare_inputs(self, context: FlowMatchingContext) -> dict[str, object]:
         """Collect per-sample token conditioning; ``cfg_dropout_prob`` swaps in the unconditional sequence."""
         noisy_latents = context.noisy_latents
         if noisy_latents.ndim != 4:
@@ -84,7 +83,7 @@ class HunyuanImage3Adapter(ModelAdapter):
             "device": context.device,
         }
 
-    def forward(self, model: nn.Module, inputs: Dict[str, Any]) -> torch.Tensor:
+    def forward(self, model: nn.Module, inputs: dict[str, object]) -> torch.Tensor:
         """Return the velocity prediction ``[B, C, H, W]``."""
         device = inputs["device"]
         preds = []

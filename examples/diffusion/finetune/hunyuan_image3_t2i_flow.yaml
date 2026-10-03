@@ -1,6 +1,6 @@
 # HunyuanImage-3.0 text-to-image full finetune (80B-total / 13B-active MoE).
 #
-# The MoE backbone is built natively and sharded with expert parallelism + FSDP2. The image-side modules (VAE, UNet
+# The MoE backbone is Automodel's own implementation, sharded with expert parallelism + FSDP2. The image-side modules (VAE, UNet
 # patch embedding / final layer, timestep embedders) are loaded from the checkpoint's own remote code.
 #
 # Preprocess images into a latent + token-conditioning cache first:

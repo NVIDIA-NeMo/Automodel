@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native HunyuanImage-3.0 (tencent/HunyuanImage-3.0).
+"""Automodel implementation of HunyuanImage-3.0 (tencent/HunyuanImage-3.0).
 
-The 80B-total / 13B-active MoE language backbone is implemented natively so expert parallelism and FSDP2 can shard
+The 80B-total / 13B-active MoE language backbone is implemented here so expert parallelism and FSDP2 can shard
 it. The image-side modules (VAE, UNet patch embedding and final layer, timestep embedders, SigLIP2 vision tower) are
 built from the checkpoint's own remote code at construction time, so their numerics are identical to the release
 and their source is not vendored here.
@@ -30,7 +30,6 @@ Two forward modes mirror the release:
 
 import re
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -43,7 +42,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.hunyuan_image3.config import per_layer
+from nemo_automodel.components.models.hunyuan_image3.config import HunyuanImage3Config, per_layer
 from nemo_automodel.components.models.hunyuan_image3.layers import HunyuanImage3Block, HunyuanImage3RMSNorm
 from nemo_automodel.components.models.hunyuan_image3.rope import build_2d_rope_cos_sin
 from nemo_automodel.components.models.hunyuan_image3.state_dict_adapter import HunyuanImage3StateDictAdapter
@@ -51,10 +50,6 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
-
-# Image-side modules taken from the checkpoint's remote code: attribute -> remote class.
-_IMAGE_GEN_MODULES = ("timestep_emb", "patch_embed", "time_embed", "final_layer", "time_embed_2")
-_IMAGE_EXTRA_MODULES = ("vae", "vision_model", "vision_aligner")
 
 
 @dataclass
@@ -64,8 +59,8 @@ class HunyuanImage3Output(CausalLMOutputWithPast):
     diffusion_prediction: torch.Tensor | None = None
 
 
-def _remote_code_dir(config: Any) -> str:
-    path = getattr(config, "remote_code_dir", None) or getattr(config, "_name_or_path", None)
+def _remote_code_dir(config: HunyuanImage3Config) -> str:
+    path = config.remote_code_dir or config.name_or_path
     if not path:
         raise ValueError(
             "HunyuanImage-3.0 builds its image modules from the checkpoint's remote code; set "
@@ -78,7 +73,7 @@ def _remote_code_dir(config: Any) -> str:
 _HF_SNAPSHOT_RE = re.compile(r"models--(?P<org>[^/]+?)--(?P<name>[^/]+)/snapshots/(?P<revision>[^/]+)/*$")
 
 
-def _remote_code_source(config: Any) -> tuple[str, str | None]:
+def _remote_code_source(config: HunyuanImage3Config) -> tuple[str, str | None]:
     """Repository (and revision) to load the release image modules from.
 
     transformers resolves the relative imports of remote code next to the real file, which for an HF cache snapshot is
@@ -92,7 +87,7 @@ def _remote_code_source(config: Any) -> tuple[str, str | None]:
     return path, None
 
 
-def build_image_modules(config: Any, include_extra: bool) -> dict[str, nn.Module]:
+def build_image_modules(config: HunyuanImage3Config, include_extra: bool) -> dict[str, nn.Module]:
     """Instantiate the release's image modules from the checkpoint's remote code."""
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
@@ -136,7 +131,7 @@ def build_image_modules(config: Any, include_extra: bool) -> dict[str, nn.Module
 class HunyuanImage3Model(nn.Module):
     """Token embedding, MoE decoder layers and final norm (applied only for text logits)."""
 
-    def __init__(self, config: Any, backend: BackendConfig, moe_config: MoEConfig | None = None):
+    def __init__(self, config: HunyuanImage3Config, backend: BackendConfig, moe_config: MoEConfig | None = None):
         super().__init__()
         self.config = config
         self.backend = backend
@@ -161,7 +156,7 @@ class HunyuanImage3Model(nn.Module):
             expert_bias=False,
             expert_activation="swiglu",
             gate_dtype=torch.float32,
-            dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
+            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
         )
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleDict(
@@ -196,7 +191,7 @@ class HunyuanImage3Model(nn.Module):
 
 
 class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    """HunyuanImage-3.0 with the native MoE backbone and the release's image modules."""
+    """HunyuanImage-3.0: Automodel's MoE backbone plus the release's image modules."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     # The router runs in fp32 like the release; the frozen VAE is stored in fp32 on disk.
@@ -213,27 +208,31 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
 
     @classmethod
     def from_config(
-        cls, config: Any, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs
-    ):
+        cls,
+        config: HunyuanImage3Config,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        **kwargs: object,
+    ) -> "HunyuanImage3ForCausalMM":
         return cls(config, moe_config, backend, **kwargs)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str, *model_args: object, **kwargs: object
+    ) -> "HunyuanImage3ForCausalMM":
         from transformers import AutoConfig
 
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=False)
-        if not getattr(config, "remote_code_dir", None):
+        if config.remote_code_dir is None:
             config.remote_code_dir = str(pretrained_model_name_or_path)
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
         self,
-        config: Any,
+        config: HunyuanImage3Config,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        *,
-        include_vae_and_vision: bool | None = None,
-        **kwargs,
+        **kwargs: object,
     ):
         super().__init__()
         self.config = config
@@ -241,16 +240,14 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         self.backend = backend or BackendConfig()
         self.model = HunyuanImage3Model(config, self.backend, moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
-        if include_vae_and_vision is None:
-            include_vae_and_vision = getattr(config, "include_vae_and_vision", True)
-        for name, module in build_image_modules(config, include_extra=include_vae_and_vision).items():
+        for name, module in build_image_modules(config, include_extra=config.include_vae_and_vision).items():
             setattr(self, name, module)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = HunyuanImage3StateDictAdapter(
                 config,
                 self.model.moe_config,
                 self.backend,
-                dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
+                dtype=get_dtype(config.torch_dtype, torch.bfloat16),
             )
 
     def get_input_embeddings(self):
@@ -298,7 +295,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         timestep_scatter_index: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         output_hidden_states: bool = False,
-        **kwargs: Any,
+        **kwargs: object,
     ) -> HunyuanImage3Output:
         """
         Args:

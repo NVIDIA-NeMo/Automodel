@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the native HunyuanImage-3.0 layers and model.
+"""Unit tests for the HunyuanImage-3.0 layers and model.
 
-The attention test checks the native layer against a from-scratch reference of the release semantics: fused QKV
+The attention test checks the attention layer against a from-scratch reference of the release semantics: fused QKV
 grouped per KV head, RoPE before the per-head QK RMSNorm, and a text-causal / image-bidirectional mask. The image-side
 modules come from the checkpoint's remote code, so the model tests replace them with small stand-ins.
 """
@@ -194,18 +194,18 @@ class TestLayers:
         x = torch.randn(2, seq_len, HIDDEN)
         if image_block is None:
             positions = build_2d_positions(seq_len, [])
-            native_mask = None
+            mask = None
             ref_mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
         else:
             start, h, w = image_block
             positions = build_2d_positions(seq_len, [image_block])
-            native_mask = text_causal_image_bidirectional_mask(seq_len, start, h * w, x.device)
-            ref_mask = native_mask[0, 0]
+            mask = text_causal_image_bidirectional_mask(seq_len, start, h * w, x.device)
+            ref_mask = mask[0, 0]
             assert ref_mask[start, start + h * w - 1] and not ref_mask[start - 1, start]
         positions = positions[None].expand(2, -1, -1)
         cos, sin = build_2d_rope_cos_sin(positions, HEAD_DIM, config.rope_theta)
         torch.testing.assert_close(
-            attn(x, cos, sin, native_mask), _reference_attention(attn, x, positions, ref_mask), rtol=1e-4, atol=1e-5
+            attn(x, cos, sin, mask), _reference_attention(attn, x, positions, ref_mask), rtol=1e-4, atol=1e-5
         )
 
     def test_block_adds_shared_expert_to_routed_experts(self, model):
@@ -293,15 +293,15 @@ class TestModel:
             model(torch.zeros(1, 3, dtype=torch.long), rope_positions=torch.zeros(1, 3, 2), mode="edit")
 
     def test_hf_state_dict_round_trip(self, model):
-        native = model.state_dict()
-        hf = model.state_dict_adapter.to_hf(native)
+        state = model.state_dict()
+        hf = model.state_dict_adapter.to_hf(state)
         assert "model.wte.weight" in hf
         assert "model.layers.0.mlp.gate.wg.weight" in hf
         assert "model.layers.0.mlp.experts.3.gate_and_up_proj.weight" in hf
         assert "model.layers.0.mlp.shared_mlp.down_proj.weight" in hf
         restored = model.state_dict_adapter.from_hf(hf)
-        assert restored.keys() == native.keys()
-        for key, value in native.items():
+        assert restored.keys() == state.keys()
+        for key, value in state.items():
             torch.testing.assert_close(restored[key], value, msg=key)
 
 

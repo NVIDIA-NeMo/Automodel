@@ -27,7 +27,6 @@ what the released inference pipeline feeds the model.
 """
 
 import logging
-from typing import Any, Dict
 
 import torch
 
@@ -49,7 +48,7 @@ class HunyuanImage3Processor(BaseModelProcessor):
     def default_model_name(self) -> str:
         return "tencent/HunyuanImage-3.0"
 
-    def load_models(self, model_name: str, device: str) -> Dict[str, Any]:
+    def load_models(self, model_name: str, device: str) -> dict[str, torch.nn.Module]:
         """Load the release model without decoder layers: only the VAE, tokenizer and input builder are needed."""
         from transformers import AutoTokenizer
 
@@ -59,13 +58,13 @@ class HunyuanImage3Processor(BaseModelProcessor):
         logger.info("[HunyuanImage-3.0] Loading VAE and input builder from %s", model_dir)
         from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-        # Use the release classes directly: once nemo_automodel registers its native config for this model_type,
-        # the Auto factories resolve to it, and it lacks the release's image/tokenizer defaults.
+        # Use the release classes directly: nemo_automodel registers its own config for this model_type, so the
+        # Auto factories would resolve to it, and it lacks the release's image/tokenizer defaults.
         release_cls = get_class_from_dynamic_module("hunyuan.HunyuanImage3ForCausalMM", model_dir)
         config = release_cls.config_class.from_pretrained(model_dir)
         config.num_hidden_layers = 0
         for key in ("moe_topk", "moe_intermediate_size", "num_shared_expert"):
-            if isinstance(getattr(config, key, None), list):
+            if isinstance(config.to_dict()[key], list):
                 setattr(config, key, [])
         config.moe_impl = "eager"
         model = release_cls.from_pretrained(
@@ -75,19 +74,21 @@ class HunyuanImage3Processor(BaseModelProcessor):
         model.load_tokenizer(AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True))
         return {"model": model, "vae": model.vae}
 
-    def encode_image(self, image_tensor: torch.Tensor, models: Dict[str, Any], device: str) -> torch.Tensor:
+    def encode_image(self, image_tensor: torch.Tensor, models: dict[str, torch.nn.Module], device: str) -> torch.Tensor:
         """Encode an image in ``[-1, 1]`` (``[1, 3, H, W]``) to a scaled VAE latent ``[32, H/16, W/16]``."""
         model = models["model"]
         with torch.no_grad():
             _, latents = model.vae_encode(image_tensor.to(device=device, dtype=torch.float32))
         return latents.detach().float().cpu().squeeze(0)
 
-    def encode_text(self, prompt: str, models: Dict[str, Any], device: str) -> Dict[str, Any]:
+    def encode_text(self, prompt: str, models: dict[str, torch.nn.Module], device: str) -> dict[str, str]:
         """The token sequence depends on the image size, so it is built in :meth:`get_cache_data`."""
         self._models = models
         return {"prompt": prompt}
 
-    def build_conditioning(self, prompt: str, width: int, height: int, models: Dict[str, Any]) -> Dict[str, Any]:
+    def build_conditioning(
+        self, prompt: str, width: int, height: int, models: dict[str, torch.nn.Module]
+    ) -> dict[str, torch.Tensor | int]:
         """Conditional and unconditional token sequences for a ``width x height`` target image."""
         model = models["model"]
         info = model.image_processor.build_image_info((height, width))
@@ -99,7 +100,7 @@ class HunyuanImage3Processor(BaseModelProcessor):
         with torch.no_grad():
             inputs = model.prepare_model_inputs(prompt=prompt, mode="gen_image", image_size=(height, width), seed=0)
         output = inputs["tokenizer_output"]
-        conditioning: Dict[str, Any] = {"token_h": info.token_height, "token_w": info.token_width}
+        conditioning: dict[str, torch.Tensor | int] = {"token_h": info.token_height, "token_w": info.token_width}
         # Row 0 is the conditional prompt, row 1 the unconditional one (classifier-free guidance pair).
         for row, prefix in ((0, ""), (1, "uncond_")):
             image_slices = output.gen_image_slices[row]
@@ -113,16 +114,12 @@ class HunyuanImage3Processor(BaseModelProcessor):
             conditioning[prefix + "image_start"] = int(image_slices[0].start)
         return conditioning
 
-    def verify_latent(self, latent: torch.Tensor, models: Dict[str, Any], device: str) -> bool:
+    def verify_latent(self, latent: torch.Tensor, models: dict[str, torch.nn.Module], device: str) -> bool:
         """Decode the latent back to pixels and check for a finite RGB image."""
         try:
             vae = models["vae"]
-            config = vae.config
-            z = latent.unsqueeze(0).to(device=device, dtype=torch.float32)
-            if getattr(config, "scaling_factor", None):
-                z = z / config.scaling_factor
-            if getattr(config, "shift_factor", None):
-                z = z + config.shift_factor
+            # The release VAE scales latents by scaling_factor and has no shift factor.
+            z = latent.unsqueeze(0).to(device=device, dtype=torch.float32) / vae.config.scaling_factor
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
                 image = vae.decode(z.unsqueeze(2), return_dict=False)[0]
             return image.shape[1] == 3 and bool(torch.isfinite(image).all())
@@ -131,8 +128,8 @@ class HunyuanImage3Processor(BaseModelProcessor):
             return False
 
     def get_cache_data(
-        self, latent: torch.Tensor, text_encodings: Dict[str, Any], metadata: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, latent: torch.Tensor, text_encodings: dict[str, str], metadata: dict[str, object]
+    ) -> dict[str, object]:
         """Assemble the cache entry; ``bucket_resolution`` is ``(width, height)`` in pixels."""
         width, height = metadata["bucket_resolution"]
         return {

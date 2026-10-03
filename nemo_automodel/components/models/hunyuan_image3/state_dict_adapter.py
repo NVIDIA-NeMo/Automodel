@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""State dict conversion between the tencent/HunyuanImage-3.0 checkpoint and the native model.
+"""State dict conversion between the tencent/HunyuanImage-3.0 checkpoint and the Automodel implementation.
 
-On disk (release)                                         Native
+On disk (release)                                         Automodel
   model.wte.weight                                          model.embed_tokens.weight
   model.layers.{L}.mlp.gate.wg.weight          [E, D]       model.layers.{L}.mlp.gate.weight
   model.layers.{L}.mlp.experts.{e}.gate_and_up_proj.weight  model.layers.{L}.mlp.experts.gate_and_up_projs  [E, D, 2I]
@@ -28,26 +28,26 @@ loaded from the full checkpoint.
 """
 
 import re
-from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.hunyuan_image3.config import HunyuanImage3Config
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
 _LAYER_RE = re.compile(r"^(?:model\.)?layers\.(\d+)\.")
 _HF_EXPERT_FUSED_RE = re.compile(r"^(?P<prefix>.*\.mlp\.experts\.\d+)\.gate_and_up_proj\.weight$")
-_NATIVE_EXPERT_SPLIT_RE = re.compile(r"^(?P<prefix>.*\.mlp\.experts\.\d+)\.(?P<proj>gate_proj|up_proj)\.weight$")
+_SPLIT_EXPERT_RE = re.compile(r"^(?P<prefix>.*\.mlp\.experts\.\d+)\.(?P<proj>gate_proj|up_proj)\.weight$")
 
-_HF_TO_NATIVE = (
+_HF_TO_AUTOMODEL = (
     (re.compile(r"^model\.wte\."), "model.embed_tokens."),
     (re.compile(r"\.mlp\.gate\.wg\.weight$"), ".mlp.gate.weight"),
     (re.compile(r"\.mlp\.shared_mlp\."), ".shared_mlp."),
 )
-_NATIVE_TO_HF = (
+_AUTOMODEL_TO_HF = (
     (re.compile(r"^model\.embed_tokens\."), "model.wte."),
     (re.compile(r"\.mlp\.gate\.weight$"), ".mlp.gate.wg.weight"),
     (re.compile(r"\.shared_mlp\."), ".mlp.shared_mlp."),
@@ -63,13 +63,19 @@ def _rename(key: str, rules) -> str:
 
 
 class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
-    """Bridges the native grouped-experts layout and the HunyuanImage-3.0 release layout."""
+    """Bridges Automodel's grouped-experts layout and the HunyuanImage-3.0 release layout."""
 
     # The mixin's low-memory DCP path reads per-expert gate/up keys directly from disk, which this checkpoint
     # does not have (it stores them fused).
     _supports_low_memory_dcp_load = False
 
-    def __init__(self, config: Any, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype = torch.bfloat16):
+    def __init__(
+        self,
+        config: HunyuanImage3Config,
+        moe_config: MoEConfig,
+        backend: BackendConfig,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
         self.config = config
         self.moe_config = moe_config
         self.backend = backend
@@ -80,25 +86,29 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
         m = _LAYER_RE.match(key)
         return bool(m and int(m.group(1)) >= self.config.num_hidden_layers)
 
-    def from_hf(self, hf_state_dict: dict[str, Any], device_mesh: DeviceMesh | None = None, **kwargs) -> dict[str, Any]:
-        native: dict[str, Any] = {}
+    def from_hf(
+        self, hf_state_dict: dict[str, torch.Tensor], device_mesh: DeviceMesh | None = None, **kwargs: object
+    ) -> dict[str, torch.Tensor]:
+        converted: dict[str, torch.Tensor] = {}
         for key, value in hf_state_dict.items():
             if self._is_dropped_layer(key):
                 continue
             m = _HF_EXPERT_FUSED_RE.match(key)
             if m:
                 up, gate = value.chunk(2, dim=0)
-                native[f"{m['prefix']}.gate_proj.weight"] = gate
-                native[f"{m['prefix']}.up_proj.weight"] = up
+                converted[f"{m['prefix']}.gate_proj.weight"] = gate
+                converted[f"{m['prefix']}.up_proj.weight"] = up
                 continue
-            native[_rename(key, _HF_TO_NATIVE)] = value
-        return self._from_hf_w_merged_experts(native, device_mesh)
+            converted[_rename(key, _HF_TO_AUTOMODEL)] = value
+        return self._from_hf_w_merged_experts(converted, device_mesh)
 
-    def _fuse_and_rename(self, pairs: list[tuple[str, Any]], exclude_key_regex: str | None) -> list[tuple[str, Any]]:
-        out: list[tuple[str, Any]] = []
-        pending: dict[str, dict[str, Any]] = {}
+    def _fuse_and_rename(
+        self, pairs: list[tuple[str, torch.Tensor]], exclude_key_regex: str | None
+    ) -> list[tuple[str, torch.Tensor]]:
+        out: list[tuple[str, torch.Tensor]] = []
+        pending: dict[str, dict[str, torch.Tensor]] = {}
         for key, value in pairs:
-            m = _NATIVE_EXPERT_SPLIT_RE.match(key)
+            m = _SPLIT_EXPERT_RE.match(key)
             if m:
                 parts = pending.setdefault(m["prefix"], {})
                 parts[m["proj"]] = value
@@ -107,14 +117,14 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
                     out.append((f"{m['prefix']}.gate_and_up_proj.weight", fused))
                     del pending[m["prefix"]]
                 continue
-            out.append((_rename(key, _NATIVE_TO_HF), value))
+            out.append((_rename(key, _AUTOMODEL_TO_HF), value))
         if pending:
             raise ValueError(f"Unpaired expert gate/up projections: {sorted(pending)}")
         if exclude_key_regex:
             out = [(k, v) for k, v in out if not re.match(exclude_key_regex, k)]
         return out
 
-    def _fused_gate_up_load_destinations(self, fqn: str, tensor: Any) -> list[tuple[str, Any]]:
+    def _fused_gate_up_load_destinations(self, fqn: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         """Checkpoint-load destinations for one layer's grouped ``gate_and_up_projs``.
 
         The release stores each expert's projections fused and half-swapped (``[up; gate]``), which cannot be a view
@@ -132,8 +142,10 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
             for expert_id in self._last_expert_ids
         ]
 
-    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, **kwargs) -> dict[str, Any]:
-        out: dict[str, Any] = {}
+    def to_hf(
+        self, state_dict: dict[str, torch.Tensor], exclude_key_regex: str | None = None, **kwargs: object
+    ) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
         for fqn, tensor in state_dict.items():
             for key, value in self.convert_single_tensor_to_hf(
                 fqn, tensor, exclude_key_regex=exclude_key_regex, **kwargs
@@ -141,7 +153,9 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
                 out[key] = value
         return out
 
-    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+    def convert_single_tensor_to_hf(
+        self, fqn: str, tensor: torch.Tensor, **kwargs: object
+    ) -> list[tuple[str, torch.Tensor]]:
         exclude_key_regex = kwargs.get("exclude_key_regex")
         if kwargs.get("for_checkpoint_load") and fqn.endswith(".mlp.experts.gate_and_up_projs"):
             pairs = self._fused_gate_up_load_destinations(fqn, tensor)
