@@ -59,7 +59,8 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 
 def _model_dtype(config: HunyuanImage3Config) -> torch.dtype:
-    return dtype_from_str(config.torch_dtype, default=torch.bfloat16)
+    dtype = getattr(config, "dtype", None) or getattr(config, "torch_dtype", None)
+    return dtype if isinstance(dtype, torch.dtype) else dtype_from_str(dtype, default=torch.bfloat16)
 
 
 def build_moe_config(config: HunyuanImage3Config, overrides: dict[str, Any] | None = None) -> MoEConfig:

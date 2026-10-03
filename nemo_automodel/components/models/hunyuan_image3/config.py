@@ -109,8 +109,9 @@ class HunyuanImage3Config(PretrainedConfig):
         self.image_base_size = image_base_size
         self.image_token_id = image_token_id
         self.vae = vae if vae is not None else {"latent_channels": 32}
-        self.torch_dtype = torch_dtype
         kwargs.pop("head_dim", None)
+        # Let PretrainedConfig own the dtype (transformers 5 stores it as ``dtype``, 4.x as ``torch_dtype``).
+        kwargs["dtype"] = kwargs.get("dtype") or torch_dtype
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

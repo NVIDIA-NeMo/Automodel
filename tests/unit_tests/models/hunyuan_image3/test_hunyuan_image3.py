@@ -27,6 +27,7 @@ from nemo_automodel.components.models.hunyuan_image3.config import HunyuanImage3
 from nemo_automodel.components.models.hunyuan_image3.flow_adapter import HunyuanImage3Adapter
 from nemo_automodel.components.models.hunyuan_image3.model import (
     HunyuanImage3ForCausalMM,
+    _model_dtype,
     build_joint_attention_mask,
     build_moe_config,
 )
@@ -90,6 +91,12 @@ def _model(seed: int = 0, **config_overrides) -> HunyuanImage3ForCausalMM:
     return model.eval()
 
 
+@pytest.fixture(scope="module")
+def model() -> HunyuanImage3ForCausalMM:
+    """One tiny fp32 model shared by the tests that only read it."""
+    return _model()
+
+
 def _sequence(prompt_len: int, num_image: int) -> torch.Tensor:
     prompt = torch.randint(0, 200, (prompt_len,))
     return torch.cat([prompt, torch.tensor([TIMESTEP_ID]), torch.full((num_image,), IMAGE_ID), torch.tensor([3])])
@@ -106,6 +113,11 @@ def test_config_defaults_match_release_and_head_dim_alias():
     assert config.head_dim == config.attention_head_dim == 128
     assert config.latent_channels == 32
     assert per_layer([3, 5], 1) == 5 and per_layer(7, 4) == 7
+
+
+@pytest.mark.parametrize("dtype, expected", [("float32", torch.float32), ("bfloat16", torch.bfloat16)])
+def test_model_dtype_follows_config(dtype, expected):
+    assert _model_dtype(HunyuanImage3Config(torch_dtype=dtype)) == expected
 
 
 def test_moe_config_matches_release_routing():
@@ -192,8 +204,7 @@ def test_joint_attention_mask():
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def test_forward_shapes_and_text_logits():
-    model = _model()
+def test_forward_shapes_and_text_logits(model):
     latents = torch.randn(2, 4, 2, 3)
     input_ids = torch.stack([_sequence(5, 6), _sequence(5, 6)])
     (velocity,) = model(input_ids, latents, torch.tensor([10.0, 900.0]))
@@ -205,8 +216,7 @@ def test_forward_shapes_and_text_logits():
     assert model.get_output_embeddings() is model.lm_head
 
 
-def test_forward_is_invariant_to_right_padding_and_batching():
-    model = _model()
+def test_forward_is_invariant_to_right_padding_and_batching(model):
     latents = torch.randn(2, 4, 2, 3)
     short, long = _sequence(3, 6), _sequence(7, 6)
     timesteps = torch.tensor([250.0, 700.0])
@@ -218,14 +228,12 @@ def test_forward_is_invariant_to_right_padding_and_batching():
     torch.testing.assert_close(batched[:1], alone, rtol=1e-4, atol=1e-5)
 
 
-def test_forward_rejects_wrong_image_token_count():
-    model = _model()
+def test_forward_rejects_wrong_image_token_count(model):
     with pytest.raises(ValueError, match="image tokens"):
         model(_sequence(3, 5)[None], torch.randn(1, 4, 2, 3), torch.tensor([1.0]))
 
 
-def test_timestep_changes_prediction():
-    model = _model()
+def test_timestep_changes_prediction(model):
     ids, latents = _sequence(3, 6)[None], torch.randn(1, 4, 2, 3)
     (a,) = model(ids, latents, torch.tensor([10.0]))
     (b,) = model(ids, latents, torch.tensor([990.0]))
@@ -260,8 +268,7 @@ def _expected_hf_keys(config: HunyuanImage3Config) -> set[str]:
     return keys
 
 
-def test_to_hf_produces_release_keys_and_fused_up_gate_layout():
-    model = _model()
+def test_to_hf_produces_release_keys_and_fused_up_gate_layout(model):
     config = model.config
     hf = model.state_dict_adapter.to_hf(model.state_dict())
     image_keys = {k for k in hf if re.match(r"(patch_embed|final_layer|time_embed|time_embed_2|timestep_emb)\.", k)}
@@ -279,8 +286,7 @@ def test_to_hf_produces_release_keys_and_fused_up_gate_layout():
     )
 
 
-def test_hf_round_trip_and_unused_release_modules():
-    model = _model()
+def test_hf_round_trip_and_unused_release_modules(model):
     native = {k: v.clone() for k, v in model.state_dict().items()}
     hf = model.state_dict_adapter.to_hf(native)
     hf["vae.encoder.conv_in.weight"] = torch.zeros(1)
@@ -292,16 +298,14 @@ def test_hf_round_trip_and_unused_release_modules():
         torch.testing.assert_close(restored[key], value, msg=key)
 
 
-def test_from_hf_rejects_wrong_expert_shape():
-    model = _model()
+def test_from_hf_rejects_wrong_expert_shape(model):
     hf = model.state_dict_adapter.to_hf(model.state_dict())
     hf["model.layers.0.mlp.experts.0.gate_and_up_proj.weight"] = torch.zeros(10, 64)
     with pytest.raises(ValueError, match="expected 64 rows"):
         model.state_dict_adapter.from_hf(hf)
 
 
-def test_to_hf_honors_exclude_regex():
-    model = _model()
+def test_to_hf_honors_exclude_regex(model):
     hf = model.state_dict_adapter.to_hf(model.state_dict(), exclude_key_regex=r".*experts.*")
     assert not any("experts" in key for key in hf)
     assert "model.wte.weight" in hf
@@ -343,7 +347,7 @@ def _context(cfg_dropout_prob: float = 0.0) -> FlowMatchingContext:
     )
 
 
-def test_adapter_builds_padded_sequences():
+def test_adapter_builds_padded_sequences(model):
     adapter = HunyuanImage3Adapter(image_token_id=IMAGE_ID, pad_token_id=PAD_ID)
     inputs = adapter.prepare_inputs(_context())
     ids = inputs["input_ids"]
@@ -353,7 +357,6 @@ def test_adapter_builds_padded_sequences():
     assert inputs["valid_lengths"].tolist() == [11, 9]
     assert inputs["timestep"].dtype == torch.float32
 
-    model = _model()
     pred = adapter.forward(model, inputs)
     assert pred.shape == (2, 4, 2, 3)
 
