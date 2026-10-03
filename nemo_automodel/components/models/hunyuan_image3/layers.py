@@ -39,6 +39,14 @@ class HunyuanRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize over the last axis.
+
+        Args:
+            x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+        Returns:
+            Tensor of shape [..., hidden] in the promoted dtype of ``weight`` and ``x``.
+        """
         input_dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -107,8 +115,8 @@ class HunyuanImage3Attention(nn.Module):
         k = k.to(v.dtype)
 
         # Query head h uses KV head h // q_per_kv (the fused layout groups query heads by KV head).
-        k = k.repeat_interleave(self.q_per_kv, dim=1)
-        v = v.repeat_interleave(self.q_per_kv, dim=1)
+        k = k[:, :, None].expand(batch, self.num_kv_heads, self.q_per_kv, seq, self.head_dim).flatten(1, 2)
+        v = v[:, :, None].expand(batch, self.num_kv_heads, self.q_per_kv, seq, self.head_dim).flatten(1, 2)
         if attention_mask is None:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
@@ -139,6 +147,14 @@ class HunyuanSharedMLP(nn.Module):
         self.down_proj = initialize_linear_module(backend.linear, inter_dim, dim, bias=bias, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the shared expert.
+
+        Args:
+            x: Tensor of shape [tokens, hidden].
+
+        Returns:
+            Tensor of shape [tokens, hidden].
+        """
         up, gate = self.gate_and_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(up * F.silu(gate))
 
@@ -151,7 +167,16 @@ class HunyuanSharedMLP(nn.Module):
 
 
 def timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
-    """Sinusoidal embedding ``[B] -> [B, dim]`` in fp32, cos half first."""
+    """Sinusoidal timestep features, cosine half first.
+
+    Args:
+        t: Tensor of shape [batch] holding (possibly fractional) timesteps.
+        dim: Feature size.
+        max_period: Longest sinusoid period.
+
+    Returns:
+        fp32 tensor of shape [batch, dim].
+    """
     half = dim // 2
     freqs = torch.exp(-math.log(max_period) * torch.arange(half, device=t.device, dtype=torch.float32) / half)
     args = t.float()[:, None] * freqs[None]
@@ -174,6 +199,14 @@ class TimestepEmbedder(nn.Module):
         )
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """Embed timesteps.
+
+        Args:
+            t: Tensor of shape [batch] holding timesteps in [0, 1000].
+
+        Returns:
+            Tensor of shape [batch, hidden] in the MLP weight dtype.
+        """
         freq = timestep_embedding(t, self.frequency_embedding_size).to(self.mlp[0].weight.dtype)
         return self.mlp(freq)
 
@@ -191,6 +224,14 @@ class GroupNorm32(nn.GroupNorm):
         super().__init__(32, channels, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize channel groups.
+
+        Args:
+            x: Tensor of shape [batch, channels, height, width].
+
+        Returns:
+            Tensor of shape [batch, channels, height, width] in the dtype of ``x``.
+        """
         weight = self.weight.float() if self.weight is not None else None
         bias = self.bias.float() if self.bias is not None else None
         return F.group_norm(x.float(), self.num_groups, weight, bias, self.eps).to(x.dtype)
@@ -218,6 +259,15 @@ class ResBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        """Run the block.
+
+        Args:
+            x: Tensor of shape [batch, in_channels, height, width].
+            emb: Tensor of shape [batch, emb_channels] timestep embedding.
+
+        Returns:
+            Tensor of shape [batch, out_channels, height, width].
+        """
         h = self.in_layers(x)
         scale, shift = self.emb_layers(emb)[:, :, None, None].chunk(2, dim=1)
         h = self.out_layers[0](h) * (1.0 + scale) + shift
@@ -240,6 +290,15 @@ class UNetDown(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        """Embed latents as tokens.
+
+        Args:
+            x: Tensor of shape [batch, channels, height, width] VAE latents.
+            emb: Tensor of shape [batch, hidden] timestep embedding.
+
+        Returns:
+            Tensor of shape [batch, height * width, hidden], tokens in row-major (height, width) order.
+        """
         x = self.model[0](x)
         x = self.model[1](x, emb)
         return x.flatten(2).transpose(1, 2)
@@ -264,6 +323,17 @@ class UNetUp(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor, token_h: int, token_w: int) -> torch.Tensor:
+        """Project image tokens back to latent space.
+
+        Args:
+            x: Tensor of shape [batch, token_h * token_w, hidden], tokens in row-major (height, width) order.
+            emb: Tensor of shape [batch, hidden] timestep embedding.
+            token_h: Image height in tokens.
+            token_w: Image width in tokens.
+
+        Returns:
+            Tensor of shape [batch, channels, token_h, token_w].
+        """
         batch, _, channels = x.shape
         x = x.transpose(1, 2).reshape(batch, channels, token_h, token_w)
         x = self.model[0](x, emb)

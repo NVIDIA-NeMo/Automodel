@@ -142,6 +142,50 @@ def test_moe_config_rejects_unsupported_layouts(overrides, message):
         build_moe_config(_config(**overrides))
 
 
+def test_checkpoint_config_resolves_to_local_class(tmp_path):
+    """The release config.json (with remote-code auto_map) loads without trust_remote_code."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _has_custom_model
+    from nemo_automodel._transformers.model_init import get_hf_config
+
+    config = {
+        "architectures": ["HunyuanImage3ForCausalMM"],
+        "auto_map": {"AutoConfig": "configuration_hunyuan.HunyuanImage3Config"},
+        "model_type": "hunyuan_image_3_moe",
+        "num_experts": 64,
+        "moe_topk": [8, 8],
+        "head_dim": 128,
+        "torch_dtype": "bfloat16",
+    }
+    (tmp_path / "config.json").write_text(__import__("json").dumps(config))
+    resolved = get_hf_config(str(tmp_path), attn_implementation=None, trust_remote_code=False)
+    assert isinstance(resolved, HunyuanImage3Config)
+    assert resolved.moe_topk == [8, 8] and resolved.head_dim == 128
+    assert _model_dtype(resolved) == torch.bfloat16
+    assert _has_custom_model(str(tmp_path))
+
+
+def test_tied_embeddings_are_rejected():
+    with pytest.raises(NotImplementedError, match="tie"):
+        HunyuanImage3ForCausalMM(_config(tie_word_embeddings=True), backend=_backend())
+
+
+def test_random_init_gives_finite_forward_and_backward():
+    torch.manual_seed(0)
+    model = HunyuanImage3ForCausalMM(_config(), backend=_backend())
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    for name, param in model.named_parameters():
+        assert torch.isfinite(param).all(), name
+    (pred,) = model(_sequence(3, 6)[None], torch.randn(1, 4, 2, 3), torch.tensor([500.0]))
+    pred.backward(torch.randn_like(pred))
+    assert torch.isfinite(pred).all()
+    grads = {name: p.grad for name, p in model.named_parameters() if p.grad is not None}
+    assert all(torch.isfinite(g).all() for g in grads.values())
+    # The image path reaches the decoder, the router and the routed experts.
+    for name in ("patch_embed.model.0.weight", "model.layers.0.mlp.gate.weight", "final_layer.model.1.2.weight"):
+        assert name in grads, name
+    assert any(".mlp.experts." in name for name in grads)
+
+
 def test_model_rejects_unsupported_options():
     with pytest.raises(NotImplementedError, match="patch_size=1"):
         HunyuanImage3ForCausalMM(_config(patch_size=2), backend=_backend())

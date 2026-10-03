@@ -39,6 +39,10 @@ import torch.nn as nn
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.hunyuan_image3.config import HunyuanImage3Config, per_layer
 from nemo_automodel.components.models.hunyuan_image3.layers import (
@@ -126,6 +130,19 @@ class HunyuanImage3Block(nn.Module):
         attention_mask: torch.Tensor | None,
         padding_mask: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Run one decoder layer.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden].
+            cos: fp32 tensor of shape [batch, sequence, head_dim] rotary table.
+            sin: fp32 tensor of shape [batch, sequence, head_dim] rotary table.
+            attention_mask: Boolean tensor of shape [batch, 1, sequence, sequence], true where attention is
+                allowed, or ``None`` for causal attention.
+            padding_mask: Boolean tensor of shape [batch, sequence], true at padding, or ``None``.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
         x = x + self.self_attn(self.input_layernorm(x), cos, sin, attention_mask)
         return x + self.mlp(self.post_attention_layernorm(x), padding_mask)
 
@@ -160,7 +177,19 @@ class HunyuanImage3Model(nn.Module):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the decoder layers; returns the last hidden states *before* the final norm."""
+        """Run the decoder layers.
+
+        Args:
+            inputs_embeds: Tensor of shape [batch, sequence, hidden].
+            cos: fp32 tensor of shape [batch, sequence, head_dim] rotary table.
+            sin: fp32 tensor of shape [batch, sequence, head_dim] rotary table.
+            attention_mask: Boolean tensor of shape [batch, 1, sequence, sequence], true where attention is
+                allowed, or ``None`` for causal attention.
+            padding_mask: Boolean tensor of shape [batch, sequence], true at padding, or ``None``.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden]: the last hidden states *before* the final norm.
+        """
         h = inputs_embeds
         for layer in self.layers.values():
             h = layer(h, cos, sin, attention_mask, padding_mask)
@@ -181,9 +210,13 @@ def build_joint_attention_mask(
 
     Args:
         seq_len: Padded sequence length.
-        image_starts: ``[batch]`` index of the first image token of every sample.
+        image_starts: Long tensor of shape [batch], index of the first image token of every sample.
         num_image_tokens: Number of image tokens (same for every sample of a batch).
-        valid_lengths: ``[batch]`` number of real (non-padding) tokens of every sample.
+        valid_lengths: Long tensor of shape [batch], number of real (non-padding) tokens of every sample.
+
+    Returns:
+        Boolean tensor of shape [batch, 1, sequence, sequence], indexed [batch, 1, query, key], true where
+        attention is allowed.
     """
     device = image_starts.device
     index = torch.arange(seq_len, device=device)
@@ -204,6 +237,8 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
     next-token logits (the release's ``gen_text`` mode) and is used for parity checks.
     """
 
+    # The released checkpoint has separate wte / lm_head weights.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     # The release keeps the router in fp32.
     _keep_in_fp32_modules_strict = ["mlp.gate"]
 
@@ -241,6 +276,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         **kwargs: Any,
     ):
         super().__init__()
+        reject_unsupported_tie_word_embeddings(type(self), config)
         if config.img_proj_type != "unet" or config.patch_size != 1:
             raise NotImplementedError("Only the released UNet image projection with patch_size=1 is supported.")
         self.config = config
@@ -332,7 +368,14 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         return {"sample": sample} if return_dict else (sample,)
 
     def forward_text(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Next-token logits ``[batch, seq, vocab]`` (fp32) of a causal text-only sequence."""
+        """Next-token logits of a causal text-only sequence (the release's ``gen_text`` mode).
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence].
+
+        Returns:
+            fp32 tensor of shape [batch, sequence, vocab].
+        """
         _, seq_len = input_ids.shape
         cos, sin = rope_cos_sin(
             text_positions(seq_len, device=input_ids.device)[None],

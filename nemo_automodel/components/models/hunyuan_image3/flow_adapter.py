@@ -52,6 +52,17 @@ class HunyuanImage3Adapter(ModelAdapter):
         self.pad_token_id = pad_token_id
 
     def prepare_inputs(self, context: FlowMatchingContext) -> dict[str, Any]:
+        """Assemble model inputs.
+
+        Args:
+            context: ``noisy_latents`` of shape [batch, channels, height, width], ``timesteps`` of shape [batch]
+                (``sigma * 1000``) and a batch holding per-sample 1D long tensors under ``prompt_input_ids``,
+                ``uncond_prompt_input_ids`` and ``prompt_suffix_ids``.
+
+        Returns:
+            ``input_ids`` long [batch, sequence] right-padded with ``pad_token_id``, ``latents`` [batch, channels,
+            height, width], fp32 ``timestep`` [batch] and long ``valid_lengths`` [batch].
+        """
         batch = context.batch
         noisy = context.noisy_latents
         if noisy.ndim != 4:
@@ -82,4 +93,9 @@ class HunyuanImage3Adapter(ModelAdapter):
         }
 
     def forward(self, model: nn.Module, inputs: dict[str, Any]) -> torch.Tensor:
+        """Run the model on ``prepare_inputs`` output.
+
+        Returns:
+            Tensor of shape [batch, channels, height, width]: the predicted velocity ``noise - x0``.
+        """
         return self.post_process_prediction(model(**inputs, return_dict=False))

@@ -29,12 +29,15 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
 from .base import BaseModelProcessor
 from .registry import ProcessorRegistry
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.datasets.diffusion.multi_tier_bucketing import MultiTierBucketCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,15 @@ class HunyuanImage3Processor(BaseModelProcessor):
         self._image_processor = image_processor_cls(config)
         self._sequence_template = sequence_template
         return {"vae": _load_vae(model_dir, config, device), "config": config}
+
+    def target_resolution(self, width: int, height: int, calculator: MultiTierBucketCalculator) -> tuple[int, int]:
+        """Snap to the release's resolution group (33 aspect ratios around ``image_base_size``).
+
+        The release only generates these sizes, and its ``<img_ratio_*>`` token names one of them; the generic
+        bucket calculator is not used.
+        """
+        target_width, target_height = self._image_processor.reso_group.get_target_size(width, height)
+        return int(target_width), int(target_height)
 
     def encode_image(self, image_tensor: torch.Tensor, models: Dict[str, Any], device: str) -> torch.Tensor:
         vae = models["vae"]

@@ -73,7 +73,16 @@ def _rename(key: str, renames: tuple[tuple[re.Pattern[str], str], ...]) -> str:
 
 
 def _fuse_gate_up(pairs: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
-    """Merge per-expert ``gate_proj`` / ``up_proj`` entries into released ``gate_and_up_proj`` = ``[up; gate]``."""
+    """Merge per-expert ``gate_proj`` / ``up_proj`` entries into the released ``gate_and_up_proj``.
+
+    Args:
+        pairs: ``(key, tensor)`` entries. Per-expert ``gate_proj`` / ``up_proj`` tensors have shape
+            [expert_hidden, hidden]; other entries pass through unchanged.
+
+    Returns:
+        Entries where each expert's gate/up pair became one new tensor of shape [2 * expert_hidden, hidden] whose
+        rows are ``[up; gate]``.
+    """
     out: list[tuple[str, Any]] = []
     pending: dict[str, dict[str, Any]] = {}
     for key, value in pairs:
@@ -115,7 +124,20 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
         return out
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
-        """Convert one native tensor to one or more released checkpoint entries."""
+        """Convert one native tensor to one or more released checkpoint entries.
+
+        Args:
+            fqn: Native parameter name.
+            tensor: Native tensor; grouped ``gate_and_up_projs`` have shape [experts, hidden, 2 * expert_hidden]
+                with columns ``[gate | up]`` and ``down_projs`` [experts, expert_hidden, hidden] (DTensors sharded
+                on the expert axis under expert parallelism).
+            **kwargs: Forwarded to the shared expert split (``exclude_key_regex`` filters the output keys).
+
+        Returns:
+            ``(key, tensor)`` entries in the released layout: per local expert, ``gate_and_up_proj`` of shape
+            [2 * expert_hidden, hidden] (rows ``[up; gate]``, new storage) and ``down_proj`` of shape
+            [hidden, expert_hidden]; other tensors are renamed only.
+        """
         exclude_key_regex = kwargs.pop("exclude_key_regex", None)
         if fqn.endswith(".mlp.experts.gate_and_up_projs"):
             # The fused output is new storage: never register the grouped tensor as loaded in place.
@@ -136,7 +158,18 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
     def from_hf(
         self, hf_state_dict: dict[str, Any], device_mesh: DeviceMesh | None = None, **kwargs: Any
     ) -> dict[str, Any]:
-        """Convert released checkpoint entries to the native layout (local experts only under EP)."""
+        """Convert released checkpoint entries to the native layout (local experts only under EP).
+
+        Args:
+            hf_state_dict: Released entries; consumed (popped) by this call. Per-expert ``gate_and_up_proj`` has
+                shape [2 * expert_hidden, hidden] with rows ``[up; gate]``.
+            device_mesh: Mesh whose ``ep`` axis selects the local experts, or ``None`` for all experts.
+            **kwargs: Unused; accepted for the base-class signature.
+
+        Returns:
+            Native state dict; grouped ``gate_and_up_projs`` of shape [local_experts, hidden, 2 * expert_hidden]
+            (columns ``[gate | up]``) and ``down_projs`` of shape [local_experts, expert_hidden, hidden].
+        """
         native: dict[str, Any] = {}
         intermediate = self.moe_config.moe_inter_dim
         for key in list(hf_state_dict):
