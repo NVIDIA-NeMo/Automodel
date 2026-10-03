@@ -26,6 +26,7 @@ loaded from the checkpoint at preprocessing time (``trust_remote_code``) and not
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -86,8 +87,11 @@ class HunyuanImage3Processor(BaseModelProcessor):
         logger.info("[HunyuanImage-3.0] Loading VAE and tokenizer from %s", model_dir)
         config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-        wrapper_cls = get_class_from_dynamic_module("tokenizer_wrapper.TokenizerWrapper", model_dir)
         image_processor_cls = get_class_from_dynamic_module("image_processor.HunyuanImage3ImageProcessor", model_dir)
+        # Take the wrapper from the package the image processor imported it from: a second dynamic load can create a
+        # separate module copy whose ImageInfo fails the wrapper's isinstance checks.
+        package = image_processor_cls.__module__.rsplit(".", 1)[0]
+        wrapper_cls = importlib.import_module(f"{package}.tokenizer_wrapper").TokenizerWrapper
         with open(os.path.join(model_dir, "generation_config.json")) as f:
             sequence_template = json.load(f).get("sequence_template", "pretrain")
         # Token construction happens in get_cache_data, which does not receive the models dict.

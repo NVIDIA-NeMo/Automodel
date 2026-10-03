@@ -169,6 +169,9 @@ def test_tied_embeddings_are_rejected():
         HunyuanImage3ForCausalMM(_config(tie_word_embeddings=True), backend=_backend())
 
 
+@pytest.mark.runtime_budget(
+    60, hard_timeout=70, reason="first MoE forward/backward compiles the torch.compile'd expert activation kernels"
+)
 def test_random_init_gives_finite_forward_and_backward():
     torch.manual_seed(0)
     model = HunyuanImage3ForCausalMM(_config(), backend=_backend())
