@@ -263,7 +263,9 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
             _to_grouped_mm_operand(self.lora_down_B, x.dtype),
         )
 
-        if torch.count_nonzero(tokens_per_expert) > 0:
+        # Capacity mode never dispatches an empty buffer, so its per-microbatch host read is skipped (as in
+        # GroupedExpertsDeepEP.forward).
+        if self.dispatcher_capacity_factor is not None or torch.count_nonzero(tokens_per_expert) > 0:
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
 
