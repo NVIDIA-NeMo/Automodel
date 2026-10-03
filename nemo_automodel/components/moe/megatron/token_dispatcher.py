@@ -1073,15 +1073,20 @@ class MoEFlexTokenDispatcher:
                     self._comm_manager.moe_hybridep_num_sms_preprocessing,
                     self._comm_manager.moe_hybridep_num_blocks_permute,
                     self._comm_manager.moe_hybridep_num_blocks_unpermute,
+                    self._comm_manager.hybridep_capacity_factor,
+                    self._comm_manager.equal_token_counts,
                 ) != (
                     self.config.moe_hybridep_compact_routing,
                     self.config.moe_hybridep_permute_fusion,
                     self.config.moe_hybridep_num_sms_preprocessing,
                     self.config.moe_hybridep_num_blocks_permute,
                     self.config.moe_hybridep_num_blocks_unpermute,
+                    self.config.moe_hybridep_capacity_factor,
+                    self.config.moe_hybridep_equal_token_counts,
                 ):
                     raise ValueError(
-                        "Shared HybridEP dispatchers must use identical routing, fusion, and kernel tuning settings"
+                        "Shared HybridEP dispatchers must use identical routing, fusion, kernel tuning, and sync-free "
+                        "dispatch settings"
                     )
             else:
                 self._comm_manager = _HybridEPManager(

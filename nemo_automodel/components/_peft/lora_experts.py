@@ -413,6 +413,10 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
         self.dispatcher_hybridep_num_blocks_permute = orig_module.dispatcher_hybridep_num_blocks_permute
         self.dispatcher_hybridep_num_blocks_unpermute = orig_module.dispatcher_hybridep_num_blocks_unpermute
+        # Sync-free dispatch knobs (BackendConfig.dispatcher_capacity_factor / dispatcher_equal_token_counts) travel
+        # with the other HybridEP settings: the shared dispatcher is built from the first (wrapped) layer.
+        self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
+        self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
 
         self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
         self.down_projs.data.copy_(orig_module.down_projs.data)
@@ -521,7 +525,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
-        if torch.count_nonzero(tokens_per_expert) > 0:
+        # Capacity mode never dispatches an empty buffer, so its per-microbatch host read is skipped (as in
+        # GroupedExpertsDeepEP.forward).
+        if self.dispatcher_capacity_factor is not None or torch.count_nonzero(tokens_per_expert) > 0:
             lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
                 lora_gate_and_up_A, lora_gate_and_up_B
             )

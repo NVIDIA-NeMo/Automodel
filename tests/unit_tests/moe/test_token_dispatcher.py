@@ -416,6 +416,8 @@ def test_hybridep_preprocess_records_cuda_graph_sample(hybrid_ep_manager, monkey
         ("moe_hybridep_num_sms_preprocessing", 12),
         ("moe_hybridep_num_blocks_permute", 16),
         ("moe_hybridep_num_blocks_unpermute", 16),
+        ("moe_hybridep_capacity_factor", 1.5),
+        ("moe_hybridep_equal_token_counts", True),
     ],
 )
 def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, setting, value):
@@ -430,7 +432,7 @@ def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, sett
     assert first._comm_manager is second._comm_manager
 
     monkeypatch.setattr(config, setting, value)
-    with pytest.raises(ValueError, match="identical routing, fusion, and kernel tuning"):
+    with pytest.raises(ValueError, match="identical routing, fusion, kernel tuning, and sync-free"):
         MoEFlexTokenDispatcher(2, [0, 1], config, group)
 
 
