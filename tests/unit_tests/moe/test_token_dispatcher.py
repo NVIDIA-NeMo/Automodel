@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -113,6 +114,41 @@ class TestHybridEPRuntimeInitialization:
         assert hybrid_ep_manager.handle is old_handle
         assert torch.equal(parameter.grad, torch.tensor([7.0]))
         assert torch.equal(actual_rng, expected_rng)
+
+    @pytest.mark.parametrize("calibrated", [None, 8])
+    def test_runtime_warmup_leaves_capacity_mode_uncalibrated(self, monkeypatch, caplog, calibrated):
+        """The synthetic warmup dispatch must neither become nor use capacity mode's calibration.
+
+        ``calibrated=8`` is the growth path: a re-warmup after real batches already calibrated the
+        capacity must not run the synthetic dispatch non-blocking at that capacity, nor recalibrate it.
+        """
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            manager = _HybridEPManager(
+                group=None, num_local_experts=2, num_experts=8, router_topk=2, moe_hybridep_capacity_factor=1.5
+            )
+        manager._hybridep_capacity = calibrated
+        passed = []
+
+        def fake_dispatch(x, routing_map, probs, num_permuted_tokens=None, **kwargs):
+            passed.append(num_permuted_tokens)
+            token_rows = routing_map.nonzero(as_tuple=False)[:, 0]
+            return x[token_rows], probs[routing_map], None, routing_map.sum(dim=0), "runtime-handle"
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        monkeypatch.setattr(
+            td, "hybrid_ep_combine", lambda x, **kwargs: x.reshape(5, manager.router_topk, 4).sum(dim=1)
+        )
+        with caplog.at_level(logging.INFO, logger=td.__name__):
+            manager.initialize_runtime(num_tokens=5, hidden_dim=4, dtype=torch.float32, device=torch.device("cpu"))
+
+        assert passed == [None], "warmup dispatch ran on the blocking path (no capacity passed)"
+        assert manager._hybridep_capacity == calibrated, "calibration neither taken from nor changed by the warmup"
+        assert manager.hybridep_capacity_factor == 1.5, "knob restored after the warmup"
+        assert "HybridEP capacity mode: calibrated" not in caplog.text
 
     def test_runtime_capacity_matches_hybridep_floor_rounding_and_group_max(self, hybrid_ep_manager, monkeypatch):
         initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 16, torch.bfloat16)
@@ -451,3 +487,112 @@ class TestHybridEPStaticRoutingPadPin:
         assert calls == [4] and sizes == [12, 12]
         calls2, sizes2 = self._dispatch_n(m, monkeypatch, [16], group_max=16, pin=True)
         assert calls2 == [16] and sizes2 == [16] and m._static_target_tokens == 16
+
+
+class TestHybridEPCapacityMode:
+    """BackendConfig.dispatcher_capacity_factor: one blocking calibration dispatch, then every dispatch passes
+    the calibrated capacity as num_permuted_tokens (non-blocking) and guards HybridEP's overflow flag."""
+
+    def _run(self, monkeypatch, factor, num_tokens_seq, tpe_rows, overflow=0, static=False):
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            m = _HybridEPManager(
+                group=None,
+                num_local_experts=2,
+                num_experts=8,
+                router_topk=2,
+                benchmark_static_routing=static,
+                moe_hybridep_capacity_factor=factor,
+            )
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        passed, asserts = [], []
+
+        def fake_dispatch(x, routing_map, probs, num_permuted_tokens=None, **kwargs):
+            passed.append(num_permuted_tokens)
+            # blocking mode returns host-side counts; non-blocking returns device-side (cpu stands in) counts
+            tpe = torch.tensor(tpe_rows, dtype=torch.int64)
+            # DeepEP 10d4dd7 layout: slot 10 is num_of_valid_tokens (a Python int), the overflow flag is last
+            handle = tuple([None] * 10 + [int(tpe.sum()), torch.tensor(overflow)])
+            rows = int(tpe.sum()) if num_permuted_tokens is None else int(num_permuted_tokens)
+            return x.new_zeros(rows, x.shape[1]), probs, None, tpe, handle
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        monkeypatch.setattr(torch, "_assert_async", lambda cond, msg="": asserts.append((bool(cond), msg)))
+        for n in num_tokens_seq:
+            m.routing_map = torch.ones(n, 8, dtype=torch.bool)
+            m.token_probs = torch.full((n, 8), 0.125)
+            m.dispatch(torch.randn(n, 4))
+        return m, passed, asserts
+
+    def test_first_dispatch_calibrates_then_passes_the_capacity(self, monkeypatch):
+        m, passed, asserts = self._run(monkeypatch, 1.5, [8, 8, 8], tpe_rows=[5, 5])  # 10 rows x 1.5 = 15 -> aligned 16
+        assert passed == [None, 16, 16]
+        assert m._hybridep_capacity == 16 and m.num_permuted_tokens == 16
+        assert asserts and all(ok for ok, _ in asserts), "overflow guard checked on every capacity dispatch"
+
+    def test_calibration_dispatch_keeps_the_exact_count_for_its_combine(self, monkeypatch):
+        m, passed, _ = self._run(monkeypatch, 2.0, [8], tpe_rows=[5, 5])
+        assert passed == [None] and m.num_permuted_tokens == 10 and m._hybridep_capacity == 20
+
+    def test_overflow_flag_trips_the_guard(self, monkeypatch):
+        _, _, asserts = self._run(monkeypatch, 1.5, [8, 8], tpe_rows=[5, 5], overflow=1)
+        assert asserts and asserts[-1][0] is False and "capacity" in asserts[-1][1]
+
+    def test_static_routing_ignores_the_factor(self, monkeypatch):
+        m, passed, asserts = self._run(monkeypatch, 1.5, [8, 8], tpe_rows=[5, 5], static=True)
+        assert passed[0] is None and m._hybridep_capacity is None and asserts == []
+
+    def test_no_factor_keeps_the_blocking_path(self, monkeypatch):
+        m, passed, asserts = self._run(monkeypatch, None, [8, 8], tpe_rows=[5, 5])
+        assert passed == [None, None] and asserts == []
+
+
+class TestHybridEPEqualTokenCounts:
+    """BackendConfig.dispatcher_equal_token_counts: the pad size is the aligned local row count, with no
+    EP-group all-reduce and no host sync; unset keeps the per-dispatch MAX all-reduce."""
+
+    def _run(self, monkeypatch, equal, num_tokens_seq, group_max):
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            m = _HybridEPManager(
+                group=None,
+                num_local_experts=2,
+                num_experts=8,
+                router_topk=2,
+                benchmark_static_routing=False,
+                moe_hybridep_equal_token_counts=equal,
+            )
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+        calls, sizes = [], []
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            calls.append(int(tensor))
+            tensor.fill_(group_max)
+
+        def fake_dispatch(x, routing_map, probs, **kwargs):
+            sizes.append(x.shape[0])
+            return x, probs, None, routing_map.sum(dim=0), "handle"
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        for n in num_tokens_seq:
+            m.routing_map = torch.ones(n, 8, dtype=torch.bool)
+            m.token_probs = torch.full((n, 8), 0.125)
+            m.dispatch(torch.randn(n, 4))
+        return calls, sizes
+
+    def test_equal_counts_skip_the_collective_and_only_align(self, monkeypatch):
+        calls, sizes = self._run(monkeypatch, True, [6, 8, 9], group_max=99)
+        assert calls == [] and sizes == [8, 8, 12]
+
+    def test_default_keeps_the_per_dispatch_all_reduce(self, monkeypatch):
+        calls, sizes = self._run(monkeypatch, False, [6, 6], group_max=6)
+        assert calls == [6, 6] and sizes == [8, 8]

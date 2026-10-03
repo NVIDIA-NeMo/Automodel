@@ -487,3 +487,15 @@ class TestBackendConfigPartialCudaGraphs:
                 dispatcher="deepep",
                 cuda_graph=CudaGraphConfig(modules=["moe_router", "moe_preprocess"]),
             )
+
+
+class TestBackendConfigHybridEPSyncFree:
+    """The two HybridEP sync-free knobs default off and pass through unchanged."""
+
+    def test_dispatcher_capacity_factor_defaults_off(self):
+        assert BackendConfig().dispatcher_capacity_factor is None
+        assert BackendConfig(dispatcher_capacity_factor=1.5).dispatcher_capacity_factor == 1.5
+
+    def test_dispatcher_equal_token_counts_defaults_off(self):
+        assert BackendConfig().dispatcher_equal_token_counts is False
+        assert BackendConfig(dispatcher_equal_token_counts=True).dispatcher_equal_token_counts is True
