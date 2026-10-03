@@ -225,6 +225,10 @@ class MiniMaxM3TextModel(nn.Module):
                 attn_kwargs=attn_kwargs,
                 forced_blocks=self._msa_forced_blocks,
             )
+            # Plan block selection before the decoder blocks: built lazily inside an activation-checkpointed
+            # block, its one-time ops would be saved by the checkpoint forward and never replayed by the
+            # recompute, shifting every later saved op of that block.
+            msa.prepare_selection()
             # Canonical ids still own padding for the MoE router. Every attention layer packs, so
             # document isolation travels as cu_seqlens and no attention mask may survive: a non-None
             # mask makes the TE backend silently drop cu_seqlens (attention/utils.py:135-143).
