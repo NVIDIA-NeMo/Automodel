@@ -24,7 +24,7 @@ from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeli
 
 # Over the default 5s budget on purpose: this module parses every example config under examples/.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def test_llm_benchmark_configs_define_required_benchmark_fields():

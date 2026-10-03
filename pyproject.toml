@@ -150,6 +150,11 @@ moe = [
     "nemo-automodel[fla]",
     "deep_ep",
 ]
+# MoK is Blackwell-only and requires Python 3.12+ and a matching CUDA 13 toolkit.
+# Keep it opt-in, like msa, instead of adding hardware-specific builds to all.
+mok = [
+    "mixture-of-kittens; sys_platform == 'linux' and python_version >= '3.12'",
+]
 vlm = [
     "backoff",
     "mistral_common>=1.11.0",
@@ -277,6 +282,7 @@ no-build-isolation-package = [
     "flash-attn-3",  # FA3: source build from Dao-AILab/flash-attention hopper/ (needs image torch)
     "magi_attention",
     "mamba-ssm",
+    "mixture-of-kittens",
     "transformer-engine",
     "transformer-engine-torch",
 ]
@@ -331,6 +337,10 @@ prerelease = "allow"
 [tool.uv.extra-build-variables.deep-ep]
 CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl"
 
+[tool.uv.extra-build-variables.mixture-of-kittens]
+CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl"
+LIBRARY_PATH = "/usr/local/cuda/lib64/stubs"
+
 [tool.uv.extra-build-variables.transformer-engine-torch]
 CPLUS_INCLUDE_PATH = "/usr/local/cuda/include:/usr/local/cuda/include/cccl"
 NVTE_BUILD_USE_NVIDIA_WHEELS = "1"
@@ -339,6 +349,9 @@ NVTE_WITH_NCCL_EP = "0"
 [tool.uv.sources]
 megatron-fsdp = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git", rev = "455389c480af6b3acdca74c7830c68b3274eb083", subdirectory = "megatron/core/distributed/fsdp/src" }
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "10d4dd7377d5bce900fbb4b80cce863764892b95" }
+# cursor/mixture-of-kittens#18: qualify the ThunderKittens namespace and support both Blackwell targets.
+# Use the PR author's fork until merged so uv can fetch this revision without GitHub's PR-only refs.
+mixture-of-kittens = { git = "https://github.com/balasaajay/mixture-of-kittens.git", rev = "5c8c32e23d71d88a851ff90dcb6c0b663e445cad" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }

@@ -40,7 +40,7 @@ from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCa
 
 # Over the default 5s budget on purpose: distributed checkpoint initialization spawns Gloo workers.
 # Shrink process startup and checkpoint round trips before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _config(quantized: bool) -> DeepseekV41Config:

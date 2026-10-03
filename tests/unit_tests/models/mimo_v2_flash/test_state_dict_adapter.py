@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -104,12 +105,15 @@ def v26_adapter(moe_config, backend_config):
         swa_head_dim=16,
         swa_v_head_dim=8,
     )
-    return MiMoV2FlashStateDictAdapter(
+    adapter = MiMoV2FlashStateDictAdapter(
         config=config,
         moe_config=moe_config,
         backend=backend_config,
         dtype=torch.float32,
     )
+    # Normally read from the checkpoint index's metadata.tp_size; this config has no checkpoint behind it.
+    adapter.checkpoint_tp_size = 4
+    return adapter
 
 
 class TestShouldQuantizeKey:
@@ -241,21 +245,22 @@ class TestMiMoV26CheckpointLayouts:
         base = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
         torch.testing.assert_close(output, torch.cat((base, base)).unsqueeze(0) * 2.0)
 
-    def test_fused_qkv_deinterleaves_checkpoint_tp4_shards(self):
+    @pytest.mark.parametrize("checkpoint_tp_size", [4, 8])
+    def test_fused_qkv_deinterleaves_checkpoint_shards(self, checkpoint_tp_size):
         config = SimpleNamespace(
             hybrid_layer_pattern=[0],
             hidden_size=3,
-            num_attention_heads=4,
-            num_key_value_heads=4,
+            num_attention_heads=checkpoint_tp_size,
+            num_key_value_heads=checkpoint_tp_size,
             head_dim=2,
             v_head_dim=2,
-            swa_num_attention_heads=4,
-            swa_num_key_value_heads=4,
+            swa_num_attention_heads=checkpoint_tp_size,
+            swa_num_key_value_heads=checkpoint_tp_size,
             swa_head_dim=2,
             swa_v_head_dim=2,
         )
         shards = []
-        for shard_idx in range(4):
+        for shard_idx in range(checkpoint_tp_size):
             query = torch.full((2, 3), float(shard_idx))
             key = torch.full((2, 3), float(10 + shard_idx))
             value = torch.full((2, 3), float(20 + shard_idx))
@@ -265,10 +270,11 @@ class TestMiMoV26CheckpointLayouts:
             None,
             config=config,
             layer_idx=0,
+            checkpoint_tp_size=checkpoint_tp_size,
             dtype=torch.float32,
             name="model.layers.0.self_attn.qkv_proj.weight",
         )
-        for shard_idx in range(4):
+        for shard_idx in range(checkpoint_tp_size):
             assert torch.all(query[2 * shard_idx : 2 * shard_idx + 2] == shard_idx)
             assert torch.all(key[2 * shard_idx : 2 * shard_idx + 2] == 10 + shard_idx)
             assert torch.all(value[2 * shard_idx : 2 * shard_idx + 2] == 20 + shard_idx)
@@ -429,6 +435,7 @@ class TestMiMoV26CheckpointLayouts:
                 None,
                 config=v26_adapter.config,
                 layer_idx=0,
+                checkpoint_tp_size=v26_adapter.checkpoint_tp_size,
                 dtype=torch.float32,
                 name="model.layers.0.self_attn.qkv_proj.weight",
             )
@@ -730,4 +737,104 @@ class TestRoundTrip:
                 atol=1e-5,
                 rtol=1e-5,
                 msg=f"Round-trip mismatch at {key}",
+            )
+
+
+def _pro_full_attention_config(**overrides):
+    """Build MiMo-V2.6-Pro full-attention QKV geometry with a small hidden size."""
+    from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config
+
+    return MiMoV2Config(
+        hidden_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=128,
+        num_key_value_heads=8,
+        head_dim=192,
+        v_head_dim=128,
+        hybrid_layer_pattern=[0],
+        moe_layer_freq=[0],
+        **overrides,
+    )
+
+
+def _write_index(directory, metadata):
+    """Write a minimal safetensors index carrying ``metadata``."""
+    index = {"metadata": metadata, "weight_map": {"model.layers.0.self_attn.qkv_proj.weight": "model.safetensors"}}
+    (directory / "model.safetensors.index.json").write_text(json.dumps(index))
+    return str(directory)
+
+
+class TestProCheckpointQKV:
+    def test_tp8_fp8_partial_blocks_and_native_destinations(self, tmp_path, moe_config, backend_config):
+        config = _pro_full_attention_config(name_or_path=_write_index(tmp_path, {"tp_size": 8}))
+        adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
+        prefix = "model.layers.0.self_attn"
+        native = {
+            f"{prefix}.q_proj.weight": torch.zeros(24576, 128),
+            f"{prefix}.k_proj.weight": torch.zeros(1536, 128),
+            f"{prefix}.v_proj.weight": torch.zeros(1024, 128),
+        }
+        checkpoint = adapter.to_hf(native, quantization=True, for_checkpoint_load=True)
+        weight_key = f"{prefix}.qkv_proj.weight"
+        assert checkpoint[weight_key].shape == (27136, 128)
+        assert checkpoint[weight_key + "_scale_inv"].shape == (216, 1)
+        checkpoint[weight_key].fill_(1)
+        checkpoint[weight_key + "_scale_inv"].copy_(torch.arange(1, 217).float().view(216, 1))
+        restored = adapter.from_hf(checkpoint)
+        q, k, v = (native[f"{prefix}.{name}_proj.weight"] for name in ("q", "k", "v"))
+        for name in ("q", "k", "v"):
+            assert restored[f"{prefix}.{name}_proj.weight"] is native[f"{prefix}.{name}_proj.weight"]
+        # The first storage shard is Q=3072, K=192, V=128 rows. K/V share
+        # block 25, and V ends in a partially filled block 26.
+        assert torch.all(q[0] == 1)
+        assert torch.all(q[3071] == 24)
+        assert torch.all(q[3072] == 28)
+        assert torch.all(k[0:128] == 25)
+        assert torch.all(k[128:192] == 26)
+        assert torch.all(k[192] == 52)
+        assert torch.all(v[:64] == 26)
+        assert torch.all(v[64:128] == 27)
+        assert torch.all(v[128] == 53)
+        assert torch.all(v[-1] == 216)
+
+    def test_index_tp_size_drives_tp8_deinterleave(self, tmp_path, moe_config, backend_config):
+        config = _pro_full_attention_config(
+            name_or_path=_write_index(tmp_path, {"save_format": "mxfp4", "total_size": 1, "tp_size": 8})
+        )
+        adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
+        prefix = "model.layers.0.self_attn"
+        # Each TP8 storage shard holds Q=3072, K=192, V=128 rows; tag rows by shard.
+        shard_rows = (3072, 192, 128)
+        shards = [
+            torch.cat([torch.full((rows, 128), float(10 * part + shard)) for part, rows in enumerate(shard_rows)])
+            for shard in range(8)
+        ]
+        restored = adapter.from_hf({f"{prefix}.qkv_proj.weight": torch.cat(shards)})
+
+        assert adapter.checkpoint_tp_size == 8
+        for part, (name, rows) in enumerate(zip(("q", "k", "v"), shard_rows)):
+            weight = restored[f"{prefix}.{name}_proj.weight"]
+            assert weight.shape == (8 * rows, 128)
+            for shard in range(8):
+                assert torch.all(weight[shard * rows : (shard + 1) * rows] == 10 * part + shard)
+
+    def test_index_without_tp_size_means_no_interleaving(self, tmp_path, moe_config, backend_config):
+        config = _pro_full_attention_config(name_or_path=_write_index(tmp_path, {"save_format": "mxfp4"}))
+        adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
+        assert adapter.checkpoint_tp_size == 1
+
+    def test_missing_index_raises_instead_of_guessing(self, tmp_path, moe_config, backend_config):
+        config = _pro_full_attention_config(name_or_path=str(tmp_path))
+        adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
+        with pytest.raises(ValueError, match="Cannot read model.safetensors.index.json"):
+            adapter.checkpoint_tp_size
+
+    def test_wrong_tp_size_shape_error_names_tp_source(self, tmp_path, moe_config, backend_config):
+        config = _pro_full_attention_config(name_or_path=_write_index(tmp_path, {"tp_size": 4}))
+        adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
+        key = "model.layers.0.self_attn.qkv_proj.weight"
+        # TP8-interleaved rows/scales behind an index that records TP4.
+        with pytest.raises(ValueError, match=r"weight_scale_inv has shape \(216, 1\).*checkpoint_tp_size=4"):
+            adapter.from_hf(
+                {key: torch.zeros(27136, 128, dtype=torch.float8_e4m3fn), f"{key}_scale_inv": torch.ones(216, 1)}
             )
