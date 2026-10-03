@@ -23,7 +23,7 @@ REPO_ROOT := $(shell git rev-parse --show-toplevel)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check docs-model-tables
+.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check docs-model-tables _docs-mdx-check
 
 help:
 	@echo ""
@@ -97,15 +97,28 @@ docs-login:
 # when the library source changes — for prose-only iteration, `fern docs dev`
 # alone is enough after the first generate.
 docs: docs-model-tables docs-stitch docs-generate-library
+	@set -e; \
+	trap 'python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
+	python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
 	fern docs dev
 
-docs-check: docs-mdx-check
+docs-check: docs-model-tables docs-stitch
+	@set -e; \
+	trap 'python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
+	python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
+	$(MAKE) _docs-mdx-check; \
 	fern check
 
 docs-model-tables:
 	python3 "$(REPO_ROOT)/tests/ci_tests/utils/sync_model_coverage_tables.py"
 
 docs-mdx-check: docs-model-tables docs-stitch
+	@set -e; \
+	trap 'python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
+	python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
+	$(MAKE) _docs-mdx-check
+
+_docs-mdx-check:
 	@tmp_dir="$$(mktemp -d)"; \
 	trap 'rm -rf "$$tmp_dir"' EXIT; \
 	printf '%s\n' '{"private":true,"type":"module"}' > "$$tmp_dir/package.json"; \
@@ -146,6 +159,9 @@ docs-generate-library:
 # work-in-progress link before merge. Requires DOCS_FERN_TOKEN in the environment
 # (org secret of the same name is wired into CI).
 docs-preview: docs-model-tables docs-stitch docs-generate-library
+	@set -e; \
+	trap 'python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
+	python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
 	fern generate --docs --preview
 
 # Trigger the Publish Fern Docs workflow on origin/main via workflow_dispatch.

@@ -544,3 +544,62 @@ def test_run_loop_routes_teacher_and_stops_after_student(monkeypatch, recipe_mod
     shared.pp_enabled = False
     assert shared.run_train_validation_loop() == "trained"
     assert parent_calls == [student, shared]
+
+
+@pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
+@pytest.mark.parametrize("is_train", [False, True])
+def test_chunked_kd_real_llama_loss_and_gradients(recipe_module, recipe_cls, _, is_train):
+    from copy import deepcopy
+
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+    torch.manual_seed(23)
+    student = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            use_cache=False,
+        )
+    )
+    reference = deepcopy(student)
+    teacher = deepcopy(student).eval()
+    batch = {"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[2, -100, 4, 5]])}
+    results = []
+    for model, loss_fn in [(student, ChunkedCrossEntropy(2, compile=False)), (reference, MaskedCrossEntropy())]:
+        model.train(is_train)
+        recipe = object.__new__(recipe_cls)
+        recipe.dist_env = SimpleNamespace(device="cpu")
+        recipe.device_mesh = None
+        recipe.pp_enabled = False
+        recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+        recipe.model_parts = [model]
+        recipe.teacher_model = teacher
+        recipe.loss_fn = loss_fn
+        recipe.kd_loss_fn = KDLoss()
+        recipe.kd_ratio = 0.5
+        recipe._offload_teacher_model = False
+        recipe.separate_meshes = False
+        recipe._get_dp_group = lambda **kw: None
+        recipe._get_dp_group_size = lambda **kw: 1
+        recipe._ce_loss_buffer = []
+        recipe._kd_loss_buffer = []
+        if recipe_module is vlm_kd:
+            buffer = []
+            recipe._forward_backward_step(
+                0, dict(batch), loss_buffer=buffer, num_label_tokens=3, num_batches=1, is_train=is_train
+            )
+            result = (buffer[0], recipe._kd_loss_buffer[0], recipe._ce_loss_buffer[0])
+        else:
+            result = recipe._forward_backward_step(0, dict(batch), num_label_tokens=3, num_batches=1, is_train=is_train)
+        results.append(result)
+    for actual, expected in zip(*results):
+        torch.testing.assert_close(actual, expected)
+    if is_train:
+        for actual, expected in zip(student.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, expected.grad, atol=2e-6, rtol=1e-4)
