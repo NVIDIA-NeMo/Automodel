@@ -803,6 +803,13 @@ navigation:
                 path: ../../model-coverage/diffusion/qwen/qwen-image-2-1.mdx
               - page: "Qwen-Image-Edit-2511"
                 path: ../../model-coverage/diffusion/qwen/qwen-image-edit-2511.mdx
+          - section: "Tencent"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRkYBAABXRUJQVlA4TDoBAAAvE8AEAK/iOJIkR6kacfqHV3hPYIzWYASDRpIU9ewcw0t4/wpewNuiOGokyZEy2/Dntyz2Z+9q/skmbdYk7SF7jgIIAeiPgyQgRL8nFC8gIQKhECCAFF4KhACnBxd+dmcs/1AKReZWBfinKjoERQcqgTIDIpMw0gr/VCnhlhmpPwMvQWlohfgzpAMpKGMvASL9mZCWOfz/1Oqmpz7lNbQwSoTuXLZjdVrdJTjep8MVcCTbtul8+yc3uA+xbds25z+ctNKP6P8E+APwt32/IACg43I/B2ReCsgALS/E86ddQZA9hhQzHF1yjXTEG04sJ7NVbzPuzNvrxWA7fdXFkHY4Pz7P5vuZvN73t+7lGEUINlKjciVTavVzw+I3W6taBEAxJUO2VVFURUM1FQ18AAw5ZUg5o5xSZBT+OA=="/></svg>'
+            slug: tencent
+            path: ../../model-coverage/diffusion/tencent/index.mdx
+            contents:
+              - page: "HunyuanImage-3.0"
+                path: ../../model-coverage/diffusion/tencent/hunyuan-image-3.mdx
           - section: "Wan AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRkAEAABXRUJQVlA4TDQEAAAvE8AEECK52bYdm/QWMBUos23bnvcf27ZtW6Ft255Z25Ft63cPT7SVTDcbTripetsutgMW8L8F/A1sBEkAwDJSfrK3/cd+wNtRsfXY5tq2ebRtazzXta3TONBr623beHPP4RX0MxNkgN57owQQpLoImuof3Gzbjj2/4nTawShzZAh1moGlnbSqtIa1h60qR9oP73sKTRPWrH4BAICRrEyFKHqxv72hpubOV1bexZun5xitTEOEGjVZxagE8ldVnOViVD4Di75xlKG8Wy4u3QKFqQRpJmGa4T9O9tWKwKHADgEUs4pRCuRRBeq5b4Nnr3ZUiKxpuI6WqMsDtRN/ZXUbquoWY/T9SpK5W8qxD0tVZeN8eTE1I4hiVvGxBACAwKmqesg/UCEiFSLUjjTMMM9N5qOfKokwQLwFUh2Q7YL6eih01cdwAHHGuwblrJ8enozLNh3Bz+ZHKkS+6Q8U83P6qGWKCktUcjvUZRS8zNzIMvNhqjRY2iaJ+phnmNwAvTqz5mTpYLTl7cPoZrB4oPFdAk5fRvPHvXXvYP082LxQWxdqxxvt+dQhX3QspNmJICQaeBH8eBqzw6POqT5QIVDhGrtna1cfNoTNPpnd6L+EM6+aqRBFN8r/uLAhWGESLl6d44c0XLlPyoYa44dq6iiYPQrmjtX8kVo6VgsHaser8WhI042TiQv5OwtZO6i4U3bHS5aYCCVk1Fc+pHckf6gkkJOTRQvyooKKiGlLLKUckl5fOhKcrZ+k/GhoU1TnbxE4lg7csbsGZ9K9OEtD1Bdx2PAq8vB/ZqwlSoylwzEDThjQHkXrPPybEfLj6hM4ij/GATBlRt2UG2Pc5d5W8TK6It2bLUGhocFbeqxQFFpDGx3y6H/RNlmjwi3st4zVrwhkjRhB+ZM9yddYEakKOO9c6FAhvElscDGTIogSzrzd1n8ysNxRySZHw9H31wlIsOf7OsWoIHAo2JM05ahYGFOSWcjJnZ8Z2YwEYoQhi5LtcEDufM3s5ZYx5vkavKqeKjQMhBBrdb8IoOiBvzTZU+7Tlu8Ykj6IZLOkdud9akeFO99qEVhLCCkbrKgJLRtOonmRZyz0wQpV5kg+AU5EPueuBGNMMm+rldbqxDazW1/J2zg0T3XO3ETkpybBjBgfzdmaFUXBWX6GaToDcKGLfkd6yKwYSW6+p5TL5R4JTmF4q0Hep3fBVUJezLmZMjEhzbYt/tjmLJdujDw1wi/QyTUHbTPwHsKzGLxIws1v6FxJbn+nSCZPeqIiE3RkXdSl6REjWTXzBYIo/jPIfWmK8DTzAU5Z8nLykpubVgwMxSJ2/958gPAuueSGhv8oQRSZljLSIN9HQIFH1bd/wA6Bi+aujeaveWPCKygoqxMF8v8KfrHN5AT2XlV94US0ogY0Za+TKqr6SYL8v5Pj5E6R/uij7wcAAA=="/></svg>'
             slug: wan-ai

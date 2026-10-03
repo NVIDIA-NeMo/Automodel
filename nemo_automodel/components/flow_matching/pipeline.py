@@ -632,14 +632,20 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
 
     Args:
         adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "qwen_image",
-            "qwen_image_21", "qwen_image_edit", "ltx2")
+            "qwen_image_21", "qwen_image_edit", "ltx2", "hunyuan_image3")
         **kwargs: Additional arguments passed to the adapter constructor
 
     Returns:
         ModelAdapter instance
     """
-    # Imported lazily: the adapter is owned by the model package, and importing
-    # it here at module scope would load the Qwen model code for every recipe.
+
+    # Adapters owned by a model package are imported only when selected, so other recipes never load that
+    # model's code.
+    def hunyuan_image3_adapter(**adapter_kwargs) -> ModelAdapter:
+        from nemo_automodel.components.models.hunyuan_image3.flow_adapter import HunyuanImage3Adapter
+
+        return HunyuanImage3Adapter(**adapter_kwargs)
+
     from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
 
     adapters = {
@@ -651,6 +657,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
         "qwen_image_21": QwenImage21Adapter,
         "qwen_image_edit": QwenImageEditAdapter,
         "ltx2": LTX2Adapter,
+        "hunyuan_image3": hunyuan_image3_adapter,
     }
 
     if adapter_type not in adapters:

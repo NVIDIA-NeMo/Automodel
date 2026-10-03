@@ -1,0 +1,87 @@
+---
+title: "HunyuanImage-3.0"
+description: "Fine-tune tencent/HunyuanImage-3.0, an 80B MoE text-to-image transformer, with LoRA and expert parallelism in NeMo AutoModel."
+slug: model-coverage/diffusion/tencent/HunyuanImage-3.0
+---
+
+[HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0) is Tencent's text-to-image model. Unlike the diffusers-based models on this site, it is a single multimodal MoE decoder: the prompt tokens and the image tokens share one sequence, and the same transformer predicts the flow-matching velocity of the image latents. NeMo AutoModel ships its own implementation of the transformer, so the diffusion recipe trains it through the custom-model path with FSDP2 and expert parallelism.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| **Tasks** | Text-to-Image |
+| **Architecture** | Multimodal MoE decoder with flow-matching image head (80B total / 13B active) |
+| **Layers** | 32, each with GQA attention (32 query / 8 KV heads, head dim 128) and 64 routed experts (top-8) plus one shared expert |
+| **Positions** | 2D RoPE over the joint text / image sequence |
+| **Latents** | 32 channels, 16x spatial compression (release VAE) |
+| **HF Org** | [tencent](https://huggingface.co/tencent) |
+
+### Model Class
+
+`HunyuanImage3ForCausalMM` (`nemo_automodel/components/models/hunyuan_image3/`) is registered for the checkpoint's `HunyuanImage3ForCausalMM` architecture and `hunyuan_image_3_moe` model type, so the config loads without `trust_remote_code`. The decoder uses the shared `MoE` layer, which the MoE parallelizer shards with FSDP2 and expert parallelism; the released checkpoint is converted by `HunyuanImage3StateDictAdapter` (fused `[up; gate]` expert projections to grouped experts, `wte` / `ln_f` renames). The release's VAE and vision encoder are not part of the training model.
+
+Supported: FSDP2, expert parallelism, LoRA, full fine-tuning through the same recipe. Not supported: tensor, pipeline and context parallelism, image conditioning (image-to-image), text generation training.
+
+## Available Models
+
+| Model | HF ID | Training Scope |
+|---|---|---|
+| HunyuanImage-3.0 | [`tencent/HunyuanImage-3.0`](https://huggingface.co/tencent/HunyuanImage-3.0) | Text-to-image LoRA and full fine-tuning |
+
+## Recipes
+
+| Recipe | Description |
+|---|---|
+| [hunyuan_image3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) | Single-node LoRA fine-tuning with 8-way expert parallelism |
+
+## Prepare Data
+
+The preprocessing step needs the release's VAE and tokenizer wrapper, which are loaded from the checkpoint's remote code. For every image it stores the VAE latent and the release's prompt token ids around the image span (the conditional prompt, the `<cfg>` unconditional prompt used for classifier-free guidance dropout, and the suffix). Images are snapped to the release's own resolution group (33 aspect ratios around 1024x1024) instead of the generic buckets:
+
+```bash
+uv run python -m tools.diffusion.preprocessing_multiprocess image \
+  --image_dir /data/images \
+  --output_dir /cache/hunyuan-image3 \
+  --processor hunyuan_image3 \
+  --model_name tencent/HunyuanImage-3.0 \
+  --resolution_preset 1024p
+```
+
+Captions follow the image processors' JSONL convention (`<stem>_internvl.json` next to the image, or the `--caption_field` you pass).
+
+## Cache Contract
+
+Each cache sample contains:
+
+- `latent`: `[32, height / 16, width / 16]` (bf16, scaled by the VAE scaling factor)
+- `prompt_input_ids`: token ids before the image span, ending in `<timestep>`
+- `uncond_prompt_input_ids`: the same with the prompt replaced by `<cfg>` tokens
+- `prompt_suffix_ids`: token ids after the image span (`<eoi>`)
+- `bucket_resolution`, `original_resolution`, `crop_offset`, `prompt`, `image_path`
+
+The `hunyuan_image3` flow-matching adapter assembles `prefix + <img> * (h * w) + suffix` per sample and right-pads the batch; `flow_matching.cfg_dropout_prob` swaps in the unconditional prefix.
+
+## Train
+
+Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir`, then launch one rank per GPU:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml
+```
+
+The recipe keeps the router in fp32 (`gate_precision: float32`), applies LoRA to the attention projections and the shared expert, and trains with `flow_shift: 3.0`, the value the release samples with. Checkpoints hold only the LoRA adapter (`adapter_model.safetensors` plus its config). `fsdp.ep_size: 1` is also supported; the experts are then sharded by FSDP2.
+
+## Install
+
+From a source checkout, install the diffusion media dependencies:
+
+```bash
+uv sync --locked --all-groups --extra all --extra diffusion-media
+```
+
+See the [Installation Guide](/get-started/installation) and [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
