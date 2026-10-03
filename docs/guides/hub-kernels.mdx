@@ -1,0 +1,117 @@
+---
+title: "Hub Kernels (Hugging Face kernels)"
+description: "Use Hugging Face Hub kernels for flash attention and layer replacements without compiling flash-attn"
+position: 5
+---
+NeMo AutoModel forwards Hugging Face Transformers' Hub kernel APIs through its
+existing model-loading interface. The same knobs work as in Transformers
+([Loading kernels](https://huggingface.co/docs/transformers/en/kernel_doc/loading_kernels)).
+
+| Setting | What It Changes |
+|---------|-----------------|
+| `attn_implementation: flash_attention_2`, `flash_attention_3`, or `flash_attention_4` | Attention only |
+| `use_kernels: true` | Non-attention layers (RMSNorm, MLP, Linear, activations, RoPE, fused CE, and so on) |
+| `kernel_config` | Optional per-op Hub mapping (enables `use_kernels`) |
+| `allow_all_kernels: true` | Allow Hub repos outside the trusted `kernels-community` org |
+
+You do **not** need `use_kernels` when you only want Hub flash attention.
+
+This feature requires the [`kernels`](https://huggingface.co/docs/kernels) package
+(`kernels>=0.16.0,<0.17.0`, matching the pinned Transformers release).
+
+## Install
+
+```bash
+uv sync --extra hub_kernels
+# or
+uv pip install "nemo-automodel[hub_kernels]"
+```
+
+See [Install NeMo AutoModel](/get-started/installation). The `hub_kernels` extra
+is not part of `[all]`.
+
+## Attention Only
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B
+  force_hf: true
+  attn_implementation: flash_attention_4
+```
+
+Use the standard selector that matches the target GPU. Transformers uses an
+installed implementation when available and otherwise resolves its matching Hub
+kernel when `kernels` is installed. FlashAttention 4 requires Hopper or newer.
+
+You can also select a specific Hub repository, including:
+
+- `kernels-community/flash-attn2`
+- `kernels-community/vllm-flash-attn3`
+- `kernels-community/flash-attn4`
+- Revision pins such as `kernels-community/flash-attn2@<commit>`.
+- Non-`kernels-community` attention repos need `allow_all_kernels: true`.
+
+## Layer Kernels (`use_kernels`)
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B
+  force_hf: true
+  use_kernels: true
+  # AutoModel skips pip Liger when use_kernels is true
+  use_liger_kernel: false
+```
+
+Defaults come from Transformers' device-aware Hub map (CUDA uses
+`kernels-community/liger-kernels` for RMSNorm, MLP, Linear, and loss, plus
+activation and rotary repos). Override with `kernel_config`:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B
+  force_hf: true
+  use_kernels: true
+  use_liger_kernel: false
+  kernel_config:
+    _target_: transformers.KernelConfig
+    kernel_mapping:
+      RMSNorm: kernels-community/liger-kernels:LigerRMSNorm
+```
+
+Combine with Hub attention when you want both:
+
+```yaml
+  attn_implementation: flash_attention_4
+  use_kernels: true
+  use_liger_kernel: false
+```
+
+Hub kernels follow `model.train()` and `model.eval()` (training and inference
+variants). AutoModel training recipes keep the model in train mode. For
+distributed layer replacement, use the Hugging Face `from_pretrained` path as
+shown above so Transformers kernelizes the materialized model before AutoModel
+applies distributed infrastructure.
+
+## Recommended Settings by Goal
+
+| Goal | Recommended Settings |
+|------|----------------------|
+| Avoid compiling `flash-attn` | `hub_kernels` extra and Hub `attn_implementation` |
+| Match Transformers default Hub layers | `use_kernels: true` |
+| Pin or remap individual ops | `kernel_config` and `use_kernels: true` |
+| TE, DeepEP, or TileLang | Keep existing `backend:` fields. Do not mix TE attention with Hub FA |
+| EAGLE ring attention or some VLMs | Still need pip `flash-attn` (direct imports) |
+
+## Limitations
+
+- Transformer Engine attention and Hub flash attention are mutually exclusive.
+- Some vision and speculative paths still import pip `flash-attn` directly
+  (Kimi VL, BAGEL packed inference, LLaVA-OneVision Rice ViT, and EAGLE).
+- Scoped CUDA graphs (`backend.cuda_graph`) require `attn: te`.
+
+For offline or reproducible deploys, pin kernels with `kernels lock` and
+`kernels download` as described in the [Hugging Face kernels docs](https://huggingface.co/docs/kernels)
+and the [Transformers loading guide](https://huggingface.co/docs/transformers/en/kernel_doc/loading_kernels).

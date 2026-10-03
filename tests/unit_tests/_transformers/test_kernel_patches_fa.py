@@ -63,6 +63,33 @@ class TestApplyPreloadOverridesPacked:
         )
         assert attn == impl
 
+    @pytest.mark.parametrize(
+        "repo_id",
+        [
+            "kernels-community/flash-attn2",
+            "kernels-community/flash-attn3",
+            "kernels-community/vllm-flash-attn3",
+            "kernels-community/aiter-flash-attn",
+            "kernels-community/flash-attn4",
+            "kernels-community/flash-attn4@main",
+        ],
+    )
+    def test_packed_keeps_requested_hub_flash_without_pip_flash(self, monkeypatch, repo_id):
+        """An explicit Hub kernel remains selected on a Hub-only host."""
+        monkeypatch.setattr(kernel_patches, "HAS_FA", False)
+        monkeypatch.setattr(kernel_patches, "HAS_FA3", False)
+        monkeypatch.setattr(kernel_patches, "HAS_FA4", False)
+
+        attn, _ = _apply_preload_overrides(
+            tp_size=1,
+            cp_size=1,
+            has_packed_sequence=True,
+            attn_implementation=repo_id,
+            use_liger_kernel=False,
+        )
+
+        assert attn == repo_id
+
     def test_packed_non_flash_falls_back_to_available_flash(self, monkeypatch):
         monkeypatch.setattr(kernel_patches, "HAS_FA", True)
         attn, _ = _apply_preload_overrides(
