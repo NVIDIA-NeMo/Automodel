@@ -104,9 +104,7 @@ def _fuse_gate_up(pairs: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
 class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Converts between the released HunyuanImage-3.0 checkpoint and the native grouped-expert model."""
 
-    def __init__(
-        self, config: Any, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype = torch.bfloat16
-    ):
+    def __init__(self, config: Any, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype = torch.bfloat16):
         self.config = config
         self.moe_config = moe_config
         self.backend = backend

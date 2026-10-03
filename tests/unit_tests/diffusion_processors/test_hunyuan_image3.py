@@ -180,11 +180,13 @@ def test_load_vae_reads_only_vae_weights(tmp_path, monkeypatch):
     weights = {"vae.conv.weight": torch.full((4, 3, 1, 1), 2.0), "vae.conv.bias": torch.ones(4)}
     save_file(weights, str(tmp_path / "a.safetensors"))
     save_file({"model.wte.weight": torch.zeros(2, 2)}, str(tmp_path / "b.safetensors"))
-    weight_map = {"vae.conv.weight": "a.safetensors", "vae.conv.bias": "a.safetensors", "model.wte.weight": "b.safetensors"}
+    weight_map = {
+        "vae.conv.weight": "a.safetensors",
+        "vae.conv.bias": "a.safetensors",
+        "model.wte.weight": "b.safetensors",
+    }
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
-    monkeypatch.setattr(
-        "transformers.dynamic_module_utils.get_class_from_dynamic_module", lambda name, path: _TinyVAE
-    )
+    monkeypatch.setattr("transformers.dynamic_module_utils.get_class_from_dynamic_module", lambda name, path: _TinyVAE)
     vae = hunyuan_image3._load_vae(str(tmp_path), SimpleNamespace(vae={}), device="cpu")
     assert torch.equal(vae.conv.weight, weights["vae.conv.weight"]) and not vae.training
 

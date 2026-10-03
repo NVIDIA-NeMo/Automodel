@@ -120,7 +120,9 @@ class HunyuanImage3Attention(nn.Module):
         if attention_mask is None:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
-            out = F.scaled_dot_product_attention(q.contiguous(), k.contiguous(), v.contiguous(), attn_mask=attention_mask)
+            out = F.scaled_dot_product_attention(
+                q.contiguous(), k.contiguous(), v.contiguous(), attn_mask=attention_mask
+            )
         out = out.transpose(1, 2).reshape(batch, seq, self.num_heads * self.head_dim)
         return self.o_proj(out)
 

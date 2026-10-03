@@ -79,9 +79,7 @@ def rope_cos_sin(positions: torch.Tensor, head_dim: int, base: float = 10000.0) 
     """
     if head_dim % 4 != 0:
         raise ValueError(f"head_dim must be divisible by 4, got {head_dim}")
-    inv_freq = 1.0 / (
-        base ** (torch.arange(0, head_dim, 2, device=positions.device, dtype=torch.float32) / head_dim)
-    )
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=positions.device, dtype=torch.float32) / head_dim))
     # [head_dim/4, 2]: column 0 pairs with y, column 1 with x.
     inv_freq = inv_freq.reshape(head_dim // 4, 2)
     angles = positions.float().unsqueeze(-2) * inv_freq  # [..., seq, head_dim/4, 2]

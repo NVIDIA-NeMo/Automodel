@@ -71,6 +71,7 @@ def build_moe_config(config: HunyuanImage3Config, overrides: dict[str, Any] | No
     """MoE settings of the release: softmax over all experts, top-k, renormalized, one shared expert."""
     if not config.use_mixed_mlp_moe:
         raise NotImplementedError("HunyuanImage-3.0 checkpoints without the shared expert are not supported.")
+
     def uniform(field: str) -> int:
         values = {per_layer(getattr(config, field), i) for i in range(config.num_hidden_layers)}
         if len(values) != 1:
