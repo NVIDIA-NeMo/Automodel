@@ -7,7 +7,7 @@ import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
-from nemo_automodel.components.models.kimi_linear.model import KimiLinear48BForCausalLM
+from nemo_automodel.components.models.kimi_linear.model import KimiDeltaAttention, KimiLinear48BForCausalLM
 from tests.unit_tests.models.kimi_linear.test_cp import _FakeCPMesh
 
 
@@ -282,9 +282,55 @@ def test_thd_packed_inputs_run_through_the_batched_layers():
         bshd = model(
             input_ids=input_ids,
             attention_mask=torch.tensor([[1, 1, 1, 2, 2, 2]], dtype=torch.int32),
+            packed_token_indices=torch.arange(6).unsqueeze(0),
+            cu_seqlens=cu_seqlens,
         ).logits
 
     assert thd.shape == (1, 6, model.vocab_size)
     assert torch.isfinite(thd).all()
     # Both routes describe the same two documents, so they must agree.
     torch.testing.assert_close(thd, bshd, rtol=1e-5, atol=1e-6)
+
+
+def test_kda_short_sequences_use_the_configured_chunk_kernel(monkeypatch):
+    _require_fla()
+    import nemo_automodel.components.models.kimi_linear.model as kimi_linear_model
+
+    calls = []
+
+    def fake_chunk_kda(*, q, k, v, g, beta, **kwargs):
+        calls.append(q.shape[1])
+        return v, None
+
+    def forbidden_recurrent_kda(**kwargs):
+        raise AssertionError("fused_recurrent_kda has no backward pass")
+
+    monkeypatch.setattr(kimi_linear_model, "chunk_kda", fake_chunk_kda)
+    monkeypatch.setattr(kimi_linear_model, "fused_recurrent_kda", forbidden_recurrent_kda)
+    config = _tiny_kimi_config(use_kda=True)
+    attn = KimiDeltaAttention(config, layer_idx=1)
+
+    # Identity stand-ins keep the kernel choice testable on CPU without compiling Triton kernels.
+    class _PassThroughConv(torch.nn.Module):
+        def forward(self, x, **kwargs):
+            return x, None
+
+    class _PassThroughNorm(torch.nn.Module):
+        def forward(self, o, gate):
+            return o
+
+    for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
+        monkeypatch.setattr(attn, name, _PassThroughConv())
+    monkeypatch.setattr(attn, "o_norm", _PassThroughNorm())
+
+    class _PassThroughGate(torch.nn.Module):
+        def forward(self, g, *args):
+            return g
+
+    monkeypatch.setattr(attn, "_fp32_params", _PassThroughGate())
+
+    for training in (True, False):
+        attn.train(training)
+        for seq_len in (32, 128):
+            attn._kda_core(torch.randn(1, seq_len, config.hidden_size))
+    assert calls == [32, 128, 32, 128]

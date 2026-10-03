@@ -1,20 +1,20 @@
 ---
 title: "Fine-Tune Large MoE LLMs"
-description: ""
+description: "Fine-tune large Mixture-of-Experts (MoE) LLMs with NeMo AutoModel using HellaSwag recipes for MiniMax-M2.5, GLM-5, Step-3.5 Flash, and DeepSeek-V3.2."
 position: 5
 ---
 ## Introduction
 
-Mixture-of-Experts (MoE) architectures have become the dominant design for frontier language models, activating only a fraction of their total parameters per token to deliver strong performance at reduced compute cost. This guide walks through fine-tuning four example MoE LLMs with NVIDIA NeMo Automodel. For a full list of supported architectures, see the [LLM model coverage](/model-coverage/large-language-models/overview) page.
+Mixture-of-Experts (MoE) architectures have become the dominant design for frontier language models, activating only a fraction of their total parameters per token to deliver strong performance at reduced compute cost. This guide walks through fine-tuning four example MoE LLMs with NVIDIA NeMo AutoModel. For a full list of supported architectures, see the [LLM model coverage](/model-coverage/large-language-models/overview) page.
 
-| Model | HF Checkpoint | Validated Using |
+| Model | Hugging Face Checkpoint | Validated Using |
 |-------|--------------|-----------------|
 | GLM-5 | [`zai-org/GLM-5`](https://huggingface.co/zai-org/GLM-5) | 256 H100 GPUs (32 nodes x 8) |
 | MiniMax-M2.5 | [`MiniMaxAI/MiniMax-M2.5`](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) | 64 H100 GPUs (8 nodes x 8) |
 | Step-3.5 Flash | [`stepfun-ai/Step-3.5-Flash`](https://huggingface.co/stepfun-ai/Step-3.5-Flash) | 64 H100 GPUs (8 nodes x 8) |
 | DeepSeek-V3.2 | [`deepseek-ai/DeepSeek-V3.2`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) | 256 H100 GPUs (32 nodes x 8) |
 
-To set up your environment to run NeMo Automodel, follow the [installation guide](/get-started/installation).
+To set up your environment to run NeMo AutoModel, follow the [installation guide](/get-started/installation).
 
 ## Data
 
@@ -32,7 +32,7 @@ For details on how to swap in your own dataset, see the [LLM Dataset Guide](/dat
 
 ### MiniMax-M2.5
 
-[`examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) — validated using **64 H100 GPUs** (8 nodes x 8).
+[`examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml). Validated using **64 H100 GPUs** (8 nodes x 8).
 
 Key distributed settings:
 
@@ -48,7 +48,7 @@ distributed:
 
 ### GLM-5
 
-[`examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) — validated using **256 H100 GPUs** (32 nodes x 8).
+[`examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml). Validated using **256 H100 GPUs** (32 nodes x 8).
 
 Key distributed settings:
 
@@ -65,7 +65,7 @@ distributed:
 
 ### Step-3.5 Flash (StepFun)
 
-[`examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml) — validated using **64 H100 GPUs** (8 nodes x 8).
+[`examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml). Validated using **64 H100 GPUs** (8 nodes x 8).
 
 Key distributed settings:
 
@@ -81,7 +81,7 @@ distributed:
 
 ### DeepSeek-V3.2
 
-[`examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml) — validated using **256 H100 GPUs** (32 nodes x 8).
+[`examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml). Validated using **256 H100 GPUs** (32 nodes x 8).
 
 Key distributed settings:
 
@@ -96,11 +96,51 @@ distributed:
     layers_per_stage: 2
 ```
 
+## Configure HybridEP Routing
+
+Several large-scale MoE recipes use the [HybridEP dispatcher](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) to combine expert-parallel token permutation and communication. Select it in the model backend:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: hybridep
+```
+
+HybridEP supports two routing-metadata paths:
+
+- **Dense routing (default)**: Builds a Boolean routing map with shape `[tokens, experts]` and a matching dense probability tensor.
+- **Compact routing (opt-in)**: Passes top-k expert indices with shape `[tokens, top_k]` instead of the dense Boolean routing map. NeMo AutoModel still expands the routing probabilities to `[tokens, experts]` to preserve the existing router-gradient layout.
+
+Enable compact routing only after benchmarking the exact model, batch shape, GPU, and expert-parallel topology:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: hybridep
+    dispatcher_hybridep_compact_routing: true
+```
+
+Compact routing reduces routing-map size, but its additional metadata preprocessing can increase latency for some workloads. Dense routing therefore remains the default.
+
+The following advanced settings apply only when `dispatcher: hybridep`:
+
+| Setting | Default | Description |
+|---|---:|---|
+| `dispatcher_hybridep_compact_routing` | `false` | Pass top-k expert indices instead of a dense Boolean routing map. |
+| `dispatcher_hybridep_permute_fusion` | `false` | Fuse token permutation into dispatch and unpermutation into combine. |
+| `dispatcher_hybridep_num_sms_preprocessing` | `null` | Override the number of SMs used for routing-metadata preprocessing. |
+| `dispatcher_hybridep_num_blocks_permute` | `null` | Override the number of dispatch permutation blocks. |
+| `dispatcher_hybridep_num_blocks_unpermute` | `null` | Override the number of combine unpermutation blocks. |
+
+Leave the numeric tuning settings unset to use HybridEP defaults unless a matched benchmark demonstrates an improvement. A value that improves performance on one GPU architecture or topology might reduce performance on another.
+
 ## Launch Training
 
-NeMo Automodel supports direct Slurm submission, local interactive runs through the Automodel CLI, and external `torchrun`. For full details on Slurm batch jobs, multi-node configuration, environment variables, and other launch options, see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
+NeMo AutoModel supports direct Slurm submission, local interactive runs through the NeMo AutoModel CLI, and external `torchrun`. For full details on Slurm batch jobs, multi-node configuration, environment variables, and other launch options, see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 
-### Automodel CLI
+### NeMo AutoModel CLI
 
 ```bash
 uv run automodel your_single_node_config.yaml --nproc-per-node 8
@@ -111,7 +151,7 @@ with a config whose distributed topology fits one node; the four configs above
 use multi-node PP/EP sizes and should be launched through Slurm or external
 `torchrun` as shown below.
 
-### torchrun
+### Torchrun
 
 ```bash
 export TRANSFORMERS_OFFLINE=1
@@ -134,7 +174,8 @@ This command uses the GLM-5 config and its `model.pretrained_model_name_or_path`
 field. For another recipe, replace the `-c` path and `--nnodes`, then update the
 model and tokenizer path fields defined by that YAML.
 
-**Before you start**:
-- Hugging Face applies rate limits on downloads. We recommend cloning the model repository to your local filesystem beforehand.
+### Before You Start
+
+- Hugging Face applies rate limits on downloads. Clone the model repository to your local filesystem beforehand.
 - Ensure your Hugging Face cache (`HF_HOME`) is configured and that the dataset is already cached locally.
 - To enable Weights & Biases logging, set your `WANDB_API_KEY` and configure the `wandb` section in the YAML file.

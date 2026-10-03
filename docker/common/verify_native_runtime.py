@@ -79,6 +79,10 @@ def main() -> None:
             raise RuntimeError(
                 f"FlashAttention 4 requires nvidia-cutlass-dsl 4.6.2 or later, found {cutlass_dsl_version}"
             )
+    # MoK recipes import both modules; loading them also checks the compiled
+    # mok._C extension against the final image's PyTorch/CUDA libraries.
+    importlib.import_module("mok.functional")
+    importlib.import_module("mok.ops")
 
 
 if __name__ == "__main__":

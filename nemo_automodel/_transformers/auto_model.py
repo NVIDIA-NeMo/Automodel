@@ -1087,6 +1087,34 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
     pass
 
 
+class NeMoAutoModelForDiffusion(_BaseNeMoAutoModelClass):
+    """Auto class for diffusion transformers that have a custom Automodel implementation.
+
+    ``transformers`` has no diffusion auto class, and diffusion checkpoints without a custom implementation are
+    loaded through diffusers (``nemo_automodel._diffusers``). This class therefore only resolves architectures
+    registered in ``ModelRegistry``; everything else (``distributed_setup`` with FSDP2 / expert parallelism,
+    PEFT, sharded checkpoint loading) works as for ``NeMoAutoModelForCausalLM``.
+
+    Examples:
+    --------
+    >>> transformer = NeMoAutoModelForDiffusion.from_config(
+    ...     "/ckpts/my-moe-dit/transformer", distributed_setup=setup, load_base_model=True)
+    """
+
+    _NO_CUSTOM_MODEL = (
+        "NeMoAutoModelForDiffusion only builds architectures with a custom Automodel implementation "
+        "(see ModelRegistry); load other diffusion transformers through diffusers."
+    )
+
+    @classmethod
+    def _from_pretrained_parent_class(cls, *args, **kwargs):
+        raise ValueError(cls._NO_CUSTOM_MODEL)
+
+    @classmethod
+    def _from_config_parent_class(cls, *args, **kwargs):
+        raise ValueError(cls._NO_CUSTOM_MODEL)
+
+
 class _NeMoAutoModelForRetrievalBase:
     """Private shared base for encoder auto-models.
 

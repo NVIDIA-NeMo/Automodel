@@ -38,6 +38,12 @@ from torch.utils.data.sampler import Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
+from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    PackedSequenceContract,
+    resolve_packing_contract,
+)
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
@@ -142,7 +148,7 @@ class PackingConfig:
     Subclasses (:class:`ThdPackingConfig` / :class:`NeatPackingConfig`) pick the packing strategy and the
     matching collater. :meth:`build` returns ``(dataset, collate_fn)`` — the packed dataset and the
     packing-specific collater. Construction-time knobs are the fields; runtime / model-derived values
-    (``split`` / ``seed`` / ``supports_seq_lens`` / ``pad_token_id`` / ``cp_size`` / ``attn_implementation``)
+    (``split`` / ``seed`` / ``supports_seq_lens`` / ``pad_token_id`` / ``cp_size`` / ``packing_contract``)
     are :meth:`build` args.
     """
 
@@ -184,6 +190,7 @@ class PackingConfig:
         pad_token_id: int = 0,
         cp_size: int = 1,
         attn_implementation: str | None = None,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
     ) -> tuple[object, CollateFn | None]:
         """Pack ``dataset`` and return ``(dataset, collate_fn)``."""
         raise NotImplementedError
@@ -209,9 +216,10 @@ class ThdPackingConfig(PackingConfig):
         pad_token_id: int = 0,
         cp_size: int = 1,
         attn_implementation: str | None = None,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
     ) -> tuple[object, CollateFn | None]:
         """Pack with THD; returns ``(dataset, None)`` if the model does not accept ``seq_lens``."""
-        del attn_implementation
+        resolve_packing_contract(packing_contract, attn_implementation)
         if not supports_seq_lens:
             logger.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             return dataset, None
@@ -250,9 +258,11 @@ class NeatPackingConfig(PackingConfig):
         pad_token_id: int = 0,
         cp_size: int = 1,
         attn_implementation: str | None = None,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
     ) -> tuple[object, CollateFn]:
         """Pack with NEAT and configure the collator for the selected attention implementation."""
         del supports_seq_lens, cp_size
+        packing_contract = resolve_packing_contract(packing_contract, attn_implementation)
         from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
         from nemo_automodel.components.datasets.utils import neat_packed_collater
 
@@ -268,7 +278,7 @@ class NeatPackingConfig(PackingConfig):
             padding_idx=pad_token_id,
             drop_long_samples=self.drop_long_samples,
         )
-        return dataset, partial(neat_packed_collater, attn_implementation=attn_implementation)
+        return dataset, partial(neat_packed_collater, packing=packing_contract)
 
 
 _PACKING_CONFIGS: dict[str, type[PackingConfig]] = {
@@ -641,6 +651,7 @@ class DataloaderConfig:
         supports_seq_lens: bool = True,
         cp_size: int = 1,
         attn_implementation: str | None = None,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
         collate_wrapper: Callable[[CollateFn], CollateFn] | None = None,
     ) -> DataLoader:
         """Build the configured dataset, packing, sampler, collator, and stateful dataloader.
@@ -654,12 +665,16 @@ class DataloaderConfig:
                 dataset. Collective dataset builders should pass ``None``.
             supports_seq_lens: Whether the model forward contract accepts THD ``seq_lens`` metadata.
             cp_size: Context-parallel world size used for packed-sequence divisibility.
-            attn_implementation: Attention backend used by NEAT packing.
+            attn_implementation: Deprecated attention-backend name retained for
+                Python-call compatibility during the packing-contract migration.
+            packing_contract: Structural model contract used by NEAT packing.
+                Defaults to block-causal masking without packed-sequence metadata.
             collate_wrapper: Optional recipe-owned wrapper around the resolved collator.
 
         Returns:
             Stateful, data-parallel-aware dataloader.
         """
+        packing_contract = resolve_packing_contract(packing_contract, attn_implementation)
         dataset = self._build_dataset(tokenizer=tokenizer, dataset_build_context=dataset_build_context)
 
         collate_override = None
@@ -671,7 +686,7 @@ class DataloaderConfig:
                 supports_seq_lens=supports_seq_lens,
                 pad_token_id=getattr(tokenizer, "pad_token_id", 0),
                 cp_size=cp_size,
-                attn_implementation=attn_implementation,
+                packing_contract=packing_contract,
             )
         elif self.packing is not None:
             logger.info(

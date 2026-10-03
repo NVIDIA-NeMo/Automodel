@@ -136,7 +136,7 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
             return _PEFT_PREFIX + key.removeprefix(_PEFT_PREFIX + _THINKER_PREFIX)
         return key.removeprefix(_THINKER_PREFIX)
 
-    def map_peft_target_module_to_hf(self, name: str) -> str:
+    def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
         """Namespace adapter_config.json target_modules under ``thinker.``.
 
         Without it, PEFT's suffix matching on the full omni model also hits
