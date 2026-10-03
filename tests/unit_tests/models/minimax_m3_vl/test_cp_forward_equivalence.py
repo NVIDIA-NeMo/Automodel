@@ -34,7 +34,7 @@ cuda_available = torch.cuda.is_available()
 
 # Over the default 5s budget on purpose: CUDA FlexAttention compilation takes longer on a cold worker.
 # Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 # FlexAttention's compiled kernel requires the sparse block size to be a multiple of
