@@ -102,6 +102,42 @@ def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypat
     assert captured.out == ""
 
 
+def _exact_sq_norm(module: nn.Module) -> float:
+    """Sum of squared parameters, computed in float64 as the reference value."""
+    return sum(p.detach().double().pow(2).sum().item() for p in module.parameters())
+
+
+def _wide_model(dtype: torch.dtype, n_layers: int = 64) -> nn.Module:
+    """Many layers whose per-tensor norms are large enough to expose accumulator rounding."""
+    torch.manual_seed(0)
+    layers = []
+    for _ in range(n_layers):
+        linear = nn.Linear(64, 64, bias=False)
+        with torch.no_grad():
+            linear.weight.mul_(10.0)
+        layers.append(linear)
+    return nn.Sequential(*layers).to(dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16, torch.float16])
+def test_get_model_param_stats_norm_matches_float64_reference(dtype):
+    """The reported squared norm must not depend on the parameter dtype.
+
+    Accumulating in the parameter dtype rounds every partial sum to that dtype's
+    mantissa, which drifts by >1% for bf16 once enough tensors are summed, and
+    reports inf for fp16, whose 65504 max is exceeded by squaring any norm above
+    ~256. float64 covers the opposite direction: a hard-coded float32 accumulator
+    narrows, which makes vector_norm raise and drops the parameter entirely.
+    """
+    model = _wide_model(dtype)
+    _, _, sq_norm = model_utils._get_model_param_stats(model)
+    expected = _exact_sq_norm(model)
+
+    # 1e-3 relative: float32 accumulation plus the reduced-precision parameter values
+    # themselves, which is far tighter than the >1% drift of dtype-native accumulation.
+    assert float(sq_norm) == pytest.approx(expected, rel=1e-3)
+
+
 @pytest.mark.parametrize(
     "freeze_cfg, expect",
     [
