@@ -42,6 +42,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from PIL import Image
 from transformers import AutoConfig, AutoTokenizer
 
 from nemo_automodel import NeMoAutoModelForDiffusion
@@ -146,7 +147,17 @@ def load_custom_model(
 
 
 @torch.no_grad()
-def generate(model, builder, prompt: str, seed: int, height: int, width: int, steps: int, guidance: float, device):
+def generate(
+    model: torch.nn.Module,
+    builder: torch.nn.Module,
+    prompt: str,
+    seed: int,
+    height: int,
+    width: int,
+    steps: int,
+    guidance: float,
+    device: torch.device,
+) -> Image.Image:
     """Release sampler with Automodel's model predicting the flow velocity; returns a PIL image (rank 0)."""
     from importlib import import_module
 
@@ -202,7 +213,7 @@ def generate(model, builder, prompt: str, seed: int, height: int, width: int, st
     return pipe.image_processor.postprocess(image, output_type="pil", do_denormalize=[True])[0]
 
 
-def main():
+def main() -> None:
     """Parse arguments, load the model and the release builder, and generate one image per prompt."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, help="Release checkpoint directory (config, remote code, tokenizer, VAE).")

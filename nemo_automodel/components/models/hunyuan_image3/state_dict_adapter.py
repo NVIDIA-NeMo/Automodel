@@ -54,7 +54,7 @@ _AUTOMODEL_TO_HF = (
 )
 
 
-def _rename(key: str, rules) -> str:
+def _rename(key: str, rules: tuple[tuple[re.Pattern[str], str], ...]) -> str:
     for pattern, repl in rules:
         key, n = pattern.subn(repl, key)
         if n:
