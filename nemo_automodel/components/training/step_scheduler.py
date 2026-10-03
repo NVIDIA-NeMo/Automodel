@@ -362,8 +362,9 @@ class StepSchedulerConfig:
 
     Attributes:
         global_batch_size: Total samples per optimizer step across all GPUs.
-        num_epochs: Number of training epochs.  When ``None`` the builder
-            derives it from ``max_steps``.  Default: 10.
+        num_epochs: Number of training epochs.  When ``None`` (the default)
+            it is derived from ``max_steps``, or falls back to 10 when
+            ``max_steps`` is also unset.
         max_steps: Hard cap on optimizer steps.  ``None`` means derive from
             ``num_epochs * epoch_len``.
         ckpt_every_steps: Save a checkpoint every N optimizer steps.
@@ -385,7 +386,7 @@ class StepSchedulerConfig:
     """
 
     global_batch_size: int = 32
-    num_epochs: int | None = 10
+    num_epochs: int | None = None
     max_steps: int | None = None
     ckpt_every_steps: int | None = 100
     save_checkpoint_every_epoch: bool = True

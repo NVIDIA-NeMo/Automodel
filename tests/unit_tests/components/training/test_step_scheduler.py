@@ -723,3 +723,56 @@ def test_step_scheduler_config_exposes_preemption_signal():
         assert scheduler.sig_handler.sigs == [_signal.SIGUSR2]
     finally:
         scheduler.sig_handler.release()
+
+
+# ---------------------------------------------------------------------------
+# num_epochs / max_steps resolution via the typed config
+# ---------------------------------------------------------------------------
+
+
+def _run_all_steps(scheduler):
+    """Drive the scheduler to exhaustion and return the number of steps executed."""
+    total = 0
+    for epoch in scheduler.epochs:
+        scheduler.set_epoch(epoch)
+        for _ in scheduler:
+            total += 1
+    return total
+
+
+def test_config_max_steps_only_derives_num_epochs():
+    """max_steps alone must be honored; num_epochs is derived, not left at a default."""
+    cfg = StepSchedulerConfig(global_batch_size=1, max_steps=5000, preemption_signal=None)
+    scheduler = cfg.build(SizedDataLoader(num_batches=100), dp_group_size=1, local_batch_size=1)
+
+    assert scheduler.epoch_len == 100
+    assert scheduler.num_epochs == 50  # ceil(5000 / 100)
+    assert _run_all_steps(scheduler) == 5000
+
+
+def test_config_num_epochs_only_derives_max_steps():
+    cfg = StepSchedulerConfig(global_batch_size=1, num_epochs=3, preemption_signal=None)
+    scheduler = cfg.build(SizedDataLoader(num_batches=100), dp_group_size=1, local_batch_size=1)
+
+    assert scheduler.num_epochs == 3
+    assert scheduler.max_steps == 300
+    assert _run_all_steps(scheduler) == 300
+
+
+def test_config_both_set_stops_at_whichever_comes_first():
+    cfg = StepSchedulerConfig(global_batch_size=1, num_epochs=10, max_steps=250, preemption_signal=None)
+    scheduler = cfg.build(SizedDataLoader(num_batches=100), dp_group_size=1, local_batch_size=1)
+
+    assert scheduler.num_epochs == 10
+    assert scheduler.max_steps == 250
+    assert _run_all_steps(scheduler) == 250
+
+
+def test_config_neither_set_keeps_ten_epoch_fallback():
+    """Unchanged behaviour when the config pins neither field."""
+    cfg = StepSchedulerConfig(global_batch_size=1, preemption_signal=None)
+    scheduler = cfg.build(SizedDataLoader(num_batches=100), dp_group_size=1, local_batch_size=1)
+
+    assert scheduler.num_epochs == 10
+    assert scheduler.max_steps == 1000
+    assert _run_all_steps(scheduler) == 1000
