@@ -18,6 +18,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+import torch
+from diffusers.utils.torch_utils import randn_tensor
 
 import examples.diffusion.generate.generate as gen
 
@@ -64,6 +66,31 @@ class TextToImagePipeline:
     def __call__(self, prompt, generator):
         self.calls.append({"prompt": prompt, "generator": generator})
         return SimpleNamespace(images=[self.output_image])
+
+
+@pytest.mark.parametrize("is_rank0", [True, False])
+def test_inference_supports_cpu_latents_and_reproducible_prompt_seeds(tmp_path, is_rank0):
+    """Offloaded pipelines sample CPU latents with the real supplied generator."""
+
+    class CpuLatentPipeline(TextToImagePipeline):
+        def __call__(self, prompt, generator):
+            output = super().__call__(prompt, generator)
+            self.calls[-1]["latents"] = randn_tensor((2, 4), generator=generator, device=torch.device("cpu"))
+            assert generator.device.type == "cpu"
+            return output
+
+    cfg = _make_cfg(tmp_path, ["first prompt", "second prompt"])
+    pipe = CpuLatentPipeline()
+
+    gen.run_inference(pipe, cfg, is_rank0=is_rank0)
+    gen.run_inference(pipe, cfg, is_rank0=is_rank0)
+
+    for i in range(2):
+        expected = torch.randn((2, 4), generator=torch.Generator(device="cpu").manual_seed(cfg.seed + i))
+        torch.testing.assert_close(pipe.calls[i]["latents"], expected, rtol=0, atol=0)
+        torch.testing.assert_close(pipe.calls[i + 2]["latents"], expected, rtol=0, atol=0)
+    assert not torch.equal(pipe.calls[0]["latents"], pipe.calls[1]["latents"])
+    assert pipe.output_image.save.call_count == (4 if is_rank0 else 0)
 
 
 def test_input_images_are_loaded_and_passed_to_matching_prompts(tmp_path):
