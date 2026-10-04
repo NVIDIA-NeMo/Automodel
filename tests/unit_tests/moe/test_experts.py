@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import importlib.util
+import weakref
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
@@ -1318,6 +1320,93 @@ class TestGroupedExpertsDeepEP:
         torch.testing.assert_close(expected, torch.ones_like(bias), rtol=0, atol=0)
         torch.testing.assert_close(bias.grad, expected, rtol=0, atol=0)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("apply_router_weight_after_down", [False, True])
+    def test_checkpointed_chunked_expert_mlp_releases_routed_input(
+        self, monkeypatch, dtype, apply_router_weight_after_down
+    ):
+        """Nested checkpointing releases routed inputs without changing outputs or gradients."""
+
+        def dense_mm(value, weights, offs):
+            """Multiply a single expert's contiguous input rows.
+
+            Args:
+                value: Tensor of shape [tokens, input_features].
+                weights: Tensor of shape [1, input_features, output_features].
+                offs: Tensor of shape [1] containing the token count.
+
+            Returns:
+                Tensor of shape [tokens, output_features].
+            """
+            return value @ weights[0]
+
+        def activation(value, probs):
+            """Apply an eager gated activation.
+
+            Args:
+                value: Tensor of shape [tokens, 2 * intermediate] in concatenated gate/up layout.
+                probs: Tensor of shape [tokens, 1].
+
+            Returns:
+                Tensor of shape [tokens, intermediate] in ``value.dtype``.
+            """
+            gate, up = value.chunk(2, dim=-1)
+            return (torch.nn.functional.silu(gate) * up * probs).to(value.dtype)
+
+        monkeypatch.setattr("nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: dense_mm)
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._BIAS_CHUNK_ROWS", 3)
+        torch.manual_seed(123)
+        tensors = [
+            torch.randn(4, 4, dtype=dtype, requires_grad=True),
+            torch.randn(1, 4, 6, dtype=dtype, requires_grad=True),
+            torch.randn(1, 3, 4, dtype=dtype, requires_grad=True),
+            torch.rand(8, 1, dtype=torch.float32, requires_grad=True),
+        ]
+        expected_tensors = [tensor.detach().clone().requires_grad_() for tensor in tensors]
+        routing_indices = torch.arange(4).repeat_interleave(2)
+        token_counts = torch.tensor([8])
+        routed_refs = []
+
+        def block(hidden, gate_up, down, probs):
+            """Materialize routed rows inside the outer checkpoint.
+
+            Args:
+                hidden: Tensor of shape [input_tokens, hidden].
+                gate_up: Tensor of shape [1, hidden, 2 * intermediate] in concatenated gate/up layout.
+                down: Tensor of shape [1, intermediate, hidden].
+                probs: Tensor of shape [routed_tokens, 1].
+
+            Returns:
+                Tensor of shape [routed_tokens, hidden] with independent storage.
+            """
+            routed = hidden.index_select(0, routing_indices)
+            routed_refs.append(weakref.ref(routed))
+            return _checkpointed_chunked_expert_mlp(
+                routed,
+                gate_up,
+                down,
+                None,
+                None,
+                token_counts,
+                probs,
+                activation,
+                apply_router_weight_after_down,
+            )
+
+        expected = block(*expected_tensors)
+        upstream = torch.randn_like(expected)
+        expected_grads = torch.autograd.grad(expected, expected_tensors, upstream)
+        routed_refs.clear()
+
+        actual = checkpoint(block, *tensors, use_reentrant=False)
+        gc.collect()
+        assert routed_refs[0]() is None, "The inner checkpoint must not retain the full routed input"
+        actual_grads = torch.autograd.grad(actual, tensors, upstream)
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
     @pytest.mark.parametrize("with_bias", [False, True])
     @pytest.mark.parametrize("apply_router_weight_after_down", [False, True])
     def test_checkpointed_chunked_expert_mlp_matches_full_dispatch(
@@ -1635,8 +1724,16 @@ class TestGroupedExpertsDeepEP:
 
     def test_grouped_experts_deepep_token_dispatcher_init_hybridep(self, moe_config):
         """Test init_token_dispatcher passes hybridep config to TokenDispatcherConfig."""
+        backend = BackendConfig(
+            dispatcher_hybridep_permute_fusion=True,
+            dispatcher_hybridep_compact_routing=True,
+            dispatcher_hybridep_num_sms_preprocessing=132,
+            dispatcher_hybridep_num_blocks_permute=112,
+            dispatcher_hybridep_num_blocks_unpermute=112,
+        )
         experts = GroupedExpertsDeepEP(
             moe_config,
+            backend=backend,
             dispatcher_backend="hybridep",
             dispatcher_num_sms=24,
             dispatcher_share_token_dispatcher=False,
@@ -1663,6 +1760,11 @@ class TestGroupedExpertsDeepEP:
             assert config_arg.moe_deepep_num_sms == 24
             assert config_arg.moe_share_token_dispatcher is False
             assert config_arg.moe_deepep_async_dispatch is True
+            assert config_arg.moe_hybridep_permute_fusion is True
+            assert config_arg.moe_hybridep_compact_routing is True
+            assert config_arg.moe_hybridep_num_sms_preprocessing == 132
+            assert config_arg.moe_hybridep_num_blocks_permute == 112
+            assert config_arg.moe_hybridep_num_blocks_unpermute == 112
 
 
 class TestNonGatedActivations:

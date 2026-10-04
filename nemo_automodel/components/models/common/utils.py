@@ -409,12 +409,21 @@ class MoKBackendConfig:
         )
 
 
+AttentionBackend = Literal["torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "magi"]
+
+
 @dataclass(kw_only=True)
 class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or "cudnn").
+        attn: Attention backend ("torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", or "magi").
+            "fa4" selects native FlashAttention-4 (CuTe) and requires an
+            INSTALL_FA4=true image. HF-dispatched models use "flash_attention_4". A rank-2 binary
+            padding mask is converted to varlen metadata, while dense/block masks and indexed
+            document masks without explicit packed metadata are rejected.
+            Inputs must use BSHD layout; pre-packed THD is unsupported. Packed
+            Qwen3Next and DeepSeek V3.2 sparse attention do not support FA4.
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
@@ -442,6 +451,17 @@ class BackendConfig:
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
             asynchronously and allocate their outputs on the communication stream.
+        dispatcher_hybridep_permute_fusion: Fuse HybridEP token permutation into dispatch and
+            unpermutation into combine. Has no effect for other dispatcher backends.
+        dispatcher_hybridep_compact_routing: Send compact top-k expert indices to HybridEP
+            instead of the dense Boolean routing map. This can reduce metadata traffic, but
+            remains opt-in because its latency depends on topology and model shape.
+        dispatcher_hybridep_num_sms_preprocessing: Optional number of SMs used by HybridEP
+            routing-metadata preprocessing.
+        dispatcher_hybridep_num_blocks_permute: Optional number of dispatch permutation
+            blocks. ``None`` preserves HybridEP's default.
+        dispatcher_hybridep_num_blocks_unpermute: Optional number of combine
+            unpermutation blocks. ``None`` preserves HybridEP's default.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -487,9 +507,7 @@ class BackendConfig:
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
-        "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
-    )
+    attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     sparse_attn: Literal["generic", "msa"] = "generic"
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
@@ -509,6 +527,11 @@ class BackendConfig:
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
+    dispatcher_hybridep_permute_fusion: bool = False
+    dispatcher_hybridep_compact_routing: bool = False
+    dispatcher_hybridep_num_sms_preprocessing: int | None = None
+    dispatcher_hybridep_num_blocks_permute: int | None = None
+    dispatcher_hybridep_num_blocks_unpermute: int | None = None
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -1460,6 +1483,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
 
 
 __all__ = [
+    "AttentionBackend",
     "BackendConfig",
     "Float32RMSNorm",
     "TEFp8Config",

@@ -2,6 +2,50 @@
 title: "Release Notes"
 description: ""
 ---
+## Unreleased
+
+### Native FlashAttention-4
+
+- Select the native CuTe backend with `model.backend.attn: fa4` in an
+  `INSTALL_FA4=true` image. On models declaring native FA4 support,
+  `model.attn_implementation: flash_attention_4` also selects it when no backend
+  config is supplied. An explicit backend config remains authoritative.
+  HF-dispatched models continue to use the HF `flash_attention_4` implementation.
+- Native FA4 accepts BSHD inputs and NEAT packing. Use `cp_size: 1` and select
+  NEAT explicitly for packed runs; legacy THD packing is unsupported. Dense
+  attention masks are unsupported. Packed Qwen3Next recurrent attention and
+  DeepSeek V3.2 sparse attention are also unsupported by this backend.
+- Finite native FA4 windows count visible keys including the current token,
+  matching the SDPA window convention. The pinned SM100/SM110 FA4 kernel does
+  not support local attention with 256-wide query/key and value heads; select
+  `model.backend.attn: sdpa` for that combination.
+
+### NEAT packing API migration
+
+- Packing now follows the built model's attention dispatch. The legacy YAML
+  selector `packed_sequence.attn_implementation` is ignored with a warning.
+- Replace `get_attn_implementation(cfg_model, model)` with
+  `get_model_attn_implementation(model)` from
+  `nemo_automodel.components.models.common.packing`. For multiple local pipeline
+  stages, use `configure_packing_for_models(model_parts)`.
+- Import `get_unpad_data` and `get_seqlens_in_batch` from
+  `nemo_automodel.components.datasets.packing`. HF flash packing uses
+  explicit public varlen kwargs without modifying Transformers globals. Pass the
+  contract returned by `configure_packing` as `packing=` to
+  the collater or `packing_contract=` to the dataloader config's `build()`.
+- `VlmDataloaderConfig.resolve_packing_attn_implementation` was removed. Custom
+  integrations should configure the built model and supply its packing contract
+  to `VlmDataloaderConfig.build()` instead of selecting a backend in the dataset.
+- `configure_packing` now requires an attention implementation and returns a
+  packing contract. Qwen3.5, Qwen3.5-MoE, Kimi Linear, and Kimi K3 require the
+  resulting dataset metadata alongside indexed masks. Custom loops must pass
+  the contract to their collater and forward its metadata; the legacy
+  `attn_implementation=` collater argument cannot declare model-specific
+  metadata requirements.
+- Qwen3.5 packing with load-balanced context parallelism now raises instead of
+  silently losing document isolation. Use `cp_size: 1`, or the supported SDPA
+  block-diagonal CP path for Qwen3.5-MoE.
+
 ## 0.5.0 · 26.06 · [PyPI](https://pypi.org/project/nemo-automodel/0.5.0/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.5.0) · [NGC Docker](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.06.00)
 
 ### Highlights

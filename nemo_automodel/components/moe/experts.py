@@ -1154,6 +1154,9 @@ def _checkpointed_chunked_expert_mlp(
     is allocated once and populated by slice assignment; no concatenation or
     stateful scratch buffer is used.
 
+    The checkpoint callback captures the input dtype rather than the routed
+    tensor so an enclosing activation checkpoint can release that tensor.
+
     This helper is for the plain ``torch._grouped_mm`` path. MXFP8 uses a
     different quantization contract and remains on its existing whole-dispatch
     implementation.
@@ -1192,6 +1195,8 @@ def _checkpointed_chunked_expert_mlp(
     if down_proj_bias is not None and down_proj_bias.dtype in (torch.float16, torch.bfloat16):
         down_proj_bias = down_proj_bias.float()
 
+    hidden_dtype = hidden_states.dtype
+
     def run_chunk(
         chunk_hidden,
         chunk_probs,
@@ -1229,7 +1234,7 @@ def _checkpointed_chunked_expert_mlp(
             None if apply_router_weight_after_down else chunk_probs,
         )
         if apply_router_weight_after_down:
-            expert_output = _apply_router_weight_fp32(expert_output, chunk_probs, hidden_states.dtype)
+            expert_output = _apply_router_weight_fp32(expert_output, chunk_probs, hidden_dtype)
         return expert_output
 
     for chunk_start in range(0, hidden_states.shape[0], _BIAS_CHUNK_ROWS):
@@ -1308,6 +1313,21 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.dispatcher_hybridep_permute_fusion = (
+            backend.dispatcher_hybridep_permute_fusion if backend is not None else False
+        )
+        self.dispatcher_hybridep_compact_routing = (
+            backend.dispatcher_hybridep_compact_routing if backend is not None else False
+        )
+        self.dispatcher_hybridep_num_sms_preprocessing = (
+            backend.dispatcher_hybridep_num_sms_preprocessing if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_permute = (
+            backend.dispatcher_hybridep_num_blocks_permute if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_unpermute = (
+            backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
+        )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -1341,6 +1361,11 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_hybridep_permute_fusion=self.dispatcher_hybridep_permute_fusion,
+            moe_hybridep_compact_routing=self.dispatcher_hybridep_compact_routing,
+            moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
+            moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
+            moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -1634,6 +1659,21 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.dispatcher_hybridep_permute_fusion = (
+            backend.dispatcher_hybridep_permute_fusion if backend is not None else False
+        )
+        self.dispatcher_hybridep_compact_routing = (
+            backend.dispatcher_hybridep_compact_routing if backend is not None else False
+        )
+        self.dispatcher_hybridep_num_sms_preprocessing = (
+            backend.dispatcher_hybridep_num_sms_preprocessing if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_permute = (
+            backend.dispatcher_hybridep_num_blocks_permute if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_unpermute = (
+            backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
+        )
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
         # Non-gated (ReLU²): out_features = moe_inter_dim
@@ -1944,6 +1984,11 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_hybridep_permute_fusion=self.dispatcher_hybridep_permute_fusion,
+            moe_hybridep_compact_routing=self.dispatcher_hybridep_compact_routing,
+            moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
+            moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
+            moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
             moe_benchmark_static_routing=self.static_routing,
         )
 
