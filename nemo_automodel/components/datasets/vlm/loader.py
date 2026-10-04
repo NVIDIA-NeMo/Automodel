@@ -30,6 +30,11 @@ from transformers import AutoProcessor, ProcessorMixin
 
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.loader import DatasetConfig, TokenizerDatasetConfig
+from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    PackedSequenceContract,
+    resolve_packing_contract,
+)
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     COLLATE_FNS,
     neat_packed_vlm_collater,
@@ -167,35 +172,6 @@ class VlmDataloaderConfig:
     prefetch_factor: int | None = None
     drop_last: bool = False
 
-    def resolve_packing_attn_implementation(
-        self,
-        *,
-        model_attn_implementation: str | None,
-        cp_size: int,
-    ) -> str | None:
-        """Resolve the packed-collator mask backend.
-
-        Args:
-            model_attn_implementation: Attention implementation selected by the model config.
-            cp_size: Runtime context-parallel world size.
-
-        Returns:
-            Attention implementation used to choose the packed attention-mask representation.
-        """
-        if self.packing is None:
-            return None
-        override = self.packing.attn_implementation
-        if override is not None and cp_size > 1:
-            return override
-        if override not in (None, model_attn_implementation):
-            logger.warning(
-                "Ignoring packed_sequence.attn_implementation=%r at cp_size=1: the packed mask format must "
-                "match the model attention backend (%r)",
-                override,
-                model_attn_implementation,
-            )
-        return model_attn_implementation
-
     def _build_source(
         self,
         *,
@@ -240,6 +216,7 @@ class VlmDataloaderConfig:
         dataset_build_context: AbstractContextManager[object] | None = None,
         get_rope_index: Callable[..., object] | None = None,
         packing_attn_implementation: str | None = None,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
         pp_n_microbatches: int | None = None,
         cp_size: int = 1,
     ) -> VlmDataloaderBuild:
@@ -252,7 +229,10 @@ class VlmDataloaderConfig:
             batch_size: Runtime local training batch size.
             dataset_build_context: Optional rank-ordering context used only for processor and source-dataset build.
             get_rope_index: Optional model callback used to create packed multimodal position IDs.
-            packing_attn_implementation: Resolved attention backend for packed-mask construction.
+            packing_attn_implementation: Deprecated attention-backend name
+                retained for Python-call compatibility.
+            packing_contract: Structural model contract used for packed-mask construction.
+                Defaults to block-causal masking without packed-sequence metadata.
             pp_n_microbatches: Optional pipeline microbatch count used to pre-chunk media tensors.
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
                 compact document IDs instead of a dense quadratic attention mask;
@@ -277,6 +257,8 @@ class VlmDataloaderConfig:
         if self.packing is not None:
             if self.pretokenization is None:
                 raise ValueError("VLM neat packing requires pretokenization")
+            legacy_attn_implementation = packing_attn_implementation or self.packing.attn_implementation
+            packing_contract = resolve_packing_contract(packing_contract, legacy_attn_implementation)
             tokenizer = getattr(processor, "tokenizer", None)
             padding_idx = getattr(tokenizer, "pad_token_id", 0) or 0
             dataset = self.packing.build(
@@ -306,7 +288,7 @@ class VlmDataloaderConfig:
                     neat_packed_vlm_collater,
                     padding_idx=padding_idx,
                     max_length=self.packing.collate_max_length,
-                    attn_implementation=packing_attn_implementation,
+                    packing=packing_contract,
                     materialize_4d_mask=materialize_4d_mask,
                 )
         elif self.collator is not None:

@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from torch import nn
@@ -91,11 +91,14 @@ class FusedLinearCEConfig(LossConfig):
         ignore_index: Label value marking padding tokens.
         logit_softcapping: Softcap logits before CE (0 = disabled).
         reduction: Reduction mode.
+        impl: ``"cce"`` (flat memory, slowest) or ``"torch_compile"`` (faster,
+            memory grows with supervised tokens x vocab).
     """
 
     ignore_index: int = -100
     logit_softcapping: float = 0.0
     reduction: str = "sum"
+    impl: Literal["cce", "torch_compile"] = "cce"
 
     def build(self) -> nn.Module:
         from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -103,6 +106,34 @@ class FusedLinearCEConfig(LossConfig):
         return FusedLinearCrossEntropy(
             ignore_index=self.ignore_index,
             logit_softcapping=self.logit_softcapping,
+            reduction=self.reduction,
+            impl=self.impl,
+        )
+
+
+@dataclass
+class ChunkedCEConfig(LossConfig):
+    """Chunked output projection and cross entropy.
+
+    Attributes:
+        chunk_len: Maximum token rows per output projection.
+        compile: Compile each chunk's projection and CE.
+        ignore_index: Ignored target value.
+        reduction: Reduction across all tokens.
+    """
+
+    chunk_len: int = 512
+    compile: bool = True
+    ignore_index: int = -100
+    reduction: str = "sum"
+
+    def build(self) -> nn.Module:
+        from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+        return ChunkedCrossEntropy(
+            chunk_len=self.chunk_len,
+            compile=self.compile,
+            ignore_index=self.ignore_index,
             reduction=self.reduction,
         )
 
@@ -231,6 +262,7 @@ class LossFromFactoryConfig(LossConfig):
 LOSS_CONFIG_REGISTRY: dict[str, type[LossConfig]] = {
     "MaskedCrossEntropy": MaskedCrossEntropyConfig,
     "FusedLinearCrossEntropy": FusedLinearCEConfig,
+    "ChunkedCrossEntropy": ChunkedCEConfig,
     "TEParallelCrossEntropy": TEParallelCEConfig,
     "KDLoss": KDLossConfig,
     "DFlashDecayLoss": DFlashDecayLossConfig,

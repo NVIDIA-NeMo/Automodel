@@ -74,6 +74,17 @@ For developers building a custom docker container with Automodel, please refer t
 
 If [Nvidia PyTorch](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/index.html) container is used as a base image, please review [Developing with Automodel container](#1-developing-with-automodel-container).
 
+The image includes a pinned [Mixture-of-Kittens](https://github.com/cursor/mixture-of-kittens)
+build for GB200 (SM100) and GB300 (SM103). Pass `--build-arg MOK_ARCH=SM100` or
+`--build-arg MOK_ARCH=SM103` to build for a single target. MoK recipes require
+Blackwell GPUs; H100 GPUs are unsupported.
+Outside the image, install it with `MOK_ARCH=ALL uv sync --extra mok` on Linux
+with Python 3.12+, CUDA-enabled PyTorch 2.10+ and the matching CUDA 13 toolkit.
+Use `MOK_ARCH=SM100` or `MOK_ARCH=SM103` for a single target. Run
+`uv cache clean mixture-of-kittens` before switching architectures in an existing
+installation, then add
+`--reinstall-package mixture-of-kittens` to the sync command.
+
 Command to build Automodel's Dockerfile:
 
 ```bash
@@ -104,7 +115,6 @@ pip install transformer-engine[pytorch]==2.8.0
 # Flash-attn version should be selected to satisfy TE requirements
 # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
 pip install flash-attn==2.7.4.post1
-pip install grouped_gemm
 ```
 
 ## Development Dependencies

@@ -137,8 +137,9 @@ class _ConsolidatedHFMetadataExporter(Protocol):
         hf_metadata_dir: str,
         tokenizer: object,
         original_model_path: str | None,
+        v4_compatible: bool,
     ) -> None:
-        """Write model-specific metadata into the shared Hugging Face metadata directory."""
+        """Write model-specific metadata, honoring the requested v4 config layout."""
         ...
 
 
@@ -161,6 +162,7 @@ class ConsolidatedHFAddon:
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
             original_model_path (str | None): Authoritative source checkpoint snapshot.
+            v4_compatible (bool): Preserve the source config beside the generated v5 config when available.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
@@ -194,6 +196,7 @@ class ConsolidatedHFAddon:
                     hf_metadata_dir=hf_metadata_dir,
                     tokenizer=tokenizer,
                     original_model_path=original_model_path,
+                    v4_compatible=kwargs.get("v4_compatible", False),
                 )
             else:
                 _save_generated_hf_assets(
@@ -400,6 +403,25 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     return result
 
 
+def load_automodel_peft_config_dict(model_path: str) -> dict:
+    """Read back the PEFT configuration ``PeftAddon`` saved in a ``model/`` checkpoint directory.
+
+    ``automodel_peft_config.json`` holds every ``PeftConfig`` field except ``dim`` and ``alpha``, which are taken
+    from the PEFT ``adapter_config.json`` (``r`` / ``lora_alpha``).
+
+    Args:
+        model_path: The checkpoint's ``model/`` directory.
+
+    Returns:
+        A dict for ``PeftConfig.from_dict``.
+    """
+    with open(os.path.join(model_path, "automodel_peft_config.json")) as f:
+        fields = json.load(f)
+    with open(os.path.join(model_path, "adapter_config.json")) as f:
+        hf_config = json.load(f)
+    return {**fields, "dim": hf_config["r"], "alpha": hf_config["lora_alpha"]}
+
+
 def _has_trainable_moe_lora_parameters(
     model: "nn.Module | list[nn.Module]",
     pp_group: "torch.distributed.ProcessGroup | None" = None,
@@ -536,9 +558,11 @@ def _extract_target_modules(
                         seen_expert_groups.add((expert_path, group))
 
                         n_experts = param.shape[0]
+                        is_gated = getattr(adapter, "_is_gated_moe", True)
                         for expert_id in range(n_experts):
                             if group == "gate_and_up":
-                                final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
+                                if is_gated:
+                                    final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
                                 final_target_modules.add(f"{expert_path}.{expert_id}.up_proj")
                             else:
                                 final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
@@ -694,8 +718,11 @@ def _maybe_save_custom_model_code(
     hub id (e.g. ``nvidia/Nemotron-Flash-1B``) and the loaded model has ``auto_map`` custom
     code, copy the ``.py`` files from the cached ``transformers_modules`` directory so the
     consolidated checkpoint carries ``modeling_*.py`` locally and reloads without needing
-    ``trust_remote_code=True``.
+    ``trust_remote_code=True``. Models marked for stock export intentionally skip this copy.
     """
+    if model_part is not None and getattr(model_part, "_export_as_stock_model", False):
+        return
+
     copied: set[str] = set()
 
     def _copy_py_tree(src_dir: str) -> None:

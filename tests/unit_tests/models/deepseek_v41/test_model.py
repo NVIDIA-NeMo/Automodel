@@ -30,14 +30,13 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from nemo_automodel._transformers.capabilities import _is_deepseek_v4
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-    get_parallelization_strategy,
-)
+from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
+from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
 from nemo_automodel.components.models.deepseek_v41.attention import DeepseekV41AttentionState
 from nemo_automodel.components.models.deepseek_v41.config import (
     DeepseekV41Config,
@@ -45,12 +44,13 @@ from nemo_automodel.components.models.deepseek_v41.config import (
     DeepseekV41VisionConfig,
 )
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
+from nemo_automodel.components.moe.layers import FakeBalancedGate
 from nemo_automodel.components.moe.parallelizer import _is_deepseek_v4_model, apply_ac
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
 
 # Over the default 5s budget on purpose: this module runs full-model forwards and distributed FSDP checks.
 # Shrink the model fixtures and process startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _tiny_config() -> DeepseekV41Config:
@@ -114,6 +114,28 @@ def test_full_tiny_ced_model_trains_after_meta_initialization() -> None:
     optimizer.step()
     optimizer.zero_grad()
     assert model(inputs, labels=inputs).loss.item() < initial_loss
+
+
+def test_fake_balanced_gate_is_honored() -> None:
+    """With ``BackendConfig.fake_balanced_gate`` every MoE layer routes through the ``FakeBalancedGate`` that
+    ``MoE`` builds (forced balance for benchmarks, as in DeepSeek-V4); weight init and a forward/backward run on
+    it, and the default backend still installs the learned ``DeepseekV4VisionGate``."""
+    torch.manual_seed(8)
+    backend = replace(_backend(), fake_balanced_gate=True)
+    with torch.device("meta"):
+        model = DeepseekV41ForCausalLM(_tiny_config(), backend=backend)
+    gates = [layer.ffn.gate for layer in model.model.layers.values()]
+    assert gates and all(isinstance(gate, FakeBalancedGate) for gate in gates)
+    model.to_empty(device="cpu")
+    model.initialize_weights(torch.device("cpu"), dtype=torch.float32)  # pre-fix: dereferenced gate.bias_vl
+    inputs = torch.randint(0, 64, (2, 12))
+    out = model(inputs, labels=inputs)  # pre-fix: called gate.set_routing_context unconditionally
+    assert out.logits.shape == (2, 12, 64) and torch.isfinite(out.loss)
+    out.loss.backward()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    with torch.device("meta"):
+        learned = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
+    assert all(isinstance(layer.ffn.gate, DeepseekV4VisionGate) for layer in learned.model.layers.values())
 
 
 def test_tied_embeddings_are_rejected() -> None:
@@ -373,10 +395,10 @@ def test_indexers_are_frozen_by_the_model_constructor() -> None:
     assert expected and frozen == expected
 
 
-def test_v41_uses_generic_moe_parallelization() -> None:
+def test_v41_uses_unified_moe_parallelization() -> None:
     model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
     assert not _is_deepseek_v4_model(model)
-    assert type(get_parallelization_strategy(model)) is DefaultParallelizationStrategy
+    assert isinstance(get_model_parallelizer(model), ModelParallelizer)
     assert not dsv4_fsdp._is_deepseek_v4_module(model)
     assert not _is_deepseek_v4(model)
     assert _is_deepseek_v4(SimpleNamespace(config=SimpleNamespace(model_type="deepseek_v4")))

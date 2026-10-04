@@ -23,39 +23,39 @@ This module provides a single pipeline class that handles:
 
 Usage:
     # Finetuning (from_pretrained) - no pipeline_spec needed
-    pipe, managers = NeMoAutoDiffusionPipeline.from_pretrained(
+    pipe = NeMoAutoDiffusionPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-dev",
         load_for_training=True,
-        parallel_scheme={"transformer": manager_args},
+        mesh_context=mesh_context,
     )
 
     # Pretraining (from_config) - pipeline_spec required in YAML
-    pipe, managers = NeMoAutoDiffusionPipeline.from_config(
+    pipe = NeMoAutoDiffusionPipeline.from_config(
         "black-forest-labs/FLUX.1-dev",
         pipeline_spec={
             "transformer_cls": "FluxTransformer2DModel",
             "subfolder": "transformer",
         },
-        parallel_scheme={"transformer": manager_args},
+        mesh_context=mesh_context,
     )
 """
 
+import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable
 
 import torch
 import torch.nn as nn
 
 from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
-from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes, parallelizer
+from nemo_automodel._diffusers.parallelization import attach_parallelizer
+from nemo_automodel.components.distributed import MeshContext
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
-from nemo_automodel.components.distributed.ddp import DDPManager
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from nemo_automodel.components.distributed.parallelizer import (
-    HunyuanParallelizationStrategy,
-    WanParallelizationStrategy,
+from nemo_automodel.components.distributed.model_parallelizer import (
+    compile_parallelized_model,
+    parallelize_model,
 )
 from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
@@ -71,9 +71,6 @@ except Exception:
 
 
 logger = logging.getLogger(__name__)
-
-# Type alias for parallel managers
-ParallelManager = Union[FSDP2Manager, DDPManager]
 
 
 @dataclass
@@ -139,12 +136,6 @@ def _import_diffusers_class(class_name: str):
     return getattr(diffusers, class_name)
 
 
-def _init_parallelizer():
-    """Register custom parallelization strategies."""
-    parallelizer.PARALLELIZATION_STRATEGIES["WanTransformer3DModel"] = WanParallelizationStrategy()
-    parallelizer.PARALLELIZATION_STRATEGIES["HunyuanVideo15Transformer3DModel"] = HunyuanParallelizationStrategy()
-
-
 def _choose_device(device: torch.device | None) -> torch.device:
     """Choose device, defaulting to CUDA with LOCAL_RANK if available."""
     if device is not None:
@@ -155,7 +146,7 @@ def _choose_device(device: torch.device | None) -> torch.device:
     return torch.device("cpu")
 
 
-def _iter_pipeline_modules(pipe) -> Iterable[Tuple[str, nn.Module]]:
+def _iter_pipeline_modules(pipe) -> Iterable[tuple[str, nn.Module]]:
     """Iterate over nn.Module components in a pipeline."""
     # Prefer Diffusers' components registry when available
     if hasattr(pipe, "components") and isinstance(pipe.components, dict):
@@ -375,150 +366,38 @@ def _fuse_transformer_qkv_projections(module: nn.Module, module_name: str, *, co
     return fused
 
 
-def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
-    """
-    Factory function to create the appropriate parallel manager based on config.
-
-    Builds a ``DistributedSetup`` via ``DistributedSetup.build(...)``, then instantiates the
-    requested manager from the setup's strategy config and meshes. This mirrors
-    the pattern used by ``_instantiate_distributed`` in the transformers infrastructure.
-
-    The manager type is determined by the ``_manager_type`` key in *manager_args*:
-    - ``'ddp'``: Creates a DDP ``DistributedSetup`` + ``DDPManager``
-    - ``'fsdp2'`` (default): Creates an FSDP2 ``DistributedSetup`` + ``FSDP2Manager``
-
-    Args:
-        manager_args: Flat dictionary of arguments.  Recognised keys:
-
-            Common:
-                ``_manager_type`` (str): ``'fsdp2'`` or ``'ddp'``.
-                ``activation_checkpointing`` (bool): Enable activation checkpointing.
-
-            FSDP2-specific (mesh creation):
-                ``world_size`` (int): Total number of processes.
-                ``dp_size``, ``dp_replicate_size``, ``tp_size``, ``cp_size``,
-                ``pp_size``, ``ep_size`` (int): Parallelism dimensions.
-
-            FSDP2-specific (config):
-                ``mp_policy``: :class:`MixedPrecisionPolicy` instance.
-                ``sequence_parallel`` (bool), ``tp_plan`` (dict),
-                ``offload_policy``, ``defer_fsdp_grad_sync`` (bool).
-
-    Returns:
-        Either an FSDP2Manager or DDPManager instance.
-
-    Raises:
-        ValueError: If an unknown manager type is specified.
-    """
-    args = manager_args.copy()
-    manager_type = args.pop("_manager_type", "fsdp2").lower()
-    if "backend" in args:
-        raise ValueError(
-            "backend is not a parallel manager option; configure the process group before parallelization."
-        )
-    parallelism = ParallelismSizes(
-        dp_size=args.get("dp_size"),
-        dp_replicate_size=args.get("dp_replicate_size"),
-        tp_size=args.get("tp_size", 1),
-        pp_size=args.get("pp_size", 1),
-        cp_size=args.get("cp_size", 1),
-        ep_size=args.get("ep_size", 1),
-    )
-
-    if manager_type == "ddp":
-        distributed_setup = DistributedSetup.build(
-            strategy=DDPConfig(
-                activation_checkpointing=args.get("activation_checkpointing", False),
-                find_unused_parameters=args.get("find_unused_parameters", False),
-            ),
-            parallelism_sizes=parallelism,
-            activation_checkpointing=args.get("activation_checkpointing", False),
-            world_size=args.get("world_size"),
-        )
-        logger.info("[Parallel] Creating DDPManager with config: %s", distributed_setup.strategy_config)
-        return DDPManager(distributed_setup.strategy_config)
-
-    elif manager_type == "fsdp2":
-        world_size = args.get("world_size")
-        if world_size is None:
-            world_size = torch.distributed.get_world_size()
-
-        distributed_setup = DistributedSetup.build(
-            strategy=FSDP2Config(
-                mp_policy=args["mp_policy"] if "mp_policy" in args else None,
-                sequence_parallel=args.get("sequence_parallel", False),
-                tp_plan=args.get("tp_plan", None),
-                patch_is_packed_sequence=args.get("patch_is_packed_sequence", False),
-                offload_policy=args.get("offload_policy", None),
-                defer_fsdp_grad_sync=args.get("defer_fsdp_grad_sync", True),
-                enable_async_tensor_parallel=args.get("enable_async_tensor_parallel", False),
-                enable_compile=args.get("enable_compile", False),
-                enable_fsdp2_prefetch=args.get("enable_fsdp2_prefetch", False),
-                fsdp2_backward_prefetch_depth=args.get("fsdp2_backward_prefetch_depth", 2),
-                fsdp2_forward_prefetch_depth=args.get("fsdp2_forward_prefetch_depth", 1),
-                activation_checkpointing=args.get("activation_checkpointing", False),
-            ),
-            parallelism_sizes=parallelism,
-            activation_checkpointing=args.get("activation_checkpointing", False),
-            world_size=world_size,
-        )
-
-        mesh_context = distributed_setup.mesh_context
-        logger.info("[Parallel] Creating FSDP2Manager with config: %s", distributed_setup.strategy_config)
-        return FSDP2Manager(
-            distributed_setup.strategy_config,
-            device_mesh=mesh_context.device_mesh,
-            moe_mesh=mesh_context.moe_mesh,
-        )
-
-    else:
-        raise ValueError(f"Unknown manager type: '{manager_type}'. Expected 'ddp' or 'fsdp2'.")
-
-
 def _enable_context_parallel(
-    module: nn.Module, module_name: str, manager: ParallelManager, manager_args: Dict[str, Any]
+    module: nn.Module,
+    module_name: str,
+    mesh_context: MeshContext,
 ) -> None:
     """Enable diffusers context parallelism on a transformer before FSDP2 sharding.
 
     Registers diffusers' CP hooks (sequence-dim input split / output gather driven by
     the model's ``_cp_plan``) on *module*, reusing the ``cp`` axis of the FSDP2 device
     mesh instead of letting diffusers initialize a second world mesh. Must run before
-    ``manager.parallelize`` so hooks and FSDP2 wrapping compose on the same modules.
+    ``ModelParallelizer.parallelize`` so hooks and FSDP2 wrapping compose on the same modules.
 
     Args:
         module: The diffusers transformer to enable CP on. Must expose
             ``enable_parallelism`` and define a ``_cp_plan``.
         module_name: Component name, for error messages.
-        manager: The parallel manager created for this component. Must be an
-            ``FSDP2Manager`` (its device mesh provides the ``cp`` axis).
-        manager_args: Flat manager-args dict. Reads ``cp_size`` and the optional
-            ``cp_ring_degree`` / ``cp_ulysses_degree`` split (defaults to pure
-            Ulysses, i.e. ``ring=1, ulysses=cp_size``).
+        mesh_context: Resolved topology and policy. Its device mesh provides the
+            ``cp`` axis and its CP split defaults to pure Ulysses.
 
     Raises:
-        ValueError: If the manager is not FSDP2, the ring/ulysses split does not
+        ValueError: If the strategy is not FSDP2, the ring/ulysses split does not
             multiply to ``cp_size``, ring is requested (training backward is
             broken in diffusers<=0.39), or the model has no ``_cp_plan``.
     """
-    from diffusers import ContextParallelConfig
+    if not isinstance(mesh_context.strategy_config, FSDP2Config):
+        raise ValueError("Context parallelism requires FSDP2; DDP is not supported.")
 
-    from nemo_automodel._diffusers.diffusers_patches import (
-        apply_cudnn_attention_patch,
-        apply_native_flash_backward_patch,
-    )
-    from nemo_automodel.components.distributed.mesh_utils import create_ring_ulysses_mesh
-
-    # Interim fixes for the diffusers<=0.39 _native_flash/_native_cudnn backward
-    # bugs on the CP path; feature-detected, no-ops once upstream ships the fix.
-    apply_native_flash_backward_patch()
-    apply_cudnn_attention_patch()
-
-    cp_size = int(manager_args.get("cp_size", 1))
-    ring_degree = int(manager_args.get("cp_ring_degree", 1))
-    ulysses_degree = int(manager_args.get("cp_ulysses_degree", cp_size // ring_degree if ring_degree else 0))
-
-    if not isinstance(manager, FSDP2Manager):
-        raise ValueError(f"cp_size={cp_size} requires the fsdp2 manager; DDP does not support context parallelism.")
+    cp_size = mesh_context.cp_size
+    ring_degree = mesh_context.cp_ring_degree
+    ulysses_degree = mesh_context.cp_ulysses_degree
+    if ulysses_degree is None:
+        ulysses_degree = cp_size // ring_degree if ring_degree else 0
     if ring_degree * ulysses_degree != cp_size:
         raise ValueError(
             f"cp_ring_degree ({ring_degree}) * cp_ulysses_degree ({ulysses_degree}) must equal cp_size ({cp_size})."
@@ -535,7 +414,27 @@ def _enable_context_parallel(
             "diffusers context-parallel plan (_cp_plan). Provide a custom plan upstream or disable CP."
         )
 
-    cp_mesh = create_ring_ulysses_mesh(manager.device_mesh, ring_degree=ring_degree, ulysses_degree=ulysses_degree)
+    if mesh_context.device_mesh is None:
+        raise ValueError("Diffusers context parallelism requires a device mesh.")
+
+    from diffusers import ContextParallelConfig
+
+    from nemo_automodel._diffusers.diffusers_patches import (
+        apply_cudnn_attention_patch,
+        apply_native_flash_backward_patch,
+    )
+    from nemo_automodel.components.distributed.mesh_utils import create_ring_ulysses_mesh
+
+    # Interim fixes for the diffusers<=0.39 _native_flash/_native_cudnn backward
+    # bugs on the CP path; feature-detected, no-ops once upstream ships the fix.
+    apply_native_flash_backward_patch()
+    apply_cudnn_attention_patch()
+
+    cp_mesh = create_ring_ulysses_mesh(
+        mesh_context.device_mesh,
+        ring_degree=ring_degree,
+        ulysses_degree=ulysses_degree,
+    )
     logger.info(
         "[CP] Enabling context parallelism on %s: ring=%d ulysses=%d mesh=%s",
         module_name,
@@ -550,8 +449,9 @@ def _enable_context_parallel(
 
 def _apply_parallelization(
     pipe,
-    parallel_scheme: Dict[str, Dict[str, Any]] | None,
-) -> Dict[str, ParallelManager]:
+    mesh_context: MeshContext | None,
+    components_to_load: Iterable[str] | None = None,
+):
     """Apply FSDP2/DDP parallelization to pipeline components.
 
     Each parallelized component is stamped with ``_pre_shard_hf_state_dict_keys``:
@@ -564,36 +464,100 @@ def _apply_parallelization(
     state-dict keys gain a ``module.`` prefix, and DDP delegates attribute access
     to the inner module.
     """
-    created_managers: Dict[str, ParallelManager] = {}
-    if parallel_scheme is None:
-        return created_managers
+    if mesh_context is None or (mesh_context.strategy_config is None and mesh_context.ep_size <= 1):
+        return pipe
 
-    assert torch.distributed.is_initialized(), "Distributed environment must be initialized for parallelization"
-    _init_parallelizer()
-
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("Distributed environment must be initialized for parallelization")
     for comp_name, comp_module in _iter_pipeline_modules(pipe):
-        manager_args = parallel_scheme.get(comp_name)
-        if manager_args is None:
+        if components_to_load is not None and comp_name not in components_to_load:
             continue
         logger.info("[INFO] Applying parallelization to %s", comp_name)
-        manager = _create_parallel_manager(manager_args)
-        created_managers[comp_name] = manager
+        attach_parallelizer(comp_module)
         pre_shard_hf_state_dict_keys = list(comp_module.state_dict().keys())
         # CP hooks must be registered before fully_shard so diffusers sees the
         # final module tree by name and FSDP2 wraps the hook-carrying modules.
-        if int(manager_args.get("cp_size", 1)) > 1:
-            _enable_context_parallel(comp_module, comp_name, manager, manager_args)
-        parallel_module = manager.parallelize(comp_module)
-        if hasattr(manager, "maybe_compile"):
-            manager.maybe_compile(parallel_module)
-        if isinstance(manager, DDPManager):
+        if mesh_context.cp_size > 1:
+            _enable_context_parallel(comp_module, comp_name, mesh_context)
+        parallel_module = parallelize_model(comp_module, mesh_context)
+        compile_parallelized_model(parallel_module, mesh_context)
+        if isinstance(mesh_context.strategy_config, DDPConfig):
             inner_module = getattr(parallel_module, "module", parallel_module)
             setattr(inner_module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         else:
             setattr(parallel_module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         setattr(pipe, comp_name, parallel_module)
 
-    return created_managers
+    return pipe
+
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
+    from nemo_automodel.components._peft.lora import PeftConfig
+    from nemo_automodel.components.models.common import BackendConfig
+
+# A value a YAML / CLI override can assign to a model config field.
+ConfigFieldValue = bool | int | float | str | list[bool | int | float | str] | None
+
+
+def _transformer_dir(model_dir: str, subfolder: str = "transformer") -> str:
+    """Directory that holds the transformer's ``config.json``.
+
+    Diffusers repositories (those with a ``model_index.json``) keep it in ``subfolder``; single-model checkpoints
+    keep it at the root.
+    """
+    if os.path.isfile(os.path.join(model_dir, "model_index.json")):
+        return os.path.join(model_dir, subfolder)
+    return model_dir
+
+
+def _has_custom_model(transformer_dir: str) -> bool:
+    """Whether the transformer has a custom Automodel implementation.
+
+    This is the decision ``NeMoAutoModel.from_pretrained`` makes for LLMs and VLMs (``get_is_hf_model``): load the
+    config the same way and resolve it against ``ModelRegistry``. Diffusers transformer configs have no
+    ``architectures`` and are skipped before loading.
+    """
+    from nemo_automodel._transformers.model_init import get_hf_config, get_is_hf_model
+
+    config_path = os.path.join(transformer_dir, "config.json")
+    if not os.path.isfile(config_path):
+        return False
+    with open(config_path) as f:
+        if not json.load(f).get("architectures"):
+            return False
+    config = get_hf_config(transformer_dir, attn_implementation=None, trust_remote_code=False)
+    return not get_is_hf_model(config, force_hf=False)
+
+
+def has_custom_transformer(pretrained_model_name_or_path: str) -> bool:
+    """Whether ``NeMoAutoDiffusionPipeline.from_pretrained`` builds this checkpoint's transformer from a custom
+    Automodel implementation (and so returns a transformer-only pipeline)."""
+    return _has_custom_model(_transformer_dir(resolve_diffusion_model_dir(pretrained_model_name_or_path)))
+
+
+def _validate_custom_model_options(mesh_context: MeshContext | None, **options: bool | str | None) -> None:
+    """Check that no option a custom model cannot honor was requested.
+
+    ``options`` are the pipeline arguments that only work with a diffusers transformer because they call diffusers
+    APIs (``transformer_engine_linear``, ``fuse_qkv_projections``, ``attention_backend``, ...). Context parallelism
+    is not supported for custom models yet either.
+    """
+    requested = sorted(name for name, value in options.items() if value)
+    if requested:
+        raise ValueError(f"{requested} only work with a diffusers transformer; this checkpoint uses a custom model.")
+    if mesh_context is not None and mesh_context.cp_size > 1:
+        raise ValueError("Context parallelism is not supported for custom models yet (cp_size > 1).")
+
+
+def _apply_config_overrides(config: "PretrainedConfig", config_overrides: dict[str, ConfigFieldValue]) -> None:
+    """Set ``config_overrides`` on the loaded model config. Unknown fields are an error, so typos cannot pass silently."""
+    unknown = sorted(set(config_overrides) - set(config.to_dict()))
+    if unknown:
+        raise ValueError(f"config_overrides has fields that {type(config).__name__} does not define: {unknown}")
+    for key, value in config_overrides.items():
+        setattr(config, key, value)
 
 
 class NeMoAutoDiffusionPipeline:
@@ -612,15 +576,13 @@ class NeMoAutoDiffusionPipeline:
       Requires pipeline_spec with transformer_cls in YAML config
 
     Features:
-    - Accepts a per-component mapping from component name to parallel manager init args
+    - Accepts one resolved MeshContext for topology and execution policy
     - Moves all nn.Module components to the chosen device/dtype
-    - Parallelizes only components present in the mapping by constructing a manager per component
-    - Supports both FSDP2Manager and DDPManager via '_manager_type' key in config
+    - Parallelizes the components selected by ``components_to_load``
+    - Supports both FSDP2 and DDP through ``MeshContext.strategy_config``
     - Gradient checkpointing support for memory efficiency
 
-    parallel_scheme:
-    - Dict[str, Dict[str, Any]]: component name -> kwargs for parallel manager
-    - Each component's kwargs should include '_manager_type': 'fsdp2' or 'ddp' (defaults to 'fsdp2')
+    Passing no ``mesh_context`` leaves the loaded pipeline un-parallelized.
     """
 
     def __init__(self, transformer=None, **components):
@@ -647,7 +609,7 @@ class NeMoAutoDiffusionPipeline:
         cls,
         pretrained_model_name_or_path: str,
         *model_args,
-        parallel_scheme: Dict[str, Dict[str, Any]] | None = None,
+        mesh_context: MeshContext | None = None,
         device: torch.device | None = None,
         torch_dtype: Any = torch.bfloat16,
         move_to_device: bool = True,
@@ -661,20 +623,25 @@ class NeMoAutoDiffusionPipeline:
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
+        backend: "BackendConfig | None" = None,
+        config_overrides: dict[str, ConfigFieldValue] | None = None,
         **kwargs,
-    ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
+    ) -> "DiffusionPipeline | NeMoAutoDiffusionPipeline":
         """
         Load pipeline from pretrained weights using DiffusionPipeline auto-detection.
 
         This method auto-detects the pipeline type from model_index.json and loads
         all components. Use this for finetuning existing models.
 
+        When the transformer's architecture has a custom Automodel implementation (``ModelRegistry``), only the
+        transformer is built, through ``NeMoAutoModelForDiffusion``, and a ``NeMoAutoDiffusionPipeline`` holding
+        it is returned; the diffusers-only options below are then rejected.
+
         No pipeline_spec is needed - the pipeline type is determined automatically.
 
         Args:
             pretrained_model_name_or_path: HuggingFace model ID or local path
-            parallel_scheme: Dict mapping component names to parallel manager kwargs.
-                           Each component's kwargs should include '_manager_type': 'fsdp2' or 'ddp'
+            mesh_context: Resolved distributed topology and execution policy.
             device: Device to load model to
             torch_dtype: Data type for model parameters
             move_to_device: Whether to move modules to device
@@ -696,22 +663,48 @@ class NeMoAutoDiffusionPipeline:
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             attention_backend: Optional diffusers attention backend name set on the transformer
                 before parallelization (context parallelism validates the backend at enable time).
+            backend: ``BackendConfig`` of a custom-model transformer.
+            config_overrides: Fields set on the custom-model transformer's config before it is built; every key
+                must be a field of that config.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
-            Tuple of (DiffusionPipeline, Dict[str, ParallelManager])
+            The loaded diffusers pipeline with requested components replaced by their parallelized modules, or a
+            ``NeMoAutoDiffusionPipeline`` holding the custom-model transformer.
         """
-        if not DIFFUSERS_AVAILABLE:
-            raise RuntimeError(
-                "diffusers is required for NeMoAutoDiffusionPipeline.from_pretrained. "
-                "Install with: pip install nemo_automodel[diffusion]"
-            )
-
         logger.info("[INFO] Loading pipeline from pretrained: %s", pretrained_model_name_or_path)
 
         # Resolve to a local snapshot dir so a warm HF cache is not re-validated
         # (and potentially re-downloaded) over the network on every run.
         model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path)
+
+        transformer_dir = _transformer_dir(model_dir)
+        if _has_custom_model(transformer_dir):
+            if components_to_load is not None and set(components_to_load) - {"transformer"}:
+                raise ValueError("Custom-model pipelines load only the `transformer` component.")
+            _validate_custom_model_options(
+                mesh_context,
+                active_transformer=active_transformer,
+                transformer_engine_linear=transformer_engine_linear,
+                fuse_qkv_projections=fuse_qkv_projections,
+                attention_backend=attention_backend,
+            )
+            return cls._from_custom_model(
+                transformer_dir,
+                mesh_context=mesh_context,
+                torch_dtype=torch_dtype,
+                load_base_model=True,
+                load_for_training=load_for_training,
+                peft_cfg=peft_cfg,
+                backend=backend,
+                config_overrides=config_overrides,
+            )
+
+        if not DIFFUSERS_AVAILABLE:
+            raise RuntimeError(
+                "diffusers is required for NeMoAutoDiffusionPipeline.from_pretrained. "
+                "Install with: pip install nemo_automodel[diffusion]"
+            )
 
         # Use DiffusionPipeline.from_pretrained for auto-detection
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
@@ -821,9 +814,7 @@ class NeMoAutoDiffusionPipeline:
                         _ensure_params_trainable(module, module_name=name)
 
         if peft_cfg is not None:
-            transformer_parallel_args = (parallel_scheme or {}).get("transformer", {})
-            manager_type = str(transformer_parallel_args.get("_manager_type", "fsdp2")).lower()
-            if manager_type == "ddp":
+            if mesh_context is not None and isinstance(mesh_context.strategy_config, DDPConfig):
                 for param_name, param in pipe.transformer.named_parameters():
                     if "lora_" not in param_name and param.requires_grad:
                         param.requires_grad_(False)
@@ -833,7 +824,7 @@ class NeMoAutoDiffusionPipeline:
         # FSDP2 LoRA: all params are trainable when fully_shard() runs so FSDP2
         # sets up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
         # DDP LoRA: base weights are frozen before wrapping so DDP only reduces LoRA gradients.
-        created_managers = _apply_parallelization(pipe, parallel_scheme)
+        _apply_parallelization(pipe, mesh_context, components_to_load)
 
         # Freeze base weights after FSDP2 wrapping — mirrors the LLM pattern in
         # nemo_automodel/_transformers/infrastructure.py lines 513-518.
@@ -846,7 +837,64 @@ class NeMoAutoDiffusionPipeline:
                     param.requires_grad_(False)
             logger.info("[LoRA] Froze base weights after parallelization")
 
-        return pipe, created_managers
+        return pipe
+
+    @classmethod
+    def _from_custom_model(
+        cls,
+        transformer_dir: str,
+        *,
+        mesh_context: MeshContext | None,
+        torch_dtype: torch.dtype,
+        load_base_model: bool,
+        load_for_training: bool,
+        peft_cfg: "PeftConfig | None" = None,
+        backend: "BackendConfig | None" = None,
+        config_overrides: dict[str, ConfigFieldValue] | None = None,
+    ) -> "NeMoAutoDiffusionPipeline":
+        """Pipeline around a transformer built from its custom Automodel implementation.
+
+        Same as the LLM recipe's ``build_model``: ``NeMoAutoModelForDiffusion.from_config`` with a ``DistributedSetup``
+        does the sharding (FSDP2, expert parallelism), PEFT and sharded weight loading. ``config_overrides`` are
+        applied to the loaded model config (fields must exist on it).
+        """
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForDiffusion
+        from nemo_automodel._transformers.model_init import get_hf_config
+        from nemo_automodel.components.distributed.config import DistributedSetup
+
+        config = get_hf_config(transformer_dir, attn_implementation=None, trust_remote_code=False)
+        _apply_config_overrides(config, config_overrides or {})
+
+        distributed_setup = None
+        if mesh_context is not None:
+            distributed_setup = DistributedSetup(
+                mesh_context=mesh_context,
+                strategy_config=mesh_context.strategy_config,
+                moe_parallel_config=mesh_context.moe_parallel_config,
+                activation_checkpointing=mesh_context.activation_checkpointing,
+            )
+        model_kwargs = {"backend": backend} if backend is not None else {}
+
+        logger.info("[INFO] Building custom-model transformer %s from %s", config.architectures[0], transformer_dir)
+        transformer = NeMoAutoModelForDiffusion.from_config(
+            config,
+            distributed_setup=distributed_setup,
+            load_base_model=load_base_model,
+            torch_dtype=torch_dtype,
+            trust_remote_code=False,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+            peft_config=peft_cfg,
+            **model_kwargs,
+        )
+        if load_for_training and peft_cfg is None:
+            _ensure_params_trainable(transformer, "transformer")
+        pipe = cls(transformer=transformer)
+        if peft_cfg is not None:
+            # Same contract as the diffusers path: the recipe hands these to the checkpointer.
+            pipe._peft_config = peft_cfg
+            pipe._lora_params = [p for n, p in transformer.named_parameters() if "lora_" in n and p.requires_grad]
+        return pipe
 
     @classmethod
     def from_config(
@@ -855,7 +903,7 @@ class NeMoAutoDiffusionPipeline:
         pipeline_spec: Dict[str, Any],
         torch_dtype: torch.dtype = torch.bfloat16,
         device: torch.device | None = None,
-        parallel_scheme: Dict[str, Dict[str, Any]] | None = None,
+        mesh_context: MeshContext | None = None,
         move_to_device: bool = True,
         components_to_load: Iterable[str] | None = None,
         transformer_engine_linear: bool = False,
@@ -863,25 +911,31 @@ class NeMoAutoDiffusionPipeline:
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
+        backend: "BackendConfig | None" = None,
+        config_overrides: dict[str, ConfigFieldValue] | None = None,
         **kwargs,
-    ) -> Tuple["NeMoAutoDiffusionPipeline", Dict[str, ParallelManager]]:
+    ) -> "NeMoAutoDiffusionPipeline | DiffusionPipeline":
         """
         Initialize pipeline with random weights using YAML-specified transformer class.
 
         This method uses the transformer_cls from pipeline_spec to create a model
         with random weights. Use this for pretraining from scratch.
 
-        Requires pipeline_spec in YAML config with at least:
+        For diffusers transformers, pipeline_spec in the YAML config needs at least:
             pipeline_spec:
                 transformer_cls: "FluxTransformer2DModel"  # or WanTransformer3DModel, etc.
                 subfolder: "transformer"
 
+        When the transformer config in ``subfolder`` names an architecture with a custom Automodel implementation,
+        the transformer is built through ``NeMoAutoModelForDiffusion`` instead; ``transformer_cls`` is not needed
+        and the diffusers-only options are rejected.
+
         Args:
             model_id: HuggingFace model ID or local path (for loading config)
-            pipeline_spec: Dict from YAML config with transformer_cls, subfolder, etc.
+            pipeline_spec: Dict from YAML config with subfolder and, for diffusers transformers, transformer_cls.
             torch_dtype: Data type for model parameters
             device: Device to load model to
-            parallel_scheme: Dict mapping component names to parallel manager kwargs
+            mesh_context: Resolved distributed topology and execution policy.
             move_to_device: Whether to move modules to device
             components_to_load: Which components to process (default: all)
             transformer_engine_linear: Whether to replace torch.nn.Linear modules in the transformer with TE Linear.
@@ -890,19 +944,39 @@ class NeMoAutoDiffusionPipeline:
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             attention_backend: Optional diffusers attention backend name set on the transformer
                 before parallelization (context parallelism validates the backend at enable time).
+            backend: ``BackendConfig`` of a custom-model transformer.
+            config_overrides: Fields set on the custom-model transformer's config before it is built; every key
+                must be a field of that config.
             **kwargs: Additional arguments
 
         Returns:
-            Tuple of (NeMoAutoDiffusionPipeline or DiffusionPipeline, Dict[str, ParallelManager])
+            The initialized diffusers pipeline with requested components replaced by their parallelized modules, or
+            a ``NeMoAutoDiffusionPipeline`` holding the randomly initialized custom-model transformer.
         """
+        # Parse and validate pipeline spec
+        spec = PipelineSpec.from_dict(pipeline_spec)
+        transformer_dir = _transformer_dir(resolve_diffusion_model_dir(model_id), spec.subfolder)
+        if _has_custom_model(transformer_dir):
+            _validate_custom_model_options(
+                mesh_context,
+                transformer_engine_linear=transformer_engine_linear,
+                fuse_qkv_projections=fuse_qkv_projections,
+                attention_backend=attention_backend,
+            )
+            return cls._from_custom_model(
+                transformer_dir,
+                mesh_context=mesh_context,
+                torch_dtype=torch_dtype,
+                load_base_model=False,
+                load_for_training=True,
+                backend=backend,
+                config_overrides=config_overrides,
+            )
         if not DIFFUSERS_AVAILABLE:
             raise RuntimeError(
                 "diffusers is required for NeMoAutoDiffusionPipeline.from_config. "
                 "Install with: pip install nemo_automodel[diffusion]"
             )
-
-        # Parse and validate pipeline spec
-        spec = PipelineSpec.from_dict(pipeline_spec)
         spec.validate_for_from_config()
 
         logger.info("[INFO] Initializing pipeline from config with random weights")
@@ -977,6 +1051,6 @@ class NeMoAutoDiffusionPipeline:
                 _ensure_params_trainable(module, module_name=name)
 
         # Apply parallelization (FSDP2 or DDP)
-        created_managers = _apply_parallelization(pipe, parallel_scheme)
+        _apply_parallelization(pipe, mesh_context, components_to_load)
 
-        return pipe, created_managers
+        return pipe

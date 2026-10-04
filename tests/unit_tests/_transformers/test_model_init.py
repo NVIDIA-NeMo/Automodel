@@ -40,6 +40,7 @@ from nemo_automodel._transformers.model_init import (
     _try_get_remote_code_model_cls,
     get_hf_config,
 )
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.utils import BackendConfig, generation_config_from_model_config
 
 
@@ -559,7 +560,14 @@ class TestBackendDictCoercion:
         config.name_or_path = "fake/model"
         return config
 
-    def _run_init_model(self, mock_resolve_cls, backend_config_resolver=None, **extra_kwargs):
+    def _run_init_model(
+        self,
+        mock_resolve_cls,
+        backend_config_resolver=None,
+        attn_implementation="flash_attention_2",
+        uses_native_fa4=False,
+        **extra_kwargs,
+    ):
         """Helper to call _init_model with a fake model class and capture kwargs."""
         captured_kwargs = {}
 
@@ -568,6 +576,8 @@ class TestBackendDictCoercion:
             return MagicMock()
 
         fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        if uses_native_fa4:
+            fake_model_cls._uses_native_fa4 = True
         if backend_config_resolver is not None:
             fake_model_cls.backend_config_resolver = backend_config_resolver
         mock_resolve_cls.return_value = fake_model_cls
@@ -575,7 +585,7 @@ class TestBackendDictCoercion:
         _init_model(
             cls=MagicMock(),
             pretrained_model_name_or_path_or_config=self._make_config(),
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             torch_dtype="auto",
             quantization_config=None,
             force_hf=False,
@@ -598,6 +608,99 @@ class TestBackendDictCoercion:
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_preserves_explicit_native_backend(self, mock_resolve_cls, _mock_download):
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            attn_implementation="flash_attention_4",
+            uses_native_fa4=True,
+            backend={"attn": "sdpa"},
+        )
+
+        assert isinstance(captured["backend"], BackendConfig)
+        assert captured["backend"].attn == "sdpa"
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_does_not_mutate_typed_backend(self, mock_resolve_cls, _mock_download):
+        original = BackendConfig(attn="sdpa", linear="torch")
+        with patch("nemo_automodel._transformers.model_init._apply_backend_module_overrides") as apply_overrides:
+            captured = self._run_init_model(
+                mock_resolve_cls,
+                attn_implementation="flash_attention_4",
+                uses_native_fa4=True,
+                backend=original,
+            )
+
+        assert captured["backend"] is original
+        assert captured["backend"].attn == "sdpa"
+        assert original.attn == "sdpa"
+        assert apply_overrides.call_args.args[1] is captured["backend"]
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_config_node_stays_at_instantiation_boundary(self, mock_resolve_cls, _mock_download):
+        cfg_model = ConfigNode(
+            {
+                "_target_": lambda **kwargs: self._run_init_model(
+                    mock_resolve_cls,
+                    uses_native_fa4=True,
+                    **kwargs,
+                ),
+                "attn_implementation": "flash_attention_4",
+                "backend": {"_target_": BackendConfig, "attn": "sdpa"},
+            }
+        )
+
+        captured = cfg_model.instantiate()
+
+        assert cfg_model.backend.attn == "sdpa"
+        assert captured["backend"].attn == "sdpa"
+
+    @pytest.mark.parametrize("extra_kwargs", [{}, {"backend": None}])
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_resolves_default_native_backend(self, mock_resolve_cls, _mock_download, extra_kwargs):
+        captured = self._run_init_model(
+            mock_resolve_cls, attn_implementation="flash_attention_4", uses_native_fa4=True, **extra_kwargs
+        )
+        assert isinstance(captured["backend"], BackendConfig)
+        assert captured["backend"].attn == "fa4"
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_preserves_backend_without_native_consumer(self, mock_resolve_cls, _mock_download):
+        original = BackendConfig(attn="sdpa")
+
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            attn_implementation="flash_attention_4",
+            backend=original,
+        )
+
+        assert captured["backend"] is original
+        assert captured["backend"].attn == "sdpa"
+
+    @pytest.mark.parametrize("attn_implementation", ["sdpa", "flash_attention_2", "flash_attention_3"])
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_attention_without_native_alias_preserves_backend(
+        self,
+        mock_resolve_cls,
+        _mock_download,
+        attn_implementation,
+    ):
+        original = BackendConfig(attn="te")
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            attn_implementation=attn_implementation,
+            backend=original,
+        )
+
+        assert captured["backend"] is original
+        assert captured["backend"].attn == "te"
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
     def test_model_specific_backend_resolver_takes_precedence(self, mock_resolve_cls, _mock_download):
         """Custom models may merge partial mappings onto model-specific stable defaults."""
         resolved_backend = object()
@@ -609,6 +712,7 @@ class TestBackendDictCoercion:
         captured = self._run_init_model(
             mock_resolve_cls,
             backend_config_resolver=_resolve_backend,
+            attn_implementation="flash_attention_4",
             backend={"rms_norm": "te"},
         )
 
@@ -627,7 +731,7 @@ class TestBackendDictCoercion:
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
     def test_no_backend_kwarg_unchanged(self, mock_resolve_cls, _mock_download):
         """When no backend is provided, kwargs should not gain one."""
-        captured = self._run_init_model(mock_resolve_cls)
+        captured = self._run_init_model(mock_resolve_cls, attn_implementation="flash_attention_4")
 
         assert "backend" not in captured
 
@@ -748,7 +852,7 @@ class TestGetHfConfigCustomRegistry:
 
         with (
             patch(
-                "nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict",
+                "nemo_automodel._transformers.model_init.AutoConfig.get_config_dict",
                 return_value=(
                     {"model_type": "am_future", "hidden_size": 123, "architectures": ["FutureForCausalLM"]},
                     {"output_hidden_states": True},
@@ -772,7 +876,7 @@ class TestGetHfConfigCustomRegistry:
         fallback_config = MagicMock()
         with (
             patch(
-                "nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict",
+                "nemo_automodel._transformers.model_init.AutoConfig.get_config_dict",
                 return_value=({"model_type": "not_registered"}, {}),
             ),
             patch("nemo_automodel._transformers.model_init.resolve_custom_config_cls", return_value=None),
@@ -866,6 +970,59 @@ class TestDictConfigOverrideKeepsCustomPath:
         # otherwise collide with the positional config and/or raise TypeError).
         assert "config" not in captured_kwargs
 
+    @patch("nemo_automodel._transformers.model_init.restore_pretrained_generation_config")
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_hub_kwargs_not_forwarded_to_custom_init(
+        self, mock_resolve_cls, mock_get_hf_config, mock_download, mock_restore
+    ):
+        hf_config = self._make_config()
+        hf_config._commit_hash = "a" * 40
+        mock_get_hf_config.return_value = hf_config
+        captured_kwargs = {}
+
+        def fake_model_cls(config, **kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        mock_resolve_cls.return_value = fake_model_cls
+
+        is_custom, _ = _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config="fake/model",
+            attn_implementation="flash_attention_2",
+            torch_dtype="auto",
+            quantization_config=None,
+            force_hf=False,
+            cache_dir="/tmp/hub-cache",
+            token="token",
+            local_files_only=True,
+            force_download=True,
+            subfolder="nested",
+            code_revision="code-main",
+        )
+
+        assert is_custom is True
+        assert (
+            not {
+                "cache_dir",
+                "token",
+                "local_files_only",
+                "force_download",
+                "subfolder",
+                "revision",
+                "_commit_hash",
+                "code_revision",
+            }
+            & captured_kwargs.keys()
+        )
+        assert mock_download.call_args.kwargs["cache_dir"] == "/tmp/hub-cache"
+        assert mock_download.call_args.kwargs["revision"] == "a" * 40
+        assert mock_restore.call_args.kwargs["cache_dir"] == "/tmp/hub-cache"
+        assert mock_restore.call_args.kwargs["revision"] == "a" * 40
+
 
 class TestSetupBnbLoadingKwargs:
     """_setup_bnb_loading_kwargs sets a per-GPU device_map and disables HF async weight loading."""
@@ -926,7 +1083,7 @@ class TestResolveModelDir:
             mock_sd.return_value = str(tmp_path)
             result = _resolve_model_dir("some/repo-id")
 
-        mock_sd.assert_called_once_with("some/repo-id", local_files_only=True)
+        mock_sd.assert_called_once_with("some/repo-id", revision=None, cache_dir=None, local_files_only=True)
         assert result == str(tmp_path)
 
 
@@ -1215,7 +1372,7 @@ class TestLayerTypesFix:
         }
 
     @patch("transformers.dynamic_module_utils.get_class_from_dynamic_module")
-    @patch("nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict")
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
     def test_truncates_layer_types_via_dynamic_module(self, mock_get_dict, mock_get_cls):
         mock_get_dict.return_value = (self._config_dict(), {})
         built = MagicMock()
@@ -1233,7 +1390,7 @@ class TestLayerTypesFix:
         mock_get_cls.assert_called_once_with("configuration_step3p5.Step3p5Config", "stepfun-ai/Step-3.5-Flash")
 
     @patch("transformers.models.auto.configuration_auto.CONFIG_MAPPING", new_callable=MagicMock)
-    @patch("nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict")
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
     def test_resolves_via_config_mapping_when_not_trust_remote_code(self, mock_get_dict, mock_mapping):
         cfg_dict = self._config_dict()
         cfg_dict.pop("auto_map")
@@ -1251,7 +1408,7 @@ class TestLayerTypesFix:
         mock_mapping.get.assert_called_once_with("step3p5")
 
     @patch("transformers.models.auto.configuration_auto.CONFIG_MAPPING", new_callable=MagicMock)
-    @patch("nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict")
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
     def test_matching_lengths_leaves_layer_types_untouched(self, mock_get_dict, mock_mapping):
         cfg_dict = self._config_dict(n_layers=45, n_layer_types=45)
         original = list(cfg_dict["layer_types"])
@@ -1267,7 +1424,7 @@ class TestLayerTypesFix:
         assert passed_dict["layer_types"] == original
 
     @patch("transformers.models.auto.configuration_auto.CONFIG_MAPPING", new_callable=MagicMock)
-    @patch("nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict")
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
     def test_raises_when_config_class_cannot_be_resolved(self, mock_get_dict, mock_mapping):
         cfg_dict = self._config_dict()
         cfg_dict.pop("auto_map")
@@ -1455,3 +1612,46 @@ class TestTieWeightsNemoConfigGate:
         torch.testing.assert_close(resumed.lm_head.weight, checkpoint["lm_head.weight"])
         torch.testing.assert_close(resumed.model.embed_tokens.weight, checkpoint["model.embed_tokens.weight"])
         assert resumed.lm_head.weight.data_ptr() != resumed.model.embed_tokens.weight.data_ptr()
+
+
+def test_direct_config_and_weights_keep_one_revision(hf_config_hub, monkeypatch):
+    from huggingface_hub import snapshot_download
+
+    from nemo_automodel._transformers import model_init
+
+    root, cache, ref, requests = hf_config_hub
+    config = get_hf_config("test/config-race", "eager", cache_dir=str(root))
+    assert config.n_embd == 64
+    assert config._commit_hash == "b" * 40
+    # Another caller advances or rewrites main after this model chose its config.
+    ref.write_text("a" * 40)
+    selected = []
+
+    def download(*args, **kwargs):
+        path = snapshot_download(*args, **kwargs)
+        selected.append(path)
+        return path
+
+    monkeypatch.setattr(model_init, "snapshot_download", download)
+    model_init._download_model_weights(config, "test/config-race", cache_dir=str(root), local_files_only=True)
+    assert selected == [str(cache / "snapshots" / ("b" * 40))]
+    assert ref.read_text() == "a" * 40
+
+
+def test_registered_config_keeps_resolved_commit(hf_config_hub, monkeypatch):
+    root, _, _, _ = hf_config_hub
+    from transformers import GPT2Config
+
+    from nemo_automodel._transformers import model_init
+
+    monkeypatch.setattr(model_init, "resolve_custom_config_cls", lambda model_type: GPT2Config)
+    config = get_hf_config("test/config-race", "eager", cache_dir=str(root))
+    assert isinstance(config, GPT2Config)
+    assert config.n_embd == 64
+    assert config._commit_hash == "b" * 40
+
+
+def test_streaming_directory_uses_config_snapshot_and_subfolder(hf_config_hub):
+    root, cache, _, _ = hf_config_hub
+    result = _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root), subfolder="nested")
+    assert result == str(cache / "snapshots" / ("b" * 40) / "nested")

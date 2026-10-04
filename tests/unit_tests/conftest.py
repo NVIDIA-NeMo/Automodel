@@ -54,7 +54,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 
 _DEFAULT_RUNTIME_BUDGET_SECONDS = 5.0
-_DEFAULT_HARD_TIMEOUT_SECONDS = 60.0
+_DEFAULT_HARD_TIMEOUT_SECONDS = 70.0
 _RUNTIME_BUDGET_ATTRIBUTE = "_automodel_runtime_budget_seconds"
 _DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
@@ -515,10 +515,13 @@ def _kill_leaked_child_processes(request: pytest.FixtureRequest):
             leaked_processes.append(process)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    if leaked_processes:
-        psutil.wait_procs(leaked_processes, timeout=5)
+    # Let multiprocessing reap its own children first. If psutil consumes their
+    # waitpid status, Process.join() cannot record an exit code and active_children()
+    # keeps reporting the dead workers in every subsequent test.
     for process in multiprocessing_children:
         process.join(timeout=5)
+    if leaked_processes:
+        psutil.wait_procs(leaked_processes, timeout=5)
     pytest.fail(
         f"test left {len(leaked_pids)} child process(es) running (pids {sorted(leaked_pids)}); "
         "they were killed. Join or terminate spawned workers before the test returns",

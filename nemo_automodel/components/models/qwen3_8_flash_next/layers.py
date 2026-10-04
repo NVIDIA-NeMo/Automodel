@@ -21,6 +21,8 @@ uses a different Sinkhorn-based HyperConnection parameterization.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 
 import torch
@@ -38,9 +40,13 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
+from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import build_flex_qsa_mask
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
+    QSARouteSelection,
     Qwen3_8_FlashNextQSAIndexer,
     qsa_gqa_attention,
+    qsa_route_replay,
+    qsa_route_selection_region,
 )
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
 from nemo_automodel.components.moe.layers import MoE
@@ -152,20 +158,62 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
         unchanged. With an active CP mesh the boundaries describe the global
         packed row, so they are stashed for :meth:`_forward_with_cp` and the
         inherited dispatcher sees no ``cu_seqlens``.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden]. Packed
+                non-CP inputs have one physical row; a padded tail must be its own segment.
+            **kwargs: Arguments with the tensor layouts documented by
+                :meth:`CPAwareGatedDeltaNet.forward`. ``cu_seqlens`` contains
+                document boundaries of shape [documents + 1], global under CP;
+                ``attention_mask`` has shape [batch, sequence], with document-ID
+                change points matching ``cu_seqlens``. IDs and ``indices`` are
+                normalized to consecutive documents covering the full row.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+
+        Raises:
+            ValueError: If non-CP boundaries do not strictly partition one row
+                or the supplied document mask disagrees with those boundaries.
         """
         cu_seqlens = kwargs.pop("cu_seqlens", None)
         cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
         if not cp_active or cu_seqlens is None:
-            if cu_seqlens is not None and kwargs.get("attention_mask") is None:
-                # The inherited packed conv path reads per-token document IDs
-                # from ``attention_mask``. Synthesize them from the boundaries
-                # for cu_seqlens-only packed batches.
-                boundaries = cu_seqlens.reshape(-1).to(device=hidden_states.device, dtype=torch.long)
-                document_ids = torch.repeat_interleave(
-                    torch.arange(boundaries.numel() - 1, device=hidden_states.device),
-                    boundaries.diff(),
+            if cu_seqlens is not None:
+                boundaries = cu_seqlens.to(device=hidden_states.device, dtype=torch.long)
+                if (
+                    hidden_states.shape[0] != 1
+                    or boundaries.ndim != 1
+                    or boundaries.numel() < 2
+                    or int(boundaries[0]) != 0
+                    or int(boundaries[-1]) != hidden_states.shape[1]
+                    or bool((boundaries.diff() <= 0).any())
+                ):
+                    raise ValueError(
+                        "Packed Qwen3.8 GDN cu_seqlens must strictly partition one unpadded row "
+                        "from zero through the full sequence length."
+                    )
+                document_ids = (
+                    torch.repeat_interleave(
+                        torch.arange(boundaries.numel() - 1, device=hidden_states.device),
+                        boundaries.diff(),
+                    )
+                    .unsqueeze(0)
+                    .to(torch.int32)
                 )
-                kwargs["attention_mask"] = document_ids.unsqueeze(0).to(torch.int32)
+                attention_mask = kwargs.get("attention_mask")
+                if attention_mask is not None and (
+                    attention_mask.shape != document_ids.shape
+                    or not torch.equal(
+                        attention_mask[:, 1:] != attention_mask[:, :-1],
+                        document_ids[:, 1:] != document_ids[:, :-1],
+                    )
+                ):
+                    raise ValueError("Packed Qwen3.8 GDN attention_mask document boundaries must match cu_seqlens.")
+                # Kernels compare document IDs for equality inside their convolution
+                # window. Canonical IDs prevent reused labels joining disjoint documents.
+                kwargs["attention_mask"] = document_ids
+                kwargs["indices"] = torch.arange(hidden_states.shape[1], device=hidden_states.device)
             return super().forward(hidden_states, cu_seqlens=cu_seqlens, **kwargs)
         self._packed_global_cu_seqlens = cu_seqlens
         try:
@@ -449,13 +497,45 @@ class Qwen3_8_FlashNextHyperConnection(nn.Module):
             nn.init.trunc_normal_(self.block_inject_weight.weight, mean=0.0, std=init_std)
 
 
+def _qsa_route_extents(
+    local_sequence_length: int,
+    *,
+    packed_cu_seqlens: torch.Tensor | None,
+    cp_context: Qwen3_8_FlashNextCPContext | None,
+) -> tuple[int, int]:
+    """Bound the QSA route width and name the physical K/V extent for one forward.
+
+    Valid route IDs are contiguous and a causal row can never see more than the
+    longest document (packed) or the whole sequence (dense), so the indexer's
+    fixed-width output can be trimmed without changing attention. Routes are
+    global K/V coordinates: under CP the keys are all-gathered to the global
+    length, so the mask extent follows the CP context whether or not the row is
+    packed.
+
+    Args:
+        local_sequence_length: Number of query positions on this rank.
+        packed_cu_seqlens: Optional packed-document boundaries ``[num_docs + 1]``.
+        cp_context: Optional contiguous CP metadata.
+
+    Returns:
+        ``(max_visible_tokens, kv_length)``: the route-width bound and the number of
+        physical K/V rows the FlexAttention mask must cover.
+    """
+    kv_length = cp_context.global_sequence_length if cp_context is not None else local_sequence_length
+    if packed_cu_seqlens is not None:
+        max_visible_tokens = int(packed_cu_seqlens.diff().max())
+    else:
+        max_visible_tokens = kv_length
+    return max_visible_tokens, kv_length
+
+
 class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     """Qwen3.8-Flash-Next gated attention with compressed-block QSA routing.
 
     The main query/key/value, output gate, and output projection retain the
     Qwen3-Next equations.  A separate frozen indexer returns logical token IDs,
     then the model-owned QSA dispatcher evaluates only those IDs. CUDA BF16
-    training uses FlexAttention over a route-membership BlockMask; CPU and
+    training selects FlexAttention or SM90 CuTe through backend.attn; CPU and
     explicit reference backends use the PyTorch oracle. Main Q/K/V remain
     differentiable.
     """
@@ -463,7 +543,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     def __init__(self, config: object, layer_idx: int, backend: BackendConfig) -> None:
         # QSA owns its sparse-attention dispatch. The inherited constructor is
         # reused only for projections/norms, but its generic attention factory
-        # does not implement ``flex``. Give that factory an isolated SDPA
+        # does not implement ``flex`` or ``cute``. Give it an isolated SDPA
         # copy, then discard the unused callable and retain the real backend.
         parent_backend = replace(backend, attn="sdpa")
         super().__init__(config, layer_idx, parent_backend)
@@ -472,6 +552,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
         self.attn_func = None
         self._cp_mesh: DeviceMesh | None = None
         self.indexer = Qwen3_8_FlashNextQSAIndexer(config, backend)
+        self.reuse_routes_on_recompute = bool(getattr(config, "qsa_reuse_routes_on_recompute", True))
 
     def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
         """Install the contiguous CP mesh used for QSA K/V exchange."""
@@ -545,27 +626,15 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
                 if cp_context.size != self._cp_mesh.size() or cp_context.rank != dist.get_rank(cp_group):
                     raise RuntimeError("Qwen3.8-Flash-Next QSA CP context does not match the installed CP mesh")
 
-        selected_token_ids = self.indexer(
+        batch_size, sequence_length, _ = x.shape
+        selection = self._select_routes(
             x,
             freqs_cis=freqs_cis,
-            attention_mask=None if packed_cu_seqlens is not None else attention_mask,
+            attention_mask=attention_mask,
             cp_context=cp_context,
-            cu_seqlens=packed_cu_seqlens,
+            packed_cu_seqlens=packed_cu_seqlens,
         )
-
-        batch_size, sequence_length, _ = x.shape
-        # Keep the indexer's fixed-width output hookable for parity while
-        # avoiding 2,051 padded gathers on short sequences.  Valid IDs are
-        # contiguous and a causal row can never contain more than S tokens
-        # (or, when packed, more than the longest document).
-        if packed_cu_seqlens is not None:
-            max_visible_tokens = int(packed_cu_seqlens.diff().max())
-        elif cp_context is not None:
-            max_visible_tokens = cp_context.global_sequence_length
-        else:
-            max_visible_tokens = sequence_length
-        attention_width = min(max_visible_tokens, selected_token_ids.shape[-1])
-        selected_token_ids = selected_token_ids[..., :attention_width]
+        selected_token_ids, flex_mask = selection.selected_token_ids, selection.flex_mask
         query = self.q_proj(x).view(batch_size, sequence_length, -1, self.head_dim * 2)
         key = self.k_proj(x).view(batch_size, sequence_length, -1, self.head_dim)
         value = self.v_proj(x).view(batch_size, sequence_length, -1, self.head_dim)
@@ -585,7 +654,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             value = qwen3_8_flash_next_cp_all_gather(value, cp_context, sequence_dim=1, differentiable=True)
 
         # One dispatcher serves dense, packed, and CP layouts: routes are
-        # global K/V coordinates and FlexAttention accepts S_q != S_kv, so
+        # global K/V coordinates and both CUDA backends accept S_q != S_kv, so
         # packed rows need no dedicated kernel path. CPU keeps the oracle.
         attn_output = qsa_gqa_attention(
             query,
@@ -594,10 +663,61 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             selected_token_ids,
             backend=self.backend.attn,
             softmax_scale=self.scaling,
+            flex_mask=flex_mask,
         )
         attn_output = attn_output.reshape(*x.shape[:-1], -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
+
+    def _select_routes(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        cp_context: Qwen3_8_FlashNextCPContext | None,
+        packed_cu_seqlens: torch.Tensor | None,
+    ) -> QSARouteSelection:
+        """Run the frozen indexer, or replay its recorded routes during checkpoint recompute.
+
+        Args:
+            x: Block input of shape ``[batch, sequence, hidden_size]``.
+            freqs_cis: Rotary values ``[batch, sequence, rotary_dim]``.
+            attention_mask: Optional binary right-tail mask ``[batch, sequence]``; ignored
+                for packed rows.
+            cp_context: Optional contiguous CP metadata.
+            packed_cu_seqlens: Optional packed-document boundaries ``[num_docs + 1]``.
+
+        Returns:
+            The route IDs ``[batch, sequence, attention_width]`` and, on the CUDA flex path,
+            the FlexAttention mask built from them.
+        """
+        replay = qsa_route_replay.current() if self.reuse_routes_on_recompute else None
+        if replay is not None and replay[1] == "replay":
+            cached = replay[0].take()
+            if cached is not None:
+                return cached
+
+        with qsa_route_selection_region():
+            selected_token_ids = self.indexer(
+                x,
+                freqs_cis=freqs_cis,
+                attention_mask=None if packed_cu_seqlens is not None else attention_mask,
+                cp_context=cp_context,
+                cu_seqlens=packed_cu_seqlens,
+            )
+            max_visible_tokens, kv_length = _qsa_route_extents(
+                x.shape[1], packed_cu_seqlens=packed_cu_seqlens, cp_context=cp_context
+            )
+            attention_width = min(max_visible_tokens, selected_token_ids.shape[-1])
+            selected_token_ids = selected_token_ids[..., :attention_width]
+            flex_mask = None
+            if x.is_cuda and self.backend.attn == "flex":
+                flex_mask = build_flex_qsa_mask(selected_token_ids, kv_length=kv_length, device=x.device)
+        selection = QSARouteSelection(selected_token_ids=selected_token_ids, flex_mask=flex_mask)
+        if replay is not None and replay[1] == "record":
+            replay[0].record(selection)
+        return selection
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
@@ -672,6 +792,29 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
         }
         self.attn_hyper_connection = Qwen3_8_FlashNextHyperConnection(**hc_kwargs)
         self.mlp_hyper_connection = Qwen3_8_FlashNextHyperConnection(**hc_kwargs)
+
+    def nemo_checkpoint_context_fn(
+        self,
+        context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Extend the activation-checkpoint contexts of this block with QSA route replay.
+
+        The MoE parallelizer calls this model-owned hook when it wraps the block in a
+        checkpoint wrapper. QSA layers record the frozen indexer's routes during the
+        checkpoint forward and replay them during recompute; GatedDeltaNet layers, or a
+        config that disables reuse, return the incoming contexts unchanged.
+
+        Args:
+            context_fn: The parallelizer's ``torch.utils.checkpoint`` context factory, or
+                ``None``.
+
+        Returns:
+            The (possibly wrapped) context factory.
+        """
+        self_attn = getattr(self, "self_attn", None)
+        if self_attn is None or not getattr(self_attn, "reuse_routes_on_recompute", False):
+            return context_fn
+        return qsa_route_replay.checkpoint_context_fn(context_fn)
 
     def _expand_initial_streams(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Expand a one-stream decoder input into the persistent HC layout.

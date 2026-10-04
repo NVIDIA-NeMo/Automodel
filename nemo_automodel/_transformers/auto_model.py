@@ -29,7 +29,7 @@ import inspect
 import logging
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend
@@ -38,8 +38,8 @@ from nemo_automodel.shared.torch_patches import apply_torch_patches
 
 apply_torch_patches()
 from huggingface_hub import constants as hf_constants  # noqa: E402
+from huggingface_hub import snapshot_download
 from transformers import (  # noqa: E402
-    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForMultimodalLM,
@@ -53,10 +53,12 @@ from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
 
-from nemo_automodel.components.distributed.config import DistributedSetup  # noqa: E402
-from nemo_automodel.components.distributed.ddp import DDPManager  # noqa: E402
+from nemo_automodel.components.distributed.config import (  # noqa: E402
+    DDPConfig,
+    DistributedSetup,
+    MegatronFSDPConfig,
+)
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
-from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager  # noqa: E402
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
 from nemo_automodel.components.utils.model_utils import (  # noqa: E402
@@ -70,14 +72,17 @@ if TYPE_CHECKING:
 
     from nemo_automodel.components.quantization.fp8 import FP8Config
     from nemo_automodel.components.utils.compile_utils import CompileConfig
+    from nemo_automodel.components.utils.model_utils import FreezeConfig
 
 #  Re-exports from sibling modules (backward compatibility)
 # Backward-compat shim for trust_remote_code models (e.g. DeciLM)
 # that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
 import transformers.generation.utils as _gen_utils  # noqa: E402
 
+from nemo_automodel._transformers.auto_config import NeMoAutoConfig as AutoConfig
 from nemo_automodel._transformers.infrastructure import (
     MeshContext,
+    _get_strategy_config,
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
@@ -199,6 +204,8 @@ def _patch_remote_code_compat():
 
 _AUTO_CONFIG_HUB_KWARG_KEYS = (
     "revision",
+    "_commit_hash",
+    "force_download",
     "subfolder",
     "token",
     "use_auth_token",
@@ -417,6 +424,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
+        if isinstance(pretrained_model_name_or_path_or_config, str):
+            # Hub loaders need the cache location; from_config constructors do not.
+            kwargs["cache_dir"] = cache_dir
 
         def _retry(**override):
             """Re-enter ``_build_model`` with overridden parameters."""
@@ -508,13 +518,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 kwargs["config"] = _hf_config
 
         # Use meta device initialization when:
-        # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
+        # - Not using Megatron-FSDP or DDP (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
         # - AND not using quantization (we let HF handle BitsAndBytes/FP8; don't init meta device)
         #   For non-HF models, native quant config is ignored.
         is_meta_device = all(
             [
-                not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
+                not isinstance(_get_strategy_config(model_wrapper), (MegatronFSDPConfig, DDPConfig)),
                 get_world_size_safe() > 1 or not is_hf_model,
                 quantization_config is None and (_hf_native_quant_cfg is None or not is_hf_model),
             ]
@@ -611,6 +621,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # during init.  Custom models and meta-device initialization do not load weights
         # here; they rely on apply_model_infrastructure to load the checkpoint later.
         weights_already_loaded = not is_custom_model and not is_meta_device and load_base_model
+        if load_base_model and pretrained_path and not os.path.isdir(pretrained_path) and _hf_config._commit_hash:
+            # Give the checkpointer the selected snapshot, not a repo id whose
+            # cache may also contain an unrelated (or newer) weight index.
+            pretrained_path = snapshot_download(
+                pretrained_path,
+                revision=_hf_config._commit_hash,
+                cache_dir=cache_dir,
+                local_files_only=True,
+            )
+            pretrained_path = os.path.join(pretrained_path, kwargs.get("subfolder", ""))
 
         from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
 
@@ -756,6 +776,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
             else:
                 raise
+        # Keep config rereads, remote code, and weights on the same snapshot.
+        if hf_config._commit_hash is not None:
+            kwargs["revision"] = hf_config._commit_hash
+            kwargs["_commit_hash"] = hf_config._commit_hash
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
         # Layer 2: reject loading a checkpoint with tie_word_embeddings flipped from the
@@ -1064,6 +1088,34 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
     pass
 
 
+class NeMoAutoModelForDiffusion(_BaseNeMoAutoModelClass):
+    """Auto class for diffusion transformers that have a custom Automodel implementation.
+
+    ``transformers`` has no diffusion auto class, and diffusion checkpoints without a custom implementation are
+    loaded through diffusers (``nemo_automodel._diffusers``). This class therefore only resolves architectures
+    registered in ``ModelRegistry``; everything else (``distributed_setup`` with FSDP2 / expert parallelism,
+    PEFT, sharded checkpoint loading) works as for ``NeMoAutoModelForCausalLM``.
+
+    Examples:
+    --------
+    >>> transformer = NeMoAutoModelForDiffusion.from_config(
+    ...     "/ckpts/my-moe-dit/transformer", distributed_setup=setup, load_base_model=True)
+    """
+
+    _NO_CUSTOM_MODEL = (
+        "NeMoAutoModelForDiffusion only builds architectures with a custom Automodel implementation "
+        "(see ModelRegistry); load other diffusion transformers through diffusers."
+    )
+
+    @classmethod
+    def _from_pretrained_parent_class(cls, *args, **kwargs):
+        raise ValueError(cls._NO_CUSTOM_MODEL)
+
+    @classmethod
+    def _from_config_parent_class(cls, *args, **kwargs):
+        raise ValueError(cls._NO_CUSTOM_MODEL)
+
+
 class _NeMoAutoModelForRetrievalBase:
     """Private shared base for encoder auto-models.
 
@@ -1077,6 +1129,7 @@ class _NeMoAutoModelForRetrievalBase:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
+        *model_args: Any,
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
@@ -1086,6 +1139,7 @@ class _NeMoAutoModelForRetrievalBase:
         device_mesh: Optional["DeviceMesh"] = None,
         compile_config: Optional["CompileConfig"] = None,
         peft_config: dict | None = None,
+        freeze_config: "FreezeConfig | dict[str, bool] | None" = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
@@ -1096,6 +1150,7 @@ class _NeMoAutoModelForRetrievalBase:
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            *model_args: Positional arguments forwarded to the backbone model's constructor.
             attn_implementation: Attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
                 Defaults to ``DEFAULT_ATTN_IMPLEMENTATION``
@@ -1109,6 +1164,8 @@ class _NeMoAutoModelForRetrievalBase:
                 in a topology-only ``DistributedSetup`` internally.
             compile_config: Configuration for torch.compile.
             peft_config: PEFT/LoRA configuration dictionary.
+            freeze_config: Parameter-freezing policy applied after pretrained
+                weights are loaded and before distributed sharding.
             **kwargs: Additional arguments passed to the encoder's ``build()`` method.
                 ``dtype`` selects model storage dtype and takes precedence over
                 ``torch_dtype`` when not ``None``; accepts ``auto``.
@@ -1137,6 +1194,7 @@ class _NeMoAutoModelForRetrievalBase:
         def _retry(**override):
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
+                *model_args,
                 attn_implementation=attn_implementation,
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
@@ -1146,6 +1204,7 @@ class _NeMoAutoModelForRetrievalBase:
                 device_mesh=device_mesh,
                 compile_config=compile_config,
                 peft_config=peft_config,
+                freeze_config=freeze_config,
                 **kwargs,
             )
 
@@ -1153,6 +1212,8 @@ class _NeMoAutoModelForRetrievalBase:
         build_kwargs.pop("tp_size", None)
         build_kwargs.pop("cp_size", None)
         build_kwargs.pop("has_packed_sequence", None)
+        if model_args:
+            build_kwargs["model_args"] = model_args
 
         setup = _resolve_distributed_setup(
             distributed_setup=distributed_setup,
@@ -1219,6 +1280,7 @@ class _NeMoAutoModelForRetrievalBase:
             compile_config=compile_config,
             load_base_model=False,  # encoder_cls.build already loads weights
             cache_dir=build_kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE),
+            freeze_config=freeze_config,
         )
 
         return model
@@ -1251,7 +1313,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
-        **kwargs,
+        is_causal: bool | None = None,
+        **kwargs: Any,
     ) -> PreTrainedModel:
         """Load a bi-encoder model with infrastructure.
 
@@ -1269,6 +1332,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
                 negatives during training.
             detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed
                 in-batch-negative losses. Set to false for full cross-rank gradient flow.
+            is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
+                defaults to non-causal attention.
             **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
 
         Returns:
@@ -1280,6 +1345,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
+            is_causal=is_causal,
             **kwargs,
         )
 
@@ -1300,3 +1366,33 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
     """
 
     _ENCODER_CLS_NAME = "CrossEncoderModel"
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args: Any,
+        attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
+        is_causal: bool | None = None,
+        **kwargs: Any,
+    ) -> PreTrainedModel:
+        """Load a cross-encoder model with a configurable self-attention mode.
+
+        Args:
+            pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            *model_args: Positional arguments forwarded to the backbone model's constructor.
+            attn_implementation: Attention implementation forwarded to the shared loader.
+            is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
+                preserves the scoring backbone's native attention mode.
+            **kwargs: Forwarded to the shared retrieval loader.
+
+        Returns:
+            CrossEncoderModel instance with loaded weights and all infrastructure applied.
+        """
+        return super().from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            attn_implementation=attn_implementation,
+            is_causal=is_causal,
+            **kwargs,
+        )

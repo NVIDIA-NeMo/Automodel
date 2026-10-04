@@ -66,6 +66,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -81,15 +82,18 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
-    _get_lm_head_weight,
+    _get_lm_head_module,
     _get_loss_ignore_index,
     calculate_loss,
+    prepare_lm_weight,
 )
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -175,6 +179,8 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         return MaskedCrossEntropy(
             ignore_index=_get_loss_ignore_index(loss_fn),
@@ -182,9 +188,11 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
         )
     if (
         pp_enabled
-        and isinstance(loss_fn, FusedLinearCrossEntropy)
+        and isinstance(loss_fn, LinearCrossEntropy)
         and not getattr(probe_module, "_pp_return_hidden_states_supported", False)
     ):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires pipeline stages that can return hidden states")
         logger.warning(
             "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
             "model. Using MaskedCrossEntropy instead."
@@ -193,6 +201,10 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
             ignore_index=_get_loss_ignore_index(loss_fn),
             reduction=getattr(loss_fn, "reduction", "sum"),
         )
+    if isinstance(loss_fn, ChunkedCrossEntropy):
+        lm_head = _get_lm_head_module(probe_module)
+        if lm_head is not None or not pp_enabled:
+            loss_fn.validate_lm_head(lm_head, model_config=getattr(probe_module, "config", None))
     return loss_fn
 
 
@@ -541,6 +553,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """Whether this rank owns the trainable model and its components."""
         return True
 
+    def _configure_packing(self) -> PackingCapabilities:
+        """Configure every local model stage and return its NEAT data requirements."""
+        from nemo_automodel.components.models.common.packing import configure_packing_for_models
+
+        return configure_packing_for_models(self.model_parts)
+
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
 
@@ -652,10 +670,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"domain_mixture requires a loss function with explicit reduction='sum'; got {reduction!r}"
                 )
             _validate_domain_sampling_weights(self.domain_mixture, self.cfg.dataloader)
-        if self.magi.hf_dispatch and isinstance(self.loss_fn, FusedLinearCrossEntropy):  # pragma: no cover
+        if self.magi.hf_dispatch and isinstance(self.loss_fn, LinearCrossEntropy):  # pragma: no cover
             raise ValueError(
                 "The magi HF backend needs full logits and is incompatible with "
-                "FusedLinearCrossEntropy; use a logits-based loss (e.g. MaskedCrossEntropy)."
+                f"{type(self.loss_fn).__name__}; use a logits-based loss (e.g. MaskedCrossEntropy)."
             )
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
@@ -798,6 +816,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     else self.cfg.get("step_scheduler.local_batch_size", 1)
                 ),
                 pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
+                ep_mesh=(
+                    self.moe_mesh["ep"]
+                    if self.moe_mesh is not None and "ep" in (self.moe_mesh.mesh_dim_names or ())
+                    else None
+                ),
+                stages=(self.pp.info.stages if self.pp is not None else None),
             )
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
@@ -819,15 +843,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
         # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
-        attn_implementation = None
+        packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
         if (
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
             and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
         ):
-            from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
-
-            attn_implementation = get_attn_implementation(self.cfg.model, model=self.model_parts[0])
-            configure_packing(attn_implementation=attn_implementation)
+            packing_contract = self._configure_packing()
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config):
@@ -853,7 +874,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         )
                         else self.cfg.get("distributed.cp_size", 1)
                     ),
-                    attn_implementation=attn_implementation,
+                    packing_contract=packing_contract,
                     collate_wrapper=collate_wrapper,
                 )
 
@@ -1030,8 +1051,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        # FusedLinearCrossEntropy consumes hidden states: flag the last stage to emit them
-        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+        # Linear CE consumes hidden states: flag the last stage to emit them
+        if isinstance(self.loss_fn, LinearCrossEntropy):
             last_stage_model._pp_return_hidden_states = True
 
         self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
@@ -1186,6 +1207,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
+        """Run one local batch and accumulate its loss and optional gradients.
+
+        Args:
+            idx: Microbatch index in the accumulation window.
+            batch: Input mapping with token IDs, labels, and physical NEAT
+                document IDs of shape [batch, sequence]. NEAT attention metadata
+                is batch-major; legacy THD inputs are flattened by the sharder.
+            loss_buffer: List receiving the detached scalar loss.
+            num_label_tokens: Global supervised-token count for loss normalization.
+            num_batches: Number of microbatches in the accumulation window.
+            is_train: Whether to backpropagate the combined main and MTP loss.
+        """
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
@@ -1229,6 +1262,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
+        # Preserve physical NEAT document IDs before model-kwarg filtering. The
+        # loss needs these even when the forward does not accept packing metadata.
+        mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
         labels = batch.pop("labels")
         dataset_ids = batch.pop("dataset_id", None)
         loss_weights = None
@@ -1271,8 +1307,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
                 # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
                 # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
-                # one pack/microbatch per step; the seq_idx tail handles differing per-microbatch boundaries.
-                cu_seqlens = batch_filtered.get("cu_seqlens")
+                # one pack/microbatch per step; batch-major NEAT metadata instead travels with each
+                # microbatch and its model-provided seq_idx tail.
+                cu_seqlens = None if "packed_token_indices" in batch_filtered else batch_filtered.get("cu_seqlens")
                 if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
                     cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
                 pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
@@ -1310,28 +1347,31 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             with train_ctx(), sync_ctx, fp8_ctx:
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
+                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                            f"{type(self.loss_fn).__name__} requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
                         )
                 else:
                     out = model(**batch)
 
                 # Gather the LM head once and share it across the main loss and
-                # all MTP depths (FusedLinearCrossEntropy path) to avoid redundant
+                # all MTP depths (linear CE path) to avoid redundant
                 # full_tensor() gathers that accumulate on-device and OOM.
                 loss_distributed_kwargs = {}
                 shared_lm_weight = None
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, LinearCrossEntropy):
                     grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
-                    shared_lm_weight = self.loss_fn.materialize_lm_weight(
-                        _get_lm_head_weight(model),
+                    shared_lm_weight = prepare_lm_weight(
+                        self.loss_fn,
+                        model,
                         grad_reduce_group=grad_reduce_group,
                     )
                     loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
+                    if isinstance(self.loss_fn, ChunkedCrossEntropy):
+                        loss_distributed_kwargs["logits_dtype"] = out.logits.dtype
                 # Only forward the domain-mixture weights when configured, so
                 # loss paths that predate them keep their original signature.
                 if loss_weights is not None:
@@ -1363,13 +1403,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         mtp_per_depth_h=mtp_per_depth_h,
                         mtp_per_depth_logits=mtp_per_depth_logits,
                         mtp_per_depth_targets=mtp_per_depth_targets,
+                        seq_idx=mtp_seq_idx,
                         labels=labels,
                         model=model,
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
-                        # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
-                        cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
+                        # NEAT uses physical document IDs; cu_seqlens is the legacy THD fallback.
+                        cu_seqlens=(
+                            None
+                            if mtp_per_depth_targets is not None or "packed_token_indices" in batch
+                            else batch.get("cu_seqlens")
+                        ),
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )

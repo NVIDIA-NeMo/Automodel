@@ -54,6 +54,14 @@ class TestFusedLinearCEConfig:
         assert cfg.logit_softcapping == 0.0
         assert cfg.ignore_index == -100
         assert cfg.reduction == "sum"
+        assert cfg.impl == "cce"
+
+    def test_build_forwards_impl(self):
+        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+        loss = FusedLinearCEConfig(impl="torch_compile").build()
+        assert isinstance(loss, FusedLinearCrossEntropy)
+        assert loss.impl == "torch_compile"
 
 
 class TestTEParallelCEConfig:

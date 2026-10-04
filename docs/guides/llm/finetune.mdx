@@ -741,13 +741,14 @@ distributed:
 
 # Setup Prewarms (optional)
 # Moves selected one-time CUDA and NCCL initialization work out of the first
-# training step. Leave disabled unless the corresponding lazy initialization
-# causes a first-step out-of-memory error.
+# training step. Enable the first four options only for the corresponding
+# first-step initialization failure. pipeline_stage_compile targets slow PP startup.
 prewarm:
   cublas_backward: false   # initialize cuBLAS backward workspaces during setup
   fla_gdn_autotune: false  # autotune FLA gated-delta-net Triton kernels during setup
   mamba_ssd_autotune: false # autotune Mamba SSD Triton kernels during setup
   comm_groups: false       # initialize grad-norm communication groups during setup
+  pipeline_stage_compile: false # concurrently warm PP stages with synthetic forward/backward passes
 
 {/* docs-review-end: mamba-ssd-prewarm */}
 
@@ -833,10 +834,15 @@ validation_dataloader:
 # Loss Function
 # _target_ → MaskedCrossEntropy: standard cross-entropy loss that automatically
 # ignores padding tokens so they do not affect the gradient.
-# Other available loss functions (swap _target_ to use):
+# Other available loss functions (check model compatibility before selecting):
 #   - nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
-#       Computes CE in chunks along the sequence dimension to reduce peak memory.
-#       Useful for very long sequences. Accepts chunk_len (default 32).
+#       Chunks the output projection and CE; chunk_len defaults to 512 tokens.
+#       Requires final hidden states, logits_to_keep support, and a plain
+#       bias-free linear head without final_logit_softcapping. Models with
+#       soft-capped logits must use MaskedCrossEntropy.
+#       Direct callers use loss(hidden_states, labels,
+#       lm_weight), replacing loss(logits, labels); recipes supply these inputs.
+#       TP-sharded output heads are not supported.
 #   - nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 #       Fuses the final linear projection (lm_head) with the CE computation,
 #       avoiding the full logit tensor. Significant **memory savings** for large vocabs.
@@ -878,13 +884,13 @@ The following table describes the config fields for the fine-tuning recipe.
 | `dataset` | Yes | Change `_target_`, `dataset_name`, and `split` for your data. Source: [`squad.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py). |
 | `dataloader` | Yes | Configure the loader target, collation, workers, and shuffling. Set its effective batch size with `step_scheduler.local_batch_size`; the recipe injects that value into the loader. Uses [`StatefulDataLoader`](https://meta-pytorch.org/data/main/torchdata.stateful_dataloader.html) for checkpointable iteration. Collation: [`utils.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/utils.py). |
 | `validation_dataset`, `validation_dataloader` | For validation | Configure both when running validation. The validation loader also receives `step_scheduler.local_batch_size`. |
-| `loss_fn` | Yes | [`MaskedCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/masked_ce.py) is the standard choice. Alternatives: [`ChunkedCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/chunked_ce.py) (long sequences), [`FusedLinearCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/linear_ce.py) (large vocabs), [`TEParallelCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/te_parallel_ce.py) (tensor-parallel). |
+| `loss_fn` | Yes | [`MaskedCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/masked_ce.py) is the standard choice. Alternatives: [`ChunkedCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/chunked_ce.py) (chunked projection and CE; requires a compatible linear head), [`FusedLinearCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/linear_ce.py) (large vocabs), [`TEParallelCrossEntropy`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/loss/te_parallel_ce.py) (tensor-parallel). |
 | `seed` | Optional | Controls the checkpointable, rank-aware RNG that the recipe constructs. Source: [`rng.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/rng.py). |
 | `step_scheduler` | Optional (recommended) | Set `global_batch_size` and `local_batch_size`; accumulation is derived as `global / (local × DP size)`. `ckpt_every_steps` and `val_every_steps` are counted in optimizer steps. |
 | `distributed` | Yes | `dp_size: null` means auto-detect from world size. Adjust `tp_size` for tensor parallelism across GPUs. |
-| `prewarm` | Optional | Enable only the targeted setup warmup associated with a first-step out-of-memory error. See [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization). Source: [`prewarm.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/prewarm.py). |
+| `prewarm` | Optional | Enable targeted initialization warmups for first-step out-of-memory errors, or `pipeline_stage_compile` to reduce pipeline-parallel startup time. See [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization), including [HybridEP JIT cache configuration](/get-started/configuration#reuse-hybridep-jit-kernels-across-jobs) for reuse across jobs. Source: [`prewarm.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/prewarm.py). |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. `save_consolidated` defaults to `final`: intermediate SFT checkpoints are sharded and the final checkpoint also exports consolidated HF weights. |
-| `optimizer` | Yes | Any supported `torch.optim` class can be selected using `_target_`; `RecipeConfig` normalizes it to an `OptimizerConfig` that owns construction. For long fine-tuning, especially full-parameter SFT, see the [mixed-precision training guide](/development/mixed-precision-training) before combining torch AdamW with bf16 resident parameters. |
+| `optimizer` | Yes | Any supported `torch.optim` class can be selected using `_target_`; `RecipeConfig` normalizes it to an `OptimizerConfig` that owns construction. For long fine-tuning, especially full-parameter SFT, see the [Mixed-Precision Training Guide](/development/mixed-precision-training) before combining torch AdamW with bf16 resident parameters. |
 | `wandb` | Optional | Uncomment and configure to enable Weights & Biases logging. |
 
 For the fine-tuning recipe itself, see [`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py).

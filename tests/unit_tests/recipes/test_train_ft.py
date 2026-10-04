@@ -34,6 +34,7 @@ from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.mfu import MFUConfig
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
 )
@@ -513,16 +514,6 @@ class DummyModel(nn.Module):
         return x
 
 
-class DummyPeftConfig:
-    """Mock PEFT config"""
-
-    def __init__(self):
-        self.use_triton = True
-        self.dim = 8
-        self.alpha = 32
-        self.match_all_linear = True
-
-
 class DummyOptConfig:
     """Mock optimizer config"""
 
@@ -563,7 +554,7 @@ def test_peft_with_pipeline_parallelism_enabled(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with PP."""
     from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 
-    cfg_peft = DummyPeftConfig()
+    cfg_peft = PeftConfig(use_triton=True, dim=8, alpha=32, match_all_linear=True)
     model = DummyModel()
     mock_autopipeline = MagicMock()
 
@@ -591,7 +582,7 @@ def test_peft_without_pipeline_parallelism(caplog):
     # Create mock configs
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig()
-    cfg_peft = DummyPeftConfig()
+    cfg_peft = PeftConfig(use_triton=True, dim=8, alpha=32, match_all_linear=True)
 
     # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
     with patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora:
@@ -628,7 +619,7 @@ def test_peft_with_tp_disables_triton(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with TP."""
     from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 
-    cfg_peft = DummyPeftConfig()
+    cfg_peft = PeftConfig(use_triton=True, dim=8, alpha=32, match_all_linear=True)
     model = DummyModel()
 
     with patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules"):
@@ -1587,6 +1578,31 @@ def test_forward_backward_step_pp_uses_eval_for_validation(monkeypatch):
     # Should use eval, not step
     assert len(pp_info.schedule.eval_calls) == 1, "schedule.eval() should be called once for validation"
     assert len(pp_info.schedule.step_calls) == 0, "schedule.step() should not be called for validation"
+
+
+def test_forward_backward_step_pp_does_not_treat_neat_metadata_as_thd(monkeypatch):
+    """Batch-major NEAT boundaries must not become the PP loss's flat THD fallback."""
+    pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
+    pp_info.schedule._loss_fn = SimpleNamespace(cu_seqlens=torch.tensor([99]))
+    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[1, 2, 3]]),
+        "packed_token_indices": torch.tensor([[0, 1, 2]]),
+        "cu_seqlens": torch.tensor([[0, 1, 3]], dtype=torch.int32),
+        "max_seqlen": 2,
+    }
+
+    recipe._forward_backward_step(
+        idx=0,
+        batch=batch,
+        loss_buffer=[],
+        num_label_tokens=None,
+        num_batches=1,
+        is_train=False,
+    )
+
+    assert pp_info.schedule._loss_fn.cu_seqlens is None
 
 
 def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
@@ -3298,3 +3314,378 @@ def test_default_collater_batches_per_sample_dataset_id():
     # [B], not [1, B] and not padded as a ragged sequence.
     assert out["dataset_id"].tolist() == [0, 1]
     assert out["input_ids"].shape == (2, 4)
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_recipe_profiles_model_and_loss_without_full_logits(tied):
+    import torch.nn.functional as F
+    from torch.profiler import ProfilerActivity, profile
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+    from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+
+    torch.manual_seed(31)
+    tokens, vocab = 128, 4096
+    config = LlamaConfig(
+        vocab_size=vocab,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        tie_word_embeddings=tied,
+        use_cache=False,
+    )
+    model = LlamaForCausalLM(config)
+    reference = LlamaForCausalLM(config)
+    reference.load_state_dict(model.state_dict())
+    recipe = SimpleNamespace(
+        model_parts=[model],
+        loss_fn=ChunkedCrossEntropy(8, compile=False),
+        dist_env=SimpleNamespace(device=torch.device("cpu")),
+        pp_enabled=False,
+        device_mesh=None,
+        tokenizer=None,
+        domain_mixture=None,
+        te_fp8=None,
+        distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
+        _get_cp_group_size=lambda: 1,
+        _get_dp_group_size=lambda **kw: 1,
+        _get_dp_group=lambda **kw: None,
+    )
+    labels = torch.randint(vocab, (1, tokens))
+    labels[:, :9] = -100
+    input_ids = torch.randint(vocab, (1, tokens))
+    losses = []
+    with profile(activities=[ProfilerActivity.CPU], profile_memory=True, record_shapes=True) as prof:
+        TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
+            recipe,
+            0,
+            {"input_ids": input_ids, "labels": labels},
+            loss_buffer=losses,
+            num_label_tokens=tokens - 9,
+            num_batches=1,
+        )
+    # Profile the production recipe, including model.forward, so changing its
+    # dispatch back to full logits also fails this regression.
+    assert max(event.cpu_memory_usage for event in prof.events()) < tokens * vocab * 4
+    ref_loss = F.cross_entropy(reference(input_ids).logits.flatten(0, 1), labels.flatten())
+    ref_loss.backward()
+    torch.testing.assert_close(losses[0], ref_loss)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    ref_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=1e-4, atol=2e-6)
+    optimizer.step()
+    ref_optimizer.step()
+    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter, ref_parameter, rtol=1e-4, atol=2e-6)
+
+
+@pytest.mark.parametrize("pp_enabled", [False, True])
+def test_chunked_ce_never_silently_falls_back_to_full_logits(pp_enabled):
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+    from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+    probe = _StageWithLogitsToKeep() if pp_enabled else _StageNoLogitsToKeep()
+    with pytest.raises(ValueError, match="ChunkedCrossEntropy requires"):
+        _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), probe, pp_enabled)
+
+
+@pytest.mark.parametrize("loss_kind", ["chunked", "fused"])
+def test_qwen35_hidden_state_request_in_recipe(monkeypatch, loss_kind):
+    from copy import deepcopy
+
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    from nemo_automodel.components.loss import linear_ce
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM
+
+    # The fused kernel requires CUDA; use dense CE only at that kernel boundary
+    # to exercise the real fused loss and recipe's CPU model-forward contract.
+    def cpu_linear_ce(hidden, weight, *, targets, ignore_index, reduction, **kwargs):
+        """Compute the dense reference at the fused kernel boundary.
+
+        Args:
+            hidden: States of shape [batch, sequence, hidden].
+            weight: Projection weight of shape [vocab, hidden].
+            targets: Token labels of shape [batch, sequence].
+            ignore_index: Ignored label value.
+            reduction: Cross-entropy reduction.
+            **kwargs: Unused fused-kernel options.
+
+        Returns:
+            Scalar cross-entropy loss.
+        """
+        return torch.nn.functional.cross_entropy(
+            torch.nn.functional.linear(hidden, weight).flatten(0, 1),
+            targets.flatten(),
+            ignore_index=ignore_index,
+            reduction=reduction,
+        )
+
+    monkeypatch.setattr(linear_ce, "HAVE_CUT_CROSS_ENTROPY", True)
+    monkeypatch.setattr(linear_ce, "linear_cross_entropy", cpu_linear_ce, raising=False)
+    config = Qwen3_5TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=16,
+        layer_types=["full_attention"],
+        attn_implementation="eager",
+        torch_dtype="float32",
+        tie_word_embeddings=False,
+    )
+    model = Qwen3_5ForCausalLM(
+        config,
+        backend=BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", rope_fusion=False, dispatcher="torch"),
+    )
+    reference = deepcopy(model)
+    recipe = SimpleNamespace(
+        model_parts=[model],
+        loss_fn=ChunkedCrossEntropy(2, compile=False)
+        if loss_kind == "chunked"
+        else linear_ce.FusedLinearCrossEntropy(),
+        dist_env=SimpleNamespace(device=torch.device("cpu")),
+        pp_enabled=False,
+        device_mesh=None,
+        tokenizer=None,
+        domain_mixture=None,
+        te_fp8=None,
+        distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
+        _get_cp_group_size=lambda: 1,
+        _get_dp_group_size=lambda **kw: 1,
+        _get_dp_group=lambda **kw: None,
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    labels = torch.tensor([[2, -100, 4, 5]])
+    losses = []
+    TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
+        recipe, 0, {"input_ids": input_ids, "labels": labels}, loss_buffer=losses, num_label_tokens=3, num_batches=1
+    )
+    expected = torch.nn.functional.cross_entropy(reference(input_ids).logits.flatten(0, 1), labels.flatten())
+    expected.backward()
+    torch.testing.assert_close(losses[0], expected)
+    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=1e-4, atol=2e-6)
+
+
+@pytest.mark.parametrize("implementation", ["hf", "automodel"])
+@pytest.mark.parametrize("softcap", [None, 30.0])
+def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
+    from copy import deepcopy
+
+    from transformers import Gemma4Config, Gemma4ForConditionalGeneration, Gemma4TextConfig
+
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+    from nemo_automodel.components.loss.utils import prepare_lm_weight
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.gemma4_moe.model import (
+        Gemma4ForConditionalGeneration as AutoModelGemma4,
+    )
+    from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+    torch.manual_seed(41)
+    text_config = Gemma4TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        num_kv_shared_layers=0,
+        max_position_embeddings=32,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=8,
+        hidden_size_per_layer_input=0,
+        vocab_size_per_layer_input=0,
+        enable_moe_block=False,
+        use_double_wide_mlp=False,
+        final_logit_softcapping=softcap,
+        pad_token_id=0,
+        torch_dtype="float32",
+    )
+    config = Gemma4Config(text_config=text_config)
+    config._attn_implementation = "eager"
+    config.text_config._attn_implementation = "eager"
+    if implementation == "hf":
+        model = Gemma4ForConditionalGeneration(config)
+    else:
+        model = AutoModelGemma4(
+            config,
+            backend=BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", rope_fusion=False, dispatcher="torch"),
+        )
+    model.float().train()
+    with torch.no_grad():
+        model.lm_head.weight.mul_(20)
+    reference = deepcopy(model)
+    loss_fn = ChunkedCrossEntropy(2, compile=False)
+    if softcap is not None:
+        # A plain head is not sufficient: both setup and shared weight preparation
+        # must inspect the owning model's nested text config before training.
+        assert type(model.lm_head) is torch.nn.Linear
+        with pytest.raises(ValueError, match="final_logit_softcapping.*MaskedCrossEntropy"):
+            _maybe_downgrade_loss_fn(loss_fn, model, False)
+        with pytest.raises(ValueError, match="final_logit_softcapping.*MaskedCrossEntropy"):
+            prepare_lm_weight(loss_fn, model)
+        assert all(parameter.grad is None for parameter in model.parameters())
+        # The recommended logits-based alternative remains usable with soft-capping.
+        loss_fn = MaskedCrossEntropy()
+    assert _maybe_downgrade_loss_fn(loss_fn, model, False) is loss_fn
+
+    recipe = SimpleNamespace(
+        model_parts=[model],
+        loss_fn=loss_fn,
+        dist_env=SimpleNamespace(device=torch.device("cpu")),
+        pp_enabled=False,
+        device_mesh=None,
+        tokenizer=None,
+        domain_mixture=None,
+        te_fp8=None,
+        distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
+        _get_cp_group_size=lambda: 1,
+        _get_dp_group_size=lambda **kw: 1,
+        _get_dp_group=lambda **kw: None,
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    labels = torch.tensor([[2, 3, -100, 5, 6, 7]])
+    losses = []
+    TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
+        recipe, 0, {"input_ids": input_ids, "labels": labels}, loss_buffer=losses, num_label_tokens=5, num_batches=1
+    )
+    out = reference(input_ids, output_hidden_states=True, use_cache=False)
+    expected = torch.nn.functional.cross_entropy(out.logits.float().flatten(0, 1), labels.flatten())
+    expected.backward()
+    torch.testing.assert_close(losses[0], expected)
+    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=1e-4, atol=2e-6)
+    if softcap is not None:
+        hidden = out.hidden_states[-1] if isinstance(out.hidden_states, tuple) else out.hidden_states
+        raw_logits = torch.nn.functional.linear(hidden.detach(), reference.lm_head.weight.detach())
+        raw_loss = torch.nn.functional.cross_entropy(raw_logits.float().flatten(0, 1), labels.flatten())
+        assert abs(raw_loss.item() - expected.item()) > 0.01
+
+
+@pytest.mark.parametrize("recipe_kind", ["llm", "vlm"])
+@pytest.mark.parametrize(
+    "packing_format,batch_size,filter_metadata",
+    [(fmt, size, filtered) for fmt in ("neat", "neat_varlen") for size in (1, 2) for filtered in (False, True)]
+    + [("thd", 1, False)],
+)
+def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batch_size, filter_metadata):
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+    from nemo_automodel.components.models.common.packing import PackingCapabilities
+    from nemo_automodel.recipes.llm import train_ft
+    from nemo_automodel.recipes.vlm import finetune
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logits = torch.nn.Parameter(torch.randn(3, batch_size, 8, 16))
+
+        def forward(self, input_ids: torch.Tensor) -> SimpleNamespace:
+            """Return differentiable base and two-depth MTP logits.
+
+            Args:
+                input_ids: Packed tokens of shape [batch, sequence].
+
+            Returns:
+                Base logits and two MTP logits, each [batch, sequence, vocab].
+            """
+            assert input_ids.shape == self.logits.shape[1:3]
+            return SimpleNamespace(
+                logits=self.logits[0], mtp_per_depth_logits=list(self.logits[1:]), mtp_loss_scaling_factor=0.3
+            )
+
+    class MetadataModel(Model):
+        def forward(self, input_ids: torch.Tensor, **kwargs: object) -> SimpleNamespace:
+            """Accept collator metadata as a production packing-aware model would.
+
+            Args:
+                input_ids: Packed tokens of shape [batch, sequence].
+                **kwargs: Collator metadata including document IDs [batch, sequence]
+                    and a block-causal attention mask [batch, 1, sequence, sequence].
+
+            Returns:
+                Base logits and two MTP logits, each [batch, sequence, vocab].
+            """
+            return super().forward(input_ids)
+
+    torch.manual_seed(3734)
+    model = Model() if filter_metadata else MetadataModel()
+    cls = train_ft.TrainFinetuneRecipeForNextTokenPrediction if recipe_kind == "llm" else finetune.FinetuneRecipeForVLM
+    recipe = object.__new__(cls)
+    recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=None))
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.pp_enabled = False
+    recipe.tokenizer = None
+    recipe.te_fp8 = None
+    recipe.domain_mixture = None
+    recipe.distributed_config = None
+    recipe.step_scheduler = SimpleNamespace(is_remote_logging_step=False)
+    recipe.model_parts = [model]
+    recipe.loss_fn = MaskedCrossEntropy()
+    recipe._get_cp_group_size = lambda: 1
+    recipe._get_dp_group_size = lambda **kwargs: 1
+    recipe._get_dp_group = lambda **kwargs: None
+    # Row 1 contains two three-token documents. Row 2 adds unequal lengths,
+    # an internal padding slot, and document IDs restarting in the next row.
+    samples = [
+        dict(
+            input_ids=[1, 2, 3, 4, 5, 6, 0, 0],
+            labels=[2, 3, -100, 5, 6, -100, -100, -100],
+            position_ids=[0, 1, 2, 0, 1, 2, 0, 0],
+            attention_mask=[1, 1, 1, 2, 2, 2, 0, 0],
+        ),
+        dict(
+            input_ids=[7, 8, 9, 10, 0, 11, 12, 13],
+            labels=[8, 9, 10, -100, -100, 12, 13, -100],
+            position_ids=[0, 1, 2, 3, 0, 0, 1, 2],
+            attention_mask=[1, 1, 1, 1, 0, 2, 2, 2],
+        ),
+    ][:batch_size]
+    batch = neat_packed_collater(
+        samples,
+        packing=PackingCapabilities("block_causal", requires_packed_sequence_metadata=packing_format == "neat_varlen"),
+    )
+    if packing_format == "thd":
+        # Exercise the legacy physical-offset fallback without NEAT document IDs.
+        batch.pop("_packed_seq_ids")
+        batch["cu_seqlens"] = torch.tensor([0, 3, 6, 8], dtype=torch.int32)
+    labels = batch["labels"].clone()
+    num_tokens = int((labels != -100).sum())
+    # Explicit document-isolated targets are independent of the production
+    # rolling/masking implementation, including the all-ignored depth in row 1.
+    targets = [
+        labels,
+        torch.tensor([[3, -100, -100, 6, -100, -100, -100, -100], [9, 10, -100, -100, -100, 13, -100, -100]])[
+            :batch_size
+        ],
+        torch.tensor(
+            [[-100, -100, -100, -100, -100, -100, -100, -100], [10, -100, -100, -100, -100, -100, -100, -100]]
+        )[:batch_size],
+    ]
+    reference_logits = model.logits.detach().clone().requires_grad_()
+    reference_losses = [
+        torch.nn.functional.cross_entropy(logits.flatten(0, 1), target.flatten(), reduction="sum") / num_tokens
+        for logits, target in zip(reference_logits, targets)
+    ]
+    expected = reference_losses[0] + 0.15 * (reference_losses[1] + reference_losses[2])
+    expected.backward()
+    losses = []
+    recipe._forward_backward_step(
+        0, batch, loss_buffer=losses, num_label_tokens=num_tokens, num_batches=1, is_train=True
+    )
+    torch.testing.assert_close(losses[0], expected.detach())
+    torch.testing.assert_close(model.logits.grad, reference_logits.grad)
+    # The last token of document A must receive no cross-document MTP gradient.
+    assert torch.count_nonzero(model.logits.grad[1:, 0, 2]) == 0

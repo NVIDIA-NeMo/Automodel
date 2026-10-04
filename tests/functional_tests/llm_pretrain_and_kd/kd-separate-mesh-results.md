@@ -6,7 +6,7 @@ absolute values are intentionally removed because they no longer represent the
 metric reported by the code.
 
 Current BF16 loss, gradient, restart, and TP/PP/EP parity evidence is recorded
-in `kd_sep_mesh_cw_dfw_results.md`. The small four-rank CPU bridge smoke remains
+in `kd-sep-mesh-cw-dfw-results.md`. The small four-rank CPU bridge smoke remains
 available as:
 
 ```bash

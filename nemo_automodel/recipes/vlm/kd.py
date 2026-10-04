@@ -43,6 +43,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -61,7 +62,9 @@ from nemo_automodel.components.distributed.context_parallel import ContextParall
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.utils import _count_label_tokens, _get_loss_ignore_index, _normalize_kd_labels
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
@@ -78,6 +81,7 @@ from nemo_automodel.recipes.kd_utils import (
     RUN_TEACHER,
     STOP_TEACHER,
     KDMeshBridge,
+    configure_kd_teacher_packing,
     create_kd_distributed_setups,
     materialize_teacher_logits,
 )
@@ -184,6 +188,22 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         self._kd_loss_buffer = []
         self._ce_loss_buffer = []
 
+    def _configure_packing(self) -> PackingCapabilities:
+        """Emit metadata for the teacher as well as the student."""
+        return replace(super()._configure_packing(), requires_packed_sequence_metadata=True)
+
+    def _configure_teacher_packing(self) -> None:
+        """Configure the teacher after construction and check its mask contract."""
+        dataloader = self.cfg.vlm_dataloader
+        if dataloader is None or dataloader.packing is None or dataloader.packing.packing_format == "thd":
+            return
+        student_parts = self.model_parts if not self.separate_meshes or self.kd_mesh_bridge.is_student else []
+        configure_kd_teacher_packing(
+            [self.teacher_model] if self.teacher_model is not None else [],
+            student_parts,
+            control_group=self.kd_mesh_bridge.control_group if self.separate_meshes else None,
+        )
+
     def setup(self):
         """Build student & teacher, dataloaders, optimizers, etc."""
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
@@ -208,6 +228,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 )
             else:
                 self.teacher_model = None
+            self._configure_teacher_packing()
             self.kd_mesh_bridge.synchronize()
             return
 
@@ -221,6 +242,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             device=teacher_device,
         )
 
+        self._configure_teacher_packing()
         logger.info("Teacher Model: " + str(self.teacher_model))
 
         self._setup_kd_state()
@@ -371,7 +393,10 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 teacher_logits = separate_teacher_logits
 
             # Student forward.
-            student_batch = filter_forward_kwargs(model, batch)
+            student_batch = dict(batch)
+            if self.kd_ratio < 1.0 and isinstance(self.loss_fn, LinearCrossEntropy):
+                student_batch["output_hidden_states"] = True
+            student_batch = filter_forward_kwargs(model, student_batch)
             student_out = model(**student_batch)
             del student_batch
 

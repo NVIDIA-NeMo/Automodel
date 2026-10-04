@@ -16,7 +16,8 @@
 Unified Diffusion Generation Script
 
 Single entry point for generating images and videos from all supported diffusion
-models (FLUX, Qwen-Image, Qwen-Image-Edit, Wan 2.1/2.2, HunyuanVideo, LTX-2).
+models (FLUX, Qwen-Image, Qwen-Image-Edit, Wan 2.1/2.2, HunyuanVideo, LTX-2,
+HunyuanImage-3.0).
 Supports single-GPU and distributed inference with optional checkpoint loading.
 
 Pipelines that return an audio track alongside video (e.g. LTX-2) have it muxed
@@ -61,10 +62,18 @@ _PIPELINE_OUTPUT_TYPES = {
     "FluxPipeline": "image",
     "Flux2Pipeline": "image",
     "QwenImagePipeline": "image",
+    "QwenImage21Pipeline": "image",
     "WanPipeline": "video",
     "HunyuanVideoPipeline": "video",
     "HunyuanVideo15Pipeline": "video",
     "LTX2Pipeline": "video",
+    "HunyuanImage3Pipeline": "image",
+}
+
+# Samplers for transformers with a custom Automodel implementation, which have no diffusers pipeline, by architecture.
+# Each provides ``from_transformer(transformer, model_dir)`` and a diffusers-style ``__call__``.
+_CUSTOM_MODEL_PIPELINES = {
+    "HunyuanImage3ForCausalMM": "nemo_automodel.components.models.hunyuan_image3.pipeline.HunyuanImage3Pipeline",
 }
 
 # AAC encodes fixed-size frames; PyAV requires input frames of this length.
@@ -105,11 +114,14 @@ def load_pipeline(cfg, dist_info):
         dist_info: DistInfo from maybe_init_distributed, or None.
 
     Returns:
-        A diffusers pipeline instance.
+        The pipeline with `model.checkpoint` and `model.lora_weights` loaded: a diffusers pipeline,
+        or for a custom-model transformer its sampler from `_CUSTOM_MODEL_PIPELINES`.
     """
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+    from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline, has_custom_transformer
 
-    model_id = cfg.model.pretrained_model_name_or_path
+    # Resolve a repo id to its local snapshot once; everything below reads the local directory.
+    model_id = resolve_diffusion_model_dir(cfg.model.pretrained_model_name_or_path)
     dtype_str = getattr(cfg.inference, "dtype", "bfloat16")
     torch_dtype = _resolve_dtype(dtype_str)
 
@@ -118,25 +130,31 @@ def load_pipeline(cfg, dist_info):
     if torch_dtype == torch.bfloat16:
         patch_t5_layer_norm()
 
-    # Build parallel_scheme from distributed config (None for single-GPU).
-    parallel_scheme = None
-    if dist_info is not None and hasattr(cfg.distributed, "parallel_scheme"):
-        parallel_scheme = _build_parallel_scheme(cfg.distributed.parallel_scheme, dist_info)
+    # Resolve one MeshContext from distributed config (None for single-GPU).
+    mesh_context = None
+    if dist_info is not None and hasattr(cfg.distributed, "parallelism"):
+        mesh_context = _build_mesh_context(cfg.distributed.parallelism, dist_info)
+
+    if has_custom_transformer(model_id):
+        return _load_custom_model_pipeline(cfg, model_id, mesh_context, torch_dtype)
 
     # CPU offload requires modules to stay on CPU so enable_model_cpu_offload()
     # can install per-module device hooks (called later in apply_optimizations).
     vae_cfg = getattr(cfg, "vae", None)
     cpu_offload = vae_cfg is not None and getattr(vae_cfg, "enable_cpu_offload", False)
 
-    pipe, _ = NeMoAutoDiffusionPipeline.from_pretrained(
+    pipe = NeMoAutoDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
-        parallel_scheme=parallel_scheme,
+        mesh_context=mesh_context,
+        components_to_load=["transformer"],
         move_to_device=not cpu_offload,
     )
 
     _fix_text_encoder_weight_tying(pipe)
-    logger.info("Loaded pipeline: %s (distributed=%s)", type(pipe).__name__, parallel_scheme is not None)
+    logger.info("Loaded pipeline: %s (distributed=%s)", type(pipe).__name__, mesh_context is not None)
+    load_checkpoint_into_pipeline(pipe, cfg)
+    load_lora_weights_into_pipeline(pipe, cfg)
     return pipe
 
 
@@ -162,35 +180,103 @@ def _fix_text_encoder_weight_tying(pipe):
         logger.info("Fixed UMT5 text encoder weight tying (shared.weight -> embed_tokens.weight)")
 
 
-def _build_parallel_scheme(scheme_cfg, dist_info):
-    """Build parallel_scheme dict from config for NeMoAutoDiffusionPipeline.
+def _build_mesh_context(parallelism_cfg, dist_info):
+    """Build the MeshContext consumed by NeMoAutoDiffusionPipeline.
 
     Args:
-        scheme_cfg: Config node mapping component names to their parallelism settings.
+        parallelism_cfg: Config node containing transformer parallelism settings.
         dist_info: DistInfo with distributed environment details.
 
     Returns:
-        Dict mapping component names to manager kwargs dicts.
+        Resolved MeshContext for the transformer.
     """
-    parallel_scheme = {}
-    for comp_name in dir(scheme_cfg):
-        if comp_name.startswith("_"):
-            continue
-        comp_cfg = getattr(scheme_cfg, comp_name)
-        if comp_cfg is None:
-            continue
-        manager_args = {
-            "backend": "nccl",
-            "world_size": dist_info.world_size,
-            "use_hf_tp_plan": False,
-        }
-        # Copy parallelism sizes from config
-        for key in ("tp_size", "cp_size", "pp_size", "dp_size", "dp_replicate_size"):
-            val = getattr(comp_cfg, key, None)
-            if val is not None:
-                manager_args[key] = val
-        parallel_scheme[comp_name] = manager_args
-    return parallel_scheme
+    from nemo_automodel.components.distributed import FSDP2Config, ParallelismSizes
+    from nemo_automodel.components.distributed.config import DistributedSetup
+
+    # DistributedSetup adds the MoE parallelizer policy when ep_size > 1 (custom-model MoE transformers).
+    return DistributedSetup.build(
+        FSDP2Config(),
+        parallelism_sizes=ParallelismSizes(
+            tp_size=getattr(parallelism_cfg, "tp_size", 1),
+            cp_size=getattr(parallelism_cfg, "cp_size", 1),
+            pp_size=getattr(parallelism_cfg, "pp_size", 1),
+            dp_size=getattr(parallelism_cfg, "dp_size", None),
+            dp_replicate_size=getattr(parallelism_cfg, "dp_replicate_size", None),
+            ep_size=getattr(parallelism_cfg, "ep_size", 1),
+        ),
+        world_size=dist_info.world_size,
+    ).mesh_context
+
+
+def _load_custom_model_pipeline(cfg, model_id, mesh_context, torch_dtype):
+    """Build a custom-model transformer as the training recipe does and wrap it in its sampler.
+
+    ``model.backend`` and ``distributed.parallelism.ep_size`` select kernels and expert parallelism.
+    ``model.checkpoint`` (a full fine-tune step directory) and ``model.lora_weights`` (a LoRA ``model``
+    directory) are training checkpoints and load through the training checkpointer, so expert-parallel
+    and FSDP-sharded weights resolve the same way as when resuming training.
+
+    Args:
+        cfg: Config node with a `model` section.
+        model_id: Local base checkpoint directory (weights, plus the release assets the sampler needs).
+        mesh_context: Resolved MeshContext, or None for a single process.
+        torch_dtype: Parameter dtype.
+
+    Returns:
+        The sampler from `_CUSTOM_MODEL_PIPELINES` for the transformer's architecture.
+    """
+    import importlib
+
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+    from nemo_automodel.components._peft.lora import PeftConfig
+    from nemo_automodel.components.checkpoint.addons import load_automodel_peft_config_dict
+    from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+
+    checkpoint = getattr(cfg.model, "checkpoint", None)
+    lora_weights = getattr(cfg.model, "lora_weights", None)
+    # LoRA is injected before sharding, as in training, so the adapter loads into sharded LoRA weights.
+    peft_cfg = PeftConfig.from_dict(load_automodel_peft_config_dict(lora_weights)) if lora_weights else None
+    pipe = NeMoAutoDiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch_dtype,
+        mesh_context=mesh_context,
+        components_to_load=["transformer"],
+        peft_cfg=peft_cfg,
+        backend=_custom_model_backend(cfg),
+    )
+    transformer = pipe.transformer
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    moe_mesh = mesh_context.moe_mesh if mesh_context is not None else None
+
+    def load(path, is_peft):
+        checkpointer = CheckpointingConfig(is_peft=is_peft, save_consolidated=False).build(
+            dp_rank=rank, tp_rank=0, pp_rank=0, moe_mesh=moe_mesh
+        )
+        checkpointer.load_model(transformer, path)
+        logger.info("Loaded %s weights from %s", "LoRA" if is_peft else "fine-tuned", path)
+
+    if checkpoint:
+        load(os.path.join(checkpoint, "model"), is_peft=False)
+    if lora_weights:
+        load(lora_weights, is_peft=True)
+
+    architecture = transformer.config.architectures[0]
+    if architecture not in _CUSTOM_MODEL_PIPELINES:
+        raise ValueError(f"No sampling pipeline for the custom-model architecture {architecture!r}")
+    module_name, class_name = _CUSTOM_MODEL_PIPELINES[architecture].rsplit(".", 1)
+    pipeline_cls = getattr(importlib.import_module(module_name), class_name)
+    return pipeline_cls.from_transformer(transformer, model_id)
+
+
+def _custom_model_backend(cfg):
+    """BackendConfig from `model.backend`, resolved as the diffusion training recipe resolves it."""
+    from nemo_automodel.components.models.common import BackendConfig
+
+    backend = getattr(cfg.model, "backend", None)
+    if backend is None:
+        return None
+    # A `_target_` selects a model-specific BackendConfig subclass; otherwise the keys are its fields.
+    return backend.instantiate() if "_target_" in backend.to_dict() else BackendConfig(**backend.to_dict())
 
 
 def load_checkpoint_into_pipeline(pipe, cfg):
@@ -774,14 +860,8 @@ def main():
     dist_info = maybe_init_distributed(cfg)
     is_rank0 = dist_info is None or dist_info.is_main
 
-    # 2. Load pipeline
+    # 2-3. Load the pipeline with its checkpoint and LoRA adapter weights (if configured)
     pipe = load_pipeline(cfg, dist_info)
-
-    # 3. Load checkpoint (if configured)
-    load_checkpoint_into_pipeline(pipe, cfg)
-
-    # 3b. Load LoRA adapter weights (if configured)
-    load_lora_weights_into_pipeline(pipe, cfg)
 
     # 4. Apply VAE / memory optimizations
     apply_optimizations(pipe, cfg)

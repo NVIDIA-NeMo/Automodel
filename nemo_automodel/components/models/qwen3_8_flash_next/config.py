@@ -87,6 +87,8 @@ class Qwen3_8_FlashNextTextConfig(PretrainedConfig):
         indexer_head_dim: int = 128,
         indexer_kv_heads: int = 1,
         indexer_n_heads: int = 4,
+        qsa_indexer_query_chunk_size: int | None = None,
+        qsa_reuse_routes_on_recompute: bool = True,
         # Multi-token prediction.
         mtp: dict[str, Any] | None = None,
         mtp_num_hidden_layers: int = 1,
@@ -211,6 +213,13 @@ class Qwen3_8_FlashNextTextConfig(PretrainedConfig):
         self.indexer_head_dim = indexer_head_dim
         self.indexer_kv_heads = indexer_kv_heads
         self.indexer_n_heads = indexer_n_heads
+        # Query rows the indexer scores per chunk. None sizes chunks by a 256 MiB fp32
+        # score budget (whole row for 4k-16k sequences); an int forces that many rows.
+        self.qsa_indexer_query_chunk_size = qsa_indexer_query_chunk_size
+        # The indexer is frozen and its selection is deterministic, so activation
+        # checkpointing may replay the checkpoint-forward routes instead of rerunning
+        # the indexer and rebuilding the FlexAttention mask during recompute.
+        self.qsa_reuse_routes_on_recompute = qsa_reuse_routes_on_recompute
 
         self.mtp = mtp
         self.mtp_num_hidden_layers = mtp_num_hidden_layers

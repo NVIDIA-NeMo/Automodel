@@ -46,6 +46,10 @@ inputs:
     description: "Total number of pytest-shard chunks the suite is split into"
     required: false
     default: ""
+  full-moe-matrix:
+    description: "Run the full MoE parity matrix instead of representative PR cases"
+    required: false
+    default: "false"
   PAT:
     description: "GitHub Personal Access Token"
     required: true
@@ -62,6 +66,14 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Restore MoE JIT kernels
+      if: ${{ contains(inputs.test-folder, 'moe') && inputs.cpu-only == 'false' }}
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ runner.temp }}/moe-jit-cache
+        # Separate runner/GPU pools and invalidate when the compiler image or DeepEP pin changes.
+        key: moe-jit-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner }}-${{ hashFiles('docker/Dockerfile', 'docker/common/deepep.patch', 'pyproject.toml', 'nemo_automodel/components/moe/megatron/fused_a2a.py') }}
+
     - name: Install uuidgen
       shell: bash -x -e -u -o pipefail {0}
       if: ${{ contains(inputs.runner, 'aws') || contains(inputs.runner, 'gcp') }}
@@ -81,6 +93,14 @@ runs:
         if [[ "${{ inputs.cpu-only }}" == "false" ]]; then
           ARG=("--runtime=nvidia --gpus all")
         fi
+        if [[ "${{ contains(inputs.test-folder, 'moe') }}" == "true" ]]; then
+          mkdir -p "${{ runner.temp }}/moe-jit-cache"
+          ARG+=("--env NEMO_HYBRIDEP_JIT_CACHE=/opt/moe-jit-cache/hybridep")
+          ARG+=("--env TRITON_CACHE_DIR=/opt/moe-jit-cache/triton")
+          ARG+=("--env TORCHINDUCTOR_CACHE_DIR=/opt/moe-jit-cache/inductor")
+          ARG+=("--env CUDA_CACHE_PATH=/opt/moe-jit-cache/cuda")
+          ARG+=("--volume ${{ runner.temp }}/moe-jit-cache:/opt/moe-jit-cache")
+        fi
 
         cmd=$(cat <<RUN_TEST_EOF
         #!/bin/bash
@@ -96,6 +116,7 @@ runs:
           --env HF_HOME=/home/TestData/HF_HOME \
           --env RUN_ID=${{ github.run_id }} \
           --env TEST_DATA_DIR=/home/TestData/automodel \
+          --env NEMO_MOE_TEST_FULL_MATRIX=${{ inputs.full-moe-matrix }} \
           --volume ${{ inputs.test-data-path }}:/home/TestData \
           ${{ inputs.container-image }} \
           bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"

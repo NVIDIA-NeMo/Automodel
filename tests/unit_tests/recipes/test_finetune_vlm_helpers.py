@@ -510,6 +510,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
     assert "use_te" not in captured
     assert "magi" not in captured
     assert captured["padding_token_id"] == 7
+    assert captured["num_chunks"] == 1
 
 
 @pytest.mark.cuda(False)
@@ -1553,6 +1554,8 @@ class _MockAutoPipeline:
     def __init__(self, has_first_stage=True, has_last_stage=True, n_microbatches=2, add_losses=True):
         self._info = _MockPPInfo(has_first_stage, has_last_stage, n_microbatches, add_losses)
         self.info = self._info
+        self.pp_batch_size = n_microbatches
+        self.pp_microbatch_size = 1
         self.step_batches = []
 
     def update_seq_len(self, seq_len: int) -> None:
@@ -1642,6 +1645,51 @@ class TestForwardBackwardStepPP:
 
         # Loss buffer should be empty (no forward pass)
         assert len(loss_buffer) == 0
+
+    def test_pp_thd_uses_pipeline_chunks_and_local_sequence_length(self, pp_recipe, monkeypatch):
+        """TE THD sharding runs per PP microbatch and reports its local token length."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+        pp_recipe.mesh_context = SimpleNamespace(cp_size=2)
+        pp_recipe.pp.update_seq_len = MagicMock()
+        captured = {}
+
+        local_input_ids = torch.tensor([[1, 2, 7, 8], [9, 10, 15, 16]])
+        local_labels = torch.tensor([[2, 3, -100, -100], [10, 11, -100, -100]])
+        local_cu_seqlens = torch.tensor([[0, 4], [0, 4]], dtype=torch.int32)
+
+        def make_thd_sharder(model, device_mesh, batch, **kwargs):
+            del model, device_mesh, batch
+            captured.update(kwargs)
+
+            def shard(actual):
+                actual["input_ids"] = local_input_ids
+                actual["labels"] = local_labels
+                actual["cu_seqlens"] = local_cu_seqlens
+                return nullcontext, actual
+
+            return SimpleNamespace(shard=shard)
+
+        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder", make_thd_sharder)
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch={
+                "input_ids": torch.arange(16).reshape(2, 8),
+                "labels": torch.arange(16).reshape(2, 8),
+                "qkv_format": "thd",
+            },
+            loss_buffer=[],
+            num_label_tokens=8,
+            num_batches=1,
+            is_train=True,
+        )
+
+        assert captured["num_chunks"] == 2
+        pp_recipe.pp.update_seq_len.assert_called_once_with(4)
+        step_call = pp_recipe.pp.info.schedule.step.call_args
+        assert torch.equal(step_call.args[0], local_input_ids)
+        assert torch.equal(step_call.kwargs["target"], local_labels)
+        assert torch.equal(step_call.kwargs["cu_seqlens"], local_cu_seqlens)
 
     def test_pp_vlm_chunking_equal_images_and_batch(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking when n_images == batch_size."""
@@ -2853,7 +2901,6 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     )
     loader_config = SimpleNamespace(
         packing=None,
-        resolve_packing_attn_implementation=lambda **kwargs: None,
         build=lambda **kwargs: SimpleNamespace(dataloader="dl", processor="proc"),
     )
     monkeypatch.setattr(
@@ -3423,24 +3470,37 @@ def _patches_for_packing(neat_pack_side_effect):
     processor = MagicMock()
     processor.tokenizer.pad_token_id = 0
     processor.chat_template = "{{ x }}"
-    return processor, [
-        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
-        patch("torch.utils.data.distributed.DistributedSampler"),
-        patch(
-            "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
-            return_value=MagicMock(),
-        ),
-        patch(
-            "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
-            side_effect=neat_pack_side_effect,
-        ),
-        patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", return_value=MagicMock()),
-        patch("nemo_automodel.components.models.common.packing.configure_packing"),
-        patch(
-            "nemo_automodel.components.models.common.packing.get_attn_implementation",
-            return_value="sdpa",
-        ),
-    ]
+    packing_contract = SimpleNamespace(
+        packed_mask_type="document_ids",
+        requires_packed_sequence_metadata=True,
+    )
+    stateful_dataloader = MagicMock(return_value=MagicMock())
+    return (
+        processor,
+        packing_contract,
+        stateful_dataloader,
+        [
+            patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
+            patch("torch.utils.data.distributed.DistributedSampler"),
+            patch(
+                "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
+                side_effect=neat_pack_side_effect,
+            ),
+            patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", stateful_dataloader),
+            patch(
+                "nemo_automodel.components.models.common.packing.configure_packing",
+                return_value=packing_contract,
+            ),
+            patch(
+                "nemo_automodel.components.models.common.packing.get_model_attn_implementation",
+                return_value="sdpa",
+            ),
+        ],
+    )
 
 
 def test_build_dataloader_forwards_get_rope_index_to_packing():
@@ -3456,7 +3516,7 @@ def test_build_dataloader_forwards_get_rope_index_to_packing():
         captured.update(kwargs)
         return MagicMock()
 
-    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+    _, _, _, ctx_managers = _patches_for_packing(fake_neat_pack)
 
     with ExitStack() as stack:
         for cm in ctx_managers:
@@ -3471,6 +3531,7 @@ def test_build_dataloader_forwards_get_rope_index_to_packing():
             1,
             cfg_ps=_make_packing_cfg(pack_size=64),
             get_rope_index=sentinel,
+            model=object(),
         )
 
     assert captured.get("get_rope_index") is sentinel, (
@@ -3490,7 +3551,7 @@ def test_build_dataloader_default_get_rope_index_is_none():
         captured.update(kwargs)
         return MagicMock()
 
-    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+    _, _, _, ctx_managers = _patches_for_packing(fake_neat_pack)
 
     with ExitStack() as stack:
         for cm in ctx_managers:
@@ -3504,10 +3565,61 @@ def test_build_dataloader_default_get_rope_index_is_none():
             42,
             1,
             cfg_ps=_make_packing_cfg(pack_size=64),
+            model=object(),
         )
 
     assert "get_rope_index" in captured, "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
     assert captured["get_rope_index"] is None
+
+
+def test_build_dataloader_forwards_structural_packing_contract_to_collator():
+    """The recipe forwards configure_packing's structural result without a backend string."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    _, packing_contract, stateful_dataloader, ctx_managers = _patches_for_packing(lambda *args, **kwargs: [{}])
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        build_dataloader(
+            _make_dataset_cfg(),
+            _vlm_dataloader_cfg(),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+            model=object(),
+        )
+
+    collate_fn = stateful_dataloader.call_args.kwargs["collate_fn"]
+    assert collate_fn.keywords["packing"] is packing_contract
+    assert "attn_implementation" not in collate_fn.keywords
+
+
+def test_deprecated_build_dataloader_requires_model_for_packing():
+    """The legacy helper must not silently invent a backend-only data contract."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    _, _, _, ctx_managers = _patches_for_packing(lambda *args, **kwargs: [{}])
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        with pytest.raises(ValueError, match="require the built model"):
+            build_dataloader(
+                _make_dataset_cfg(),
+                _vlm_dataloader_cfg(),
+                "test/model",
+                None,
+                None,
+                42,
+                1,
+                cfg_ps=_make_packing_cfg(pack_size=64),
+            )
 
 
 def _run_build_dataloader_capturing_wrapper(dataset_cfg):
@@ -3517,7 +3629,7 @@ def _run_build_dataloader_capturing_wrapper(dataset_cfg):
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
     wrapper_mock = MagicMock(return_value=MagicMock())
-    _, ctx_managers = _patches_for_packing(lambda *a, **k: MagicMock())
+    _, _, _, ctx_managers = _patches_for_packing(lambda *a, **k: MagicMock())
 
     with ExitStack() as stack:
         for cm in ctx_managers:
@@ -3538,6 +3650,7 @@ def _run_build_dataloader_capturing_wrapper(dataset_cfg):
             42,
             1,
             cfg_ps=_make_packing_cfg(pack_size=64),
+            model=object(),
         )
     return wrapper_mock
 

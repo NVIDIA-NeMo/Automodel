@@ -61,13 +61,14 @@ from nemo_automodel.components.distributed.pipelining.config import PipelineConf
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
     _get_loss_ignore_index,
     _normalize_kd_labels,
     calculate_loss,
 )
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
@@ -85,6 +86,7 @@ from nemo_automodel.recipes.kd_utils import (
     RUN_TEACHER,
     STOP_TEACHER,
     KDMeshBridge,
+    configure_kd_teacher_packing,
     create_kd_distributed_setups,
     materialize_teacher_logits,
 )
@@ -315,6 +317,32 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             pp_microbatch_size=pp_microbatch_size,
         )
 
+    def _configure_packing(self) -> PackingCapabilities:
+        """Emit metadata for both KD consumers, including a teacher built later."""
+        return replace(super()._configure_packing(), requires_packed_sequence_metadata=True)
+
+    def _configure_teacher_packing(self) -> None:
+        """Adapt teacher stages and reject incompatible student/teacher mask layouts.
+
+        All separate-mesh ranks participate in the layout check before either
+        side starts training. Metadata is always emitted by the KD dataloader,
+        since the teacher is constructed after the student loader.
+        """
+        if (
+            self.cfg.get("packed_sequence.packed_sequence_size", 0) <= 0
+            or self.cfg.get("packed_sequence.packing_strategy", "thd") != "neat"
+        ):
+            return
+        teacher_parts = []
+        if self.teacher_model is not None:
+            teacher_parts = self.teacher_pp.parts if self.teacher_pp is not None else [self.teacher_model]
+        student_parts = self.model_parts if not self.separate_meshes or self.kd_mesh_bridge.is_student else []
+        configure_kd_teacher_packing(
+            teacher_parts,
+            student_parts,
+            control_group=self.kd_mesh_bridge.control_group if self.separate_meshes else None,
+        )
+
     def setup(self):  # noqa: C901 – same complexity as parent
         """Build student & teacher, dataloaders, optimizers, etc."""
         # Right now, we only support tokenizer compatibility for the same tokenizer.
@@ -357,17 +385,18 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     schedule = self.pp.info.schedule
                     self._original_pp_loss_fn = getattr(schedule, "_loss_fn", None)
                     schedule._loss_fn = self._make_pp_kd_loss_wrapper()
+            self._configure_teacher_packing()
             self.kd_mesh_bridge.synchronize()
             return
 
         teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
 
         if self.pp_enabled:
-            # FusedLinearCrossEntropy needs hidden_states; the last PP stage only has logits.
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+            # Linear CE needs hidden_states; the last PP stage only has logits.
+            if isinstance(self.loss_fn, LinearCrossEntropy):
                 raise ValueError(
                     "Pipeline parallelism with KD requires a loss that uses only logits and labels "
-                    "(e.g. MaskedCrossEntropy). FusedLinearCrossEntropy is not supported for PP KD."
+                    f"(e.g. MaskedCrossEntropy). {type(self.loss_fn).__name__} is not supported for PP KD."
                 )
             self.teacher_model = _build_teacher_model_with_pp(
                 cfg_teacher=self.cfg.get("teacher_model", None),
@@ -388,6 +417,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             )
             self.teacher_pp = None
 
+        self._configure_teacher_packing()
         logger.info("Teacher Model: " + str(self.teacher_model))
 
         # KD
@@ -607,7 +637,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         separate_teacher_logits = (
             self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None
         )
-        batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+        batch = {
+            k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
         if separate_teacher_logits is not None:
             batch["teacher_logits"] = separate_teacher_logits
         labels = batch.pop("labels")
@@ -648,7 +681,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 teacher_logits = separate_teacher_logits
 
             # Student forward.
-            student_batch = filter_forward_kwargs(model, batch)
+            student_batch = dict(batch)
+            if self.kd_ratio < 1.0 and isinstance(self.loss_fn, LinearCrossEntropy):
+                student_batch["output_hidden_states"] = True
+            student_batch = filter_forward_kwargs(model, student_batch)
             student_out = model(**student_batch)
 
             student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)

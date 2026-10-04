@@ -30,7 +30,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderBuild
 
 from .sampler import SequentialBucketSampler
-from .text_to_image_dataset import TextToImageDatasetConfig
+from .text_to_image_dataset import PROMPT_TOKEN_ID_KEYS, TextToImageDatasetConfig
 from .text_to_video_dataset import TextToVideoDatasetConfig, collate_optional_video_fields
 
 logger = logging.getLogger(__name__)
@@ -101,8 +101,18 @@ def collate_fn_production(batch: List[Dict]) -> Dict:
             if key in variable_length_text_keys:
                 sequence_length_multiple = 8 if key == "prompt_embeds" else 1
                 output[key] = _stack_or_pad_text_tensors(tensors, sequence_length_multiple=sequence_length_multiple)
+                if key == "prompt_embeds" and tensors[0].ndim >= 2:
+                    # Valid-token mask for the right-padded sequence axis.
+                    lengths = torch.tensor([tensor.shape[0] for tensor in tensors])
+                    positions = torch.arange(output[key].shape[1])
+                    output["prompt_embeds_mask"] = positions.unsqueeze(0) < lengths.unsqueeze(1)
             else:
                 output[key] = torch.stack(tensors)
+
+    # Variable-length token ids stay a per-sample list; the model adapter builds the padded sequence.
+    for key in PROMPT_TOKEN_ID_KEYS:
+        if key in batch[0]:
+            output[key] = [item[key] for item in batch]
 
     return output
 
@@ -143,11 +153,16 @@ def collate_fn_text_to_image(batch: List[Dict]) -> Dict:
     if "prompt_embeds" in production_batch:
         # Pre-encoded text embeddings
         image_batch["text_embeddings"] = production_batch["prompt_embeds"]
+        if "prompt_embeds_mask" in production_batch:
+            image_batch["text_attention_mask"] = production_batch["prompt_embeds_mask"]
         # Include optional model-specific fields if present
         if "pooled_prompt_embeds" in production_batch:
             image_batch["pooled_prompt_embeds"] = production_batch["pooled_prompt_embeds"]
         if "clip_hidden" in production_batch:
             image_batch["clip_hidden"] = production_batch["clip_hidden"]
+    elif PROMPT_TOKEN_ID_KEYS[0] in production_batch:
+        # The model embeds the prompt tokens itself.
+        image_batch.update({key: production_batch[key] for key in PROMPT_TOKEN_ID_KEYS})
     else:
         # Tokenized - need to encode during training (not supported yet)
         image_batch["t5_tokens"] = production_batch["t5_tokens"]

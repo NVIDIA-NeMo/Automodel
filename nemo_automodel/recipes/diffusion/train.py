@@ -29,8 +29,11 @@ _HAS_WANDB, wandb = safe_import(
     "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
 )
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+from nemo_automodel._diffusers.auto_diffusion_pipeline import ConfigFieldValue, NeMoAutoDiffusionPipeline
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
@@ -38,12 +41,14 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG, init_all_rng
 from nemo_automodel.components.training.utils import (
-    clip_grad_norm,
+    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
+    scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
@@ -160,7 +165,7 @@ def _calculate_throughput_metrics(
     }
 
 
-def _build_diffusion_parallel_manager_args(
+def _build_diffusion_mesh_context(
     *,
     fsdp_cfg: Dict[str, Any] | None,
     ddp_cfg: Dict[str, Any] | None,
@@ -168,8 +173,8 @@ def _build_diffusion_parallel_manager_args(
     dtype: torch.dtype,
     compute_dtype: torch.dtype | None = None,
     lora_enabled: bool,
-) -> Dict[str, Any]:
-    """Build diffusion transformer manager args through the shared distributed parser."""
+) -> MeshContext:
+    """Build the diffusion transformer's sole parallelization input."""
     if compute_dtype is None:
         compute_dtype = dtype
 
@@ -189,15 +194,15 @@ def _build_diffusion_parallel_manager_args(
         ddp_options = dict(ddp_cfg)
         ddp_options.pop("backend", None)
         parsed = parse_distributed_section({"strategy": "ddp", **ddp_options})
-        return {
-            "_manager_type": "ddp",
-            "world_size": world_size,
-            **parsed["strategy_config"].to_dict(),
-            "activation_checkpointing": parsed["activation_checkpointing"],
-        }
+        return MeshContext.build(
+            strategy_config=parsed["strategy_config"],
+            parallelism_sizes=ParallelismSizes(),
+            activation_checkpointing=parsed["activation_checkpointing"],
+            world_size=world_size,
+        )
 
     fsdp_options = dict(fsdp_cfg or {})
-    ignored_options = {"use_hf_tp_plan": fsdp_options.pop("use_hf_tp_plan", False)}
+    fsdp_options.pop("use_hf_tp_plan", None)
     # Diffusion-specific CP knobs (consumed by _enable_context_parallel, not the
     # shared distributed parser): how the cp axis splits into ring x ulysses.
     cp_ring_degree = int(fsdp_options.pop("cp_ring_degree", 1))
@@ -229,21 +234,22 @@ def _build_diffusion_parallel_manager_args(
         # Default to pure Ulysses: ring-attention backward is broken in diffusers<=0.39.
         cp_ulysses_degree = max(1, parsed["cp_size"] // cp_ring_degree)
 
-    return {
-        "_manager_type": "fsdp2",
-        "world_size": world_size,
-        "dp_size": parsed["dp_size"],
-        "dp_replicate_size": parsed["dp_replicate_size"],
-        "tp_size": parsed["tp_size"],
-        "cp_size": parsed["cp_size"],
-        "cp_ring_degree": cp_ring_degree,
-        "cp_ulysses_degree": int(cp_ulysses_degree),
-        "pp_size": parsed["pp_size"],
-        "ep_size": parsed["ep_size"],
-        **parsed["strategy_config"].to_dict(),
-        "activation_checkpointing": parsed["activation_checkpointing"],
-        **ignored_options,
-    }
+    return MeshContext.build(
+        strategy_config=parsed["strategy_config"],
+        parallelism_sizes=ParallelismSizes(
+            dp_size=parsed["dp_size"],
+            dp_replicate_size=parsed["dp_replicate_size"],
+            tp_size=parsed["tp_size"],
+            cp_size=parsed["cp_size"],
+            pp_size=parsed["pp_size"],
+            ep_size=parsed["ep_size"],
+        ),
+        moe_parallel_config=parsed.get("moe_parallel_config"),
+        activation_checkpointing=parsed["activation_checkpointing"],
+        cp_ring_degree=cp_ring_degree,
+        cp_ulysses_degree=int(cp_ulysses_degree),
+        world_size=world_size,
+    )
 
 
 def _build_transformer_engine_fp8_recipe(
@@ -320,7 +326,9 @@ def build_diffusion_pipeline(
     peft_cfg=None,
     model_type=None,
     active_transformer: str | None = None,
-) -> tuple[NeMoAutoDiffusionPipeline, Any]:
+    backend: BackendConfig | None = None,
+    config_overrides: dict[str, ConfigFieldValue] | None = None,
+) -> tuple[NeMoAutoDiffusionPipeline, MeshContext]:
     """Build the sharded diffusion pipeline (model + parallel scheme).
 
     The optimizer is built separately by the recipe via
@@ -353,15 +361,19 @@ def build_diffusion_pipeline(
             transformer to finetune. ``"transformer"`` (default for Wan2.2 = high-noise)
             or ``"transformer_2"`` (low-noise). The unused transformer is dropped
             before device placement so only one transformer lives on GPU.
+        backend: ``BackendConfig`` for a transformer with a custom Automodel
+            implementation (for example MoE diffusion transformers that need expert parallelism).
+        config_overrides: Config attributes overridden before building a custom-model transformer.
 
     Returns:
-        Tuple of (pipeline, device_mesh or None).
+        Tuple of (pipeline, resolved MeshContext). The mesh context carries both the
+        training ``device_mesh`` and, with expert parallelism, the ``moe_mesh``.
 
     Raises:
         ValueError: If both fsdp_cfg and ddp_cfg are provided.
         ValueError: If finetune_mode is False and pipeline_spec is not provided.
     """
-    logging.info("[INFO] Building NeMoAutoDiffusionPipeline with transformer parallel scheme...")
+    logging.info("[INFO] Building NeMoAutoDiffusionPipeline with a resolved mesh context...")
 
     if not dist.is_initialized():
         logging.info("[WARN] torch.distributed not initialized; proceeding in single-process mode")
@@ -377,7 +389,7 @@ def build_diffusion_pipeline(
         logging.info("[INFO] Using DDP (DistributedDataParallel) for training")
     else:
         logging.info("[INFO] Using FSDP2 (Fully Sharded Data Parallel) for training")
-    manager_args = _build_diffusion_parallel_manager_args(
+    mesh_context = _build_diffusion_mesh_context(
         fsdp_cfg=fsdp_cfg,
         ddp_cfg=ddp_cfg,
         world_size=world_size,
@@ -386,18 +398,16 @@ def build_diffusion_pipeline(
         lora_enabled=lora_enabled,
     )
 
-    parallel_scheme = {"transformer": manager_args}
-
     if finetune_mode:
         # Finetuning: load from pretrained weights
         logging.info("[INFO] Loading pretrained model for finetuning")
         if active_transformer is not None:
             logging.info("[INFO] Active transformer: %s", active_transformer)
-        pipe, created_managers = NeMoAutoDiffusionPipeline.from_pretrained(
+        pipe = NeMoAutoDiffusionPipeline.from_pretrained(
             model_id,
             torch_dtype=dtype,
             device=device,
-            parallel_scheme=parallel_scheme,
+            mesh_context=mesh_context,
             components_to_load=["transformer"],
             load_for_training=True,
             low_cpu_mem_usage=True,
@@ -409,6 +419,8 @@ def build_diffusion_pipeline(
             fuse_qkv_projections=fuse_qkv_projections,
             compact_fused_qkv_projections=compact_fused_qkv_projections,
             attention_backend=attention_backend,
+            backend=backend,
+            config_overrides=config_overrides,
         )
     else:
         # Pretraining: initialize with random weights using pipeline_spec
@@ -421,20 +433,21 @@ def build_diffusion_pipeline(
                 "    subfolder: 'transformer'"
             )
         logging.info("[INFO] Initializing model with random weights for pretraining")
-        pipe, created_managers = NeMoAutoDiffusionPipeline.from_config(
+        pipe = NeMoAutoDiffusionPipeline.from_config(
             model_id,
             pipeline_spec=pipeline_spec,
             torch_dtype=dtype,
             device=device,
-            parallel_scheme=parallel_scheme,
+            mesh_context=mesh_context,
             components_to_load=["transformer"],
             transformer_engine_linear=transformer_engine_linear,
             transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
             fuse_qkv_projections=fuse_qkv_projections,
             compact_fused_qkv_projections=compact_fused_qkv_projections,
             attention_backend=attention_backend,
+            backend=backend,
+            config_overrides=config_overrides,
         )
-    fsdp2_manager = created_managers["transformer"]
     transformer_module = pipe.transformer
 
     if lora_enabled:
@@ -467,7 +480,7 @@ def build_diffusion_pipeline(
 
     logging.info("[INFO] NeMoAutoDiffusion pipeline setup complete")
 
-    return pipe, getattr(fsdp2_manager, "device_mesh", None)
+    return pipe, mesh_context
 
 
 class TrainDiffusionRecipe(BaseRecipe):
@@ -678,7 +691,15 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info(f"[INFO] LoRA: {lora_status}")
 
-        self.pipe, self.device_mesh = build_diffusion_pipeline(
+        # ConfigNode lives at the recipe boundary; the pipeline takes a BackendConfig and plain config values.
+        backend = self.cfg.get("model.backend", None)
+        if isinstance(backend, ConfigNode):
+            # A `_target_` selects a model-specific BackendConfig subclass; otherwise the keys are its fields.
+            backend = backend.instantiate() if "_target_" in backend.to_dict() else BackendConfig(**backend.to_dict())
+        config_overrides = self.cfg.get("model.config_overrides", None)
+        if isinstance(config_overrides, ConfigNode):
+            config_overrides = config_overrides.to_dict()
+        self.pipe, mesh_context = build_diffusion_pipeline(
             model_id=self.model_id,
             finetune_mode=self.cfg.get("model.mode", "finetune").lower() == "finetune",
             device=self.device,
@@ -696,7 +717,13 @@ class TrainDiffusionRecipe(BaseRecipe):
             peft_cfg=self.peft_cfg,
             model_type=self.model_type,
             active_transformer=self.active_transformer,
+            backend=backend,
+            config_overrides=config_overrides,
         )
+        self.device_mesh = mesh_context.device_mesh
+        # Expert-parallel mesh; None unless ep_size > 1.
+        self.moe_mesh = mesh_context.moe_mesh
+        self.pp_enabled = False
 
         self.model = self.pipe.transformer
         # LoRA and random-pretraining parameters are initialized before TP is
@@ -808,7 +835,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
-            moe_mesh=None,
+            moe_mesh=self.moe_mesh,
         )
 
         dataloader_config = self.cfg.diffusion_dataloader
@@ -1030,6 +1057,9 @@ class TrainDiffusionRecipe(BaseRecipe):
                 micro_losses = []
                 prepare_for_grad_accumulation([self.model], pp_enabled=False)
                 num_microbatches = len(batch_group)
+                # Router auxiliary losses are injected in backward by MoEAuxLossAutoScaler regardless of EP;
+                # average them over the accumulation microbatches like the main loss (as the LLM recipe does).
+                self._set_moe_aux_loss_backward_scale(num_batches=num_microbatches, num_label_tokens=0)
                 for microbatch_idx, micro_batch in enumerate(batch_group):
                     is_final_microbatch = microbatch_idx == num_microbatches - 1
                     if is_final_microbatch:
@@ -1073,11 +1103,19 @@ class TrainDiffusionRecipe(BaseRecipe):
                         prepare_after_first_microbatch()
 
                 synchronize_tp_replica_gradients([self.model], getattr(self, "device_mesh", None))
-                grad_norm = clip_grad_norm(
+                # Same clipping as the LLM recipe. With an EP mesh, expert gradients (reduced over the EP-shard
+                # group only) are first rescaled to the dense DP mean and the norm is EP-aware; without one, this is
+                # plain gradient clipping.
+                moe_mesh_axes = self.moe_mesh.mesh_dim_names or () if self.moe_mesh is not None else ()
+                grad_norm = scale_grads_and_clip_grad_norm(
                     self.clip_grad_max_norm,
                     [self.model],
-                    device_mesh=getattr(self, "device_mesh", None),
+                    device_mesh=self.device_mesh,
+                    moe_mesh=self.moe_mesh,
+                    ep_axis_name="ep" if "ep" in moe_mesh_axes else None,
                     foreach=self.grad_clip_foreach,
+                    dp_group_size=self._get_dp_group_size(include_cp=True),
+                    expert_tp_replication_factor=get_expert_tp_replication_factor([self.model], self.device_mesh),
                 )
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
@@ -1096,6 +1134,11 @@ class TrainDiffusionRecipe(BaseRecipe):
 
                 for optimizer in self.optimizer:
                     optimizer.step()
+                # Same guard as the LLM recipe: diffusers transformers have no router bias to update. DDP hides
+                # the model's hook behind .module, so look at the wrapped model.
+                model = self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
+                if hasattr(model, "update_moe_gate_bias"):
+                    model.update_moe_gate_bias()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler[0].step(1)
 
