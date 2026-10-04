@@ -2327,6 +2327,8 @@ def _make_eval_recipe(distributed_config, evaluator):
     recovers the per-rank means directly.
     """
     recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.partial_cuda_graph_manager = None
+    recipe._partial_cuda_graph_capture_pending = False
     recipe.model_parts = [SimpleNamespace(eval=lambda: None)]
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
     recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.01}])]
