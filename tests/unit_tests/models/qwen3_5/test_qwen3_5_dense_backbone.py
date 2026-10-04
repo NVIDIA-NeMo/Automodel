@@ -37,10 +37,7 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata, get_unpad_data
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5 import packing as qwen3_5_packing
-from nemo_automodel.components.models.qwen3_5.model import (
-    Fp32SafeQwen3_5TextRotaryEmbedding,
-    Qwen3_5DenseTextBackbone,
-)
+from nemo_automodel.components.models.qwen3_5.model import Qwen3_5DenseTextBackbone
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 
 # Over the default 5s budget on purpose: CUDA gated-delta kernels take about 70s to compile on a cold worker.
@@ -82,21 +79,6 @@ def _tiny_config(layer_types=("full_attention",), **kwargs):
         torch_dtype="float32",
         **kwargs,
     )
-
-
-# ---------------------------------------------------------------------------
-# Fp32SafeQwen3_5TextRotaryEmbedding
-# ---------------------------------------------------------------------------
-
-
-class TestFp32SafeRotaryEmbedding:
-    def test_inv_freq_stays_fp32_after_dtype_cast(self):
-        cfg = _tiny_config()
-        rope = Fp32SafeQwen3_5TextRotaryEmbedding(config=cfg)
-        assert rope.inv_freq.dtype == torch.float32
-        rope.to(torch.bfloat16)
-        # The fp32 inv_freq buffer must survive a bulk bf16 cast.
-        assert rope.inv_freq.dtype == torch.float32
 
 
 # ---------------------------------------------------------------------------

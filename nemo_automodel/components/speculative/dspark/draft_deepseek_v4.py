@@ -280,8 +280,7 @@ class DeepseekV4DSparkModel(nn.Module):
         ``inv_freq`` to bf16 and dephase RoPE with absolute position, eroding draft
         acceptance (the mismatch grows with position, and a bf16 round-trip cannot
         be undone by upcasting). Snapshot the fp32 frequencies before the cast and
-        restore them after (the Fp32Safe rotary idiom used elsewhere in the repo),
-        so the buffer never makes a bf16 round-trip.
+        restore them after, so the buffer never makes a bf16 round-trip.
         """
         rotary_emb = getattr(self, "rotary_emb", None)
         inv_freq = getattr(rotary_emb, "inv_freq", None) if rotary_emb is not None else None

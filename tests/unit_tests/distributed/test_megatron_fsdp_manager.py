@@ -18,15 +18,17 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+import torch.nn as nn
 
 from nemo_automodel.components.distributed import megatron_fsdp as mfsdp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 
 
-class _FakeModel:
+class _FakeModel(nn.Module):
     """Tiny stand-in with `.to()` chaining and optional checkpointing support."""
 
     def __init__(self, *, supports_gradient_checkpointing: bool):
+        super().__init__()
         self.to_calls = []
         self.gradient_checkpointing_enabled = False
         if supports_gradient_checkpointing:
@@ -58,7 +60,7 @@ def test_parallelize_world_size_one_moves_to_cuda_bf16_and_enables_checkpointing
     assert out_model is model
     assert out_opt is optimizer
 
-    # `.to("cuda").to(torch.bfloat16)` chain
+    # `.to("cuda")` then the bf16 cast issued by `cast_model_to_dtype`
     assert [args for (args, _kwargs) in model.to_calls] == [("cuda",), (torch.bfloat16,)]
     model.gradient_checkpointing_enable.assert_called_once_with()
     assert model.gradient_checkpointing_enabled is True

@@ -28,6 +28,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     _get_parallel_plan,
     megatron_fsdp_strategy_parallelize,
 )
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.config import DistributedConfig
@@ -56,7 +57,8 @@ def parallelize_megatron_fsdp(
     """Apply Megatron-FSDP and tensor parallelism from a typed config."""
     if dist.get_world_size() == 1:
         logger.info("World size is 1, skipping parallelization.")
-        model = model.to("cuda").to(torch.bfloat16)
+        model = model.to("cuda")
+        cast_model_to_dtype(model, torch.bfloat16)
         if config.activation_checkpointing:
             if hasattr(model, "gradient_checkpointing_enable"):
                 model.gradient_checkpointing_enable()

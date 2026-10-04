@@ -29,12 +29,12 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeModelOutputWithPast,
+    Qwen3_5MoeTextRotaryEmbedding,
+    Qwen3_5MoeVisionRotaryEmbedding,
 )
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.model import (
-    Fp32SafeQwen3_5MoeTextRotaryEmbedding,
-    Fp32SafeQwen3_5MoeVisionRotaryEmbedding,
     ModelClass,
     Qwen3_5MoeBlock,
     Qwen3_5MoeForCausalLM,
@@ -154,29 +154,6 @@ def vl_config(text_config):
 
 
 # ---------------------------------------------------------------------------
-# Fp32-safe rotary embedding tests
-# ---------------------------------------------------------------------------
-class TestFp32SafeRotaryEmbeddings:
-    def test_text_rotary_inv_freq_remains_fp32(self, text_config):
-        rotary = Fp32SafeQwen3_5MoeTextRotaryEmbedding(config=text_config)
-        original = rotary.inv_freq.clone()
-
-        rotary = rotary.to(torch.float16)
-
-        assert rotary.inv_freq.dtype == torch.float32
-        torch.testing.assert_close(rotary.inv_freq.float(), original.float())
-
-    def test_vision_rotary_inv_freq_remains_fp32(self):
-        rotary = Fp32SafeQwen3_5MoeVisionRotaryEmbedding(dim=16)
-        original = rotary.inv_freq.clone()
-
-        rotary = rotary.to(torch.float16)
-
-        assert rotary.inv_freq.dtype == torch.float32
-        torch.testing.assert_close(rotary.inv_freq.float(), original.float())
-
-
-# ---------------------------------------------------------------------------
 # Qwen3_5MoeBlock tests
 # ---------------------------------------------------------------------------
 class TestQwen3_5MoeBlock:
@@ -280,7 +257,7 @@ class TestQwen3_5MoeTextModelBackend:
         assert model.backend is backend_config
         assert model.embed_tokens.num_embeddings == text_config.vocab_size
         assert len(model.layers) == text_config.num_hidden_layers
-        assert isinstance(model.rotary_emb, Fp32SafeQwen3_5MoeTextRotaryEmbedding)
+        assert isinstance(model.rotary_emb, Qwen3_5MoeTextRotaryEmbedding)
 
     def test_moe_config_defaults_when_not_provided(self, text_config, backend_config):
         """MoE config should be created automatically from text_config when not provided."""
@@ -505,8 +482,10 @@ class TestQwen3_5MoeForConditionalGeneration:
         assert model.model.moe_config is model.model.language_model.moe_config
 
         vision_model = getattr(model.model, "visual")
-        assert isinstance(vision_model.rotary_pos_emb, Fp32SafeQwen3_5MoeVisionRotaryEmbedding)
+        assert isinstance(vision_model.rotary_pos_emb, Qwen3_5MoeVisionRotaryEmbedding)
         assert vision_model.rotary_pos_emb.inv_freq.dtype == torch.float32
+        # The keep-in-fp32 name lists are the only thing protecting the rotary buffers.
+        assert {"rotary_emb", "rotary_pos_emb"} <= set(model._keep_in_fp32_modules)
 
     def test_pad_token_id_uses_config_value(self, vl_config, backend_config, moe_config):
         vl_config.text_config.pad_token_id = 42

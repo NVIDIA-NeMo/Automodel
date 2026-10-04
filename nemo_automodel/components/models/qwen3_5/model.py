@@ -63,7 +63,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import KeepRotaryInvFreqFp32, cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     prepare_gated_delta_packed_metadata,
@@ -329,10 +329,6 @@ def build_qwen3_5_dense_mtp(
     )
 
 
-class Fp32SafeQwen3_5TextRotaryEmbedding(KeepRotaryInvFreqFp32, Qwen3_5TextRotaryEmbedding):
-    """Qwen3.5 text rotary whose ``inv_freq`` stays fp32 across ``.to(dtype)`` calls."""
-
-
 def _dense_moe_config(config: Qwen3_5TextConfig, dtype: torch.dtype) -> MoEConfig:
     """Trivial MoEConfig for the dense Qwen3.5 backbone.
 
@@ -498,7 +494,7 @@ class Qwen3_5DenseTextBackbone(nn.Module):
             {str(i): Qwen3_5DenseBlock(i, config, moe_config, backend) for i in range(config.num_hidden_layers)}
         )
         self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Fp32SafeQwen3_5TextRotaryEmbedding(config=config)
+        self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
 
     def forward(
         self,
@@ -711,6 +707,9 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     requires_packed_sequence_metadata = True
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    # The text rotary's fp32 ``inv_freq`` buffers (``model.rotary_emb``) survive every
+    # ``cast_model_to_dtype`` / ``cast_frozen_modules_to_compute_dtype`` by name.
+    _keep_in_fp32_modules: list[str] = ["rotary_emb"]
     # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
     _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
 
@@ -956,11 +955,12 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
     # ``cast_model_to_dtype`` snapshots/restores matched fp32 buffers around its
     # bulk cast, and ``cast_frozen_modules_to_compute_dtype`` exempts matched
-    # names, so this keeps the vision tower's rotary ``inv_freq`` buffer at its
+    # names, so this keeps the text rotary (``language_model.rotary_emb``) and the
+    # vision tower rotary (``visual.rotary_pos_emb``) ``inv_freq`` buffers at their
     # exact fp32 values under shared bf16/fp16 casts (including the frozen-vision
     # recipes' cast). Class-level: ``super().__init__()`` runs ``post_init`` ->
     # ``initialize_weights`` -> the first cast before the constructor body.
-    _keep_in_fp32_modules: list[str] = ["rotary_pos_emb"]
+    _keep_in_fp32_modules: list[str] = ["rotary_emb", "rotary_pos_emb"]
     # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
     _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
 

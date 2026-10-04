@@ -46,7 +46,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
-from nemo_automodel.components.models.qwen3_5_moe.model import Fp32SafeQwen3_5MoeTextRotaryEmbedding
+from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeTextRotaryEmbedding
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -228,7 +228,7 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
             use_combine=False,
             dtype=self.model_dtype,
         )
-        self.rotary_emb = Fp32SafeQwen3_5MoeTextRotaryEmbedding(config=config)
+        self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
 
     def get_input_embeddings(self) -> nn.Module:
         """Return the raw-token embedding table."""
@@ -486,6 +486,9 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     """Trainable language-only Qwen3.8-Flash-Next causal-LM wrapper."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    # The text rotary's fp32 ``inv_freq`` buffers (``model.language_model.rotary_emb``)
+    # survive every ``cast_model_to_dtype`` / ``cast_frozen_modules_to_compute_dtype`` by name.
+    _keep_in_fp32_modules: list[str] = ["rotary_emb"]
     # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
     _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
     _owns_cp_attention = True

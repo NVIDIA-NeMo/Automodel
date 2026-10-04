@@ -17,7 +17,7 @@ import logging
 import math
 import os
 import warnings
-from collections.abc import Callable, Collection
+from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -990,32 +990,6 @@ def get_rope_config(config) -> tuple[float, dict, float]:
     return rope_theta, rope_parameters, partial_rotary_factor
 
 
-class KeepRotaryInvFreqFp32(nn.Module):
-    """Mixin for HF rotary-embedding modules whose ``inv_freq`` must survive ``.to(dtype)``.
-
-    ``nn.Module.to`` rounds every floating buffer, and the HF rotary classes derive cos/sin
-    from the stored buffer (``self.inv_freq.float()`` cannot undo a bf16 rounding), so a bulk
-    cast skews the RoPE phases. ``_keep_in_fp32_modules`` only guards ``cast_model_to_dtype``
-    and ``cast_frozen_modules_to_compute_dtype``; this override also covers the raw
-    ``model.to(dtype)`` calls (DDP, Megatron-FSDP, retrieval model construction) by
-    snapshotting the fp32 buffers around ``_apply`` and re-registering them on the moved
-    device. List it before the HF class: ``class Fp32SafeX(KeepRotaryInvFreqFp32, X)``.
-    """
-
-    _fp32_buffer_names: tuple[str, ...] = ("inv_freq", "original_inv_freq")
-
-    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "KeepRotaryInvFreqFp32":
-        fp32_buffers = {
-            name: buf.detach().to(torch.float32, copy=True)
-            for name, buf in self.named_buffers(recurse=False)
-            if name in self._fp32_buffer_names
-        }
-        result = super()._apply(fn, recurse=recurse)
-        for name, fp32_buffer in fp32_buffers.items():
-            self.register_buffer(name, fp32_buffer.to(device=self._buffers[name].device), persistent=False)
-        return result
-
-
 def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -> None:
     """Cast ``model`` to ``dtype`` while keeping its fp32-contract tensors in fp32.
 
@@ -1023,7 +997,10 @@ def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -
     ``_keep_in_fp32_modules`` or ``_keep_in_fp32_modules_strict`` (the HuggingFace
     attributes) are snapshotted before the bulk ``nn.Module.to`` and written back
     afterwards, so their values survive exactly instead of round-tripping through
-    ``dtype``.
+    ``dtype``. This is the only mechanism that protects fp32 buffers such as the HF
+    rotary ``inv_freq`` tables, so every whole-model dtype cast (model init, DDP and
+    Megatron-FSDP single-rank paths, retrieval backbone construction) must go through
+    it instead of a raw ``model.to(dtype)``.
 
     fp32-contract parameters are restored only while they are plain tensors, i.e.
     before FSDP sharding. Models with fp32-contract parameters train with
@@ -1366,7 +1343,6 @@ __all__ = [
     "AttentionBackend",
     "BackendConfig",
     "Float32RMSNorm",
-    "KeepRotaryInvFreqFp32",
     "TEFp8Config",
     "cast_frozen_modules_to_compute_dtype",
     "cast_model_to_dtype",

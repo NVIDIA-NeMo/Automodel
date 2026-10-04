@@ -27,7 +27,6 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
     Qwen3VLMoeTextRotaryEmbedding,
-    Qwen3VLMoeVisionRotaryEmbedding,
 )
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
@@ -37,7 +36,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
-    KeepRotaryInvFreqFp32,
     cast_model_to_dtype,
     compute_lm_head_logits,
 )
@@ -48,14 +46,6 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .state_dict_adapter import Qwen3VLMoeStateDictAdapter
-
-
-class Fp32SafeQwen3VLMoeTextRotaryEmbedding(KeepRotaryInvFreqFp32, Qwen3VLMoeTextRotaryEmbedding):
-    """Qwen3-VL-MoE text rotary whose ``inv_freq`` stays fp32 across ``.to(dtype)`` calls."""
-
-
-class Fp32SafeQwen3VLMoeVisionRotaryEmbedding(KeepRotaryInvFreqFp32, Qwen3VLMoeVisionRotaryEmbedding):
-    """Qwen3-VL-MoE vision rotary whose ``inv_freq`` stays fp32 across ``.to(dtype)`` calls."""
 
 
 class Qwen3VLMoeBlock(Block):
@@ -319,7 +309,7 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         self.norm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
         )
-        self.rotary_emb = Fp32SafeQwen3VLMoeTextRotaryEmbedding(config=config)
+        self.rotary_emb = Qwen3VLMoeTextRotaryEmbedding(config=config)
 
     def forward(
         self,
@@ -438,6 +428,15 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
+    # ``cast_model_to_dtype`` snapshots/restores matched fp32 buffers around its bulk
+    # cast, and ``cast_frozen_modules_to_compute_dtype`` exempts matched names, so the
+    # text rotary (``language_model.rotary_emb``) and vision rotary
+    # (``visual.rotary_pos_emb``) ``inv_freq`` buffers keep their exact fp32 values
+    # under shared bf16/fp16 casts, including the frozen-vision recipes' cast.
+    # Class-level: ``super().__init__()`` runs ``post_init`` -> ``initialize_weights``
+    # -> the first cast before the constructor body.
+    _keep_in_fp32_modules: list[str] = ["rotary_emb", "rotary_pos_emb"]
+
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
@@ -522,11 +521,6 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                 self.backend,
                 dtype=model_dtype,
             )
-
-        # The HF vision rotary keeps its fp32 ``inv_freq`` through later ``.to(dtype)`` calls.
-        rotary = self.model.visual.rotary_pos_emb
-        rotary.__class__ = Fp32SafeQwen3VLMoeVisionRotaryEmbedding
-        rotary.inv_freq = rotary.inv_freq.detach().to(torch.float32)
 
     def get_input_embeddings(self):
         return self.model.language_model.embed_tokens
