@@ -330,8 +330,9 @@ def _precompute_stage_shapes(
 
     Returns:
         Maximum local token count across stage outputs for runtime initialization.
-        The primary output has layout [batch, local_sequence, ...]; trailing
-        feature or hyper-connection dimensions do not multiply the token count.
+        A packed primary output has layout [tokens, hidden]; batch-major outputs
+        have layout [batch, local_sequence, ...]. Trailing feature or
+        hyper-connection dimensions do not multiply the token count.
     """
     if stages and not all(
         callable(getattr(stage, "_configure_outputs_meta", None)) or getattr(stage, "_user_meta", None) is not None
@@ -361,7 +362,12 @@ def _precompute_stage_shapes(
                 dtype=model_dtype,
             )
             _set_stage_metas(stage, inputs_meta, outputs_meta)
-            local_token_counts.append(outputs_meta[0].shape[0] * outputs_meta[0].shape[1])
+            primary_output = outputs_meta[0]
+            local_token_counts.append(
+                primary_output.shape[0]
+                if primary_output.ndim == 2
+                else primary_output.shape[0] * primary_output.shape[1]
+            )
             continue
 
         # --- inputs_meta ---
