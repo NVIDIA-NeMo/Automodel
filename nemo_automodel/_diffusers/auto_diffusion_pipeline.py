@@ -644,7 +644,8 @@ class NeMoAutoDiffusionPipeline:
             components_to_load: Which components to process (default: all)
             components_to_parallelize: Components to parallelize, independently of device placement.
                 Defaults to components_to_load. Inference can load all components onto the device
-                while parallelizing only the transformer.
+                while parallelizing only the transformer. Custom-model checkpoints support only
+                None or ["transformer"]; other selectors, including [], are rejected.
             peft_cfg: PeftConfig instance or None. When provided, LoRA is injected
                 before _apply_parallelization() (FSDP2 wrapping). Base weights
                 are frozen after FSDP2; LoRA params are collected pre-FSDP2 and stored on pipe.
@@ -680,6 +681,10 @@ class NeMoAutoDiffusionPipeline:
         if _has_custom_model(transformer_dir):
             if components_to_load is not None and set(components_to_load) - {"transformer"}:
                 raise ValueError("Custom-model pipelines load only the `transformer` component.")
+            if components_to_parallelize is not None and set(components_to_parallelize) != {"transformer"}:
+                raise ValueError(
+                    'Custom-model pipelines support only components_to_parallelize=None or ["transformer"].'
+                )
             _validate_custom_model_options(
                 mesh_context,
                 active_transformer=active_transformer,

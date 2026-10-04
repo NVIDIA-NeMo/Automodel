@@ -352,9 +352,12 @@ def patched_custom_build(monkeypatch):
     return SimpleNamespace(build=build, transformer=transformer, diffusion_pipeline=diffusion_pipeline)
 
 
-def test_from_pretrained_dispatches_to_custom_transformer(custom_repo, patched_custom_build):
+@pytest.mark.parametrize("components_to_parallelize", [None, ["transformer"]])
+def test_from_pretrained_dispatches_to_custom_transformer(custom_repo, patched_custom_build, components_to_parallelize):
+    from nemo_automodel.components.distributed.config import FSDP2Config
+
     mesh_context = SimpleNamespace(
-        cp_size=1, strategy_config=None, moe_parallel_config=None, activation_checkpointing=False
+        cp_size=1, strategy_config=FSDP2Config(), moe_parallel_config=None, activation_checkpointing=False
     )
     backend = toy_backend()
     overrides = {"num_hidden_layers": 1}
@@ -364,6 +367,7 @@ def test_from_pretrained_dispatches_to_custom_transformer(custom_repo, patched_c
         torch_dtype=torch.float32,
         mesh_context=mesh_context,
         components_to_load=["transformer"],
+        components_to_parallelize=components_to_parallelize,
         load_for_training=True,
         backend=backend,
         config_overrides=overrides,
@@ -418,6 +422,28 @@ def test_from_pretrained_custom_rejects_diffusers_only_options(custom_repo, patc
 def test_from_pretrained_custom_rejects_context_parallelism(custom_repo, patched_custom_build):
     with pytest.raises(ValueError, match="Context parallelism"):
         NeMoAutoDiffusionPipeline.from_pretrained(custom_repo, mesh_context=SimpleNamespace(cp_size=2))
+
+    patched_custom_build.build.assert_not_called()
+
+
+@pytest.mark.parametrize("selector", [[], ["vae"], ["transformer", "vae"]])
+@pytest.mark.parametrize("with_mesh", [False, True])
+def test_from_pretrained_custom_rejects_unsupported_parallelization_selector(
+    custom_repo, patched_custom_build, selector, with_mesh
+):
+    from nemo_automodel.components.distributed.config import FSDP2Config
+
+    mesh_context = (
+        SimpleNamespace(
+            cp_size=1, strategy_config=FSDP2Config(), moe_parallel_config=None, activation_checkpointing=False
+        )
+        if with_mesh
+        else None
+    )
+    with pytest.raises(ValueError, match="components_to_parallelize"):
+        NeMoAutoDiffusionPipeline.from_pretrained(
+            custom_repo, mesh_context=mesh_context, components_to_parallelize=selector
+        )
 
     patched_custom_build.build.assert_not_called()
 

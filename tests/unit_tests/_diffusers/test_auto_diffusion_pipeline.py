@@ -696,6 +696,43 @@ def test_from_pretrained_separates_device_placement_from_parallelization(
     assert enable_cp.call_args_list == [call(modules[name], name, mesh_context) for name in selected]
 
 
+def test_generation_load_pipeline_places_all_components_but_parallelizes_only_transformer():
+    import examples.diffusion.generate.generate as gen
+    from nemo_automodel._diffusers import auto_diffusion_pipeline as adp
+
+    modules = {name: DummyModule().double() for name in ("text_encoder", "transformer", "vae")}
+    pipe = DummyPipeline(modules)
+    mesh_context = SimpleNamespace(strategy_config=FSDP2Config(), cp_size=2, ep_size=1)
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(pretrained_model_name_or_path="dummy"),
+        inference=SimpleNamespace(dtype="float32"),
+        distributed=SimpleNamespace(parallelism=object()),
+    )
+    dist_info = object()
+    with (
+        patch.object(gen, "_build_mesh_context", return_value=mesh_context) as build_mesh,
+        patch.object(adp, "DIFFUSERS_AVAILABLE", True),
+        patch.object(adp.DiffusionPipeline, "from_pretrained", return_value=pipe),
+        patch.object(adp, "_choose_device", return_value=torch.device("cpu")),
+        patch.object(adp.torch.distributed, "is_initialized", return_value=True),
+        patch.object(adp, "_move_module_to_device", wraps=adp._move_module_to_device) as move,
+        patch.object(adp, "attach_parallelizer"),
+        patch.object(adp, "_enable_context_parallel") as enable_cp,
+        patch.object(adp, "parallelize_model", side_effect=lambda module, context: module) as parallelize,
+        patch.object(adp, "compile_parallelized_model"),
+    ):
+        assert gen.load_pipeline(cfg, dist_info) is pipe
+
+    build_mesh.assert_called_once_with(cfg.distributed.parallelism, dist_info)
+    assert move.call_args_list == [call(module, torch.device("cpu"), torch.float32) for module in modules.values()]
+    assert all(next(module.parameters()).dtype == torch.float32 for module in modules.values())
+    enable_cp.assert_called_once_with(modules["transformer"], "transformer", mesh_context)
+    parallelize.assert_called_once_with(modules["transformer"], mesh_context)
+    assert all(
+        hasattr(module, "_pre_shard_hf_state_dict_keys") == (name == "transformer") for name, module in modules.items()
+    )
+
+
 def test_from_pretrained_applies_transformer_qkv_and_te_options():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
