@@ -532,13 +532,14 @@ def _distributed_cp_parity_worker(rank: int, world_size: int, store_path: str) -
             # convolution halo through the autograd-aware collective.
             assert torch.count_nonzero(local_ple_hidden.grad) > 0
 
-        # Packed PLE CP2 versus separate documents: document [5, 7) straddles
-        # the rank boundary and document [7, 12) must not read rank zero's halo.
+        # Packed PLE CP2 versus separate documents. Document [3, 10) straddles the
+        # rank boundary, so tokens 6-9 keep halo taps into tokens 3-5 on rank zero;
+        # document [10, 12) must drop every halo tap.
         reference_ple = _tiny_ple()
         cp_ple = _tiny_ple()
         cp_ple.load_state_dict(reference_ple.state_dict())
         packed_ids = torch.tensor([[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]], dtype=torch.long)
-        boundaries = torch.tensor([0, 5, 7, 12])
+        boundaries = torch.tensor([0, 3, 10, 12])
         packed_context = _cp_context(
             rank=rank,
             world_size=world_size,

@@ -678,7 +678,17 @@ def _packed_ple_inputs(rows: int = 1) -> tuple[torch.Tensor, torch.Tensor, torch
 
 
 def _separate(run, *tensors: torch.Tensor) -> torch.Tensor:
-    """Run every document of every row on its own and reassemble the packed layout."""
+    """Run every document of every row on its own and reassemble the packed layout.
+
+    Args:
+        run: Callable applied to one document, taking slices of ``tensors``.
+        *tensors: Packed inputs of shape ``[batch, sequence, ...]``, with arbitrary
+            trailing dimensions and shared batch and sequence axes.
+
+    Returns:
+        Reassembled tensor of shape ``[batch, sequence, ...]``, with trailing
+        dimensions determined by ``run``.
+    """
     return torch.cat(
         [
             torch.cat([run(*(t[row : row + 1, a:b] for t in tensors)) for a, b in zip(bounds, bounds[1:])], dim=1)

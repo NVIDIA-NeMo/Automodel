@@ -863,7 +863,8 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
 
         Args:
             input_ids: Raw integer tokenizer IDs of shape ``[batch, sequence]``.
-            sequence_ids: Optional packed segment IDs; n-gram history stays inside a segment.
+            sequence_ids: Optional packed segment IDs of shape ``[batch, sequence]``;
+                n-gram history stays inside a segment.
 
         Returns:
             Global table IDs of shape ``[batch, sequence, ngram_heads]``. Heads
@@ -1087,8 +1088,10 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
             cp_context: Optional contiguous CP metadata. Under CP, ``sequence``
                 is local and the method exchanges only the preceding nine-token
                 boundary required by the released dilation/kernel settings.
-            sequence_ids: Optional packed segment IDs, global under CP. Taps that
-                read another segment contribute zero, as at the start of a row.
+            sequence_ids: Optional packed segment IDs of shape ``[batch,
+                local_sequence]`` without CP, or replicated ``[batch,
+                global_sequence]`` under CP. Taps that read another segment
+                contribute zero, as at the start of a row.
 
         Returns:
             Tensor of shape ``[batch, sequence, hc_count * hidden_size]``.
