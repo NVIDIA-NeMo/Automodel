@@ -31,13 +31,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import (
-    PROMPT_IDS_KEY,
-    PROMPT_SUFFIX_IDS_KEY,
-    PROMPT_TOKEN_ID_KEYS,
-    UNCOND_PROMPT_IDS_KEY,
-)
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext, ModelAdapter
+
+# Batch keys of the hunyuan_image3 cache (``PROMPT_TOKEN_ID_KEYS`` of the text-to-image dataset). Spelled out
+# like the other adapters' batch keys: flow_matching must not import the datasets component.
+PROMPT_IDS_KEY = "prompt_input_ids"
+UNCOND_PROMPT_IDS_KEY = "uncond_prompt_input_ids"
+PROMPT_SUFFIX_IDS_KEY = "prompt_suffix_ids"
 
 
 class HunyuanImage3Adapter(ModelAdapter):
@@ -68,7 +68,7 @@ class HunyuanImage3Adapter(ModelAdapter):
         noisy = context.noisy_latents
         if noisy.ndim != 4:
             raise ValueError(f"HunyuanImage3Adapter expects 4D latents [B, C, H, W], got {noisy.ndim}D")
-        for key in PROMPT_TOKEN_ID_KEYS:
+        for key in (PROMPT_IDS_KEY, UNCOND_PROMPT_IDS_KEY, PROMPT_SUFFIX_IDS_KEY):
             if key not in batch:
                 raise KeyError(f"Batch is missing {key!r}; preprocess the data with the 'hunyuan_image3' processor.")
         batch_size, _, height, width = noisy.shape

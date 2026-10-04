@@ -114,3 +114,8 @@ checkpoint:
   # Sharded checkpoints; generate.py loads them through the training checkpointer.
   save_consolidated: false
   restore_from: null
+
+ci:
+  recipe_owner: khazic
+  time: "01:00:00"
+  nodes: 4

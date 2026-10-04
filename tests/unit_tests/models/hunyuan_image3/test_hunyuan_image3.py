@@ -624,3 +624,11 @@ def test_adapter_validates_batch():
     context.noisy_latents = torch.randn(2, 4, 1, 2, 3)
     with pytest.raises(ValueError, match="4D latents"):
         adapter.prepare_inputs(context)
+
+
+def test_adapter_batch_keys_match_the_dataset():
+    from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import PROMPT_TOKEN_ID_KEYS
+    from nemo_automodel.components.models.hunyuan_image3 import flow_adapter
+
+    keys = (flow_adapter.PROMPT_IDS_KEY, flow_adapter.UNCOND_PROMPT_IDS_KEY, flow_adapter.PROMPT_SUFFIX_IDS_KEY)
+    assert keys == PROMPT_TOKEN_ID_KEYS
