@@ -1724,6 +1724,27 @@ class TestPeftOuterPrefixIsNotLoadBearing:
             f"{base}.lora_B.weight": torch.randn(8, 2),
         }
 
+    @staticmethod
+    def _native_expert_lora(prefix: str, moe_config, rank: int = 2) -> dict[str, torch.Tensor]:
+        """Grouped expert LoRA as the native model holds it: one tensor per factor, all experts."""
+        experts = moe_config.n_routed_experts
+        base = f"{prefix}model.language_model.model.layers.0.mlp.experts"
+        return {
+            f"{base}.lora_gate_and_up_A": torch.randn(experts, moe_config.dim, rank),
+            f"{base}.lora_gate_and_up_B": torch.randn(experts, rank, 2 * moe_config.moe_inter_dim),
+            f"{base}.lora_down_A": torch.randn(experts, moe_config.moe_inter_dim, rank),
+            f"{base}.lora_down_B": torch.randn(experts, rank, moe_config.dim),
+        }
+
+    @staticmethod
+    def _assert_same(direct: dict, through_boundary: dict, what: str) -> None:
+        assert set(direct) == set(through_boundary), (
+            f"{what} reads the outer prefix; direct_only={sorted(set(direct) - set(through_boundary))} "
+            f"boundary_only={sorted(set(through_boundary) - set(direct))}"
+        )
+        for key, value in direct.items():
+            torch.testing.assert_close(through_boundary[key], value, rtol=0, atol=0)
+
     def _strip(self, state_dict: dict) -> dict:
         return {key.removeprefix(self._PREFIX): value for key, value in state_dict.items()}
 
@@ -1737,10 +1758,7 @@ class TestPeftOuterPrefixIsNotLoadBearing:
         direct = adapter.to_hf(dict(prefixed))
         through_boundary = self._restore(adapter.to_hf(self._strip(prefixed)))
 
-        assert set(direct) == set(through_boundary), (
-            f"to_hf reads the outer prefix; direct_only={sorted(set(direct) - set(through_boundary))} "
-            f"boundary_only={sorted(set(through_boundary) - set(direct))}"
-        )
+        self._assert_same(direct, through_boundary, "to_hf")
 
     def test_from_hf_does_not_read_the_prefix(self, adapter):
         """Loading bare keys and re-adding the prefix has to match loading prefixed ones.
@@ -1754,7 +1772,28 @@ class TestPeftOuterPrefixIsNotLoadBearing:
         direct = adapter.from_hf(dict(prefixed))
         through_boundary = self._restore(adapter.from_hf(self._strip(prefixed)))
 
-        assert set(direct) == set(through_boundary), (
-            f"from_hf reads the outer prefix; direct_only={sorted(set(direct) - set(through_boundary))} "
-            f"boundary_only={sorted(set(through_boundary) - set(direct))}"
-        )
+        self._assert_same(direct, through_boundary, "from_hf")
+
+    def test_to_hf_expert_lora_does_not_read_the_prefix(self, adapter):
+        """Grouped expert factors split per expert on export, with or without the prefix."""
+        native = self._native_expert_lora(self._PREFIX, adapter.moe_config)
+
+        direct = adapter.to_hf(dict(native))
+        through_boundary = self._restore(adapter.to_hf(self._strip(native)))
+
+        self._assert_same(direct, through_boundary, "to_hf on expert LoRA")
+
+    def test_from_hf_expert_lora_does_not_read_the_prefix(self, adapter):
+        """Per-expert factors recombine into grouped tensors on load, with or without the prefix.
+
+        This is where the prefix was load-bearing: ``from_hf`` only sent keys to the
+        expert recombiner when they started with ``base_model.``, so a bare adapter came
+        back as per-expert tensors the model holds no parameter for. The attention case
+        above cannot see that, because attention factors pass through unchanged either way.
+        """
+        exported = adapter.to_hf(self._native_expert_lora(self._PREFIX, adapter.moe_config))
+
+        direct = adapter.from_hf(dict(exported))
+        through_boundary = self._restore(adapter.from_hf(self._strip(exported)))
+
+        self._assert_same(direct, through_boundary, "from_hf on expert LoRA")

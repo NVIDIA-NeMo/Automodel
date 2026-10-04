@@ -139,12 +139,12 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
     def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
         """Namespace adapter_config.json target_modules the way the tensors are namespaced.
 
-        On the full omni layout the namespace is required: PEFT suffix-matches
-        target_modules against the receiving model, so an entry without it also hits
-        the talker's structurally identical submodules and injects adapters the saved
-        file has no weights for. On a thinker-only base the namespace does not exist on
-        the receiving model, and adding it makes PEFT reject the adapter outright, so
-        this follows ``_uses_thinker_prefix`` exactly as the tensor exporters do.
+        PEFT suffix-matches target_modules against the receiving model, so on the full
+        omni layout an entry without ``thinker.`` also hits the talker's structurally
+        identical submodules and injects adapters the saved file has no weights for.
+        This follows ``_uses_thinker_prefix`` the same way ``to_hf`` and
+        ``convert_single_tensor_to_hf`` do, so the hook and the tensor exporters stay
+        aligned.
 
         Args:
             name: A target-module name in native layout.

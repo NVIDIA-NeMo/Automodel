@@ -374,11 +374,13 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         peft_keys = {}
 
         for key, value in effective_state_dict.items():
-            if key.startswith("base_model."):
-                # PEFT adapter namespace. These keys are saved with their native-format
-                # path preserved (including the "base_model.model." outer prefix), so no
-                # HF->native renaming applies — only the per-expert expert-LoRA keys need
-                # recombining into the grouped tensors the model actually holds.
+            if ".lora_" in key:
+                # PEFT adapter factors. These are saved with their native-format path
+                # preserved, so no HF->native renaming applies -- only the per-expert
+                # expert-LoRA keys need recombining into the grouped tensors the model
+                # actually holds. Recognised by ".lora_" rather than the "base_model."
+                # outer prefix, which ModelState owns and #3867 moves out of the adapters'
+                # sight; it is also what export uses for the same decision above.
                 peft_keys[key] = value
             elif key.startswith("language_model.model."):
                 llm_key = key.replace("language_model.model.", "model.")
