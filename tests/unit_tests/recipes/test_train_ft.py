@@ -1080,6 +1080,20 @@ def test_nvtx_false_skips_patching(monkeypatch):
     assert patch_calls == []
 
 
+def test_setup_without_backend_keeps_paged_stash_disabled(monkeypatch):
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    model = DummyModel()
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *a, **k: model)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert trainer.partial_cuda_graph_manager is None
+    assert trainer._partial_cuda_graph_capture_pending is False
+    assert trainer._partial_cuda_graph_paged_stash_enabled is False
+
+
 def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     cfg = _minimal_cfg_with_nvtx(nvtx_value=False, optimizer_target="torch.optim.AdamW")
 
@@ -1206,6 +1220,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer.max_grad_norm = 1.0
     trainer.partial_cuda_graph_manager = None
     trainer._partial_cuda_graph_capture_pending = False
+    trainer._partial_cuda_graph_paged_stash_enabled = False
     trainer._enable_qat_if_delayed = MagicMock()
     trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
     trainer._maybe_collect_garbage = MagicMock()

@@ -815,7 +815,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pipeline_parallel=bool(self.pp_enabled),
         )
         self._partial_cuda_graph_capture_pending = self.partial_cuda_graph_manager is not None
-        enabled_parts = [part for part in self.model_parts if part.backend.cuda_graph.moe_paged_stash]
+        enabled_parts = [
+            part
+            for part in self.model_parts
+            if getattr(part, "backend", None) is not None and part.backend.cuda_graph.moe_paged_stash
+        ]
         self._partial_cuda_graph_paged_stash_enabled = bool(enabled_parts)
         if self._partial_cuda_graph_paged_stash_enabled and self.partial_cuda_graph_manager is None:
             raise RuntimeError("MoE paged stash requires an active partial CUDA graph manager")
