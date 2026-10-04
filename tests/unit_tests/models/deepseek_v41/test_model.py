@@ -405,19 +405,6 @@ def test_v41_uses_unified_moe_parallelization() -> None:
         assert all(".mlp." not in name for name in model.state_dict())
 
 
-def test_strict_fp32_names_match_exactly_the_fp32_parameters() -> None:
-    config = _tiny_config()
-    config.text_config.dtype = torch.bfloat16
-    model = DeepseekV41ForCausalLM(config, backend=_backend())
-    strict = model._keep_in_fp32_modules_strict
-    pinned = {name for name, _ in model.named_parameters() if any(token in name for token in strict)}
-    fp32 = {name for name, param in model.named_parameters() if param.dtype == torch.float32}
-
-    assert pinned == fp32
-    assert {"model.layers.0.attn.attn_sink", "model.layers.0.attn_hc.fn", "lm_head.weight"} <= pinned
-    assert "model.layers.0.attn.wq_a.weight" not in pinned
-
-
 def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch.dtype) -> None:
     dist.init_process_group(
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=90)
@@ -460,9 +447,9 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
 
         torch.manual_seed(419 + rank)
         # This covers real CPU FSDP wrapping and initialization, not a CUDA
-        # all-gather or forward. The requested compute dtype must not replace
-        # either BF16 storage or explicitly requested FP32 master storage.
-        model.initialize_weights(torch.device("cpu"), dtype=torch.bfloat16)
+        # all-gather or forward. Like the recipe, the post-shard call requests the
+        # storage dtype, which must leave every local shard's dtype in place.
+        model.initialize_weights(torch.device("cpu"), dtype=storage_dtype)
         for name, parameter in model.named_parameters():
             assert parameter is parameters[name], name
             assert parameter.dtype == parameter.to_local().dtype == expected_dtypes[name], name

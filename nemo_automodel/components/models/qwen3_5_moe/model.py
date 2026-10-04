@@ -87,7 +87,11 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import (
+    KeepRotaryInvFreqFp32,
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     prepare_gated_delta_packed_metadata,
@@ -494,32 +498,12 @@ def build_qwen3_5_moe_mtp(
     )
 
 
-class Fp32SafeQwen3_5MoeTextRotaryEmbedding(Qwen3_5MoeTextRotaryEmbedding):
-    """Ensure inv_freq stays in float32 across ``.to(dtype)`` calls."""
-
-    def _apply(self, fn: Any, recurse: bool = True):
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
-        result = super()._apply(fn, recurse=recurse)
-        self.register_buffer(
-            "inv_freq",
-            inv_freq_fp32.to(device=self.inv_freq.device),
-            persistent=False,
-        )
-        return result
+class Fp32SafeQwen3_5MoeTextRotaryEmbedding(KeepRotaryInvFreqFp32, Qwen3_5MoeTextRotaryEmbedding):
+    """Qwen3.5-MoE text rotary whose ``inv_freq`` stays fp32 across ``.to(dtype)`` calls."""
 
 
-class Fp32SafeQwen3_5MoeVisionRotaryEmbedding(Qwen3_5MoeVisionRotaryEmbedding):
-    """Ensure the vision rotary inv_freq buffer remains float32."""
-
-    def _apply(self, fn: Any, recurse: bool = True):
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
-        result = super()._apply(fn, recurse=recurse)
-        self.register_buffer(
-            "inv_freq",
-            inv_freq_fp32.to(device=self.inv_freq.device),
-            persistent=False,
-        )
-        return result
+class Fp32SafeQwen3_5MoeVisionRotaryEmbedding(KeepRotaryInvFreqFp32, Qwen3_5MoeVisionRotaryEmbedding):
+    """Qwen3.5-MoE vision rotary whose ``inv_freq`` stays fp32 across ``.to(dtype)`` calls."""
 
 
 # ---------------------------------------------------------------------------
@@ -1292,18 +1276,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 or getattr(config, "name_or_path", None),
             )
 
-        # Wrap vision rotary embedding with fp32-safe version
-        vision_model = getattr(self.model, "visual")
-        rotary = vision_model.rotary_pos_emb
-        dim = rotary.inv_freq.shape[0] * 2
-        fp32_safe_rotary = Fp32SafeQwen3_5MoeVisionRotaryEmbedding(dim)
-        fp32_safe_rotary.register_buffer(
-            "inv_freq",
-            rotary.inv_freq.detach().clone().to(torch.float32, copy=True),
-            persistent=False,
-        )
-        fp32_safe_rotary.to(rotary.inv_freq.device)
-        vision_model.rotary_pos_emb = fp32_safe_rotary
+        # The HF vision rotary keeps its fp32 ``inv_freq`` through later ``.to(dtype)`` calls.
+        rotary = self.model.visual.rotary_pos_emb
+        rotary.__class__ = Fp32SafeQwen3_5MoeVisionRotaryEmbedding
+        rotary.inv_freq = rotary.inv_freq.detach().to(torch.float32)
 
     def _encode_vision_for_cp(
         self,

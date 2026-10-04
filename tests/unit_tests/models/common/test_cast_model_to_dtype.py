@@ -19,10 +19,11 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
+import nemo_automodel.components.models.common.utils as utils_module
 from nemo_automodel.components.models.common.utils import (
+    KeepRotaryInvFreqFp32,
     _get_fp32_module_keywords,
     _get_strict_fp32_module_keywords,
-    _has_dtensor_params,
     cast_frozen_modules_to_compute_dtype,
     cast_model_to_dtype,
 )
@@ -391,15 +392,6 @@ def _shard_parameters(model: nn.Module, mesh) -> None:
 
 
 class TestShardedCasting:
-    def test_has_dtensor_params_false_for_plain_model(self):
-        model = SimpleModel()
-        assert not _has_dtensor_params(model)
-
-    def test_has_dtensor_params_true_after_sharding(self, cpu_mesh):
-        model = SimpleModel()
-        _shard_parameters(model, cpu_mesh)
-        assert _has_dtensor_params(model)
-
     def test_fp32_storage_cast_to_fp32_leaves_sharded_params_untouched(self, cpu_mesh):
         """The post-shard ``initialize_weights(dtype=<storage dtype>)`` call is a no-op on params."""
         model = ModelWithStrictFp32Parameter()
@@ -513,15 +505,13 @@ class TestCastFrozenModulesToComputeDtype:
         This mirrors the sharded frozen-tower case (e.g. gemma4 vision tower in the root
         FSDP unit): FSDP all-gathers the params to the compute dtype itself, but never casts
         buffers, so an fp32 buffer would promote bf16 activations back to fp32. We simulate a
-        DTensor param with a ``nn.Parameter`` subclass and patch the ``DTensor`` symbol the
-        function imports at call time.
+        DTensor param with a ``nn.Parameter`` subclass and patch the module's ``DTensor`` symbol.
         """
-        import torch.distributed.tensor as dt_mod
 
         class _FakeDTensor(nn.Parameter):
             pass
 
-        monkeypatch.setattr(dt_mod, "DTensor", _FakeDTensor, raising=False)
+        monkeypatch.setattr(utils_module, "DTensor", _FakeDTensor)
 
         model = _VLMLike()
         # Mark the frozen proj weight as a "sharded" param (DTensor-like instance).
@@ -592,3 +582,70 @@ class TestRopeBufferPreserved:
         model = self._rope_model(["freqs_cis"], buffer_name="freqs_cis", module_name="model")
         cast_model_to_dtype(model, torch.bfloat16)
         assert model.model.freqs_cis.dtype == torch.float32
+
+
+class _Rotary(KeepRotaryInvFreqFp32):
+    """Stand-in for an HF rotary module: fp32 ``inv_freq`` / ``original_inv_freq`` plus one plain buffer."""
+
+    def __init__(self):
+        super().__init__()
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+        self.register_buffer("attention_scaling", torch.ones(1), persistent=False)
+
+
+class TestKeepRotaryInvFreqFp32:
+    """The mixin covers raw ``nn.Module.to`` calls, which ``_keep_in_fp32_modules`` cannot intercept."""
+
+    @staticmethod
+    def _expected() -> torch.Tensor:
+        return 1.0 / (10000.0 ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8))
+
+    def test_repeated_dtype_casts_keep_exact_fp32_values(self):
+        rotary = _Rotary()
+        for dtype in (torch.bfloat16, torch.float16, torch.bfloat16, torch.float32, torch.bfloat16):
+            rotary.to(dtype)
+            for name in ("inv_freq", "original_inv_freq"):
+                buffer = getattr(rotary, name)
+                assert buffer.dtype == torch.float32
+                assert name in rotary._buffers and name in rotary._non_persistent_buffers_set
+                torch.testing.assert_close(buffer, self._expected(), rtol=0.0, atol=0.0)
+            # Other buffers follow the requested dtype like any plain module.
+            assert rotary.attention_scaling.dtype == dtype
+
+    def test_parent_module_cast_keeps_child_rotary_fp32(self):
+        parent = nn.Module()
+        parent.linear = nn.Linear(4, 4)
+        parent.rotary_emb = _Rotary()
+
+        parent.to(torch.bfloat16)
+
+        assert parent.linear.weight.dtype == torch.bfloat16
+        torch.testing.assert_close(parent.rotary_emb.inv_freq, self._expected(), rtol=0.0, atol=0.0)
+
+    def test_class_swap_on_existing_module_protects_later_casts(self):
+        # The VLM constructors swap the HF vision rotary's class in place after construction.
+        class _PlainRotary(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("inv_freq", _Rotary().inv_freq.clone(), persistent=False)
+
+        class _Guarded(KeepRotaryInvFreqFp32, _PlainRotary):
+            pass
+
+        rotary = _PlainRotary()
+        rotary.__class__ = _Guarded
+        rotary.inv_freq = rotary.inv_freq.detach().to(torch.float32)
+
+        rotary.to(torch.bfloat16)
+
+        torch.testing.assert_close(rotary.inv_freq, self._expected(), rtol=0.0, atol=0.0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="device move needs CUDA")
+    def test_device_move_keeps_fp32_buffer_on_target_device(self):
+        rotary = _Rotary().to("cuda")
+        assert rotary.inv_freq.device.type == "cuda" and rotary.inv_freq.dtype == torch.float32
+        rotary.to(device="cuda", dtype=torch.bfloat16)
+        assert rotary.inv_freq.device.type == "cuda"
+        torch.testing.assert_close(rotary.inv_freq.cpu(), self._expected(), rtol=0.0, atol=0.0)

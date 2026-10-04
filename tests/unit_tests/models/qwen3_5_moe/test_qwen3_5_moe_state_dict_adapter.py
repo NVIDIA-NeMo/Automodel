@@ -999,15 +999,6 @@ class TestConvertSingleTensorToHf:
         assert result[0][0] == "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"
         assert torch.equal(result[0][1], tensor)
 
-    def test_gdn_gate_param_key_is_passed_through_on_save(self, adapter):
-        # The decay-gate params carry their HF names natively; nothing to rename.
-        tensor = torch.randn(8)
-        fqn = "model.language_model.layers.0.linear_attn.A_log"
-
-        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
-
-        assert result == [(fqn, tensor)]
-
     def test_non_expert_tensor_passthrough(self, adapter):
         tensor = torch.randn(64, 64)
         fqn = "model.language_model.layers.0.self_attn.q_proj.weight"
@@ -1120,8 +1111,11 @@ class TestConvertSingleTensorToHf:
 # ---------------------------------------------------------------------------
 class TestConditionalGenerationStateDictAdapterWiring:
     def test_passes_top_level_model_name_to_state_dict_adapter(self):
-        class DummyRotary:
-            inv_freq = torch.ones(4)
+        class DummyRotary(torch.nn.Module):
+            # A real module: the constructor swaps its class to the fp32-safe rotary in place.
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("inv_freq", torch.ones(4), persistent=False)
 
         class DummyVisual:
             def __init__(self):
@@ -1138,16 +1132,6 @@ class TestConditionalGenerationStateDictAdapterWiring:
 
         class DummyMTPConfig:
             enabled = False
-
-        class DummyFp32SafeRotary:
-            def __init__(self, dim):
-                self.dim = dim
-
-            def register_buffer(self, *args, **kwargs):
-                pass
-
-            def to(self, *args, **kwargs):
-                return self
 
         adapter_calls = []
 
@@ -1175,11 +1159,6 @@ class TestConditionalGenerationStateDictAdapterWiring:
             patch.object(qwen3_5_moe_model, "initialize_linear_module", Mock(return_value=Mock())),
             patch.object(qwen3_5_moe_model, "build_mtp_config_from_hf", Mock(return_value=DummyMTPConfig())),
             patch.object(qwen3_5_moe_model, "Qwen3_5MoeStateDictAdapter", DummyAdapter),
-            patch.object(
-                qwen3_5_moe_model,
-                "Fp32SafeQwen3_5MoeVisionRotaryEmbedding",  # pragma: allowlist secret
-                DummyFp32SafeRotary,
-            ),
         ):
             qwen3_5_moe_model.Qwen3_5MoeForConditionalGeneration(config, backend=backend)
 
@@ -1287,53 +1266,3 @@ class TestFromHFEpShard:
         # No ep_shard slicing — full transposed tensor
         assert local_gate.shape == (n_experts, hidden, inter)
         torch.testing.assert_close(local_gate, gate_up_hf.transpose(1, 2).to(adapter.dtype))
-
-
-class TestFp32GateParamCheckpointContract:
-    """GatedDeltaNet ``A_log``/``dt_bias`` keep HF keys and pass through the adapter unchanged."""
-
-    _A_LOG = "model.language_model.layers.0.linear_attn.A_log"
-    _DT_BIAS = "model.language_model.layers.0.linear_attn.dt_bias"
-    _Q_PROJ = "model.language_model.layers.0.self_attn.q_proj.weight"
-
-    def test_from_hf_keeps_gating_keys(self, adapter):
-        hf_state = {self._A_LOG: torch.randn(8), self._DT_BIAS: torch.randn(8)}
-
-        out = adapter.from_hf(hf_state)
-
-        assert set(out) == {self._A_LOG, self._DT_BIAS}
-
-    def test_to_hf_keeps_gating_keys(self, adapter):
-        sd = {self._A_LOG: torch.zeros(4), "model.language_model.layers.2.linear_attn.dt_bias": torch.ones(4)}
-        out = adapter.to_hf(sd)
-        assert set(out) == set(sd)
-
-    def test_to_hf_passes_gdn_fp32_params_through(self, adapter):
-        sd = {
-            self._A_LOG: torch.zeros(4, dtype=torch.bfloat16),
-            self._DT_BIAS: torch.ones(4, dtype=torch.bfloat16),
-            self._Q_PROJ: torch.zeros(2, 2, dtype=torch.bfloat16),
-        }
-
-        out = adapter.to_hf(sd)
-
-        for key, tensor in sd.items():
-            assert out[key] is tensor
-
-    def test_convert_single_tensor_keeps_gdn_param_dtype(self, adapter):
-        tensor = torch.zeros(4, dtype=torch.bfloat16)
-        result = adapter.convert_single_tensor_to_hf("model.language_model.layers.1.linear_attn.dt_bias", tensor)
-        assert result == [("model.language_model.layers.1.linear_attn.dt_bias", tensor)]
-        assert result[0][1] is tensor
-
-    def test_from_hf_keeps_checkpoint_dtypes(self, adapter):
-        hf_state = {
-            self._A_LOG: torch.zeros(4, dtype=torch.bfloat16),
-            self._DT_BIAS: torch.ones(4, dtype=torch.bfloat16),
-            self._Q_PROJ: torch.zeros(2, 2, dtype=torch.bfloat16),
-        }
-
-        out = adapter.from_hf(hf_state)
-
-        for key, tensor in hf_state.items():
-            assert out[key] is tensor

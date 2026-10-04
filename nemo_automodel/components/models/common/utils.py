@@ -17,7 +17,7 @@ import logging
 import math
 import os
 import warnings
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -25,7 +25,7 @@ from typing import Any, Literal, Protocol
 import torch
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
-from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.experimental import register_sharding
 from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
@@ -990,6 +990,32 @@ def get_rope_config(config) -> tuple[float, dict, float]:
     return rope_theta, rope_parameters, partial_rotary_factor
 
 
+class KeepRotaryInvFreqFp32(nn.Module):
+    """Mixin for HF rotary-embedding modules whose ``inv_freq`` must survive ``.to(dtype)``.
+
+    ``nn.Module.to`` rounds every floating buffer, and the HF rotary classes derive cos/sin
+    from the stored buffer (``self.inv_freq.float()`` cannot undo a bf16 rounding), so a bulk
+    cast skews the RoPE phases. ``_keep_in_fp32_modules`` only guards ``cast_model_to_dtype``
+    and ``cast_frozen_modules_to_compute_dtype``; this override also covers the raw
+    ``model.to(dtype)`` calls (DDP, Megatron-FSDP, retrieval model construction) by
+    snapshotting the fp32 buffers around ``_apply`` and re-registering them on the moved
+    device. List it before the HF class: ``class Fp32SafeX(KeepRotaryInvFreqFp32, X)``.
+    """
+
+    _fp32_buffer_names: tuple[str, ...] = ("inv_freq", "original_inv_freq")
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "KeepRotaryInvFreqFp32":
+        fp32_buffers = {
+            name: buf.detach().to(torch.float32, copy=True)
+            for name, buf in self.named_buffers(recurse=False)
+            if name in self._fp32_buffer_names
+        }
+        result = super()._apply(fn, recurse=recurse)
+        for name, fp32_buffer in fp32_buffers.items():
+            self.register_buffer(name, fp32_buffer.to(device=self._buffers[name].device), persistent=False)
+        return result
+
+
 def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -> None:
     """Cast ``model`` to ``dtype`` while keeping its fp32-contract tensors in fp32.
 
@@ -1021,41 +1047,23 @@ def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -
 
 
 @contextmanager
-def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None):
-    """Run a block with the model temporarily in fp32, then cast it to ``restore_dtype``.
+def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype):
+    """Run a block with the model in fp32, then cast it to ``restore_dtype``.
 
-    On entry the whole model is cast to fp32; on exit it is cast to ``restore_dtype``
-    (which defaults to the model's pre-context floating-point dtype, so by default the
-    original dtype is restored). The exit cast is a no-op when the target is already fp32.
-
-    The motivating use is from-scratch weight initialization. Sampling a random init directly
-    in a reduced-precision dtype (e.g. bf16) distorts the init's variance/mean schedule: bf16's
-    8-bit mantissa quantizes the small init magnitudes and biases the truncation/scaling
-    arithmetic used by ``normal_`` / ``trunc_normal_``. In a deep residual stack this compounds
-    and produces genuinely huge gradients on the first optimization steps of from-scratch
-    pretraining (flat / diverging loss). Sampling in fp32 and then casting back avoids this while
-    keeping reduced-precision storage: the round-to-bf16 of a correct fp32 sample is an unbiased
-    per-element perturbation that preserves the init statistics. Wrap the body of a model's
-    ``initialize_weights`` to keep that round-trip in one place.
-
-    Both casts go through ``cast_model_to_dtype``, so ``_keep_in_fp32_modules`` /
-    ``_keep_in_fp32_modules_strict`` tensors are restored to fp32 on exit under the same
-    rules (plain parameters and buffers; see ``cast_model_to_dtype`` for sharded models).
+    Sampling a random init directly in bf16 distorts the init statistics (the 8-bit mantissa
+    quantizes the small magnitudes and biases ``normal_`` / ``trunc_normal_``), which compounds
+    through a deep residual stack into exploding early gradients for from-scratch pretraining.
+    Sampling in fp32 and rounding afterwards keeps reduced-precision storage with an unbiased
+    per-element perturbation. Both casts go through ``cast_model_to_dtype``, so the
+    ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` tensors are restored on exit.
 
     Args:
         model: The model to run in fp32 within the context.
-        restore_dtype: The dtype to cast the model to on exit. Defaults to the model's current
-            floating-point dtype (captured before the fp32 cast), i.e. the original dtype.
+        restore_dtype: The dtype to cast the model to on exit.
 
     Yields:
         The same ``model``, now in fp32.
-
-    Example:
-        >>> with yield_fp32_model(self, dtype):
-        ...     self.model.init_weights(buffer_device=buffer_device)
     """
-    if restore_dtype is None:
-        restore_dtype = next((p.dtype for p in model.parameters() if p.is_floating_point()), torch.float32)
     cast_model_to_dtype(model, torch.float32)
     try:
         yield model
@@ -1063,45 +1071,25 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
         cast_model_to_dtype(model, restore_dtype)
 
 
+def _fp32_keywords_from_attr(model: nn.Module, attr: str) -> list[str]:
+    """Read one HuggingFace keep-in-fp32 attribute of ``model`` as a list (empty when absent).
+
+    ``PreTrainedModel.__init__`` normalizes the class-level ``list[str]`` into an
+    instance-level ``set[str]``, so list, set and tuple are all accepted.
+    """
+    val = getattr(model, attr, None)
+    return list(val) if isinstance(val, (list, set, tuple)) else []
+
+
 def _get_strict_fp32_module_keywords(model: nn.Module) -> list[str]:
     """Return the de-duplicated ``_keep_in_fp32_modules_strict`` tokens of ``model``."""
-    val = getattr(model, "_keep_in_fp32_modules_strict", None)
-    if not isinstance(val, (list, set, tuple)):
-        return []
-    return list(dict.fromkeys(val))
+    return list(dict.fromkeys(_fp32_keywords_from_attr(model, "_keep_in_fp32_modules_strict")))
 
 
 def _get_fp32_module_keywords(model: nn.Module) -> list[str]:
-    """Collect module name patterns that must remain in fp32.
-
-    Reads ``_keep_in_fp32_modules`` and ``_keep_in_fp32_modules_strict``
-    from the model (the same attributes HuggingFace transformers uses).
-
-    Args:
-        model: The model to inspect.
-
-    Returns:
-        De-duplicated list of module-name keywords to keep in fp32.
-    """
-    keywords: list[str] = []
-    for attr in ("_keep_in_fp32_modules_strict", "_keep_in_fp32_modules"):
-        val = getattr(model, attr, None)
-        # HuggingFace's PreTrainedModel.__init__ normalizes a class-level
-        # list[str] into an instance-level set[str], so accept both (and tuple).
-        if isinstance(val, (list, set, tuple)):
-            keywords.extend(val)
-
-    # de-duplicate while preserving order
+    """Return the de-duplicated strict and non-strict keep-in-fp32 tokens of ``model``, strict first."""
+    keywords = _get_strict_fp32_module_keywords(model) + _fp32_keywords_from_attr(model, "_keep_in_fp32_modules")
     return list(dict.fromkeys(keywords))
-
-
-def _has_dtensor_params(model: nn.Module) -> bool:
-    """Check if any model parameter is a DTensor (FSDP2 sharded)."""
-    try:
-        from torch.distributed.tensor import DTensor
-    except ImportError:
-        return False
-    return any(isinstance(p, DTensor) for p in model.parameters())
 
 
 def _snapshot_fp32_tensors(
@@ -1140,8 +1128,6 @@ def _restore_fp32_tensor_snapshots(
     Raises:
         RuntimeError: A parameter to restore is a DTensor that is no longer fp32.
     """
-    from torch.distributed.tensor import DTensor
-
     named_parameters = dict(model.named_parameters())
     for name, snapshot in parameter_snapshots.items():
         param = named_parameters[name]
@@ -1304,11 +1290,6 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     if compute_dtype is None:
         return
 
-    try:
-        from torch.distributed.tensor import DTensor
-    except ImportError:
-        DTensor = ()
-
     fp32_keywords = _get_fp32_module_keywords(model)
 
     def _is_fp32_pinned(name: str) -> bool:
@@ -1337,7 +1318,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
                 if not subtree:
                     break
                 subtree, _, _ = subtree.rpartition(".")
-        elif param.is_floating_point() and not _is_fp32_pinned(name) and not (DTensor and isinstance(param, DTensor)):
+        elif param.is_floating_point() and not _is_fp32_pinned(name) and not isinstance(param, DTensor):
             frozen_param_owners.add(owner_name)
 
     mixed_subtrees = frozen_param_owners & trainable_subtrees
@@ -1356,7 +1337,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     for name, param in named_params:
         if (param.requires_grad and not _is_in_subtrees(name, mixed_subtrees)) or _is_fp32_pinned(name):
             continue
-        if DTensor and isinstance(param, DTensor):
+        if isinstance(param, DTensor):
             continue
         if param.is_floating_point() and param.dtype != compute_dtype:
             param.data = param.data.to(compute_dtype)
@@ -1385,6 +1366,7 @@ __all__ = [
     "AttentionBackend",
     "BackendConfig",
     "Float32RMSNorm",
+    "KeepRotaryInvFreqFp32",
     "TEFp8Config",
     "cast_frozen_modules_to_compute_dtype",
     "cast_model_to_dtype",

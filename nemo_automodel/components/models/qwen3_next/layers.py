@@ -95,20 +95,6 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
         self.chunk_gated_delta_rule = chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
 
-    def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
-        """Compute the decay gate ``g = -exp(A_log) * softplus(a + dt_bias)`` in fp32.
-
-        Casts ``a`` to fp32 itself: under FSDP mixed precision the block's inputs
-        arrive in bf16 while ``A_log`` / ``dt_bias`` stay fp32.
-
-        Args:
-            a: Pre-activation of the time-step projection, shape ``[batch, seq, num_v_heads]``.
-
-        Returns:
-            fp32 gate with the same shape as ``a``.
-        """
-        return gdn_decay_gate(a, self.A_log, self.dt_bias)
-
     def forward(  # pragma: no cover - verbatim HF GDN forward; needs CUDA conv1d/FLA kernels (GPU/functional only)
         self,
         hidden_states: torch.Tensor,
@@ -116,7 +102,7 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
         attention_mask: torch.Tensor | None = None,
     ):
         # Mirrors transformers ``Qwen3NextGatedDeltaNet.forward`` with the gate routed
-        # through ``self._compute_gate(a)`` so the decay gate is computed in fp32.
+        # through ``gdn_decay_gate`` so the decay gate is computed in fp32.
         from transformers.models.qwen3_next.modeling_qwen3_next import apply_mask_to_padding_states
 
         # transformers 5.15 dropped this helper's shape guards; it documents a 2D padding
@@ -180,7 +166,7 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
         beta = b.sigmoid()
         # Gate is computed in fp32 so the exponentiated decay rate keeps full precision
         # under bf16 compute.
-        g = self._compute_gate(a)
+        g = gdn_decay_gate(a, self.A_log, self.dt_bias)
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)

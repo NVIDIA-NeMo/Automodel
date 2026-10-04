@@ -33,7 +33,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
-    _has_dtensor_params,
     cast_model_to_dtype,
     compute_lm_head_logits,
 )
@@ -1006,8 +1005,6 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     a=-cutoff_factor * final_out_std,
                     b=cutoff_factor * final_out_std,
                 )
-        if _has_dtensor_params(self):
-            return
         cast_model_to_dtype(self, dtype)
 
 

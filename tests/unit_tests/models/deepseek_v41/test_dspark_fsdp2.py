@@ -17,7 +17,7 @@
 FSDP2 keeps one storage dtype per unit, so the draft trains from fp32 master
 weights; the bf16 mixed-precision policy computes in bf16 except for the
 strict fp32 parameters, which keep fp32 compute through the per-parameter
-override installed by ``with_fp32_compute_override``.
+override the base ``ModelParallelizer`` installs on every unit.
 """
 
 from __future__ import annotations
@@ -31,12 +31,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.distributed.activation_checkpointing import apply_submodule_checkpointing
-from nemo_automodel.components.distributed.parallelizer_utils import with_fp32_compute_override
+from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
@@ -86,10 +86,11 @@ def _config(dtype: str = "bfloat16") -> DeepseekV41TextConfig:
 def _fully_shard_model(model: DeepseekV41DSparkModel, mesh: DeviceMesh, dtype: torch.dtype) -> None:
     """Apply the same layer and root FSDP2 wrapping used by the DSpark recipe."""
     policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32)
-    strict = tuple(model._keep_in_fp32_modules_strict)
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, mp_policy=with_fp32_compute_override(layer, policy, strict))
-    fully_shard(model, mesh=mesh, mp_policy=with_fp32_compute_override(model, policy, strict))
+    parallelizer = ModelParallelizer()
+    with parallelizer._bind_model(model):
+        for layer in model.layers:
+            parallelizer._fully_shard_module(layer, mesh=mesh, mp_policy=policy)
+        parallelizer._fully_shard_module(model, mesh=mesh, mp_policy=policy)
 
 
 def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir: str) -> None:

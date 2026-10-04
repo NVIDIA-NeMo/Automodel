@@ -498,10 +498,6 @@ class TestNemotronV3Mamba2Mixer:
         torch.testing.assert_close(mixer.D, torch.ones(config.mamba_num_heads))
         torch.testing.assert_close(mixer.dt_bias, torch.ones(config.mamba_num_heads))
 
-        # Check no_weight_decay attributes
-        assert getattr(mixer.A_log, "_no_weight_decay", False)
-        assert getattr(mixer.D, "_no_weight_decay", False)
-
     def test_mamba2_mixer_conv1d(self, config):
         """Test Mamba2Mixer conv1d layer."""
         from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer

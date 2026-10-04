@@ -92,7 +92,9 @@ class NewMoEForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 Declare each such param as a plain attribute of the module that uses it,
 constructed with `dtype=torch.float32` regardless of the model dtype, and have
 that module cast its own inputs to fp32; FSDP casts block inputs to
-`param_dtype`. Keep the upcast of loaded tensors to fp32.
+`param_dtype`. State-dict adapters do no dtype work for these params:
+checkpoint loads copy into the existing fp32 parameters and HF exports pin
+them to F32 in the checkpointer from the same declaration.
 
 Each block is one FSDP2 unit. Its mixed-precision policy keeps the declared
 params in fp32 through per-parameter mixed precision
@@ -106,9 +108,9 @@ For HF-derived models with fp32 runtime params, build the fp32 structure in the
 model or layer constructor. Do not use a runtime monkeypatch, and do not infer
 the contract globally from a broad module path or a parameter name alone.
 
-Always declare the pin. Checkpoint load can auto-record original HF dtypes as a
-fallback, but quantized, from-scratch, and unusual checkpoint paths may skip
-that recording.
+Always declare the pin. It is the single source of truth: it selects the
+parameters that keep fp32 compute under FSDP2, that `cast_model_to_dtype`
+restores to fp32, and that HF exports write as F32.
 
 ## Frozen Submodules
 

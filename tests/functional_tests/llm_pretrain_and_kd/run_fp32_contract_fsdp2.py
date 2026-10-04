@@ -13,15 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Functional test: fp32 master weights + bf16 FSDP2 policy with per-parameter fp32 compute.
+"""Functional test: the fp32 compute contract under FSDP2 through ``ModelParallelizer``.
 
-Each KDA-style block (bf16-compute projections, bare fp32 ``A_log``/``dt_bias``)
-is one FSDP unit whose policy carries ``with_fp32_compute_override`` (the same
-policy the base ``ModelParallelizer`` installs on every unit). The sharded model
-must match an unsharded reference that emulates the same mixed precision by hand.
+A model trains from fp32 master weights under a bf16 mixed-precision policy. Each
+KDA-style block (bf16-compute projections, bare fp32 ``A_log``/``dt_bias``) is one FSDP
+unit sharded by ``ModelParallelizer._fully_shard_module``, which applies the model's
+``_keep_in_fp32_modules_strict`` contract to the unit's policy. The sharded model must
+match an unsharded reference that emulates the same mixed precision by hand, and bf16
+storage of a contract parameter must be rejected.
 
 Usage:
-    torchrun --nproc_per_node=2 tests/functional_tests/llm_pretrain_and_kd/run_fully_shard_by_dtype_param_dtype.py
+    torchrun --nproc_per_node=2 tests/functional_tests/llm_pretrain_and_kd/run_fp32_contract_fsdp2.py
 """
 
 from __future__ import annotations
@@ -35,10 +37,11 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.distributed.parallelizer_utils import with_fp32_compute_override
+from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+from nemo_automodel.components.distributed.parallelizer_utils import _HAS_PARAM_DTYPE_OVERRIDE
 
 HIDDEN = 16
 NUM_BLOCKS = 2
@@ -74,6 +77,10 @@ class KDABlock(nn.Module):
 
 
 class TinyModel(nn.Module):
+    """Stack of KDA blocks declaring the fp32 compute contract the way the real models do."""
+
+    _keep_in_fp32_modules_strict = list(FP32_TOKENS)
+
     def __init__(self, check_dtypes: bool):
         super().__init__()
         self.layers = nn.ModuleList([KDABlock(check_dtypes) for _ in range(NUM_BLOCKS)])
@@ -101,13 +108,16 @@ def _build_model(device: torch.device, check_dtypes: bool) -> TinyModel:
 def _shard(
     model: TinyModel, mesh: DeviceMesh, *, reshard_after_forward: bool | None, activation_checkpoint: bool
 ) -> None:
-    for index, block in enumerate(model.layers):
-        if activation_checkpoint:
-            block = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
-            model.layers[index] = block
-        kwargs = {} if reshard_after_forward is None else {"reshard_after_forward": reshard_after_forward}
-        fully_shard(block, mesh=mesh, mp_policy=with_fp32_compute_override(block, POLICY, FP32_TOKENS), **kwargs)
-    fully_shard(model, mesh=mesh, mp_policy=with_fp32_compute_override(model, POLICY, FP32_TOKENS))
+    """Shard each block and the root as the base ``ModelParallelizer`` does outside ``_apply``."""
+    parallelizer = ModelParallelizer()
+    with parallelizer._bind_model(model):
+        for index, block in enumerate(model.layers):
+            if activation_checkpoint:
+                block = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+                model.layers[index] = block
+            kwargs = {} if reshard_after_forward is None else {"reshard_after_forward": reshard_after_forward}
+            parallelizer._fully_shard_module(block, mesh=mesh, mp_policy=POLICY, **kwargs)
+        parallelizer._fully_shard_module(model, mesh=mesh, mp_policy=POLICY)
     for block in model.layers:
         _expect(isinstance(block, FSDPModule), "each block must be an FSDP unit")
         nested = [name for name, child in block.named_modules() if child is not block and isinstance(child, FSDPModule)]
@@ -197,9 +207,12 @@ def _run_variant(
 
 
 def _run_negative(mesh: DeviceMesh, device: torch.device) -> None:
+    """bf16 storage of a contract parameter is rejected at sharding time, naming ``model.dtype``."""
     model = _build_model(device, check_dtypes=False).to(torch.bfloat16)
+    parallelizer = ModelParallelizer()
     try:
-        with_fp32_compute_override(model.layers[0], POLICY, FP32_TOKENS)
+        with parallelizer._bind_model(model):
+            parallelizer._fully_shard_module(model.layers[0], mesh=mesh, mp_policy=POLICY)
     except ValueError as error:
         _expect("model.dtype" in str(error), f"unexpected error text: {error}")
     else:
@@ -211,6 +224,9 @@ def _run_negative(mesh: DeviceMesh, device: torch.device) -> None:
 def main() -> int:
     if not torch.cuda.is_available():
         print("SKIP: CUDA not available", file=sys.stderr)
+        return 0
+    if not _HAS_PARAM_DTYPE_OVERRIDE:
+        print("SKIP: MixedPrecisionPolicy.param_dtype_override_fn requires PyTorch >= 2.15", file=sys.stderr)
         return 0
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])

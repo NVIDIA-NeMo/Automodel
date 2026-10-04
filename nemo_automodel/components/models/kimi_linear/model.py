@@ -645,7 +645,14 @@ class KimiDeltaAttention(nn.Module):
         k = k.reshape(*k.shape[:-1], self.num_k_heads, self.head_k_dim).contiguous()
         v = v.reshape(*v.shape[:-1], self.num_heads, self.head_dim).contiguous()
         beta = beta.contiguous()
-        g = self._decay_gate(g).contiguous()
+        g = kda_decay_gate(
+            g,
+            self.A_log,
+            self.dt_bias,
+            head_dim=self.head_dim,
+            lower_bound=None,
+            use_fused=self.config.kda_use_fused_gate,
+        ).contiguous()
         use_qk_l2norm_in_kernel = getattr(self.config, "kda_use_qk_l2norm_in_kernel", True)
         if not use_qk_l2norm_in_kernel:
             q = F.normalize(q.float(), p=2, dim=-1, eps=1e-6).to(q.dtype)
@@ -674,24 +681,6 @@ class KimiDeltaAttention(nn.Module):
         o = self.o_norm(o, gate)
         o = o.reshape(o.shape[0], o.shape[1], -1).contiguous()
         return self.o_proj(o)
-
-    def _decay_gate(self, g: torch.Tensor) -> torch.Tensor:
-        """Compute the fp32 KDA decay from the raw gate projection.
-
-        Args:
-            g: Raw gate tensor of shape [batch, sequence, heads * head_dim].
-
-        Returns:
-            FP32 decay tensor of shape [batch, sequence, heads, head_dim].
-        """
-        return kda_decay_gate(
-            g,
-            self.A_log,
-            self.dt_bias,
-            head_dim=self.head_dim,
-            lower_bound=None,
-            use_fused=self.config.kda_use_fused_gate,
-        )
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:

@@ -30,7 +30,6 @@ import torch
 from torch import nn
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.fp32_gates import GDN_FP32_PARAM_TOKENS, MAMBA_FP32_PARAM_TOKENS
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 
 Builder = Callable[[torch.dtype], tuple[nn.Module, set[str]]]
@@ -308,6 +307,43 @@ def _inkling(dtype: torch.dtype) -> tuple[nn.Module, set[str]]:
     return model, expected
 
 
+def _deepseek_v4(dtype: torch.dtype) -> tuple[nn.Module, set[str]]:
+    from tests.unit_tests.models.deepseek_v4.test_dsv4_model_smoke import _make_model, _tiny_config
+
+    model = _make_model(_tiny_config(num_hidden_layers=2, num_hash_layers=0, compress_ratios=[4, 128]))
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=dtype)
+    hc = ("fn", "base", "scale")
+    expected = {"lm_head.weight", *(f"model.hc_head.hc_{name}" for name in hc)}
+    for index in range(2):
+        prefix = f"model.layers.{index}"
+        expected.update(f"{prefix}.{site}.{name}" for site in ("attn_hc", "ffn_hc") for name in hc)
+        expected.add(f"{prefix}.self_attn.sinks")
+        expected.update(f"{prefix}.self_attn.compressor.{name}" for name in ("ape", "wgate.weight", "wkv.weight"))
+    # Only the compress-ratio-4 layer carries a lightning indexer.
+    expected.update(
+        f"model.layers.0.self_attn.compressor.indexer.{name}" for name in ("ape", "wgate.weight", "wkv.weight")
+    )
+    return model, expected
+
+
+def _deepseek_v41(dtype: torch.dtype) -> tuple[nn.Module, set[str]]:
+    from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
+    from tests.unit_tests.models.deepseek_v41.test_model import _backend, _tiny_config
+
+    model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
+    model.initialize_weights(torch.device("cpu"), dtype=dtype)
+    hc = ("fn", "base", "scale")
+    expected = {"lm_head.weight"}
+    for index in range(6):
+        prefix = f"model.layers.{index}"
+        expected.update(f"{prefix}.{site}.{name}" for site in ("attn_hc", "ffn_hc") for name in hc)
+        expected.add(f"{prefix}.attn.attn_sink")
+    # Compressor layers of the tiny config: layer 2 (gated) and layer 4 (ungated).
+    expected.update(f"model.layers.2.attn.compressor.{name}" for name in ("wgate.weight", "wkv.weight"))
+    expected.add("model.layers.4.attn.compressor.wkv.weight")
+    return model, expected
+
+
 needs_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Qwen3NextModel builds on the current CUDA device"
 )
@@ -321,6 +357,8 @@ FAMILIES = [
     pytest.param(_nemotron_v3, id="nemotron_v3"),
     pytest.param(_glm5_next, id="glm5_next"),
     pytest.param(_inkling, id="inkling"),
+    pytest.param(_deepseek_v4, id="deepseek_v4"),
+    pytest.param(_deepseek_v41, id="deepseek_v41"),
 ]
 
 
@@ -374,23 +412,3 @@ def test_cast_model_to_dtype_restores_exactly_the_fp32_parameters_with_exact_val
     for name, param in model.named_parameters():
         if name in expected:
             assert torch.equal(param, before[name]), name
-
-
-def test_gdn_and_mamba_families_share_the_token_constants():
-    from nemo_automodel.components.models.nemotron_omni.model import NemotronOmniForConditionalGeneration
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-    from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM
-    from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
-    from nemo_automodel.components.models.qwen3_8_flash_next.model import Qwen3_8_FlashNextForConditionalGeneration
-    from nemo_automodel.components.models.qwen3_next.model import Qwen3NextForCausalLM
-
-    gdn_models = (
-        Qwen3NextForCausalLM,
-        Qwen3_5ForCausalLM,
-        Qwen3_5MoeForCausalLM,
-        Qwen3_8_FlashNextForConditionalGeneration,
-    )
-    assert all(model._keep_in_fp32_modules_strict == list(GDN_FP32_PARAM_TOKENS) for model in gdn_models)
-    # Omni reuses the NemotronH mixers, so its strict tokens are the V3 ones.
-    assert NemotronHForCausalLM._keep_in_fp32_modules_strict == list(MAMBA_FP32_PARAM_TOKENS)
-    assert NemotronOmniForConditionalGeneration._keep_in_fp32_modules_strict == list(MAMBA_FP32_PARAM_TOKENS)

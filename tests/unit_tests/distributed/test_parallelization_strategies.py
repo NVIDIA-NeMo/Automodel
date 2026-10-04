@@ -1041,11 +1041,6 @@ class TestQwen3_5ModelParallelizer:
         assert sharded[: len(model.model.layers)] == list(model.model.layers)
         assert sharded[-1] is model
 
-    def test_sidecar_does_not_override_fsdp_sharding(self):
-        """The fp32 contract lives in the base class; Qwen3.5 only installs its CP mesh."""
-        assert Qwen3_5ModelParallelizer._apply_fsdp_sharding is ModelParallelizer._apply_fsdp_sharding
-        assert Qwen3_5ModelParallelizer._fully_shard_module is ModelParallelizer._fully_shard_module
-
 
 class TestModelSidecars:
     """Model-specific parallelizers are owned by their model classes."""

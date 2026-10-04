@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the Qwen3.5 dense state-dict adapter (MTP key mapping, GDN gate params pass through)."""
+"""Tests for the Qwen3.5 dense state-dict adapter (identity round trip, MTP key mapping)."""
 
 from __future__ import annotations
 
@@ -32,25 +32,6 @@ class TestAdapter:
             "model.language_model.embed_tokens.weight": torch.zeros(8, 2),
         }
 
-    def test_to_hf_keeps_keys_and_passes_tensors_through(self):
-        sd = self._sample_state_dict()
-        out = self.adapter.to_hf(sd)
-        assert set(out) == set(sd)
-        for key, tensor in sd.items():
-            assert out[key] is tensor
-
-    def test_to_hf_passes_gdn_fp32_params_through(self):
-        sd = {
-            _A_LOG: torch.zeros(4, dtype=torch.bfloat16),
-            _DT_BIAS: torch.ones(4, dtype=torch.bfloat16),
-            _Q_PROJ: torch.zeros(2, 2, dtype=torch.bfloat16),
-        }
-
-        out = self.adapter.to_hf(sd)
-
-        for key, tensor in sd.items():
-            assert out[key] is tensor
-
     def test_to_hf_accepts_kwargs(self):
         # Save callsites pass exclude_key_regex, quantization, device_mesh, etc.
         out = self.adapter.to_hf(
@@ -61,40 +42,12 @@ class TestAdapter:
         )
         assert list(out.keys()) == ["x.linear_attn.A_log"]
 
-    def test_from_hf_keeps_hf_keys(self):
-        hf_sd = {_A_LOG: torch.zeros(4), _DT_BIAS: torch.ones(4), _Q_PROJ: torch.zeros(2, 2)}
-        out = self.adapter.from_hf(hf_sd)
-        assert set(out) == set(hf_sd)
-
-    def test_from_hf_keeps_checkpoint_dtypes(self):
-        hf_sd = {
-            _A_LOG: torch.zeros(4, dtype=torch.bfloat16),
-            _DT_BIAS: torch.ones(4, dtype=torch.bfloat16),
-            _Q_PROJ: torch.zeros(2, 2, dtype=torch.bfloat16),
-        }
-
-        out = self.adapter.from_hf(hf_sd)
-
-        for key, tensor in hf_sd.items():
-            assert out[key] is tensor
-
     def test_round_trip_is_identity(self):
         sd = self._sample_state_dict()
         round_tripped = self.adapter.from_hf(self.adapter.to_hf(sd))
         assert set(round_tripped.keys()) == set(sd.keys())
         for k, v in sd.items():
             assert round_tripped[k] is v
-
-    def test_convert_single_tensor_to_hf(self):
-        t = torch.ones(4)
-        assert self.adapter.convert_single_tensor_to_hf(_A_LOG, t) == [(_A_LOG, t)]
-        assert self.adapter.convert_single_tensor_to_hf(_DT_BIAS, t) == [(_DT_BIAS, t)]
-
-    def test_convert_single_tensor_to_hf_keeps_gdn_param_dtype(self):
-        t = torch.zeros(4, dtype=torch.bfloat16)
-        out = self.adapter.convert_single_tensor_to_hf(_A_LOG, t)
-        assert out == [(_A_LOG, t)]
-        assert out[0][1] is t
 
     def test_convert_single_tensor_passthrough(self):
         t = torch.zeros(2, 2)

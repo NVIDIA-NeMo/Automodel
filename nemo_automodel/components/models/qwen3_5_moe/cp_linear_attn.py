@@ -117,18 +117,6 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
         pin_gdn_params_fp32(self)
 
-    def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
-        """Compute the decay gate ``g = -exp(A_log) * softplus(a + dt_bias)`` in fp32.
-
-        Args:
-            a: Decay-rate pre-activation of shape [batch, sequence, num_v_heads]
-                in the block's compute dtype.
-
-        Returns:
-            Gate of shape [batch, sequence, num_v_heads] in fp32.
-        """
-        return gdn_decay_gate(a, self.A_log, self.dt_bias)
-
     def _forward_no_cp(
         self,
         hidden_states: torch.Tensor,
@@ -260,7 +248,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         value = value.reshape(eff_batch, eff_seq_len, -1, self.head_v_dim)
 
         beta = b.sigmoid()
-        g = self._compute_gate(a)
+        g = gdn_decay_gate(a, self.A_log, self.dt_bias)
 
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -661,7 +649,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
 
         # ---- Gate & beta ----
         beta = b.sigmoid()
-        g = self._compute_gate(a)
+        g = gdn_decay_gate(a, self.A_log, self.dt_bias)
 
         # GVA: repeat q/k heads to match v heads
         if self.num_v_heads // self.num_k_heads > 1:

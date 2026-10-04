@@ -63,7 +63,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import KeepRotaryInvFreqFp32, cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     prepare_gated_delta_packed_metadata,
@@ -329,14 +329,8 @@ def build_qwen3_5_dense_mtp(
     )
 
 
-class Fp32SafeQwen3_5TextRotaryEmbedding(Qwen3_5TextRotaryEmbedding):
-    """Ensure inv_freq stays in float32 across ``.to(dtype)`` calls."""
-
-    def _apply(self, fn: Any, recurse: bool = True):
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
-        result = super()._apply(fn, recurse=recurse)
-        self.register_buffer("inv_freq", inv_freq_fp32.to(device=self.inv_freq.device), persistent=False)
-        return result
+class Fp32SafeQwen3_5TextRotaryEmbedding(KeepRotaryInvFreqFp32, Qwen3_5TextRotaryEmbedding):
+    """Qwen3.5 text rotary whose ``inv_freq`` stays fp32 across ``.to(dtype)`` calls."""
 
 
 def _dense_moe_config(config: Qwen3_5TextConfig, dtype: torch.dtype) -> MoEConfig:

@@ -307,7 +307,7 @@ def test_kda_short_sequences_use_the_configured_chunk_kernel(monkeypatch):
     for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
         monkeypatch.setattr(attn, name, _PassThroughConv())
     monkeypatch.setattr(attn, "o_norm", _PassThroughNorm())
-    monkeypatch.setattr(attn, "_decay_gate", lambda g: g)
+    monkeypatch.setattr(kimi_linear_model, "kda_decay_gate", lambda g, *args, **kwargs: g)
 
     for training in (True, False):
         attn.train(training)

@@ -7,19 +7,13 @@ from __future__ import annotations
 
 import math
 
-import pytest
 import torch
-import torch.nn.functional as F
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextFp32GatedDeltaNet
-from nemo_automodel.components.models.qwen3_next.model import Qwen3NextForCausalLM
-
-GATE_PARAM_KEYS = frozenset({"model.layers.0.linear_attn.A_log", "model.layers.0.linear_attn.dt_bias"})
 
 
-def _tiny_config(layer_types: list[str]) -> Qwen3NextConfig:
+def _tiny_config() -> Qwen3NextConfig:
     return Qwen3NextConfig(
         vocab_size=128,
         hidden_size=32,
@@ -29,7 +23,7 @@ def _tiny_config(layer_types: list[str]) -> Qwen3NextConfig:
         num_experts=4,
         num_experts_per_tok=2,
         decoder_sparse_step=1,
-        num_hidden_layers=len(layer_types),
+        num_hidden_layers=1,
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=8,
@@ -40,102 +34,27 @@ def _tiny_config(layer_types: list[str]) -> Qwen3NextConfig:
         linear_conv_kernel_dim=4,
         max_position_embeddings=16,
         rms_norm_eps=1e-6,
-        layer_types=layer_types,
+        layer_types=["linear_attention"],
     )
-
-
-def _backend() -> BackendConfig:
-    return BackendConfig(
-        attn="sdpa",
-        linear="torch",
-        rms_norm="torch",
-        experts="torch",
-        dispatcher="torch",
-        rope_fusion=False,
-        enable_hf_state_dict_adapter=True,
-    )
-
-
-def _tiny_model() -> Qwen3NextForCausalLM:
-    return Qwen3NextForCausalLM(_tiny_config(["linear_attention", "full_attention"]), backend=_backend())
-
-
-def _gdn(default_dtype: torch.dtype = torch.float32) -> Qwen3NextFp32GatedDeltaNet:
-    cfg = _tiny_config(["linear_attention"])
-    cfg.torch_dtype = default_dtype
-    previous = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(default_dtype)
-        return Qwen3NextFp32GatedDeltaNet(cfg, layer_idx=0)
-    finally:
-        torch.set_default_dtype(previous)
-
-
-def _assert_hf_init_values(a_log: torch.Tensor, dt_bias: torch.Tensor) -> None:
-    assert a_log.dtype == torch.float32
-    assert dt_bias.dtype == torch.float32
-    assert torch.equal(dt_bias, torch.ones_like(dt_bias))
-    assert torch.all(a_log <= math.log(16.0))
-    assert torch.isfinite(a_log).all()
 
 
 def test_constructor_keeps_gate_params_fp32_under_bf16_default_dtype():
-    gdn = _gdn(torch.bfloat16)
+    """The override rebuilds ``A_log`` / ``dt_bias`` fp32 with HF's init values under a bf16 default dtype.
 
-    assert "A_log" in gdn._parameters
-    assert "dt_bias" in gdn._parameters
-    assert set(gdn.state_dict()) >= {"A_log", "dt_bias"}
+    The strict-contract and gate tests cover the model-level behaviour; this is the CPU check
+    of the layer itself (``Qwen3NextForCausalLM`` builds on the current CUDA device).
+    """
+    cfg = _tiny_config()
+    cfg.torch_dtype = torch.bfloat16
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        gdn = Qwen3NextFp32GatedDeltaNet(cfg, layer_idx=0)
+    finally:
+        torch.set_default_dtype(previous)
+
+    assert "A_log" in gdn._parameters and "dt_bias" in gdn._parameters
+    assert gdn.A_log.dtype == torch.float32 and gdn.dt_bias.dtype == torch.float32
     assert gdn.in_proj_qkvz.weight.dtype == torch.bfloat16
-    _assert_hf_init_values(gdn.A_log.detach(), gdn.dt_bias.detach())
-
-
-def test_compute_gate_matches_hf_formula_in_fp32():
-    gdn = _gdn()
-    a = torch.randn(2, 3, gdn.num_v_heads)
-
-    g = gdn._compute_gate(a)
-
-    expected = -gdn.A_log.exp() * F.softplus(a + gdn.dt_bias)
-    assert g.dtype == torch.float32
-    torch.testing.assert_close(g, expected)
-
-
-def test_compute_gate_casts_bf16_input_to_fp32_and_backpropagates():
-    gdn = _gdn()
-    a = torch.randn(2, 3, gdn.num_v_heads).to(torch.bfloat16)
-
-    g = gdn._compute_gate(a)
-    g.sum().backward()
-
-    expected = -gdn.A_log.detach().exp() * F.softplus(a.float() + gdn.dt_bias.detach())
-    assert g.dtype == torch.float32
-    torch.testing.assert_close(g, expected)
-    for param in (gdn.A_log, gdn.dt_bias):
-        assert param.grad is not None
-        assert param.grad.dtype == torch.float32
-        assert torch.isfinite(param.grad).all()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen3NextModel builds on the current CUDA device")
-def test_state_dict_round_trips_to_hf_keys():
-    model = _tiny_model()
-    state_dict = model.state_dict()
-
-    hf_state_dict = model.state_dict_adapter.to_hf(state_dict)
-    native_state_dict = model.state_dict_adapter.from_hf(hf_state_dict)
-
-    assert GATE_PARAM_KEYS <= set(hf_state_dict)
-    assert all(hf_state_dict[key].dtype == torch.float32 for key in GATE_PARAM_KEYS)
-    assert set(native_state_dict) == set(state_dict)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen3NextModel builds on the current CUDA device")
-@pytest.mark.parametrize("key", sorted(GATE_PARAM_KEYS))
-def test_from_hf_upcasts_bf16_gate_params(key):
-    model = _tiny_model()
-    hf_state_dict = model.state_dict_adapter.to_hf(model.state_dict())
-    hf_state_dict[key] = hf_state_dict[key].to(torch.bfloat16)
-
-    native_state_dict = model.state_dict_adapter.from_hf(hf_state_dict)
-
-    assert native_state_dict[key].dtype == torch.float32
+    assert torch.equal(gdn.dt_bias, torch.ones_like(gdn.dt_bias))
+    assert torch.all(gdn.A_log <= math.log(16.0)) and torch.isfinite(gdn.A_log).all()

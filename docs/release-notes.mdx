@@ -18,8 +18,9 @@ description: ""
 - Fixes: with `model.dtype: float32`, the default FSDP2 path (EP=1) and the MoE
   path for `Qwen3_5MoeForCausalLM` previously all-gathered these parameters in
   bf16 (and DeepSeek V4.1 failed with a dtype mismatch); they now compute in fp32
-  on every path. `lm_head_precision: float32` is equivalent to listing `lm_head`
-  in the strict list.
+  on every path. Under `model.dtype: float32`, `lm_head_precision: float32` is
+  equivalent to listing `lm_head` in the strict list (with bf16 storage only
+  `lm_head_precision` applies, for example hy_mt2).
 - Breaking: these models require `model.dtype: float32` (fp32 master weights)
   for FSDP2 training with `param_dtype: bfloat16`; a block whose trainable
   parameters mix storage dtypes is rejected at sharding time with an error

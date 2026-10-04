@@ -45,19 +45,6 @@ def test_adapter_renames_flat_hyperconnection_and_keeps_kda_checkpoint_dtypes():
     assert adapter.to_hf(native).keys() == hf_state.keys()
 
 
-def test_native_state_dict_uses_hf_names_for_fp32_contract_parameters():
-    model = tiny_glm5_next_model()
-    native = model.state_dict()
-    hf_state = model.state_dict_adapter.to_hf(native)
-
-    assert "model.language_model.layers.0.self_attn.A_log" in native
-    assert "model.language_model.layers.0.self_attn.dt_bias" in native
-    assert "model.language_model.layers.0.attn_hc.base" in native
-    assert "model.language_model.layers.0.hc_attn_base" in hf_state
-    assert "model.language_model.layers.0.hc_ffn_scale" in hf_state
-    assert "model.language_model.layers.0.self_attn.A_log" in hf_state
-
-
 def test_quantized_load_plan_matches_sparse_but_not_linear_output_projection():
     model = tiny_glm5_next_model()
     planned = model.state_dict_adapter.to_hf(model.state_dict(), quantization=True, for_checkpoint_load=True)

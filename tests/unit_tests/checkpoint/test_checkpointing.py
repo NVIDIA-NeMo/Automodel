@@ -52,7 +52,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
     SaveConsolidatedMode,
-    _apply_adapter_forced_dtype_mapping,
     _collect_global_tensor_sizes,
     _divide_keys_by_size,
     _ensure_dirs,
@@ -64,6 +63,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _model_has_dtensors,
     _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
+    _pin_strict_fp32_export_dtypes,
     _reinit_non_persistent_buffers,
     _should_write_consolidated_safetensors,
     _summarize_state_dict_key_diff,
@@ -991,22 +991,22 @@ def test_original_dtype_mapping_pins_strict_fp32_keys_without_hf_reference(tmp_p
     assert dtype_mapping == {"backbone.layers.0.mixer.A_log": "F32"}
 
 
-def test_forced_dtype_mapping_uses_native_keys_without_adapter_and_skips_absent_keys():
+def test_pin_strict_fp32_export_dtypes_uses_native_keys_without_adapter_and_skips_absent_keys():
     parts = [_StrictFp32Model(), _StrictFp32Model()]
     # Only the first part's strict tensor is exported (e.g. a PEFT export or another PP stage).
     state_dict = {"layers.0.mixer.A_log": torch.ones(1), "layers.0.mixer.in_proj.weight": torch.ones(1, 1)}
 
-    forced = _apply_adapter_forced_dtype_mapping(parts, state_dict, {"layers.0.mixer.in_proj.weight": "BF16"})
+    forced = _pin_strict_fp32_export_dtypes(parts, state_dict, {"layers.0.mixer.in_proj.weight": "BF16"})
 
     assert forced == {"layers.0.mixer.in_proj.weight": "BF16", "layers.0.mixer.A_log": "F32"}
 
 
-def test_forced_dtype_mapping_is_identity_without_strict_fp32_tokens():
+def test_pin_strict_fp32_export_dtypes_is_identity_without_strict_fp32_tokens():
     model = torch.nn.Linear(1, 1)
     baseline = {"weight": "BF16"}
 
-    assert _apply_adapter_forced_dtype_mapping([model], {"weight": model.weight}, baseline) == baseline
-    assert _apply_adapter_forced_dtype_mapping([], {"weight": model.weight}, baseline) == baseline
+    assert _pin_strict_fp32_export_dtypes([model], {"weight": model.weight}, baseline) == baseline
+    assert _pin_strict_fp32_export_dtypes([], {"weight": model.weight}, baseline) == baseline
 
 
 def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():

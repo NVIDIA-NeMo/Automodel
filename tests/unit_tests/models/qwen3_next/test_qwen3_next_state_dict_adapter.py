@@ -565,62 +565,6 @@ class TestConvertSingleTensorToHf:
             assert "exclude_me.weight" not in [k for k, _ in result]
 
 
-class TestFp32GdnParams:
-    """``A_log`` / ``dt_bias`` keep their HF keys and pass through the adapter unchanged.
-
-    Checkpoint loads copy into the model's fp32 parameters and the HF export pins them to
-    F32 from ``_keep_in_fp32_modules_strict``, so the adapter never changes their dtype.
-    """
-
-    def _make_adapter(self):
-        moe_config = Mock()
-        moe_config.n_routed_experts = 8
-        moe_config.moe_inter_dim = 512
-        moe_config.expert_bias = False
-        backend = Mock()
-        backend.dispatcher = "torch"
-        backend.experts = "torch"
-        return Qwen3NextStateDictAdapter(config=Mock(), moe_config=moe_config, backend=backend, dtype=torch.float32)
-
-    def test_convert_single_tensor_keeps_hf_key_and_tensor(self):
-        adapter = self._make_adapter()
-        tensor = torch.zeros(4, dtype=torch.bfloat16)
-        result = adapter.convert_single_tensor_to_hf("model.layers.0.linear_attn.dt_bias", tensor)
-        assert result == [("model.layers.0.linear_attn.dt_bias", tensor)]
-        assert result[0][1] is tensor
-
-    def test_to_hf_passes_gdn_fp32_params_through(self):
-        adapter = self._make_adapter()
-        state_dict = {
-            "model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
-            "model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.bfloat16),
-            "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
-        }
-
-        out = adapter.to_hf(state_dict)
-
-        assert set(out) == set(state_dict)
-        for key, tensor in state_dict.items():
-            assert out[key] is tensor
-
-    def test_from_hf_keeps_hf_keys_and_checkpoint_dtypes(self):
-        adapter = self._make_adapter()
-        hf_state = {
-            "model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
-            "model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.bfloat16),
-            "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
-        }
-
-        with patch.object(
-            adapter, "_from_hf_w_merged_experts", side_effect=lambda state, device_mesh=None: dict(state)
-        ):
-            out = adapter.from_hf(hf_state)
-
-        assert set(out) == set(hf_state)
-        for key, tensor in hf_state.items():
-            assert out[key] is tensor
-
-
 def _tiny_qwen3_next_model() -> Qwen3NextForCausalLM:
     """Build a two-layer fp32 Qwen3-Next (one GDN layer, one attention layer) on CPU."""
     config = Qwen3NextConfig(

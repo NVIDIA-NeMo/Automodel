@@ -102,32 +102,16 @@ class Glm5NextHyperConnection(nn.Module):
         self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build Sinkhorn mixing weights and collapse streams for one sublayer."""
-        hc = self.hc_mult
-        flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
-        pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
-        pre, post, comb = self._mixing_weights(pre_w, post_w, comb_w)
-        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
-        return post, comb, collapsed
-
-    def _mixing_weights(
-        self,
-        pre_w: torch.Tensor,
-        post_w: torch.Tensor,
-        comb_w: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build the fp32 pre/post/comb mHC weights from the projected logits.
-
-        Args:
-            pre_w: Pre-mixing logits, ``[..., hc_mult]``.
-            post_w: Post-mixing logits, ``[..., hc_mult]``.
-            comb_w: Combination logits, ``[..., hc_mult * hc_mult]``.
+        """Build the fp32 Sinkhorn mixing weights and collapse the streams for one sublayer.
 
         Returns:
-            fp32 ``(pre, post, comb)`` weights after the base/scale affine map and
-            sigmoid / softmax / Sinkhorn normalization.
+            ``(post, comb, collapsed)``: the fp32 post-mixing and combination weights after
+            the base/scale affine map and sigmoid / softmax / Sinkhorn normalization, and
+            the pre-mixed stream in the input dtype.
         """
         hc, eps = self.hc_mult, self.hc_eps
+        flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+        pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
         pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
         pre_scale, post_scale, comb_scale = self.scale.unbind(0)
         pre = torch.sigmoid(pre_w.float() * pre_scale + pre_b) + eps
@@ -138,7 +122,8 @@ class Glm5NextHyperConnection(nn.Module):
         for _ in range(self.hc_sinkhorn_iters - 1):
             comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
             comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-        return pre, post, comb
+        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+        return post, comb, collapsed
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:
@@ -326,7 +311,14 @@ class Glm5NextLinearAttention(nn.Module):
         shape = (*hidden_states.shape[:-1], self.num_heads, self.head_dim)
         q, k, v = q.view(shape).contiguous(), k.view(shape).contiguous(), v.view(shape).contiguous()
         gate = self.f_b_proj(self.f_a_proj(hidden_states)).contiguous()
-        gate = self._decay_gate(gate).contiguous()
+        gate = kda_decay_gate(
+            gate.reshape(*gate.shape[:-1], -1, self.head_dim),
+            self.A_log,
+            self.dt_bias,
+            head_dim=self.head_dim,
+            lower_bound=self.config.linear_lower_bound,
+            use_fused=HAVE_FUSED_KDA_GATE and gate.is_cuda,
+        ).contiguous()
         beta = self.b_proj(hidden_states).float().sigmoid().contiguous()
         if _CHUNK_KDA_OK and hidden_states.is_cuda:
             # The chunk kernel runs at every sequence length: FLA's fused_recurrent_kda
@@ -355,18 +347,6 @@ class Glm5NextLinearAttention(nn.Module):
         final_gate = self.g_b_proj(self.g_a_proj(hidden_states)).view(shape)
         output = self.o_norm(output, final_gate).reshape(*hidden_states.shape[:-1], -1).contiguous()
         return self.o_proj(output)
-
-    def _decay_gate(self, gate: torch.Tensor) -> torch.Tensor:
-        """Return fp32 log-decay gates ``[batch, sequence, heads, head_dim]``."""
-        gate = gate.reshape(*gate.shape[:-1], -1, self.head_dim)
-        return kda_decay_gate(
-            gate,
-            self.A_log,
-            self.dt_bias,
-            head_dim=self.head_dim,
-            lower_bound=self.config.linear_lower_bound,
-            use_fused=HAVE_FUSED_KDA_GATE and gate.is_cuda,
-        )
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:

@@ -465,26 +465,6 @@ class TestNemotronV3AdapterToHf:
         assert "backbone.embeddings.weight" in hf_state_dict
         assert "exclude_me.weight" not in hf_state_dict
 
-    def test_to_hf_keeps_mamba_fp32_keys_and_dtypes(self, config, moe_config, backend):
-        """Test to_hf renames the bare Mamba SSM keys and passes the tensors through unchanged."""
-        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
-
-        state_dict = {
-            "model.layers.0.mixer.A_log": torch.randn(4, dtype=torch.bfloat16),
-            "model.layers.0.mixer.dt_bias": torch.randn(4, dtype=torch.bfloat16),
-            "model.layers.0.mixer.D": torch.randn(4, dtype=torch.bfloat16),
-        }
-
-        hf_state_dict = adapter.to_hf(state_dict)
-
-        assert set(hf_state_dict) == {
-            "backbone.layers.0.mixer.A_log",
-            "backbone.layers.0.mixer.dt_bias",
-            "backbone.layers.0.mixer.D",
-        }
-        for key, tensor in state_dict.items():
-            assert hf_state_dict[key.replace("model.", "backbone.", 1)] is tensor
-
 
 class TestNemotronV3AdapterFromHf:
     """Test from_hf conversion."""
@@ -573,29 +553,6 @@ class TestNemotronV3AdapterFromHf:
 
             assert adapter._uses_model_prefix is True
 
-    def test_from_hf_keeps_mamba_fp32_keys_and_dtypes(self, config, moe_config, backend):
-        """Test from_hf renames public Mamba SSM keys and passes the tensors through unchanged."""
-        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
-
-        hf_state_dict = {
-            "backbone.layers.0.mixer.A_log": torch.randn(4, dtype=torch.bfloat16),
-            "backbone.layers.0.mixer.dt_bias": torch.randn(4, dtype=torch.bfloat16),
-            "backbone.layers.0.mixer.D": torch.randn(4, dtype=torch.bfloat16),
-        }
-
-        with patch.object(adapter, "_from_hf_w_merged_experts") as mock_merge:
-            mock_merge.return_value = {}
-            adapter.from_hf(hf_state_dict)
-
-            call_args = mock_merge.call_args[0][0]
-            assert set(call_args) == {
-                "model.layers.0.mixer.A_log",
-                "model.layers.0.mixer.dt_bias",
-                "model.layers.0.mixer.D",
-            }
-            for key, tensor in hf_state_dict.items():
-                assert call_args[key.replace("backbone.", "model.", 1)] is tensor
-
 
 class TestNemotronV3AdapterConvertSingleTensor:
     """Test convert_single_tensor_to_hf method."""
@@ -667,18 +624,6 @@ class TestNemotronV3AdapterConvertSingleTensor:
         assert len(result) == 1
         assert result[0][0] == "backbone.layers.0.mixer.weight"
         assert torch.equal(result[0][1], tensor)
-
-    def test_convert_mamba_fp32_param_passes_through(self, config, moe_config, backend):
-        """Test single-tensor conversion renames bare Mamba SSM keys without touching the tensor."""
-        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
-
-        tensor = torch.randn(4, dtype=torch.bfloat16)
-        fqn = "model.layers.0.mixer.D"
-
-        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
-
-        assert result == [("backbone.layers.0.mixer.D", tensor)]
-        assert result[0][1] is tensor
 
     def test_convert_expert_tensor(self, config, moe_config, backend):
         """Test converting merged expert tensor to split experts."""

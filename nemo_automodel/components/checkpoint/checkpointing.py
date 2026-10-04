@@ -92,6 +92,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.components.models.common.utils import _get_strict_fp32_module_keywords
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
@@ -291,19 +292,7 @@ def _normalize_dtype_mapping_to_state_dict_keys(
     return normalized
 
 
-def _strict_fp32_tokens(model: nn.Module) -> list[str]:
-    """Return the de-duplicated ``_keep_in_fp32_modules_strict`` tokens of ``model``.
-
-    HuggingFace's ``PreTrainedModel.__init__`` turns the class-level list into an
-    instance-level set, so both containers are accepted.
-    """
-    tokens = getattr(model, "_keep_in_fp32_modules_strict", None)
-    if not isinstance(tokens, (list, tuple, set)):
-        return []
-    return list(dict.fromkeys(tokens))
-
-
-def _apply_adapter_forced_dtype_mapping(
+def _pin_strict_fp32_export_dtypes(
     model_parts: list[nn.Module],
     state_dict: dict[str, torch.Tensor],
     fqn_to_dtype_mapping: dict[str, str],
@@ -329,7 +318,7 @@ def _apply_adapter_forced_dtype_mapping(
     model_parts = [_unwrap_ddp_model(part) for part in model_parts]
     if not model_parts:
         return fqn_to_dtype_mapping
-    tokens = _strict_fp32_tokens(model_parts[0])
+    tokens = _get_strict_fp32_module_keywords(model_parts[0])
     if not tokens:
         return fqn_to_dtype_mapping
 
@@ -2224,7 +2213,7 @@ fi
                 normalized_dtype_mapping = _normalize_dtype_mapping_to_state_dict_keys(
                     dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
                 )
-        normalized_dtype_mapping = _apply_adapter_forced_dtype_mapping(
+        normalized_dtype_mapping = _pin_strict_fp32_export_dtypes(
             model_state.model, state_dict, normalized_dtype_mapping
         )
         return normalized_dtype_mapping or None

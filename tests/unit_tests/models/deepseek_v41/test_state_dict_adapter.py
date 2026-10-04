@@ -32,7 +32,7 @@ from transformers import PreTrainedModel
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
-    _apply_adapter_forced_dtype_mapping,
+    _pin_strict_fp32_export_dtypes,
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
@@ -599,7 +599,7 @@ def test_bf16_export_pins_only_strict_fp32_parameters() -> None:
     assert all(value.dtype is torch.float32 for value in native.values() if value.is_floating_point())
     exported = model.state_dict_adapter.to_hf(native)
 
-    forced = _apply_adapter_forced_dtype_mapping([model], exported, {"embed.weight": "BF16"})
+    forced = _pin_strict_fp32_export_dtypes([model], exported, {"embed.weight": "BF16"})
 
     strict_tokens = model._keep_in_fp32_modules_strict
     expected = {key for key in exported if any(token in _native_key(key) for token in strict_tokens)}

@@ -242,9 +242,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         # FSDP keeps them fp32 through ``_keep_in_fp32_modules_strict``.
         self.dt_bias = nn.Parameter(torch.ones(self.num_heads, dtype=torch.float32))
         self.A_log = nn.Parameter(torch.log(torch.arange(1, self.num_heads + 1, dtype=torch.float32)))
-        self.A_log._no_weight_decay = True
         self.D = nn.Parameter(torch.ones(self.num_heads, dtype=torch.float32))
-        self.D._no_weight_decay = True
 
         # Gated RMSNorm
         self.norm = NemotronV3MambaRMSNormGated(

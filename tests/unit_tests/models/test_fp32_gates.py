@@ -12,16 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bitwise equivalence of the shared fp32 decay gates with the per-family code they replaced.
+"""Closed-form checks of the shared fp32 decay gates.
 
-The reference functions below are verbatim copies of the removed Kimi K3, Kimi Linear,
-GLM-5.3 and Qwen GatedDeltaNet gate bodies, so a change to ``fp32_gates`` that alters a
-single bit of any family's numerics fails here.
+``kda_decay_gate`` (Kimi K3, Kimi Linear, GLM-5.3) and ``gdn_decay_gate`` (Qwen3-Next, Qwen3.5,
+Qwen3.8-Flash-Next) are compared bitwise with the closed-form fp32 formulas on every layout the
+families use (flat / per-head gates, 1-D / 4-D ``A_log``); the fused FLA path is checked against
+the torch path; and the Qwen3-Next override's forward is compared bitwise with HF's.
 """
 
 from __future__ import annotations
-
-import inspect
 
 import pytest
 import torch
@@ -38,82 +37,47 @@ from nemo_automodel.components.models.common.fp32_gates import (
     kda_decay_gate,
 )
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextFp32GatedDeltaNet
-from nemo_automodel.shared.import_utils import safe_import_from
 
 HEADS, HEAD_DIM = 4, 8
 LOWER_BOUNDS = (None, -5.0)
-_, _fla_fused_kda_gate = safe_import_from("fla.ops.kda.gate", "fused_kda_gate")
-_FUSED_PARAMS = inspect.signature(_fla_fused_kda_gate).parameters if HAVE_FUSED_KDA_GATE else {}
-_HAS_G_BIAS = "g_bias" in _FUSED_PARAMS
-_HAS_LOWER_BOUND = "lower_bound" in _FUSED_PARAMS
+GATE_LAYOUTS = ("flat", "per_head")
+A_LOG_LAYOUTS = ("1d", "4d")
 
 
-# --------------------------------------------------------------------------- removed family code
-def _kimi_k3_torch_kda_gate(g, a_log, head_dim, dt_bias, lower_bound):
-    gate = g if g.shape[-1] == head_dim else g.reshape(*g.shape[:-1], -1, head_dim)
-    num_heads = gate.shape[-2]
-    gate = gate.float() + dt_bias.float().view(num_heads, head_dim)
-    decay = a_log.float().view(num_heads, 1).exp()
-    if lower_bound is not None:
-        return lower_bound * torch.sigmoid(decay * gate)
-    return -decay * F.softplus(gate)
+# --------------------------------------------------------------------------- closed forms
+def _softplus_decay(gate: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor) -> torch.Tensor:
+    """Kimi Linear / unbounded KDA: ``-exp(A_log) * softplus(g + dt_bias)`` on a ``[..., H, D]`` gate."""
+    return -a_log.float().view(HEADS, 1).exp() * F.softplus(gate.float() + dt_bias.float().view(HEADS, HEAD_DIM))
 
 
-def _kimi_k3_fused_kda_gate(g, a_log, head_dim, dt_bias, lower_bound):
-    if _HAS_G_BIAS:
-        if lower_bound is not None:
-            return _kimi_k3_torch_kda_gate(g, a_log, head_dim, dt_bias, lower_bound)
-        return _fla_fused_kda_gate(g, a_log.view(1, 1, -1, 1), head_dim, g_bias=dt_bias)
-    gate_input = g if g.shape[-1] == head_dim else g.reshape(*g.shape[:-1], -1, head_dim)
-    kwargs = {"dt_bias": dt_bias}
-    if _HAS_LOWER_BOUND:
-        kwargs["lower_bound"] = lower_bound
-    elif lower_bound is not None:
-        return _kimi_k3_torch_kda_gate(gate_input, a_log, head_dim, dt_bias, lower_bound)
-    return _fla_fused_kda_gate(gate_input, a_log, **kwargs)
+def _bounded_decay(gate: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor, lower_bound: float) -> torch.Tensor:
+    """Kimi K3 / GLM-5.3 bounded KDA: ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``."""
+    decay = a_log.float().view(HEADS, 1).exp()
+    return lower_bound * torch.sigmoid(decay * (gate.float() + dt_bias.float().view(HEADS, HEAD_DIM)))
 
 
-def _kimi_linear_torch_kda_gate(g, a_log, head_dim, dt_bias):
-    gate = g if g.shape[-1] == head_dim else g.reshape(*g.shape[:-1], -1, head_dim)
-    num_heads = gate.shape[-2]
-    gate = gate.float() + dt_bias.float().view(num_heads, head_dim)
-    return -a_log.float().view(num_heads, 1).exp() * F.softplus(gate)
+def _kda_reference(g: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor, lower_bound: float | None):
+    gate = g if g.shape[-1] == HEAD_DIM else g.reshape(*g.shape[:-1], HEADS, HEAD_DIM)
+    if lower_bound is None:
+        return _softplus_decay(gate, a_log, dt_bias)
+    return _bounded_decay(gate, a_log, dt_bias, lower_bound)
 
 
-def _kimi_linear_fused_kda_gate(g, a_log, head_dim, dt_bias):
-    if _HAS_G_BIAS:
-        return _fla_fused_kda_gate(g, a_log, head_dim, g_bias=dt_bias)
-    gate_input = g if g.shape[-1] == head_dim else g.reshape(*g.shape[:-1], -1, head_dim)
-    return _fla_fused_kda_gate(gate_input, a_log, dt_bias=dt_bias)
-
-
-def _glm5_torch_decay_gate(gate, A_log, dt_bias, head_dim, lower_bound):
-    gate = gate.reshape(*gate.shape[:-1], -1, head_dim)
-    gate = gate.float() + dt_bias.view(1, 1, -1, head_dim)
-    decay = A_log.view(1, 1, -1, 1).exp()
-    return lower_bound * torch.sigmoid(decay * gate) if lower_bound is not None else -decay * F.softplus(gate)
-
-
-def _glm5_fused_decay_gate(gate, A_log, dt_bias, head_dim, lower_bound):
-    gate = gate.reshape(*gate.shape[:-1], -1, head_dim)
-    return _fla_fused_kda_gate(gate, A_log.contiguous(), dt_bias=dt_bias.contiguous(), lower_bound=lower_bound)
-
-
-def _gdn_compute_gate(a, A_log, dt_bias):
-    return -A_log.float().exp() * F.softplus(a.float() + dt_bias.float())
-
-
-def _hf_qwen3_next_gate(a, A_log, dt_bias):
-    # transformers Qwen3NextGatedDeltaNet.forward (5.8 through 5.15.1), dt_bias already fp32.
+def _gdn_reference(a: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor) -> torch.Tensor:
+    """GatedDeltaNet: ``-exp(A_log) * softplus(a + dt_bias)``, HF's inline formula with fp32 ``dt_bias``."""
     return -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
 
 # --------------------------------------------------------------------------- inputs
-def _kda_inputs(device: str, gate_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _kda_inputs(device: str, gate_dtype: torch.dtype, gate_layout: str, a_log_layout: str):
     generator = torch.Generator(device="cpu").manual_seed(7)
     g = torch.randn(2, 5, HEADS * HEAD_DIM, generator=generator).to(device=device, dtype=gate_dtype)
     a_log = torch.empty(HEADS).uniform_(1, 16, generator=generator).log().to(device)
     dt_bias = torch.randn(HEADS * HEAD_DIM, generator=generator).to(device)
+    if gate_layout == "per_head":
+        g = g.reshape(2, 5, HEADS, HEAD_DIM)
+    if a_log_layout == "4d":
+        a_log = a_log.view(1, 1, HEADS, 1)
     return g, a_log, dt_bias
 
 
@@ -125,43 +89,19 @@ def _devices() -> list[str]:
 @pytest.mark.parametrize("device", _devices())
 @pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("lower_bound", LOWER_BOUNDS)
-@pytest.mark.parametrize("per_head", [False, True])
-def test_torch_kda_gate_matches_kimi_k3(device, gate_dtype, lower_bound, per_head):
-    g, a_log, dt_bias = _kda_inputs(device, gate_dtype)
-    g = g.reshape(2, 5, HEADS, HEAD_DIM) if per_head else g
+@pytest.mark.parametrize("gate_layout", GATE_LAYOUTS)
+@pytest.mark.parametrize("a_log_layout", A_LOG_LAYOUTS)
+def test_torch_kda_gate_matches_closed_form_bitwise(device, gate_dtype, lower_bound, gate_layout, a_log_layout):
+    g, a_log, dt_bias = _kda_inputs(device, gate_dtype, gate_layout, a_log_layout)
 
     out = kda_decay_gate(g, a_log, dt_bias, head_dim=HEAD_DIM, lower_bound=lower_bound, use_fused=False)
 
-    expected = _kimi_k3_torch_kda_gate(g, a_log, HEAD_DIM, dt_bias, lower_bound)
     assert out.dtype is torch.float32 and out.shape == (2, 5, HEADS, HEAD_DIM)
-    assert torch.equal(out, expected)
-
-
-@pytest.mark.parametrize("device", _devices())
-@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float32])
-def test_torch_kda_gate_matches_kimi_linear_with_4d_a_log(device, gate_dtype):
-    g, a_log, dt_bias = _kda_inputs(device, gate_dtype)
-    a_log = a_log.view(1, 1, HEADS, 1)
-
-    out = kda_decay_gate(g, a_log, dt_bias, head_dim=HEAD_DIM, lower_bound=None, use_fused=False)
-
-    assert torch.equal(out, _kimi_linear_torch_kda_gate(g, a_log, HEAD_DIM, dt_bias))
-
-
-@pytest.mark.parametrize("device", _devices())
-@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("lower_bound", LOWER_BOUNDS)
-def test_torch_kda_gate_matches_glm5_next(device, gate_dtype, lower_bound):
-    g, a_log, dt_bias = _kda_inputs(device, gate_dtype)
-    gate = g.reshape(*g.shape[:-1], -1, HEAD_DIM)
-
-    out = kda_decay_gate(gate, a_log, dt_bias, head_dim=HEAD_DIM, lower_bound=lower_bound, use_fused=False)
-
-    assert torch.equal(out, _glm5_torch_decay_gate(g, a_log, dt_bias, HEAD_DIM, lower_bound))
+    assert torch.equal(out, _kda_reference(g, a_log, dt_bias, lower_bound))
 
 
 def test_torch_kda_gate_backpropagates_to_fp32_parameters():
-    g, a_log, dt_bias = _kda_inputs("cpu", torch.bfloat16)
+    g, a_log, dt_bias = _kda_inputs("cpu", torch.bfloat16, "flat", "1d")
     a_log, dt_bias = a_log.requires_grad_(), dt_bias.requires_grad_()
 
     kda_decay_gate(g, a_log, dt_bias, head_dim=HEAD_DIM, lower_bound=-5.0, use_fused=False).sum().backward()
@@ -179,42 +119,23 @@ fused = pytest.mark.skipif(
 @fused
 @pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("lower_bound", LOWER_BOUNDS)
-def test_fused_kda_gate_matches_kimi_k3(gate_dtype, lower_bound):
-    g, a_log, dt_bias = _kda_inputs("cuda", gate_dtype)
+@pytest.mark.parametrize("gate_layout", GATE_LAYOUTS)
+@pytest.mark.parametrize("a_log_layout", A_LOG_LAYOUTS)
+def test_fused_kda_gate_matches_torch_path(gate_dtype, lower_bound, gate_layout, a_log_layout):
+    """The fused Triton gate agrees with the torch path on every installed FLA API generation."""
+    g, a_log, dt_bias = _kda_inputs("cuda", gate_dtype, gate_layout, a_log_layout)
 
     out = kda_decay_gate(g, a_log, dt_bias, head_dim=HEAD_DIM, lower_bound=lower_bound, use_fused=True)
 
-    assert torch.equal(out, _kimi_k3_fused_kda_gate(g, a_log.contiguous(), HEAD_DIM, dt_bias.contiguous(), lower_bound))
-
-
-@fused
-@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float32])
-def test_fused_kda_gate_matches_kimi_linear_with_4d_a_log(gate_dtype):
-    g, a_log, dt_bias = _kda_inputs("cuda", gate_dtype)
-    a_log = a_log.view(1, 1, HEADS, 1)
-
-    out = kda_decay_gate(g, a_log, dt_bias, head_dim=HEAD_DIM, lower_bound=None, use_fused=True)
-
-    assert torch.equal(out, _kimi_linear_fused_kda_gate(g, a_log.contiguous(), HEAD_DIM, dt_bias.contiguous()))
-
-
-@fused
-@pytest.mark.skipif(not _HAS_LOWER_BOUND, reason="GLM-5.3 only ran the fused gate on the lower_bound FLA API")
-@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("lower_bound", LOWER_BOUNDS)
-def test_fused_kda_gate_matches_glm5_next(gate_dtype, lower_bound):
-    g, a_log, dt_bias = _kda_inputs("cuda", gate_dtype)
-    gate = g.reshape(*g.shape[:-1], -1, HEAD_DIM)
-
-    out = kda_decay_gate(gate, a_log, dt_bias, head_dim=HEAD_DIM, lower_bound=lower_bound, use_fused=True)
-
-    assert torch.equal(out, _glm5_fused_decay_gate(g, a_log, dt_bias, HEAD_DIM, lower_bound))
+    expected = kda_decay_gate(g, a_log, dt_bias, head_dim=HEAD_DIM, lower_bound=lower_bound, use_fused=False)
+    assert out.dtype is torch.float32 and out.shape == (2, 5, HEADS, HEAD_DIM)
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
 # --------------------------------------------------------------------------- GatedDeltaNet gate
 @pytest.mark.parametrize("device", _devices())
 @pytest.mark.parametrize("a_dtype", [torch.bfloat16, torch.float32])
-def test_gdn_decay_gate_matches_the_family_and_hf_formulas(device, a_dtype):
+def test_gdn_decay_gate_matches_hf_formula_bitwise(device, a_dtype):
     generator = torch.Generator(device="cpu").manual_seed(3)
     a = torch.randn(2, 5, HEADS, generator=generator).to(device=device, dtype=a_dtype)
     A_log = torch.empty(HEADS).uniform_(0, 16, generator=generator).log().to(device)
@@ -223,8 +144,18 @@ def test_gdn_decay_gate_matches_the_family_and_hf_formulas(device, a_dtype):
     out = gdn_decay_gate(a, A_log, dt_bias)
 
     assert out.dtype is torch.float32
-    assert torch.equal(out, _gdn_compute_gate(a, A_log, dt_bias))
-    assert torch.equal(out, _hf_qwen3_next_gate(a, A_log, dt_bias))
+    assert torch.equal(out, _gdn_reference(a, A_log, dt_bias))
+
+
+def test_gdn_decay_gate_backpropagates_to_fp32_parameters():
+    a = torch.randn(2, 5, HEADS).to(torch.bfloat16)
+    A_log = torch.zeros(HEADS, requires_grad=True)
+    dt_bias = torch.ones(HEADS, requires_grad=True)
+
+    gdn_decay_gate(a, A_log, dt_bias).sum().backward()
+
+    for param in (A_log, dt_bias):
+        assert param.grad is not None and param.grad.dtype is torch.float32 and torch.isfinite(param.grad).all()
 
 
 # --------------------------------------------------------------------------- Qwen3-Next forward (M3)

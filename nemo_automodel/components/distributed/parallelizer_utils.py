@@ -32,6 +32,7 @@ from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 _HAS_PARAM_DTYPE_OVERRIDE = "param_dtype_override_fn" in {field.name for field in fields(MixedPrecisionPolicy)}
 
 __all__ = [
+    "configure_fsdp_unused_param_reduction",
     "fsdp_unit_named_parameters",
     "get_internal_fsdp_mp_policy",
     "with_fp32_compute_override",

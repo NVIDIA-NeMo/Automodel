@@ -108,13 +108,17 @@ mixed-precision, prefetch, CP, EP, and root-wrapping behavior.
 - Override `_fully_shard_module(module, **kwargs)` when the model needs a
   different FSDP2 primitive or must adjust a module immediately before it is
   sharded. The shared traversal uses this hook for decoder layers, standalone
-  embeddings, the output head, and the root model. Set the protected
-  `_customizes_moe_fsdp = True` capability only when that primitive is also
-  required and safe after the unified MoE path establishes EP ownership.
+  embeddings, the output head, and the root model. The base implementation
+  applies the model's fp32 compute contract (`_keep_in_fp32_modules_strict`)
+  to the unit's mixed-precision policy through `_fsdp_unit_mp_policy`, so an
+  override calls `super()._fully_shard_module(...)` (or `_fsdp_unit_mp_policy`)
+  to keep that contract. The contract is resolved once per model by
+  `_bind_model(model)`: `parallelize()` binds automatically, and code that
+  shards outside `_apply` (for example a recipe wrapping a separately built
+  draft) wraps its sharding in `with parallelizer._bind_model(model):`.
 - Override `_apply_fsdp_sharding(...)` when the model needs different FSDP unit
-  boundaries, such as dtype-uniform groups. Continue to use
-  `self._fully_shard_module` (or helpers that accept the parallelizer) so custom
-  wrapping remains consistent at every level.
+  boundaries. Continue to use `self._fully_shard_module` (or helpers that
+  accept the parallelizer) so custom wrapping remains consistent at every level.
 - Override `_validate_tp_mesh(model, tp_mesh)` when the model exposes
   heterogeneous per-layer attention shapes that cannot be validated through a
   single global head count.
