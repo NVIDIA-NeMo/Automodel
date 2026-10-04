@@ -311,7 +311,7 @@ def _precompute_stage_shapes(
     microbatch_size: int,
     seq_len: int,
     tensor_dtype: torch.dtype | None = None,
-) -> None:
+) -> int:
     """Precompute input/output meta tensors for each pipeline stage to bypass serial shape inference.
 
     By default, PipelineStage performs shape inference at runtime via a serial P2P chain:
@@ -327,15 +327,21 @@ def _precompute_stage_shapes(
         model_config: The HuggingFace model config (``model.config``).
         microbatch_size: Microbatch size used by the pipeline schedule.
         seq_len: Sequence length of the input data.
+
+    Returns:
+        Maximum local token count across stage outputs for runtime initialization.
+        The primary output has layout [batch, local_sequence, ...]; trailing
+        feature or hyper-connection dimensions do not multiply the token count.
     """
     if stages and not all(
         callable(getattr(stage, "_configure_outputs_meta", None)) or getattr(stage, "_user_meta", None) is not None
         for stage in stages
     ):
         logger.info("PipelineStage does not expose a supported static metadata API; using dynamic metadata inference")
-        return
+        return microbatch_size * seq_len
 
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
+    local_token_counts = []
 
     for stage in stages:
         if tensor_dtype is None:
@@ -355,6 +361,7 @@ def _precompute_stage_shapes(
                 dtype=model_dtype,
             )
             _set_stage_metas(stage, inputs_meta, outputs_meta)
+            local_token_counts.append(outputs_meta[0].shape[0] * outputs_meta[0].shape[1])
             continue
 
         # --- inputs_meta ---
@@ -374,11 +381,13 @@ def _precompute_stage_shapes(
             primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
         outputs_meta = (primary_output_meta,)
         _set_stage_metas(stage, inputs_meta, outputs_meta)
+        local_token_counts.append(microbatch_size * seq_len)
 
     logger.info(
         f"Precomputed pipeline stage shapes (seq_len={seq_len}, microbatch_size={microbatch_size}) — "
         f"serial shape inference bypassed"
     )
+    return max(local_token_counts, default=microbatch_size * seq_len)
 
 
 def _warmup_pipeline_stage_neighbors(stage: PipelineStage) -> None:
@@ -493,7 +502,7 @@ def reset_pp_stage_shapes(
     microbatch_size: int,
     seq_len: int,
     tensor_dtype: torch.dtype | None = None,
-) -> None:
+) -> int:
     """Reset pipeline stage infrastructure and recompute shapes for a new sequence length.
 
     VLM training produces batches with highly variable sequence lengths (image tokens expand
@@ -512,6 +521,9 @@ def reset_pp_stage_shapes(
         model_config: The HuggingFace model config (``model.config``).
         microbatch_size: Per-microbatch batch size used by the schedule.
         seq_len: Sequence length of the upcoming batch (e.g. ``input_ids.shape[1]``).
+
+    Returns:
+        Maximum local token count across the recomputed stage outputs.
     """
     for stage in stages:
         # PyTorch <= 2.10 stores static metadata in these fields.
@@ -539,7 +551,9 @@ def reset_pp_stage_shapes(
         stage.grad_send_info = None
 
     # Analytically set shapes for the new seq_len (no forward pass)
-    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
+    local_num_tokens = _precompute_stage_shapes(
+        stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype
+    )
 
     # Trigger _initialize_stage(s) on the next step() call.
     # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.
@@ -549,6 +563,7 @@ def reset_pp_stage_shapes(
     if hasattr(schedule, "_stages_forward_initialized"):
         schedule._stages_forward_initialized = False
         schedule._stages_backward_initialized = False
+    return local_num_tokens
 
 
 def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
