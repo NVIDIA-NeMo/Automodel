@@ -1,23 +1,28 @@
-# HunyuanImage-3.0 (80B total / 13B active MoE) text-to-image LoRA fine-tuning.
+# HunyuanImage-3.0 (80B total / 13B active MoE) text-to-image full fine-tuning.
 #
-# Single node, 8 GPUs: experts are sharded 8 ways (ep_size: 8), everything else with FSDP2.
+# Four nodes, 8 GPUs each: experts are sharded 8 ways (ep_size: 8) and FSDP2 shards the rest across all ranks.
+# With fp32 master weights (TE FusedAdam) training keeps about 14 bytes per parameter, roughly 1.1 TB for the
+# model, so a single node cannot hold it.
 #
 # 1. Preprocess images and captions (latents from the release VAE, prompt tokens from the release tokenizer,
 #    images snapped to the release's 33 resolutions around 1024x1024):
 #      uv run python tools/diffusion/preprocessing_multiprocess.py image \
 #        --image_dir PATH_TO_IMAGES --output_dir PATH_TO_YOUR_DATA \
 #        --processor hunyuan_image3 --model_name tencent/HunyuanImage-3.0 --resolution_preset 1024p
-# 2. Train:
-#      uv run torchrun --nproc-per-node 8 examples/diffusion/finetune/finetune.py \
-#        -c examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml
+# 2. Train, the same command on every node with its own --node-rank:
+#      uv run torchrun --nnodes 4 --node-rank NODE_RANK --nproc-per-node 8 \
+#        --master-addr MASTER_ADDR --master-port 29500 \
+#        examples/diffusion/finetune/finetune.py -c examples/diffusion/finetune/hunyuan_image3_t2i_flow.yaml
+# 3. Generate from a checkpoint step: examples/diffusion/generate/configs/generate_hunyuan_image3.yaml with
+#    model.checkpoint set to the step directory.
 
 seed: 42
 
 wandb:
   enable: false
-  project: hunyuan-image3-lora-finetuning
+  project: hunyuan-image3-finetuning
   mode: online
-  name: hunyuan_image3_lora
+  name: hunyuan_image3_finetune
 
 dist_env:
   backend: "nccl"
@@ -40,20 +45,9 @@ model:
     gate_precision: float32
     enable_hf_state_dict_adapter: true
 
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  dim: 64
-  alpha: 64
-  dropout: 0.0
-  target_modules:
-    - "*.self_attn.qkv_proj"
-    - "*.self_attn.o_proj"
-    - "*.mlp.shared_experts.gate_and_up_proj"
-    - "*.mlp.shared_experts.down_proj"
-
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
-  lr: 1e-4
+  lr: 1e-5
   weight_decay: 0.01
   betas: [0.9, 0.999]
   # bf16 params + 16-bit remainders give fp32-precision master weights.
@@ -67,7 +61,7 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   lr_warmup_steps: 20
-  min_lr: 1e-6
+  min_lr: 1e-7
 
 fsdp:
   tp_size: 1
@@ -97,8 +91,8 @@ flow_matching:
 step_scheduler:
   num_epochs: 10
   local_batch_size: 1
-  global_batch_size: 8
-  ckpt_every_steps: 200
+  global_batch_size: 32
+  ckpt_every_steps: 500
   save_checkpoint_every_epoch: false
   log_remote_every_steps: 1
 
@@ -117,5 +111,6 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
+  # Sharded checkpoints; generate.py loads them through the training checkpointer.
   save_consolidated: false
   restore_from: null

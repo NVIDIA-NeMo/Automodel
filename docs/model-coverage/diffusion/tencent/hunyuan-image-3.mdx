@@ -36,10 +36,12 @@ Supported: FSDP2, expert parallelism, LoRA, full fine-tuning through the same re
 | Recipe | Description |
 |---|---|
 | [hunyuan_image3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) | Single-node LoRA fine-tuning with 8-way expert parallelism |
+| [hunyuan_image3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow.yaml) | Four-node full fine-tuning with 8-way expert parallelism |
+| [generate_hunyuan_image3.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_hunyuan_image3.yaml) | Text-to-image generation from the base model, a full fine-tune or a LoRA adapter |
 
 ## Prepare Data
 
-The preprocessing step needs the release's VAE and tokenizer wrapper, which are loaded from the checkpoint's remote code. For every image it stores the VAE latent and the release's prompt token ids around the image span (the conditional prompt, the `<cfg>` unconditional prompt used for classifier-free guidance dropout, and the suffix). Images are snapped to the release's own resolution group (33 aspect ratios around 1024x1024) instead of the generic buckets:
+The preprocessing step needs the release's VAE and tokenizer wrapper, which are loaded from the checkpoint's remote code (`nemo_automodel/components/models/hunyuan_image3/release.py`, shared with generation). For every image it stores the VAE latent and the release's prompt token ids around the image span (the conditional prompt, the `<cfg>` unconditional prompt used for classifier-free guidance dropout, and the suffix). Images are snapped to the release's own resolution group (33 aspect ratios around 1024x1024) instead of the generic buckets:
 
 ```bash
 uv run python -m tools.diffusion.preprocessing_multiprocess image \
@@ -56,7 +58,7 @@ Captions follow the image processors' JSONL convention (`<stem>_internvl.json` n
 
 Each cache sample contains:
 
-- `latent`: `[32, height / 16, width / 16]` (bf16, scaled by the VAE scaling factor)
+- `latent`: `[32, height / 16, width / 16]` (fp32, scaled by the VAE scaling factor)
 - `prompt_input_ids`: token ids before the image span, ending in `<timestep>`
 - `uncond_prompt_input_ids`: the same with the prompt replaced by `<cfg>` tokens
 - `prompt_suffix_ids`: token ids after the image span (`<eoi>`)
@@ -66,7 +68,7 @@ The `hunyuan_image3` flow-matching adapter assembles `prefix + <img> * (h * w) +
 
 ## Train
 
-Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir`, then launch one rank per GPU:
+Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir`, then launch one rank per GPU. LoRA fits on one node:
 
 ```bash
 uv run torchrun --nproc-per-node=8 \
@@ -74,7 +76,28 @@ uv run torchrun --nproc-per-node=8 \
   -c examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml
 ```
 
-The recipe keeps the router in fp32 (`gate_precision: float32`), applies LoRA to the attention projections and the shared expert, and trains with `flow_shift: 3.0`, the value the release samples with. Checkpoints hold only the LoRA adapter (`adapter_model.safetensors` plus its config). `fsdp.ep_size: 1` is also supported; the experts are then sharded by FSDP2.
+Full fine-tuning keeps fp32-precision master weights and Adam moments for all 80B parameters (about 1.1 TB), so its recipe is laid out for four nodes; run the same command on every node with its own `--node-rank`:
+
+```bash
+uv run torchrun --nnodes=4 --node-rank=NODE_RANK --nproc-per-node=8 \
+  --master-addr=MASTER_ADDR --master-port=29500 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/hunyuan_image3_t2i_flow.yaml
+```
+
+Both recipes keep the router in fp32 (`gate_precision: float32`), train with `flow_shift: 3.0` (the value the release samples with) and use Transformer Engine's `FusedAdam` with fp32 master weights (`master_weights: true` with 16-bit remainders), since plain AdamW on bf16 parameters rounds away most small updates. The LoRA recipe adapts the attention projections and the shared expert, and its checkpoints hold only the adapter (`adapter_model.safetensors` plus its config). `fsdp.ep_size: 1` is also supported; the experts are then sharded by FSDP2.
+
+## Generate
+
+`examples/diffusion/generate/generate.py` samples with the native transformer, sharded across the launched ranks as in training, and the release's VAE, prompt format and `flow_shift` from the checkpoint. Sampling follows the release pipeline: Euler steps on the shifted sigma schedule with classifier-free guidance over a `[prompt, <cfg>]` batch. Every rank samples the same prompts:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_hunyuan_image3.yaml
+```
+
+Set `model.lora_weights` to the `model/` directory of a LoRA checkpoint step, or `model.checkpoint` to a full fine-tuning checkpoint step; both load through the training checkpointer. Requested sizes snap to the release resolution group.
 
 ## Install
 
