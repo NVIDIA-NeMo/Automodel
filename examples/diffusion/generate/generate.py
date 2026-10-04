@@ -133,7 +133,9 @@ def load_pipeline(cfg, dist_info):
         model_id,
         torch_dtype=torch_dtype,
         mesh_context=mesh_context,
-        components_to_load=["transformer"],
+        # Inference needs every component on device, but only the transformer
+        # supports the requested model/context parallelism.
+        components_to_parallelize=["transformer"],
         move_to_device=not cpu_offload,
     )
 
@@ -712,9 +714,7 @@ def run_inference(pipe, cfg, is_rank0):
     for i, prompt_text in enumerate(prompts):
         logger.info("[%d/%d] Prompt: %s", i + 1, len(prompts), prompt_text[:80])
 
-        # Diffusers can sample latents on CPU even when the denoiser runs on CUDA.
-        # Its randn_tensor helper supports a CPU generator for either target device.
-        generator = torch.Generator(device="cpu").manual_seed(seed + i)
+        generator = torch.Generator(device="cuda").manual_seed(seed + i)
         sample_kwargs = dict(pipe_kwargs)
         if input_images is not None:
             sample_kwargs["image"] = load_image(input_images[i])

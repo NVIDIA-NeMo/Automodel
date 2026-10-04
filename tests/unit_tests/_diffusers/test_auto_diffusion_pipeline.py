@@ -657,6 +657,45 @@ def test_from_pretrained_components_to_load_filters_modules():
     assert mock_move.call_args[0][0] is unet
 
 
+@pytest.mark.parametrize("move_to_device", [False, True])
+@pytest.mark.parametrize(
+    "components_to_load,components_to_parallelize",
+    [(["transformer"], None), (None, ["transformer"]), (None, [])],
+)
+def test_from_pretrained_separates_device_placement_from_parallelization(
+    move_to_device, components_to_load, components_to_parallelize
+):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    modules = {name: DummyModule() for name in ("text_encoder", "transformer", "vae")}
+    pipe = DummyPipeline(modules)
+    mesh_context = SimpleNamespace(strategy_config=FSDP2Config(), cp_size=2, ep_size=1)
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline.from_pretrained", return_value=pipe),
+        patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
+        patch(f"{MODULE_PATH}._move_module_to_device") as move,
+        patch(f"{MODULE_PATH}.attach_parallelizer"),
+        patch(f"{MODULE_PATH}._enable_context_parallel") as enable_cp,
+        patch(f"{MODULE_PATH}.parallelize_model", side_effect=lambda module, context: module) as parallelize,
+        patch(f"{MODULE_PATH}.compile_parallelized_model"),
+    ):
+        NeMoAutoDiffusionPipeline.from_pretrained(
+            "dummy",
+            mesh_context=mesh_context,
+            device=torch.device("cpu"),
+            move_to_device=move_to_device,
+            components_to_load=components_to_load,
+            components_to_parallelize=components_to_parallelize,
+        )
+
+    moved_names = (components_to_load or list(modules)) if move_to_device else []
+    assert move.call_args_list == [call(modules[name], torch.device("cpu"), torch.bfloat16) for name in moved_names]
+    selected = components_to_load if components_to_parallelize is None else components_to_parallelize
+    assert parallelize.call_args_list == [call(modules[name], mesh_context) for name in selected]
+    assert enable_cp.call_args_list == [call(modules[name], name, mesh_context) for name in selected]
+
+
 def test_from_pretrained_applies_transformer_qkv_and_te_options():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
