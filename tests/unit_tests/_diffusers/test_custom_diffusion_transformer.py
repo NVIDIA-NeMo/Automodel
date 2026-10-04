@@ -355,10 +355,9 @@ def patched_custom_build(monkeypatch):
 @pytest.mark.parametrize("components_to_parallelize", [None, ["transformer"]])
 def test_from_pretrained_dispatches_to_custom_transformer(custom_repo, patched_custom_build, components_to_parallelize):
     from nemo_automodel.components.distributed.config import FSDP2Config
+    from nemo_automodel.components.distributed.mesh import MeshContext
 
-    mesh_context = SimpleNamespace(
-        cp_size=1, strategy_config=FSDP2Config(), moe_parallel_config=None, activation_checkpointing=False
-    )
+    mesh_context = MeshContext(strategy_config=FSDP2Config())
     backend = toy_backend()
     overrides = {"num_hidden_layers": 1}
 
@@ -379,7 +378,8 @@ def test_from_pretrained_dispatches_to_custom_transformer(custom_repo, patched_c
     assert config._name_or_path == os.path.join(custom_repo, "transformer")
     assert config.architectures == [CUSTOM_ARCH]
     assert config.num_hidden_layers == 1
-    assert kwargs["distributed_setup"].mesh_context is mesh_context
+    assert kwargs["distributed_setup"].mesh_context == mesh_context
+    assert kwargs["distributed_setup"].strategy_config is mesh_context.strategy_config
     assert kwargs["torch_dtype"] == torch.float32
     assert kwargs["load_base_model"] is True
     assert kwargs["peft_config"] is None
@@ -432,14 +432,9 @@ def test_from_pretrained_custom_rejects_unsupported_parallelization_selector(
     custom_repo, patched_custom_build, selector, with_mesh
 ):
     from nemo_automodel.components.distributed.config import FSDP2Config
+    from nemo_automodel.components.distributed.mesh import MeshContext
 
-    mesh_context = (
-        SimpleNamespace(
-            cp_size=1, strategy_config=FSDP2Config(), moe_parallel_config=None, activation_checkpointing=False
-        )
-        if with_mesh
-        else None
-    )
+    mesh_context = MeshContext(strategy_config=FSDP2Config()) if with_mesh else None
     with pytest.raises(ValueError, match="components_to_parallelize"):
         NeMoAutoDiffusionPipeline.from_pretrained(
             custom_repo, mesh_context=mesh_context, components_to_parallelize=selector
