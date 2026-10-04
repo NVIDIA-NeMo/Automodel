@@ -150,6 +150,35 @@ def apply_rotary_emb(
     return y
 
 
+def apply_rotary_emb_half_split(x: torch.Tensor, freqs_cis: torch.Tensor, qkv_format: str = "bshd") -> torch.Tensor:
+    """Apply half-split (``rotate_half``) rotary embeddings using the complex ``freqs_cis`` table.
+
+    The DeepSeek-V3.2 DSA indexer rotates its rope slice with the non-interleaved layout
+    (pair dim ``j`` with ``j + d/2``), unlike the main MLA attention which pairs adjacent
+    dims (``apply_rotary_emb``). ``freqs_cis`` is the same complex table used by the MLA
+    (``exp(i * theta_j * pos)`` for ``j in [0, d/2)``); its real/imag parts are the cos/sin
+    for frequency ``j``, so the rotation angles match the interleaved path exactly.
+
+    Args:
+        x: Rope slice, ``[B, S, H, d]`` / ``[B, S, d]`` (bshd) or ``[T, H, d]`` / ``[T, d]`` (thd).
+        freqs_cis: Complex RoPE table with trailing dim ``d/2`` (``[B, S, d/2]`` or ``[T, d/2]``).
+        qkv_format: ``"bshd"`` or ``"thd"``.
+
+    Returns:
+        Rotated tensor with the same shape and dtype as ``x``.
+    """
+    half = x.shape[-1] // 2
+    if qkv_format == "thd":
+        fc = freqs_cis.reshape(x.shape[0], *([1] * (x.dim() - 2)), half)
+    else:
+        fc = freqs_cis.reshape(x.shape[0], x.shape[1], *([1] * (x.dim() - 3)), half)
+    cos = fc.real.to(x.dtype)
+    sin = fc.imag.to(x.dtype)
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
 def apply_rotary_emb_qk(
     q: torch.Tensor,
     k: torch.Tensor,

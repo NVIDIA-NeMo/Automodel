@@ -69,6 +69,7 @@ from nemo_automodel.components.models.common import (
 )
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
+    apply_rotary_emb_half_split,
     yarn_get_mscale,
 )
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
@@ -105,6 +106,8 @@ class DeepseekV32Indexer(nn.Module):
     - Has a weights_proj that learns per-head importance weights
     - Optional Hadamard transform (rotate_activation) on Q and K
     - ReLU activation on attention scores before weighting
+    - Half-split (non-interleaved) RoPE on the leading ``qk_rope_head_dim`` dims of Q/K,
+      unlike the interleaved RoPE of the main MLA attention
     """
 
     def __init__(self, config: DeepseekV32Config, backend: BackendConfig):
@@ -189,24 +192,21 @@ class DeepseekV32Indexer(nn.Module):
         else:
             q = q.view(bsz, seq_len, self.num_heads, self.head_dim)
 
-        # Split Q into nope and pe parts (nope first, then pe - matching training code)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # The reference indexer (DeepSeek-V3.2 ``inference/model.py`` and HF ``DeepseekV32Indexer``)
+        # takes the rope slice from the FIRST ``qk_rope_head_dim`` dims of the projections and rotates
+        # it with half-split (``rotate_half``) RoPE, unlike the interleaved RoPE of the MLA path.
+        q_pe, q_nope = torch.split(q, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
 
         # Project K from hidden states
         k = self.k_norm(self.wk(x))
+        k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
 
-        # Split K into nope and pe parts
-        k_nope, k_pe = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_pe = apply_rotary_emb_half_split(q_pe, freqs_cis, qkv_format=qkv_format)
+        k_pe = apply_rotary_emb_half_split(k_pe, freqs_cis, qkv_format=qkv_format)
 
-        # Apply RoPE to the pe parts
-        head_unsqueeze_dim = 2 if qkv_format == "bshd" else 1
-        q_pe = apply_rotary_emb(q_pe, freqs_cis, qkv_format=qkv_format)
-        k_pe = apply_rotary_emb(k_pe, freqs_cis, qkv_format=qkv_format, unsqueeze_dim=head_unsqueeze_dim)
-        k_pe = k_pe.squeeze(head_unsqueeze_dim)
-
-        # Combine nope and pe parts (nope first, matching training code)
-        q = torch.cat([q_nope, q_pe], dim=-1)
-        k = torch.cat([k_nope, k_pe], dim=-1)
+        # Combine pe and nope parts (rope slice first, matching the reference layout)
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        k = torch.cat([k_pe, k_nope], dim=-1)
 
         # Apply optional Hadamard rotation (if fast_hadamard_transform is available)
         q = _rotate_activation(q)
