@@ -23,9 +23,9 @@ import numpy as np
 import pytest
 import torch
 
+from nemo_automodel.recipes.retrieval.mining_encoder import CheckpointMiningEncoderConfig
 from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
 from nemo_automodel.recipes.retrieval.mine_hard_negatives import MINING_DEFAULTS, MineHardNegativesRecipe
-from nemo_automodel.recipes.retrieval.mining_encoder import CheckpointMiningEncoderConfig
 
 # ---------------------------------------------------------------------------
 # Helpers

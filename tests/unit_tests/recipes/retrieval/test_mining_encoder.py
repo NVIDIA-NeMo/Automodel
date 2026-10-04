@@ -26,14 +26,14 @@ import pytest
 import torch
 from PIL import Image
 
-from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.models.ministral_bidirectional.processor import load_image
-from nemo_automodel.recipes.retrieval.mine_hard_negatives import MineHardNegativesRecipe
 from nemo_automodel.recipes.retrieval.mining_encoder import (
     CheckpointMiningEncoder,
     CheckpointMiningEncoderConfig,
     SentenceTransformerMiningEncoder,
 )
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.models.ministral_bidirectional.processor import load_image
+from nemo_automodel.recipes.retrieval.mine_hard_negatives import MineHardNegativesRecipe
 
 
 class _PixelProcessor:
