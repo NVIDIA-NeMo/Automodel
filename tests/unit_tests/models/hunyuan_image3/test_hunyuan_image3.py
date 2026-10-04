@@ -125,9 +125,17 @@ def test_moe_config_matches_release_routing():
     moe = build_moe_config(_config())
     assert moe.score_func == "softmax" and moe.softmax_before_topk and moe.norm_topk_prob
     assert (moe.n_routed_experts, moe.n_activated_experts, moe.moe_inter_dim) == (4, 2, 32)
-    assert moe.n_shared_experts == 0  # attached separately as HunyuanSharedMLP
+    assert moe.n_shared_experts == 0  # the release shared expert is the block's own HunyuanSharedMLP
     assert moe.gate_dtype == torch.float32
     assert build_moe_config(_config(), {"aux_loss_coeff": 0.5}).aux_loss_coeff == 0.5
+
+
+def test_shared_expert_lives_in_the_block(model):
+    from nemo_automodel.components.models.hunyuan_image3.layers import HunyuanSharedMLP
+
+    block = model.model.layers["0"]
+    assert block.mlp.shared_experts is None and isinstance(block.shared_mlp, HunyuanSharedMLP)
+    assert "model.layers.0.shared_mlp.gate_and_up_proj.weight" in model.state_dict()
 
 
 @pytest.mark.parametrize(
@@ -456,7 +464,7 @@ def test_exported_lora_reloads_all_release_projections(tmp_path, v4_compatible):
     release_layout = _model()
     # Only exercise projections, using the released shared-expert names and the same base weights.
     for block in release_layout.model.layers.values():
-        block.mlp.shared_mlp = block.mlp._modules.pop("shared_experts")
+        block.mlp.shared_mlp = block._modules.pop("shared_mlp")
     config = PeftConfig(
         dim=4,
         alpha=8,
@@ -464,8 +472,8 @@ def test_exported_lora_reloads_all_release_projections(tmp_path, v4_compatible):
         target_modules=[
             "*.self_attn.qkv_proj",
             "*.self_attn.o_proj",
-            "*.mlp.shared_experts.gate_and_up_proj",
-            "*.mlp.shared_experts.down_proj",
+            "*.shared_mlp.gate_and_up_proj",
+            "*.shared_mlp.down_proj",
         ],
     )
     assert apply_lora_to_linear_modules(source, config) == 8
@@ -494,7 +502,7 @@ def test_exported_lora_reloads_all_release_projections(tmp_path, v4_compatible):
     restored = PeftModel.from_pretrained(release_layout, tmp_path).eval()
     source.eval()
     for target in targets:
-        native_name = target.replace(".shared_mlp.", ".shared_experts.")
+        native_name = target.replace(".mlp.shared_mlp.", ".shared_mlp.")
         original = source.get_submodule(native_name)
         loaded = restored.base_model.model.get_submodule(target)
         torch.testing.assert_close(loaded.lora_A["default"].weight, original.lora_A.weight)

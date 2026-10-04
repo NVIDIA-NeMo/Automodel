@@ -113,16 +113,18 @@ def build_moe_config(config: HunyuanImage3Config, overrides: dict[str, Any] | No
 
 
 class HunyuanImage3Block(nn.Module):
-    """Pre-norm decoder layer: GQA attention and a shared-expert MoE."""
+    """Pre-norm decoder layer: GQA attention, then routed experts (``MoE``) plus the release's fused shared expert.
+
+    The shared expert lives in the block, not in ``MoE``, because its fused ``[up; gate]`` projection is not the
+    ``MLP`` that ``MoE`` builds and manages.
+    """
 
     def __init__(self, config: HunyuanImage3Config, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype):
         super().__init__()
         self.self_attn = HunyuanImage3Attention(config, backend, dtype)
         self.mlp = MoE(moe_config, backend)
         shared_inter = moe_config.moe_inter_dim * per_layer(config.num_shared_expert, 0)
-        self.mlp.shared_experts = HunyuanSharedMLP(
-            config.hidden_size, shared_inter, backend, bias=config.mlp_bias, dtype=dtype
-        )
+        self.shared_mlp = HunyuanSharedMLP(config.hidden_size, shared_inter, backend, bias=config.mlp_bias, dtype=dtype)
         self.input_layernorm = HunyuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.post_attention_layernorm = HunyuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
 
@@ -148,12 +150,14 @@ class HunyuanImage3Block(nn.Module):
             Tensor of shape [batch, sequence, hidden].
         """
         x = x + self.self_attn(self.input_layernorm(x), cos, sin, attention_mask)
-        return x + self.mlp(self.post_attention_layernorm(x), padding_mask)
+        h = self.post_attention_layernorm(x)
+        # Routed plus shared expert, in the order MoE sums its own shared expert.
+        return x + (self.mlp(h, padding_mask) + self.shared_mlp(h))
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.mlp.init_weights(buffer_device, init_std=init_std)  # router and routed experts
-        for module in (self.input_layernorm, self.post_attention_layernorm, self.self_attn, self.mlp.shared_experts):
+        for module in (self.input_layernorm, self.post_attention_layernorm, self.self_attn, self.shared_mlp):
             init_leaf_weights(module, init_std)
 
 

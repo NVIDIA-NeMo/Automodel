@@ -18,7 +18,7 @@ Released checkpoint (HF)                                   Native
   model.wte.weight                                           model.embed_tokens.weight
   model.ln_f.weight                                          model.norm.weight
   model.layers.{L}.mlp.gate.wg.weight          [E, H]        model.layers.{L}.mlp.gate.weight
-  model.layers.{L}.mlp.shared_mlp.*                          model.layers.{L}.mlp.shared_experts.*
+  model.layers.{L}.mlp.shared_mlp.*                          model.layers.{L}.shared_mlp.*
   model.layers.{L}.mlp.experts.{e}.gate_and_up_proj.weight   model.layers.{L}.mlp.experts.gate_and_up_projs
         [2I, H], rows = [up; gate]                                 [E, H, 2I], columns = [gate | up]
   model.layers.{L}.mlp.experts.{e}.down_proj.weight [H, I]   model.layers.{L}.mlp.experts.down_projs [E, I, H]
@@ -52,7 +52,8 @@ _RENAMES: tuple[tuple[str, str], ...] = (
     (r"^model\.embed_tokens\.weight$", r"^model\.wte\.weight$"),
     (r"^model\.norm\.weight$", r"^model\.ln_f\.weight$"),
     (r"\.mlp\.gate\.weight$", r"\.mlp\.gate\.wg\.weight$"),
-    (r"\.mlp\.shared_experts\.", r"\.mlp\.shared_mlp\."),
+    # The shared expert sits in the decoder block natively and under ``mlp`` in the release.
+    (r"\.shared_mlp\.", r"\.mlp\.shared_mlp\."),
 )
 
 

@@ -48,8 +48,8 @@ peft:
   target_modules:
     - "*.self_attn.qkv_proj"
     - "*.self_attn.o_proj"
-    - "*.mlp.shared_experts.gate_and_up_proj"
-    - "*.mlp.shared_experts.down_proj"
+    - "*.shared_mlp.gate_and_up_proj"
+    - "*.shared_mlp.down_proj"
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
