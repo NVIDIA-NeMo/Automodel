@@ -90,10 +90,9 @@ def _dsa_kernel_backend(backend: BackendConfig) -> str:
 
 
 def _apply_index_rope_half_split(x: torch.Tensor, freqs_cis: torch.Tensor, qkv_format: str) -> torch.Tensor:
-    """Apply NON-interleaved (half-split) RoPE to the indexer's rope slice.
+    """Apply half-split RoPE when the indexer's interleaved layout is disabled.
 
-    The DSA indexer uses half-split RoPE (``rotate_half``: pair dim ``j`` with ``j + d/2``),
-    unlike the main MLA attention which uses interleaved RoPE. ``freqs_cis`` is the same
+    Half-split RoPE pairs dim ``j`` with ``j + d/2``. ``freqs_cis`` is the same
     complex tensor used by the MLA (``exp(i * theta_j * pos)`` for ``j in [0, d/2)``); we read
     its real/imag parts as cos/sin so the angles match exactly.
 
@@ -101,6 +100,9 @@ def _apply_index_rope_half_split(x: torch.Tensor, freqs_cis: torch.Tensor, qkv_f
         x: rope slice, ``[B, S, H, d]`` / ``[B, S, d]`` (bshd) or ``[T, H, d]`` / ``[T, d]`` (thd).
         freqs_cis: complex RoPE table with trailing dim ``d/2``.
         qkv_format: ``"bshd"`` or ``"thd"``.
+
+    Returns:
+        Rotated tensor with the same shape and dtype as ``x``.
     """
     d = x.shape[-1]
     half = d // 2
@@ -174,6 +176,9 @@ class GlmMoeDsaIndexer(nn.Module):
         self.head_dim = config.index_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
+        # HF configs preserve this checkpoint field but do not always declare it.
+        # GLM's default is interleaved, independently of the main attention's RoPE.
+        self.rope_interleave = getattr(config, "indexer_rope_interleave", True)
         self.index_topk = config.index_topk
         self.q_lora_rank = config.q_lora_rank
         self.hidden_size = config.hidden_size
@@ -270,10 +275,14 @@ class GlmMoeDsaIndexer(nn.Module):
         # Split K into pe and nope parts (rope slice first, matching Q)
         k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
 
-        # Apply NON-interleaved (half-split) RoPE to the pe parts. The indexer uses half-split
-        # RoPE (matching the DSA reference / HF), unlike the interleaved RoPE of the MLA path.
-        q_pe = _apply_index_rope_half_split(q_pe, freqs_cis, qkv_format)
-        k_pe = _apply_index_rope_half_split(k_pe, freqs_cis, qkv_format)
+        # GLM checkpoints use interleaved indexer RoPE. Honor an explicit half-split
+        # setting before dispatching the rotated Q/K to any scoring backend.
+        if self.rope_interleave:
+            q_pe = apply_rotary_emb(q_pe, freqs_cis, qkv_format=qkv_format)
+            k_pe = apply_rotary_emb(k_pe, freqs_cis, qkv_format=qkv_format, unsqueeze_dim=2)
+        else:
+            q_pe = _apply_index_rope_half_split(q_pe, freqs_cis, qkv_format)
+            k_pe = _apply_index_rope_half_split(k_pe, freqs_cis, qkv_format)
 
         # Combine pe and nope parts (rope slice first, matching the reference layout)
         q = torch.cat([q_pe, q_nope], dim=-1)
