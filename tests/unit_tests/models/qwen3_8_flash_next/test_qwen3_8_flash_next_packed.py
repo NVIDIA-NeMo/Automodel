@@ -756,5 +756,10 @@ def test_decoder_layer_derives_ple_document_ids_only_for_packed_rows() -> None:
         derive(input_ids, None, torch.tensor([0, 2, 6])),
         torch.tensor([[0, 0, 1, 1, 1, 1]]),
     )
+    # Positions past the last boundary (pack or CP padding) form one more segment.
+    torch.testing.assert_close(
+        derive(input_ids, None, torch.tensor([0, 2, 4])),
+        torch.tensor([[0, 0, 1, 1, 2, 2]]),
+    )
     with pytest.raises(ValueError, match="one physical row"):
         derive(torch.zeros(2, 6, dtype=torch.long), None, torch.tensor([0, 2, 6]))

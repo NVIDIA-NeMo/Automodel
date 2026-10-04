@@ -1090,8 +1090,8 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
                 boundary required by the released dilation/kernel settings.
             sequence_ids: Optional packed segment IDs of shape ``[batch,
                 local_sequence]`` without CP, or replicated ``[batch,
-                global_sequence]`` under CP. Taps that read another segment
-                contribute zero, as at the start of a row.
+                global_sequence]`` under CP. Each segment then starts with zero
+                history, as at the start of a row.
 
         Returns:
             Tensor of shape ``[batch, sequence, hc_count * hidden_size]``.
@@ -1103,7 +1103,7 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
             left_halo = qwen3_8_flash_next_cp_left_halo(hidden_states, cp_context, history=left_padding)
             channels_first = torch.cat((left_halo, hidden_states), dim=1).transpose(1, 2)
         if sequence_ids is not None:
-            return F.silu(self._segment_masked_conv(channels_first.transpose(1, 2), cp_context, sequence_ids))
+            return F.silu(self._segmented_conv(channels_first.transpose(1, 2), cp_context, sequence_ids))
         convolved = F.conv1d(
             channels_first,
             self.conv1d.weight,
@@ -1113,13 +1113,16 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
         )
         return F.silu(convolved.transpose(1, 2))
 
-    def _segment_masked_conv(
+    def _segmented_conv(
         self,
         padded: torch.Tensor,
         cp_context: Qwen3_8_FlashNextCPContext | None,
         sequence_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Sum the convolution taps, dropping taps whose source is in another packed segment.
+        """Run the convolution over every packed segment as if it started a fresh row.
+
+        Each run of one segment in ``padded`` gets ``history`` zeros ahead of it and
+        its own ``F.conv1d``, so every tap reads its own segment or zeros.
 
         Args:
             padded: Left history followed by the local sequence, ``[batch, history + sequence, channels]``.
@@ -1127,24 +1130,31 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
             sequence_ids: Packed segment IDs ``[batch, sequence]``, or ``[batch, global_sequence]`` under CP.
 
         Returns:
-            Pre-activation output ``[batch, sequence, channels]`` in the dtype of ``padded``.
+            Pre-activation output ``[batch, sequence, channels]``.
         """
         history = (self.conv_kernel_size - 1) * self.short_conv_dilation
-        sequence_length = padded.shape[1] - history
+        length = padded.shape[1]
         start = 0 if cp_context is None else cp_context.local_sequence_start
-        positions = torch.arange(start - history, start + sequence_length, device=padded.device)
-        source_ids = torch.where(positions >= 0, sequence_ids[:, positions.clamp_min(0)], -1)
-        target_ids = source_ids[:, history:]
-        weight = self.conv1d.weight.squeeze(1)
-        # The F.conv1d sum, one tap at a time: a tap reading another segment (or padding) adds zero.
-        output = 0
-        for tap in range(self.conv_kernel_size):
-            offset = tap * self.short_conv_dilation
-            same_segment = (source_ids[:, offset : offset + sequence_length] == target_ids).unsqueeze(-1)
-            source = torch.where(same_segment, padded[:, offset : offset + sequence_length], 0.0)
-            # fp32 products, as in F.conv1d.
-            output = output + source.float() * weight[:, tap].float()
-        return output.to(padded.dtype)
+        positions = torch.arange(start - history, start + length - history, device=padded.device)
+        # Segment of every row; -1 marks history before the global row start.
+        segment = torch.where(positions >= 0, sequence_ids[:, positions.clamp_min(0)], -1)
+        rows = []
+        for row, row_segment in zip(padded, segment):
+            _, run_lengths = torch.unique_consecutive(row_segment, return_counts=True)
+            runs = [
+                F.conv1d(
+                    F.pad(run.t(), (history, 0)),
+                    self.conv1d.weight,
+                    bias=None,
+                    dilation=self.short_conv_dilation,
+                    groups=self.hc_hidden_size,
+                ).t()
+                for run in row.split(run_lengths.tolist())
+            ]
+            # The outputs for the left history are dropped.
+            rows.append(torch.cat(runs)[history:])
+        # A packed micro-batch has one row; skip the copy that stacking would make.
+        return rows[0].unsqueeze(0) if len(rows) == 1 else torch.stack(rows)
 
     def forward(
         self,

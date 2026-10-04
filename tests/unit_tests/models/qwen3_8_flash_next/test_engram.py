@@ -730,6 +730,22 @@ def test_packed_ple_matches_separate_documents_forward_and_backward(rows: int) -
         torch.testing.assert_close(packed_parameter.grad, separate_parameter.grad, rtol=1e-5, atol=1e-6, msg=name)
 
 
+@pytest.mark.parametrize("rows", [1, 2])
+def test_segmented_conv_matches_per_segment_conv(rows: int) -> None:
+    ple = _tiny_ple()
+    _, hidden_states, sequence_ids = _packed_ple_inputs(rows)
+    packed_hidden = hidden_states.clone().requires_grad_(True)
+    separate_hidden = hidden_states.clone().requires_grad_(True)
+
+    packed = ple._causal_short_conv(packed_hidden, sequence_ids=sequence_ids)
+    separate = _separate(ple._causal_short_conv, separate_hidden)
+    torch.testing.assert_close(packed, separate, rtol=1e-6, atol=1e-6)
+
+    packed.square().sum().backward()
+    separate.square().sum().backward()
+    torch.testing.assert_close(packed_hidden.grad, separate_hidden.grad, rtol=1e-6, atol=1e-6)
+
+
 def test_packed_ple_without_boundaries_reads_previous_document() -> None:
     ple = _tiny_ple()
     input_ids, hidden_states, _ = _packed_ple_inputs()
