@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the native dense Qwen3.5 backbone and fp32 SSMGate machinery.
+"""Unit tests for the native dense Qwen3.5 backbone and its fp32 GatedDeltaNet contract.
 
 Covers the custom-model building blocks that replaced the old runtime
-``patch_hf_model``: the fp32 ``SSMGate`` holder + ``install_ssm_gate`` +
-``_SSMGateParam`` descriptor, the ``Qwen3_5DenseTextBackbone`` forward, and the
-fp32-safe rotary embedding. All tests are CPU-only.
+``patch_hf_model``: the fp32 ``A_log``/``dt_bias`` decay-gate parameters, the
+``Qwen3_5DenseTextBackbone`` forward, and the fp32-safe rotary embedding. All
+tests are CPU-only.
 """
 
 from __future__ import annotations
@@ -36,17 +36,14 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata, get_unpad_data
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5 import packing as qwen3_5_packing
 from nemo_automodel.components.models.qwen3_5.model import (
     Fp32SafeQwen3_5TextRotaryEmbedding,
     Qwen3_5DenseTextBackbone,
+    Qwen3_5ForCausalLM,
 )
-from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
-    SSMGate,
-    _resolve_ssm_dtype,
-    _SSMGateParam,
-    install_ssm_gate,
-)
+from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 
 # Over the default 5s budget on purpose: CUDA gated-delta kernels take about 70s to compile on a cold worker.
 # Reduce cold compiler startup before lowering this further.
@@ -90,107 +87,82 @@ def _tiny_config(layer_types=("full_attention",), **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# SSMGate / install_ssm_gate / _SSMGateParam descriptor
+# fp32 GatedDeltaNet decay-gate parameters
 # ---------------------------------------------------------------------------
 
 
-class TestSSMGate:
-    def test_params_are_fp32_with_expected_shape(self):
-        gate = SSMGate(num_v_heads=4)
-        assert gate.A_log.dtype == torch.float32
-        assert gate.dt_bias.dtype == torch.float32
-        assert tuple(gate.A_log.shape) == (4,)
-        assert tuple(gate.dt_bias.shape) == (4,)
+class TestFp32GateParams:
+    def test_gate_params_are_bare_fp32_under_bf16_default_dtype(self):
+        cfg = _tiny_config(layer_types=("linear_attention",))
+        cfg.torch_dtype = torch.bfloat16
+        old_default_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            gdn = CPAwareGatedDeltaNet(cfg, layer_idx=0)
+        finally:
+            torch.set_default_dtype(old_default_dtype)
 
-    def test_forward_computes_gate_in_fp32(self):
-        gate = SSMGate(num_v_heads=4)
-        nn.init.zeros_(gate.A_log)  # exp(0) = 1
-        nn.init.zeros_(gate.dt_bias)
-        a = torch.randn(2, 3, 4, dtype=torch.float32)
-        out = gate(a)
+        assert gdn._parameters["A_log"] is gdn.A_log
+        assert gdn._parameters["dt_bias"] is gdn.dt_bias
+        assert "_fp32_params" not in gdn._modules
+        assert gdn.A_log.dtype == torch.float32
+        assert gdn.dt_bias.dtype == torch.float32
+        assert gdn.in_proj_qkv.weight.dtype == torch.bfloat16
+
+    def test_compute_gate_runs_in_fp32(self):
+        gdn = CPAwareGatedDeltaNet(_tiny_config(layer_types=("linear_attention",)), layer_idx=0)
+        with torch.no_grad():
+            nn.init.zeros_(gdn.A_log)  # exp(0) = 1
+            nn.init.zeros_(gdn.dt_bias)
+        a = torch.randn(2, 3, gdn.num_v_heads, dtype=torch.bfloat16)
+
+        out = gdn._compute_gate(a)
+
         assert out.shape == a.shape
         assert out.dtype == torch.float32
         # g = -exp(A_log) * softplus(a + dt_bias) = -softplus(a) here.
-        torch.testing.assert_close(out, -torch.nn.functional.softplus(a))
+        torch.testing.assert_close(out, -torch.nn.functional.softplus(a.float()))
 
-    def test_forward_upcasts_bf16_input(self):
-        gate = SSMGate(num_v_heads=2)
-        out = gate(torch.randn(1, 2, 2, dtype=torch.bfloat16))
-        # Gate math runs in fp32 regardless of the activation dtype.
-        assert out.dtype == torch.float32
+    def test_strict_fp32_tokens_match_exactly_the_gate_params(self):
+        model = Qwen3_5ForCausalLM(_tiny_config(layer_types=("linear_attention", "full_attention")), backend=_backend())
+        tokens = model._keep_in_fp32_modules_strict
 
+        matched = {name for name, _ in model.named_parameters() if any(token in name for token in tokens)}
+        assert matched == {"model.layers.0.linear_attn.A_log", "model.layers.0.linear_attn.dt_bias"}
 
-class TestInstallSSMGate:
-    def _module_with_bare_params(self, dtype=torch.bfloat16, num_v_heads=4):
-        mod = nn.Module()
-        mod.register_parameter("A_log", nn.Parameter(torch.randn(num_v_heads, dtype=dtype)))
-        mod.register_parameter("dt_bias", nn.Parameter(torch.randn(num_v_heads, dtype=dtype)))
-        return mod
+        # FSDP matches the same tokens against layer-relative names.
+        layer_matched = {
+            name for name, _ in model.model.layers["0"].named_parameters() if any(token in name for token in tokens)
+        }
+        assert layer_matched == {"linear_attn.A_log", "linear_attn.dt_bias"}
+        full_attention_names = [name for name, _ in model.model.layers["1"].named_parameters()]
+        assert not any(any(token in name for token in tokens) for name in full_attention_names)
 
-    def test_moves_params_into_fp32_holder(self):
-        mod = self._module_with_bare_params(dtype=torch.bfloat16)
-        original_a_log = mod._parameters["A_log"]
+    def test_cast_model_to_dtype_keeps_gate_params_fp32_with_exact_values(self):
+        model = Qwen3_5ForCausalLM(_tiny_config(layer_types=("linear_attention",)), backend=_backend())
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+        linear_attn = model.model.layers["0"].linear_attn
+        a_log_before = linear_attn.A_log.detach().clone()
+        dt_bias_before = linear_attn.dt_bias.detach().clone()
 
-        gate = install_ssm_gate(mod, fp32_dtype=torch.float32)
+        cast_model_to_dtype(model, torch.bfloat16)
 
-        # Bare params are removed from the parent and live in the holder.
-        assert "A_log" not in mod._parameters
-        assert "dt_bias" not in mod._parameters
-        assert mod._fp32_params is gate
-        assert gate.A_log.dtype == torch.float32
-        assert gate.dt_bias.dtype == torch.float32
-        # The original tensor values are preserved (cast to fp32 in place).
-        torch.testing.assert_close(gate.A_log, original_a_log.detach().float())
+        assert linear_attn.in_proj_qkv.weight.dtype == torch.bfloat16
+        assert linear_attn.A_log.dtype == torch.float32
+        assert linear_attn.dt_bias.dtype == torch.float32
+        torch.testing.assert_close(linear_attn.A_log.detach(), a_log_before, rtol=0, atol=0)
+        torch.testing.assert_close(linear_attn.dt_bias.detach(), dt_bias_before, rtol=0, atol=0)
 
-    def test_already_fp32_params_kept(self):
-        mod = self._module_with_bare_params(dtype=torch.float32)
-        a_before = mod._parameters["A_log"].detach().clone()
-        gate = install_ssm_gate(mod, fp32_dtype=torch.float32)
-        torch.testing.assert_close(gate.A_log.detach(), a_before)
+    def test_state_dict_uses_hf_keys_for_gate_params(self):
+        model = Qwen3_5ForCausalLM(_tiny_config(layer_types=("linear_attention",)), backend=_backend())
+        state_dict = model.state_dict()
 
-
-class TestSSMGateParamDescriptor:
-    def test_descriptor_resolves_to_holder(self):
-        class Mod(nn.Module):
-            A_log = _SSMGateParam("A_log")
-            dt_bias = _SSMGateParam("dt_bias")
-
-            def __init__(self):
-                super().__init__()
-                self.register_parameter("A_log", nn.Parameter(torch.randn(3)))
-                self.register_parameter("dt_bias", nn.Parameter(torch.randn(3)))
-                install_ssm_gate(self, fp32_dtype=torch.float32)
-
-        mod = Mod()
-        # Attribute reads resolve through the descriptor into the holder.
-        assert mod.A_log is mod._fp32_params.A_log
-        assert mod.dt_bias is mod._fp32_params.dt_bias
-
-    def test_descriptor_on_class_returns_itself(self):
-        class Mod(nn.Module):
-            A_log = _SSMGateParam("A_log")
-
-        assert isinstance(Mod.A_log, _SSMGateParam)
-
-
-class TestResolveSSMDtype:
-    def test_default_is_fp32(self):
-        class Cfg:
-            pass
-
-        assert _resolve_ssm_dtype(Cfg()) == torch.float32
-
-    def test_string_dtype_resolved(self):
-        class Cfg:
-            mamba_ssm_dtype = "float32"
-
-        assert _resolve_ssm_dtype(Cfg()) == torch.float32
-
-    def test_explicit_dtype_passthrough(self):
-        class Cfg:
-            mamba_ssm_dtype = torch.float32
-
-        assert _resolve_ssm_dtype(Cfg()) == torch.float32
+        assert "model.layers.0.linear_attn.A_log" in state_dict
+        assert "model.layers.0.linear_attn.dt_bias" in state_dict
+        assert not any("_fp32_params" in key for key in state_dict)
+        hf_state_dict = model.state_dict_adapter.to_hf(state_dict)
+        assert set(hf_state_dict) == set(state_dict)
+        assert hf_state_dict["model.layers.0.linear_attn.A_log"].dtype == torch.float32
 
 
 # ---------------------------------------------------------------------------
@@ -278,9 +250,10 @@ class TestDenseTextBackbone:
         types = [backbone.layers[str(i)].layer_type for i in range(cfg.num_hidden_layers)]
         assert types == ["full_attention", "linear_attention"]
         # The linear-attention block builds the native CP-aware GatedDeltaNet with
-        # an fp32 SSMGate holder; the full-attention block does not.
-        assert hasattr(backbone.layers["1"], "linear_attn")
-        assert hasattr(backbone.layers["1"].linear_attn, "_fp32_params")
+        # bare fp32 decay-gate parameters; the full-attention block does not.
+        assert isinstance(backbone.layers["1"].linear_attn, CPAwareGatedDeltaNet)
+        assert backbone.layers["1"].linear_attn.A_log.dtype == torch.float32
+        assert backbone.layers["1"].linear_attn.dt_bias.dtype == torch.float32
 
     def test_forward_shape_full_attention(self):
         cfg = _tiny_config(layer_types=("full_attention",))

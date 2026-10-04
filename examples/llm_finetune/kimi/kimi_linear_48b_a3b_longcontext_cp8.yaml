@@ -57,7 +57,7 @@ model:
     kda_use_fused_gate: true
     kda_use_qk_l2norm_in_kernel: true
   trust_remote_code: true
-  torch_dtype: bfloat16
+  dtype: float32
   load_base_model: true
   output_hidden_states: true
   backend:

@@ -671,8 +671,8 @@ def test_packed_gdn_parent_forward_backward_matches_separate_documents(document_
     config.linear_num_value_heads = 2
     layer = Qwen3_8_FlashNextGatedDeltaNet(config, layer_idx=0).float()
     with torch.no_grad():
-        layer._fp32_params.A_log.zero_()
-        layer._fp32_params.dt_bias.zero_()
+        layer.A_log.zero_()
+        layer.dt_bias.zero_()
     layer.causal_conv1d_fn = reference_conv
     layer.chunk_gated_delta_rule = reference_gdn
     reference = copy.deepcopy(layer)

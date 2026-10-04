@@ -485,7 +485,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     """Trainable language-only Qwen3.8-Flash-Next causal-LM wrapper."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
-    _keep_in_fp32_modules_strict = ["_fp32_params"]
+    # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
+    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
     _owns_cp_attention = True
     # Packed (THD) training and packed CP are owned by the model's
     # route-indexed QSA path for the listed CUDA backends.
@@ -566,11 +567,6 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         self.pad_token_id = config.text_config.pad_token_id if config.text_config.pad_token_id is not None else -1
         self.moe_config = self.model.language_model.moe_config
         self.mtp = None
-
-        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
-        if "_fp32_params" not in keep_fp32:
-            keep_fp32.append("_fp32_params")
-        self._keep_in_fp32_modules = keep_fp32
 
         if self.backend.enable_hf_state_dict_adapter:
             if len(config.text_config.ple_layer_ids) != 1:
@@ -748,7 +744,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         self.model.language_model.init_weights(buffer_device)
         std = self.config.text_config.hidden_size**-0.5
         nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
         for layer in self.model.language_model.layers.values():
             if layer.ple is not None:
                 layer.ple.ple_embedding.ngram_embedding.mark_sharding_contract()

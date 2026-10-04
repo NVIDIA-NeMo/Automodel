@@ -26,7 +26,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   trust_remote_code: true
-  torch_dtype: torch.bfloat16
+  dtype: float32
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa

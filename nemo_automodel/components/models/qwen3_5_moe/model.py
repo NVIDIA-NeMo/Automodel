@@ -845,6 +845,8 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     requires_packed_sequence_metadata = True
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _pp_keep_self_forward: bool = True
+    # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
+    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -926,11 +928,6 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             else None
         )
         self.moe_config = self.model.moe_config
-
-        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
-        if "_fp32_params" not in keep_fp32:
-            keep_fp32.append("_fp32_params")
-        self._keep_in_fp32_modules = keep_fp32
 
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3_5MoeStateDictAdapter(
@@ -1133,7 +1130,7 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 for sublayer in self.mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
             self.model.rotary_emb.device = buffer_device
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -1154,7 +1151,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
-    _keep_in_fp32_modules_strict = ["_fp32_params"]
+    # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
+    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
     # Packed CP uses the model-owned block-diagonal SDPA dispatch. Generic
     # hybrid CP also supports TE for unpacked sequences, but TE has no route
     # through this packed attention contract.
@@ -1277,15 +1275,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Expose moe_config for FSDP sync mixin
         self.model.moe_config = self.model.language_model.moe_config
-
-        # Keep the SSM-gating params (A_log/dt_bias) — isolated in each
-        # linear_attn ``_fp32_params`` holder at construction — in fp32 storage
-        # even when the model's bulk dtype is bf16. cast_model_to_dtype() (called
-        # from initialize_weights) honors this AutoModel training-storage contract.
-        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
-        if "_fp32_params" not in keep_fp32:
-            keep_fp32.append("_fp32_params")
-        self._keep_in_fp32_modules = keep_fp32
 
         self.vocab_size = text_config.vocab_size
         pad_token_id = getattr(text_config, "pad_token_id", None)
@@ -1904,11 +1893,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 for sublayer in mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
 
-        # Skip the SSM-gating holders so they keep fp32 storage (master weights):
-        # cast_model_to_dtype cannot reliably restore fp32 once FSDP2-sharded, so it
-        # detaches them and never casts them. The MoE parallelizer's dtype-aware
-        # sharder places each holder in its own fp32 FSDP group.
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
 
         with buffer_device:
             self.model.language_model.rotary_emb.device = buffer_device

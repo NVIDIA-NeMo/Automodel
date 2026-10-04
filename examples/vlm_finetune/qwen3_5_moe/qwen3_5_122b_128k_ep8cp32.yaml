@@ -66,7 +66,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.5-122B-A10B
   attn_implementation: sdpa
-  torch_dtype: torch.bfloat16
+  dtype: float32
   text_config:
     # FusedLinearCrossEntropy consumes the decoder hidden states directly.
     output_hidden_states: true

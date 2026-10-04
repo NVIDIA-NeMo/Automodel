@@ -89,8 +89,13 @@ class DeepseekV4VisionPatchEmbed(nn.Module):
         self.proj = nn.Linear(patch_dim, int(config.vision_dim), bias=True, dtype=dtype)
 
     def forward(self, patches: torch.Tensor) -> torch.Tensor:
-        """Project ``[patches, 3, patch_h, patch_w]`` to ``[patches, vision_dim]``."""
-        return self.proj(patches.flatten(1))
+        """Project ``[patches, 3, patch_h, patch_w]`` to ``[patches, vision_dim]``.
+
+        Patches are cast to the projection's compute dtype here: under FSDP2
+        mixed precision the weight computes in ``param_dtype`` while its storage
+        (and therefore the dtype a caller observes) stays fp32.
+        """
+        return self.proj(patches.flatten(1).to(self.proj.weight.dtype))
 
 
 class DeepseekV4VisionAttention(nn.Module):

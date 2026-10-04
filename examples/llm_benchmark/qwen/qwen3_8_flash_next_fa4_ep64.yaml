@@ -84,7 +84,7 @@ model:
       rms_norm_eps: 1.0e-6
       max_position_embeddings: 262144
       tie_word_embeddings: false
-      dtype: bfloat16
+      dtype: float32
       rope_parameters:
         rope_type: default
         rope_theta: 10000000
@@ -123,7 +123,7 @@ model:
       qsa_indexer_query_chunk_size: 128
   trust_remote_code: false
   load_base_model: false
-  torch_dtype: bfloat16
+  dtype: float32
   use_liger_kernel: false
   use_sdpa_patching: false
   backend:

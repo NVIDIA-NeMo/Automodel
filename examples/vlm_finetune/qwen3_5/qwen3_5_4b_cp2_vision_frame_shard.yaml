@@ -58,7 +58,7 @@ model:
     rms_norm: torch
     rope_fusion: false
   attn_implementation: sdpa
-  torch_dtype: bfloat16
+  dtype: float32
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained

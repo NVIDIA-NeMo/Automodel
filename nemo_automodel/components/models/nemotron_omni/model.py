@@ -339,7 +339,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
     # bf16. The checkpoint stores them in fp32 (values ~3.97 +- 0.024, none bf16-exact) and
     # the bf16 rounding (ulp 0.0156 at 4.0) is larger than the sigmoid routing margins, so
     # top-k expert selection diverged from the HF reference on ~85% of tokens.
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "mixer.A_log", "mixer.dt_bias", "mixer.D"]
     # CP submesh, installed by the MoE parallelizer's apply_cp when context
     # parallelism is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
@@ -1441,7 +1441,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
         # Vision model and projectors are loaded from checkpoint
         # Cast everything to target dtype
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
 
 
 ModelClass = NemotronOmniForConditionalGeneration

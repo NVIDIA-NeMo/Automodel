@@ -77,7 +77,7 @@ class NemotronV3Model(nn.Module):
     This is a hybrid architecture with Mamba2, Attention, MLP, and MoE layers.
     """
 
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "mixer.A_log", "mixer.dt_bias", "mixer.D"]
 
     def __init__(
         self,
@@ -318,7 +318,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     # Hybrid Mamba2/Attention uses NemotronHybridCache, not DynamicCache.
     _is_stateful: bool = True
     main_input_name: str = "input_ids"
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "mixer.A_log", "mixer.dt_bias", "mixer.D"]
 
     # Skip patch_hf_model_for_pp; our forward already handles PP routing.
     _pp_keep_self_forward: bool = True
@@ -1205,7 +1205,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 for sublayer in self.mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
 
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
 
 
 NemotronHForCausalLM.parallelizer = PARALLELIZER

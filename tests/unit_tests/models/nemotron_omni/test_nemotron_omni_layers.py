@@ -200,23 +200,36 @@ def test_registry_v2_entry_removed():
 
 
 def test_initialize_weights_preserves_sharded_mamba_fp32(tmp_path):
-    """Preserve FP32 storage and values so DCP can initialize fresh optimizer state."""
+    """Preserve FP32 storage and values so DCP can initialize fresh optimizer state.
+
+    The Mamba SSM parameters share one FSDP unit with the bf16 projections; the
+    strict fp32 keywords must restore them by name after the wrapper-level cast.
+    """
     import torch.distributed as dist
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
 
-    from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3MambaFP32Params
+    class TinyMixer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+            self.A_log = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
+            self.dt_bias = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
+            self.D = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+        def fp32_parameters(self) -> tuple[torch.nn.Parameter, ...]:
+            return (self.A_log, self.dt_bias, self.D)
 
     class TinyLanguageModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self._fp32_params = NemotronV3MambaFP32Params(num_heads=4)
+            self.mixer = TinyMixer()
 
         @torch.no_grad()
         def initialize_weights(self, buffer_device=None, dtype=torch.bfloat16):
             # Values deliberately not representable in BF16 expose rounding on a broad cast.
-            for index, parameter in enumerate(self._fp32_params.parameters()):
+            for index, parameter in enumerate(self.mixer.fp32_parameters()):
                 parameter.fill_(0.1234567 + index)
 
     dist.init_process_group("gloo", init_method=f"file://{tmp_path}/init", rank=0, world_size=1)
@@ -226,20 +239,31 @@ def test_initialize_weights_preserves_sharded_mamba_fp32(tmp_path):
         model.language_model = TinyLanguageModel()
         model.vision_model = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
         mesh = init_device_mesh("cpu", (1,))
-        fully_shard(model.language_model._fp32_params, mesh=mesh)
         fully_shard(model, mesh=mesh)
 
         model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
 
-        for index, parameter in enumerate(model.language_model._fp32_params.parameters()):
+        for index, parameter in enumerate(model.language_model.mixer.fp32_parameters()):
             local = parameter.to_local()
             assert parameter.dtype == torch.float32
             assert local.dtype == torch.float32
             torch.testing.assert_close(local, torch.full_like(local, 0.1234567 + index), rtol=0, atol=0)
             parameter.grad = torch.zeros_like(parameter)
             parameter.grad = None
+        assert model.language_model.mixer.in_proj.weight.dtype == torch.bfloat16
         assert model.vision_model.weight.dtype == torch.bfloat16
         state = get_optimizer_state_dict(model, torch.optim.AdamW(model.parameters()))
         assert set(state["state"]) == set(dict(model.named_parameters()))
     finally:
         dist.destroy_process_group()
+
+
+def test_omni_strict_fp32_tokens_match_the_shared_mamba_contract():
+    """Omni reuses NemotronH mixers, so its strict fp32 tokens must be the V3 ones."""
+    from nemo_automodel.components.models.nemotron_omni.model import NemotronOmniForConditionalGeneration
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+    assert set(NemotronOmniForConditionalGeneration._keep_in_fp32_modules_strict) == set(
+        NemotronHForCausalLM._keep_in_fp32_modules_strict
+    )
+    assert "_fp32_params" not in NemotronOmniForConditionalGeneration._keep_in_fp32_modules_strict

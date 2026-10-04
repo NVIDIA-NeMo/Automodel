@@ -58,7 +58,7 @@ model:
     language_model_only: true
   trust_remote_code: false
   load_base_model: true
-  torch_dtype: bfloat16
+  dtype: float32
   use_liger_kernel: false
   use_sdpa_patching: false
   backend:

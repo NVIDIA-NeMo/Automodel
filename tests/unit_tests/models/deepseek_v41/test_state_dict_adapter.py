@@ -154,7 +154,7 @@ def test_released_projection_names_and_grouped_experts_roundtrip() -> None:
     assert "model.layers.0.attn_hc.fn" in native
     assert "model.layers.0.ffn_hc.scale" in native
     assert "model.layers.0.ffn.gate.e_score_correction_bias" in native
-    assert "model.layers.0.attn.sinks_param.weight" in native
+    assert "model.layers.0.attn.attn_sink" in native
     assert "model.layers.0.attn.compressor.norm.weight" in native
     assert "model.layers.0.ffn.shared_experts.gate_proj.weight" in native
     assert "model.hc_head" not in native
@@ -431,7 +431,7 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size
         for released, native, value in (
             (
                 "layers.0.attn.attn_sink",
-                "model.layers.0.attn.sinks_param.weight",
+                "model.layers.0.attn.attn_sink",
                 torch.tensor([1.00123, -0.33337, 2.00456, -3.00091]),
             ),
             (

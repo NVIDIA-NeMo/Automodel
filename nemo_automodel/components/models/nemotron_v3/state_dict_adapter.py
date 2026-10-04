@@ -26,32 +26,15 @@ from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateD
 
 logger = logging.getLogger(__name__)
 
-_MAMBA_FP32_PARAMS_TO_BARE = re.compile(r"(\.mixer)\._fp32_params\.")
 _MAMBA_FP32_PARAM_NAMES = ("A_log", "dt_bias", "D")
 
 
-def _strip_mamba_fp32_holder_key(key: str) -> str:
-    return _MAMBA_FP32_PARAMS_TO_BARE.sub(r"\1.", key)
-
-
-def _route_mamba_fp32_holder_key(key: str) -> str:
-    if "._fp32_params." in key or ".mixer." not in key:
-        return key
-    head, tail = key.rsplit(".mixer.", 1)
-    if tail not in _MAMBA_FP32_PARAM_NAMES:
-        return key
-    return f"{head}.mixer._fp32_params.{tail}"
-
-
 def _is_mamba_fp32_state_key(key: str) -> bool:
+    """Return whether ``key`` names a Mamba SSM parameter that is stored in fp32."""
     if ".mixer." not in key:
         return False
     _, tail = key.rsplit(".mixer.", 1)
-    if tail in _MAMBA_FP32_PARAM_NAMES:
-        return True
-    if tail.startswith("_fp32_params."):
-        return tail[len("_fp32_params.") :] in _MAMBA_FP32_PARAM_NAMES
-    return False
+    return tail in _MAMBA_FP32_PARAM_NAMES
 
 
 def _upcast_mamba_fp32_state_tensor(key: str, value: Any) -> Any:
@@ -130,7 +113,6 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
     def _native_key_to_hf(self, key: str, *, v4_compatible: bool = False) -> str:
         """Normalize a native Nemotron V3 key to its public HF namespace."""
-        key = _strip_mamba_fp32_holder_key(key)
         # Base checkpoints may still use the remote-code backbone namespace.
         # Default PEFT exports target the built-in Transformers v5 model, whose
         # modules live under model regardless of the base checkpoint's keys.
@@ -157,7 +139,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """
         if v4_compatible:
             return self._native_key_to_hf(module_name, v4_compatible=True)
-        return _strip_mamba_fp32_holder_key(module_name)
+        return module_name
 
     def _hf_key_to_native(self, key: str) -> str:
         """Normalize a public HF Nemotron V3 key to its native namespace."""
@@ -272,8 +254,6 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         for key in list(backbone_state_dict.keys()):
             value = backbone_state_dict.pop(key)
             new_key = self._hf_key_to_native(key)
-
-            new_key = _route_mamba_fp32_holder_key(new_key)
             renamed_state_dict[new_key] = _upcast_mamba_fp32_state_tensor(new_key, value)
 
         # Then merge experts using the mixin method. Dense Nemotron-H variants have no
@@ -290,7 +270,6 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             stripped: dict[str, Any] = {}
             for key, value in mtp_state_dict.items():
                 stripped_key = key[len("mtp.") :] if key.startswith("mtp.") else key
-                stripped_key = _route_mamba_fp32_holder_key(stripped_key)
                 stripped[stripped_key] = _upcast_mamba_fp32_state_tensor(stripped_key, value)
             # reset_view_loaded_keys=False: this is the second merge of a single from_hf (after the
             # backbone merge above), so accumulate MTP view-loaded keys onto the backbone's record.
@@ -329,7 +308,6 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         # the standard expert-split path with the prefix overridden so
         # emitted HF keys stay under ``mtp.`` instead of ``backbone.``.
         if fqn.startswith("mtp."):
-            fqn = _strip_mamba_fp32_holder_key(fqn)
             expert_split = (
                 None
                 if self.moe_config is None

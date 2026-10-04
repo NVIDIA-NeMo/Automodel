@@ -28,7 +28,6 @@ from transformers.activations import ACT2FN
 from nemo_automodel.components.attention.dflash_mask import create_dflash_sdpa_mask
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v4.layers import (
-    DeepseekV4FP32Parameter,
     DeepseekV4GroupedLinear,
     DeepseekV4RotaryEmbedding,
     _apply_partial_rope,
@@ -100,7 +99,7 @@ class DeepseekV4DSparkAttention(nn.Module):
             config.o_groups,
         )
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
-        self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
+        self.sinks = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
 
     def forward(
         self,

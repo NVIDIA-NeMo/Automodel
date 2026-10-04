@@ -947,6 +947,8 @@ class TestNemotronHModelParallelizer:
 class _MockQwen35Model(nn.Module):
     """Minimal Qwen3.5-shaped model: a decoder ``layers`` list under ``model``."""
 
+    _keep_in_fp32_modules_strict = ["linear_attn.A_log", "linear_attn.dt_bias"]
+
     def __init__(self):
         super().__init__()
         self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=64)
@@ -992,6 +994,8 @@ class TestQwen3_5ModelParallelizer:
                 self.vision_tower.layers = nn.ModuleList([nn.Linear(10, 10)])
 
         class MockQwen35Model(nn.Module):
+            _keep_in_fp32_modules_strict = ["linear_attn.A_log", "linear_attn.dt_bias"]
+
             def __init__(self):
                 super().__init__()
                 self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=64)
@@ -1069,6 +1073,11 @@ class TestQwen3_5ModelParallelizer:
         layer_calls = fully_shard_by_dtype.call_args_list
         assert [call.args[0] for call in layer_calls] == list(model.model.layers)
         assert all(call.kwargs["model_parallelizer"] is strategy for call in layer_calls)
+        # The strict fp32 tokens come from the model, not from the sidecar.
+        assert all(
+            call.kwargs["fp32_compute_module_names"] == ("linear_attn.A_log", "linear_attn.dt_bias")
+            for call in layer_calls
+        )
         assert custom_fully_shard.call_args_list[-1].args[0] is model
 
 

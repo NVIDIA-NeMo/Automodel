@@ -15,6 +15,8 @@ Follow the [installation instructions](/get-started/installation), then run the 
 automodel examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml --nproc-per-node 8
 ```
 
+Full-parameter FSDP2 training requires fp32 parameter storage: set `model.dtype: float32` and keep `mp_policy.param_dtype: bfloat16`. The model's fp32 parameters (the router `mlp.gate.weight`) then stay in fp32 inside each layer's FSDP unit; bf16 storage fails at sharding time.
+
 ## Choose a Workflow
 
 | Goal | Start Here |

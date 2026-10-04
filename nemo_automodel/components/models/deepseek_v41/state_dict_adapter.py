@@ -34,7 +34,6 @@ Key mapping (HF -> internal):
   head.weight                            -> lm_head.weight
   layers.{i}.attn_norm.weight            -> model.layers.{i}.attn_norm.weight
   layers.{i}.ffn_norm.weight             -> model.layers.{i}.ffn_norm.weight
-  layers.{i}.attn.attn_sink              -> model.layers.{i}.attn.sinks_param.weight
   layers.{i}.attn.*                      -> model.layers.{i}.attn.*   (compressor.*, indexer.* keep their names)
   layers.{i}.ffn.gate.bias               -> model.layers.{i}.ffn.gate.e_score_correction_bias
   layers.{i}.ffn.gate.weight             -> model.layers.{i}.ffn.gate.weight
@@ -78,8 +77,6 @@ def _native_key(key: str) -> str:
         return "model.embed_tokens." + key.removeprefix("embed.")
     if key.startswith("head."):
         return "lm_head." + key.removeprefix("head.")
-    if key.endswith(".attn.attn_sink"):
-        key = key.removesuffix(".attn_sink") + ".sinks_param.weight"
     match = re.fullmatch(r"layers\.(\d+)\.hc_(attn|ffn)_(fn|base|scale)", key)
     if match:
         return f"model.layers.{match[1]}.{match[2]}_hc.{match[3]}"
@@ -103,8 +100,6 @@ def _released_key(key: str) -> str:
     if key.startswith("lm_head."):
         return "head." + key.removeprefix("lm_head.")
     key = key.removeprefix("model.")
-    if key.endswith(".attn.sinks_param.weight"):
-        key = key.removesuffix(".sinks_param.weight") + ".attn_sink"
     match = re.fullmatch(r"layers\.(\d+)\.(attn|ffn)_hc\.(fn|base|scale)", key)
     if match:
         return f"layers.{match[1]}.hc_{match[2]}_{match[3]}"

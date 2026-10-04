@@ -34,11 +34,8 @@ _FP8_WEIGHT = re.compile(
 )
 _SPARSE_O_WEIGHT = re.compile(r"^model\.language_model\.layers\.(\d+)\.self_attn\.o_proj\.weight$")
 _HC_KEY = re.compile(r"^(model\.language_model\.layers\.\d+)\.hc_(attn|ffn)_(fn|base|scale)$")
-_NATIVE_HC_KEY = re.compile(
-    r"^(model\.language_model\.layers\.\d+)\.(attn_hc|ffn_hc)(?:\._fp32_params)?\.(fn|base|scale)$"
-)
-_KDA_PARAMETER = re.compile(r"^(model\.language_model\.layers\.\d+\.self_attn)\.(A_log|dt_bias)$")
-_NATIVE_KDA_PARAMETER = re.compile(r"^(model\.language_model\.layers\.\d+\.self_attn)\._fp32_params\.(A_log|dt_bias)$")
+_NATIVE_HC_KEY = re.compile(r"^(model\.language_model\.layers\.\d+)\.(attn_hc|ffn_hc)\.(fn|base|scale)$")
+_FP32_PARAMETER_SUFFIXES = (".A_log", ".dt_bias", ".e_score_correction_bias")
 
 
 def _scale_shape(weight: torch.Tensor) -> tuple[int, int]:
@@ -158,11 +155,7 @@ def _hf_to_native_key(key: str) -> str:
     match = _HC_KEY.match(key)
     if match:
         site = "attn_hc" if match.group(2) == "attn" else "ffn_hc"
-        holder = "._fp32_params" if match.group(3) in ("base", "scale") else ""
-        return f"{match.group(1)}.{site}{holder}.{match.group(3)}"
-    match = _KDA_PARAMETER.match(key)
-    if match:
-        return f"{match.group(1)}._fp32_params.{match.group(2)}"
+        return f"{match.group(1)}.{site}.{match.group(3)}"
     return key
 
 
@@ -171,9 +164,6 @@ def _native_to_hf_key(key: str) -> str:
     if match:
         site = "attn" if match.group(2) == "attn_hc" else "ffn"
         return f"{match.group(1)}.hc_{site}_{match.group(3)}"
-    match = _NATIVE_KDA_PARAMETER.match(key)
-    if match:
-        return f"{match.group(1)}.{match.group(2)}"
     return key
 
 
@@ -229,7 +219,7 @@ class Glm5NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         device_mesh: DeviceMesh | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Dequantize, drop MTP, route flat parameters and aggregate experts."""
+        """Dequantize, drop MTP, rename flat mHC parameters and aggregate experts."""
         del kwargs
         layer_limit = self.config.text_config.num_hidden_layers
         mtp_prefix = f"model.language_model.layers.{layer_limit}."
@@ -240,9 +230,7 @@ class Glm5NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         for key in list(hf_state_dict):
             value = hf_state_dict.pop(key)
             native_key = _hf_to_native_key(key)
-            if native_key.endswith("._fp32_params.A_log"):
-                value = value.float()
-            elif native_key.endswith("._fp32_params.dt_bias") or native_key.endswith(".e_score_correction_bias"):
+            if native_key.endswith(_FP32_PARAMETER_SUFFIXES):
                 value = value.float()
             hf_state_dict[native_key] = value
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)

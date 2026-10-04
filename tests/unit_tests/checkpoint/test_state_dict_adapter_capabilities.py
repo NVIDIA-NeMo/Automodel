@@ -161,7 +161,7 @@ def test_write_through_adapters_expose_aliasing_destinations(
         adapter,
         {
             "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
-            "model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(2, dtype=torch.float32),
+            "model.layers.0.linear_attn.A_log": torch.zeros(2, dtype=torch.float32),
             "model.language_model.layers.0.mlp.experts.gate_and_up_projs": torch.zeros(2, 2, 4),
         },
     )
@@ -186,7 +186,7 @@ def test_low_memory_dcp_grouped_adapters_preserve_non_expert_storage_and_require
         adapter,
         {
             "model.layers.0.input_layernorm.weight": torch.zeros(2, dtype=torch.bfloat16),
-            "model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(2, dtype=torch.float32),
+            "model.layers.0.linear_attn.A_log": torch.zeros(2, dtype=torch.float32),
             "model.layers.0.mlp.gate.e_score_correction_bias": torch.zeros(2, dtype=torch.float32),
         },
     )

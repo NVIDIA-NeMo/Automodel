@@ -159,6 +159,11 @@ def patch_fsdp_accumulated_grad_guard() -> None:
     except Exception:
         return
 
+    # PyTorch >= 2.15 accumulates unsharded gradients without this hook and no
+    # longer dereferences ``_unsharded_param`` in deferred post-backward.
+    if not hasattr(FSDPParam, "to_accumulated_grad_if_needed"):
+        return
+
     orig = FSDPParam.to_accumulated_grad_if_needed
     if getattr(orig, "_nemo_automodel_guarded", False):
         return

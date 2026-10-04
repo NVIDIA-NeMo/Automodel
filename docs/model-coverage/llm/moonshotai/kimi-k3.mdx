@@ -19,6 +19,8 @@ uv run automodel --nproc-per-node=4 examples/llm_finetune/kimi/k3_hellaswag.yaml
 
 See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for distributed MoE configuration.
 
+Full-parameter FSDP2 training requires fp32 parameter storage: set `model.dtype: float32` and keep `mp_policy.param_dtype: bfloat16`. The model's fp32 parameters (the KDA `A_log`, `dt_bias`, short-convolution, and `o_norm` weights) then stay in fp32 inside each layer's FSDP unit; bf16 storage fails at sharding time.
+
 ## Model Reference
 
 ### Model Architecture

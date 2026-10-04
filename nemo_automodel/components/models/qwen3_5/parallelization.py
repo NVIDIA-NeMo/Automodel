@@ -29,14 +29,13 @@ from nemo_automodel.components.distributed.multimodal_fsdp import (
     normalize_frozen_multimodal_sharding,
 )
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.models.common.utils import _get_strict_fp32_module_keywords
 
 logger = logging.getLogger(__name__)
 
 
 class Qwen3_5ModelParallelizer(ModelParallelizer):
-    """Keep mixed-dtype GatedDeltaNet parameters in dtype-uniform FSDP units."""
-
-    _fp32_compute_module_names: tuple[str, ...] = ("_fp32_params",)
+    """Shard each decoder layer as one FSDP unit with fp32 GatedDeltaNet gate parameters."""
 
     def _apply_fsdp_sharding(
         self,
@@ -50,9 +49,28 @@ class Qwen3_5ModelParallelizer(ModelParallelizer):
         reshard_after_forward: bool | None = None,
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
         ignored_multimodal_params: set[nn.Parameter] | None = None,
+        fp32_compute_module_names: tuple[str, ...] | None = None,
     ) -> None:
-        """Shard each decoder layer into dtype-uniform FSDP groups."""
+        """Shard each decoder layer as one FSDP unit whose strict fp32 parameters compute in fp32.
+
+        Args:
+            module: Root model on the first call; its ``_keep_in_fp32_modules_strict``
+                provides the fp32 parameter-name tokens. Recursive calls receive
+                submodules together with the resolved ``fp32_compute_module_names``.
+            mesh: Device mesh for FSDP sharding.
+            mp_policy: Mixed-precision policy of the enclosing boundary.
+            offload_policy: FSDP offload policy.
+            enable_fsdp2_prefetch: Unused; layer units rely on the FSDP2 defaults.
+            fsdp2_backward_prefetch_depth: Unused.
+            fsdp2_forward_prefetch_depth: Unused.
+            reshard_after_forward: Optional override for every layer unit.
+            frozen_multimodal_sharding: Policy for fully frozen multimodal modules.
+            ignored_multimodal_params: Accumulator for replicated frozen multimodal parameters.
+            fp32_compute_module_names: Resolved strict fp32 tokens; ``None`` on the root call.
+        """
         del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth
+        if fp32_compute_module_names is None:
+            fp32_compute_module_names = tuple(_get_strict_fp32_module_keywords(module))
         frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
         pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
 
@@ -70,6 +88,7 @@ class Qwen3_5ModelParallelizer(ModelParallelizer):
                     reshard_after_forward=reshard_after_forward,
                     frozen_multimodal_sharding=frozen_multimodal_sharding,
                     ignored_multimodal_params=ignored_multimodal_params,
+                    fp32_compute_module_names=fp32_compute_module_names,
                 )
 
             for index, (_, child) in enumerate(flat_items):
@@ -84,7 +103,7 @@ class Qwen3_5ModelParallelizer(ModelParallelizer):
                     mesh,
                     mp_policy,
                     offload_policy,
-                    fp32_compute_module_names=self._fp32_compute_module_names,
+                    fp32_compute_module_names=fp32_compute_module_names,
                     reshard_after_forward=layer_reshard_after_forward,
                     model_parallelizer=self,
                 )
@@ -107,6 +126,7 @@ class Qwen3_5ModelParallelizer(ModelParallelizer):
                 reshard_after_forward=reshard_after_forward,
                 frozen_multimodal_sharding=frozen_multimodal_sharding,
                 ignored_multimodal_params=ignored_multimodal_params,
+                fp32_compute_module_names=fp32_compute_module_names,
             )
 
     def _apply(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):

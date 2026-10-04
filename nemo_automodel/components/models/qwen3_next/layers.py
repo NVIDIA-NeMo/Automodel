@@ -38,72 +38,29 @@ from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
-class _SSMGateParam:
-    """Get-only descriptor exposing a param from ``_fp32_params`` when present."""
-
-    def __init__(self, name: str):
-        self.name = name
-
-    def __get__(self, obj, owner=None):
-        if obj is None:
-            return self
-        holder = obj._modules.get("_fp32_params")
-        if holder is not None:
-            return getattr(holder, self.name)
-        param = obj._parameters.get(self.name)
-        if param is not None:
-            return param
-        raise AttributeError(f"{type(obj).__name__!s} has no parameter {self.name!r}")
-
-
-class Qwen3NextSSMGate(nn.Module):
-    """Owns Qwen3-Next fp32 SSM-gating params and computes the decay gate."""
-
-    def __init__(self, num_v_heads: int, dtype: torch.dtype = torch.float32):
-        super().__init__()
-        self.A_log = nn.Parameter(torch.empty(num_v_heads, dtype=dtype))
-        self.dt_bias = nn.Parameter(torch.empty(num_v_heads, dtype=dtype))
-
-    def forward(self, a: torch.Tensor) -> torch.Tensor:
-        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-
-
-def _install_ssm_gate(mod: nn.Module, fp32_dtype: torch.dtype = torch.float32) -> Qwen3NextSSMGate:
-    """Move HF-created bare ``A_log``/``dt_bias`` into a native fp32 holder."""
-    num_v_heads = mod._parameters["A_log"].shape[0]
-    gate = Qwen3NextSSMGate(num_v_heads, dtype=fp32_dtype)
-    for pname in ("A_log", "dt_bias"):
-        param = mod._parameters.pop(pname)
-        if param.dtype != fp32_dtype:
-            param.data = param.data.to(fp32_dtype)
-        setattr(gate, pname, param)
-    mod.add_module("_fp32_params", gate)
-    return gate
-
-
 class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
-    """Qwen3-Next GatedDeltaNet that computes the decay gate via an fp32 holder.
+    """Qwen3-Next GatedDeltaNet with fp32-resident ``A_log`` / ``dt_bias``.
 
     HF's ``Qwen3NextGatedDeltaNet`` computes the gate inline as
-    ``g = -exp(A_log) * softplus(a + dt_bias)`` using the bare ``A_log`` / ``dt_bias``
-    parameters. ``A_log`` and ``dt_bias`` are intrinsically fp32 (``A_log`` is
-    exponentiated, so bf16 rounding becomes a proportional error on the decay rate that
-    the recurrence compounds across the sequence).
+    ``g = -exp(A_log) * softplus(a + dt_bias)``. ``A_log`` and ``dt_bias`` are
+    intrinsically fp32 (``A_log`` is exponentiated, so bf16 rounding becomes a
+    proportional error on the decay rate that the recurrence compounds across the
+    sequence).
 
-    The constructor moves those params into a native ``_fp32_params`` holder so they
-    are fp32 resident before any dtype cast or FSDP wrapping. To keep the gate
-    computation in fp32 -- and to make FSDP's unshard/reshard + gradient
-    reduce-scatter fire for that unit -- the gate is computed inside the holder's
-    forward. This subclass overrides ``forward`` to route the gate through
-    ``self._compute_gate(a)`` while reproducing the rest of HF's forward verbatim.
+    The constructor rebuilds both parameters in fp32 under their HF names, independent
+    of the model dtype. ``Qwen3NextForCausalLM._keep_in_fp32_modules_strict`` names them,
+    so ``cast_model_to_dtype`` restores them to fp32 and FSDP2 keeps them computing in
+    fp32 under a bf16 ``param_dtype`` (see ``fully_shard_by_dtype``). ``_compute_gate``
+    casts its own inputs to fp32 because FSDP casts the block's inputs to bf16; ``forward``
+    reproduces HF's forward verbatim apart from routing the gate through it.
     """
-
-    A_log = _SSMGateParam("A_log")
-    dt_bias = _SSMGateParam("dt_bias")
 
     def __init__(self, config: Qwen3NextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-        _install_ssm_gate(self)
+        # HF creates these in the default dtype. Pin them to fp32 storage regardless of
+        # the model dtype (values preserved).
+        self.A_log = nn.Parameter(self.A_log.detach().to(torch.float32))
+        self.dt_bias = nn.Parameter(self.dt_bias.detach().to(torch.float32))
         self._bind_kernels()
 
     def _bind_kernels(self) -> None:
@@ -135,11 +92,18 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
 
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
-        """Compute the decay gate ``g`` in fp32, via the holder when it exists."""
-        holder = self._modules.get("_fp32_params")
-        if holder is not None:
-            return holder(a)
-        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        """Compute the decay gate ``g = -exp(A_log) * softplus(a + dt_bias)`` in fp32.
+
+        Casts ``a`` to fp32 itself: under FSDP mixed precision the block's inputs
+        arrive in bf16 while ``A_log`` / ``dt_bias`` stay fp32.
+
+        Args:
+            a: Pre-activation of the time-step projection, shape ``[batch, seq, num_v_heads]``.
+
+        Returns:
+            fp32 gate with the same shape as ``a``.
+        """
+        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
 
     def forward(  # pragma: no cover - verbatim HF GDN forward; needs CUDA conv1d/FLA kernels (GPU/functional only)
         self,
@@ -148,7 +112,7 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
         attention_mask: torch.Tensor | None = None,
     ):
         # Mirrors transformers ``Qwen3NextGatedDeltaNet.forward`` with the gate routed
-        # through ``self._compute_gate(a)`` so A_log/dt_bias stay fp32 under FSDP.
+        # through ``self._compute_gate(a)`` so the decay gate is computed in fp32.
         from transformers.models.qwen3_next.modeling_qwen3_next import apply_mask_to_padding_states
 
         # transformers 5.15 dropped this helper's shape guards; it documents a 2D padding
@@ -210,8 +174,8 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
         value = value.reshape(value.shape[0], value.shape[1], -1, self.head_v_dim)
 
         beta = b.sigmoid()
-        # Gate is computed in fp32 (via the _fp32_params holder when present) so the
-        # exponentiated decay rate keeps full precision under bf16 compute.
+        # Gate is computed in fp32 so the exponentiated decay rate keeps full precision
+        # under bf16 compute.
         g = self._compute_gate(a)
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)

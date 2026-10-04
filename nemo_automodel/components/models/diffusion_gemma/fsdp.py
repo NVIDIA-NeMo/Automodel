@@ -25,8 +25,7 @@ layer at once on each forward — a large activation-memory spike for a model th
 runs the shared stack twice (causal encode + bidirectional decode, plus an
 optional self-conditioning pass).
 
-``fully_shard_diffusion_gemma`` mirrors ``deepseek_v4``'s
-``fully_shard_deepseek_v4``: it makes ``moe.experts`` its **own** FSDP unit
+``fully_shard_diffusion_gemma`` makes ``moe.experts`` its **own** FSDP unit
 (sharded dim-0 on the dp mesh) *before* wrapping the rest of the decoder layer.
 Consequences:
 

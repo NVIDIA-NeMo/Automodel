@@ -105,7 +105,7 @@ def _fixture(quantized: bool) -> tuple[DeepseekV41Config, dict[str, torch.Tensor
         "model.embed_tokens.weight": "embed.weight",
         "model.norm.weight": "norm.weight",
         "lm_head.weight": "head.weight",
-        "model.layers.0.attn.sinks_param.weight": "layers.0.attn.attn_sink",
+        "model.layers.0.attn.attn_sink": "layers.0.attn.attn_sink",
         "model.layers.0.ffn.gate.e_score_correction_bias": "layers.0.ffn.gate.bias",
     }
     for suffix in (
@@ -135,7 +135,7 @@ def _fixture(quantized: bool) -> tuple[DeepseekV41Config, dict[str, torch.Tensor
     for native, released in names.items():
         shape = schema[native].shape
         strict = native == "lm_head.weight" or any(
-            part in native for part in ("_hc.", "sinks_param", "e_score_correction_bias", "bias_vl")
+            part in native for part in ("_hc.", "attn_sink", "e_score_correction_bias", "bias_vl")
         )
         dtype = torch.float32 if strict else torch.bfloat16
         if released in dense_quantized:

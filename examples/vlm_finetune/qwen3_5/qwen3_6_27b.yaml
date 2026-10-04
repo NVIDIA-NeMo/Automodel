@@ -43,7 +43,7 @@ model:
     rms_norm: torch
     rope_fusion: false
   attn_implementation: sdpa
-  torch_dtype: bfloat16
+  dtype: float32
   text_config:
     # Set to 0 to disable dense Qwen3.6 VLM MTP.
     mtp_num_hidden_layers: 1

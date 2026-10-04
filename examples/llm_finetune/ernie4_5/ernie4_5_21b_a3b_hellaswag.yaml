@@ -37,7 +37,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: baidu/ERNIE-4.5-21B-A3B-PT
-  torch_dtype: bfloat16
+  dtype: float32
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te

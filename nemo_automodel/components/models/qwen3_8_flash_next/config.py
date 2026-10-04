@@ -184,6 +184,11 @@ class Qwen3_8_FlashNextTextConfig(PretrainedConfig):
         self.linear_value_head_dim = linear_value_head_dim
         self.linear_num_key_heads = linear_num_key_heads
         self.linear_num_value_heads = linear_num_value_heads
+        if mamba_ssm_dtype not in ("float32", "torch.float32"):
+            raise ValueError(
+                f"mamba_ssm_dtype={mamba_ssm_dtype!r} is not supported: GatedDeltaNet A_log/dt_bias are "
+                "always stored and computed in fp32 (see _keep_in_fp32_modules_strict)."
+            )
         self.mamba_ssm_dtype = mamba_ssm_dtype
 
         self.decoder_sparse_step = decoder_sparse_step

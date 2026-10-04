@@ -154,23 +154,21 @@ def test_from_hf_upcasts_kda_and_router_fp32_keys(adapter):
 
     native = adapter.from_hf(hf_state)
 
-    assert native["model.layers.0.self_attn._fp32_params.A_log"].dtype is torch.float32
-    assert native["model.layers.0.self_attn._fp32_params.dt_bias"].dtype is torch.float32
+    assert native["model.layers.0.self_attn.A_log"].dtype is torch.float32
+    assert native["model.layers.0.self_attn.dt_bias"].dtype is torch.float32
     assert native["model.layers.1.mlp.gate.e_score_correction_bias"].dtype is torch.float32
 
 
-def test_to_hf_strips_kda_fp32_holder(adapter):
+def test_kda_fp32_keys_round_trip_under_hf_names(adapter):
     native = {
-        "model.layers.0.self_attn._fp32_params.A_log": torch.ones(1, 1, 2, 1, dtype=torch.float32),
-        "model.layers.0.self_attn._fp32_params.dt_bias": torch.ones(8, dtype=torch.float32),
+        "model.layers.0.self_attn.A_log": torch.ones(1, 1, 2, 1, dtype=torch.float32),
+        "model.layers.0.self_attn.dt_bias": torch.ones(8, dtype=torch.float32),
     }
 
     hf_state = adapter.to_hf(native)
 
-    assert "model.layers.0.self_attn.A_log" in hf_state
-    assert "model.layers.0.self_attn.dt_bias" in hf_state
-    assert "model.layers.0.self_attn._fp32_params.A_log" not in hf_state
-    assert "model.layers.0.self_attn._fp32_params.dt_bias" not in hf_state
+    assert set(hf_state) == set(native)
+    assert set(adapter.from_hf(hf_state)) == set(native)
 
 
 def test_to_hf_splits_grouped_experts_back_to_kimi_names(adapter, moe_config):

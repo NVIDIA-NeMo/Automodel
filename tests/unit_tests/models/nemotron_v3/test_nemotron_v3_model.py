@@ -594,7 +594,7 @@ class TestNemotronHForCausalLM:
                 expected[name] = values
 
         assert expected, "Nemotron V3 Mamba layers should create decay parameters"
-        assert all("._fp32_params." in name for name in expected)
+        assert all(".mixer." in name and "_fp32_params" not in name for name in expected)
 
         cast_model_to_dtype(model, torch.bfloat16)
 
@@ -603,6 +603,26 @@ class TestNemotronHForCausalLM:
             assert params[name].dtype == torch.float32
             torch.testing.assert_close(params[name], values)
         assert model.lm_head.weight.dtype == torch.bfloat16
+
+    def test_strict_fp32_tokens_select_exactly_mamba_ssm_params(self, config, backend):
+        """The strict fp32 tokens match the Mamba SSM params (plus the router bias) and nothing else."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention", "mlp", "moe"]
+        config.num_hidden_layers = 4
+        model = NemotronHForCausalLM(config, backend=backend)
+        tokens = model._keep_in_fp32_modules_strict
+
+        tensor_names = [name for name, _ in model.named_parameters()] + [name for name, _ in model.named_buffers()]
+        matched = {name for name in tensor_names if any(token in name for token in tokens)}
+        expected = {f"model.layers.0.mixer.{suffix}" for suffix in ("A_log", "dt_bias", "D")}
+        expected |= {name for name in tensor_names if name.endswith("e_score_correction_bias")}
+        assert matched == expected
+
+        params = dict(model.named_parameters())
+        assert all(params[name].dtype == torch.float32 for name in expected if name in params)
+        # The tokens name parameters, so module-name matching (unsharded restore path) selects no module.
+        assert not any(any(token in name for token in tokens) for name, _ in model.named_modules())
 
     def test_model_class_export(self):
         """Test that ModelClass is exported correctly."""

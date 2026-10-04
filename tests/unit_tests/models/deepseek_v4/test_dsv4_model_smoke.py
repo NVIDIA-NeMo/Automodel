@@ -27,6 +27,7 @@ import pytest
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
+from nemo_automodel.components.distributed.parallelizer_utils import _HAS_PARAM_DTYPE_OVERRIDE
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.mtp import MTPConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -46,6 +47,10 @@ pytestmark = pytest.mark.timeout(70)
 # though the model parameters live on the CPU.  Gate the forward-running
 # smoke tests on CUDA availability — the rest of the file (HC params,
 # weight shapes, attn-sink dtype) is pure metadata and runs everywhere.
+_REQUIRES_PARAM_DTYPE_OVERRIDE = pytest.mark.skipif(
+    not _HAS_PARAM_DTYPE_OVERRIDE, reason="fp32 compute inside a bf16 FSDP unit needs torch >= 2.15"
+)
+
 _REQUIRES_CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="MoE.forward unconditionally allocates torch.cuda.Stream() for shared experts",
@@ -193,7 +198,8 @@ class TestDeepseekV4ModelSmoke:
         assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(TwoDimMesh()) is None
         assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(NamedOneDimMesh()) is named_hca_group
 
-    def test_dsv4_fsdp_uses_bf16_compute_for_uniform_fp32_master_weights(self, monkeypatch):
+    @_REQUIRES_PARAM_DTYPE_OVERRIDE
+    def test_dsv4_block_is_one_bf16_unit_with_fp32_contract_parameters(self, monkeypatch):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
         model = _make_model(cfg)
         block = model.model.layers["0"]
@@ -225,20 +231,34 @@ class TestDeepseekV4ModelSmoke:
 
         dsv4_fsdp.fully_shard_deepseek_v4(
             block,
+            fp32_compute_module_names=tuple(model._keep_in_fp32_modules_strict),
             mesh=FakeMesh(),
             mp_policy=input_policy,
-            offload_policy=object(),
+            offload_policy=None,
         )
 
         assert block.self_attn.compressor._hca_param_sync_group is hca_group
-        assert calls[-1][0] is block
-        assert calls[-1][1]["mp_policy"].param_dtype == torch.bfloat16
-        assert calls[-1][1]["mp_policy"].reduce_dtype == torch.float32
-        assert any(module is not block and kwargs["mp_policy"].param_dtype == torch.float32 for module, kwargs in calls)
+        assert [module for module, _ in calls] == [block]
+        policy = calls[0][1]["mp_policy"]
+        assert policy.param_dtype == torch.bfloat16
+        assert policy.reduce_dtype == torch.float32
+        assert policy.output_dtype == torch.bfloat16
+        fp32_params = (
+            block.attn_hc.fn,
+            block.ffn_hc.scale,
+            block.self_attn.sinks,
+            block.self_attn.compressor.wkv.weight,
+            block.self_attn.compressor.wgate.weight,
+            block.self_attn.compressor.ape,
+        )
+        assert all(policy.param_dtype_override_fn(param) == torch.float32 for param in fp32_params)
+        assert policy.param_dtype_override_fn(block.self_attn.wq_a.weight) is None
+        assert policy.param_dtype_override_fn(block.mlp.experts.gate_and_up_projs) is None
 
-    def test_dsv4_fsdp_preserves_explicit_all_fp32_compute_fast_path(self, monkeypatch):
+    def test_dsv4_fsdp_preserves_explicit_all_fp32_compute(self, monkeypatch):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
-        block = _make_model(cfg).model.layers["0"]
+        model = _make_model(cfg)
+        block = model.model.layers["0"]
         calls = []
 
         def fake_fully_shard(module, **kwargs):
@@ -255,46 +275,26 @@ class TestDeepseekV4ModelSmoke:
 
         dsv4_fsdp.fully_shard_deepseek_v4(
             block,
+            fp32_compute_module_names=tuple(model._keep_in_fp32_modules_strict),
             mesh=object(),
             mp_policy=input_policy,
-            offload_policy=object(),
+            offload_policy=None,
         )
 
         assert len(calls) == 1
         assert calls[0][0] is block
-        assert calls[0][1]["mp_policy"].param_dtype == torch.float32
-        assert calls[0][1]["mp_policy"].reduce_dtype == torch.float32
+        assert calls[0][1]["mp_policy"] is input_policy
 
-    def test_dsv4_fsdp_wraps_fp32_islands_without_ignored_trainable_tensors(self, monkeypatch):
-        cfg = _tiny_config(
-            num_hidden_layers=1,
-            num_hash_layers=0,
-            compress_ratios=[4],
-            torch_dtype="bfloat16",
-        )
-        backend = BackendConfig(
-            attn="sdpa",
-            linear="torch",
-            rms_norm="torch",
-            rope_fusion=False,
-            enable_hf_state_dict_adapter=False,
-            dispatcher="torch",
-            experts="torch_mm",
-        )
-        old_default_dtype = torch.get_default_dtype()
-        try:
-            torch.set_default_dtype(torch.bfloat16)
-            model = DeepseekV4ForCausalLM(cfg, backend=backend)
-        finally:
-            torch.set_default_dtype(old_default_dtype)
-
+    @_REQUIRES_PARAM_DTYPE_OVERRIDE
+    def test_dsv4_block_unit_forwards_ignored_expert_parameters(self, monkeypatch):
+        # fp32 master weights: FSDP2 keeps one storage dtype per unit.
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[4])
+        model = _make_model(cfg)
         block = model.model.layers["0"]
-        module_names = {id(module): name for name, module in block.named_modules()}
-        module_names[id(block)] = "<block>"
         calls = []
 
         def fake_fully_shard(module, **kwargs):
-            calls.append((module_names.get(id(module), "<unknown>"), kwargs))
+            calls.append((module, kwargs))
             return module
 
         monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
@@ -319,39 +319,112 @@ class TestDeepseekV4ModelSmoke:
 
         dsv4_fsdp.fully_shard_deepseek_v4(
             block,
+            fp32_compute_module_names=tuple(model._keep_in_fp32_modules_strict),
             mesh=FakeMesh(),
             mp_policy=input_policy,
-            offload_policy=object(),
+            offload_policy=None,
+            reshard_after_forward=True,
             ignored_params=ignored_expert_params,
         )
 
         assert block.self_attn.compressor._hca_param_sync_group is hca_group
-        calls_by_name = {name: kwargs for name, kwargs in calls}
-        expected_fp32_modules = {
-            "attn_hc",
-            "ffn_hc",
-            "self_attn.sinks_param",
-            "self_attn.compressor.wkv",
-            "self_attn.compressor.wgate",
-            "self_attn.compressor.ape_param",
-            "self_attn.compressor.indexer.wkv",
-            "self_attn.compressor.indexer.wgate",
-            "self_attn.compressor.indexer.ape_param",
-        }
-        assert expected_fp32_modules.issubset(calls_by_name)
-        for name in expected_fp32_modules:
-            assert calls_by_name[name]["mp_policy"].param_dtype == torch.float32
-            assert calls_by_name[name]["mp_policy"].reduce_dtype == torch.float32
+        assert [module for module, _ in calls] == [block]
+        kwargs = calls[0][1]
+        assert kwargs["ignored_params"] == ignored_expert_params
+        assert kwargs["reshard_after_forward"] is True
+        policy = kwargs["mp_policy"]
+        assert policy.param_dtype == torch.bfloat16
+        indexer = block.self_attn.compressor.indexer
+        for param in (indexer.wkv.weight, indexer.wgate.weight, indexer.ape, block.self_attn.sinks):
+            assert policy.param_dtype_override_fn(param) == torch.float32
+        assert policy.param_dtype_override_fn(indexer.wq_b.weight) is None
 
-        parent_ignored = calls_by_name["<block>"]["ignored_params"]
-        assert ignored_expert_params.issubset(parent_ignored)
-        assert len(parent_ignored) == len(ignored_expert_params)
+    def test_dsv4_lm_head_unit_computes_and_returns_fp32(self, monkeypatch):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[0])
+        model = _make_model(cfg)
+        calls = []
 
-    def test_dsv4_fp32_holder_preserves_explicit_no_reshard(self):
-        holder_type = type("DeepseekV4FP32Parameter", (torch.nn.Module,), {})
-        kwargs = {"reshard_after_forward": False, "mesh": object()}
+        def fake_fully_shard(module, **kwargs):
+            calls.append((module, kwargs))
+            return module
 
-        assert dsv4_fsdp._fp32_module_fsdp_kwargs(holder_type(), kwargs) is kwargs
+        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+        input_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+            cast_forward_inputs=False,
+        )
+
+        dsv4_fsdp.fully_shard_deepseek_v4(
+            model.lm_head,
+            fp32_compute_module_names=tuple(model._keep_in_fp32_modules_strict),
+            module_name="lm_head",
+            mesh=object(),
+            mp_policy=input_policy,
+            offload_policy=None,
+        )
+
+        assert [module for module, _ in calls] == [model.lm_head]
+        policy = calls[0][1]["mp_policy"]
+        assert policy.param_dtype == torch.float32
+        assert policy.reduce_dtype == torch.float32
+        assert policy.output_dtype == torch.float32
+        assert policy.cast_forward_inputs is True
+
+    def test_dsv4_lm_head_without_model_level_name_keeps_the_caller_policy(self):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[0])
+        model = _make_model(cfg)
+        input_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+
+        policy = dsv4_fsdp.deepseek_v4_unit_mp_policy(
+            model.lm_head, input_policy, tuple(model._keep_in_fp32_modules_strict)
+        )
+
+        assert policy is input_policy
+
+    def test_strict_fp32_names_match_exactly_the_fp32_parameters(self):
+        cfg = _tiny_config(
+            num_hidden_layers=2,
+            num_hash_layers=0,
+            compress_ratios=[4, 128],
+            torch_dtype="bfloat16",
+        )
+        old_default_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            model = DeepseekV4ForCausalLM(
+                cfg,
+                backend=BackendConfig(
+                    attn="sdpa",
+                    linear="torch",
+                    rms_norm="torch",
+                    rope_fusion=False,
+                    enable_hf_state_dict_adapter=False,
+                    dispatcher="torch",
+                    experts="torch_mm",
+                ),
+            )
+        finally:
+            torch.set_default_dtype(old_default_dtype)
+
+        strict = model._keep_in_fp32_modules_strict
+        pinned = {name for name, _ in model.named_parameters() if any(token in name for token in strict)}
+        fp32 = {name for name, param in model.named_parameters() if param.dtype == torch.float32}
+
+        assert pinned == fp32
+        assert {
+            "model.layers.0.self_attn.sinks",
+            "model.layers.0.self_attn.compressor.ape",
+            "model.layers.0.self_attn.compressor.indexer.ape",
+            "model.layers.0.self_attn.compressor.indexer.wkv.weight",
+            "model.layers.1.self_attn.compressor.wgate.weight",
+            "model.layers.1.attn_hc.fn",
+            "model.hc_head.hc_scale",
+            "lm_head.weight",
+        } <= pinned
+        assert "model.layers.0.self_attn.compressor.indexer.wq_b.weight" not in pinned
+        assert "model.layers.0.self_attn.compressor.kv_norm.weight" not in pinned
 
     def test_reference_fp32_parameters_constructed_before_cast(self):
         cfg = _tiny_config(

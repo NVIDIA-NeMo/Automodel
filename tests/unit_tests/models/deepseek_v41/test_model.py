@@ -32,10 +32,9 @@ from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from nemo_automodel._transformers.capabilities import _is_deepseek_v4
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallelizer_utils import _HAS_PARAM_DTYPE_OVERRIDE, fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
 from nemo_automodel.components.models.deepseek_v41.attention import DeepseekV41AttentionState
 from nemo_automodel.components.models.deepseek_v41.config import (
@@ -399,12 +398,24 @@ def test_v41_uses_unified_moe_parallelization() -> None:
     model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
     assert not _is_deepseek_v4_model(model)
     assert isinstance(get_model_parallelizer(model), ModelParallelizer)
-    assert not dsv4_fsdp._is_deepseek_v4_module(model)
     assert not _is_deepseek_v4(model)
     assert _is_deepseek_v4(SimpleNamespace(config=SimpleNamespace(model_type="deepseek_v4")))
     for layer in model.model.layers.values():
         assert layer.mlp is layer.ffn
         assert all(".mlp." not in name for name in model.state_dict())
+
+
+def test_strict_fp32_names_match_exactly_the_fp32_parameters() -> None:
+    config = _tiny_config()
+    config.text_config.dtype = torch.bfloat16
+    model = DeepseekV41ForCausalLM(config, backend=_backend())
+    strict = model._keep_in_fp32_modules_strict
+    pinned = {name for name, _ in model.named_parameters() if any(token in name for token in strict)}
+    fp32 = {name for name, param in model.named_parameters() if param.dtype == torch.float32}
+
+    assert pinned == fp32
+    assert {"model.layers.0.attn.attn_sink", "model.layers.0.attn_hc.fn", "lm_head.weight"} <= pinned
+    assert "model.layers.0.attn.wq_a.weight" not in pinned
 
 
 def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch.dtype) -> None:
@@ -477,8 +488,11 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("storage_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32_master"])
-def test_fsdp_initialization_preserves_local_storage_dtype_and_checkpoint_values(
-    tmp_path: Path, storage_dtype: torch.dtype
-) -> None:
-    mp.spawn(_fsdp_initialization_worker, args=(str(tmp_path / "rendezvous"), storage_dtype), nprocs=2, join=True)
+@pytest.mark.skipif(not _HAS_PARAM_DTYPE_OVERRIDE, reason="fp32 compute inside a bf16 FSDP unit needs torch >= 2.15")
+@pytest.mark.runtime_budget(
+    30, hard_timeout=70, reason="Spawns two gloo FSDP workers that wrap, initialize and reload a tiny model."
+)
+def test_fsdp_initialization_preserves_local_storage_dtype_and_checkpoint_values(tmp_path: Path) -> None:
+    # FSDP2 keeps one storage dtype per unit, so strict fp32 parameters share a
+    # unit with the projections only under fp32 master weights.
+    mp.spawn(_fsdp_initialization_worker, args=(str(tmp_path / "rendezvous"), torch.float32), nprocs=2, join=True)

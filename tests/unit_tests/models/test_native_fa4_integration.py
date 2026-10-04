@@ -220,8 +220,8 @@ def test_qwen35_hybrid_packed_fa4_matches_sdpa(microbatch_size):
                 module.causal_conv1d_fn = conv
                 module.chunk_gated_delta_rule = recurrence
                 with torch.no_grad():
-                    module._fp32_params.A_log.zero_()
-                    module._fp32_params.dt_bias.zero_()
+                    module.A_log.zero_()
+                    module.dt_bias.zero_()
     reference.load_state_dict(model.state_dict())
     samples = [
         dict(

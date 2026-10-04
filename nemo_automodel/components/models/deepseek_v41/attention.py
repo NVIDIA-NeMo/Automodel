@@ -36,7 +36,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
-from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Parameter, DeepseekV4GroupedLinear
+from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4GroupedLinear
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sparse_attention
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
@@ -477,7 +477,7 @@ class DeepseekV41Attention(nn.Module):
             self.num_groups,
         ).to(dtype=dtype)
         self.wo_b = nn.Linear(self.num_groups * config.o_lora_rank, config.hidden_size, bias=False, dtype=dtype)
-        self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
+        self.attn_sink = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.rotary_emb = _RotaryEmbedding(config, compressed=bool(self.compress_ratio))
         self.compressor = (
             _Compressor(config, ratio=self.compress_ratio, dtype=dtype, rms_norm=backend.rms_norm)
@@ -493,11 +493,6 @@ class DeepseekV41Attention(nn.Module):
     def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
         """Configure the model-owned KV transport through the shared CP hook."""
         self.cp_group = cp_mesh.get_group()
-
-    @property
-    def attn_sink(self) -> nn.Parameter:
-        """Return the checkpoint's per-head FP32 attention sink parameter."""
-        return self.sinks_param.weight
 
     def reset_parameters(self, init_std: float = 0.02) -> None:
         """Initialize every attention parameter after construction or meta materialization.
@@ -664,7 +659,7 @@ class DeepseekV41Attention(nn.Module):
             attended = dsv4_sparse_attention(
                 query,
                 kv,
-                self.sinks_param(query),
+                self.attn_sink,
                 indices,
                 self.head_dim**-0.5,
                 backend="tilelang",
@@ -691,7 +686,7 @@ class DeepseekV41Attention(nn.Module):
         kv = torch.cat((kv, kv.new_zeros(batch, 1, self.head_dim)), dim=1)
         bias = torch.zeros(batch, 1, sequence, allowed.shape[-1], device=hidden_states.device, dtype=torch.float32)
         bias = bias.masked_fill(~allowed.unsqueeze(1), -torch.inf).expand(-1, self.num_heads, -1, -1)
-        sink = self.sinks_param(query).view(1, self.num_heads, 1, 1).expand(batch, -1, sequence, -1)
+        sink = self.attn_sink.view(1, self.num_heads, 1, 1).expand(batch, -1, sequence, -1)
         bias = torch.cat((bias, sink), dim=-1)
         if self.backend.attn == "sdpa":
             attended = F.scaled_dot_product_attention(

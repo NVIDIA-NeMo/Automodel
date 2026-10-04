@@ -13,10 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Functional test for dtype-specific FSDP2 mixed precision policies.
+"""Functional test: fp32 master weights + bf16 FSDP2 policy with per-parameter fp32 compute.
+
+Each KDA-style block (bf16-compute projections, bare fp32 ``A_log``/``dt_bias``)
+is one FSDP unit. The sharded model must match an unsharded reference that
+emulates the same mixed precision by hand.
 
 Usage:
-    torchrun --nproc_per_node=2 tests/functional_tests/training/run_fully_shard_by_dtype_param_dtype.py
+    torchrun --nproc_per_node=2 tests/functional_tests/llm_pretrain_and_kd/run_fully_shard_by_dtype_param_dtype.py
 """
 
 from __future__ import annotations
@@ -26,163 +30,209 @@ import sys
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 
-
-def _is_distributed() -> bool:
-    return dist.is_available() and dist.is_initialized()
-
-
-def _rank() -> int:
-    return dist.get_rank() if _is_distributed() else 0
+HIDDEN = 16
+NUM_BLOCKS = 2
+FP32_TOKENS = ("A_log", "dt_bias")
+POLICY = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16)
 
 
-class ParamDTypeCheckingModule(nn.Module):
-    def __init__(self, name: str, dtype: torch.dtype):
+class KDABlock(nn.Module):
+    """Kimi-Delta-Attention-style block: bf16 projections and fp32 decay parameters on the block itself."""
+
+    def __init__(self, check_dtypes: bool):
         super().__init__()
-        self.name = name
-        self.expected_dtype = dtype
-        self.weight = nn.Parameter(torch.ones(4, dtype=dtype))
+        self.check_dtypes = check_dtypes
+        self.in_proj = nn.Linear(HIDDEN, HIDDEN, bias=False, dtype=torch.float32)
+        self.out_proj = nn.Linear(HIDDEN, HIDDEN, bias=False, dtype=torch.float32)
+        self.A_log = nn.Parameter(torch.rand(HIDDEN, dtype=torch.float32).log())
+        self.dt_bias = nn.Parameter(torch.rand(HIDDEN, dtype=torch.float32))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.weight.dtype != self.expected_dtype:
-            raise AssertionError(f"{self.name} expected param dtype {self.expected_dtype}, got {self.weight.dtype}")
-        return x
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Map ``[batch, HIDDEN]`` bf16 activations to ``[batch, HIDDEN]`` bf16 activations."""
+        if self.check_dtypes:
+            _expect(self.in_proj.weight.dtype == torch.bfloat16, f"in_proj computes {self.in_proj.weight.dtype}")
+            _expect(self.out_proj.weight.dtype == torch.bfloat16, f"out_proj computes {self.out_proj.weight.dtype}")
+            _expect(self.A_log.dtype == torch.float32, f"A_log computes {self.A_log.dtype}")
+            _expect(self.dt_bias.dtype == torch.float32, f"dt_bias computes {self.dt_bias.dtype}")
+            _expect(hidden.dtype == torch.bfloat16, f"block input is {hidden.dtype}")
+        # The unsharded reference holds fp32 masters; casting mirrors FSDP's bf16 all-gather.
+        h = F.linear(hidden.to(torch.bfloat16), self.in_proj.weight.to(torch.bfloat16))
+        # Decay gate owns its fp32 casts; FSDP only casts the block inputs.
+        gate = torch.exp(-torch.exp(self.A_log) * F.softplus(h.float() + self.dt_bias))
+        h = (h.float() * gate).to(torch.bfloat16)
+        return F.linear(h, self.out_proj.weight.to(torch.bfloat16))
 
 
-class TwoDTypeRoot(nn.Module):
-    def __init__(self):
+class TinyModel(nn.Module):
+    def __init__(self, check_dtypes: bool):
         super().__init__()
-        self.fp32_module = ParamDTypeCheckingModule("fp32_module", torch.float32)
-        self.bf16_module = ParamDTypeCheckingModule("bf16_module", torch.bfloat16)
+        self.layers = nn.ModuleList([KDABlock(check_dtypes) for _ in range(NUM_BLOCKS)])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fp32_module(x)
-        return self.bf16_module(x)
-
-
-class NaturalOutputFp32Module(nn.Module):
-    """Compute with FP32 parameters while restoring the incoming activation dtype."""
-
-    def __init__(self):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(4, dtype=torch.float32))
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Scale ``[batch, hidden]`` inputs and return the same layout and dtype."""
-        if self.weight.dtype != torch.float32:
-            raise AssertionError(f"internal expected FP32 weight, got {self.weight.dtype}")
-        return (inputs.float() * self.weight).to(inputs.dtype)
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            hidden = layer(hidden)
+        return hidden
 
 
-class InternalOutputDTypeRoot(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.internal = NaturalOutputFp32Module()
-        self.consumer = nn.Linear(4, 4, bias=True, dtype=torch.bfloat16)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Run an internal FP32 FSDP unit followed by a BF16 consumer.
-
-        Args:
-            inputs: Tensor of shape [batch, hidden], where ``hidden`` is 4.
-
-        Returns:
-            Tensor of shape [batch, hidden], where ``hidden`` is 4.
-        """
-        hidden_states = self.internal(inputs)
-        if hidden_states.dtype != torch.bfloat16:
-            raise AssertionError(f"internal FSDP changed BF16 output to {hidden_states.dtype}")
-        if self.consumer.weight.dtype != torch.bfloat16:
-            raise AssertionError(f"consumer expected BF16 compute weight, got {self.consumer.weight.dtype}")
-        return self.consumer(hidden_states)
+def _expect(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
 
 
-def _init_distributed() -> tuple[int, torch.device]:
-    if not dist.is_available():
-        return 1, torch.device("cpu")
-    if not dist.is_initialized():
-        if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-            return 1, torch.device("cpu")
-        dist.init_process_group(backend="nccl")
+def _local(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank)
-    return dist.get_world_size(), torch.device(f"cuda:{local_rank}")
+
+def _build_model(device: torch.device, check_dtypes: bool) -> TinyModel:
+    torch.manual_seed(1234)
+    return TinyModel(check_dtypes).to(device)
+
+
+def _shard(
+    model: TinyModel, mesh: DeviceMesh, *, reshard_after_forward: bool | None, activation_checkpoint: bool
+) -> None:
+    for index, block in enumerate(model.layers):
+        if activation_checkpoint:
+            block = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            model.layers[index] = block
+        fully_shard_by_dtype(
+            block,
+            mesh=mesh,
+            mp_policy=POLICY,
+            offload_policy=None,
+            fp32_compute_module_names=FP32_TOKENS,
+            reshard_after_forward=reshard_after_forward,
+        )
+    fully_shard(model, mesh=mesh, mp_policy=POLICY)
+    for block in model.layers:
+        _expect(isinstance(block, FSDPModule), "each block must be an FSDP unit")
+        nested = [name for name, child in block.named_modules() if child is not block and isinstance(child, FSDPModule)]
+        _expect(not nested, f"nested FSDP units inside a block: {nested}")
+
+
+def _batches(device: torch.device) -> list[list[torch.Tensor]]:
+    """Three steps of data, identical on every rank; step 2 accumulates two microbatches."""
+    generator = torch.Generator(device="cpu").manual_seed(42)
+
+    def batch() -> torch.Tensor:
+        return torch.randn(8, HIDDEN, generator=generator).to(device=device, dtype=torch.bfloat16)
+
+    return [[batch()], [batch(), batch()], [batch()]]
+
+
+def _is_fp32_param(name: str) -> bool:
+    return any(token in name for token in FP32_TOKENS)
+
+
+def _round_bf16_compute_grads(model: nn.Module) -> None:
+    """Emulate FSDP2 microbatch accumulation, which sums bf16-compute gradients in bf16."""
+    for name, param in model.named_parameters():
+        if not _is_fp32_param(name):
+            param.grad = param.grad.to(torch.bfloat16).to(torch.float32)
+
+
+def _train(model: nn.Module, steps: list[list[torch.Tensor]], sharded: bool) -> list[float]:
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    losses: list[float] = []
+    for microbatches in steps:
+        optimizer.zero_grad(set_to_none=True)
+        step_loss = 0.0
+        for index, inputs in enumerate(microbatches):
+            if sharded:
+                model.set_requires_gradient_sync(index == len(microbatches) - 1)
+            output = model(inputs)
+            if sharded:
+                _expect(output.dtype == torch.bfloat16, f"block output is {output.dtype}")
+            loss = output.float().square().mean() / len(microbatches)
+            loss.backward()
+            step_loss += loss.item()
+            if not sharded and len(microbatches) > 1:
+                _round_bf16_compute_grads(model)
+        if sharded:
+            _check_grads(model)
+        optimizer.step()
+        losses.append(step_loss)
+    return losses
+
+
+def _check_grads(model: nn.Module) -> None:
+    for name, param in model.named_parameters():
+        _expect(param.grad is not None, f"missing gradient for {name}")
+        grad = _local(param.grad)
+        _expect(bool(torch.isfinite(grad).all()), f"non-finite gradient for {name}")
+        _expect(grad.dtype == torch.float32, f"{name} gradient is {grad.dtype}")
+
+
+def _assert_parity(sharded: nn.Module, reference: nn.Module, variant: str) -> None:
+    reference_params = dict(reference.named_parameters())
+    for name, param in sharded.named_parameters():
+        full = param.full_tensor() if isinstance(param, DTensor) else param
+        canonical = name.replace("_checkpoint_wrapped_module.", "")
+        torch.testing.assert_close(full, reference_params[canonical], rtol=1e-4, atol=1e-5, msg=f"{variant}: {name}")
+
+
+def _run_variant(
+    name: str,
+    mesh: DeviceMesh,
+    device: torch.device,
+    *,
+    reshard_after_forward: bool | None = None,
+    activation_checkpoint: bool = False,
+) -> None:
+    reference = _build_model(device, check_dtypes=False)
+    model = _build_model(device, check_dtypes=True)
+    _shard(model, mesh, reshard_after_forward=reshard_after_forward, activation_checkpoint=activation_checkpoint)
+    for param in model.parameters():
+        _expect(param.dtype == torch.float32, "sharded storage must stay fp32 (master weights)")
+    losses = _train(model, _batches(device), sharded=True)
+    reference_losses = _train(reference, _batches(device), sharded=False)
+    torch.testing.assert_close(losses, reference_losses, rtol=1e-4, atol=1e-5, msg=f"{name}: losses")
+    _assert_parity(model, reference, name)
+    if dist.get_rank() == 0:
+        print(f"PASS: {name} matches the unsharded reference (losses {losses})")
+
+
+def _run_negative(mesh: DeviceMesh, device: torch.device) -> None:
+    model = _build_model(device, check_dtypes=False).to(torch.bfloat16)
+    try:
+        fully_shard_by_dtype(
+            model.layers[0], mesh=mesh, mp_policy=POLICY, offload_policy=None, fp32_compute_module_names=FP32_TOKENS
+        )
+    except ValueError as error:
+        _expect("model.dtype" in str(error), f"unexpected error text: {error}")
+    else:
+        raise AssertionError("bf16 storage of pinned fp32 parameters must be rejected")
+    if dist.get_rank() == 0:
+        print("PASS: bf16-storage pinned parameters raise ValueError")
 
 
 def main() -> int:
     if not torch.cuda.is_available():
         print("SKIP: CUDA not available", file=sys.stderr)
         return 0
-
-    world_size, device = _init_distributed()
-    rank = _rank()
-    if world_size != 2:
-        if rank == 0:
-            print(f"ERROR: This test requires world_size=2, got {world_size}", file=sys.stderr)
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    if dist.get_world_size() != 2:
+        print(f"ERROR: This test requires world_size=2, got {dist.get_world_size()}", file=sys.stderr)
         return 1
+    mesh = init_device_mesh(device_type="cuda", mesh_shape=(2,), mesh_dim_names=("dp",))
 
-    torch.manual_seed(1234)
-    torch.cuda.manual_seed_all(1234)
-
-    model = TwoDTypeRoot().to(device)
-    model.fp32_module.weight._hf_compute_dtype = torch.float32
-    model.bf16_module.weight._hf_compute_dtype = torch.bfloat16
-    mesh = init_device_mesh(device_type="cuda", mesh_shape=(world_size,), mesh_dim_names=("dp",))
-
-    # Start with the wrong param_dtype; fully_shard_by_dtype should override it
-    # per wrapped module based on the underlying parameter dtype.
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.float16,
-        reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
-    )
-    fully_shard_by_dtype(model, mesh=mesh, mp_policy=mp_policy, offload_policy=None)
-
-    model(torch.ones(4, device=device, dtype=torch.float32))
-
-    # A dtype-isolated child is an implementation detail inside its parent's
-    # forward. It must preserve its natural BF16 output even when the enclosing
-    # FSDP boundary promises FP32 outputs to its caller.
-    internal_model = InternalOutputDTypeRoot().to(device)
-    boundary_policy = MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
-    )
-    fully_shard_by_dtype(
-        internal_model,
-        mesh=mesh,
-        mp_policy=boundary_policy,
-        offload_policy=None,
-        fp32_compute_module_names=("internal",),
-    )
-
-    inputs = torch.ones(2, 4, device=device, dtype=torch.bfloat16, requires_grad=True)
-    output = internal_model(inputs)
-    if output.dtype != torch.float32:
-        raise AssertionError(f"enclosing FSDP expected FP32 output, got {output.dtype}")
-    if not torch.isfinite(output).all():
-        raise AssertionError("enclosing FSDP produced non-finite output")
-    output.square().mean().backward()
-    if inputs.grad is None or not torch.isfinite(inputs.grad).all():
-        raise AssertionError("internal FSDP produced a missing or non-finite input gradient")
-    for name, param in internal_model.named_parameters():
-        if param.grad is None:
-            raise AssertionError(f"missing gradient for {name}")
-        grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
-        if not torch.isfinite(grad).all():
-            raise AssertionError(f"non-finite gradient for {name}")
+    _run_variant("default", mesh, device)
+    _run_variant("reshard_after_forward=False", mesh, device, reshard_after_forward=False)
+    _run_variant("checkpoint_wrapper", mesh, device, activation_checkpoint=True)
+    _run_negative(mesh, device)
     torch.cuda.synchronize()
-
-    if rank == 0:
-        print("PASS: fully_shard_by_dtype preserved parameter and internal output dtypes")
     return 0
 
 
@@ -190,5 +240,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     finally:
-        if _is_distributed():
+        if dist.is_initialized():
             dist.destroy_process_group()

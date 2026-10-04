@@ -40,7 +40,7 @@ model:
     rms_norm: torch
     rope_fusion: false
   attn_implementation: sdpa
-  torch_dtype: bfloat16
+  dtype: float32
   # MTP disabled: its extra full-vocab projection at 2k OOMs the forward pass
   # on 2 nodes (activation does not shard across DP). Irrelevant to CP parity.
   num_nextn_predict_layers: 0

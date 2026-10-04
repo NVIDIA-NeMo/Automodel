@@ -20,7 +20,11 @@ checkpoint-faithful router is fp32 end to end: fp32 parameter, fp32
 projection, fp32 scoring, fp32 selected weights (AMINT-286).
 """
 
+import dataclasses
+
+import pytest
 import torch
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from transformers import AutoConfig
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -80,22 +84,24 @@ def test_router_fp32_contract_is_model_owned():
     assert indices.shape == (8, TINY["num_experts_per_tok"])
 
 
+@pytest.mark.skipif(
+    "param_dtype_override_fn" not in {f.name for f in dataclasses.fields(MixedPrecisionPolicy)},
+    reason="needs torch >= 2.15 MixedPrecisionPolicy.param_dtype_override_fn",
+)
 def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping(monkeypatch):
-    """The gate must be fp32 from allocation, before any init or checkpoint cast.
+    """The gate is fp32 from allocation and stays fp32 compute inside the block's FSDP unit.
 
-    FSDP shards the freshly constructed (meta/from_pretrained) module: a
-    bf16-allocated gate weight with an fp32-pinned compute dtype shares its
-    module with the fp32 correction-bias buffer, which FSDP cannot isolate
-    (pipeline 64344786: "FSDP could not isolate parameters with a distinct
-    dtype from siblings in the same module: mlp.gate.weight").
+    FSDP2 keeps strict fp32 parameters in fp32 through a per-parameter override, which
+    requires fp32 storage; under fp32 master weights the whole block is one unit.
     """
     import torch.distributed.fsdp as fsdp
 
     from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 
+    policies = []
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer_utils.fully_shard",
-        lambda *_args, **_kwargs: None,
+        lambda _module, **kwargs: policies.append(kwargs["mp_policy"]),
     )
 
     config = AutoConfig.for_model("minimax_m2", torch_dtype="bfloat16", **TINY)
@@ -106,13 +112,19 @@ def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping(monkeypatch):
     assert block.mlp.gate.weight.dtype == torch.float32
     assert block.mlp.gate.e_score_correction_bias.dtype == torch.float32
 
+    fp32_config = AutoConfig.for_model("minimax_m2", torch_dtype="float32", **TINY)
+    fp32_block = MiniMaxM2ForCausalLM(fp32_config, backend=_cpu_backend()).model.layers["0"]
+    fp32_block.to(torch.float32)  # fp32 master weights: one storage dtype per unit
     fully_shard_by_dtype(
-        block,
+        fp32_block,
         mesh=None,
         mp_policy=fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
         offload_policy=None,
         fp32_compute_module_names=tuple(MiniMaxM2ForCausalLM._keep_in_fp32_modules_strict),
     )
+    (policy,) = policies
+    assert policy.param_dtype_override_fn(fp32_block.mlp.gate.weight) is torch.float32
+    assert policy.param_dtype_override_fn(next(iter(fp32_block.mlp.experts.parameters()))) is None
 
 
 def test_explicit_gate_precision_override_is_preserved():

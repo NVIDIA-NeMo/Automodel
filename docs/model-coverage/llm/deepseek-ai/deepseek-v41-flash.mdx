@@ -62,10 +62,12 @@ HybridEP provides both token dispatch and expert-output combine. Router
 correction biases remain fixed during fine-tuning through
 `gate_bias_update_factor: 0`.
 
-FSDP mixed precision must use `param_dtype: bfloat16`, `reduce_dtype: float32`,
-`output_dtype: null`, and `cast_forward_inputs: false`. Set
-`lm_head_precision: float32`. These settings preserve FP32 mHC coefficients
-across module boundaries; the language-model head returns FP32 logits.
+Set `model.dtype: float32` so the fp32 mHC coefficients, attention sinks, and
+compressor weights are stored in fp32. FSDP mixed precision must use
+`param_dtype: bfloat16`, `reduce_dtype: float32`, `output_dtype: null`, and
+`cast_forward_inputs: false`. Set `lm_head_precision: float32`. These settings
+preserve FP32 mHC coefficients across layer FSDP units; the language-model head
+returns FP32 logits.
 
 See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) and
 [Installation Guide](/get-started/installation) for setup. Compilation caches

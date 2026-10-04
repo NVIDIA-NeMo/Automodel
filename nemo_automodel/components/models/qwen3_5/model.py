@@ -487,7 +487,7 @@ class Qwen3_5DenseTextBackbone(nn.Module):
 
     Native counterpart of ``Qwen3_5MoeTextModelBackend`` for the dense model:
     reuses the same blocks/GatedDeltaNet/norm/rotary so dense and MoE share one
-    code path, with the fp32 ``SSMGate`` built at construction (no runtime patch).
+    code path, with the GatedDeltaNet decay-gate parameters pinned to fp32 at construction.
     """
 
     def __init__(self, config: Qwen3_5TextConfig, backend: BackendConfig):
@@ -716,6 +716,8 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     requires_packed_sequence_metadata = True
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
+    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -767,13 +769,6 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         if getattr(config, "tie_word_embeddings", False):
             self.tie_weights()
 
-        # Keep the SSM-gating params (in each linear_attn ``_fp32_params`` holder)
-        # in fp32 storage even under a bf16 bulk dtype.
-        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
-        if "_fp32_params" not in keep_fp32:
-            keep_fp32.append("_fp32_params")
-        self._keep_in_fp32_modules = keep_fp32
-
         self.mtp_config = build_mtp_config_from_hf(
             config,
             loss_scaling_factor=mtp_loss_scaling_factor,
@@ -782,7 +777,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         self.mtp = build_qwen3_5_dense_mtp(config, self.mtp_config, dtype=dtype) if self.mtp_config.enabled else None
 
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=True)
+            self.state_dict_adapter = Qwen3_5DenseStateDictAdapter()
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
@@ -924,7 +919,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         init_std = float(getattr(self.config, "initializer_range", 0.02))
         # The backbone (embed/norm/layers, incl. GatedDeltaNet-specific init) owns
         # its own init_weights; init only the non-backbone modules (lm_head, MTP)
-        # generically so the GatedDeltaNet/SSMGate init is not clobbered.
+        # generically so the GatedDeltaNet init is not clobbered.
         self.model.init_weights(buffer_device=buffer_device)
         with buffer_device:
             for name, module in self.named_modules():
@@ -940,7 +935,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
                         module.weight[module.padding_idx].zero_()
                 elif isinstance(module, (Qwen3_5RMSNorm, Qwen3NextRMSNorm)):
                     nn.init.zeros_(module.weight)
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
 
 
 class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditionalGeneration):
@@ -971,6 +966,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     # recipes' cast). Class-level: ``super().__init__()`` runs ``post_init`` ->
     # ``initialize_weights`` -> the first cast before the constructor body.
     _keep_in_fp32_modules: list[str] = ["rotary_pos_emb"]
+    # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
+    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -1026,13 +1023,6 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         self.model.__class__ = Qwen3_5Model
         self.model.language_model = Qwen3_5DenseTextBackbone(text_config, self.backend)
 
-        # Keep the SSM-gating params (per-layer ``_fp32_params`` holder) in fp32
-        # storage even under a bf16 bulk dtype.
-        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
-        if "_fp32_params" not in keep_fp32:
-            keep_fp32.append("_fp32_params")
-        self._keep_in_fp32_modules = keep_fp32
-
         param_dtype = next(self.model.language_model.parameters()).dtype
         dtype = get_dtype(getattr(text_config, "torch_dtype", None), param_dtype)
         # ``super().__init__`` ran HF ``post_init`` (-> ``initialize_weights``) and may
@@ -1056,7 +1046,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         if self.mtp is not None:
             cast_model_to_dtype(self.mtp, dtype)
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=True)
+            self.state_dict_adapter = Qwen3_5DenseStateDictAdapter()
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
         """Tie ``lm_head`` to the active VLM text embedding when requested."""
@@ -1648,7 +1638,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     ) -> None:
         buffer_device = buffer_device or _default_init_device()
         # Initialize the native text backbone (embed/norm/layers incl. the
-        # GatedDeltaNet/SSMGate-specific init). The HF vision tower + lm_head were
+        # GatedDeltaNet-specific init). The HF vision tower + lm_head were
         # initialized by ``super().__init__`` (or loaded from a checkpoint).
         # HF's ``post_init`` (in ``super().__init__``) routes through
         # ``init_weights -> initialize_weights`` *before* the backbone is swapped in,
@@ -1664,9 +1654,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             with buffer_device:
                 for sublayer in mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
-        # Keep the fp32 SSM-gating params fp32 (skip them in the dtype cast); each
-        # ``_fp32_params`` holder is sharded as its own fp32 FSDP group.
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
 
 
 Qwen3_5ForCausalLM.parallelizer = PARALLELIZER

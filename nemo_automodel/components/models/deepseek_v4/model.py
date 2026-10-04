@@ -85,7 +85,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
 )
-from nemo_automodel.components.models.deepseek_v4.parallelization import PARALLELIZER
+from nemo_automodel.components.models.deepseek_v4.parallelization import DeepseekV4ModelParallelizer
 from nemo_automodel.components.models.deepseek_v4.processing import (
     COMPRESS_PAD_TO,
     IMAGE,
@@ -1544,5 +1544,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         cast_model_to_dtype(self, dtype)
 
 
-DeepseekV4ForCausalLM.parallelizer = PARALLELIZER
+DeepseekV4ForCausalLM.parallelizer = DeepseekV4ModelParallelizer(
+    tuple(DeepseekV4ForCausalLM._keep_in_fp32_modules_strict)
+)
 ModelClass = DeepseekV4ForCausalLM

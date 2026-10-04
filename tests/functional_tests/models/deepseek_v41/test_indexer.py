@@ -151,7 +151,7 @@ def _cp_worker(rank: int, rendezvous: str, ac: bool) -> None:
             assert name == other
             if a.grad is None:
                 assert b.grad is None
-            elif name.endswith("sinks_param.weight"):
+            elif name.endswith(".attn_sink"):
                 torch.testing.assert_close(a.grad, b.grad, atol=2e-6, rtol=2e-5, msg=name)
             else:
                 torch.testing.assert_close(a.grad, b.grad, atol=0, rtol=0, msg=name)

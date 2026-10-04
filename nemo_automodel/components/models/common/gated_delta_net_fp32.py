@@ -14,28 +14,25 @@
 
 """Shared checkpoint helpers for fp32 GatedDeltaNet (GDN) params.
 
-GDN layers carry intrinsically-fp32 bare parameters (``A_log`` and ``dt_bias``)
-that feed the decay gate ``g = -exp(A_log) * softplus(a + dt_bias)``. Under FSDP2
-mixed precision with fp32 master weights, the bulk of a model computes in bf16
+GDN layers carry intrinsically-fp32 parameters (``A_log`` and ``dt_bias``) that
+feed the decay gate ``g = -exp(A_log) * softplus(a + dt_bias)``. Under FSDP2 mixed
+precision with fp32 master weights, the bulk of a model computes in bf16
 (``param_dtype=bf16``) while these parameters must stay in fp32 -- ``A_log`` is
 exponentiated, so bf16 rounding becomes a proportional error on the decay rate
 that the recurrence compounds across the sequence.
 
-Each model owns the runtime construction of its fp32 holder. This module only
-centralizes the checkpoint contract: hide ``_fp32_params`` in saved HF-compatible
-keys, route bare HF keys back into the holder for native load, and upcast these
-params to fp32 when checkpoint tensors arrive in a lower precision.
+Each model owns these parameters as plain fp32 attributes under their HF names
+(``linear_attn.A_log``, ``linear_attn.dt_bias``), so native state-dict keys equal
+HF keys. This module centralizes the checkpoint contract: recognize those keys,
+upcast them to fp32 when checkpoint tensors arrive in a lower precision, and force
+fp32 on HF export.
 """
 
 from __future__ import annotations
 
-import re
-
 import torch
 
-HOLDER_NAME = "_fp32_params"
-
-# Intrinsically-fp32 GatedDeltaNet bare params routed through the holder.
+# Intrinsically-fp32 GatedDeltaNet parameter names (HF names on the GDN module).
 FP32_GDN_PARAM_NAMES = ("A_log", "dt_bias")
 GDN_FP32_CHECKPOINT_ARCHITECTURES = frozenset(
     (
@@ -46,34 +43,6 @@ GDN_FP32_CHECKPOINT_ARCHITECTURES = frozenset(
         "Qwen3_5MoeForConditionalGeneration",
     )
 )
-
-_FP32_HOLDER_KEY_RE = re.compile(r"(\.linear_attn)\._fp32_params\.")
-
-
-def strip_fp32_holder_key(key: str) -> str:
-    """Rewrite ``...linear_attn._fp32_params.X`` -> ``...linear_attn.X``.
-
-    Used by state-dict adapters so saved checkpoints hide the ``_fp32_params``
-    wrapping and stay directly HF-loadable.
-    """
-    return _FP32_HOLDER_KEY_RE.sub(r"\1.", key)
-
-
-def route_fp32_holder_key(key: str, param_names: tuple[str, ...] = FP32_GDN_PARAM_NAMES) -> str:
-    """Rewrite a bare ``...linear_attn.X`` GDN param key into the ``_fp32_params`` holder.
-
-    Inverse of :func:`strip_fp32_holder_key` for the param names in ``param_names``.
-    No-op when the key is already routed, is not under ``linear_attn``, or is not a
-    tracked fp32 GDN param.
-    """
-    if not key.endswith(param_names):
-        return key
-    if "._fp32_params." in key:
-        return key
-    if ".linear_attn." not in key:
-        return key
-    head, tail = key.rsplit(".linear_attn.", 1)
-    return f"{head}.linear_attn._fp32_params.{tail}"
 
 
 def is_gated_delta_net_fp32_param_key(key: str, param_names: tuple[str, ...] = FP32_GDN_PARAM_NAMES) -> bool:

@@ -557,11 +557,8 @@ class TestConvertSingleTensorToHf:
             assert "exclude_me.weight" not in [k for k, _ in result]
 
 
-class TestFp32HolderKeyStripping:
-    """After FSDP isolation, A_log/dt_bias live under ``linear_attn._fp32_params.*``.
-
-    The adapter must hide that wrapping on save so checkpoints stay HF-loadable.
-    """
+class TestFp32GdnParams:
+    """``A_log`` / ``dt_bias`` keep their HF keys and are upcast to fp32 at the adapter boundary."""
 
     def _make_adapter(self):
         moe_config = Mock()
@@ -573,32 +570,25 @@ class TestFp32HolderKeyStripping:
         backend.experts = "torch"
         return Qwen3NextStateDictAdapter(config=Mock(), moe_config=moe_config, backend=backend, dtype=torch.float32)
 
-    def test_convert_single_tensor_strips_a_log(self):
+    def test_convert_single_tensor_keeps_hf_key_and_upcasts(self):
         adapter = self._make_adapter()
-        result = adapter.convert_single_tensor_to_hf("model.layers.1.linear_attn._fp32_params.A_log", torch.zeros(4))
-        assert [k for k, _ in result] == ["model.layers.1.linear_attn.A_log"]
-
-    def test_convert_single_tensor_strips_dt_bias(self):
-        adapter = self._make_adapter()
-        result = adapter.convert_single_tensor_to_hf("model.layers.0.linear_attn._fp32_params.dt_bias", torch.ones(4))
+        result = adapter.convert_single_tensor_to_hf(
+            "model.layers.0.linear_attn.dt_bias", torch.zeros(4, dtype=torch.bfloat16)
+        )
         assert [k for k, _ in result] == ["model.layers.0.linear_attn.dt_bias"]
-
-    def test_to_hf_strips_holder(self):
-        adapter = self._make_adapter()
-        out = adapter.to_hf({"model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)})
-        assert "model.layers.0.linear_attn.A_log" in out
-        assert all("_fp32_params" not in k for k in out)
+        assert result[0][1].dtype == torch.float32
 
     def test_to_hf_upcasts_gdn_fp32_params_saved_as_bf16(self):
         adapter = self._make_adapter()
         state_dict = {
-            "model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4, dtype=torch.bfloat16),
-            "model.layers.0.linear_attn._fp32_params.dt_bias": torch.ones(4, dtype=torch.bfloat16),
+            "model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
+            "model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.bfloat16),
             "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
         }
 
         out = adapter.to_hf(state_dict)
 
+        assert set(out) == set(state_dict)
         assert out["model.layers.0.linear_attn.A_log"].dtype == torch.float32
         assert out["model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
         q_proj_key = "model.layers.0.self_attn.q_proj.weight"
@@ -619,21 +609,7 @@ class TestFp32HolderKeyStripping:
             "model.layers.0.linear_attn.dt_bias": "F32",
         }
 
-    def test_bare_key_unchanged(self):
-        adapter = self._make_adapter()
-        result = adapter.convert_single_tensor_to_hf("model.layers.0.linear_attn.A_log", torch.zeros(4))
-        assert [k for k, _ in result] == ["model.layers.0.linear_attn.A_log"]
-
-    def test_convert_single_tensor_upcasts_gdn_fp32_params(self):
-        adapter = self._make_adapter()
-        result = adapter.convert_single_tensor_to_hf(
-            "model.layers.0.linear_attn._fp32_params.dt_bias",
-            torch.zeros(4, dtype=torch.bfloat16),
-        )
-        assert result[0][0] == "model.layers.0.linear_attn.dt_bias"
-        assert result[0][1].dtype == torch.float32
-
-    def test_from_hf_routes_and_upcasts_gdn_fp32_params_loaded_as_bf16(self):
+    def test_from_hf_keeps_hf_keys_and_upcasts_gdn_fp32_params_loaded_as_bf16(self):
         adapter = self._make_adapter()
         hf_state = {
             "model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
@@ -646,10 +622,9 @@ class TestFp32HolderKeyStripping:
         ):
             out = adapter.from_hf(hf_state)
 
-        a_log_key = "model.layers.0.linear_attn._fp32_params.A_log"
-        dt_bias_key = "model.layers.0.linear_attn._fp32_params.dt_bias"
+        assert set(out) == set(hf_state)
+        assert out["model.layers.0.linear_attn.A_log"].dtype == torch.float32
+        assert out["model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
         q_proj_key = "model.layers.0.self_attn.q_proj.weight"
-        assert out[a_log_key].dtype == torch.float32
-        assert out[dt_bias_key].dtype == torch.float32
         assert out[q_proj_key] is hf_state[q_proj_key]
         assert out[q_proj_key].dtype == torch.bfloat16

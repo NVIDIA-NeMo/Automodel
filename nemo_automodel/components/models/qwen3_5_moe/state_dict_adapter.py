@@ -50,8 +50,6 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     forced_gated_delta_net_fp32_dtype_mapping,
-    route_fp32_holder_key,
-    strip_fp32_holder_key,
     upcast_gated_delta_net_fp32_state_tensor,
 )
 from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
@@ -224,16 +222,6 @@ def _get_local_safetensors_keys(model_path: str | None) -> set[str]:
         except (OSError, SafetensorError):
             continue
     return checkpoint_keys
-
-
-def _strip_fp32_params(key: str) -> str:
-    """Strip the fp32 holder segment from GDN state-dict keys."""
-    return strip_fp32_holder_key(key)
-
-
-def _route_fp32_params(key: str) -> str:
-    """Route bare GDN fp32 params into the holder used by the native module."""
-    return route_fp32_holder_key(key)
 
 
 class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
@@ -446,7 +434,6 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         mtp_expert_parts: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
 
         def store_native_key(native_key: str, tensor: Any) -> None:
-            native_key = route_fp32_holder_key(native_key)
             state_dict[native_key] = upcast_gated_delta_net_fp32_state_tensor(native_key, tensor)
 
         for key, value in hf_state_dict.items():
@@ -740,11 +727,6 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
             if pattern in new_fqn:
                 new_fqn = new_fqn.replace(pattern, replacement)
                 break
-
-        # Hide the GatedDeltaNet fp32 holder wrapping so saved checkpoints keep the
-        # bare HF key (``...linear_attn.A_log`` instead of
-        # ``...linear_attn._fp32_params.A_log``) and stay directly HF-loadable.
-        new_fqn = strip_fp32_holder_key(new_fqn)
 
         new_fqn = map_qwen3_5_mtp_to_hf_key(new_fqn)
         value = upcast_gated_delta_net_fp32_state_tensor(new_fqn, value)

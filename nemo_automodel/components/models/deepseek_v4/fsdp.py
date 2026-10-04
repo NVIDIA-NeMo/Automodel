@@ -12,49 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""FSDP2 primitive shared by DeepSeek-V4 and DeepSeek-V4.1.
+
+Every unit the parallelizer hands over (decoder block, vision block or tower,
+model root, ``lm_head``) becomes exactly one FSDP unit. Parameters named in the
+model's ``_keep_in_fp32_modules_strict`` keep fp32 compute inside that unit
+through PyTorch's per-parameter ``param_dtype_override_fn`` (see
+``with_fp32_compute_override``); a unit made only of such parameters, such as
+``lm_head``, computes in fp32 outright and returns fp32 activations.
+"""
+
 from __future__ import annotations
+
+from dataclasses import replace
 
 import torch
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
-_DSV4_CLASS_NAMES = {
-    "DeepseekV4ForCausalLM",
-    "DeepseekV4Model",
-    "DeepseekV4Block",
-    "DeepseekV4VisionBlock",
-    "DeepseekV4VisionTransformer",
-}
-
-_DSV4_FP32_MODULE_SUFFIXES = (
-    "attn_hc",
-    "ffn_hc",
-    "hc_head",
-    "lm_head",
-    "self_attn.sinks_param",
-    "self_attn.compressor.wkv",
-    "self_attn.compressor.wgate",
-    "self_attn.compressor.ape_param",
-    "self_attn.compressor.indexer.wkv",
-    "self_attn.compressor.indexer.wgate",
-    "self_attn.compressor.indexer.ape_param",
-    "norm1",
-    "norm2",
-    "vision.norm",
-)
-
-_DSV4_RETURNED_FP32_PARAMETER_CLASS_NAMES = {
-    "DeepseekV4FP32Parameter",
-}
-
-# These modules own fp32 parameters but explicitly upcast their arithmetic and
-# cast the result back to the incoming activation dtype.  Their nested FSDP
-# unit must therefore be transparent at the module boundary: casting the input
-# and forcing an fp32 output would leak fp32 activations into the following
-# bf16 projection.
-_DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES = {
-    "DeepseekV4VisionRMSNorm",
-}
+from nemo_automodel.components.distributed.parallelizer_utils import with_fp32_compute_override
+from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4Compressor
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 
 def _hca_param_sync_group_from_1d_mesh(mesh):
@@ -93,207 +72,113 @@ def _hca_param_sync_group_from_1d_mesh(mesh):
         return None
 
 
-def _matches_suffix(name: str, suffix: str) -> bool:
-    return name == suffix or name.endswith(f".{suffix}")
+def _attach_hca_param_sync_group(module: nn.Module, mesh: DeviceMesh | None) -> None:
+    """Bind the FSDP mesh's parameter-sync group to every HCA compressor in ``module``.
+
+    The FSDP2 mesh is only known while wrapping, so the group is attached here
+    instead of through public model configuration.
+    """
+    process_group = _hca_param_sync_group_from_1d_mesh(mesh)
+    for submodule in module.modules():
+        if isinstance(submodule, DeepseekV4Compressor):
+            submodule._set_hca_param_sync_group(process_group)
 
 
-def _has_fsdp_state(module: nn.Module) -> bool:
-    try:
-        from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
-    except ImportError:
-        return False
+def deepseek_v4_unit_mp_policy(
+    module: nn.Module,
+    mp_policy: MixedPrecisionPolicy | None,
+    fp32_compute_module_names: tuple[str, ...],
+    ignored_params: set[nn.Parameter] | None = None,
+    *,
+    module_name: str = "",
+) -> MixedPrecisionPolicy | None:
+    """Return the mixed-precision policy for one DeepSeek-V4 FSDP unit.
 
-    return _get_module_fsdp_state(module) is not None
+    The strict names are model-level tokens (``lm_head``, ``vision.norm.weight``,
+    ``attn_hc.fn``). They are matched against ``module_name`` joined with each
+    parameter's unit-relative name, so a unit such as ``lm_head`` whose only
+    parameter is ``weight`` still resolves its contract. Without ``module_name``
+    the unit-relative names are matched directly, which is sufficient for
+    decoder and vision blocks.
 
+    Args:
+        module: Module about to become one FSDP unit.
+        mp_policy: Policy of the enclosing FSDP boundary, or ``None``.
+        fp32_compute_module_names: The model's ``_keep_in_fp32_modules_strict``.
+        ignored_params: Parameters owned by another FSDP or parallelism unit.
+        module_name: Model-level name of ``module``; empty for the model itself
+            or when unknown.
 
-def _module_config_model_type(module: nn.Module) -> str | None:
-    return getattr(getattr(module, "config", None), "model_type", None)
+    Returns:
+        ``mp_policy`` itself when it already computes in fp32 or when no
+        parameter of the unit has an fp32 contract. A full fp32 policy (fp32
+        parameters, reductions, inputs and outputs) when every parameter of the
+        unit has an fp32 contract, e.g. ``lm_head``. Otherwise ``mp_policy``
+        with ``param_dtype_override_fn`` pinning the fp32-contract parameters.
 
-
-def _is_deepseek_v4_module(module: nn.Module) -> bool:
-    if module.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(module) == "deepseek_v4":
-        return True
-
-    wrapped = getattr(module, "_checkpoint_wrapped_module", None)
-    if wrapped is not None and _is_deepseek_v4_module(wrapped):
-        return True
-
-    return any(
-        sub.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(sub) == "deepseek_v4"
-        for sub in module.modules()
-        if sub is not module
-    )
-
-
-def _floating_param_dtypes(module: nn.Module) -> set[torch.dtype]:
-    return {param.dtype for param in module.parameters() if torch.is_floating_point(param)}
-
-
-def _fp32_mp_policy(mp_policy, *, preserve_activation_dtype: bool = False):
-    if not isinstance(mp_policy, MixedPrecisionPolicy):
+    """
+    if mp_policy is None or mp_policy.param_dtype in (None, torch.float32):
         return mp_policy
-
-    return MixedPrecisionPolicy(
-        param_dtype=torch.float32,
-        reduce_dtype=torch.float32,
-        output_dtype=None if preserve_activation_dtype else torch.float32,
-        cast_forward_inputs=False if preserve_activation_dtype else mp_policy.cast_forward_inputs,
+    ignored_param_ids = {id(param) for param in ignored_params or ()}
+    owned = [
+        canonical_parameter_fqn(name)
+        for name, param in module.named_parameters()
+        if id(param) not in ignored_param_ids and param.dtype.is_floating_point
+    ]
+    prefix = f"{module_name}." if module_name else ""
+    pinned = [name for name in owned if any(token in prefix + name for token in fp32_compute_module_names)]
+    if not pinned:
+        return mp_policy
+    if len(pinned) == len(owned):
+        return replace(
+            mp_policy,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+            cast_forward_inputs=True,
+        )
+    return with_fp32_compute_override(
+        module, mp_policy, fp32_compute_module_names, ignored_params, module_name=module_name
     )
 
 
-def _fsdp_kwargs_for_module(module: nn.Module, fsdp_kwargs: dict) -> dict:
-    ignored_params = fsdp_kwargs.get("ignored_params")
-    if not ignored_params:
-        return fsdp_kwargs
+def fully_shard_deepseek_v4(
+    module: nn.Module,
+    *,
+    fp32_compute_module_names: tuple[str, ...],
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy | None,
+    module_name: str = "",
+    **fsdp_kwargs,
+) -> nn.Module:
+    """Shard ``module`` as one FSDP2 unit with DeepSeek-V4's fp32 compute contract.
 
-    module_param_ids = {id(param) for param in module.parameters()}
-    filtered_ignored_params = {param for param in ignored_params if id(param) in module_param_ids}
-    if len(filtered_ignored_params) == len(ignored_params):
-        return fsdp_kwargs
+    Args:
+        module: Module to shard in place.
+        fp32_compute_module_names: The model's ``_keep_in_fp32_modules_strict``.
+        mesh: Runtime FSDP device mesh; its 1D group also drives HCA graph alignment.
+        mp_policy: Mixed-precision policy of the enclosing boundary.
+        module_name: Model-level name of ``module`` (see
+            :func:`deepseek_v4_unit_mp_policy`).
+        **fsdp_kwargs: Remaining ``fully_shard`` keyword arguments
+            (``offload_policy``, ``reshard_after_forward``, ``ignored_params``).
 
-    filtered_kwargs = dict(fsdp_kwargs)
-    if filtered_ignored_params:
-        filtered_kwargs["ignored_params"] = filtered_ignored_params
-    else:
-        filtered_kwargs.pop("ignored_params", None)
-    return filtered_kwargs
-
-
-def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp32_policy: bool = False, **fsdp_kwargs):
-    if module is None or _has_fsdp_state(module):
-        return module
-
-    # An activation-checkpoint wrapper can own an fp32 island's FSDP unit; the
-    # wrapped module still decides whether the unit keeps the activation dtype.
-    wrapped = getattr(module, "_checkpoint_wrapped_module", module)
+    Returns:
+        The input module with FSDP applied.
+    """
+    _attach_hca_param_sync_group(module, mesh)
     return fully_shard(
         module,
         mesh=mesh,
-        mp_policy=(
-            _fp32_mp_policy(
-                mp_policy,
-                preserve_activation_dtype=wrapped.__class__.__name__ in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES,
-            )
-            if fp32_policy
-            else mp_policy
+        mp_policy=deepseek_v4_unit_mp_policy(
+            module,
+            mp_policy,
+            fp32_compute_module_names,
+            fsdp_kwargs.get("ignored_params"),
+            module_name=module_name,
         ),
-        offload_policy=offload_policy,
-        **_fsdp_kwargs_for_module(module, fsdp_kwargs),
+        **fsdp_kwargs,
     )
 
 
-def _iter_dsv4_fp32_modules(module: nn.Module):
-    seen: set[int] = set()
-    selected_prefixes: list[str] = []
-    for name, submodule in module.named_modules():
-        if not name or id(submodule) in seen:
-            continue
-        # Activation checkpointing replaces an fp32 island with a wrapper that
-        # recursively contains the original module.  Once the wrapper is an
-        # FSDP unit, selecting its child as another unit would shard the same
-        # parameter twice on the same mesh.
-        if any(name.startswith(f"{prefix}.") for prefix in selected_prefixes):
-            continue
-        # A standalone vision tower names its final norm simply "norm".
-        # Match the shared vision norm type as well as paths relative to a model.
-        if submodule.__class__.__name__ not in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES and not any(
-            _matches_suffix(name, suffix) for suffix in _DSV4_FP32_MODULE_SUFFIXES
-        ):
-            continue
-        if _floating_param_dtypes(submodule) != {torch.float32}:
-            continue
-        seen.add(id(submodule))
-        selected_prefixes.append(name)
-        yield submodule
-
-
-def _fp32_module_fsdp_kwargs(module: nn.Module, fsdp_kwargs: dict) -> dict:
-    if module.__class__.__name__ not in _DSV4_RETURNED_FP32_PARAMETER_CLASS_NAMES:
-        return fsdp_kwargs
-
-    # These holders return their raw parameter tensor to the parent module. If
-    # FSDP2 reshards immediately after the holder's tiny forward, the parent can
-    # observe a zero-storage tensor while still inside its own forward/autograd.
-    if fsdp_kwargs.get("reshard_after_forward") is False:
-        return fsdp_kwargs
-    holder_kwargs = dict(fsdp_kwargs)
-    holder_kwargs["reshard_after_forward"] = False
-    return holder_kwargs
-
-
-def _attach_hca_param_sync_group(module: nn.Module, mesh) -> None:
-    process_group = _hca_param_sync_group_from_1d_mesh(mesh)
-    for submodule in module.modules():
-        setter = getattr(submodule, "_set_hca_param_sync_group", None)
-        if submodule.__class__.__name__ == "DeepseekV4Compressor" and setter is not None:
-            # The FSDP2 mesh is only known while wrapping. Bind its parameter
-            # sync group narrowly to the DeepSeek-V4 HCA compressor instead of
-            # adding public config.
-            setter(process_group)
-
-
-def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=None, **fsdp_kwargs):
-    """Apply FSDP2 to DeepSeek-V4 without mixing fp32 and bf16 params in one unit.
-
-    This is intentionally model-specific.  DeepSeek-V4 keeps a small set of
-    reference-sensitive tensors in fp32, while the existing DeepEP path expects
-    the transformer block itself to remain the main FSDP unit.
-
-    Uniform fp32 storage does not necessarily mean fp32 compute: full-parameter
-    training commonly keeps fp32 master weights while the FSDP mixed-precision
-    policy requests bf16 compute.  In that case, preserve fp32 compute only for
-    the explicitly listed reference-sensitive islands and let the parent block
-    use the caller's bf16 policy.
-    """
-    is_dsv4 = _is_deepseek_v4_module(module)
-    if is_dsv4:
-        _attach_hca_param_sync_group(module, mesh)
-
-    policy_param_dtype = getattr(mp_policy, "param_dtype", None)
-    use_all_fp32_fast_path = _floating_param_dtypes(module) == {torch.float32} and (
-        not is_dsv4 or policy_param_dtype in (None, torch.float32)
-    )
-    if use_all_fp32_fast_path:
-        fsdp_kwargs = _fp32_module_fsdp_kwargs(module, fsdp_kwargs)
-        return _fully_shard_once(
-            module,
-            mesh=mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            fp32_policy=True,
-            **fsdp_kwargs,
-        )
-
-    if not is_dsv4:
-        return _fully_shard_once(
-            module,
-            mesh=mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            fp32_policy=False,
-            **fsdp_kwargs,
-        )
-
-    for fp32_module in _iter_dsv4_fp32_modules(module):
-        _fully_shard_once(
-            fp32_module,
-            mesh=mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            fp32_policy=True,
-            **_fp32_module_fsdp_kwargs(fp32_module, fsdp_kwargs),
-        )
-
-    ignored_params = set(fsdp_kwargs.get("ignored_params") or ())
-    parent_kwargs = dict(fsdp_kwargs)
-    if ignored_params:
-        parent_kwargs["ignored_params"] = ignored_params
-
-    return _fully_shard_once(
-        module,
-        mesh=mesh,
-        mp_policy=mp_policy,
-        offload_policy=offload_policy,
-        fp32_policy=False,
-        **parent_kwargs,
-    )
+__all__ = ["deepseek_v4_unit_mp_policy", "fully_shard_deepseek_v4"]

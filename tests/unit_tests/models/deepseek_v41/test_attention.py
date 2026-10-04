@@ -375,8 +375,8 @@ def test_attention_dropout_is_training_only_and_keeps_gradients_finite(backend):
     torch.testing.assert_close(layer(inputs, **kwargs).hidden_states, actual, atol=0, rtol=0)
     actual.square().sum().backward()
     assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
-    assert layer.sinks_param.weight.grad is not None
-    assert torch.isfinite(layer.sinks_param.weight.grad).all()
+    assert layer.attn_sink.grad is not None
+    assert torch.isfinite(layer.attn_sink.grad).all()
     layer.eval()
     torch.testing.assert_close(layer(inputs, **kwargs).hidden_states, expected, atol=0, rtol=0)
 

@@ -42,10 +42,6 @@ _FP32_KEY_PARTS = (
     "v_conv1d.weight",
     "o_norm.weight",
 )
-_KDA_FP32_HOLDER = re.compile(r"(\.self_attn)\._fp32_params\.")
-_KDA_FP32_OP_HOLDER = re.compile(r"(\.self_attn\.(?:q_conv1d|k_conv1d|v_conv1d|o_norm))\._fp32_params\.")
-_KDA_FP32_OP_PARAM = re.compile(r"(\.self_attn\.(?:q_conv1d|k_conv1d|v_conv1d|o_norm))\.(weight)$")
-_KDA_FP32_PARAM_NAMES = ("A_log", "dt_bias")
 _MXFP4_VALUES = (
     0.0,
     0.5,
@@ -93,25 +89,6 @@ def _upcast_fp32_state_tensor(key: str, value: Any) -> Any:
     if isinstance(value, torch.Tensor) and any(part in key for part in _FP32_KEY_PARTS):
         return value.to(torch.float32)
     return value
-
-
-def _strip_kda_fp32_holder(key: str) -> str:
-    key = _KDA_FP32_OP_HOLDER.sub(r"\1.", key)
-    return _KDA_FP32_HOLDER.sub(r"\1.", key)
-
-
-def _route_kda_fp32_holder(key: str) -> str:
-    if "._fp32_params." in key:
-        return key
-    routed = _KDA_FP32_OP_PARAM.sub(r"\1._fp32_params.\2", key)
-    if routed != key:
-        return routed
-    if not key.endswith(_KDA_FP32_PARAM_NAMES):
-        return key
-    if ".self_attn." not in key:
-        return key
-    head, tail = key.rsplit(".self_attn.", 1)
-    return f"{head}.self_attn._fp32_params.{tail}"
 
 
 # The decoder block calls its feed-forward ``mlp`` for both the dense and the MoE
@@ -290,7 +267,6 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             split_kwargs = {**kwargs, "quantization": False}
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **split_kwargs)
         result = expert_result if expert_result is not None else [(fqn, tensor)]
-        result = [(_strip_kda_fp32_holder(key), value) for key, value in result]
         result = [(self._map_generic_expert_key_to_hf(key), value) for key, value in result]
         result = [(_native_moe_key_to_hf(key), value) for key, value in result]
         result = [(self._add_hf_text_prefix(key), value) for key, value in result]
@@ -333,7 +309,7 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         }
         self._dequantize_packed_experts(stripped_state_dict)
         generic_state_dict = {
-            _route_kda_fp32_holder(_hf_moe_key_to_native(self._map_hf_expert_key_to_generic(key))): value
+            _hf_moe_key_to_native(self._map_hf_expert_key_to_generic(key)): value
             for key, value in stripped_state_dict.items()
         }
         return self._from_hf_w_merged_experts(generic_state_dict, device_mesh)

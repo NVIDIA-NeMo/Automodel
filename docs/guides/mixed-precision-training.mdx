@@ -116,6 +116,12 @@ Both patterns keep the master weights and Adam EMA in fp32, so for most models t
 
 This is usually negligible. When bringing up a new model, fp32 storage (Pattern B) is a robust starting point because every part of the update path is fp32; move to TE (Pattern A) after it is validated for that model and you want bf16 checkpoints.
 
+## Models with Intrinsically fp32 Parameters
+
+Hybrid and MoE models carry a few parameters that must compute in fp32 even when the bulk computes in bf16: SSM or linear-attention `A_log` / `dt_bias`, Mamba `D`, MoE sigmoid-gate biases, attention-sink biases, per-head scales. Each model declares them in `_keep_in_fp32_modules_strict`.
+
+FSDP2 keeps these parameters in fp32 through PyTorch 2.15 per-parameter mixed precision (`MixedPrecisionPolicy.param_dtype_override_fn`): the block is one FSDP unit, `param_dtype: bfloat16` casts every other parameter at all-gather, and the declared parameters keep their storage dtype. Because the override can only keep a parameter's storage dtype, fp32 compute requires fp32 storage. Train these models with Pattern B (`model.dtype: float32`); Pattern A (bf16 storage) is not available for them because the fp32 parameters would share a unit with bf16 parameters, and FSDP2 requires one storage dtype per unit. Sharding then fails with an error listing the mismatched parameters. Gradients of the fp32 parameters are reduced in the unit's `reduce_dtype`, so keep the default `reduce_dtype: float32`.
+
 ## Risky Pattern Using torch AdamW with bf16 Model Storage
 
 This pattern is easy to enter accidentally. In several NeMo AutoModel paths, leaving `model.dtype` unset, or setting it to `auto`, resolves the resident model parameter dtype to bf16. If that is paired with `torch.optim.AdamW`, the AdamW EMA buffers are also bf16 because the optimizer initializes state from the parameter dtype.

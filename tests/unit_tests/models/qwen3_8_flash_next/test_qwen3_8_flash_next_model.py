@@ -178,6 +178,41 @@ def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout(backend_sourc
     assert "model.language_model.hyper_connection_mixer.block_inject_weight.weight" not in keys
 
 
+def test_strict_fp32_tokens_match_exactly_the_gdn_gate_params() -> None:
+    config = _tiny_config()
+    config.text_config.layer_types = ["linear_attention"]
+    config.text_config.linear_conv_kernel_dim = 4
+    config.text_config.linear_key_head_dim = 4
+    config.text_config.linear_value_head_dim = 4
+    config.text_config.linear_num_key_heads = 1
+    config.text_config.linear_num_value_heads = 2
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=False,
+    )
+    model = Qwen3_8_FlashNextForConditionalGeneration.from_config(
+        config,
+        moe_config=_tiny_moe_config(config.text_config),
+        backend=backend,
+    )
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
+    tokens = model._keep_in_fp32_modules_strict
+
+    matched = {name: param for name, param in model.named_parameters() if any(token in name for token in tokens)}
+
+    assert set(matched) == {
+        "model.language_model.layers.0.linear_attn.A_log",
+        "model.language_model.layers.0.linear_attn.dt_bias",
+    }
+    assert all(param.dtype == torch.float32 for param in matched.values())
+    assert model.model.language_model.layers["0"].linear_attn.in_proj_qkv.weight.dtype == torch.bfloat16
+    assert not any("_fp32_params" in key for key in model.state_dict())
+
+
 def test_output_hidden_states_defaults_to_model_config() -> None:
     config = _tiny_config()
     config.output_hidden_states = True

@@ -34,29 +34,12 @@ _HF_TO_GENERIC_EXPERT_PROJ = {
 }
 _GENERIC_TO_HF_EXPERT_PROJ = {value: key for key, value in _HF_TO_GENERIC_EXPERT_PROJ.items()}
 _FP32_KEY_PARTS = ("A_log", "dt_bias", "e_score_correction_bias")
-_KDA_FP32_HOLDER = re.compile(r"(\.self_attn)\._fp32_params\.")
-_KDA_FP32_PARAM_NAMES = ("A_log", "dt_bias")
 
 
 def _upcast_fp32_state_tensor(key: str, value: Any) -> Any:
     if isinstance(value, torch.Tensor) and any(part in key for part in _FP32_KEY_PARTS):
         return value.to(torch.float32)
     return value
-
-
-def _strip_kda_fp32_holder(key: str) -> str:
-    return _KDA_FP32_HOLDER.sub(r"\1.", key)
-
-
-def _route_kda_fp32_holder(key: str) -> str:
-    if not key.endswith(_KDA_FP32_PARAM_NAMES):
-        return key
-    if "._fp32_params." in key:
-        return key
-    if ".self_attn." not in key:
-        return key
-    head, tail = key.rsplit(".self_attn.", 1)
-    return f"{head}.self_attn._fp32_params.{tail}"
 
 
 # The decoder block calls its feed-forward ``mlp`` for both the dense and the MoE
@@ -179,7 +162,6 @@ class KimiLinear48BStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         result = expert_result if expert_result is not None else [(fqn, tensor)]
-        result = [(_strip_kda_fp32_holder(key), value) for key, value in result]
         result = [(self._map_generic_expert_key_to_hf(key), value) for key, value in result]
         result = [(_native_moe_key_to_hf(key), value) for key, value in result]
         if exclude_key_regex:
@@ -204,9 +186,7 @@ class KimiLinear48BStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
         """
         self._uses_model_prefix = any(key.startswith("model.") for key in hf_state_dict)
         generic_state_dict = {
-            _route_kda_fp32_holder(_hf_moe_key_to_native(self._map_hf_expert_key_to_generic(key))): (
-                _upcast_fp32_state_tensor(key, value)
-            )
+            _hf_moe_key_to_native(self._map_hf_expert_key_to_generic(key)): _upcast_fp32_state_tensor(key, value)
             for key, value in hf_state_dict.items()
         }
         return self._from_hf_w_merged_experts(generic_state_dict, device_mesh)

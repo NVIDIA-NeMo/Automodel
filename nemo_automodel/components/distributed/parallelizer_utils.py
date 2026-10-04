@@ -129,6 +129,8 @@ def with_fp32_compute_override(
     mp_policy: MixedPrecisionPolicy | None,
     fp32_compute_module_names: tuple[str, ...],
     ignored_params: set[nn.Parameter] | None = None,
+    *,
+    module_name: str = "",
 ) -> MixedPrecisionPolicy | None:
     """Keep ``module``'s fp32-contract parameters in fp32 under a lower-precision policy.
 
@@ -147,27 +149,49 @@ def with_fp32_compute_override(
         mp_policy: Policy of the enclosing FSDP boundary, or ``None``.
         fp32_compute_module_names: Parameter-name substrings that must compute in fp32.
         ignored_params: Parameters owned by another FSDP or parallelism unit.
+        module_name: Model-level name of ``module``. When given, tokens are matched
+            against ``module_name`` joined with each parameter's relative name, so
+            model-level tokens such as ``lm_head`` resolve inside the ``lm_head`` unit.
 
     Returns:
         ``mp_policy`` itself when no parameter needs fp32 compute, otherwise a
         copy carrying ``param_dtype_override_fn``.
 
     Raises:
-        ValueError: A parameter must compute in fp32 but is not stored in fp32.
+        ValueError: Trainable parameters mix storage dtypes, or a parameter must
+            compute in fp32 but is not stored in fp32.
         RuntimeError: PyTorch lacks ``param_dtype_override_fn`` and fp32 compute is needed.
     """
+    ignored_param_ids = {id(param) for param in ignored_params or ()}
+    # FSDP2 packs one unit into one all-gather buffer, so trainable parameters must
+    # share a storage dtype. Fail here with the offending names instead of at the
+    # first forward with PyTorch's bare uniformity assertion.
+    trainable_dtypes: dict[torch.dtype, list[str]] = {}
+    for name, param in module.named_parameters():
+        if id(param) not in ignored_param_ids and param.requires_grad and param.dtype.is_floating_point:
+            trainable_dtypes.setdefault(param.dtype, []).append(name)
+    if len(trainable_dtypes) > 1:
+        minority = min(trainable_dtypes.items(), key=lambda item: len(item[1]))
+        raise ValueError(
+            f"FSDP2 requires one storage dtype per unit but trainable parameters use {sorted(map(str, trainable_dtypes))}; "
+            f"{minority[0]}: {', '.join(minority[1][:8])}. Set model.dtype to float32 (fp32 master weights) so fp32 "
+            "parameters can share the block's unit."
+        )
     if mp_policy is None or mp_policy.param_dtype in (None, torch.float32):
         return mp_policy
-    ignored_param_ids = {id(param) for param in ignored_params or ()}
     fp32_param_ids: set[int] = set()
     for name, param in module.named_parameters():
         if id(param) in ignored_param_ids or not param.dtype.is_floating_point:
             continue
-        pinned = any(token in canonical_parameter_fqn(name) for token in fp32_compute_module_names)
+        fqn = canonical_parameter_fqn(f"{module_name}.{name}" if module_name else name)
+        pinned = any(token in fqn for token in fp32_compute_module_names)
         recorded = getattr(param, "_hf_compute_dtype", None)
         if not pinned and recorded != torch.float32:
             continue
         if param.dtype != torch.float32:
+            if not param.requires_grad:
+                # A frozen lower-precision copy (e.g. a LoRA base) has no fp32 storage to keep.
+                continue
             raise ValueError(
                 f"{name} must compute in fp32 but is stored in {param.dtype}. FSDP2 keeps fp32 compute parameters "
                 "in their storage dtype, so set model.dtype to float32 (fp32 master weights) for this model."

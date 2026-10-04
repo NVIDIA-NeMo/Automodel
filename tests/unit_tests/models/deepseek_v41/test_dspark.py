@@ -121,7 +121,7 @@ def _official_attention_reference(
     kv = torch.cat((target_kv, draft_kv, target_kv.new_zeros(target_kv.shape[0], 1, layer.head_dim)), dim=1)
 
     bias = attention_mask.expand(-1, layer.num_heads, -1, -1).float()
-    sink = layer.sinks_param(query).view(1, layer.num_heads, 1, 1).expand(query.shape[0], -1, query.shape[1], -1)
+    sink = layer.attn_sink.view(1, layer.num_heads, 1, 1).expand(query.shape[0], -1, query.shape[1], -1)
     logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * layer.head_dim**-0.5
     probabilities = (logits + torch.cat((bias, sink), dim=-1)).softmax(dim=-1)
     attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)

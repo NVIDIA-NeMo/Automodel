@@ -990,9 +990,7 @@ def get_rope_config(config) -> tuple[float, dict, float]:
     return rope_theta, rope_parameters, partial_rotary_factor
 
 
-def cast_model_to_dtype(
-    model: nn.Module, dtype: torch.dtype = torch.bfloat16, skip_modules: tuple[str, ...] = ()
-) -> None:
+def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -> None:
     """Cast model parameters to the target dtype, keeping fp32 modules in full precision.
 
     Respects ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` on
@@ -1000,23 +998,15 @@ def cast_model_to_dtype(
 
     Uses ``nn.Module.to()`` which is safe for both plain tensors and DTensors
     (FSDP2 sharded parameters).  When the model is already FSDP2-sharded
-    (parameters are DTensors), strict fp32 modules are restored to fp32 because
-    they are expected to be isolated as uniform fp32 FSDP units. Non-strict fp32
-    hints only restore matching buffers, since their parameters may share an
-    FSDP unit with lower-precision parameters.
+    (parameters are DTensors), strict fp32 parameters are restored to fp32
+    because FSDP keeps them in fp32 compute through a per-parameter mixed
+    precision override (see ``fully_shard_by_dtype``). Non-strict fp32 hints
+    only restore matching buffers, since their parameters compute in the
+    unit's ``param_dtype``.
 
     Args:
         model: The model whose parameters should be cast.
         dtype: Target dtype (e.g. ``torch.bfloat16``).
-        skip_modules: Names of immediate submodules to leave entirely untouched
-            (kept at their current dtype). Unlike the ``_keep_in_fp32_modules``
-            restore path, these are *detached* during the cast so ``model.to()``
-            never visits them — the only reliable way to preserve an fp32
-            parameter once it is FSDP2-sharded (post-shard ``.data`` reassignment
-            does not stick). The caller must guarantee each skipped submodule is
-            its own dtype-uniform FSDP group (e.g. Qwen3.5's ``_fp32_params``
-            holder, sharded separately in fp32), so leaving it fp32 cannot break
-            FSDP's uniform-dtype rule.
     """
     fp32_keywords = _get_fp32_module_keywords(model)
     strict_fp32_keywords = _get_strict_fp32_module_keywords(model)
@@ -1035,21 +1025,7 @@ def cast_model_to_dtype(
             buffer_keywords=fp32_keywords,
         )
 
-    # Detach skip_modules so ``model.to(dtype)`` does not descend into them. This
-    # preserves their exact dtype (e.g. fp32 master weights) through the cast.
-    detached: list[tuple[nn.Module, str, nn.Module]] = []
-    if skip_modules:
-        for _, parent in model.named_modules():
-            for child_name, child in list(parent._modules.items()):
-                if child is not None and child_name in skip_modules:
-                    detached.append((parent, child_name, child))
-                    parent._modules[child_name] = None
-
-    try:
-        model.to(dtype)
-    finally:
-        for parent, child_name, child in detached:
-            parent._modules[child_name] = child
+    model.to(dtype)
 
     if fp32_keywords:
         if has_dtensor_params:
@@ -1202,12 +1178,23 @@ def _restore_fp32_tensor_snapshots(
     buffer_snapshots: dict[str, torch.Tensor],
 ) -> None:
     """Restore fp32-preserved tensors from pre-cast snapshots."""
+    from torch.distributed.tensor import DTensor
+
     named_parameters = dict(model.named_parameters())
     for name, snapshot in parameter_snapshots.items():
         param = named_parameters.get(name)
-        if param is None:
+        if param is None or param.dtype == torch.float32:
             continue
-        param.data = snapshot.to(dtype=torch.float32)
+        if isinstance(param, DTensor):
+            # ``param.data = ...`` swaps the TensorImpl only; a DTensor's Python-side
+            # local tensor would keep the bf16 copy. Swap the whole tensor object in
+            # place so optimizer and module references stay valid. Must run before
+            # FSDP lazy init (the first forward), which caches the sharded storage.
+            restored = nn.Parameter(snapshot.to(dtype=torch.float32), requires_grad=param.requires_grad)
+            restored.__dict__.update(param.__dict__)
+            torch.utils.swap_tensors(param, restored)
+        else:
+            param.data = snapshot.to(dtype=torch.float32)
 
     for name, snapshot in buffer_snapshots.items():
         # ActivationWrapper forwards __getattr__ / __setattr__ to the wrapped

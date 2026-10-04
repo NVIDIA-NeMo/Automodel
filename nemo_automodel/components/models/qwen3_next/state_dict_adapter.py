@@ -22,8 +22,6 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     forced_gated_delta_net_fp32_dtype_mapping,
-    route_fp32_holder_key,
-    strip_fp32_holder_key,
     upcast_gated_delta_net_fp32_state_tensor,
 )
 from nemo_automodel.components.moe.config import MoEConfig
@@ -125,11 +123,11 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
         # First apply key mappings for shared experts (shared_expert -> shared_experts)
         hf_state_dict = self._apply_key_mapping(hf_state_dict, self.hf_to_internal_map)
-        fp32_routed_state_dict = {}
-        for key, value in hf_state_dict.items():
-            native_key = route_fp32_holder_key(key)
-            fp32_routed_state_dict[native_key] = upcast_gated_delta_net_fp32_state_tensor(native_key, value)
-        hf_state_dict = fp32_routed_state_dict
+        # A_log / dt_bias are fp32 in the model; upcast them when the checkpoint stored
+        # them in a lower precision. Their keys already equal the HF keys.
+        hf_state_dict = {
+            key: upcast_gated_delta_net_fp32_state_tensor(key, value) for key, value in hf_state_dict.items()
+        }
 
         # Then convert routed experts from split to grouped format
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
@@ -160,10 +158,6 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 if pattern in key:
                     new_key = new_key.replace(pattern, replacement)
                     break
-            # Hide the GatedDeltaNet fp32 holder wrapping so saved checkpoints keep the
-            # bare HF key (``...linear_attn.A_log`` instead of
-            # ``...linear_attn._fp32_params.A_log``) and stay directly HF-loadable.
-            new_key = strip_fp32_holder_key(new_key)
             value = upcast_gated_delta_net_fp32_state_tensor(new_key, value)
             mapped_result.append((new_key, value))
 

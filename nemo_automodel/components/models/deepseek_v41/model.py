@@ -68,6 +68,7 @@ from nemo_automodel.components.models.common.utils import (
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
+from nemo_automodel.components.models.deepseek_v4.parallelization import DeepseekV4ModelParallelizer
 from nemo_automodel.components.models.deepseek_v41.attention import (
     DeepseekV41Attention,
     DeepseekV41AttentionState,
@@ -75,7 +76,6 @@ from nemo_automodel.components.models.deepseek_v41.attention import (
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
 from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram, DeepseekV41NgramHash
-from nemo_automodel.components.models.deepseek_v41.fsdp import PARALLELIZER
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41HyperConnection,
     DeepseekV41RMSNorm,
@@ -416,7 +416,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     _keep_in_fp32_modules_strict = [
         "attn_hc",
         "ffn_hc",
-        "attn.sinks_param",
+        "attn.attn_sink",
         "attn.compressor.wgate",
         "attn.compressor.wkv",
         "e_score_correction_bias",
@@ -735,5 +735,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 layer.engram.embed.mark_sharding_contract()
 
 
-DeepseekV41ForCausalLM.parallelizer = PARALLELIZER
+DeepseekV41ForCausalLM.parallelizer = DeepseekV4ModelParallelizer(
+    tuple(DeepseekV41ForCausalLM._keep_in_fp32_modules_strict)
+)
 ModelClass = DeepseekV41ForCausalLM

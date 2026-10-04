@@ -4,6 +4,26 @@ description: ""
 ---
 ## Unreleased
 
+### FSDP2 per-parameter mixed precision
+
+- `fully_shard_by_dtype` now shards each block as one FSDP unit and keeps
+  `_keep_in_fp32_modules_strict` parameters (and checkpoint-recorded fp32
+  parameters) in fp32 through PyTorch 2.15 `MixedPrecisionPolicy.param_dtype_override_fn`.
+  The nested per-dtype FSDP units and the `_fp32_params` holder modules in
+  Qwen3-Next, Qwen3.5, Qwen3.5-MoE, Qwen3.8-Flash-Next, Kimi K3, Kimi Linear,
+  NemotronH, Nemotron Omni, GLM5-Next and Inkling are removed, as are DeepSeek
+  V4 / V4.1's nested fp32-island units and `DeepseekV4FP32Parameter` holders;
+  fp32 parameters now use their HF names directly (for example
+  `linear_attn.A_log`, `mixer.D`, `self_attn.sinks`, `attn.attn_sink`).
+- Breaking: these models require `model.dtype: float32` (fp32 master weights)
+  for FSDP2 training with `param_dtype: bfloat16`; a pinned fp32 parameter stored
+  in bf16 is rejected. Automodel-native DCP checkpoints that contain
+  `._fp32_params.` keys are not migrated; HF-format checkpoints are unaffected.
+- DeepSeek V4.1's `lm_head` and DeepSeek V4's `ffn.gate.bias_vl` now follow the
+  models' strict fp32 lists (fp32 compute and fp32 logits); previously they
+  computed in bf16 on the V4.1 path.
+- Keeping fp32 parameters in fp32 under FSDP2 mixed precision requires PyTorch >= 2.15.
+
 ### Native FlashAttention-4
 
 - Select the native CuTe backend with `model.backend.attn: fa4` in an

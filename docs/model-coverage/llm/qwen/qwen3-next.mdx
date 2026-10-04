@@ -21,6 +21,8 @@ From the repository root, run:
 uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml
 ```
 
+Full-parameter FSDP2 training requires fp32 parameter storage: set `model.dtype: float32` and keep `mp_policy.param_dtype: bfloat16`. The model's fp32 parameters (the GatedDeltaNet `A_log` and `dt_bias`) then stay in fp32 inside each layer's FSDP unit; bf16 storage fails at sharding time.
+
 ## Choose a Workflow
 
 | Goal | Start Here |

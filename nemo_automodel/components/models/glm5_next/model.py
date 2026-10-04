@@ -213,8 +213,15 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
     _owns_cp_attention = True
     _owns_packed_attention = True
     _packed_cp_attn_backends = ("sdpa", "cudnn")
+    # mHC base/scale and the KDA recurrent-decay parameters stay fp32 under
+    # FSDP mixed precision; the tokens are matched as substrings of the FQN.
     _keep_in_fp32_modules_strict = [
-        "_fp32_params",
+        "attn_hc.base",
+        "attn_hc.scale",
+        "ffn_hc.base",
+        "ffn_hc.scale",
+        "self_attn.A_log",
+        "self_attn.dt_bias",
         "e_score_correction_bias",
         "rotary_pos_emb",
     ]
@@ -448,7 +455,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         final_std = self.config.text_config.hidden_size**-0.5
         with buffer_device:
             nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=final_std, a=-3 * final_std, b=3 * final_std)
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
 
 
 ModelClass = Glm5NextForConditionalGeneration

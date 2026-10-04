@@ -47,6 +47,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  dtype: float32
   config:
     _target_: transformers.models.qwen3_5_moe.configuration_qwen3_5_moe.Qwen3_5MoeTextConfig
     # Routes NeMoAutoModel to the NeMo class via MODEL_ARCH_MAPPING, not the HF one.
@@ -70,7 +71,7 @@ model:
     # All full_attention: linear-attention layers keep two params in fp32, and
     # this class does not set up the separate FSDP group they need.
     layer_types: [full_attention, full_attention, full_attention, full_attention, full_attention, full_attention]
-    dtype: bfloat16
+    dtype: float32
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
