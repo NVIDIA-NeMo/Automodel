@@ -15,6 +15,7 @@
 import sys
 import types
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -359,7 +360,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
 
 
 def _import_parallelizer_with_stubs(monkeypatch):
-    import importlib
+    import importlib.util
 
     # ensure fresh import of parallelizer
     for mod in [
@@ -471,6 +472,21 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.distributed.parallelizer_utils",
         parallelizer_utils_stub,
     )
+
+    fsdp_patches_stub = types.ModuleType("nemo_automodel.components.distributed.fsdp_patches")
+    fsdp_patches_stub.patch_fsdp_accumulated_grad_guard = lambda: None
+    fsdp_patches_stub.patch_fsdp_uniform_reduce_dtype = lambda: None
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.fsdp_patches", fsdp_patches_stub)
+
+    # multimodal_fsdp only depends on torch.nn, so load the real module against the stubs.
+    multimodal_fsdp_name = "nemo_automodel.components.distributed.multimodal_fsdp"
+    multimodal_fsdp_spec = importlib.util.spec_from_file_location(
+        multimodal_fsdp_name,
+        Path(__file__).resolve().parents[3] / "nemo_automodel" / "components" / "distributed" / "multimodal_fsdp.py",
+    )
+    multimodal_fsdp_module = importlib.util.module_from_spec(multimodal_fsdp_spec)
+    monkeypatch.setitem(sys.modules, multimodal_fsdp_name, multimodal_fsdp_module)
+    multimodal_fsdp_spec.loader.exec_module(multimodal_fsdp_module)
     distributed_package = importlib.import_module("nemo_automodel.components.distributed")
     monkeypatch.setattr(distributed_package, "parallelizer_utils", parallelizer_utils_stub, raising=False)
 
