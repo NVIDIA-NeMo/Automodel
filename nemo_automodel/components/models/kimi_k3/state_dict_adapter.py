@@ -33,15 +33,6 @@ _HF_TO_GENERIC_EXPERT_PROJ = {
     "w3": "up_proj",
 }
 _GENERIC_TO_HF_EXPERT_PROJ = {value: key for key, value in _HF_TO_GENERIC_EXPERT_PROJ.items()}
-_FP32_KEY_PARTS = (
-    "A_log",
-    "dt_bias",
-    "e_score_correction_bias",
-    "q_conv1d.weight",
-    "k_conv1d.weight",
-    "v_conv1d.weight",
-    "o_norm.weight",
-)
 _MXFP4_VALUES = (
     0.0,
     0.5,
@@ -83,12 +74,6 @@ def dequantize_mxfp4(
     unpacked[..., 1::2] = lookup[(blocks >> 4).long()]
     exponents = scales.to(torch.int32).sub(127).unsqueeze(-1)
     return torch.ldexp(unpacked, exponents).reshape(output_features, groups * 32)
-
-
-def _upcast_fp32_state_tensor(key: str, value: Any) -> Any:
-    if isinstance(value, torch.Tensor) and any(part in key for part in _FP32_KEY_PARTS):
-        return value.to(torch.float32)
-    return value
 
 
 # The decoder block calls its feed-forward ``mlp`` for both the dense and the MoE
@@ -337,7 +322,6 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
 
     def _normalize_checkpoint_tensor(self, key: str, value: Any) -> Any:
         """Remove K3's zero padding from the per-head KDA decay parameter."""
-        value = _upcast_fp32_state_tensor(key, value)
         if not key.endswith(".self_attn.A_log") or not isinstance(value, torch.Tensor):
             return value
         num_heads = self.config.linear_attn_config["num_heads"]

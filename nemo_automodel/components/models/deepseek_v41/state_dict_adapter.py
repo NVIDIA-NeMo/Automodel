@@ -622,23 +622,6 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                 converted.append((key, value))
         return converted
 
-    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
-        """Preserve full-precision parameters when checkpoint export casts weights.
-
-        Args:
-            state_dict: Native parameter/buffer tensors with arbitrary registered
-                shapes and layouts. Values are inspected only for their dtype.
-
-        Returns:
-            Released checkpoint keys that must remain float32, including mHC,
-            router parameters, attention sinks and the full-precision head.
-        """
-        return {
-            _released_key(key): "float32"
-            for key, value in state_dict.items()
-            if isinstance(value, torch.Tensor) and value.dtype == torch.float32
-        }
-
 
 def _dspark_native_key(key: str) -> str:
     """Map one released DSpark checkpoint name to the native draft namespace."""
@@ -831,11 +814,3 @@ class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDict
             else:
                 converted.append((key, value))
         return converted
-
-    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
-        """Return released draft keys whose trained values must remain FP32."""
-        return {
-            _dspark_released_key(key): "float32"
-            for key, value in state_dict.items()
-            if isinstance(value, torch.Tensor) and value.dtype == torch.float32
-        }

@@ -735,7 +735,5 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 layer.engram.embed.mark_sharding_contract()
 
 
-DeepseekV41ForCausalLM.parallelizer = DeepseekV4ModelParallelizer(
-    tuple(DeepseekV41ForCausalLM._keep_in_fp32_modules_strict)
-)
+DeepseekV41ForCausalLM.parallelizer = DeepseekV4ModelParallelizer()
 ModelClass = DeepseekV41ForCausalLM

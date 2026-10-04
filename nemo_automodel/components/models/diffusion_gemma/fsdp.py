@@ -119,6 +119,7 @@ class DiffusionGemmaModelParallelizer(ModelParallelizer):
     """Pure-FSDP2 strategy that shards grouped experts as their own units."""
 
     def _fully_shard_module(self, module, **kwargs):
+        kwargs["mp_policy"] = self._fsdp_unit_mp_policy(module, kwargs.get("mp_policy"), kwargs.get("ignored_params"))
         return fully_shard_diffusion_gemma(module, **kwargs)
 
 

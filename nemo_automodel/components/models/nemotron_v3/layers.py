@@ -574,10 +574,6 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 dt_bias_local.copy_(inv_dt)
                 self.dt_bias._no_reinit = True
 
-            # Mark A_log and D for no weight decay
-            self.A_log._no_weight_decay = True
-            self.D._no_weight_decay = True
-
             # Zero biases (don't reinitialize weights - they use default init)
             if self.in_proj.bias is not None:
                 nn.init.zeros_(self.in_proj.bias)

@@ -33,13 +33,6 @@ _HF_TO_GENERIC_EXPERT_PROJ = {
     "w3": "up_proj",
 }
 _GENERIC_TO_HF_EXPERT_PROJ = {value: key for key, value in _HF_TO_GENERIC_EXPERT_PROJ.items()}
-_FP32_KEY_PARTS = ("A_log", "dt_bias", "e_score_correction_bias")
-
-
-def _upcast_fp32_state_tensor(key: str, value: Any) -> Any:
-    if isinstance(value, torch.Tensor) and any(part in key for part in _FP32_KEY_PARTS):
-        return value.to(torch.float32)
-    return value
 
 
 # The decoder block calls its feed-forward ``mlp`` for both the dense and the MoE
@@ -186,7 +179,7 @@ class KimiLinear48BStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
         """
         self._uses_model_prefix = any(key.startswith("model.") for key in hf_state_dict)
         generic_state_dict = {
-            _hf_moe_key_to_native(self._map_hf_expert_key_to_generic(key)): _upcast_fp32_state_tensor(key, value)
+            _hf_moe_key_to_native(self._map_hf_expert_key_to_generic(key)): value
             for key, value in hf_state_dict.items()
         }
         return self._from_hf_w_merged_experts(generic_state_dict, device_mesh)

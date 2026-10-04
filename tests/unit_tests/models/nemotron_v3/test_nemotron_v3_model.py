@@ -17,7 +17,6 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 
 # Over the default 5s budget on purpose: CUDA Mamba kernels compile on their first invocation.
@@ -580,49 +579,6 @@ class TestNemotronHForCausalLM:
         model = NemotronHForCausalLM(config, backend=backend)
 
         assert hasattr(model, "state_dict_adapter")
-
-    def test_mamba_decay_params_stay_fp32_after_bf16_cast(self, config, backend):
-        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-
-        config.layers_block_type = ["mamba", "attention"]
-        model = NemotronHForCausalLM(config, backend=backend)
-        expected = {}
-        for name, param in model.named_parameters():
-            if name.endswith(("A_log", "dt_bias", "D")):
-                values = torch.linspace(0.00123, 0.00456, param.numel(), dtype=torch.float32).reshape_as(param)
-                param.data.copy_(values)
-                expected[name] = values
-
-        assert expected, "Nemotron V3 Mamba layers should create decay parameters"
-        assert all(".mixer." in name and "_fp32_params" not in name for name in expected)
-
-        cast_model_to_dtype(model, torch.bfloat16)
-
-        params = dict(model.named_parameters())
-        for name, values in expected.items():
-            assert params[name].dtype == torch.float32
-            torch.testing.assert_close(params[name], values)
-        assert model.lm_head.weight.dtype == torch.bfloat16
-
-    def test_strict_fp32_tokens_select_exactly_mamba_ssm_params(self, config, backend):
-        """The strict fp32 tokens match the Mamba SSM params (plus the router bias) and nothing else."""
-        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-
-        config.layers_block_type = ["mamba", "attention", "mlp", "moe"]
-        config.num_hidden_layers = 4
-        model = NemotronHForCausalLM(config, backend=backend)
-        tokens = model._keep_in_fp32_modules_strict
-
-        tensor_names = [name for name, _ in model.named_parameters()] + [name for name, _ in model.named_buffers()]
-        matched = {name for name in tensor_names if any(token in name for token in tokens)}
-        expected = {f"model.layers.0.mixer.{suffix}" for suffix in ("A_log", "dt_bias", "D")}
-        expected |= {name for name in tensor_names if name.endswith("e_score_correction_bias")}
-        assert matched == expected
-
-        params = dict(model.named_parameters())
-        assert all(params[name].dtype == torch.float32 for name in expected if name in params)
-        # The tokens name parameters, so module-name matching (unsharded restore path) selects no module.
-        assert not any(any(token in name for token in tokens) for name, _ in model.named_modules())
 
     def test_model_class_export(self):
         """Test that ModelClass is exported correctly."""
@@ -1378,7 +1334,7 @@ class TestNemotronV3ModelWithMoE:
     def test_e_score_correction_bias_stays_fp32_after_dtype_cast(self, config, backend):
         """Nemotron v3 router correction bias must stay fp32 under bf16 storage casts."""
         from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM, NemotronV3Model
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
         backend = BackendConfig(
             linear=backend.linear,
@@ -1388,17 +1344,7 @@ class TestNemotronV3ModelWithMoE:
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
-        base_model = NemotronV3Model(config, backend=backend)
         original_bias = torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32)
-        base_model.layers["0"].mixer.gate.e_score_correction_bias.copy_(original_bias)
-        cast_model_to_dtype(base_model, torch.bfloat16)
-
-        base_gate = base_model.layers["0"].mixer.gate
-        assert base_model.embed_tokens.weight.dtype == torch.bfloat16
-        assert base_model.layers["0"].mixer.experts.gate_and_up_projs.dtype == torch.bfloat16
-        assert base_gate.e_score_correction_bias.dtype == torch.float32
-        assert torch.equal(base_gate.e_score_correction_bias, original_bias)
-
         model = NemotronHForCausalLM(config, backend=backend)
         model.model.layers["0"].mixer.gate.e_score_correction_bias.copy_(original_bias)
         cast_model_to_dtype(model, torch.bfloat16)

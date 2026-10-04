@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +32,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common.fp32_gates import HAVE_FUSED_KDA_GATE, kda_decay_gate
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packing import (
     flatten_packed_sequence_metadata,
@@ -73,52 +73,11 @@ _FUSED_RMSNORM_GATED_OK, FusedRMSNormGated = safe_import_from(
 )
 _CHUNK_KDA_OK, chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
 _RECURRENT_KDA_OK, fused_recurrent_kda = safe_import_from("fla.ops.kda", "fused_recurrent_kda", msg=_FLA_MSG)
-_KDA_GATE_OK, fused_kda_gate = safe_import_from("fla.ops.kda.gate", "fused_kda_gate", msg=_FLA_MSG)
-try:
-    _FUSED_KDA_GATE_HAS_G_BIAS = _KDA_GATE_OK and "g_bias" in inspect.signature(fused_kda_gate).parameters
-except (TypeError, ValueError):
-    _FUSED_KDA_GATE_HAS_G_BIAS = False
 
 
 def _require_fla() -> None:
-    if not all((_SHORT_CONV_OK, _FUSED_RMSNORM_GATED_OK, _CHUNK_KDA_OK, _RECURRENT_KDA_OK, _KDA_GATE_OK)):
+    if not all((_SHORT_CONV_OK, _FUSED_RMSNORM_GATED_OK, _CHUNK_KDA_OK, _RECURRENT_KDA_OK, HAVE_FUSED_KDA_GATE)):
         raise UnavailableError(_FLA_MSG)
-
-
-def _fused_kda_gate(g: torch.Tensor, a_log: torch.Tensor, head_dim: int, dt_bias: torch.Tensor) -> torch.Tensor:
-    """Call FLA fused KDA gate across FLA versions.
-
-    Args:
-        g: Tensor of shape [batch, sequence, heads * head_dim].
-        a_log: Tensor of shape [1, 1, heads, 1].
-        head_dim: Per-head KDA dimension.
-        dt_bias: Tensor of shape [heads * head_dim].
-
-    Returns:
-        Tensor of shape [batch, sequence, heads, head_dim].
-    """
-    if _FUSED_KDA_GATE_HAS_G_BIAS:
-        return fused_kda_gate(g, a_log, head_dim, g_bias=dt_bias)
-    gate_input = g if g.shape[-1] == head_dim else g.reshape(*g.shape[:-1], -1, head_dim)
-    return fused_kda_gate(gate_input, a_log, dt_bias=dt_bias)
-
-
-def _torch_kda_gate(g: torch.Tensor, a_log: torch.Tensor, head_dim: int, dt_bias: torch.Tensor) -> torch.Tensor:
-    """Torch equivalent of FLA's KDA gate.
-
-    Args:
-        g: Tensor of shape [batch, sequence, heads * head_dim] or [batch, sequence, heads, head_dim].
-        a_log: Tensor of shape [1, 1, heads, 1].
-        head_dim: Per-head KDA dimension.
-        dt_bias: Tensor of shape [heads * head_dim].
-
-    Returns:
-        Tensor of shape [batch, sequence, heads, head_dim].
-    """
-    gate = g if g.shape[-1] == head_dim else g.reshape(*g.shape[:-1], -1, head_dim)
-    num_heads = gate.shape[-2]
-    gate = gate.float() + dt_bias.float().view(num_heads, head_dim)
-    return -a_log.float().view(num_heads, 1).exp() * F.softplus(gate)
 
 
 def _index_first_axis(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -725,11 +684,14 @@ class KimiDeltaAttention(nn.Module):
         Returns:
             FP32 decay tensor of shape [batch, sequence, heads, head_dim].
         """
-        a_log = self.A_log.contiguous()
-        dt_bias = self.dt_bias.contiguous()
-        if self.config.kda_use_fused_gate:
-            return _fused_kda_gate(g, a_log, self.head_dim, dt_bias)
-        return _torch_kda_gate(g, a_log, self.head_dim, dt_bias)
+        return kda_decay_gate(
+            g,
+            self.A_log,
+            self.dt_bias,
+            head_dim=self.head_dim,
+            lower_bound=None,
+            use_fused=self.config.kda_use_fused_gate,
+        )
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:
@@ -1128,7 +1090,6 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
     # KDA decay parameters keep fp32 (HF names, prefixed with the attention attribute so they
     # cannot match MLA layers), as does the router correction bias.
     _keep_in_fp32_modules_strict = ["self_attn.A_log", "self_attn.dt_bias", "e_score_correction_bias"]
-    _keep_in_fp32_modules = list(_keep_in_fp32_modules_strict)
     # Kimi Linear owns context parallelism end to end: it shards the batch itself
     # (contiguous slices, as FLA's CP kernels require) and each layer type carries
     # its own transport, so CP does not depend on the attention backend.

@@ -12,18 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterator
 from dataclasses import fields, replace
-from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import (
-    FSDPModule,
-    MixedPrecisionPolicy,
-    OffloadPolicy,
-    fully_shard,
-)
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 
 from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
@@ -33,15 +27,12 @@ from nemo_automodel.components.distributed.fsdp_patches import (
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
-if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
-
 # PyTorch >= 2.15: MixedPrecisionPolicy.param_dtype_override_fn keeps selected parameters in
 # their storage dtype inside one FSDP unit. Required only when a model has an fp32 contract.
 _HAS_PARAM_DTYPE_OVERRIDE = "param_dtype_override_fn" in {field.name for field in fields(MixedPrecisionPolicy)}
 
 __all__ = [
-    "fully_shard_by_dtype",
+    "fsdp_unit_named_parameters",
     "get_internal_fsdp_mp_policy",
     "with_fp32_compute_override",
     "reject_unsupported_mtp_cp",
@@ -124,6 +115,33 @@ def get_internal_fsdp_mp_policy(
     return replace(mp_policy, output_dtype=None)
 
 
+def fsdp_unit_named_parameters(module: nn.Module) -> Iterator[tuple[str, nn.Parameter]]:
+    """Yield the parameters FSDP2 assigns to ``module``'s own unit.
+
+    Parameters below an already-sharded descendant belong to that descendant's
+    unit and are excluded, exactly as ``fully_shard`` excludes them. A parameter
+    reachable through several modules (tied weights) is yielded once.
+
+    Args:
+        module: Module about to become one FSDP unit.
+
+    Yields:
+        ``(name, parameter)`` pairs with names relative to ``module``.
+    """
+    seen: set[int] = set()
+
+    def _walk(current: nn.Module, prefix: str) -> Iterator[tuple[str, nn.Parameter]]:
+        for name, param in current.named_parameters(recurse=False):
+            if id(param) not in seen:
+                seen.add(id(param))
+                yield f"{prefix}{name}", param
+        for child_name, child in current.named_children():
+            if not isinstance(child, FSDPModule):
+                yield from _walk(child, f"{prefix}{child_name}.")
+
+    return _walk(module, "")
+
+
 def with_fp32_compute_override(
     module: nn.Module,
     mp_policy: MixedPrecisionPolicy | None,
@@ -135,14 +153,16 @@ def with_fp32_compute_override(
     """Keep ``module``'s fp32-contract parameters in fp32 under a lower-precision policy.
 
     A parameter computes in fp32 when its canonical name contains one of
-    ``fp32_compute_module_names`` (the model's ``_keep_in_fp32_modules_strict``)
-    or when the checkpoint loader recorded fp32 as its original dtype
-    (``tensor._hf_compute_dtype``, see ``_restore_loaded_model_dtype``). Every
-    other parameter computes in ``mp_policy.param_dtype``.
+    ``fp32_compute_module_names`` (the model's ``_keep_in_fp32_modules_strict``).
+    Every other parameter computes in ``mp_policy.param_dtype``.
 
     PyTorch's ``param_dtype_override_fn`` keeps a parameter in its *storage*
     dtype; it cannot upcast. fp32 compute therefore requires fp32 storage, which
     is what ``model.dtype: float32`` (fp32 master weights) provides.
+
+    Only the parameters of ``module``'s own unit are considered (see
+    :func:`fsdp_unit_named_parameters`), so the model root can be sharded after
+    its layers without re-checking them.
 
     Args:
         module: Module about to be sharded as one FSDP unit.
@@ -163,12 +183,17 @@ def with_fp32_compute_override(
         RuntimeError: PyTorch lacks ``param_dtype_override_fn`` and fp32 compute is needed.
     """
     ignored_param_ids = {id(param) for param in ignored_params or ()}
+    unit_params = [
+        (name, param)
+        for name, param in fsdp_unit_named_parameters(module)
+        if id(param) not in ignored_param_ids and param.dtype.is_floating_point
+    ]
     # FSDP2 packs one unit into one all-gather buffer, so trainable parameters must
     # share a storage dtype. Fail here with the offending names instead of at the
     # first forward with PyTorch's bare uniformity assertion.
     trainable_dtypes: dict[torch.dtype, list[str]] = {}
-    for name, param in module.named_parameters():
-        if id(param) not in ignored_param_ids and param.requires_grad and param.dtype.is_floating_point:
+    for name, param in unit_params:
+        if param.requires_grad:
             trainable_dtypes.setdefault(param.dtype, []).append(name)
     if len(trainable_dtypes) > 1:
         minority = min(trainable_dtypes.items(), key=lambda item: len(item[1]))
@@ -180,13 +205,9 @@ def with_fp32_compute_override(
     if mp_policy is None or mp_policy.param_dtype in (None, torch.float32):
         return mp_policy
     fp32_param_ids: set[int] = set()
-    for name, param in module.named_parameters():
-        if id(param) in ignored_param_ids or not param.dtype.is_floating_point:
-            continue
+    for name, param in unit_params:
         fqn = canonical_parameter_fqn(f"{module_name}.{name}" if module_name else name)
-        pinned = any(token in fqn for token in fp32_compute_module_names)
-        recorded = getattr(param, "_hf_compute_dtype", None)
-        if not pinned and recorded != torch.float32:
+        if not any(token in fqn for token in fp32_compute_module_names):
             continue
         if param.dtype != torch.float32:
             if not param.requires_grad:
@@ -208,49 +229,3 @@ def with_fp32_compute_override(
         mp_policy,
         param_dtype_override_fn=lambda param: torch.float32 if id(param) in fp32_param_ids else None,
     )
-
-
-def fully_shard_by_dtype(
-    module: nn.Module,
-    mesh: DeviceMesh,
-    mp_policy: MixedPrecisionPolicy | None,
-    offload_policy: OffloadPolicy | None,
-    fp32_compute_module_names: tuple[str, ...] = (),
-    reshard_after_forward: bool | int | None = None,
-    ignored_params: set[nn.Parameter] | None = None,
-    model_parallelizer: "ModelParallelizer | None" = None,
-) -> None:
-    """Fully shard ``module`` as one FSDP unit whose fp32-contract parameters compute in fp32.
-
-    Everything computes in ``mp_policy.param_dtype`` (e.g. bf16) except the
-    parameters selected by :func:`with_fp32_compute_override`, which keep their
-    fp32 storage dtype through all-gather. Modules owning such parameters cast
-    their own inputs; the unit's input and output casting is unchanged.
-
-    Args:
-        module: Module to shard, typically one transformer block.
-        mesh: Device mesh for FSDP sharding.
-        mp_policy: Mixed-precision policy of the enclosing boundary.
-        offload_policy: FSDP offload policy.
-        fp32_compute_module_names: Parameter-name substrings that must compute in
-            fp32, sourced from the model's ``_keep_in_fp32_modules_strict``.
-        reshard_after_forward: Optional FSDP2 reshard override. ``None`` leaves
-            the FSDP2 default unchanged.
-        ignored_params: Parameters already owned by another FSDP or parallelism
-            unit. They are excluded from the fp32 contract and forwarded to FSDP.
-        model_parallelizer: Optional model sidecar that owns the FSDP primitive.
-    """
-    shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
-    kwargs = {
-        "mesh": mesh,
-        "mp_policy": with_fp32_compute_override(module, mp_policy, fp32_compute_module_names, ignored_params),
-        "offload_policy": offload_policy,
-    }
-    if reshard_after_forward is not None:
-        kwargs["reshard_after_forward"] = reshard_after_forward
-    if ignored_params:
-        module_param_ids = {id(param) for param in module.parameters()}
-        module_ignored_params = {param for param in ignored_params if id(param) in module_param_ids}
-        if module_ignored_params:
-            kwargs["ignored_params"] = module_ignored_params
-    shard_module(module, **kwargs)

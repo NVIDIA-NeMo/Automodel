@@ -512,7 +512,7 @@ def test_adapter_rejects_owner_ranges_that_cut_a_checkpoint_shard(
 def test_grouped_experts_and_fp32_gdn_use_inherited_qwen35_conversion(
     adapter: Qwen3_8_FlashNextStateDictAdapter,
 ) -> None:
-    """Expert ``[E, in, out]`` transposes and fp32 GDN gate-param upcasting round-trip."""
+    """Expert ``[E, in, out]`` transposes round-trip and GDN gate params pass through untouched."""
     gate_up = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
     down = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
     a_log = torch.tensor([1.0, 2.0], dtype=torch.float32)
@@ -537,15 +537,15 @@ def test_grouped_experts_and_fp32_gdn_use_inherited_qwen35_conversion(
     assert hf_state[a_log_hf_key].dtype == torch.float32
     assert hf_state[a_log_hf_key] is a_log
 
-    # A lower-precision checkpoint tensor is upcast back to the model's fp32 parameter.
-    hf_state[a_log_hf_key] = hf_state[a_log_hf_key].to(torch.bfloat16)
+    # A lower-precision checkpoint tensor is passed through unchanged; the checkpoint load
+    # copies it into the model's fp32 parameter, which performs the exact upcast.
+    bf16_a_log = hf_state[a_log_hf_key].to(torch.bfloat16)
+    hf_state[a_log_hf_key] = bf16_a_log
     restored = adapter.from_hf(hf_state)
 
     torch.testing.assert_close(restored["model.language_model.layers.0.mlp.experts.gate_and_up_projs"], gate_up)
     torch.testing.assert_close(restored["model.language_model.layers.0.mlp.experts.down_projs"], down)
-    restored_a_log = restored["model.language_model.layers.0.linear_attn.A_log"]
-    assert restored_a_log.dtype == torch.float32
-    torch.testing.assert_close(restored_a_log, a_log)
+    assert restored["model.language_model.layers.0.linear_attn.A_log"] is bf16_a_log
 
 
 def test_adapter_advertises_nonquantized_low_memory_loading(

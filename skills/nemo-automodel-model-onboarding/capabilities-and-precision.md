@@ -80,29 +80,27 @@ checkpoints keep it fp32, MoE sigmoid-gate bias (`e_score_correction_bias`),
 attention-sink bias, and per-head `scale`.
 
 If the model has such params, declare `_keep_in_fp32_modules_strict` as
-parameter-name substrings. Sharding (`fully_shard_by_dtype`) reads this list and
-keeps matching params in fp32 through FSDP2 per-parameter mixed precision
-(`MixedPrecisionPolicy.param_dtype_override_fn`, PyTorch >= 2.15) while other
-params compute in `mp_policy.param_dtype`. The whole block is one FSDP unit.
-fp32 compute requires fp32 storage: train these models with
-`model.dtype: float32` (fp32 master weights). A pinned param stored in bf16 is
-rejected at sharding time with an error naming the parameter.
-
-For a NeMo-native model class:
+strict substrings of the HF parameter names, tokens that cannot match other
+params (for example `"linear_attn.A_log"`, not `"A_log"` alone when another
+module could contain that substring):
 
 ```python
 class NewMoEForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 ```
 
-Declare fp32 params as plain attributes of the module that uses them, with the
-HF parameter name, constructed with `dtype=torch.float32` regardless of the
-model dtype. Use strict tokens that cannot match other params (for example
-`"linear_attn.A_log"`, not `"A_log"` alone when another module could contain
-that substring). The module that consumes the param casts its own inputs to
-fp32; FSDP casts block inputs to `param_dtype`. No holder module, no
-`skip_modules`, and no holder-key routing in the state-dict adapter are needed;
-keep only the upcast of loaded tensors to fp32.
+Declare each such param as a plain attribute of the module that uses it,
+constructed with `dtype=torch.float32` regardless of the model dtype, and have
+that module cast its own inputs to fp32; FSDP casts block inputs to
+`param_dtype`. Keep the upcast of loaded tensors to fp32.
+
+Each block is one FSDP2 unit. Its mixed-precision policy keeps the declared
+params in fp32 through per-parameter mixed precision
+(`MixedPrecisionPolicy.param_dtype_override_fn`, PyTorch >= 2.15) while other
+params compute in `mp_policy.param_dtype`. The override preserves storage dtype,
+so fp32 compute requires fp32 storage: train these models with
+`model.dtype: float32`. A pinned param stored in bf16 is rejected at sharding
+time with an error naming the parameter.
 
 For HF-derived models with fp32 runtime params, build the fp32 structure in the
 model or layer constructor. Do not use a runtime monkeypatch, and do not infer

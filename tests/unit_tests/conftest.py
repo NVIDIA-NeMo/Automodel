@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ast
+import dataclasses
 import importlib
 import multiprocessing
 import os
@@ -25,6 +26,7 @@ from shutil import rmtree
 import psutil
 import pytest
 import torch
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 os.environ.setdefault("HF_CACHE", "/home/TestData/lite/hf_cache")
 os.environ.setdefault("HF_HOME", "/home/TestData/HF_HOME")
@@ -384,6 +386,18 @@ def downloads_weights(request, device):
             )
 
 
+_HAS_PARAM_DTYPE_OVERRIDE = "param_dtype_override_fn" in {
+    field.name for field in dataclasses.fields(MixedPrecisionPolicy)
+}
+
+
+@pytest.fixture(autouse=True)
+def requires_param_dtype_override_fixture(request):
+    """Skip ``requires_param_dtype_override`` tests when FSDP2 lacks per-parameter mixed precision."""
+    if request.node.get_closest_marker("requires_param_dtype_override") and not _HAS_PARAM_DTYPE_OVERRIDE:
+        pytest.skip("needs torch >= 2.15 MixedPrecisionPolicy.param_dtype_override_fn")
+
+
 @pytest.fixture(autouse=True)
 def cleanup_local_folder():
     """Cleanup local experiments folder"""
@@ -550,4 +564,8 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "runtime_budget(seconds, hard_timeout=None, reason=None): exact-test soft runtime budget and hard watchdog",
+    )
+    config.addinivalue_line(
+        "markers",
+        "requires_param_dtype_override: skips when MixedPrecisionPolicy lacks param_dtype_override_fn (torch < 2.15)",
     )

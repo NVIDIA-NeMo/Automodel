@@ -215,7 +215,7 @@ class TestNemotronV3AdapterDense:
         assert "model.embed_tokens.weight" in native
         assert "model.norm.weight" in native
         assert "model.layers.0.mixer.A_log" in native
-        assert native["model.layers.0.mixer.A_log"].dtype == torch.float32
+        assert native["model.layers.0.mixer.A_log"] is hf_sd["backbone.layers.0.mixer.A_log"]
         assert "model.layers.1.mixer.up_proj.weight" in native
         assert "lm_head.weight" in native
         assert not any(k.startswith("backbone.") for k in native)
@@ -259,11 +259,10 @@ class TestNemotronV3AdapterDense:
         native = adapter.from_hf({"mtp.layers.0.mixer.A_log": hf_tensor})
 
         assert set(native) == {"mtp.layers.0.mixer.A_log"}
-        assert native["mtp.layers.0.mixer.A_log"].dtype == torch.float32
+        assert native["mtp.layers.0.mixer.A_log"] is hf_tensor
 
         exported = adapter.convert_single_tensor_to_hf("mtp.layers.0.mixer.A_log", native["mtp.layers.0.mixer.A_log"])
-        assert exported[0][0] == "mtp.layers.0.mixer.A_log"
-        assert exported[0][1].dtype == torch.float32
+        assert exported == [("mtp.layers.0.mixer.A_log", hf_tensor)]
 
     @pytest.mark.parametrize("v4_compatible", [False, True])
     def test_peft_outer_prefix_round_trip(self, adapter, v4_compatible):
@@ -466,8 +465,8 @@ class TestNemotronV3AdapterToHf:
         assert "backbone.embeddings.weight" in hf_state_dict
         assert "exclude_me.weight" not in hf_state_dict
 
-    def test_to_hf_upcasts_mamba_fp32_params(self, config, moe_config, backend):
-        """Test to_hf keeps the bare Mamba SSM keys and exports them in fp32."""
+    def test_to_hf_keeps_mamba_fp32_keys_and_dtypes(self, config, moe_config, backend):
+        """Test to_hf renames the bare Mamba SSM keys and passes the tensors through unchanged."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
 
         state_dict = {
@@ -483,31 +482,8 @@ class TestNemotronV3AdapterToHf:
             "backbone.layers.0.mixer.dt_bias",
             "backbone.layers.0.mixer.D",
         }
-        assert hf_state_dict["backbone.layers.0.mixer.A_log"].dtype == torch.float32
-        assert hf_state_dict["backbone.layers.0.mixer.dt_bias"].dtype == torch.float32
-        assert hf_state_dict["backbone.layers.0.mixer.D"].dtype == torch.float32
-
-    def test_forced_hf_dtype_mapping_marks_fp32_protected_keys(self, config, moe_config, backend):
-        """Test Nemotron fp32-protected HF export keys keep fp32 consolidated metadata."""
-        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
-
-        state_dict = {
-            "backbone.layers.0.mixer.A_log": torch.randn(4, dtype=torch.float32),
-            "backbone.layers.0.mixer.dt_bias": torch.randn(4, dtype=torch.float32),
-            "backbone.layers.0.mixer.D": torch.randn(4, dtype=torch.float32),
-            "backbone.layers.0.mixer.router.e_score_correction_bias": torch.randn(4, dtype=torch.float32),
-            "backbone.layers.0.mixer.in_proj.weight": torch.randn(4, 4, dtype=torch.float32),
-            "lm_head.weight": torch.randn(4, 4, dtype=torch.bfloat16),
-        }
-
-        forced = adapter.forced_hf_dtype_mapping(state_dict)
-
-        assert forced == {
-            "backbone.layers.0.mixer.A_log": "F32",
-            "backbone.layers.0.mixer.dt_bias": "F32",
-            "backbone.layers.0.mixer.D": "F32",
-            "backbone.layers.0.mixer.router.e_score_correction_bias": "F32",
-        }
+        for key, tensor in state_dict.items():
+            assert hf_state_dict[key.replace("model.", "backbone.", 1)] is tensor
 
 
 class TestNemotronV3AdapterFromHf:
@@ -597,8 +573,8 @@ class TestNemotronV3AdapterFromHf:
 
             assert adapter._uses_model_prefix is True
 
-    def test_from_hf_upcasts_mamba_fp32_params(self, config, moe_config, backend):
-        """Test from_hf keeps public Mamba SSM keys unchanged and upcasts them to fp32."""
+    def test_from_hf_keeps_mamba_fp32_keys_and_dtypes(self, config, moe_config, backend):
+        """Test from_hf renames public Mamba SSM keys and passes the tensors through unchanged."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
 
         hf_state_dict = {
@@ -617,10 +593,8 @@ class TestNemotronV3AdapterFromHf:
                 "model.layers.0.mixer.dt_bias",
                 "model.layers.0.mixer.D",
             }
-            assert not any("_fp32_params" in key for key in call_args)
-            assert call_args["model.layers.0.mixer.A_log"].dtype == torch.float32
-            assert call_args["model.layers.0.mixer.dt_bias"].dtype == torch.float32
-            assert call_args["model.layers.0.mixer.D"].dtype == torch.float32
+            for key, tensor in hf_state_dict.items():
+                assert call_args[key.replace("backbone.", "model.", 1)] is tensor
 
 
 class TestNemotronV3AdapterConvertSingleTensor:
@@ -694,8 +668,8 @@ class TestNemotronV3AdapterConvertSingleTensor:
         assert result[0][0] == "backbone.layers.0.mixer.weight"
         assert torch.equal(result[0][1], tensor)
 
-    def test_convert_mamba_fp32_param_upcasts(self, config, moe_config, backend):
-        """Test single-tensor conversion exports bare Mamba SSM keys in fp32."""
+    def test_convert_mamba_fp32_param_passes_through(self, config, moe_config, backend):
+        """Test single-tensor conversion renames bare Mamba SSM keys without touching the tensor."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
 
         tensor = torch.randn(4, dtype=torch.bfloat16)
@@ -703,9 +677,8 @@ class TestNemotronV3AdapterConvertSingleTensor:
 
         result = adapter.convert_single_tensor_to_hf(fqn, tensor)
 
-        assert len(result) == 1
-        assert result[0][0] == "backbone.layers.0.mixer.D"
-        assert result[0][1].dtype == torch.float32
+        assert result == [("backbone.layers.0.mixer.D", tensor)]
+        assert result[0][1] is tensor
 
     def test_convert_expert_tensor(self, config, moe_config, backend):
         """Test converting merged expert tensor to split experts."""

@@ -287,6 +287,12 @@ def test_invalid_hyperconnection_count_is_rejected() -> None:
         Qwen3_8_FlashNextTextConfig(hc_count=1)
 
 
+def test_mamba_ssm_dtype_other_than_float32_is_rejected() -> None:
+    """A bf16 ``mamba_ssm_dtype`` must fail loudly: the GatedDeltaNet gate parameters are always fp32."""
+    with pytest.raises(ValueError, match="mamba_ssm_dtype"):
+        Qwen3_8_FlashNextTextConfig(mamba_ssm_dtype="bfloat16")
+
+
 def test_qsa_attention_has_no_public_query_chunk_or_rematerialization_config() -> None:
     serialized = Qwen3_8_FlashNextTextConfig().to_dict()
 

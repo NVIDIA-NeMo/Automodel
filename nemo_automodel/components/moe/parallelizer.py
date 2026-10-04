@@ -799,7 +799,47 @@ def apply_fsdp(
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     model_parallelizer: "ModelParallelizer | None" = None,
 ) -> None:
-    """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
+    """Apply FSDP wrapping to MoE transformer blocks and model-level modules.
+
+    Every unit except EP-sharded experts is created through
+    ``model_parallelizer._fully_shard_module`` so the model's fp32 compute
+    contract applies; the shared base parallelizer is used when none is given.
+    """
+    if model_parallelizer is None:
+        from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+
+        model_parallelizer = ModelParallelizer()
+    with model_parallelizer._bind_model(model):
+        _apply_fsdp_units(
+            model,
+            fsdp_mesh,
+            ep_enabled,
+            ep_shard_enabled,
+            ep_shard_mesh,
+            mp_policy,
+            offload_policy,
+            reshard_after_forward,
+            lm_head_precision,
+            wrap_outer_model,
+            frozen_multimodal_sharding,
+            model_parallelizer,
+        )
+
+
+def _apply_fsdp_units(
+    model: torch.nn.Module,
+    fsdp_mesh: DeviceMesh,
+    ep_enabled: bool,
+    ep_shard_enabled: bool,
+    ep_shard_mesh: DeviceMesh | None,
+    mp_policy: MixedPrecisionPolicy | None,
+    offload_policy: OffloadPolicy | None,
+    reshard_after_forward: bool,
+    lm_head_precision: str | torch.dtype | None,
+    wrap_outer_model: bool,
+    frozen_multimodal_sharding: FrozenMultimodalSharding,
+    model_parallelizer: "ModelParallelizer",
+) -> None:
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
     # MoE normally keeps fully frozen skipped towers with an always-run root,
     # but trainable multimodal towers still get standalone FSDP units. Install
@@ -821,9 +861,7 @@ def apply_fsdp(
             cast_forward_inputs=True,
         )
     experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
-    fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
-
-    shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
+    shard_module = model_parallelizer._fully_shard_module
 
     fully_shard_default = functools.partial(
         shard_module,
@@ -960,17 +998,15 @@ def apply_fsdp(
         if externally_sharded_params:
             ignored_params.update(externally_sharded_params.intersection(block.parameters()))
 
-        # Reuse the dense dtype-aware path for model-owned fp32 contracts while
-        # leaving EP-owned experts out of the block's dtype and FSDP ownership.
-        parallelizer_utils.fully_shard_by_dtype(
+        # EP-owned experts stay out of the block's dtype contract and FSDP ownership.
+        block_kwargs = {"ignored_params": ignored_params} if ignored_params else {}
+        shard_module(
             block,
             mesh=fsdp_mesh,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
-            fp32_compute_module_names=fp32_compute_module_names,
             reshard_after_forward=reshard_after_forward,
-            ignored_params=ignored_params or None,
-            model_parallelizer=model_parallelizer,
+            **block_kwargs,
         )
 
     # Re-establish weight tying before detecting it: a device/dtype move during
@@ -1007,14 +1043,15 @@ def apply_fsdp(
         fully_shard_default(embed_norm)
 
     if lm_head is not None and not tied_input_output_embeddings:
-        # Use custom mixed precision policy for lm_head if lm_head_precision is specified
+        # ``lm_head_precision: float32`` is the explicit form of naming ``lm_head`` in
+        # ``_keep_in_fp32_modules_strict``: the unit computes, reduces and returns fp32.
         if lm_head_precision == torch.float32:
             lm_head_mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.float32,
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             )
-            fully_shard(
+            shard_module(
                 lm_head,
                 mesh=fsdp_mesh,
                 reshard_after_forward=reshard_after_forward,

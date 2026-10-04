@@ -17,7 +17,7 @@
 FSDP2 keeps one storage dtype per unit, so the draft trains from fp32 master
 weights; the bf16 mixed-precision policy computes in bf16 except for the
 strict fp32 parameters, which keep fp32 compute through the per-parameter
-override installed by ``fully_shard_by_dtype``.
+override installed by ``with_fp32_compute_override``.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.distributed.activation_checkpointing import apply_submodule_checkpointing
-from nemo_automodel.components.distributed.parallelizer_utils import _HAS_PARAM_DTYPE_OVERRIDE, fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallelizer_utils import with_fp32_compute_override
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
@@ -86,15 +86,10 @@ def _config(dtype: str = "bfloat16") -> DeepseekV41TextConfig:
 def _fully_shard_model(model: DeepseekV41DSparkModel, mesh: DeviceMesh, dtype: torch.dtype) -> None:
     """Apply the same layer and root FSDP2 wrapping used by the DSpark recipe."""
     policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32)
+    strict = tuple(model._keep_in_fp32_modules_strict)
     for layer in model.layers:
-        fully_shard_by_dtype(
-            layer,
-            mesh=mesh,
-            mp_policy=policy,
-            offload_policy=None,
-            fp32_compute_module_names=tuple(model._keep_in_fp32_modules_strict),
-        )
-    fully_shard(model, mesh=mesh, mp_policy=policy)
+        fully_shard(layer, mesh=mesh, mp_policy=with_fp32_compute_override(layer, policy, strict))
+    fully_shard(model, mesh=mesh, mp_policy=with_fp32_compute_override(model, policy, strict))
 
 
 def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir: str) -> None:
@@ -173,7 +168,7 @@ def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir
     hard_timeout=70,
     reason="Spawns two FSDP workers, compiles draft forward/backward, and saves and restores a sharded checkpoint.",
 )
-@pytest.mark.skipif(not _HAS_PARAM_DTYPE_OVERRIDE, reason="fp32 compute inside a bf16 FSDP unit needs torch >= 2.15")
+@pytest.mark.requires_param_dtype_override
 @pytest.mark.parametrize("activation_checkpointing", [False, True])
 def test_fp32_master_dspark_fsdp_forward_backward_checkpoint_roundtrip(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, activation_checkpointing: bool

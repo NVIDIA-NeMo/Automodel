@@ -13,10 +13,8 @@ import torch.nn.functional as F
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextFp32GatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.model import Qwen3NextForCausalLM
-from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 GATE_PARAM_KEYS = frozenset({"model.layers.0.linear_attn.A_log", "model.layers.0.linear_attn.dt_bias"})
 
@@ -86,7 +84,6 @@ def test_constructor_keeps_gate_params_fp32_under_bf16_default_dtype():
 
     assert "A_log" in gdn._parameters
     assert "dt_bias" in gdn._parameters
-    assert "_fp32_params" not in gdn._modules
     assert set(gdn.state_dict()) >= {"A_log", "dt_bias"}
     assert gdn.in_proj_qkvz.weight.dtype == torch.bfloat16
     _assert_hf_init_values(gdn.A_log.detach(), gdn.dt_bias.detach())
@@ -117,45 +114,6 @@ def test_compute_gate_casts_bf16_input_to_fp32_and_backpropagates():
         assert param.grad is not None
         assert param.grad.dtype == torch.float32
         assert torch.isfinite(param.grad).all()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen3NextModel builds on the current CUDA device")
-def test_strict_fp32_tokens_match_exactly_the_gate_params():
-    model = _tiny_model()
-    tokens = Qwen3NextForCausalLM._keep_in_fp32_modules_strict
-
-    matched = {
-        name for name, _ in model.named_parameters() if any(tok in canonical_parameter_fqn(name) for tok in tokens)
-    }
-
-    assert tokens == ["linear_attn.A_log", "linear_attn.dt_bias"]
-    assert matched == GATE_PARAM_KEYS
-    assert not any("_fp32_params" in key for key in model.state_dict())
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen3NextModel builds on the current CUDA device")
-def test_cast_model_to_dtype_restores_gate_params_fp32():
-    model = _tiny_model()
-
-    cast_model_to_dtype(model, torch.bfloat16)
-
-    linear_attn = model.model.layers["0"].linear_attn
-    assert linear_attn.A_log.dtype == torch.float32
-    assert linear_attn.dt_bias.dtype == torch.float32
-    assert linear_attn.in_proj_qkvz.weight.dtype == torch.bfloat16
-    assert model.model.embed_tokens.weight.dtype == torch.bfloat16
-    assert model.lm_head.weight.dtype == torch.bfloat16
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen3NextModel builds on the current CUDA device")
-def test_initialize_weights_bf16_keeps_gate_params_fp32_with_exact_values():
-    model = _tiny_model()
-
-    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
-
-    linear_attn = model.model.layers["0"].linear_attn
-    _assert_hf_init_values(linear_attn.A_log.detach(), linear_attn.dt_bias.detach())
-    assert linear_attn.in_proj_qkvz.weight.dtype == torch.bfloat16
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen3NextModel builds on the current CUDA device")

@@ -42,6 +42,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.fp32_gates import MAMBA_FP32_PARAM_TOKENS
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -339,7 +340,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
     # bf16. The checkpoint stores them in fp32 (values ~3.97 +- 0.024, none bf16-exact) and
     # the bf16 rounding (ulp 0.0156 at 4.0) is larger than the sigmoid routing margins, so
     # top-k expert selection diverged from the HF reference on ~85% of tokens.
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "mixer.A_log", "mixer.dt_bias", "mixer.D"]
+    _keep_in_fp32_modules_strict: list[str] = [*MAMBA_FP32_PARAM_TOKENS]
     # CP submesh, installed by the MoE parallelizer's apply_cp when context
     # parallelism is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None

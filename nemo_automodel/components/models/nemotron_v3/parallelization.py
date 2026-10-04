@@ -22,7 +22,7 @@ import torch
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, parallelize_module
 from torch.distributed.tensor.placement_types import Shard
 
@@ -30,7 +30,6 @@ from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 from nemo_automodel.components.distributed.parallelizer_utils import (
-    fully_shard_by_dtype,
     reject_unsupported_mtp_cp,
     reject_unsupported_mtp_cp_pp,
 )
@@ -139,23 +138,19 @@ class NemotronHModelParallelizer(ModelParallelizer):
             reapply_trainability(model)
 
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        fp32_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
-        for layer in layers:
-            fully_shard_by_dtype(
-                layer,
+        layer_kwargs = {} if reshard_after_forward is None else {"reshard_after_forward": reshard_after_forward}
+        with self._bind_model(model):
+            for layer in layers:
+                self._fully_shard_module(
+                    layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy, **layer_kwargs
+                )
+            return self._fully_shard_module(
+                model,
                 mesh=dp_mesh,
                 mp_policy=mp_policy,
                 offload_policy=offload_policy,
-                fp32_compute_module_names=fp32_module_names,
-                reshard_after_forward=reshard_after_forward,
+                reshard_after_forward=False,
             )
-        return fully_shard(
-            model,
-            mesh=dp_mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            reshard_after_forward=False,
-        )
 
 
 PARALLELIZER = NemotronHModelParallelizer()

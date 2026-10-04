@@ -24,7 +24,7 @@ def test_native_hf_round_trip_preserves_every_tensor():
         torch.testing.assert_close(restored[key], value, rtol=0.0, atol=0.0)
 
 
-def test_adapter_renames_flat_hyperconnection_and_upcasts_kda_fp32_parameters():
+def test_adapter_renames_flat_hyperconnection_and_keeps_kda_checkpoint_dtypes():
     adapter = tiny_glm5_next_model().state_dict_adapter
     hf_state = {
         "model.language_model.layers.0.hc_attn_fn": torch.randn(8, 32),
@@ -40,9 +40,8 @@ def test_adapter_renames_flat_hyperconnection_and_upcasts_kda_fp32_parameters():
     assert native["model.language_model.layers.0.attn_hc.base"].shape == (8,)
     assert native["model.language_model.layers.0.attn_hc.scale"].shape == (3,)
     assert native["model.language_model.layers.0.self_attn.A_log"].shape == (2,)
-    assert native["model.language_model.layers.0.self_attn.A_log"].dtype is torch.float32
-    assert native["model.language_model.layers.0.self_attn.dt_bias"].dtype is torch.float32
-    assert not any("_fp32_params" in key for key in native)
+    assert native["model.language_model.layers.0.self_attn.A_log"].dtype is torch.bfloat16
+    assert native["model.language_model.layers.0.self_attn.dt_bias"].dtype is torch.bfloat16
     assert adapter.to_hf(native).keys() == hf_state.keys()
 
 
@@ -57,7 +56,6 @@ def test_native_state_dict_uses_hf_names_for_fp32_contract_parameters():
     assert "model.language_model.layers.0.hc_attn_base" in hf_state
     assert "model.language_model.layers.0.hc_ffn_scale" in hf_state
     assert "model.language_model.layers.0.self_attn.A_log" in hf_state
-    assert not any("_fp32_params" in key for key in native)
 
 
 def test_quantized_load_plan_matches_sparse_but_not_linear_output_projection():

@@ -17,7 +17,7 @@ uv run automodel examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml \
   --nproc-per-node 8
 ```
 
-Full-parameter FSDP2 training requires fp32 parameter storage: set `model.dtype: float32` and keep `mp_policy.param_dtype: bfloat16`. The model's fp32 parameters (the Mamba `A_log`, `dt_bias`, and `D`) then stay in fp32 inside each layer's FSDP unit; bf16 storage fails at sharding time.
+Full-parameter FSDP2 training requires `model.dtype: float32`; see [Mixed-Precision Training](/development/mixed-precision-training#models-with-intrinsically-fp32-parameters).
 
 ## Choose a Workflow
 

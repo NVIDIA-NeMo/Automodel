@@ -49,7 +49,6 @@ distributed:
   moe:
     reshard_after_forward: true
     wrap_outer_model: true
-    lm_head_precision: float32
     mp_policy:
       _target_: torch.distributed.fsdp.MixedPrecisionPolicy
       param_dtype: bfloat16

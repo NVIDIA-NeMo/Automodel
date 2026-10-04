@@ -39,6 +39,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common.fp32_gates import GDN_FP32_PARAM_TOKENS
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -486,7 +487,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
-    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
+    _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
     _owns_cp_attention = True
     # Packed (THD) training and packed CP are owned by the model's
     # route-indexed QSA path for the listed CUDA backends.

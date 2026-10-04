@@ -23,7 +23,7 @@ For a full walkthrough - dataset preparation, SFT vs. LoRA configs, and
 post-training inference - see the
 [Nemotron-Omni guide](/recipes-e2e-examples/nemotron-omni).
 
-Full-parameter FSDP2 training requires fp32 parameter storage: set `model.dtype: float32` and keep `mp_policy.param_dtype: bfloat16`. The model's fp32 parameters (the Mamba `A_log`, `dt_bias`, and `D`) then stay in fp32 inside each layer's FSDP unit; bf16 storage fails at sharding time.
+Full-parameter FSDP2 training requires `model.dtype: float32`; see [Mixed-Precision Training](/development/mixed-precision-training#models-with-intrinsically-fp32-parameters).
 
 ## Choose a Workflow
 

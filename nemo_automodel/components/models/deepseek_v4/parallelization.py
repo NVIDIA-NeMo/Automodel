@@ -12,67 +12,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-owned distributed parallelization for DeepSeek-V4 and DeepSeek-V4.1."""
+"""Model-owned distributed parallelization for DeepSeek-V4 and DeepSeek-V4.1.
+
+The shared :class:`ModelParallelizer` already keeps the parameters named in the
+model's ``_keep_in_fp32_modules_strict`` in fp32 inside each unit and runs the
+all-fp32 ``lm_head`` unit in fp32. DeepSeek-V4 only adds the HCA parameter-sync
+group, which is known only once the FSDP mesh is.
+"""
 
 from __future__ import annotations
 
-import weakref
-from typing import TYPE_CHECKING
-
 from torch import nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
+from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4Compressor
 
-if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.mesh import MeshContext
+
+def _hca_param_sync_group_from_1d_mesh(mesh):
+    """Return the 1D PyTorch FSDP2 group used for HCA graph alignment.
+
+    HCA graph alignment is an FSDP/FSDP2 parameter-sync invariant: ranks that
+    synchronize the same sharded HCA parameters must agree on whether the HCA
+    compressor path participates in backward. This DeepSeek-V4 wrapper gets
+    that domain from its 1D PyTorch FSDP2 mesh. The mesh may be named or
+    unnamed; multi-dimensional meshes need an explicit owner dimension to avoid
+    reducing across unrelated parallel groups. Until that is available, disable
+    HCA graph alignment instead of using a broader or wrong group.
+    """
+    if mesh is None:
+        return None
+
+    mesh_ndim = getattr(mesh, "ndim", None)
+    mesh_shape = getattr(mesh, "shape", None)
+    mesh_dim_names = getattr(mesh, "mesh_dim_names", None)
+    if mesh_ndim is not None:
+        is_1d_mesh = mesh_ndim == 1
+    elif mesh_shape is not None:
+        is_1d_mesh = len(mesh_shape) == 1
+    elif mesh_dim_names is not None:
+        is_1d_mesh = len(mesh_dim_names) == 1
+    else:
+        return None
+    if not is_1d_mesh:
+        return None
+
+    try:
+        if mesh.size() <= 1:
+            return None
+        return mesh.get_group()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _attach_hca_param_sync_group(module: nn.Module, mesh: DeviceMesh | None) -> None:
+    """Bind the FSDP mesh's parameter-sync group to every HCA compressor in ``module``.
+
+    The FSDP2 mesh is only known while wrapping, so the group is attached here
+    instead of through public model configuration.
+    """
+    process_group = _hca_param_sync_group_from_1d_mesh(mesh)
+    for submodule in module.modules():
+        if isinstance(submodule, DeepseekV4Compressor):
+            submodule._set_hca_param_sync_group(process_group)
 
 
 class DeepseekV4ModelParallelizer(ModelParallelizer):
-    """Shard every unit once while the model's strict fp32 parameters compute in fp32.
-
-    Args:
-        fp32_compute_module_names: The owning model class's
-            ``_keep_in_fp32_modules_strict`` entries.
-    """
-
-    _customizes_moe_fsdp = True
-
-    def __init__(self, fp32_compute_module_names: tuple[str, ...]) -> None:
-        super().__init__()
-        self.fp32_compute_module_names = fp32_compute_module_names
-        self._module_names: weakref.WeakKeyDictionary[nn.Module, str] | None = None
-
-    def parallelize(self, model: nn.Module, mesh_context: MeshContext, /) -> nn.Module:
-        """Record every module's model-level name, then run the shared parallelization flow.
-
-        The strict fp32 names are model-level; units such as ``lm_head`` or the
-        vision tower only resolve their contract when their own name is known.
-        """
-        self._module_names = weakref.WeakKeyDictionary((module, name) for name, module in model.named_modules())
-        try:
-            return super().parallelize(model, mesh_context)
-        finally:
-            self._module_names = None
+    """Shared parallelization plus the HCA parameter-sync group per FSDP unit."""
 
     def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
-        wrapped = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
-        if self._module_names is None:
-            module_name = ""
-        elif wrapped in self._module_names:
-            module_name = self._module_names[wrapped]
-        else:
-            raise RuntimeError(
-                f"{type(wrapped).__name__} was not part of the model when parallelization started, so its "
-                "fp32 compute contract cannot be resolved."
-            )
-        return fully_shard_deepseek_v4(
-            module,
-            fp32_compute_module_names=self.fp32_compute_module_names,
-            module_name=module_name,
-            **kwargs,
-        )
+        _attach_hca_param_sync_group(module, kwargs["mesh"])
+        return super()._fully_shard_module(module, **kwargs)
 
 
 __all__ = ["DeepseekV4ModelParallelizer"]

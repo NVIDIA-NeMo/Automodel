@@ -492,7 +492,6 @@ class TestNemotronV3Mamba2Mixer:
         for name in ("A_log", "dt_bias", "D"):
             assert name in mixer._parameters
             assert mixer._parameters[name].dtype == torch.float32
-        assert not any("_fp32_params" in name for name, _ in mixer.named_modules())
         torch.testing.assert_close(
             mixer.A_log, torch.log(torch.arange(1, config.mamba_num_heads + 1, dtype=torch.float32))
         )

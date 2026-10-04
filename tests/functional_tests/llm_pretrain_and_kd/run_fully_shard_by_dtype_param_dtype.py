@@ -16,8 +16,9 @@
 """Functional test: fp32 master weights + bf16 FSDP2 policy with per-parameter fp32 compute.
 
 Each KDA-style block (bf16-compute projections, bare fp32 ``A_log``/``dt_bias``)
-is one FSDP unit. The sharded model must match an unsharded reference that
-emulates the same mixed precision by hand.
+is one FSDP unit whose policy carries ``with_fp32_compute_override`` (the same
+policy the base ``ModelParallelizer`` installs on every unit). The sharded model
+must match an unsharded reference that emulates the same mixed precision by hand.
 
 Usage:
     torchrun --nproc_per_node=2 tests/functional_tests/llm_pretrain_and_kd/run_fully_shard_by_dtype_param_dtype.py
@@ -37,7 +38,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallelizer_utils import with_fp32_compute_override
 
 HIDDEN = 16
 NUM_BLOCKS = 2
@@ -104,15 +105,9 @@ def _shard(
         if activation_checkpoint:
             block = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
             model.layers[index] = block
-        fully_shard_by_dtype(
-            block,
-            mesh=mesh,
-            mp_policy=POLICY,
-            offload_policy=None,
-            fp32_compute_module_names=FP32_TOKENS,
-            reshard_after_forward=reshard_after_forward,
-        )
-    fully_shard(model, mesh=mesh, mp_policy=POLICY)
+        kwargs = {} if reshard_after_forward is None else {"reshard_after_forward": reshard_after_forward}
+        fully_shard(block, mesh=mesh, mp_policy=with_fp32_compute_override(block, POLICY, FP32_TOKENS), **kwargs)
+    fully_shard(model, mesh=mesh, mp_policy=with_fp32_compute_override(model, POLICY, FP32_TOKENS))
     for block in model.layers:
         _expect(isinstance(block, FSDPModule), "each block must be an FSDP unit")
         nested = [name for name, child in block.named_modules() if child is not block and isinstance(child, FSDPModule)]
@@ -204,9 +199,7 @@ def _run_variant(
 def _run_negative(mesh: DeviceMesh, device: torch.device) -> None:
     model = _build_model(device, check_dtypes=False).to(torch.bfloat16)
     try:
-        fully_shard_by_dtype(
-            model.layers[0], mesh=mesh, mp_policy=POLICY, offload_policy=None, fp32_compute_module_names=FP32_TOKENS
-        )
+        with_fp32_compute_override(model.layers[0], POLICY, FP32_TOKENS)
     except ValueError as error:
         _expect("model.dtype" in str(error), f"unexpected error text: {error}")
     else:

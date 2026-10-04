@@ -74,6 +74,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
     maybe_distribute_visual,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common.fp32_gates import GDN_FP32_PARAM_TOKENS
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
@@ -846,7 +847,7 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _pp_keep_self_forward: bool = True
     # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
-    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
+    _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -1152,7 +1153,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
-    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
+    _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
     # Packed CP uses the model-owned block-diagonal SDPA dispatch. Generic
     # hybrid CP also supports TE for unpacked sequences, but TE has no route
     # through this packed attention contract.

@@ -1544,7 +1544,5 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         cast_model_to_dtype(self, dtype)
 
 
-DeepseekV4ForCausalLM.parallelizer = DeepseekV4ModelParallelizer(
-    tuple(DeepseekV4ForCausalLM._keep_in_fp32_modules_strict)
-)
+DeepseekV4ForCausalLM.parallelizer = DeepseekV4ModelParallelizer()
 ModelClass = DeepseekV4ForCausalLM

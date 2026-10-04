@@ -49,6 +49,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
     maybe_distribute_visual,
 )
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.fp32_gates import GDN_FP32_PARAM_TOKENS
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
@@ -717,7 +718,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
-    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
+    _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -967,7 +968,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     # ``initialize_weights`` -> the first cast before the constructor body.
     _keep_in_fp32_modules: list[str] = ["rotary_pos_emb"]
     # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
-    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
+    _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
 
     @dataclass(frozen=True)
     class ModelCapabilities:

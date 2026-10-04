@@ -1290,7 +1290,7 @@ class TestFromHFEpShard:
 
 
 class TestFp32GateParamCheckpointContract:
-    """GatedDeltaNet ``A_log``/``dt_bias`` keep HF keys and are upcast to fp32 at the boundary."""
+    """GatedDeltaNet ``A_log``/``dt_bias`` keep HF keys and pass through the adapter unchanged."""
 
     _A_LOG = "model.language_model.layers.0.linear_attn.A_log"
     _DT_BIAS = "model.language_model.layers.0.linear_attn.dt_bias"
@@ -1302,14 +1302,13 @@ class TestFp32GateParamCheckpointContract:
         out = adapter.from_hf(hf_state)
 
         assert set(out) == {self._A_LOG, self._DT_BIAS}
-        assert not any("_fp32_params" in key for key in out)
 
     def test_to_hf_keeps_gating_keys(self, adapter):
         sd = {self._A_LOG: torch.zeros(4), "model.language_model.layers.2.linear_attn.dt_bias": torch.ones(4)}
         out = adapter.to_hf(sd)
         assert set(out) == set(sd)
 
-    def test_to_hf_upcasts_gdn_fp32_params_saved_as_bf16(self, adapter):
+    def test_to_hf_passes_gdn_fp32_params_through(self, adapter):
         sd = {
             self._A_LOG: torch.zeros(4, dtype=torch.bfloat16),
             self._DT_BIAS: torch.ones(4, dtype=torch.bfloat16),
@@ -1318,30 +1317,16 @@ class TestFp32GateParamCheckpointContract:
 
         out = adapter.to_hf(sd)
 
-        assert out[self._A_LOG].dtype == torch.float32
-        assert out[self._DT_BIAS].dtype == torch.float32
-        assert out[self._Q_PROJ] is sd[self._Q_PROJ]
-        assert out[self._Q_PROJ].dtype == torch.bfloat16
+        for key, tensor in sd.items():
+            assert out[key] is tensor
 
-    def test_forced_hf_dtype_mapping_marks_gdn_fp32_params(self, adapter):
-        state_dict = {
-            self._A_LOG: torch.zeros(4, dtype=torch.float32),
-            self._DT_BIAS: torch.ones(4, dtype=torch.float32),
-            "model.language_model.layers.0.linear_attn.conv1d.weight": torch.zeros(4, dtype=torch.float32),
-            self._Q_PROJ: torch.zeros(2, 2, dtype=torch.float32),
-        }
+    def test_convert_single_tensor_keeps_gdn_param_dtype(self, adapter):
+        tensor = torch.zeros(4, dtype=torch.bfloat16)
+        result = adapter.convert_single_tensor_to_hf("model.language_model.layers.1.linear_attn.dt_bias", tensor)
+        assert result == [("model.language_model.layers.1.linear_attn.dt_bias", tensor)]
+        assert result[0][1] is tensor
 
-        assert adapter.forced_hf_dtype_mapping(state_dict) == {self._A_LOG: "F32", self._DT_BIAS: "F32"}
-
-    def test_convert_single_tensor_upcasts_gdn_fp32_params(self, adapter):
-        result = adapter.convert_single_tensor_to_hf(
-            "model.language_model.layers.1.linear_attn.dt_bias",
-            torch.zeros(4, dtype=torch.bfloat16),
-        )
-        assert result[0][0] == "model.language_model.layers.1.linear_attn.dt_bias"
-        assert result[0][1].dtype == torch.float32
-
-    def test_from_hf_upcasts_gdn_fp32_params_loaded_as_bf16(self, adapter):
+    def test_from_hf_keeps_checkpoint_dtypes(self, adapter):
         hf_state = {
             self._A_LOG: torch.zeros(4, dtype=torch.bfloat16),
             self._DT_BIAS: torch.ones(4, dtype=torch.bfloat16),
@@ -1350,7 +1335,5 @@ class TestFp32GateParamCheckpointContract:
 
         out = adapter.from_hf(hf_state)
 
-        assert out[self._A_LOG].dtype == torch.float32
-        assert out[self._DT_BIAS].dtype == torch.float32
-        assert out[self._Q_PROJ] is hf_state[self._Q_PROJ]
-        assert out[self._Q_PROJ].dtype == torch.bfloat16
+        for key, tensor in hf_state.items():
+            assert out[key] is tensor

@@ -24,6 +24,7 @@ from nemo_automodel.components.models.common.cudnn_sparse_attention import (
     cudnn_sparse_attention,
     is_cudnn_sparse_attention_available,
 )
+from nemo_automodel.components.models.common.fp32_gates import HAVE_FUSED_KDA_GATE, kda_decay_gate
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
@@ -39,7 +40,6 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 _FLA_MSG = "GLM-5.3 KDA requires the flash-linear-attention/fla extra for GPU training."
 _SHORT_CONV_OK, _fla_causal_conv1d = safe_import_from("fla.modules.conv", "causal_conv1d", msg=_FLA_MSG)
 _CHUNK_KDA_OK, _chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
-_KDA_GATE_OK, _fused_kda_gate = safe_import_from("fla.ops.kda.gate", "fused_kda_gate", msg=_FLA_MSG)
 
 
 class Glm5NextRMSNorm(nn.Module):
@@ -358,18 +358,15 @@ class Glm5NextLinearAttention(nn.Module):
 
     def _decay_gate(self, gate: torch.Tensor) -> torch.Tensor:
         """Return fp32 log-decay gates ``[batch, sequence, heads, head_dim]``."""
-        lower_bound = self.config.linear_lower_bound
         gate = gate.reshape(*gate.shape[:-1], -1, self.head_dim)
-        if _KDA_GATE_OK and gate.is_cuda:
-            return _fused_kda_gate(
-                gate,
-                self.A_log.contiguous(),
-                dt_bias=self.dt_bias.contiguous(),
-                lower_bound=lower_bound,
-            )
-        gate = gate.float() + self.dt_bias.view(1, 1, -1, self.head_dim)
-        decay = self.A_log.view(1, 1, -1, 1).exp()
-        return lower_bound * torch.sigmoid(decay * gate) if lower_bound is not None else -decay * F.softplus(gate)
+        return kda_decay_gate(
+            gate,
+            self.A_log,
+            self.dt_bias,
+            head_dim=self.head_dim,
+            lower_bound=self.config.linear_lower_bound,
+            use_fused=HAVE_FUSED_KDA_GATE and gate.is_cuda,
+        )
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:

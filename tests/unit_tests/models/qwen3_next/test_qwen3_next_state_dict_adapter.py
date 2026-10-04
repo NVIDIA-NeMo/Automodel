@@ -12,11 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
+from safetensors.torch import save_file
+from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
+from nemo_automodel.components.checkpoint import checkpointing
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.qwen3_next.model import Qwen3NextForCausalLM
 from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3NextStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 
@@ -558,7 +566,11 @@ class TestConvertSingleTensorToHf:
 
 
 class TestFp32GdnParams:
-    """``A_log`` / ``dt_bias`` keep their HF keys and are upcast to fp32 at the adapter boundary."""
+    """``A_log`` / ``dt_bias`` keep their HF keys and pass through the adapter unchanged.
+
+    Checkpoint loads copy into the model's fp32 parameters and the HF export pins them to
+    F32 from ``_keep_in_fp32_modules_strict``, so the adapter never changes their dtype.
+    """
 
     def _make_adapter(self):
         moe_config = Mock()
@@ -570,15 +582,14 @@ class TestFp32GdnParams:
         backend.experts = "torch"
         return Qwen3NextStateDictAdapter(config=Mock(), moe_config=moe_config, backend=backend, dtype=torch.float32)
 
-    def test_convert_single_tensor_keeps_hf_key_and_upcasts(self):
+    def test_convert_single_tensor_keeps_hf_key_and_tensor(self):
         adapter = self._make_adapter()
-        result = adapter.convert_single_tensor_to_hf(
-            "model.layers.0.linear_attn.dt_bias", torch.zeros(4, dtype=torch.bfloat16)
-        )
-        assert [k for k, _ in result] == ["model.layers.0.linear_attn.dt_bias"]
-        assert result[0][1].dtype == torch.float32
+        tensor = torch.zeros(4, dtype=torch.bfloat16)
+        result = adapter.convert_single_tensor_to_hf("model.layers.0.linear_attn.dt_bias", tensor)
+        assert result == [("model.layers.0.linear_attn.dt_bias", tensor)]
+        assert result[0][1] is tensor
 
-    def test_to_hf_upcasts_gdn_fp32_params_saved_as_bf16(self):
+    def test_to_hf_passes_gdn_fp32_params_through(self):
         adapter = self._make_adapter()
         state_dict = {
             "model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
@@ -589,27 +600,10 @@ class TestFp32GdnParams:
         out = adapter.to_hf(state_dict)
 
         assert set(out) == set(state_dict)
-        assert out["model.layers.0.linear_attn.A_log"].dtype == torch.float32
-        assert out["model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
-        q_proj_key = "model.layers.0.self_attn.q_proj.weight"
-        assert out[q_proj_key] is state_dict[q_proj_key]
-        assert out[q_proj_key].dtype == torch.bfloat16
+        for key, tensor in state_dict.items():
+            assert out[key] is tensor
 
-    def test_forced_hf_dtype_mapping_marks_gdn_fp32_params(self):
-        adapter = self._make_adapter()
-        state_dict = {
-            "model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.float32),
-            "model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.float32),
-            "model.layers.0.linear_attn.conv1d.weight": torch.zeros(4, dtype=torch.float32),
-            "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.float32),
-        }
-
-        assert adapter.forced_hf_dtype_mapping(state_dict) == {
-            "model.layers.0.linear_attn.A_log": "F32",
-            "model.layers.0.linear_attn.dt_bias": "F32",
-        }
-
-    def test_from_hf_keeps_hf_keys_and_upcasts_gdn_fp32_params_loaded_as_bf16(self):
+    def test_from_hf_keeps_hf_keys_and_checkpoint_dtypes(self):
         adapter = self._make_adapter()
         hf_state = {
             "model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
@@ -623,8 +617,110 @@ class TestFp32GdnParams:
             out = adapter.from_hf(hf_state)
 
         assert set(out) == set(hf_state)
-        assert out["model.layers.0.linear_attn.A_log"].dtype == torch.float32
-        assert out["model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
-        q_proj_key = "model.layers.0.self_attn.q_proj.weight"
-        assert out[q_proj_key] is hf_state[q_proj_key]
-        assert out[q_proj_key].dtype == torch.bfloat16
+        for key, tensor in hf_state.items():
+            assert out[key] is tensor
+
+
+def _tiny_qwen3_next_model() -> Qwen3NextForCausalLM:
+    """Build a two-layer fp32 Qwen3-Next (one GDN layer, one attention layer) on CPU."""
+    config = Qwen3NextConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        num_experts=4,
+        num_experts_per_tok=2,
+        decoder_sparse_step=1,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        max_position_embeddings=16,
+        rms_norm_eps=1e-6,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    config.torch_dtype = torch.float32
+    backend = BackendConfig(
+        attn="sdpa",
+        linear="torch",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        rope_fusion=False,
+        enable_hf_state_dict_adapter=True,
+    )
+    return Qwen3NextForCausalLM(config, backend=backend)
+
+
+_A_LOG_KEY = "model.layers.0.linear_attn.A_log"
+_DT_BIAS_KEY = "model.layers.0.linear_attn.dt_bias"
+_Q_PROJ_KEY = "model.layers.1.self_attn.q_proj.weight"
+# Exactly representable in bf16, so the bf16 checkpoint round-trips to these fp32 values bit-for-bit.
+_A_LOG_VALUES = (-1.5, 0.25, 2.0, -3.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen3NextModel builds on the current CUDA device")
+@pytest.mark.parametrize("low_memory_dcp", [False, True], ids=["full_cpu_state_dict", "direct_dcp"])
+def test_bf16_hf_checkpoint_loads_gdn_params_as_exact_fp32(tmp_path: Path, low_memory_dcp: bool) -> None:
+    """Both real load paths copy a bf16 checkpoint into the fp32 ``A_log`` / ``dt_bias`` parameters.
+
+    The adapter performs no dtype work: ``_load_full_state_dict_into_model`` and DCP both
+    ``copy_`` into the existing parameters, so the model's construction dtype wins.
+    """
+    source = _tiny_qwen3_next_model()
+    with torch.no_grad():
+        source.get_parameter(_A_LOG_KEY).copy_(torch.tensor(_A_LOG_VALUES))
+        source.get_parameter(_DT_BIAS_KEY).fill_(0.5)
+    hf_state = source.state_dict_adapter.to_hf(source.state_dict())
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    save_file(
+        {key: value.detach().to(torch.bfloat16).contiguous() for key, value in hf_state.items()},
+        source_dir / "model.safetensors",
+    )
+    source.config.save_pretrained(source_dir)
+
+    model = _tiny_qwen3_next_model()
+    with torch.no_grad():
+        model.get_parameter(_A_LOG_KEY).fill_(7.0)
+        model.get_parameter(_DT_BIAS_KEY).fill_(7.0)
+    checkpointer = Checkpointer(
+        CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            model_cache_dir=str(tmp_path),
+            model_repo_id="source",
+            model_save_format="safetensors",
+            save_consolidated=False,
+        ),
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+        moe_mesh=None,
+    )
+    with (
+        patch.object(Qwen3NextStateDictAdapter, "_supports_low_memory_dcp_load", low_memory_dcp),
+        patch.object(
+            checkpointing, "_load_full_state_dict_into_model", wraps=checkpointing._load_full_state_dict_into_model
+        ) as full_state_dict_load,
+    ):
+        checkpointer.load_model(model, str(source_dir), is_init_step=True)
+    assert full_state_dict_load.called is not low_memory_dcp
+
+    a_log = model.get_parameter(_A_LOG_KEY)
+    dt_bias = model.get_parameter(_DT_BIAS_KEY)
+    assert a_log.dtype is torch.float32
+    assert dt_bias.dtype is torch.float32
+    assert torch.equal(a_log, torch.tensor(_A_LOG_VALUES, dtype=torch.float32))
+    assert torch.equal(dt_bias, torch.full_like(dt_bias, 0.5))
+    # Ordinary weights follow the model dtype too, holding the bf16-rounded checkpoint values.
+    q_proj = model.get_parameter(_Q_PROJ_KEY)
+    assert q_proj.dtype is torch.float32
+    assert torch.equal(q_proj, source.get_parameter(_Q_PROJ_KEY).detach().to(torch.bfloat16).to(torch.float32))
+    assert all(parameter.dtype is torch.float32 for parameter in model.parameters())

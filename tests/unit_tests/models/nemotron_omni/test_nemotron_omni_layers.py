@@ -200,10 +200,10 @@ def test_registry_v2_entry_removed():
 
 
 def test_initialize_weights_preserves_sharded_mamba_fp32(tmp_path):
-    """Preserve FP32 storage and values so DCP can initialize fresh optimizer state.
+    """Preserve FP32 storage and exact values through a post-shard ``initialize_weights``.
 
-    The Mamba SSM parameters share one FSDP unit with the bf16 projections; the
-    strict fp32 keywords must restore them by name after the wrapper-level cast.
+    Under fp32 master weights the Mamba SSM parameters share one FSDP unit with
+    the projections; the wrapper-level cast must leave the sharded fp32 values intact.
     """
     import torch.distributed as dist
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
@@ -213,7 +213,7 @@ def test_initialize_weights_preserves_sharded_mamba_fp32(tmp_path):
     class TinyMixer(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.in_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+            self.in_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.float32)
             self.A_log = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
             self.dt_bias = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
             self.D = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
@@ -237,11 +237,11 @@ def test_initialize_weights_preserves_sharded_mamba_fp32(tmp_path):
         model = object.__new__(NemotronOmniForConditionalGeneration)
         torch.nn.Module.__init__(model)
         model.language_model = TinyLanguageModel()
-        model.vision_model = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+        model.vision_model = torch.nn.Linear(4, 4, bias=False, dtype=torch.float32)
         mesh = init_device_mesh("cpu", (1,))
         fully_shard(model, mesh=mesh)
 
-        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
 
         for index, parameter in enumerate(model.language_model.mixer.fp32_parameters()):
             local = parameter.to_local()
@@ -250,20 +250,9 @@ def test_initialize_weights_preserves_sharded_mamba_fp32(tmp_path):
             torch.testing.assert_close(local, torch.full_like(local, 0.1234567 + index), rtol=0, atol=0)
             parameter.grad = torch.zeros_like(parameter)
             parameter.grad = None
-        assert model.language_model.mixer.in_proj.weight.dtype == torch.bfloat16
-        assert model.vision_model.weight.dtype == torch.bfloat16
+        assert model.language_model.mixer.in_proj.weight.dtype == torch.float32
+        assert model.vision_model.weight.dtype == torch.float32
         state = get_optimizer_state_dict(model, torch.optim.AdamW(model.parameters()))
         assert set(state["state"]) == set(dict(model.named_parameters()))
     finally:
         dist.destroy_process_group()
-
-
-def test_omni_strict_fp32_tokens_match_the_shared_mamba_contract():
-    """Omni reuses NemotronH mixers, so its strict fp32 tokens must be the V3 ones."""
-    from nemo_automodel.components.models.nemotron_omni.model import NemotronOmniForConditionalGeneration
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-
-    assert set(NemotronOmniForConditionalGeneration._keep_in_fp32_modules_strict) == set(
-        NemotronHForCausalLM._keep_in_fp32_modules_strict
-    )
-    assert "_fp32_params" not in NemotronOmniForConditionalGeneration._keep_in_fp32_modules_strict

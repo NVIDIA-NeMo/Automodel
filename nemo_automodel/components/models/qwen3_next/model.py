@@ -27,6 +27,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.fp32_gates import GDN_FP32_PARAM_TOKENS
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -274,8 +275,8 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     # Intrinsically-fp32 GatedDeltaNet gate parameters (HF names). cast_model_to_dtype
-    # restores them to fp32 and fully_shard_by_dtype keeps them computing in fp32.
-    _keep_in_fp32_modules_strict: list[str] = ["linear_attn.A_log", "linear_attn.dt_bias"]
+    # restores them to fp32 and ModelParallelizer keeps them computing in fp32.
+    _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
 
     @dataclass(frozen=True)
     class ModelCapabilities:

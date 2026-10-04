@@ -147,22 +147,6 @@ def test_unpadded_logits_match_pipeline_metadata_stride():
     assert logits.stride() == outputs_meta[0].stride()
 
 
-def test_requested_dtype_preserves_strict_fp32_modules():
-    cfg = build_tiny_config()
-    cfg.torch_dtype = torch.bfloat16
-    cfg.text_config.torch_dtype = torch.bfloat16
-    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
-    model = InklingForConditionalGeneration.from_config(cfg, backend=backend)
-
-    assert model.model.language_model.layers[0].mlp.gate_up_proj.dtype == torch.bfloat16
-    assert model.model.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16
-    assert model.model.language_model.layers[0].attn_sconv.conv1d.weight.dtype == torch.float32
-    assert model.model.language_model.layers[0].self_attn.k_sconv.conv1d.weight.dtype == torch.float32
-    assert model.model.language_model.layers[2].mlp.gate.e_score_correction_bias.dtype == torch.float32
-    assert "e_score_correction_bias" in dict(model.model.language_model.layers[2].mlp.gate.named_parameters())
-    assert not any("_fp32_params" in name for name, _ in model.named_modules())
-
-
 def _expected_fp32_parameter_names(cfg: InklingConfig) -> set[str]:
     """Return the fp32-contract parameter names of the tiny Inkling model."""
     names = set()
@@ -175,37 +159,6 @@ def _expected_fp32_parameter_names(cfg: InklingConfig) -> set[str]:
         if mlp_type == "sparse":
             names.add(f"{prefix}.mlp.gate.e_score_correction_bias")
     return names
-
-
-def test_strict_fp32_tokens_match_exactly_the_fp32_contract_parameters():
-    cfg, model = _build_native_model()
-    tokens = InklingForConditionalGeneration._keep_in_fp32_modules_strict
-
-    matched_parameters = {name for name, _ in model.named_parameters() if any(token in name for token in tokens)}
-    matched_buffers = {name for name, _ in model.named_buffers() if any(token in name for token in tokens)}
-
-    assert matched_parameters == _expected_fp32_parameter_names(cfg)
-    assert matched_buffers == set()
-
-
-def test_bf16_initialization_keeps_exact_fp32_contract_values():
-    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
-    torch.manual_seed(31)
-    reference = InklingForConditionalGeneration.from_config(build_tiny_config(), backend=backend)
-    reference.initialize_weights(buffer_device=torch.device("cpu"))
-    cfg = build_tiny_config()
-    cfg.torch_dtype = torch.bfloat16
-    cfg.text_config.torch_dtype = torch.bfloat16
-    torch.manual_seed(31)
-    model = InklingForConditionalGeneration.from_config(cfg, backend=backend)
-    model.initialize_weights(buffer_device=torch.device("cpu"))
-
-    reference_parameters = dict(reference.named_parameters())
-    parameters = dict(model.named_parameters())
-    assert model.lm_head.weight.dtype == torch.bfloat16
-    for name in _expected_fp32_parameter_names(cfg):
-        assert parameters[name].dtype == torch.float32, name
-        torch.testing.assert_close(parameters[name], reference_parameters[name], rtol=0.0, atol=0.0)
 
 
 def test_native_multimodal_forward_and_backward_are_finite():

@@ -20,13 +20,10 @@ from unittest.mock import patch
 import pytest
 import torch
 from PIL import Image
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-from nemo_automodel.components.distributed.activation_checkpointing import apply_submodule_checkpointing
+import nemo_automodel.components.distributed.parallelizer as parallelizer_mod
 from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
-from nemo_automodel.components.distributed.parallelizer_utils import _HAS_PARAM_DTYPE_OVERRIDE
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4 import layers as dsv4_layers
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
@@ -63,12 +60,17 @@ from nemo_automodel.components.models.deepseek_v4.processing import (
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.models.deepseek_v4.vision import (
     DeepseekV4VisionAligner,
-    DeepseekV4VisionBlock,
     DeepseekV4VisionRMSNorm,
     DeepseekV4VisionTransformer,
 )
+from nemo_automodel.components.models.deepseek_v41.config import (
+    DeepseekV41Config,
+    DeepseekV41TextConfig,
+    DeepseekV41VisionConfig,
+)
+from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
+from nemo_automodel.components.models.deepseek_v41.vision import DeepseekV41VisionTransformer
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 # Over the default 5s budget on purpose: TileLang compilation takes up to about 50s on a cold worker.
 # Reduce cold compiler startup before lowering this further.
@@ -670,11 +672,6 @@ def test_causal_lm_consumes_staged_pp_media_chunk(image_microbatches: tuple[bool
             assert model._vlm_chunk_idx == chunk_idx + 1
 
 
-_REQUIRES_PARAM_DTYPE_OVERRIDE = pytest.mark.skipif(
-    not _HAS_PARAM_DTYPE_OVERRIDE, reason="fp32 compute inside a bf16 FSDP unit needs torch >= 2.15"
-)
-
-
 def _bf16_policy() -> torch.distributed.fsdp.MixedPrecisionPolicy:
     return torch.distributed.fsdp.MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
@@ -684,26 +681,74 @@ def _bf16_policy() -> torch.distributed.fsdp.MixedPrecisionPolicy:
     )
 
 
-@_REQUIRES_PARAM_DTYPE_OVERRIDE
-@pytest.mark.parametrize("whole_tower", [False, True])
-def test_vision_units_keep_fp32_norms_inside_one_bf16_unit(monkeypatch: pytest.MonkeyPatch, whole_tower: bool) -> None:
-    # fp32 master weights: the bf16 policy computes in bf16 except for the pinned norms.
-    config = _vision_config()
-    module = DeepseekV4VisionTransformer(config) if whole_tower else DeepseekV4VisionBlock(config)
-    calls = []
-    monkeypatch.setattr(dsv4_fsdp, "fully_shard", lambda child, **kwargs: calls.append((child, kwargs)) or child)
+def _v41_vision_config() -> DeepseekV41Config:
+    return DeepseekV41Config(
+        text_config=DeepseekV41TextConfig(hidden_size=8, engram_layer_ids=[], dtype="float32"),
+        vision_config=DeepseekV41VisionConfig(
+            num_hidden_layers=2,
+            hidden_size=16,
+            num_attention_heads=2,
+            intermediate_size=12,
+            patch_size=2,
+            downsample_ratio=2,
+            min_pixels=4,
+            max_image_tokens=32,
+        ),
+        dtype="float32",
+    )
 
-    dsv4_fsdp.fully_shard_deepseek_v4(
+
+_VISION_TOWERS = {
+    DeepseekV4ForCausalLM: lambda: DeepseekV4VisionTransformer(_vision_config()),
+    DeepseekV41ForCausalLM: lambda: DeepseekV41VisionTransformer(_v41_vision_config()),
+}
+
+
+def _vision_host(model_cls: type, tower: torch.nn.Module) -> torch.nn.Module:
+    """Minimal model hosting ``tower`` at ``model.vision`` with ``model_cls``'s strict fp32 names."""
+    host = torch.nn.Module()
+    host._keep_in_fp32_modules_strict = list(model_cls._keep_in_fp32_modules_strict)
+    host.model = torch.nn.Module()
+    host.model.vision = tower
+    return host
+
+
+def _shard_vision_unit(
+    monkeypatch: pytest.MonkeyPatch, model_cls: type, host: torch.nn.Module, module: torch.nn.Module, **kwargs
+) -> list:
+    """Shard ``module`` through ``model_cls``'s sidecar bound to ``host``; return recorded ``fully_shard`` calls."""
+    calls = []
+    monkeypatch.setattr(parallelizer_mod, "fully_shard", lambda child, **kw: calls.append((child, kw)) or child)
+    with model_cls.parallelizer._bind_model(host):
+        model_cls.parallelizer._fully_shard_module(module, **kwargs)
+    return calls
+
+
+@pytest.mark.requires_param_dtype_override
+@pytest.mark.parametrize("model_cls", [DeepseekV4ForCausalLM, DeepseekV41ForCausalLM], ids=["v4", "v41"])
+@pytest.mark.parametrize("whole_tower", [False, True])
+def test_vision_units_keep_fp32_norms_inside_one_bf16_unit(
+    monkeypatch: pytest.MonkeyPatch, model_cls: type, whole_tower: bool
+) -> None:
+    # fp32 master weights: the bf16 policy computes in bf16 except for the pinned norms.
+    tower = _VISION_TOWERS[model_cls]()
+    module = tower if whole_tower else tower.blocks[0]
+
+    calls = _shard_vision_unit(
+        monkeypatch,
+        model_cls,
+        _vision_host(model_cls, tower),
         module,
-        fp32_compute_module_names=tuple(DeepseekV4ForCausalLM._keep_in_fp32_modules_strict),
-        module_name="model.vision" if whole_tower else "model.vision.blocks.0",
         mesh=object(),
         mp_policy=_bf16_policy(),
         offload_policy=None,
+        reshard_after_forward=True,
     )
 
     assert [child for child, _ in calls] == [module]
-    policy = calls[0][1]["mp_policy"]
+    kwargs = calls[0][1]
+    assert kwargs["reshard_after_forward"] is True
+    policy = kwargs["mp_policy"]
     assert policy.param_dtype == torch.bfloat16
     assert policy.output_dtype == torch.bfloat16
     norms = [child for child in module.modules() if isinstance(child, DeepseekV4VisionRMSNorm)]
@@ -713,28 +758,3 @@ def test_vision_units_keep_fp32_norms_inside_one_bf16_unit(monkeypatch: pytest.M
     others = [param for param in module.parameters() if id(param) not in norm_param_ids]
     assert others
     assert all(policy.param_dtype_override_fn(param) is None for param in others)
-
-
-@_REQUIRES_PARAM_DTYPE_OVERRIDE
-def test_checkpoint_wrapped_vision_block_is_a_single_unit_with_fp32_norms(monkeypatch: pytest.MonkeyPatch) -> None:
-    block = DeepseekV4VisionBlock(_vision_config())
-    apply_submodule_checkpointing([block], has_kv_sharing=False, context_fn=None)
-    calls = []
-    monkeypatch.setattr(dsv4_fsdp, "fully_shard", lambda child, **kwargs: calls.append((child, kwargs)) or child)
-
-    dsv4_fsdp.fully_shard_deepseek_v4(
-        block,
-        fp32_compute_module_names=tuple(DeepseekV4ForCausalLM._keep_in_fp32_modules_strict),
-        module_name="model.vision.blocks.0",
-        mesh=object(),
-        mp_policy=_bf16_policy(),
-        offload_policy=None,
-    )
-
-    assert [child for child, _ in calls] == [block]
-    policy = calls[0][1]["mp_policy"]
-    assert any(isinstance(child, CheckpointWrapper) for child in block.children())
-    params = {canonical_parameter_fqn(name): param for name, param in block.named_parameters()}
-    assert policy.param_dtype_override_fn(params["norm1.weight"]) == torch.float32
-    assert policy.param_dtype_override_fn(params["norm2.weight"]) == torch.float32
-    assert policy.param_dtype_override_fn(params["attn.wqkv.weight"]) is None

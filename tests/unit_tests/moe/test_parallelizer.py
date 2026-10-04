@@ -418,34 +418,26 @@ def _import_parallelizer_with_stubs(monkeypatch):
 
     parallelizer_utils_stub = types.ModuleType("nemo_automodel.components.distributed.parallelizer_utils")
 
-    def fully_shard_by_dtype(
-        module,
-        *,
-        mesh,
-        mp_policy,
-        offload_policy,
-        fp32_compute_module_names=(),
-        reshard_after_forward=None,
-        ignored_params=None,
-        model_parallelizer=None,
-    ):
-        kwargs = {
-            "mesh": mesh,
-            "mp_policy": mp_policy,
-            "offload_policy": offload_policy,
-        }
-        if reshard_after_forward is not None:
-            kwargs["reshard_after_forward"] = reshard_after_forward
-        if ignored_params:
-            kwargs["ignored_params"] = ignored_params
-        shard_module = (
-            sys.modules["nemo_automodel.components.moe.parallelizer"].fully_shard
-            if model_parallelizer is None
-            else model_parallelizer._fully_shard_module
-        )
-        shard_module(module, **kwargs)
+    # The base ModelParallelizer is the default sharder; this stand-in applies no
+    # fp32 contract and forwards every unit to the module-level ``fully_shard``
+    # so the tests below keep observing it.
+    parallelizer_stub = types.ModuleType("nemo_automodel.components.distributed.parallelizer")
 
-    parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
+    class ModelParallelizer:
+        def __init__(self):
+            self.bound_models = []
+
+        @contextmanager
+        def _bind_model(self, model):
+            self.bound_models.append(model)
+            yield
+
+        def _fully_shard_module(self, module, **kwargs):
+            return sys.modules["nemo_automodel.components.moe.parallelizer"].fully_shard(module, **kwargs)
+
+    parallelizer_stub.ModelParallelizer = ModelParallelizer
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.parallelizer", parallelizer_stub)
+
     parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
 
@@ -1073,21 +1065,33 @@ def test_apply_fsdp_rejects_mok_mxfp8_with_ep_shard(monkeypatch):
         )
 
 
-def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_sharder(monkeypatch):
-    """MoE uses the dense dtype-aware sharder with the model and EP contracts."""
+def test_apply_fsdp_binds_model_and_shards_blocks_through_the_model_parallelizer(monkeypatch):
+    """Every unit but EP experts goes through the parallelizer bound to the model."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
     fully_shard_mock = MagicMock()
     monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
-    shared_sharder_mock = MagicMock()
-    monkeypatch.setattr(P.parallelizer_utils, "fully_shard_by_dtype", shared_sharder_mock)
+
+    class RecordingParallelizer:
+        def __init__(self):
+            self.bound = []
+            self.units = []
+
+        @contextmanager
+        def _bind_model(self, model):
+            self.bound.append(model)
+            yield
+
+        def _fully_shard_module(self, module, **kwargs):
+            self.units.append((module, kwargs))
+            return module
 
     block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])
-    model._keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
     fsdp_mesh = object()
     mp_policy = MagicMock()
     offload_policy = object()
+    parallelizer = RecordingParallelizer()
 
     P.apply_fsdp(
         model=model,
@@ -1097,21 +1101,46 @@ def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_
         mp_policy=mp_policy,
         offload_policy=offload_policy,
         reshard_after_forward=True,
+        model_parallelizer=parallelizer,
     )
 
-    shared_sharder_mock.assert_called_once_with(
+    assert parallelizer.bound == [model]
+    assert parallelizer.units[0] == (
         block,
-        mesh=fsdp_mesh,
-        mp_policy=mp_policy,
-        offload_policy=offload_policy,
-        fp32_compute_module_names=(
-            "mlp.gate.weight",
-            "mlp.gate.e_score_correction_bias",
-        ),
-        reshard_after_forward=True,
-        ignored_params=set(block.mlp.experts.parameters()),
-        model_parallelizer=None,
+        {
+            "mesh": fsdp_mesh,
+            "mp_policy": mp_policy,
+            "offload_policy": offload_policy,
+            "reshard_after_forward": True,
+            "ignored_params": set(block.mlp.experts.parameters()),
+        },
     )
+    assert parallelizer.units[-1][0] is model
+    fully_shard_mock.assert_not_called()
+
+
+def test_apply_fsdp_defaults_to_the_base_model_parallelizer(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    created = []
+    parallelizer_cls = sys.modules["nemo_automodel.components.distributed.parallelizer"].ModelParallelizer
+    original_init = parallelizer_cls.__init__
+
+    def recording_init(self):
+        original_init(self)
+        created.append(self)
+
+    monkeypatch.setattr(parallelizer_cls, "__init__", recording_init)
+
+    block = DummyBlock(mlp=DummyMoE())
+    model = DummyModel([block])
+    P.apply_fsdp(model=model, fsdp_mesh=object(), ep_enabled=True, ep_shard_enabled=False)
+
+    (parallelizer,) = created
+    assert parallelizer.bound_models == [model]
+    assert fully_shard_mock.call_args_list[0].args[0] is block
 
 
 def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):
@@ -2099,6 +2128,7 @@ def test_apply_fsdp_uses_sidecar_sharder_or_default(
     if model_owned_sharding:
         model_parallelizer = types.SimpleNamespace(
             _fully_shard_module=model_shard,
+            _bind_model=lambda model: nullcontext(),
         )
 
     P.apply_fsdp(

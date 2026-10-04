@@ -33,6 +33,7 @@ from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
 )
+from nemo_automodel.components.models.common.fp32_gates import gdn_decay_gate, pin_gdn_params_fp32
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -41,26 +42,29 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
     """Qwen3-Next GatedDeltaNet with fp32-resident ``A_log`` / ``dt_bias``.
 
-    HF's ``Qwen3NextGatedDeltaNet`` computes the gate inline as
-    ``g = -exp(A_log) * softplus(a + dt_bias)``. ``A_log`` and ``dt_bias`` are
-    intrinsically fp32 (``A_log`` is exponentiated, so bf16 rounding becomes a
-    proportional error on the decay rate that the recurrence compounds across the
-    sequence).
-
     The constructor rebuilds both parameters in fp32 under their HF names, independent
     of the model dtype. ``Qwen3NextForCausalLM._keep_in_fp32_modules_strict`` names them,
     so ``cast_model_to_dtype`` restores them to fp32 and FSDP2 keeps them computing in
-    fp32 under a bf16 ``param_dtype`` (see ``fully_shard_by_dtype``). ``_compute_gate``
-    casts its own inputs to fp32 because FSDP casts the block's inputs to bf16; ``forward``
-    reproduces HF's forward verbatim apart from routing the gate through it.
+    fp32 under a bf16 ``param_dtype`` (see ``ModelParallelizer``).
+
+    The decay gate is not why ``forward`` is overridden: HF's
+    ``Qwen3NextGatedDeltaNet.forward`` already computes
+    ``g = -A_log.float().exp() * softplus(a.float() + dt_bias)``, which with fp32
+    ``dt_bias`` equals ``gdn_decay_gate`` bitwise. The override exists for two other
+    reasons, both verified against transformers 5.15.1 (the pinned release):
+
+    * HF's ``apply_mask_to_padding_states`` multiplies by ``attention_mask[:, :, None]``
+      unconditionally; ``Qwen3NextDecoderLayer`` forwards the 4D packed causal mask to
+      this module, which would broadcast to 5D. ``forward`` only applies it to 2D masks.
+    * HF dispatches the conv / delta-rule kernels through module-level
+      ``use_kernel_func_from_hub_with_fallback`` wrappers that run the pure-torch
+      fallbacks unless the kernels hub is configured. ``_bind_kernels`` binds the
+      installed ``causal_conv1d`` / FLA kernels directly (the pre-5.15 behavior).
     """
 
     def __init__(self, config: Qwen3NextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-        # HF creates these in the default dtype. Pin them to fp32 storage regardless of
-        # the model dtype (values preserved).
-        self.A_log = nn.Parameter(self.A_log.detach().to(torch.float32))
-        self.dt_bias = nn.Parameter(self.dt_bias.detach().to(torch.float32))
+        pin_gdn_params_fp32(self)
         self._bind_kernels()
 
     def _bind_kernels(self) -> None:
@@ -103,7 +107,7 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
         Returns:
             fp32 gate with the same shape as ``a``.
         """
-        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        return gdn_decay_gate(a, self.A_log, self.dt_bias)
 
     def forward(  # pragma: no cover - verbatim HF GDN forward; needs CUDA conv1d/FLA kernels (GPU/functional only)
         self,

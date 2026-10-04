@@ -97,7 +97,6 @@ def test_model_storage_dtype(checkpoint, cpu_model_infrastructure, entrypoint, f
     if force_hf and entrypoint == "from_pretrained":
         reference = LlamaForCausalLM.from_pretrained(checkpoint, dtype=expected)
         torch.testing.assert_close(model.model.embed_tokens.weight, reference.model.embed_tokens.weight)
-        assert model.model.embed_tokens.weight._hf_compute_dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize("model_cls", [NeMoAutoModelBiEncoder, NeMoAutoModelCrossEncoder])

@@ -52,6 +52,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
     SaveConsolidatedMode,
+    _apply_adapter_forced_dtype_mapping,
     _collect_global_tensor_sizes,
     _divide_keys_by_size,
     _ensure_dirs,
@@ -900,44 +901,63 @@ def test_original_dtype_mapping_is_keyed_by_export_state_dict(tmp_path):
     }
 
 
-def test_original_dtype_mapping_applies_adapter_forced_dtypes(tmp_path):
-    reference_dir = tmp_path / "reference"
-    reference_dir.mkdir()
-    save_file(
-        {
-            "backbone.layers.0.mixer.A_log": torch.ones(1, dtype=torch.bfloat16),
-            "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, dtype=torch.bfloat16),
-            "unused.weight": torch.ones(1, dtype=torch.float32),
-        },
-        reference_dir / "model.safetensors",
-    )
+class _StrictFp32Model(torch.nn.Module):
+    """Tiny model whose ``mixer.A_log`` is a strict-fp32 parameter next to ordinary weights."""
+
+    _keep_in_fp32_modules_strict = ["mixer.A_log"]
+
+    def __init__(self):
+        super().__init__()
+        mixer = torch.nn.Module()
+        mixer.A_log = torch.nn.Parameter(torch.ones(1, dtype=torch.float32))
+        mixer.in_proj = torch.nn.Linear(1, 1, bias=False)
+        # Matches the token as a substring but is not floating point, so it is never pinned.
+        mixer.register_buffer("A_log_steps", torch.zeros(1, dtype=torch.int64))
+        layer = torch.nn.Module()
+        layer.mixer = mixer
+        self.layers = torch.nn.ModuleList([layer])
+
+
+class _BackboneRenamingAdapter:
+    """Export-only adapter that renames native ``layers.*`` keys into ``backbone.layers.*``."""
+
+    def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
+        return [(f"backbone.{fqn}", tensor)]
+
+
+def _strict_fp32_checkpointer(tmp_path, model_repo_id):
     config = CheckpointingConfig(
         enabled=True,
         checkpoint_dir=str(tmp_path),
         model_save_format="safetensors",
         model_cache_dir=str(tmp_path / "cache"),
-        model_repo_id="test/model",
+        model_repo_id=model_repo_id,
         save_consolidated=False,
         is_peft=False,
     )
-
-    class Adapter:
-        def forced_hf_dtype_mapping(self, state_dict):
-            assert set(state_dict) == {
-                "backbone.layers.0.mixer.A_log",
-                "backbone.layers.0.mixer.in_proj.weight",
-            }
-            return {
-                "backbone.layers.0.mixer.A_log": "F32",
-                "absent.weight": "F32",
-            }
-
     with patch("torch.distributed.is_initialized", return_value=False):
-        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-    model_state = SimpleNamespace(model=[SimpleNamespace(state_dict_adapter=Adapter())])
+        return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+
+def test_original_dtype_mapping_pins_strict_fp32_keys_over_hf_reference(tmp_path):
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir()
+    save_file(
+        {
+            "backbone.layers.0.mixer.A_log": torch.ones(1, dtype=torch.bfloat16),
+            "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, 1, dtype=torch.bfloat16),
+            "unused.weight": torch.ones(1, dtype=torch.float32),
+        },
+        reference_dir / "model.safetensors",
+    )
+    model = _StrictFp32Model()
+    model.state_dict_adapter = _BackboneRenamingAdapter()
+    checkpointer = _strict_fp32_checkpointer(tmp_path, "test/model")
+    model_state = SimpleNamespace(model=[model])
     state_dict = {
         "backbone.layers.0.mixer.A_log": torch.ones(1, dtype=torch.float32),
-        "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, dtype=torch.float32),
+        "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, 1, dtype=torch.float32),
+        "backbone.layers.0.mixer.A_log_steps": torch.zeros(1, dtype=torch.int64),
     }
 
     with patch(
@@ -952,34 +972,14 @@ def test_original_dtype_mapping_applies_adapter_forced_dtypes(tmp_path):
     }
 
 
-def test_original_dtype_mapping_applies_adapter_forced_dtypes_without_hf_reference(tmp_path):
-    config = CheckpointingConfig(
-        enabled=True,
-        checkpoint_dir=str(tmp_path),
-        model_save_format="safetensors",
-        model_cache_dir=str(tmp_path / "cache"),
-        model_repo_id="",
-        save_consolidated=False,
-        is_peft=False,
-    )
-
-    class Adapter:
-        def forced_hf_dtype_mapping(self, state_dict):
-            assert set(state_dict) == {
-                "backbone.layers.0.mixer.A_log",
-                "backbone.layers.0.mixer.in_proj.weight",
-            }
-            return {
-                "backbone.layers.0.mixer.A_log": "F32",
-                "absent.weight": "F32",
-            }
-
-    with patch("torch.distributed.is_initialized", return_value=False):
-        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-    model_state = SimpleNamespace(model=[SimpleNamespace(state_dict_adapter=Adapter())])
+def test_original_dtype_mapping_pins_strict_fp32_keys_without_hf_reference(tmp_path):
+    model = _StrictFp32Model()
+    model.state_dict_adapter = _BackboneRenamingAdapter()
+    checkpointer = _strict_fp32_checkpointer(tmp_path, "")
+    model_state = SimpleNamespace(model=[model])
     state_dict = {
         "backbone.layers.0.mixer.A_log": torch.ones(1, dtype=torch.float32),
-        "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, dtype=torch.float32),
+        "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, 1, dtype=torch.float32),
     }
 
     with patch(
@@ -989,6 +989,24 @@ def test_original_dtype_mapping_applies_adapter_forced_dtypes_without_hf_referen
         dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
 
     assert dtype_mapping == {"backbone.layers.0.mixer.A_log": "F32"}
+
+
+def test_forced_dtype_mapping_uses_native_keys_without_adapter_and_skips_absent_keys():
+    parts = [_StrictFp32Model(), _StrictFp32Model()]
+    # Only the first part's strict tensor is exported (e.g. a PEFT export or another PP stage).
+    state_dict = {"layers.0.mixer.A_log": torch.ones(1), "layers.0.mixer.in_proj.weight": torch.ones(1, 1)}
+
+    forced = _apply_adapter_forced_dtype_mapping(parts, state_dict, {"layers.0.mixer.in_proj.weight": "BF16"})
+
+    assert forced == {"layers.0.mixer.in_proj.weight": "BF16", "layers.0.mixer.A_log": "F32"}
+
+
+def test_forced_dtype_mapping_is_identity_without_strict_fp32_tokens():
+    model = torch.nn.Linear(1, 1)
+    baseline = {"weight": "BF16"}
+
+    assert _apply_adapter_forced_dtype_mapping([model], {"weight": model.weight}, baseline) == baseline
+    assert _apply_adapter_forced_dtype_mapping([], {"weight": model.weight}, baseline) == baseline
 
 
 def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():

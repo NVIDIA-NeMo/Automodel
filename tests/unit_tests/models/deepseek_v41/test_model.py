@@ -32,7 +32,7 @@ from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from nemo_automodel._transformers.capabilities import _is_deepseek_v4
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
-from nemo_automodel.components.distributed.parallelizer_utils import _HAS_PARAM_DTYPE_OVERRIDE, fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallelizer_utils import with_fp32_compute_override
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
@@ -439,12 +439,10 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=None, cast_forward_inputs=False
         )
         for module in model.model.layers.values():
-            fully_shard_by_dtype(
+            fully_shard(
                 module,
                 mesh=mesh,
-                mp_policy=policy,
-                offload_policy=None,
-                fp32_compute_module_names=tuple(strict_names),
+                mp_policy=with_fp32_compute_override(module, policy, tuple(strict_names)),
                 reshard_after_forward=True,
             )
         fully_shard(model.model.embed_tokens, mesh=mesh, mp_policy=policy, reshard_after_forward=True)
@@ -488,7 +486,7 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
         dist.destroy_process_group()
 
 
-@pytest.mark.skipif(not _HAS_PARAM_DTYPE_OVERRIDE, reason="fp32 compute inside a bf16 FSDP unit needs torch >= 2.15")
+@pytest.mark.requires_param_dtype_override
 @pytest.mark.runtime_budget(
     30, hard_timeout=70, reason="Spawns two gloo FSDP workers that wrap, initialize and reload a tiny model."
 )

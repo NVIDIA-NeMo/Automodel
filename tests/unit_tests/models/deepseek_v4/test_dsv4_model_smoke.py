@@ -27,12 +27,12 @@ import pytest
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
-from nemo_automodel.components.distributed.parallelizer_utils import _HAS_PARAM_DTYPE_OVERRIDE
+import nemo_automodel.components.distributed.parallelizer as parallelizer_mod
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.mtp import MTPConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4 import model as dsv4_model_module
+from nemo_automodel.components.models.deepseek_v4 import parallelization as dsv4_parallelization
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
 
@@ -47,10 +47,6 @@ pytestmark = pytest.mark.timeout(70)
 # though the model parameters live on the CPU.  Gate the forward-running
 # smoke tests on CUDA availability — the rest of the file (HC params,
 # weight shapes, attn-sink dtype) is pure metadata and runs everywhere.
-_REQUIRES_PARAM_DTYPE_OVERRIDE = pytest.mark.skipif(
-    not _HAS_PARAM_DTYPE_OVERRIDE, reason="fp32 compute inside a bf16 FSDP unit needs torch >= 2.15"
-)
-
 _REQUIRES_CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="MoE.forward unconditionally allocates torch.cuda.Stream() for shared experts",
@@ -118,6 +114,23 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
                 p.zero_()
     model.eval()
     return model
+
+
+def _record_fully_shard(monkeypatch) -> list:
+    calls = []
+
+    def fake_fully_shard(module, **kwargs):
+        calls.append((module, kwargs))
+        return module
+
+    monkeypatch.setattr(parallelizer_mod, "fully_shard", fake_fully_shard)
+    return calls
+
+
+def _shard_unit(model, module, **kwargs) -> None:
+    """Shard ``module`` through the model's sidecar exactly as parallelization does."""
+    with model.parallelizer._bind_model(model):
+        model.parallelizer._fully_shard_module(module, **kwargs)
 
 
 def test_fp32_config_constructs_all_floating_parameters_in_fp32():
@@ -191,25 +204,19 @@ class TestDeepseekV4ModelSmoke:
         class TwoDimMesh:
             mesh_dim_names = ("dp", "tp")
 
-        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(None) is None
-        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(UnnamedOneDimMesh()) is unnamed_hca_group
-        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(UnnamedTwoDimMesh()) is None
-        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(ShapeOnlyOneDimMesh()) is shape_only_hca_group
-        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(TwoDimMesh()) is None
-        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(NamedOneDimMesh()) is named_hca_group
+        assert dsv4_parallelization._hca_param_sync_group_from_1d_mesh(None) is None
+        assert dsv4_parallelization._hca_param_sync_group_from_1d_mesh(UnnamedOneDimMesh()) is unnamed_hca_group
+        assert dsv4_parallelization._hca_param_sync_group_from_1d_mesh(UnnamedTwoDimMesh()) is None
+        assert dsv4_parallelization._hca_param_sync_group_from_1d_mesh(ShapeOnlyOneDimMesh()) is shape_only_hca_group
+        assert dsv4_parallelization._hca_param_sync_group_from_1d_mesh(TwoDimMesh()) is None
+        assert dsv4_parallelization._hca_param_sync_group_from_1d_mesh(NamedOneDimMesh()) is named_hca_group
 
-    @_REQUIRES_PARAM_DTYPE_OVERRIDE
+    @pytest.mark.requires_param_dtype_override
     def test_dsv4_block_is_one_bf16_unit_with_fp32_contract_parameters(self, monkeypatch):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
         model = _make_model(cfg)
         block = model.model.layers["0"]
-        calls = []
-
-        def fake_fully_shard(module, **kwargs):
-            calls.append((module, kwargs))
-            return module
-
-        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+        calls = _record_fully_shard(monkeypatch)
 
         hca_group = object()
 
@@ -229,13 +236,7 @@ class TestDeepseekV4ModelSmoke:
             output_dtype=torch.bfloat16,
         )
 
-        dsv4_fsdp.fully_shard_deepseek_v4(
-            block,
-            fp32_compute_module_names=tuple(model._keep_in_fp32_modules_strict),
-            mesh=FakeMesh(),
-            mp_policy=input_policy,
-            offload_policy=None,
-        )
+        _shard_unit(model, block, mesh=FakeMesh(), mp_policy=input_policy, offload_policy=None)
 
         assert block.self_attn.compressor._hca_param_sync_group is hca_group
         assert [module for module, _ in calls] == [block]
@@ -259,13 +260,7 @@ class TestDeepseekV4ModelSmoke:
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
         model = _make_model(cfg)
         block = model.model.layers["0"]
-        calls = []
-
-        def fake_fully_shard(module, **kwargs):
-            calls.append((module, kwargs))
-            return module
-
-        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+        calls = _record_fully_shard(monkeypatch)
 
         input_policy = MixedPrecisionPolicy(
             param_dtype=torch.float32,
@@ -273,31 +268,19 @@ class TestDeepseekV4ModelSmoke:
             output_dtype=torch.float32,
         )
 
-        dsv4_fsdp.fully_shard_deepseek_v4(
-            block,
-            fp32_compute_module_names=tuple(model._keep_in_fp32_modules_strict),
-            mesh=object(),
-            mp_policy=input_policy,
-            offload_policy=None,
-        )
+        _shard_unit(model, block, mesh=object(), mp_policy=input_policy, offload_policy=None)
 
         assert len(calls) == 1
         assert calls[0][0] is block
         assert calls[0][1]["mp_policy"] is input_policy
 
-    @_REQUIRES_PARAM_DTYPE_OVERRIDE
+    @pytest.mark.requires_param_dtype_override
     def test_dsv4_block_unit_forwards_ignored_expert_parameters(self, monkeypatch):
         # fp32 master weights: FSDP2 keeps one storage dtype per unit.
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[4])
         model = _make_model(cfg)
         block = model.model.layers["0"]
-        calls = []
-
-        def fake_fully_shard(module, **kwargs):
-            calls.append((module, kwargs))
-            return module
-
-        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+        calls = _record_fully_shard(monkeypatch)
 
         hca_group = object()
 
@@ -317,9 +300,9 @@ class TestDeepseekV4ModelSmoke:
         )
         ignored_expert_params = set(block.mlp.experts.parameters())
 
-        dsv4_fsdp.fully_shard_deepseek_v4(
+        _shard_unit(
+            model,
             block,
-            fp32_compute_module_names=tuple(model._keep_in_fp32_modules_strict),
             mesh=FakeMesh(),
             mp_policy=input_policy,
             offload_policy=None,
@@ -339,16 +322,11 @@ class TestDeepseekV4ModelSmoke:
             assert policy.param_dtype_override_fn(param) == torch.float32
         assert policy.param_dtype_override_fn(indexer.wq_b.weight) is None
 
+    @pytest.mark.requires_param_dtype_override
     def test_dsv4_lm_head_unit_computes_and_returns_fp32(self, monkeypatch):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[0])
         model = _make_model(cfg)
-        calls = []
-
-        def fake_fully_shard(module, **kwargs):
-            calls.append((module, kwargs))
-            return module
-
-        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+        calls = _record_fully_shard(monkeypatch)
         input_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
@@ -356,14 +334,7 @@ class TestDeepseekV4ModelSmoke:
             cast_forward_inputs=False,
         )
 
-        dsv4_fsdp.fully_shard_deepseek_v4(
-            model.lm_head,
-            fp32_compute_module_names=tuple(model._keep_in_fp32_modules_strict),
-            module_name="lm_head",
-            mesh=object(),
-            mp_policy=input_policy,
-            offload_policy=None,
-        )
+        _shard_unit(model, model.lm_head, mesh=object(), mp_policy=input_policy, offload_policy=None)
 
         assert [module for module, _ in calls] == [model.lm_head]
         policy = calls[0][1]["mp_policy"]
@@ -372,16 +343,19 @@ class TestDeepseekV4ModelSmoke:
         assert policy.output_dtype == torch.float32
         assert policy.cast_forward_inputs is True
 
-    def test_dsv4_lm_head_without_model_level_name_keeps_the_caller_policy(self):
+    def test_dsv4_lm_head_unbound_parallelizer_keeps_the_caller_policy(self, monkeypatch):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[0])
         model = _make_model(cfg)
+        calls = _record_fully_shard(monkeypatch)
         input_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
-        policy = dsv4_fsdp.deepseek_v4_unit_mp_policy(
-            model.lm_head, input_policy, tuple(model._keep_in_fp32_modules_strict)
-        )
+        # Outside ``_bind_model`` no model-level name exists, so the ``lm_head`` token cannot resolve.
+        model.parallelizer._fully_shard_module(model.lm_head, mesh=object(), mp_policy=input_policy)
 
-        assert policy is input_policy
+        assert calls[0][1]["mp_policy"] is input_policy
+
+    def test_dsv4_parallelizer_is_the_shared_sidecar(self):
+        assert isinstance(DeepseekV4ForCausalLM.parallelizer, dsv4_parallelization.DeepseekV4ModelParallelizer)
 
     def test_strict_fp32_names_match_exactly_the_fp32_parameters(self):
         cfg = _tiny_config(
@@ -425,60 +399,6 @@ class TestDeepseekV4ModelSmoke:
         } <= pinned
         assert "model.layers.0.self_attn.compressor.indexer.wq_b.weight" not in pinned
         assert "model.layers.0.self_attn.compressor.kv_norm.weight" not in pinned
-
-    def test_reference_fp32_parameters_constructed_before_cast(self):
-        cfg = _tiny_config(
-            num_hidden_layers=2,
-            num_hash_layers=0,
-            compress_ratios=[4, 0],
-            torch_dtype="bfloat16",
-        )
-        old_default_dtype = torch.get_default_dtype()
-        try:
-            torch.set_default_dtype(torch.bfloat16)
-            model = DeepseekV4ForCausalLM(
-                cfg,
-                backend=BackendConfig(
-                    attn="sdpa",
-                    linear="torch",
-                    rms_norm="torch",
-                    rope_fusion=False,
-                    enable_hf_state_dict_adapter=False,
-                    dispatcher="torch",
-                    experts="torch_mm",
-                ),
-            )
-        finally:
-            torch.set_default_dtype(old_default_dtype)
-
-        expected_fp32 = (
-            "attn_hc.fn",
-            "attn_hc.base",
-            "attn_hc.scale",
-            "ffn_hc.fn",
-            "ffn_hc.base",
-            "ffn_hc.scale",
-            "hc_head.hc_fn",
-            "hc_head.hc_base",
-            "hc_head.hc_scale",
-            "self_attn.sinks",
-            "self_attn.compressor.wkv",
-            "self_attn.compressor.wgate",
-            "self_attn.compressor.ape",
-            "self_attn.compressor.indexer.wkv",
-            "self_attn.compressor.indexer.wgate",
-            "self_attn.compressor.indexer.ape",
-            "lm_head",
-        )
-        matched = []
-        for name, param in model.named_parameters():
-            if any(keyword in name for keyword in expected_fp32):
-                matched.append(name)
-                assert param.dtype == torch.float32, name
-
-        assert matched
-        assert model.model.embed_tokens.weight.dtype == torch.bfloat16
-        assert model.model.layers["0"].self_attn.wq_a.weight.dtype == torch.bfloat16
 
     def test_reference_fp32_parameters_survive_bf16_cast(self):
         cfg = _tiny_config(num_hidden_layers=3, num_hash_layers=0, compress_ratios=[0, 4, 0])

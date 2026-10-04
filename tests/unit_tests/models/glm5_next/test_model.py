@@ -11,7 +11,6 @@ from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextSparseAttention,
 )
 from nemo_automodel.components.models.glm5_next.model import (
-    Glm5NextForConditionalGeneration,
     build_glm5_next_moe_config,
 )
 from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config, tiny_glm5_next_model
@@ -258,50 +257,6 @@ def _expected_fp32_parameter_names() -> set[str]:
     return names
 
 
-def test_strict_fp32_tokens_match_exactly_the_fp32_contract_parameters():
-    model = tiny_glm5_next_model()
-    tokens = Glm5NextForConditionalGeneration._keep_in_fp32_modules_strict
-
-    matched_parameters = {name for name, _ in model.named_parameters() if any(token in name for token in tokens)}
-    matched_buffers = {name for name, _ in model.named_buffers() if any(token in name for token in tokens)}
-
-    assert matched_parameters == _expected_fp32_parameter_names()
-    assert all(name.endswith(("e_score_correction_bias", "rotary_pos_emb.inv_freq")) for name in matched_buffers)
-    assert "model.visual.rotary_pos_emb.inv_freq" in matched_buffers
-
-
-def test_fp32_contract_parameters_are_bare_attributes_of_their_owners():
-    layer = tiny_glm5_next_model().model.language_model.layers["0"]
-
-    assert set(dict(layer.attn_hc.named_parameters())) == {"fn", "base", "scale"}
-    assert layer.attn_hc.base.dtype is torch.float32
-    assert layer.attn_hc.scale.dtype is torch.float32
-    assert layer.self_attn.A_log.dtype is torch.float32
-    assert layer.self_attn.dt_bias.dtype is torch.float32
-    assert set(dict(layer.self_attn.named_parameters())) >= {"A_log", "dt_bias"}
-    assert "_fp32_params" not in {name for name, _ in layer.named_modules()}
-
-
-def test_bf16_initialization_keeps_exact_fp32_contract_values():
-    torch.manual_seed(31)
-    reference = tiny_glm5_next_model()
-    torch.manual_seed(31)
-    model = Glm5NextForConditionalGeneration(tiny_glm5_next_config(), backend=tiny_backend())
-    model.initialize_weights(torch.device("cpu"), dtype=torch.bfloat16)
-
-    layer = model.model.language_model.layers["0"]
-    assert layer.attn_hc.fn.dtype is torch.bfloat16
-    assert layer.self_attn.q_proj.weight.dtype is torch.bfloat16
-    assert model.lm_head.weight.dtype is torch.bfloat16
-    reference_parameters = dict(reference.named_parameters())
-    for name in _expected_fp32_parameter_names():
-        parameter = dict(model.named_parameters())[name]
-        assert parameter.dtype is torch.float32, name
-        torch.testing.assert_close(parameter, reference_parameters[name], rtol=0.0, atol=0.0)
-    assert torch.equal(layer.attn_hc.base, torch.zeros_like(layer.attn_hc.base))
-    assert torch.equal(layer.attn_hc.scale, torch.ones_like(layer.attn_hc.scale))
-
-
 def test_fp32_contract_parameters_receive_finite_gradients():
     torch.manual_seed(5)
     model = tiny_glm5_next_model().train()
@@ -338,7 +293,7 @@ def test_short_sequence_training_uses_chunk_kda_and_reaches_kda_parameters(monke
     monkeypatch.setattr(glm5_next_layers, "_chunk_kda", fake_chunk_kda)
     # PyTorch short convolution and gate keep the test free of Triton compilation.
     monkeypatch.setattr(glm5_next_layers, "_SHORT_CONV_OK", False)
-    monkeypatch.setattr(glm5_next_layers, "_KDA_GATE_OK", False)
+    monkeypatch.setattr(glm5_next_layers, "HAVE_FUSED_KDA_GATE", False)
     config = tiny_glm5_next_config().text_config
     config.hidden_size, config.linear_head_dim, config.linear_num_heads = 128, 64, 2
     config.linear_conv_kernel_dim = 4

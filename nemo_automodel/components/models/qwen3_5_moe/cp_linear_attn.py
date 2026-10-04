@@ -41,6 +41,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     torch_recurrent_gated_delta_rule,
 )
 
+from nemo_automodel.components.models.common.fp32_gates import gdn_decay_gate, pin_gdn_params_fp32
 from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
 
 if TYPE_CHECKING:
@@ -114,10 +115,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         self.causal_conv1d_update = fast_causal_conv1d_update
         self.chunk_gated_delta_rule = chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
-        # HF builds ``A_log``/``dt_bias`` in the default dtype; pin them to fp32
-        # storage independent of the model dtype (values preserved).
-        self.A_log = torch.nn.Parameter(self.A_log.detach().to(torch.float32))
-        self.dt_bias = torch.nn.Parameter(self.dt_bias.detach().to(torch.float32))
+        pin_gdn_params_fp32(self)
 
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
         """Compute the decay gate ``g = -exp(A_log) * softplus(a + dt_bias)`` in fp32.
@@ -129,7 +127,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         Returns:
             Gate of shape [batch, sequence, num_v_heads] in fp32.
         """
-        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        return gdn_decay_gate(a, self.A_log, self.dt_bias)
 
     def _forward_no_cp(
         self,

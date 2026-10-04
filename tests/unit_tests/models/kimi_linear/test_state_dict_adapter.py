@@ -145,7 +145,7 @@ def test_from_hf_groups_kimi_w1_w2_w3_experts(adapter, moe_config):
     assert torch.equal(down[0], w2.T.to(down.dtype))
 
 
-def test_from_hf_upcasts_kda_and_router_fp32_keys(adapter):
+def test_from_hf_keeps_kda_and_router_fp32_keys_unchanged(adapter):
     hf_state = {
         "model.layers.0.self_attn.A_log": torch.ones(1, 1, 2, 1, dtype=torch.bfloat16),
         "model.layers.0.self_attn.dt_bias": torch.ones(8, dtype=torch.bfloat16),
@@ -154,9 +154,12 @@ def test_from_hf_upcasts_kda_and_router_fp32_keys(adapter):
 
     native = adapter.from_hf(hf_state)
 
-    assert native["model.layers.0.self_attn.A_log"].dtype is torch.float32
-    assert native["model.layers.0.self_attn.dt_bias"].dtype is torch.float32
-    assert native["model.layers.1.mlp.gate.e_score_correction_bias"].dtype is torch.float32
+    assert native["model.layers.0.self_attn.A_log"] is hf_state["model.layers.0.self_attn.A_log"]
+    assert native["model.layers.0.self_attn.dt_bias"] is hf_state["model.layers.0.self_attn.dt_bias"]
+    assert (
+        native["model.layers.1.mlp.gate.e_score_correction_bias"]
+        is hf_state["model.layers.1.block_sparse_moe.gate.e_score_correction_bias"]
+    )
 
 
 def test_kda_fp32_keys_round_trip_under_hf_names(adapter):

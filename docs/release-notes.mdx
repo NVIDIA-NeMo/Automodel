@@ -6,22 +6,31 @@ description: ""
 
 ### FSDP2 per-parameter mixed precision
 
-- `fully_shard_by_dtype` now shards each block as one FSDP unit and keeps
-  `_keep_in_fp32_modules_strict` parameters (and checkpoint-recorded fp32
-  parameters) in fp32 through PyTorch 2.15 `MixedPrecisionPolicy.param_dtype_override_fn`.
-  The nested per-dtype FSDP units and the `_fp32_params` holder modules in
-  Qwen3-Next, Qwen3.5, Qwen3.5-MoE, Qwen3.8-Flash-Next, Kimi K3, Kimi Linear,
-  NemotronH, Nemotron Omni, GLM5-Next and Inkling are removed, as are DeepSeek
-  V4 / V4.1's nested fp32-island units and `DeepseekV4FP32Parameter` holders;
-  fp32 parameters now use their HF names directly (for example
-  `linear_attn.A_log`, `mixer.D`, `self_attn.sinks`, `attn.attn_sink`).
+- `ModelParallelizer` now applies the model's `_keep_in_fp32_modules_strict`
+  contract to every FSDP2 unit it creates: each block is one unit and the
+  listed parameters keep their fp32 storage dtype through PyTorch 2.15
+  `MixedPrecisionPolicy.param_dtype_override_fn`. This replaces
+  `fully_shard_by_dtype`, the nested per-dtype FSDP units, the `_fp32_params`
+  holder modules (Qwen3-Next, Qwen3.5, Qwen3.5-MoE, Qwen3.8-Flash-Next, Kimi K3,
+  Kimi Linear, NemotronH, Nemotron Omni, GLM5-Next, Inkling) and DeepSeek V4 /
+  V4.1's fp32-island units; fp32 parameters now use their HF names directly
+  (for example `linear_attn.A_log`, `mixer.D`, `self_attn.sinks`, `attn.attn_sink`).
+- Fixes: with `model.dtype: float32`, the default FSDP2 path (EP=1) and the MoE
+  path for `Qwen3_5MoeForCausalLM` previously all-gathered these parameters in
+  bf16 (and DeepSeek V4.1 failed with a dtype mismatch); they now compute in fp32
+  on every path. `lm_head_precision: float32` is equivalent to listing `lm_head`
+  in the strict list.
 - Breaking: these models require `model.dtype: float32` (fp32 master weights)
-  for FSDP2 training with `param_dtype: bfloat16`; a pinned fp32 parameter stored
-  in bf16 is rejected. Automodel-native DCP checkpoints that contain
-  `._fp32_params.` keys are not migrated; HF-format checkpoints are unaffected.
-- DeepSeek V4.1's `lm_head` and DeepSeek V4's `ffn.gate.bias_vl` now follow the
-  models' strict fp32 lists (fp32 compute and fp32 logits); previously they
-  computed in bf16 on the V4.1 path.
+  for FSDP2 training with `param_dtype: bfloat16`; a block whose trainable
+  parameters mix storage dtypes is rejected at sharding time with an error
+  naming them. Automodel-native DCP checkpoints that contain `._fp32_params.`
+  or `*_param.weight` holder keys are not migrated; HF-format checkpoints are
+  unaffected.
+- HF exports pin every strict fp32 parameter to F32 through one generic rule in
+  the checkpointer (previously only some adapters did), and `force_hf` loads of
+  HF-native Qwen3-Next / Qwen3.5 classes no longer force `A_log` / `dt_bias` to
+  fp32 under a bf16 request (plain Transformers behaviour; the Automodel classes
+  declare the strict contract themselves).
 - Keeping fp32 parameters in fp32 under FSDP2 mixed precision requires PyTorch >= 2.15.
 
 ### Native FlashAttention-4

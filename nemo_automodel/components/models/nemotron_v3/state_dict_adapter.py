@@ -26,22 +26,6 @@ from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateD
 
 logger = logging.getLogger(__name__)
 
-_MAMBA_FP32_PARAM_NAMES = ("A_log", "dt_bias", "D")
-
-
-def _is_mamba_fp32_state_key(key: str) -> bool:
-    """Return whether ``key`` names a Mamba SSM parameter that is stored in fp32."""
-    if ".mixer." not in key:
-        return False
-    _, tail = key.rsplit(".mixer.", 1)
-    return tail in _MAMBA_FP32_PARAM_NAMES
-
-
-def _upcast_mamba_fp32_state_tensor(key: str, value: Any) -> Any:
-    if _is_mamba_fp32_state_key(key) and isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
-        return value.to(torch.float32)
-    return value
-
 
 class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """State dict adapter for NemotronV3 models.
@@ -254,7 +238,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         for key in list(backbone_state_dict.keys()):
             value = backbone_state_dict.pop(key)
             new_key = self._hf_key_to_native(key)
-            renamed_state_dict[new_key] = _upcast_mamba_fp32_state_tensor(new_key, value)
+            renamed_state_dict[new_key] = value
 
         # Then merge experts using the mixin method. Dense Nemotron-H variants have no
         # experts (moe_config is None) and no '.mixer.experts.' keys, so the merge is a
@@ -270,7 +254,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             stripped: dict[str, Any] = {}
             for key, value in mtp_state_dict.items():
                 stripped_key = key[len("mtp.") :] if key.startswith("mtp.") else key
-                stripped[stripped_key] = _upcast_mamba_fp32_state_tensor(stripped_key, value)
+                stripped[stripped_key] = value
             # reset_view_loaded_keys=False: this is the second merge of a single from_hf (after the
             # backbone merge above), so accumulate MTP view-loaded keys onto the backbone's record.
             prior_view_keys = set(self.view_loaded_native_keys)
@@ -319,7 +303,6 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                 )
             )
             result = expert_split if expert_split is not None else [(fqn, tensor)]
-            result = [(key, _upcast_mamba_fp32_state_tensor(key, value)) for key, value in result]
             if exclude_key_regex:
                 result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
             return result
@@ -338,19 +321,9 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             result = [(self._native_key_to_hf(key, v4_compatible=v4_compatible), value) for key, value in expert_result]
         else:
             new_fqn = self._native_key_to_hf(fqn, v4_compatible=v4_compatible)
-            result = [(new_fqn, _upcast_mamba_fp32_state_tensor(new_fqn, tensor))]
+            result = [(new_fqn, tensor)]
 
         if exclude_key_regex:
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
 
         return result
-
-    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
-        """Return HF export dtype overrides for tensors that are intrinsically fp32."""
-        forced: dict[str, str] = {}
-        for fqn, value in state_dict.items():
-            if not isinstance(value, torch.Tensor) or not value.dtype.is_floating_point:
-                continue
-            if _is_mamba_fp32_state_key(fqn) or "e_score_correction_bias" in fqn:
-                forced[fqn] = "F32"
-        return forced

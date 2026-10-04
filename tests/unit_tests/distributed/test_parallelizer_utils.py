@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -20,7 +19,8 @@ import pytest
 import torch
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
-from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
+from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 
 import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
 from nemo_automodel.components.distributed.fsdp_patches import (
@@ -29,11 +29,22 @@ from nemo_automodel.components.distributed.fsdp_patches import (
 )
 from nemo_automodel.components.distributed.parallelizer_utils import (
     configure_fsdp_unused_param_reduction,
-    fully_shard_by_dtype,
+    fsdp_unit_named_parameters,
     get_internal_fsdp_mp_policy,
     reject_unsupported_mtp_cp,
     reject_unsupported_mtp_cp_pp,
     with_fp32_compute_override,
+)
+
+# The two fsdp_patches version boundaries: PyTorch >= 2.15 promotes mixed gradient
+# dtypes inside FSDP2 and reduces unused parameters through its public API.
+_UPSTREAM_PROMOTES_GRAD_DTYPES = hasattr(FSDPParamGroup, "_get_reduce_dtype")
+_UPSTREAM_REDUCES_UNUSED_PARAMS = hasattr(FSDPModule, "set_reduce_scatter_unused_params")
+legacy_reduce_dtype = pytest.mark.skipif(
+    _UPSTREAM_PROMOTES_GRAD_DTYPES, reason="PyTorch >= 2.15 promotes mixed FSDP2 gradient dtypes itself"
+)
+legacy_unused_params = pytest.mark.skipif(
+    _UPSTREAM_REDUCES_UNUSED_PARAMS, reason="PyTorch >= 2.15 has FSDPModule.set_reduce_scatter_unused_params"
 )
 
 
@@ -101,9 +112,9 @@ def test_configure_fsdp_unused_param_reduction_uses_legacy_fallback(monkeypatch)
     install_fallback.assert_called_once_with()
 
 
+@legacy_unused_params
 def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch):
     from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
-    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 
     calls = []
 
@@ -136,6 +147,13 @@ def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch
     assert FSDPParamGroup.post_backward is patched_post_backward
 
 
+@pytest.mark.skipif(not _UPSTREAM_REDUCES_UNUSED_PARAMS, reason="legacy PyTorch needs the zero-fill backport")
+def test_unused_param_reduction_patch_is_noop_with_public_api():
+    original = FSDPParamGroup.post_backward
+    patch_fsdp_unused_param_reduction()
+    assert FSDPParamGroup.post_backward is original
+
+
 def _install_uniform_reduce_dtype(monkeypatch, recorder):
     """Install the patch over a stub foreach_reduce that records what it receives."""
     import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
@@ -151,6 +169,7 @@ def _install_uniform_reduce_dtype(monkeypatch, recorder):
     return collectives
 
 
+@legacy_reduce_dtype
 def test_uniform_reduce_dtype_widens_mixed_group(monkeypatch):
     """A bf16 straggler is widened to match its fp32 peers before the reduce."""
     seen = []
@@ -165,41 +184,13 @@ def test_uniform_reduce_dtype_widens_mixed_group(monkeypatch):
     assert [g.dtype for g in grads] == [torch.float32, torch.float32]
     assert torch.equal(grads[1], torch.full((2,), 5.0))
 
-
-def test_uniform_reduce_dtype_localizes_residual_dtensor(monkeypatch):
-    """The old public unused-param zero is localized before ``chunk_cat``."""
-    import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
-    import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
-    import torch.distributed.tensor as tensor_module
-
-    class FakeDTensor(torch.Tensor):
-        @staticmethod
-        def __new__(cls, tensor):
-            return torch.Tensor._make_subclass(cls, tensor, False)
-
-        def to_local(self):
-            # Model an EP-local tensor with half of the global expert storage.
-            return self.as_subclass(torch.Tensor)[:2]
-
-    seen = []
-
-    def stub(fsdp_params, unsharded_grads, *args, **kwargs):
-        seen.append([(type(grad), grad.numel()) for grad in unsharded_grads])
-        return "reduced"
-
-    monkeypatch.setattr(tensor_module, "DTensor", FakeDTensor)
-    monkeypatch.setattr(collectives, "foreach_reduce", stub)
-    monkeypatch.setattr(param_group, "foreach_reduce", stub)
-    patch_fsdp_uniform_reduce_dtype()
-
-    grads = [torch.ones(2), FakeDTensor(torch.ones(4))]
-    result = collectives.foreach_reduce(["used", "unused"], grads)
-
-    assert result == "reduced"
-    assert seen == [[(torch.Tensor, 2), (torch.Tensor, 2)]]
-    assert all(type(grad) is torch.Tensor for grad in grads)
+    # Two 16-bit floats promote to fp32, never to one of them.
+    half_grads = [torch.ones(2, dtype=torch.float16), torch.ones(2, dtype=torch.bfloat16)]
+    collectives.foreach_reduce(["p0", "p1"], half_grads)
+    assert seen[-1] == [torch.float32, torch.float32]
 
 
+@legacy_reduce_dtype
 def test_uniform_reduce_dtype_leaves_uniform_group_untouched(monkeypatch):
     """Uniform groups pass straight through, preserving upstream's own checks."""
     seen = []
@@ -213,6 +204,7 @@ def test_uniform_reduce_dtype_leaves_uniform_group_untouched(monkeypatch):
     assert all(a is b for a, b in zip(grads, original))
 
 
+@legacy_reduce_dtype
 def test_uniform_reduce_dtype_ignores_non_float_mixtures(monkeypatch):
     """Non-float gradients are left alone so the upstream assertion still fires."""
     seen = []
@@ -224,6 +216,7 @@ def test_uniform_reduce_dtype_ignores_non_float_mixtures(monkeypatch):
     assert seen == [[torch.float32, torch.int32]]
 
 
+@legacy_reduce_dtype
 def test_uniform_reduce_dtype_patch_is_idempotent(monkeypatch):
     """Re-installing must not stack a second wrapper."""
     seen = []
@@ -233,6 +226,15 @@ def test_uniform_reduce_dtype_patch_is_idempotent(monkeypatch):
     patch_fsdp_uniform_reduce_dtype()
 
     assert collectives.foreach_reduce is wrapped
+
+
+@pytest.mark.skipif(not _UPSTREAM_PROMOTES_GRAD_DTYPES, reason="legacy PyTorch needs the widening patch")
+def test_uniform_reduce_dtype_patch_is_noop_when_upstream_promotes():
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
+
+    original = collectives.foreach_reduce
+    patch_fsdp_uniform_reduce_dtype()
+    assert collectives.foreach_reduce is original
 
 
 def test_configure_fsdp_unused_param_reduction_installs_dtype_alignment_first(monkeypatch):
@@ -255,11 +257,7 @@ def test_configure_fsdp_unused_param_reduction_installs_dtype_alignment_first(mo
 # fp32 compute inside a single FSDP unit
 # --------------------------------------------------------------------------- #
 
-_HAS_OVERRIDE_FIELD = "param_dtype_override_fn" in {field.name for field in fields(MixedPrecisionPolicy)}
-requires_param_dtype_override = pytest.mark.skipif(
-    not _HAS_OVERRIDE_FIELD,
-    reason="MixedPrecisionPolicy.param_dtype_override_fn requires PyTorch >= 2.15",
-)
+requires_param_dtype_override = pytest.mark.requires_param_dtype_override
 
 FP32_TOKENS = ("linear_attn.A_log", "linear_attn.dt_bias")
 
@@ -271,17 +269,6 @@ def _make_mp_policy(param_dtype: torch.dtype | None = torch.bfloat16) -> MixedPr
         output_dtype=torch.float32,
         cast_forward_inputs=False,
     )
-
-
-def _record_fully_shard(monkeypatch) -> list[tuple[nn.Module, dict]]:
-    """Replace ``parallelizer_utils.fully_shard`` with a recorder of ``(module, kwargs)``."""
-    calls: list[tuple[nn.Module, dict]] = []
-
-    def fake_fully_shard(module, **kwargs):
-        calls.append((module, kwargs))
-
-    monkeypatch.setattr(parallelizer_utils, "fully_shard", fake_fully_shard, raising=True)
-    return calls
 
 
 def _override_of(policy: MixedPrecisionPolicy):
@@ -328,42 +315,30 @@ def test_internal_fsdp_mp_policy_drops_only_output_dtype():
     assert get_internal_fsdp_mp_policy(None) is None
 
 
-def test_fully_shard_by_dtype_no_params(monkeypatch):
-    """A parameterless module is still sharded exactly once with the caller's policy."""
-    calls = _record_fully_shard(monkeypatch)
-    mp_policy = _make_mp_policy()
+def test_fsdp_unit_named_parameters_skips_sharded_descendants_and_dedupes_ties(monkeypatch):
+    class Sharded(nn.Linear):
+        pass
 
-    model = nn.Identity()
-    fully_shard_by_dtype(model, mesh=object(), mp_policy=mp_policy, offload_policy=None)
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", Sharded)
+    model = nn.Module()
+    model.embed = nn.Embedding(4, 4)
+    model.layer = Sharded(4, 4, bias=False)
+    model.head = nn.Linear(4, 4, bias=False)
+    model.head.weight = model.embed.weight
 
-    assert [module for module, _ in calls] == [model]
-    assert calls[0][1]["mp_policy"] is mp_policy
+    names = [name for name, _ in fsdp_unit_named_parameters(model)]
+
+    assert names == ["embed.weight"]
 
 
 @requires_param_dtype_override
-def test_fully_shard_by_dtype_fp32_masters_pinned_params_one_unit(monkeypatch):
-    """fp32 master weights + pinned params: one unit, fp32 override only for the pins."""
-    calls = _record_fully_shard(monkeypatch)
+def test_override_fp32_masters_pins_only_contract_params():
+    """fp32 master weights + pinned params: the override selects only the pins."""
     block = HybridBlock(torch.float32)
     mp_policy = _make_mp_policy()
-    mesh, offload = object(), object()
 
-    fully_shard_by_dtype(
-        block,
-        mesh=mesh,
-        mp_policy=mp_policy,
-        offload_policy=offload,
-        fp32_compute_module_names=FP32_TOKENS,
-        reshard_after_forward=True,
-    )
+    policy = with_fp32_compute_override(block, mp_policy, FP32_TOKENS)
 
-    assert [module for module, _ in calls] == [block]
-    kwargs = calls[0][1]
-    assert kwargs["mesh"] is mesh
-    assert kwargs["offload_policy"] is offload
-    assert kwargs["reshard_after_forward"] is True
-    assert "ignored_params" not in kwargs
-    policy = kwargs["mp_policy"]
     assert policy is not mp_policy
     _assert_policy_fields_preserved(policy, mp_policy)
     override = _override_of(policy)
@@ -374,92 +349,39 @@ def test_fully_shard_by_dtype_fp32_masters_pinned_params_one_unit(monkeypatch):
     assert override(block.mlp.weight) is None
 
 
-@requires_param_dtype_override
-def test_fully_shard_by_dtype_hf_recorded_fp32_param_without_pin(monkeypatch):
-    """A checkpoint-recorded fp32 dtype keeps the parameter fp32 with no strict pin."""
-    calls = _record_fully_shard(monkeypatch)
-    block = HybridBlock(torch.float32)
-    block.linear_attn.A_log._hf_compute_dtype = torch.float32
-    block.linear_attn.dt_bias._hf_compute_dtype = torch.float32
-    block.mlp.weight._hf_compute_dtype = torch.bfloat16
-
-    fully_shard_by_dtype(block, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=None)
-
-    override = _override_of(calls[0][1]["mp_policy"])
-    assert override(block.linear_attn.A_log) == torch.float32
-    assert override(block.linear_attn.dt_bias) == torch.float32
-    assert override(block.mlp.weight) is None
-    assert override(block.linear_attn.in_proj.weight) is None
-
-
-@requires_param_dtype_override
-def test_fully_shard_by_dtype_pin_beats_bf16_hf_record(monkeypatch):
-    calls = _record_fully_shard(monkeypatch)
-    block = HybridBlock(torch.float32)
-    block.linear_attn.A_log._hf_compute_dtype = torch.bfloat16
-
-    fully_shard_by_dtype(
-        block,
-        mesh=object(),
-        mp_policy=_make_mp_policy(),
-        offload_policy=None,
-        fp32_compute_module_names=FP32_TOKENS,
-    )
-
-    override = _override_of(calls[0][1]["mp_policy"])
-    assert override(block.linear_attn.A_log) == torch.float32
-    assert override(block.linear_attn.in_proj.weight) is None
-
-
-def test_fully_shard_by_dtype_nothing_pinned_passes_policy_through(monkeypatch):
-    """Without fp32-contract parameters the caller's policy object is forwarded as is."""
-    calls = _record_fully_shard(monkeypatch)
+def test_override_nothing_pinned_passes_policy_through():
+    """Without fp32-contract parameters the caller's policy object is returned as is."""
     block = HybridBlock(torch.float32)
     mp_policy = _make_mp_policy()
 
-    fully_shard_by_dtype(block, mesh=object(), mp_policy=mp_policy, offload_policy=None)
-
-    assert [module for module, _ in calls] == [block]
-    assert calls[0][1]["mp_policy"] is mp_policy
+    assert with_fp32_compute_override(block, mp_policy, ()) is mp_policy
+    assert with_fp32_compute_override(nn.Identity(), mp_policy, FP32_TOKENS) is mp_policy
 
 
 @pytest.mark.parametrize("mp_policy", [None, _make_mp_policy(torch.float32), _make_mp_policy(None)])
-def test_fully_shard_by_dtype_fp32_or_absent_policy_passes_through(monkeypatch, mp_policy):
+def test_override_fp32_or_absent_policy_passes_through(mp_policy):
     """``None``, fp32 and dtype-less policies never need an override, even with pins."""
-    calls = _record_fully_shard(monkeypatch)
-    block = HybridBlock(torch.float32)
-
-    fully_shard_by_dtype(
-        block,
-        mesh=object(),
-        mp_policy=mp_policy,
-        offload_policy=None,
-        fp32_compute_module_names=FP32_TOKENS,
-    )
-
-    assert [module for module, _ in calls] == [block]
-    assert calls[0][1]["mp_policy"] is mp_policy
+    assert with_fp32_compute_override(HybridBlock(torch.float32), mp_policy, FP32_TOKENS) is mp_policy
 
 
-def test_fully_shard_by_dtype_rejects_bf16_storage_for_pinned_param(monkeypatch):
+def test_override_rejects_bf16_storage_for_pinned_param():
     """A pinned parameter stored below fp32 cannot compute in fp32; the error names the fix."""
-    calls = _record_fully_shard(monkeypatch)
     block = HybridBlock(torch.bfloat16).to(torch.bfloat16)
 
     with pytest.raises(ValueError, match=r"linear_attn\.A_log must compute in fp32.*model\.dtype"):
-        fully_shard_by_dtype(
-            block,
-            mesh=object(),
-            mp_policy=_make_mp_policy(),
-            offload_policy=None,
-            fp32_compute_module_names=FP32_TOKENS,
-        )
-    assert calls == []
+        with_fp32_compute_override(block, _make_mp_policy(), FP32_TOKENS)
+
+
+def test_override_rejects_mixed_trainable_storage_dtypes():
+    block = HybridBlock(torch.bfloat16)
+
+    with pytest.raises(ValueError, match="one storage dtype per unit.*model.dtype"):
+        with_fp32_compute_override(block, _make_mp_policy(), FP32_TOKENS)
 
 
 @requires_param_dtype_override
-def test_fully_shard_by_dtype_excludes_ep_params(monkeypatch):
-    """EP experts stay outside the fp32 contract and only the block's own ignored params are forwarded."""
+def test_override_excludes_ignored_params():
+    """EP experts handed over as ``ignored_params`` stay outside the contract and the dtype check."""
 
     class Router(nn.Module):
         def __init__(self):
@@ -474,75 +396,52 @@ def test_fully_shard_by_dtype_excludes_ep_params(monkeypatch):
             # Experts are owned by the EP unit, stored bf16: pinning them would be a ValueError.
             self.experts = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
 
-    calls = _record_fully_shard(monkeypatch)
     block = MoEBlock()
-    expert_params = set(block.experts.parameters())
-    foreign_param = nn.Parameter(torch.zeros(2, dtype=torch.bfloat16))
 
-    fully_shard_by_dtype(
-        block,
-        mesh=object(),
-        mp_policy=_make_mp_policy(),
-        offload_policy=None,
-        fp32_compute_module_names=(*FP32_TOKENS, "gate.weight", "experts"),
-        reshard_after_forward=False,
-        ignored_params=expert_params | {foreign_param},
+    override = _override_of(
+        with_fp32_compute_override(
+            block, _make_mp_policy(), (*FP32_TOKENS, "gate.weight", "experts"), set(block.experts.parameters())
+        )
     )
 
-    assert [module for module, _ in calls] == [block]
-    kwargs = calls[0][1]
-    assert kwargs["ignored_params"] == expert_params
-    assert kwargs["reshard_after_forward"] is False
-    override = _override_of(kwargs["mp_policy"])
     assert override(block.gate.weight) == torch.float32
     assert override(block.linear_attn.A_log) == torch.float32
     assert override(block.experts.weight) is None
     assert override(block.linear_attn.in_proj.weight) is None
 
 
-def test_fully_shard_by_dtype_omits_foreign_only_ignored_params(monkeypatch):
-    calls = _record_fully_shard(monkeypatch)
-    block = HybridBlock(torch.float32)
-    foreign_param = nn.Parameter(torch.zeros(2))
+@requires_param_dtype_override
+def test_override_skips_params_of_sharded_descendants(monkeypatch):
+    """The root unit resolves only its own leftovers, not its already-sharded layers."""
 
-    fully_shard_by_dtype(
-        block,
-        mesh=object(),
-        mp_policy=_make_mp_policy(),
-        offload_policy=None,
-        ignored_params={foreign_param},
-    )
+    class Sharded(HybridBlock):
+        pass
 
-    assert "ignored_params" not in calls[0][1]
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", Sharded)
+    model = nn.Module()
+    model.layer = Sharded(torch.bfloat16)  # mixed storage inside: FSDP already owns it
+    model.norm = nn.Linear(4, 4, bias=False)
 
-
-def test_fully_shard_by_dtype_does_not_expand_modulelist(monkeypatch):
-    """Callers shard one block at a time; a ModuleList is sharded as the single unit it is."""
-    calls = _record_fully_shard(monkeypatch)
-    layers = nn.ModuleList([HybridBlock(torch.float32), HybridBlock(torch.float32)])
     mp_policy = _make_mp_policy()
-
-    fully_shard_by_dtype(layers, mesh=object(), mp_policy=mp_policy, offload_policy=None)
-
-    assert [module for module, _ in calls] == [layers]
-    assert calls[0][1]["mp_policy"] is mp_policy
-
-
-def test_fully_shard_by_dtype_omits_none_reshard_kwarg(monkeypatch):
-    calls = _record_fully_shard(monkeypatch)
-    block = HybridBlock(torch.float32)
-
-    fully_shard_by_dtype(block, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=None)
-    fully_shard_by_dtype(
-        block, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=None, reshard_after_forward=4
-    )
-
-    assert "reshard_after_forward" not in calls[0][1]
-    assert calls[1][1]["reshard_after_forward"] == 4
+    assert with_fp32_compute_override(model, mp_policy, FP32_TOKENS) is mp_policy
 
 
 @requires_param_dtype_override
-def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
+def test_override_matches_model_level_tokens_through_module_name():
+    model = nn.Module()
+    model.lm_head = nn.Linear(4, 4, bias=False)
+    model.layer = nn.Linear(4, 4, bias=False)
+
+    override = _override_of(
+        with_fp32_compute_override(model.lm_head, _make_mp_policy(), ("lm_head",), module_name="lm_head")
+    )
+
+    assert override(model.lm_head.weight) == torch.float32
+    assert with_fp32_compute_override(model.lm_head, _make_mp_policy(), ("lm_head",)) is not None
+
+
+@requires_param_dtype_override
+def test_override_pins_logical_names_through_activation_checkpointing():
     """Checkpoint wrappers preserve strict fp32 parameter matching on canonical names."""
     attention = nn.Module()
     attention.sinks_param = nn.Linear(4, 4, bias=False)
@@ -550,52 +449,20 @@ def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
     model = nn.Module()
     model.attn = checkpoint_wrapper(attention)
 
-    policy = with_fp32_compute_override(model, _make_mp_policy(), ("attn.sinks_param",))
+    override = _override_of(with_fp32_compute_override(model, _make_mp_policy(), ("attn.sinks_param",)))
 
-    override = _override_of(policy)
     assert override(attention.sinks_param.weight) == torch.float32
     assert override(attention.proj.weight) is None
 
 
-def test_fully_shard_by_dtype_uses_model_parallelizer_primitive(monkeypatch):
-    calls = _record_fully_shard(monkeypatch)
-    block = HybridBlock(torch.float32)
-    mp_policy = _make_mp_policy()
-    model_parallelizer = Mock()
-    model_parallelizer._fully_shard_module = Mock()
-    mesh = object()
-
-    fully_shard_by_dtype(
-        block,
-        mesh=mesh,
-        mp_policy=mp_policy,
-        offload_policy=None,
-        reshard_after_forward=False,
-        model_parallelizer=model_parallelizer,
-    )
-
-    assert calls == []
-    model_parallelizer._fully_shard_module.assert_called_once_with(
-        block, mesh=mesh, mp_policy=mp_policy, offload_policy=None, reshard_after_forward=False
-    )
-
-
-def test_fully_shard_by_dtype_requires_override_api_for_pins(monkeypatch):
+def test_override_requires_override_api_for_pins(monkeypatch):
     """Older PyTorch cannot keep pinned fp32 params in fp32 under a bf16 policy."""
-    calls = _record_fully_shard(monkeypatch)
     monkeypatch.setattr(parallelizer_utils, "_HAS_PARAM_DTYPE_OVERRIDE", False)
     block = HybridBlock(torch.float32)
 
     with pytest.raises(RuntimeError, match="param_dtype_override_fn"):
-        fully_shard_by_dtype(
-            block,
-            mesh=object(),
-            mp_policy=_make_mp_policy(),
-            offload_policy=None,
-            fp32_compute_module_names=FP32_TOKENS,
-        )
-    assert calls == []
+        with_fp32_compute_override(block, _make_mp_policy(), FP32_TOKENS)
 
     # Without pins the old API suffices: the policy passes through.
-    fully_shard_by_dtype(block, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=None)
-    assert len(calls) == 1
+    mp_policy = _make_mp_policy()
+    assert with_fp32_compute_override(block, mp_policy, ()) is mp_policy

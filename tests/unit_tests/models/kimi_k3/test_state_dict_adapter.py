@@ -150,7 +150,7 @@ def test_peft_target_modules_get_hf_renames():
         assert adapter.map_peft_target_module_to_hf(name) == name
 
 
-def test_kda_fp32_keys_keep_hf_names_and_upcast_to_fp32():
+def test_kda_fp32_keys_keep_hf_names_and_checkpoint_dtypes():
     adapter = _tiny_adapter()
     adapter.config = SimpleNamespace(linear_attn_config={"num_heads": 4})
     kda = "model.layers.9.self_attn"
@@ -166,8 +166,7 @@ def test_kda_fp32_keys_keep_hf_names_and_upcast_to_fp32():
     native = adapter.from_hf(hf_state)
 
     assert set(native) == {key.removeprefix("language_model.") for key in hf_state}
-    assert all("_fp32_params" not in key for key in native)
-    assert all(value.dtype is torch.float32 for value in native.values())
+    assert all(value.dtype is torch.bfloat16 for value in native.values())
     assert native[f"{kda}.A_log"].shape == (4,)
 
     round_trip = adapter.to_hf(native)

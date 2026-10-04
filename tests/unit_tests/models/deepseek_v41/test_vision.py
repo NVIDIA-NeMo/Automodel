@@ -26,7 +26,6 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import AutoProcessor, PreTrainedTokenizerFast
 
 from nemo_automodel._transformers.registry import resolve_custom_config_cls
-from nemo_automodel.components.distributed.parallelizer_utils import _HAS_PARAM_DTYPE_OVERRIDE
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import (
     DeepseekV41Config,
@@ -450,64 +449,3 @@ def test_image_masks_reach_engram_and_modality_routing() -> None:
     routes = observed["routes"].sort(-1).values
     torch.testing.assert_close(routes[text_mask.flatten()], torch.tensor([0, 1]).expand(int(text_mask.sum()), 2))
     torch.testing.assert_close(routes[~text_mask.flatten()], torch.tensor([2, 3]).expand(int((~text_mask).sum()), 2))
-
-
-@pytest.mark.skipif(not _HAS_PARAM_DTYPE_OVERRIDE, reason="fp32 compute inside a bf16 FSDP unit needs torch >= 2.15")
-@pytest.mark.parametrize("vision_block", [False, True])
-def test_shared_vision_fsdp_keeps_all_norms_fp32(monkeypatch: pytest.MonkeyPatch, vision_block: bool) -> None:
-    from nemo_automodel.components.models.deepseek_v4 import fsdp as v4_fsdp
-    from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
-    from nemo_automodel.components.models.deepseek_v4.parallelization import DeepseekV4ModelParallelizer
-    from nemo_automodel.components.models.deepseek_v4.vision import DeepseekV4VisionRMSNorm
-
-    # fp32 master weights: FSDP2 keeps one storage dtype per unit.
-    config = _config()
-    tower = DeepseekV41VisionTransformer(config)
-    module = tower.blocks[0] if vision_block else tower
-    norms = [child for child in module.modules() if isinstance(child, DeepseekV4VisionRMSNorm)]
-    calls = []
-    monkeypatch.setattr(v4_fsdp, "fully_shard", lambda child, **kwargs: calls.append((child, kwargs)) or child)
-    policy = torch.distributed.fsdp.MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16
-    )
-
-    assert isinstance(DeepseekV4ForCausalLM.parallelizer, DeepseekV4ModelParallelizer)
-    assert isinstance(DeepseekV41ForCausalLM.parallelizer, DeepseekV4ModelParallelizer)
-    assert DeepseekV41ForCausalLM.parallelizer.fp32_compute_module_names == tuple(
-        DeepseekV41ForCausalLM._keep_in_fp32_modules_strict
-    )
-    v4_fsdp.fully_shard_deepseek_v4(
-        module,
-        fp32_compute_module_names=DeepseekV41ForCausalLM.parallelizer.fp32_compute_module_names,
-        module_name="model.vision.blocks.0" if vision_block else "model.vision",
-        mesh=object(),
-        mp_policy=policy,
-        reshard_after_forward=True,
-    )
-
-    assert [child for child, _ in calls] == [module]
-    unit_policy = calls[0][1]["mp_policy"]
-    assert unit_policy.param_dtype == torch.bfloat16
-    assert unit_policy.output_dtype == torch.bfloat16
-    assert all(unit_policy.param_dtype_override_fn(norm.weight) == torch.float32 for norm in norms)
-    norm_param_ids = {id(norm.weight) for norm in norms}
-    assert all(
-        unit_policy.param_dtype_override_fn(param) is None
-        for param in module.parameters()
-        if id(param) not in norm_param_ids
-    )
-    assert calls[0][1]["reshard_after_forward"] is True
-
-
-def test_v41_nonvision_fsdp_preserves_requested_compute_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
-    from nemo_automodel.components.models.deepseek_v4 import fsdp as v4_fsdp
-
-    # FP32 master weights outside the fp32 contract must still honor BF16 mixed precision.
-    module = torch.nn.Linear(8, 8, dtype=torch.float32)
-    policy = torch.distributed.fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16)
-    calls = []
-    monkeypatch.setattr(v4_fsdp, "fully_shard", lambda child, **kwargs: calls.append((child, kwargs)) or child)
-    DeepseekV41ForCausalLM.parallelizer._fully_shard_module(module, mesh=object(), mp_policy=policy)
-    assert len(calls) == 1
-    assert calls[0][0] is module
-    assert calls[0][1]["mp_policy"] is policy

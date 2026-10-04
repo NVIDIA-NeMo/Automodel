@@ -62,7 +62,7 @@ from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_v
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallelizer_utils import with_fp32_compute_override
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -1146,18 +1146,22 @@ class TrainDSparkRecipe(BaseRecipe):
                 draft_mesh = self.dp_mesh
                 if draft_mesh is None:
                     draft_mesh = init_device_mesh(self.device.type, (self.dist_env.world_size,), mesh_dim_names=("dp",))
+                # Each draft block is one FSDP unit; its strict fp32 parameters keep fp32
+                # compute, and the root unit does the same for the confidence head.
                 fp32_compute_module_names = tuple(
                     getattr(trainer_module.draft_model, "_keep_in_fp32_modules_strict", ())
                 )
                 for layer in trainer_module.draft_model.layers:
-                    fully_shard_by_dtype(
+                    fully_shard(
                         layer,
                         mesh=draft_mesh,
-                        mp_policy=mp_policy,
-                        offload_policy=None,
-                        fp32_compute_module_names=fp32_compute_module_names,
+                        mp_policy=with_fp32_compute_override(layer, mp_policy, fp32_compute_module_names),
                     )
-                fully_shard(trainer_module, mesh=draft_mesh, mp_policy=mp_policy)
+                fully_shard(
+                    trainer_module,
+                    mesh=draft_mesh,
+                    mp_policy=with_fp32_compute_override(trainer_module, mp_policy, fp32_compute_module_names),
+                )
             elif strategy == "ddp":
                 trainer_module = DistributedDataParallel(
                     trainer_module,

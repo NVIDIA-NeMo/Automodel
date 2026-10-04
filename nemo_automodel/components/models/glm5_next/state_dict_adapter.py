@@ -35,7 +35,6 @@ _FP8_WEIGHT = re.compile(
 _SPARSE_O_WEIGHT = re.compile(r"^model\.language_model\.layers\.(\d+)\.self_attn\.o_proj\.weight$")
 _HC_KEY = re.compile(r"^(model\.language_model\.layers\.\d+)\.hc_(attn|ffn)_(fn|base|scale)$")
 _NATIVE_HC_KEY = re.compile(r"^(model\.language_model\.layers\.\d+)\.(attn_hc|ffn_hc)\.(fn|base|scale)$")
-_FP32_PARAMETER_SUFFIXES = (".A_log", ".dt_bias", ".e_score_correction_bias")
 
 
 def _scale_shape(weight: torch.Tensor) -> tuple[int, int]:
@@ -229,10 +228,7 @@ class Glm5NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         self._dequantize(hf_state_dict)
         for key in list(hf_state_dict):
             value = hf_state_dict.pop(key)
-            native_key = _hf_to_native_key(key)
-            if native_key.endswith(_FP32_PARAMETER_SUFFIXES):
-                value = value.float()
-            hf_state_dict[native_key] = value
+            hf_state_dict[_hf_to_native_key(key)] = value
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
 
     def to_hf(

@@ -20,10 +20,6 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
-    forced_gated_delta_net_fp32_dtype_mapping,
-    upcast_gated_delta_net_fp32_state_tensor,
-)
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
@@ -123,11 +119,6 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
         # First apply key mappings for shared experts (shared_expert -> shared_experts)
         hf_state_dict = self._apply_key_mapping(hf_state_dict, self.hf_to_internal_map)
-        # A_log / dt_bias are fp32 in the model; upcast them when the checkpoint stored
-        # them in a lower precision. Their keys already equal the HF keys.
-        hf_state_dict = {
-            key: upcast_gated_delta_net_fp32_state_tensor(key, value) for key, value in hf_state_dict.items()
-        }
 
         # Then convert routed experts from split to grouped format
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
@@ -158,7 +149,6 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 if pattern in key:
                     new_key = new_key.replace(pattern, replacement)
                     break
-            value = upcast_gated_delta_net_fp32_state_tensor(new_key, value)
             mapped_result.append((new_key, value))
 
         if exclude_key_regex:
@@ -167,7 +157,3 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
             mapped_result = [(k, v) for k, v in mapped_result if not re.match(exclude_key_regex, k)]
 
         return mapped_result
-
-    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
-        """Return HF export dtype overrides for intrinsically-fp32 GDN tensors."""
-        return forced_gated_delta_net_fp32_dtype_mapping(state_dict)
