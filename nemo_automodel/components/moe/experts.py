@@ -1495,7 +1495,10 @@ class GroupedExpertsDeepEP(nn.Module):
                 * permuted_local_hidden_states.element_size()
             )
 
-            if not self.use_mxfp8 and gate_up_output_bytes > _EXPERT_MLP_CHUNK_BYTES:
+            # Retain bounded MLP recomputation for biased experts. Bias-free
+            # dispatches use whole grouped GEMMs: small row chunks introduce
+            # expensive gradient copies and redundant activation recomputation.
+            if self.expert_bias and not self.use_mxfp8 and gate_up_output_bytes > _EXPERT_MLP_CHUNK_BYTES:
                 output2 = _checkpointed_chunked_expert_mlp(
                     permuted_local_hidden_states,
                     gate_and_up_projs,
