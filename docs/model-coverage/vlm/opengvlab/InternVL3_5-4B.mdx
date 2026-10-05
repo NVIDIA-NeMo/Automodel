@@ -4,7 +4,7 @@ description: "Fine-tune OpenGVLab/InternVL3_5-4B with NeMo AutoModel: checked-in
 slug: model-coverage/vision-language-models/opengvlab/InternVL3_5-4B
 ---
 
-[InternVL](https://github.com/OpenGVLab/InternVL) is a vision language model from Shanghai AI Laboratory (OpenGVLab), combining a large vision encoder with an InternLM language backbone for strong multimodal performance.
+[InternVL3.5-4B](https://github.com/OpenGVLab/InternVL) is a vision-language model from Shanghai AI Laboratory (OpenGVLab) that combines a vision encoder with a Qwen3 language backbone for image-text-to-text tasks.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
@@ -24,14 +24,14 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/internvl/internvl_3_5_
 
 ## Model Context
 
-InternVL3_5-4B is used for image-text-to-text. Its model size is 4B parameters.
+InternVL3_5-4B is used for image-text-to-text. The [upstream model card](https://huggingface.co/OpenGVLab/InternVL3_5-4B/blob/481f6e32467eab4e922ccd7fd6cf420441a62331/README.md) reports approximately 4.7 billion total parameters.
 
 | Property | Value |
 | --- | --- |
 | Recipe Checkpoint | [OpenGVLab/InternVL3_5-4B-hf](https://huggingface.co/OpenGVLab/InternVL3_5-4B-hf) |
 | Task | Image-Text-to-Text |
 | **Architecture** | `InternVLForConditionalGeneration` |
-| Parameters | 4B |
+| Parameters | Approximately 4.7B total |
 | Hugging Face Organization | [OpenGVLab](https://huggingface.co/OpenGVLab) |
 | Decoder Layers | 36 |
 | Hidden Size | 2,560 |
@@ -51,6 +51,6 @@ The recipe loads `OpenGVLab/InternVL3_5-4B-hf`, the Hugging Face-compatible chec
 
 ## Related Resources
 
-- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+- [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
 
 - [Checkpoint Configuration](https://huggingface.co/OpenGVLab/InternVL3_5-4B/blob/481f6e32467eab4e922ccd7fd6cf420441a62331/config.json)

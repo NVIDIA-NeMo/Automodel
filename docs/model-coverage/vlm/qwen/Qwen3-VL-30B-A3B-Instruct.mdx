@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `Qwen3VLMoeForConditionalGeneration`
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation) and [recipe prerequisites](#recipe-prerequisites), then run the recipe from the repository root:
 
 ```bash
 automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml --nproc-per-node 8
@@ -20,7 +20,7 @@ automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml --nproc-pe
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
 | Vision-Language Fine-Tuning | MedPix-VQA; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml) |
-| Vision-Language Fine-Tuning | MedPix-VQA; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_neat_packing.yaml) |
+| Vision-Language Fine-Tuning With Sequence Packing | MedPix-VQA; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_neat_packing.yaml) |
 
 ## Model Context
 
@@ -38,15 +38,28 @@ Qwen3-VL-30B-A3B-Instruct is used for image-text-to-text. Its model size is 31.0
 | Vocabulary Size | 151,936 |
 | Experts | 128 routed / 8 selected per token |
 
+### Recipe Prerequisites
+
+For a source installation, add the `moe` extra for DeepEP and Transformer Engine. From the repository root, synchronize and activate the environment:
+
+```bash
+uv sync --locked --extra all --extra moe
+source .venv/bin/activate
+```
+
+For the sequence-packing recipe, also add `--extra fa` to the `uv sync` command for FlashAttention 2. The `all` extra does not include `moe` or `fa`.
+
 ### Configuration
+
+These settings describe the Quick Start recipe. EP8 means eight-way expert parallelism. The recipe loads pretrained weights, fine-tunes the language model with the vision tower frozen, and saves checkpoints to `/tmp/checkpoints/`.
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=8 |
-| Nodes | 1 |
-| Features | Checkpointing (enabled=true), Transformer Engine, DeepEP (dispatcher=deepep) |
-| Advanced | attention=sdpa, linear=te, experts=gmm, dispatcher=deepep |
+| Hardware | 8 GPUs in the launch example; GPU model not specified |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=8` |
+| Nodes | 1 (recipe CI configuration) |
+| Features | Checkpointing (`enabled=true`), Transformer Engine, DeepEP (`dispatcher=deepep`) |
+| Advanced | `attn=sdpa`, `linear=te`, `experts=torch_mm`, `dispatcher=deepep` |
 
 ### More Recipes for This Model
 
@@ -54,15 +67,12 @@ Qwen3-VL-30B-A3B-Instruct is used for image-text-to-text. Its model size is 31.0
 
 ## Available Models
 
-- [`Qwen/Qwen3-VL-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Qwen3-VL-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct) | Checkpoint documented on this page |
 | [`Qwen/Qwen3-VL-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct) | Checkpoint documented on this page |
 
 ## Related Resources
 
-- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+- [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
 
 - [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct/blob/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c/config.json)

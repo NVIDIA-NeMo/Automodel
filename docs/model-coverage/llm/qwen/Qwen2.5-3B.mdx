@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `Qwen2ForCausalLM` architecture.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation) and [recipe prerequisites](#model-context), then run full supervised fine-tuning on `llamafactory/glaive_toolcall_en` from the repository root. This example launches eight GPU processes:
 
 ```bash
 automodel examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml --nproc-per-node 8
@@ -19,8 +19,8 @@ automodel examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml --nproc-p
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | Glaive tool-calling data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml) |
-| LoRA Fine-Tuning | Glaive tool-calling data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml) |
+| Full Fine-Tuning | Glaive tool-calling data; eight-GPU example | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml) |
+| LoRA Fine-Tuning | Glaive tool-calling data; one-GPU example | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml) |
 
 ## Model Context
 
@@ -38,29 +38,23 @@ Qwen2.5-3B is used for text generation. Its model size is 3.09B checkpoint param
 | Vocabulary Size | 151,936 |
 | Configured Dtype | `bfloat16` |
 
+Both fine-tuning recipes use `FusedLinearCrossEntropy` and require `cut-cross-entropy`. For a source installation, follow the [installation guide](/get-started/installation) and run `uv sync --locked --all-groups --extra all` from the repository root. The `--all-groups` option includes the `dev` dependency group that supplies this package.
+
 ### Configuration
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; cp_size=1 |
-| Nodes | - |
-| Features | Function-calling SFT, fused linear cross-entropy |
-| Advanced | configured sequence length 4096; truncation is disabled by default |
-
-### More Recipes for This Model
-
-- [`qwen2_5_3b_function_calling.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml)
-- [`qwen2_5_3b_function_calling_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml)
+| Hardware | The recipe examples launch on eight GPUs for full fine-tuning and one GPU for LoRA. These counts describe example launches, not hardware minimums. |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); context parallelism disabled (`cp_size: 1`) |
+| Nodes | One node in the documented launch examples |
+| Features | Function-calling supervised fine-tuning (SFT), fused linear cross-entropy |
+| Advanced | `seq_length: 4096`; truncation is disabled by default, so this value does not cap dialogue length. |
 
 ## Available Models
 
-- [`Qwen/Qwen2.5-3B`](https://huggingface.co/Qwen/Qwen2.5-3B)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Qwen2.5-3B](https://huggingface.co/Qwen/Qwen2.5-3B) | Checkpoint documented on this page |
-| [`Qwen/Qwen2.5-3B`](https://huggingface.co/Qwen/Qwen2.5-3B) | Checkpoint documented on this page |
+| [`Qwen/Qwen2.5-3B`](https://huggingface.co/Qwen/Qwen2.5-3B) | Pretrained base model used by both fine-tuning recipes |
 
 ## Related Resources
 

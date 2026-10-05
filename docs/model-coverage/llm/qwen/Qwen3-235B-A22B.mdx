@@ -1,15 +1,15 @@
 ---
 title: "Qwen/Qwen3-235B-A22B"
-description: "Use NeMo AutoModel to fine-tune Qwen/Qwen3-235B-A22B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+description: "Benchmark Qwen/Qwen3-235B-A22B training with NeMo AutoModel using synthetic data, Transformer Engine, and HybridEP across multiple nodes."
 slug: model-coverage/large-language-models/qwen/Qwen3-235B-A22B
 ---
 
-[Qwen3-235B-A22B](https://huggingface.co/Qwen/Qwen3-235B-A22B) has a checked-in NeMo AutoModel recipe for text generation.
+[Qwen3-235B-A22B](https://huggingface.co/Qwen/Qwen3-235B-A22B) has checked-in NeMo AutoModel recipes for training benchmarks on synthetic data.
 The Hugging Face configuration declares the `Qwen3MoeForCausalLM` architecture.
 
 ## Quick Start
 
-Allocate 32 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+Run the synthetic-data training benchmark from the repository root on 32 nodes with 8 GPUs each. Complete the [prerequisites](#prerequisites) below, set `NODE_RANK` and `MASTER_ADDR` on every node, and run this command on each node:
 
 ```bash
 uv run torchrun --nnodes 32 --nproc-per-node 8 \
@@ -21,17 +21,17 @@ uv run torchrun --nnodes 32 --nproc-per-node 8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Training Benchmark | Synthetic data; 32 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml) |
-| Training Benchmark | Synthetic data; 8 nodes; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep_gb200.yaml) |
+| Training Benchmark | Synthetic data; 32 nodes; 8 GPUs each | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml) |
+| Training Benchmark | Synthetic data; 8 nodes; 4 GB200 GPUs each | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep_gb200.yaml) |
 
 ## Model Context
 
-Qwen3-235B-A22B is used for text generation. Its model size is 235.09B checkpoint parameters.
+Qwen3-235B-A22B is a mixture-of-experts language model for text generation with 235.09B checkpoint parameters. The recipes on this page benchmark training performance.
 
 | Property | Value |
 | --- | --- |
 | Task | Text generation |
-| **Architecture** | `Qwen3MoeForCausalLM` |
+| Architecture | `Qwen3MoeForCausalLM` |
 | Parameters | 235.09B checkpoint parameters |
 | Decoder Layers | 94 |
 | Hidden Size | 4,096 |
@@ -41,15 +41,25 @@ Qwen3-235B-A22B is used for text generation. Its model size is 235.09B checkpoin
 | Experts | 128 routed / 8 selected per token |
 | Configured Dtype | `bfloat16` |
 
+The benchmark recipes initialize random weights from the model configuration, use synthetic 4,096-token sequences and fake balanced expert routing, and disable checkpoint saving (`checkpoint.enabled: false`). They do not load pretrained model weights.
+
+### Prerequisites
+
+Use the same repository checkout and dependency environment on every node. Follow the [installation instructions](/get-started/installation) and ensure Transformer Engine, `wandb`, and a multi-node-enabled HybridEP build are installed. The repository's [container build](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile) includes HybridEP with `HYBRID_EP_MULTINODE=1`; the base and `all` package installs alone do not provide HybridEP.
+
+For the Quick Start topology, assign each node a unique `NODE_RANK` from 0 to 31. Set `MASTER_ADDR` to the rank-zero node's address on every node and make port 29500 reachable between nodes.
+
 ### Configuration
+
+These settings describe the Quick Start recipe. The node count is an example topology rather than a hardware minimum.
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=32 |
+| Hardware | 8 GPUs per node in the Quick Start |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size=1`, `pp_size=4`, `cp_size=1`, `ep_size=32` |
 | Nodes | 32 |
-| Features | Activation checkpointing (activation_checkpointing=true), Transformer Engine, DeepEP (dispatcher=deepep) |
-| Advanced | attention=te, linear=te, experts=gmm, dispatcher=deepep |
+| Features | Activation checkpointing (`activation_checkpointing=true`), Transformer Engine, HybridEP (`dispatcher=hybridep`) |
+| Advanced | `attn=te`, `linear=te`, `experts=torch_mm`, `dispatcher=hybridep` |
 
 ### More Recipes for This Model
 
@@ -58,15 +68,12 @@ Qwen3-235B-A22B is used for text generation. Its model size is 235.09B checkpoin
 
 ## Available Models
 
-- [`Qwen/Qwen3-235B-A22B`](https://huggingface.co/Qwen/Qwen3-235B-A22B)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Qwen3-235B-A22B](https://huggingface.co/Qwen/Qwen3-235B-A22B) | Checkpoint documented on this page |
-| [`Qwen/Qwen3-235B-A22B`](https://huggingface.co/Qwen/Qwen3-235B-A22B) | Checkpoint documented on this page |
+| [`Qwen/Qwen3-235B-A22B`](https://huggingface.co/Qwen/Qwen3-235B-A22B) | Configuration source for the training benchmarks |
 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
-
+- [Installation Instructions](/get-started/installation)
 - [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/8efa61729e24bd65b1d152b5ab5409052aa80e65/config.json)

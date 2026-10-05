@@ -10,7 +10,7 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-From the repository root, run:
+Complete the [prerequisites](#prerequisites) for model access, data, and paths. Then, from the repository root, launch full fine-tuning on eight GPUs:
 
 ```bash
 uv run torchrun --nproc-per-node=8 \
@@ -22,8 +22,8 @@ uv run torchrun --nproc-per-node=8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | Prepared image-text cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml) |
-| Pretraining | Prepared image-text cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/flux_t2i_flow.yaml) |
+| Full Fine-Tuning | Prepared image-text cache; 8 GPUs (`fsdp.dp_size: 8`) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml) |
+| Pretraining | Prepared image-text cache; 8 GPUs (`fsdp.dp_size: 8`) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/flux_t2i_flow.yaml) |
 
 ## Model Context
 
@@ -38,6 +38,14 @@ FLUX.1-dev is used for text-to-image. Its model size is 12B parameters.
 | Transformer Blocks | 19 dual-stream / 38 single-stream |
 | Hidden Size | 3,072 |
 | Attention | 24 attention heads |
+
+### Prerequisites
+
+Before launching:
+
+1. Accept the access conditions on the [Hugging Face model page](https://huggingface.co/black-forest-labs/FLUX.1-dev) and authenticate your environment with an account that has access.
+2. Prepare the image-text cache by following [Dataset Preparation](/datasets/diffusion-dataset).
+3. In `examples/diffusion/finetune/flux_t2i_flow.yaml`, set `data.dataloader.cache_dir` to your prepared cache path and `checkpoint.checkpoint_dir` to your output directory, replacing the placeholder values.
 
 ### Task
 

@@ -5,52 +5,63 @@ slug: model-coverage/omni/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
 ---
 
 [Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16) is NVIDIA's
-omnimodal reasoning model. It pairs a NemotronH (hybrid Mamba-2 + Attention) MoE
-language backbone with a RADIO v2.5-H vision encoder and a Parakeet (FastConformer)
-sound encoder, supporting interleaved text, image, and audio inputs.
+omnimodal reasoning model. It pairs a hybrid Mamba-2 and attention mixture-of-experts
+(MoE) language backbone with a C-RADIO v4-H vision encoder and a Parakeet audio
+encoder. The recipes below fine-tune this checkpoint on CORD-v2 receipt images and text.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-From the repository root, run:
-
-For a full walkthrough - dataset preparation, SFT vs. LoRA configs, and
-post-training inference - see the
-[Nemotron-Omni guide](/recipes-e2e-examples/nemotron-omni).
+After completing the [model-specific setup](#model-context), run vision-language
+fine-tuning on CORD-v2 with eight GPUs from the repository root:
 
 ```bash
 uv run automodel examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml --nproc-per-node 8
 ```
 
+For dataset preparation, low-rank adaptation (LoRA) configuration, and inference,
+see the [Nemotron-Omni guide](/recipes-e2e-examples/nemotron-omni).
+
 ## Choose a Workflow
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Vision-Language Fine-Tuning | CORD-v2; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml) |
-| LoRA Fine-Tuning | CORD-v2; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2_peft.yaml) |
+| Vision-Language Fine-Tuning | CORD-v2; eight GPUs; FSDP2; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml) |
+| LoRA Fine-Tuning | CORD-v2; eight GPUs; FSDP2; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2_peft.yaml) |
 
 ## Model Context
 
-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 is used for omnimodal (text/image/audio). Its model size is 30B total / 3B active parameters.
+This model combines language, vision, and audio encoders for multimodal understanding.
+The [upstream model card](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16/blob/e5e9932441de940c9a62185c870ea5bcd4cd24e2/README.md)
+reports a 31B-parameter language backbone with about 3B active parameters per token.
 
 | Property | Value |
 | --- | --- |
-| Task | Omnimodal (Text/Image/Audio) |
+| Task | Receipt image and text fine-tuning in these recipes |
 | **Architecture** | `NemotronH_Nano_Omni_Reasoning_V3` |
-| Parameters | 30B total / 3B active |
+| Parameters | Language backbone: 31B total; about 3B active per token |
 | Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
-| Decoder Layers | 52 |
-| Hidden Size | 2,688 |
+| Decoder Layers | 52 (language backbone) |
+| Hidden Size | 2,688 (language backbone) |
 | Attention | 32 attention heads / 2 key-value heads |
-| Context Length | 262,144 tokens (checkpoint configuration) |
+| Context Length | Language backbone: 262,144 tokens (`max_position_embeddings`); top-level `max_sequence_length`: 131,072 tokens |
 | Vocabulary Size | 131,072 |
 | Experts | 128 routed / 1 shared / 6 selected per token |
 | Configured Dtype | `bfloat16` |
 
-## Available Models
+Both recipes load pretrained weights, use Fully Sharded Data Parallelism (FSDP2)
+and eight-way expert parallelism (EP8), and freeze the vision and audio towers.
+They use CORD-v2 data with a 4,096-token collator limit and save checkpoints under
+`vlm_checkpoints/`.
 
-- **Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16**: 30B total, 3B activated (MoE)
+For source installations, include the `vlm`, `vlm-media`, and `moe` extras.
+The `moe` extra supplies DeepEP and includes `cuda`, which supplies `mamba-ssm`,
+`causal-conv1d`, and Transformer Engine (used by the full recipe's optimizer).
+The standard `all` bundle omits DeepEP and `vlm-media`. In the container, add
+`vlm-media` as shown in the [Nemotron-Omni setup guide](/recipes-e2e-examples/nemotron-omni).
+
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -58,6 +69,6 @@ Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 is used for omnimodal (text/image/au
 
 ## Related Resources
 
-- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+- [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
 
 - [Checkpoint Configuration](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16/blob/e5e9932441de940c9a62185c870ea5bcd4cd24e2/config.json)

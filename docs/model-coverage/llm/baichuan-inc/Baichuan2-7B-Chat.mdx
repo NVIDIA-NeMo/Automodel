@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `BaichuanForCausalLM` architecture.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), then run full fine-tuning on SQuAD from the repository root. This example uses eight GPUs; adjust `--nproc-per-node` to the number of available GPUs:
 
 ```bash
 automodel examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml --nproc-per-node 8
@@ -19,8 +19,9 @@ automodel examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml --nproc-per-no
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml) |
+| Full Fine-Tuning | SQuAD; 8-GPU launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml) |
 | Full Fine-Tuning | Synthetic data; FP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_mock_fp8.yaml) |
+| LoRA Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml) |
 
 ## Model Context
 
@@ -40,26 +41,20 @@ Baichuan2-7B-Chat is used for text generation. Its model size is 7B parameters.
 
 ### Configuration
 
+These settings describe the SQuAD full fine-tuning recipe used in Quick Start.
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1 |
-| Nodes | - |
-| Features | Checkpointing (enabled=true) |
-| Advanced | - |
-
-### More Recipes for This Model
-
-- [`baichuan_2_7b_mock_fp8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_mock_fp8.yaml)
-- [`baichuan_2_7b_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml)
+| Hardware | GPU type not specified in the recipe |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size: 1`, `cp_size: 1` |
+| Nodes | Not specified in the recipe |
+| Features | Checkpoint saving enabled (`checkpoint.enabled: true`) |
+| Advanced | Compilation disabled (`compile.enabled: false`) |
 
 ## Available Models
 
-- [`baichuan-inc/Baichuan2-7B-Chat`](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Baichuan2-7B-Chat](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat) | Checkpoint documented on this page |
 | [`baichuan-inc/Baichuan2-7B-Chat`](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat) | Checkpoint documented on this page |
 
 ## Related Resources

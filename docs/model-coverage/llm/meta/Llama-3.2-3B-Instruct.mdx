@@ -4,12 +4,12 @@ description: "Use NeMo AutoModel to fine-tune meta-llama/Llama-3.2-3B-Instruct f
 slug: model-coverage/large-language-models/meta/Llama-3.2-3B-Instruct
 ---
 
-[Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) has a checked-in NeMo AutoModel recipe for text generation.
+NeMo AutoModel provides SQuAD recipes for full fine-tuning and low-rank adaptation (LoRA) of [Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct).
 The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation). Request access to the [gated checkpoint](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) and authenticate with a token from the approved account using `HF_TOKEN`. From the repository root, launch full fine-tuning on SQuAD with the recipe's example setup of eight GPUs on one node:
 
 ```bash
 automodel examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad.yaml --nproc-per-node 8
@@ -19,8 +19,8 @@ automodel examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad.yaml --npro
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad.yaml) |
-| LoRA Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad_peft.yaml) |
+| Full Fine-Tuning | SQuAD; 8-GPU example launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad.yaml) |
+| LoRA Fine-Tuning | SQuAD; 8-GPU example launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad_peft.yaml) |
 
 ## Model Context
 
@@ -33,33 +33,28 @@ Llama-3.2-3B-Instruct is used for text generation. Its model size is 3.21B check
 | Parameters | 3.21B checkpoint parameters |
 | Decoder Layers | 28 |
 | Hidden Size | 3,072 |
-| Attention | 24 attention heads / 8 key-value heads |
+| Attention | 24 attention heads and 8 key-value heads |
 | Context Length | 131,072 tokens (checkpoint configuration) |
 | Vocabulary Size | 128,256 |
 | Configured Dtype | `bfloat16` |
 
-### Configuration
+### Recipe Configuration
+
+Both recipes use Fully Sharded Data Parallel (FSDP2). These settings describe the checked-in recipes and their example launch.
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1 |
-| Nodes | - |
-| Features | Checkpointing (enabled=true) |
-| Advanced | bf16 |
-
-### More Recipes for This Model
-
-- [`llama_3_2_3b_instruct_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad_peft.yaml)
+| Hardware | 8 GPUs in the example launch; GPU model not specified |
+| Strategy | FSDP2; `tp_size: 1`, `cp_size: 1` |
+| Nodes | 1 in the example launch |
+| Features | Checkpointing (`enabled: true`) |
+| Precision | `bf16` |
 
 ## Available Models
 
-- [`meta-llama/Llama-3.2-3B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) | Checkpoint documented on this page |
-| [`meta-llama/Llama-3.2-3B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) | Checkpoint documented on this page |
+| [`meta-llama/Llama-3.2-3B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) | Instruction-tuned checkpoint for both workflows |
 
 ## Related Resources
 

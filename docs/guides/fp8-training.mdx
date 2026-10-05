@@ -1,25 +1,24 @@
 ---
 title: "FP8 Training in NeMo AutoModel"
-description: ""
+description: "Configure TorchAO FP8 training in NeMo AutoModel, choose scaling recipes, filter modules, and evaluate performance."
 position: 4
 ---
 NeMo AutoModel supports FP8 quantization using [TorchAO](https://github.com/pytorch/ao) and `torch.compile` to accelerate training on compatible hardware.
 
-FP8 (8-bit floating point) quantization can provide substantial speedups for models where the majority of GEMMs are sufficiently large. The speedup from using FP8 tensor cores must outweigh the overhead of dynamic quantization.
+FP8 (8-bit floating point) quantization can provide substantial speedups for models where the majority of general matrix multiplications (GEMMs) are sufficiently large. The speedup from using FP8 tensor cores must outweigh the overhead of dynamic quantization.
 
-### Requirements for FP8 Training in NeMo AutoModel
+## Requirements for FP8 Training in NeMo AutoModel
 
-To enable FP8 training in NeMo AutoModel, the following hardware and software requirements must be met:
+Before you enable FP8 training, check the hardware, software, and configuration:
 
 - **Hardware**:  
-  An NVIDIA H100 GPU or newer is required. These GPUs feature FP8 tensor cores that accelerate training.
+  Use an NVIDIA GPU supported by your TorchAO FP8 recipe. NeMo AutoModel checks for CUDA compute capability 8.9 or later when hardware acceleration is enabled; individual TorchAO recipes can have additional requirements. The benchmark below uses H100 GPUs.
 
 - **Software**:  
   The TorchAO library must be installed.
 
 - **Configuration**:  
-  Both `torch.compile` and `fp8` must be enabled in your training configuration.  
-  **Important**: `torch.compile` is essential for achieving meaningful speedup with TorchAO FP8 training.
+  Set `fp8.enabled: true` to enable FP8 conversion and `compile.enabled: true` to enable `torch.compile` for performance. Compilation is essential for achieving meaningful speedup with TorchAO FP8 training.
 
 ## Install TorchAO
 
@@ -54,12 +53,15 @@ fp8:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `recipe_name` | str | None | FP8 recipe: "tensorwise", "rowwise", or "rowwise_with_gw_hp" |
-| `enable_fsdp_float8_all_gather` | bool | False | Enable FP8 all-gather in FSDP for bandwidth savings |
-| `force_recompute_fp8_weight_in_bwd` | bool | False | Force recomputation of FP8 weights in backward pass |
-| `precompute_float8_dynamic_scale_for_fsdp` | bool | False | Precompute FP8 scales for FSDP optimization |
-| `filter_fqns` | list[str] | [] | Module names to exclude from FP8 conversion |
-| `emulate` | bool | False | Use emulation instead of hardware acceleration |
+| `enabled` | `bool` | `False` | Enable FP8 conversion |
+| `recipe_name` | `str` or `None` | `None` | FP8 recipe: `"tensorwise"`, `"rowwise"`, or `"rowwise_with_gw_hp"`. `None` uses tensorwise scaling |
+| `enable_fsdp_float8_all_gather` | `bool` | `False` | Enable FP8 all-gather in Fully Sharded Data Parallel (FSDP) for bandwidth savings |
+| `force_recompute_fp8_weight_in_bwd` | `bool` | `False` | Force recomputation of FP8 weights in the backward pass |
+| `precompute_float8_dynamic_scale_for_fsdp` | `bool` | `False` | Precompute FP8 scales for FSDP; use with `recipe_name: tensorwise` and `enable_fsdp_float8_all_gather: true` |
+| `filter_fqns` | `list[str]` | `[]` | Substrings of fully qualified module names to exclude from FP8 conversion |
+| `emulate` | `bool` | `False` | Use emulation instead of hardware acceleration for testing |
+
+The `enable_fsdp_float8_all_gather`, `force_recompute_fp8_weight_in_bwd`, and `emulate` overrides apply when `recipe_name` is `tensorwise` or `None`. The rowwise recipes use TorchAO's preset values for these options.
 
 ### Scaling Strategies
 
@@ -73,11 +75,11 @@ fp8:
 - Slower than tensorwise
 - Better numerical stability
 
-For more on scaling strategies, refer to the [TorchAO FP8 documentation](https://github.com/pytorch/ao/tree/main/torchao/float8).
+For more on scaling strategies, refer to the [TorchAO FP8 documentation](https://docs.pytorch.org/ao/main/workflows/training.html#float8).
 
 ## Filter Modules
 
-You can exclude specific modules from FP8 conversion using `filter_fqns`:
+You can exclude modules from FP8 conversion using `filter_fqns`. Each entry matches any fully qualified module name that contains that substring:
 
 ```yaml
 fp8:
@@ -86,17 +88,19 @@ fp8:
   filter_fqns: ["lm_head"]  # Skip these modules
 ```
 
-### Speed and Convergence
+## Speed and Convergence
 
-FP8 quantization provides measurable performance improvements while maintaining model convergence:
+The Llama 3.1 8B HellaSwag benchmark shown below compares tensorwise FP8 with BF16 training on eight H100 GPUs using an 8,192-token sequence length and `torch.compile`. The reported results for this workload are:
 
-- **Speed**: Over 1.2x training speedup on 8xH100 with tensorwise scaling.
-- **Convergence**: FP8 training achieves loss parity with BF16 training.
-- **Memory**: FP8 training achieves on par memory usage with BF16 baseline.
+- **Speed**: Over 1.2x training speedup with tensorwise scaling.
+- **Convergence**: Similar training loss curves for FP8 and BF16.
+- **Memory**: Memory usage comparable to the BF16 baseline.
+
+Speedup, memory use, and convergence depend on the model, workload, and configuration.
 
 ![FP8 Convergence Comparison](./fp8_convergence.jpg)
 
-*Figure: Loss curves comparing FP8 tensorwise scaling + torch.compile vs. BF16 + torch.compile training on 8xH100 with 8k sequence length, demonstrating virtually identical convergence behavior with 1.24x speedup*
+*Figure: Training loss and throughput for Llama 3.1 8B on HellaSwag, comparing tensorwise FP8 and BF16 with `torch.compile` on eight H100 GPUs at an 8,192-token sequence length. This benchmark reports similar loss curves and a 1.24x speedup.*
 
 ## Ready-to-Use Recipes
 We provide FP8 training configs for popular models:
@@ -106,23 +110,18 @@ We provide FP8 training configs for popular models:
 
 Check out our [examples directory](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune) for more recipes and configurations.
 
-To run any of these FP8 training recipes, use the following command:
+Run this command from the repository root to train Llama 3.1 8B on eight GPUs. To use the Qwen recipe, replace `CONFIG_PATH` with its path:
 
 ```bash
 CONFIG_PATH=examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
 uv run automodel --nproc-per-node=8 "$CONFIG_PATH"
 ```
 
-For example, to train Llama 3.1 8B with FP8:
-```bash
-automodel --nproc-per-node=8 examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
-```
-
 ## Performance Considerations
 
 FP8 requires specific conditions to be effective:
 - Linear layers are converted only when their input and output feature dimensions are divisible by 16; incompatible linear layers are skipped by the module filter
-- Use compatible hardware (H100+)
+- Use hardware supported by your TorchAO FP8 recipe
 - Train with `torch.compile`
 
 FP8 works best when the majority of GEMM operations are sufficiently large such that the speedup achieved by using FP8 tensor cores is greater than the overhead of dynamic quantization.
@@ -131,11 +130,11 @@ FP8 works best when the majority of GEMM operations are sufficiently large such 
 
 - Linear layers are large and compute-intensive
 - The model consists of fewer small operations and more large matrix multiplications
-- You have modern (H100+) hardware optimized for FP8 acceleration
+- You have compatible hardware optimized for FP8 acceleration
 - Moderate numerical precision is acceptable and slight approximations won't affect outcomes
 
 ## References
 
-- [TorchAO FP8 Documentation](https://github.com/pytorch/ao/tree/main/torchao/float8)
-- [FP8 Performance Benchmarks](https://pytorch.org/ao/main/workflows/training.html#performance)
-- [NVIDIA FP8 Primer](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html)
+- [TorchAO FP8 Documentation](https://docs.pytorch.org/ao/main/workflows/training.html#float8)
+- [FP8 Performance Benchmarks](https://docs.pytorch.org/ao/main/workflows/training.html#performance)
+- [NVIDIA FP8 Primer](https://nvidia.github.io/TransformerEngine/examples/fp8_primer.html)

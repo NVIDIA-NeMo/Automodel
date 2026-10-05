@@ -1,15 +1,15 @@
 ---
 title: "deepseek-ai/DeepSeek-V3.2"
-description: "Use NeMo AutoModel to fine-tune deepseek-ai/DeepSeek-V3.2 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+description: "Benchmark LoRA training for deepseek-ai/DeepSeek-V3.2 with NeMo AutoModel using synthetic data and documented distributed settings."
 slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V3.2
 ---
 
-[DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) has a checked-in NeMo AutoModel recipe for text generation.
+[DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) has a checked-in NeMo AutoModel benchmark for low-rank adaptation (LoRA) training on synthetic data.
 The Hugging Face configuration declares the `DeepseekV32ForCausalLM` architecture.
 
 ## Quick Start
 
-Allocate 16 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+Run the LoRA benchmark on 16 nodes with 8 GPUs each. Complete the setup in [Model Context](#model-context), including `NODE_RANK` and `MASTER_ADDR`, then run this command from the repository root on every node.
 
 ```bash
 uv run torchrun --nnodes 16 --nproc-per-node 8 \
@@ -21,11 +21,11 @@ uv run torchrun --nnodes 16 --nproc-per-node 8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Training Benchmark | Synthetic data; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/dsv32_lora.yaml) |
+| LoRA Training Benchmark | Synthetic data; 16 nodes; 4 pipeline stages; 32 expert-parallel ranks | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/dsv32_lora.yaml) |
 
 ## Model Context
 
-DeepSeek-V3.2 is used for text generation. Its model size is 685.36B checkpoint parameters.
+DeepSeek-V3.2 is a text-generation model with 685.36B checkpoint parameters. The benchmark initializes the model from its configuration without loading pretrained weights and uses 4,096-token synthetic sequences. Checkpoint saving is disabled in this recipe.
 
 | Property | Value |
 | --- | --- |
@@ -35,7 +35,7 @@ DeepSeek-V3.2 is used for text generation. Its model size is 685.36B checkpoint 
 | Decoder Layers | 61 |
 | Hidden Size | 7,168 |
 | Attention | 128 attention heads / 128 key-value heads |
-| Context Length | 163,840 tokens (checkpoint configuration) |
+| Context Length | 163,840 tokens (checkpoint configuration); 4,096 tokens in the benchmark |
 | Vocabulary Size | 129,280 |
 | Experts | 256 routed / 1 shared / 8 selected per token |
 | Configured Dtype | `bfloat16` |
@@ -44,24 +44,23 @@ DeepSeek-V3.2 is used for text generation. Its model size is 685.36B checkpoint 
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=32 |
+| Hardware | 8 GPUs per node in the launch above; GPU model unspecified by the recipe |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=4`, `cp_size=1`, `ep_size=32` |
 | Nodes | 16 |
-| Features | Activation checkpointing (activation_checkpointing=true), LoRA, Transformer Engine, DeepEP (dispatcher=deepep) |
-| Advanced | attention=te, linear=te, experts=gmm, dispatcher=deepep |
+| Features | Activation checkpointing (`activation_checkpointing=true`), LoRA, Transformer Engine, HybridEP (`dispatcher=hybridep`) |
+| Advanced | `attn=te`, `linear=te`, `experts=torch_mm`, `dispatcher=hybridep` |
 
 ### Workflow Notes
 
-Follow the [installation instructions](/get-started/installation).
+Follow the [installation instructions](/get-started/installation) and ensure that Transformer Engine and HybridEP are installed on every node for the selected backends.
+
+Use the same repository checkout and environment on all 16 nodes. Set `NODE_RANK` to a unique value from `0` through `15`, and set `MASTER_ADDR` to the address of node `0`, reachable from every node on port `29500`.
 
 ## Available Models
 
-- [`deepseek-ai/DeepSeek-V3.2`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2)
-
 | Checkpoint | Type |
 | --- | --- |
-| [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) | Checkpoint documented on this page |
-| [`deepseek-ai/DeepSeek-V3.2`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) | Checkpoint documented on this page |
+| [`deepseek-ai/DeepSeek-V3.2`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) | Configuration used by the benchmark |
 
 ## Related Resources
 

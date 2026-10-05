@@ -3,12 +3,18 @@
 # checkpoint written by north_micro_vision_shopify_lora.yaml and continues
 # training, exercising the checkpoint restore path.
 #
-# Run north_micro_vision_shopify_lora.yaml first, then adjust `restore_from`
-# below to point at a checkpoint it actually produced:
-#   automodel north_micro_vision_shopify_resume.yaml --nproc-per-node 2
+# The upstream checkpoint README requires Transformers 5.16.0:
+# https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct/blob/fa548d9aa62c1220bfd21fc6cfc465f1bd2a1a40/README.md
+# This repository pins Transformers 5.15.1. Use the per-command override below.
 #
-# NOTE: requires transformers 5.15.0.dev0 (git main), NOT the transformers==5.8.1
-# that nemo-automodel==0.5.0 pins. See north_micro_vision_shopify_full.yaml for details.
+# From the repository root, run the initial LoRA recipe:
+#   uv run --with transformers==5.16.0 automodel \
+#     examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_lora.yaml --nproc-per-node 2
+#
+# Set `checkpoint.restore_from` below to a checkpoint produced by that run,
+# then resume training from the same repository root:
+#   uv run --with transformers==5.16.0 automodel \
+#     examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_resume.yaml --nproc-per-node 2
 
 recipe: FinetuneRecipeForVLM
 

@@ -10,7 +10,7 @@ The Hugging Face configuration declares the `NemotronHForCausalLM` architecture.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). Allocate 4 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+Follow the [installation instructions](/get-started/installation). From the repository root, fine-tune on HellaSwag using 4 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node as described in [Recipe Setup](#recipe-setup), then run:
 
 ```bash
 uv run torchrun --nnodes 4 --nproc-per-node 8 \
@@ -44,43 +44,33 @@ NVIDIA-Nemotron-3-Super-120B-A12B-BF16 is used for text generation. Its model si
 
 ### Configuration
 
+The full fine-tuning recipe uses Fully Sharded Data Parallel version 2 (FSDP2) with expert parallelism (EP) and the following settings.
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1, ep_size=32 |
+| Hardware | 32 GPUs with 80 GB each, as specified by the recipe |
+| Strategy | FSDP2; `tp_size=1`, `cp_size=1`, `ep_size=32` |
 | Nodes | 4 |
-| Features | Checkpointing (enabled=true) |
-| Advanced | - |
+| Features | Checkpoint saving enabled; SafeTensors under `checkpoints/` |
+
+The LoRA benchmark initializes a model with `from_config` and uses synthetic data. It does not load pretrained weights, and checkpoint saving is disabled, so the run produces no saved adapter.
 
 ### More Recipes for This Model
 
-- [`nemotron_super_v3_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_super_v3_lora.yaml)
 - [`nemotron_super_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_super_v3_te_deepep.yaml)
 - [`nemotron_super_v3_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag_peft.yaml)
 
-### Setup and Additional Examples
-
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
-
 ### Recipe Setup
 
-Read [nemotron_super_v3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+Set `NODE_RANK` to a unique value from `0` to `3` on each node. Set `MASTER_ADDR` to node 0's hostname or IP address, reachable from every node. Run the Quick Start command on every node from the repository root using the same environment.
 
-### Workflow Notes
-
-Fine-tune nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16: [nemotron_super_v3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml). 4 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+The fine-tuning recipe loads the Hugging Face checkpoint and the `rowan/hellaswag` dataset. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
 
 ## Available Models
 
-- [`nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16)
-
 | Checkpoint | Type |
 | --- | --- |
-| [NVIDIA-Nemotron-3-Super-120B-A12B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16) | Checkpoint documented on this page |
-| [`nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16) | Checkpoint documented on this page |
+| [`nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16) | Pretrained weights for fine-tuning; configuration for benchmarks |
 
 ## Related Resources
 

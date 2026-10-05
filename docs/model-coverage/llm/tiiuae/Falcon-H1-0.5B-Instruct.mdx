@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `FalconH1ForCausalLM` architecture.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+After [installing NeMo AutoModel](/get-started/installation), run full fine-tuning on SQuAD from the repository root. This example launches on one node with eight GPUs:
 
 ```bash
 automodel examples/llm_finetune/falcon/falcon_h1_0p5b_instruct_squad.yaml --nproc-per-node 8
@@ -19,7 +19,7 @@ automodel examples/llm_finetune/falcon/falcon_h1_0p5b_instruct_squad.yaml --npro
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_0p5b_instruct_squad.yaml) |
+| Full Fine-Tuning | SQuAD; 1 node, 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_0p5b_instruct_squad.yaml) |
 
 ## Model Context
 
@@ -41,24 +41,21 @@ Falcon-H1-0.5B-Instruct is used for text generation. Its model size is 521.4M ch
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Hardware | 8 GPUs (example launch); GPU model unspecified |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size=1`, `cp_size=1` |
 | Nodes | 1 |
 | Features | - |
-| Advanced | bf16 |
+| Advanced | `bf16` |
 
 ### Workflow Notes
 
-Follow the [installation instructions](/get-started/installation).
+The recipe loads pretrained weights and fine-tunes on the SQuAD training split for 100 steps.
 
 ## Available Models
 
-- [`tiiuae/Falcon-H1-0.5B-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-0.5B-Instruct)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Falcon-H1-0.5B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-0.5B-Instruct) | Checkpoint documented on this page |
-| [`tiiuae/Falcon-H1-0.5B-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-0.5B-Instruct) | Checkpoint documented on this page |
+| [`tiiuae/Falcon-H1-0.5B-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-0.5B-Instruct) | Pretrained checkpoint for full fine-tuning |
 
 ## Related Resources
 

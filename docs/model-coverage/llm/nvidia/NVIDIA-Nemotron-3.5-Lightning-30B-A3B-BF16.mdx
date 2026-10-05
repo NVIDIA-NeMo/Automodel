@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `NemotronHForCausalLM` architecture.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation) and check the [model prerequisites](#model-context). From the repository root, launch low-rank adaptation (LoRA) fine-tuning on HellaSwag using eight GPUs on one node:
 
 ```bash
 automodel examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_hellaswag_peft.yaml --nproc-per-node 8
@@ -19,8 +19,8 @@ automodel examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_hellaswag_
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Fine-Tuning | HellaSwag; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_hellaswag_peft.yaml) |
-| LoRA Fine-Tuning | HellaSwag; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_singlegpu_lora.yaml) |
+| LoRA Fine-Tuning | HellaSwag; 1 node; 8 GPUs; expert parallelism size 8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_hellaswag_peft.yaml) |
+| LoRA Fine-Tuning | HellaSwag; 1 node; 1 GPU | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_singlegpu_lora.yaml) |
 
 ## Model Context
 
@@ -41,29 +41,25 @@ NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 is used for text generation. Its mode
 
 ### Configuration
 
+The following settings describe the eight-GPU Quick Start recipe. Both recipes load pretrained weights, train on HellaSwag, and enable checkpoint saving. The single-GPU recipe sets every parallelism size to one and enables activation checkpointing and memory-efficient LoRA.
+
+Use an environment with the Nemotron CUDA dependencies, including `mamba-ssm` and `causal-conv1d`. The [installation guide](/get-started/installation) recommends the NeMo AutoModel container for these dependencies.
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1, ep_size=8 |
+| Hardware | 8 GPUs for the Quick Start example |
+| Strategy | Fully Sharded Data Parallelism (FSDP2); `tp_size=1`, `cp_size=1`, `ep_size=8` |
 | Nodes | 1 |
-| Features | Checkpointing (enabled=true), LoRA, Transformer Engine, DeepEP (dispatcher=deepep) |
-| Advanced | attention=te, linear=te, experts=gmm, dispatcher=deepep |
-
-### More Recipes for This Model
-
-- [`nemotron_nano_v3_5_lightning_singlegpu_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_singlegpu_lora.yaml)
+| Features | Checkpoint saving (`checkpoint.enabled=true`), LoRA, Transformer Engine, DeepEP |
+| Advanced | `attn=te`, `linear=te`, `experts=torch_mm`, `dispatcher=deepep` |
 
 ## Available Models
 
-- [`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16)
-
 | Checkpoint | Type |
 | --- | --- |
-| [NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16) | Checkpoint documented on this page |
 | [`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16) | Checkpoint documented on this page |
 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
-
 - [Checkpoint Configuration](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16/blob/a9904d24bcc1d289a1950fa9d2b978c47cf903b9/config.json)

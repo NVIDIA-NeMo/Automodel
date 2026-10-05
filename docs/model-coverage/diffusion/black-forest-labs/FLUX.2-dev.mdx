@@ -10,7 +10,7 @@ NeMo AutoModel includes full-parameter and Low-Rank Adaptation (LoRA) text-to-im
 
 ## Quick Start
 
-From the repository root, run:
+Complete the setup in Recipe Notes, then launch full fine-tuning from the repository root on eight GPUs:
 
 ```bash
 uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
@@ -21,8 +21,8 @@ uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | Prepared image-text cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow.yaml) |
-| LoRA Fine-Tuning | Prepared image-text cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow_lora.yaml) |
+| Full Fine-Tuning | Prepared image-text cache; 8 data-parallel GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow.yaml) |
+| LoRA Fine-Tuning | Prepared image-text cache; 8 data-parallel GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow_lora.yaml) |
 
 ## Model Context
 
@@ -34,7 +34,7 @@ FLUX.2-dev is used for diffusion generation. Its model size is 32B parameters.
 | Upstream Tasks | Text-to-image generation; single- and multi-reference image editing |
 | Model Type | Rectified flow transformer |
 | Parameters | 32B |
-| Reference Architecture | `Flux2` |
+| Architecture | `Flux2` |
 | Transformer Blocks | 8 double-stream / 48 single-stream |
 | Hidden Size | 6,144 |
 | Attention | 48 heads |
@@ -46,11 +46,17 @@ FLUX.2-dev is used for diffusion generation. Its model size is 32B parameters.
 | Rotary Position Embedding Theta | 2,000 |
 | Guidance | Guidance-distilled with guidance embedding enabled |
 | Configured Dtype | `BF16` |
-| **Architecture** | `Flux2` |
 
 ### Recipe Notes
 
-See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
+Before running either recipe:
+
+1. Install the diffusion dependencies described in the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
+2. Obtain access to the gated [FLUX.2-dev checkpoint](https://huggingface.co/black-forest-labs/FLUX.2-dev) and authenticate your Hugging Face environment.
+3. Prepare the image-text cache using the guide's image preprocessing workflow with `--processor flux2`.
+4. In the chosen YAML, set `data.dataloader.cache_dir` to the prepared cache directory and `checkpoint.checkpoint_dir` to your checkpoint output directory, replacing the `PATH_TO_YOUR_DATA` and `PATH_TO_YOUR_CKPT_DIR` placeholders.
+
+Both recipes set `fsdp.dp_size: 8`, matching the eight-GPU launch above.
 
 ## Available Models
 

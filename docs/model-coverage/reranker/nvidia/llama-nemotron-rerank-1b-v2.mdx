@@ -10,7 +10,7 @@ For the bi-encoder variant, see [Llama (Bidirectional) for Embedding](/model-cov
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+Follow the [source installation instructions](/get-started/installation). From the repository root, run this example on one node with 8 GPUs. GPU training and memory use still require validation.
 
 ```bash
 uv run automodel examples/retrieval/cross_encoder/llama_nemotron_rerank_1b_v2_finetune.yaml --nproc-per-node 8
@@ -32,13 +32,14 @@ llama-nemotron-rerank-1b-v2 is used for reranking. Its model size is 1B paramete
 | Tasks | Reranking |
 | **Architecture** | `LlamaBidirectionalForSequenceClassification` |
 | Parameters | 1B |
-| Hugging Face Organization | [meta-llama](https://huggingface.co/meta-llama) |
+| Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
 | Decoder Layers | 16 |
 | Hidden Size | 2,048 |
 | Attention | 32 attention heads / 8 key-value heads |
-| Context Length | 131,072 tokens (checkpoint configuration) |
+| Context Length | 8,192 tokens ([upstream model card](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2/blob/828765652b05bd439c9789d2a6d093db1caa1443/README.md)) |
+| Configured Maximum Positions | 131,072 (`max_position_embeddings`) |
 | Vocabulary Size | 128,256 |
-| Configured Dtype | `bfloat16` |
+| Checkpoint Dtype | `bfloat16` |
 
 ### Reranking Models
 
@@ -48,21 +49,19 @@ The cross-encoder path is used for pairwise relevance scoring and reranking.
 |---|---|---|---|
 | `LlamaBidirectionalForSequenceClassification` | Reranking | `NeMoAutoModelCrossEncoder` | Bidirectional Llama with classification head for relevance scoring |
 
-### Setup and Additional Examples
+### Configure the Fine-Tuning Recipe
 
-From the repository root, run:
+The [fine-tuning recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/cross_encoder/llama_nemotron_rerank_1b_v2_finetune.yaml) loads pretrained `nvidia/llama-nemotron-rerank-1b-v2` weights and uses fully sharded data parallelism (FSDP2), `torch.optim.AdamW`, and FEVER and synthetic classification data. It sets `dtype: float32`, limits query-document pairs to 512 tokens, and runs for up to 100 steps. Checkpoint saving is enabled under `checkpoints/llama_nemotron_rerank_1b_v2`.
+
+### Train a Reranker from Llama 3.2 1B
+
+For this base-model example, follow the [source installation instructions](/get-started/installation) with the `cuda` extra for the Transformer Engine optimizer and the `dev` dependency group for the selected Liger kernels.
+
+Request access to the gated [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) checkpoint and wait for approval. Set `HF_TOKEN` in the runtime environment to a Hugging Face token with read access to that checkpoint. From the repository root, run:
 
 ```bash
 uv run automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-node 8
 ```
-
-### Recipe Setup
-
-Read [llama_nemotron_rerank_1b_v2_finetune.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/cross_encoder/llama_nemotron_rerank_1b_v2_finetune.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small fine-tuning example.
-
-### Model Overview
-
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 
@@ -77,5 +76,4 @@ NVIDIA trained and released the `Llama Nemotron Reranking 1B` model, optimized t
 
 - [nvidia/llama-nemotron-rerank-1b-v2](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2)
 - [NeMo AutoModel Repository](https://github.com/NVIDIA-NeMo/Automodel)
-
 - [Checkpoint Configuration](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2/blob/828765652b05bd439c9789d2a6d093db1caa1443/config.json)

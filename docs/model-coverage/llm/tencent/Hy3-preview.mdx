@@ -4,13 +4,13 @@ description: "Use tencent/Hy3-preview with NeMo AutoModel for language model fin
 slug: model-coverage/large-language-models/tencent/Hy3-preview
 ---
 
-[Hy3-preview](https://huggingface.co/tencent/Hy3-preview) is a 295B Mixture-of-Experts language model from Tencent. It features 80 transformer layers (layer 0 dense, layers 1-79 MoE), 192 routed experts plus 1 shared expert with top-8 sigmoid routing, Grouped Query Attention (64 Q / 8 KV heads), per-head QK RMSNorm, RoPE, and an `e_score_correction_bias` gate buffer for expert-load correction. It supports a 256K context window.
+[Hy3-preview](https://huggingface.co/tencent/Hy3-preview) is Tencent's 295B-parameter mixture-of-experts (MoE) language model. It has 80 decoder layers, 192 routed experts with eight selected per token, and one shared expert. The checkpoint configuration specifies grouped-query attention and a 262,144-token context window.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-Allocate 8 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+Run from the repository root on each of 8 nodes with 8 GPUs. Set `NODE_RANK` to a unique value from 0 to 7 and `MASTER_ADDR` to the rank-0 hostname. Complete the [recipe prerequisites](#model-context) before launching.
 
 ```bash
 uv run torchrun --nnodes 8 --nproc-per-node 8 \
@@ -26,7 +26,7 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 ## Model Context
 
-Hy3-preview is used for text generation (moe). Its model size is 295B total parameters.
+This recipe fine-tunes pretrained Hy3-preview weights on HellaSwag for text generation.
 
 | Property | Value |
 | --- | --- |
@@ -34,12 +34,21 @@ Hy3-preview is used for text generation (moe). Its model size is 295B total para
 | **Architecture** | `HYV3ForCausalLM` |
 | Parameters | 295B total |
 | Hugging Face Organization | [tencent](https://huggingface.co/tencent) |
-| Decoder Layers | 80 |
+| Decoder Layers | 80: one dense layer followed by 79 MoE layers |
 | Hidden Size | 4,096 |
-| Attention | 64 attention heads / 8 key-value heads |
+| Attention | Grouped-query attention with 64 query heads and 8 key-value heads |
+| Attention Details | Per-head query and key root mean square normalization (RMSNorm); rotary position embeddings (RoPE) |
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 120,832 |
-| Experts | 192 routed / 1 shared / 8 selected per token |
+| Experts | 192 routed experts, 1 shared expert, and 8 routed experts selected per token using sigmoid routing |
+
+The `e_score_correction_bias` gate buffer provides expert-load correction. Its update factor is zero during fine-tuning, so the loaded bias stays frozen.
+
+Before launching the recipe:
+
+- Install Transformer Engine and DeepEP for the configured attention and dispatch backends. For a source installation, include the `moe` extra, which also includes `cuda`; follow the [installation instructions](/get-started/installation). Use the same environment and repository checkout on every node.
+- Use the recipe's example topology: fully sharded data parallelism (FSDP2), pipeline parallelism (PP) size 8, and expert parallelism (EP) size 8 across 8 nodes with 8 GPUs each. The recipe keeps each EP group within a node.
+- Set `checkpoint.checkpoint_dir` to a persistent shared path. The recipe enables checkpoint saving and defaults to `/tmp/checkpoints/hy3_preview/`.
 
 ## Available Models
 

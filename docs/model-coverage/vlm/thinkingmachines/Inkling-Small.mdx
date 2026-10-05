@@ -9,10 +9,10 @@ The Hugging Face configuration declares the `InklingForConditionalGeneration` ar
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). Allocate 8 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+Complete the [recipe setup](#recipe-setup). From the repository root, run on each of 8 nodes with 8 GPUs. Set `NODE_RANK` to that node's rank (0-7) and `MASTER_ADDR` to the rank 0 node's reachable hostname or IP address.
 
 ```bash
-uv run torchrun --nnodes 8 --nproc-per-node 8 \
+uv run --extra moe --extra vlm torchrun --nnodes 8 --nproc-per-node 8 \
   --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
   -m nemo_automodel.cli.app examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml
 ```
@@ -21,7 +21,7 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Vision-Language Fine-Tuning | MedPix-VQA; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 8 nodes; 64-way expert parallelism | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml) |
 
 ## Model Context
 
@@ -38,44 +38,34 @@ Inkling-Small is used for image-text-to-text. Its model size is 265.96B checkpoi
 | Vocabulary Size | 201,024 |
 | Experts | 256 routed / 2 shared / 6 selected per token |
 
+The recipe loads pretrained weights and fine-tunes on `mmoukouba/MedPix-VQA`, with the vision and audio towers frozen. It runs for up to 100 steps. Checkpoint saving is disabled (`checkpoint.enabled: false`), so the example does not save the fine-tuned weights.
+
 ### Configuration
+
+The following settings describe the checked-in recipe's target topology.
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=64 |
+| Hardware | 8 H100 GPUs per node |
+| Strategy | Fully Sharded Data Parallelism (FSDP2); `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=64` |
 | Nodes | 8 |
-| Features | Activation checkpointing (activation_checkpointing=true), HybridEP (dispatcher=hybridep) |
-| Advanced | bfloat16, attention=sdpa, linear=torch, experts=torch_mm, dispatcher=hybridep |
-
-### Setup and Additional Examples
-
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+| Features | Activation checkpointing (`activation_checkpointing=true`), HybridEP (`dispatcher=hybridep`) |
+| Advanced | `bfloat16`, `attn=sdpa`, `linear=torch`, `experts=torch_mm`, `dispatcher=hybridep` |
 
 ### Recipe Setup
 
-Read [Inkling_small_medpix_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
-
-### Workflow Notes
-
-Fine-tune thinkingmachines/Inkling-Small: [Inkling_small_medpix_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml). 8 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
-
-Follow the [installation instructions](/get-started/installation).
+1. Follow the [installation instructions](/get-started/installation) for a source checkout. Before installing `deep_ep`, follow the [repository HybridEP build configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/c79ba55eb77527138337288220df04bc5939483c/docker/Dockerfile#L150-L183), including its compatibility patch, NVSHMEM, RDMA, and NCCL/DOCA setup. Build with `HYBRID_EP_MULTINODE=1` for this eight-node, 64-way expert-parallel recipe; the pinned source defaults to `0`. Set `TORCH_CUDA_ARCH_LIST` for the target GPU architecture.
+2. Install both the `moe` and `vlm` extras on every node using that build configuration. `moe` supplies `deep_ep`; `vlm` supplies image-processing dependencies for Inkling's Torchvision-backed processor. The base package and `all` extra do not include `deep_ep`. The Quick Start selects both extras.
+3. Make the checkpoint and `mmoukouba/MedPix-VQA` dataset available to all nodes. The recipe loads the dataset's `train` and `validation` splits from Hugging Face.
+4. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation. Review [Inkling_small_medpix_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml) before launching with the topology above.
 
 ## Available Models
 
-- [`thinkingmachines/Inkling-Small`](https://huggingface.co/thinkingmachines/Inkling-Small)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small) | Checkpoint documented on this page |
-| [`thinkingmachines/Inkling-Small`](https://huggingface.co/thinkingmachines/Inkling-Small) | Checkpoint documented on this page |
+| [`thinkingmachines/Inkling-Small`](https://huggingface.co/thinkingmachines/Inkling-Small) | Pretrained checkpoint for MedPix-VQA fine-tuning |
 
 ## Related Resources
 
-- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
-
+- [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
 - [Checkpoint Configuration](https://huggingface.co/thinkingmachines/Inkling-Small/blob/8cc5877b44d343f88b92086aa1fb72897950f06a/config.json)

@@ -3,8 +3,10 @@
 # Ling-mini-2.0 (BailingMoeV2: 16B total / 1.43B activated) LoRA SFT on SQuAD.
 # ------------------------------------------------------------------------------------------------
 # Hardware: tested on 4x H100 80GB with FSDP2; LoRA + activation checkpointing
-# keeps per-rank memory under 25 GB.  For more / fewer GPUs, only adjust
-# --nproc-per-node; the YAML's per-rank fields stay the same.
+# keeps per-rank memory under 25 GB.  When changing the GPU count, adjust
+# `--nproc-per-node` and choose compatible `distributed.ep_size`,
+# `step_scheduler.global_batch_size`, and `step_scheduler.local_batch_size`
+# settings for the new topology.
 # ------------------------------------------------------------------------------------------------
 #
 # To run:

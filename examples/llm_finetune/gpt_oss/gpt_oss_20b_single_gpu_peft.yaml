@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Adjust batch config as needed.
-# Current config targeting DGX Spark
+# This recipe targets a single GPU on DGX Spark.
 # To run this recipe:
-#   automodel examples/llm_finetune/gpt_oss/gpt_oss_20b_single_gpu_peft.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
+#   automodel examples/llm_finetune/gpt_oss/gpt_oss_20b_single_gpu_peft.yaml --nproc-per-node 1
+# If you change the GPU count, ensure step_scheduler.global_batch_size is divisible
+# by step_scheduler.local_batch_size times the data-parallel size.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 

@@ -4,7 +4,7 @@ description: "Fine-tune nvidia/Llama-3_3-Nemotron-Super-49B-v1 with NeMo AutoMod
 slug: model-coverage/large-language-models/nvidia/Llama-3_3-Nemotron-Super-49B-v1
 ---
 
-[Llama-3.3-Nemotron-Super-49B-v1](https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1) is a NVIDIA model derived from Llama-3.1-70B through Neural Architecture Search (NAS)-based pruning and knowledge distillation, resulting in a 49B model with strong reasoning capabilities. It uses the `DeciLMForCausalLM` architecture.
+[Llama-3.3-Nemotron-Super-49B-v1](https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1) is an NVIDIA model derived from Llama-3.3-70B-Instruct through Neural Architecture Search (NAS)-based pruning and knowledge distillation, resulting in a 49B model with strong reasoning capabilities. It uses the `DeciLMForCausalLM` architecture.
 
 Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
@@ -36,7 +36,7 @@ Llama-3_3-Nemotron-Super-49B-v1 is used for text generation. Its model size is 4
 | Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
 | Decoder Layers | 80 |
 | Hidden Size | 8,192 |
-| Attention | 64 attention heads |
+| Attention | 64 heads in attention-enabled blocks; 31 of the 80 blocks skip attention |
 | Context Length | 131,072 tokens (checkpoint configuration) |
 | Vocabulary Size | 128,256 |
 | Configured Dtype | `bfloat16` |

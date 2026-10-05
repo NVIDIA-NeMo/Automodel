@@ -4,13 +4,13 @@ description: "Fine-tune Qwen/Qwen3-Next-80B-A3B-Instruct with NeMo AutoModel: ch
 slug: model-coverage/large-language-models/qwen/Qwen3-Next-80B-A3B-Instruct
 ---
 
-Qwen3-Next is an advanced MoE language model from Alibaba Cloud's Qwen team designed for high-throughput inference with large total parameter counts and efficient per-token activation.
+Qwen3-Next-80B-A3B-Instruct is an instruction-tuned mixture-of-experts (MoE) language model from Alibaba Cloud's Qwen team. It combines Gated DeltaNet with gated attention and activates about 3 billion of its 80 billion parameters per token.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-Allocate 4 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+Use 4 nodes with 8 GPUs each for this example. Complete the setup in [Model Context](#model-context). From the repository root on every node, run the command with `NODE_RANK` set to a unique value from `0` to `3` and `MASTER_ADDR` set to the same reachable address of node `0`.
 
 ```bash
 uv run torchrun --nnodes 4 --nproc-per-node 8 \
@@ -26,7 +26,7 @@ uv run torchrun --nnodes 4 --nproc-per-node 8 \
 
 ## Model Context
 
-Qwen3-Next-80B-A3B-Instruct is used for text generation (moe). Its model size is 80B total / 3B active parameters.
+The recipe loads pretrained weights and fine-tunes on HellaSwag using Fully Sharded Data Parallel version 2 (FSDP2) and expert parallelism across 32 GPUs (EP32), with HybridEP dispatch and activation checkpointing.
 
 | Property | Value |
 | --- | --- |
@@ -36,11 +36,15 @@ Qwen3-Next-80B-A3B-Instruct is used for text generation (moe). Its model size is
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
 | Decoder Layers | 48 |
 | Hidden Size | 2,048 |
-| Attention | 16 attention heads / 2 key-value heads |
+| Gated Attention | 16 query heads and 2 key-value heads |
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 151,936 |
-| Experts | 512 routed / 10 selected per token |
+| Experts | 512 routed experts; 10 selected per token; 1 shared expert |
 | Configured Dtype | `bfloat16` |
+
+Use the same checkout and environment on all nodes. The configured dispatcher requires a DeepEP build exposing `HybridEPBuffer`, with multinode support and its RDMA and NVSHMEM dependencies. The [repository Dockerfile](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile) includes this setup. For source installations, the standard `all` extra does not include DeepEP.
+
+The example sets `checkpoint.enabled: false`, so it does not save trained weights. To retain the fine-tuned model, enable `checkpoint.enabled` and set `checkpoint.checkpoint_dir` to a writable output location before launching.
 
 ## Available Models
 

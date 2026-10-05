@@ -4,13 +4,13 @@ description: "Fine-tune baidu/ERNIE-4.5-0.3B-PT with NeMo AutoModel: checked-in 
 slug: model-coverage/large-language-models/baidu/ERNIE-4.5-0.3B-PT
 ---
 
-[ERNIE 4.5](https://huggingface.co/baidu) is Baidu's dense and Mixture-of-Experts language model family with long-context text checkpoints on Hugging Face.
+[ERNIE-4.5-0.3B-PT](https://huggingface.co/baidu/ERNIE-4.5-0.3B-PT) is Baidu's dense text-generation checkpoint in the ERNIE 4.5 family. Use the recipe below to fine-tune it on HellaSwag with NeMo AutoModel.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-From the repository root, run:
+From the repository root, run the HellaSwag fine-tuning recipe with eight GPUs per node:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml
@@ -29,7 +29,6 @@ ERNIE-4.5-0.3B-PT is used for text generation. Its model size is 0.36B parameter
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
-| Architectures | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
 | Parameters | 0.36B |
 | Context Length | 131,072 tokens |
 | Hugging Face Organization | [baidu](https://huggingface.co/baidu) |
@@ -40,8 +39,7 @@ ERNIE-4.5-0.3B-PT is used for text generation. Its model size is 0.36B parameter
 | Vocabulary Size | 103,424 |
 | Configured Dtype | `bfloat16` |
 
-- `Ernie4_5ForCausalLM`: dense Hugging Face implementation path.
-- `Ernie4_5_MoeForCausalLM`: custom NeMo AutoModel implementation with expert parallelism support.
+This checkpoint uses the dense Hugging Face implementation, `Ernie4_5ForCausalLM`.
 
 ## Available Models
 
@@ -52,6 +50,4 @@ ERNIE-4.5-0.3B-PT is used for text generation. Its model size is 0.36B parameter
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
-- [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
-
 - [Checkpoint Configuration](https://huggingface.co/baidu/ERNIE-4.5-0.3B-PT/blob/b565cf6caebdb7a1eadf00100857b1ed5e044f12/config.json)

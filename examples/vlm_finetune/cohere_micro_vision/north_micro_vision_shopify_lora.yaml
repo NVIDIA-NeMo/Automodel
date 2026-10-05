@@ -1,11 +1,18 @@
 # LoRA fine-tune of Cohere North Micro Vision Instruct on
 # Shopify/product-catalogue -- product image -> taxonomy category.
 #
-# 2-GPU data-parallel (FSDP2) run:
-#   automodel north_micro_vision_shopify_lora.yaml --nproc-per-node 2
+# The upstream model README requires Transformers 5.16.0:
+# https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct/blob/fa548d9aa62c1220bfd21fc6cfc465f1bd2a1a40/README.md
+# This checkout pins Transformers 5.15.1. The per-command override below
+# leaves the project dependency declarations unchanged.
 #
-# NOTE: requires transformers 5.15.0.dev0 (git main), NOT the transformers==5.8.1
-# that nemo-automodel==0.5.0 pins. See north_micro_vision_shopify_full.yaml for details.
+# 2-GPU data-parallel (FSDP2) run from the repository root:
+#   uv run --with transformers==5.16.0 automodel \
+#     examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_lora.yaml \
+#     --nproc-per-node 2
+#
+# The padding estimates below are historical notes from the earlier setup;
+# they have not been revalidated with Transformers 5.16.0.
 
 recipe: FinetuneRecipeForVLM
 

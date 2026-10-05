@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `SeedOssForCausalLM` architecture.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), then launch full fine-tuning on HellaSwag from the repository root with eight GPUs:
 
 ```bash
 automodel examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml --nproc-per-node 8
@@ -19,8 +19,8 @@ automodel examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml --nproc-per-nod
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | HellaSwag; TP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml) |
-| LoRA Fine-Tuning | HellaSwag | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml) |
+| Full Fine-Tuning | HellaSwag; tensor parallelism across 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml) |
+| LoRA Fine-Tuning | HellaSwag; `tp_size=1` | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml) |
 
 ## Model Context
 
@@ -40,26 +40,21 @@ Seed-OSS-36B-Instruct is used for text generation. Its model size is 36.15B chec
 
 ### Configuration
 
+The table describes the full fine-tuning recipe used in Quick Start. The low-rank adaptation (LoRA) recipe instead sets `tp_size=1` and uses rank-8 adapters (`dim=8`, `alpha=32`).
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=8, cp_size=1 |
-| Nodes | - |
-| Features | - |
-| Advanced | - |
-
-### More Recipes for This Model
-
-- [`seed_oss_36B_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml)
+| Hardware | GPU model and memory not specified in the recipe |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size=8`, `cp_size=1` |
+| Nodes | Not specified in the recipe |
+| Features | Sequence parallelism and sequence packing disabled |
+| Advanced | `torch.compile` disabled |
 
 ## Available Models
 
-- [`ByteDance-Seed/Seed-OSS-36B-Instruct`](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Seed-OSS-36B-Instruct](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct) | Checkpoint documented on this page |
-| [`ByteDance-Seed/Seed-OSS-36B-Instruct`](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct) | Checkpoint documented on this page |
+| [`ByteDance-Seed/Seed-OSS-36B-Instruct`](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct) | Instruction-tuned checkpoint used by both recipes |
 
 ## Related Resources
 

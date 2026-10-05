@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `GlmMoeDsaForCausalLM` architecture.
 
 ## Quick Start
 
-Allocate 16 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+To run LoRA fine-tuning on Tulu-3 with the example's 16 nodes and 8 GPUs per node, complete the setup in [Model Context](#model-context). On each node, set `NODE_RANK` to its unique rank (0-15) and `MASTER_ADDR` to the same rank-0 host address, then run from the repository root:
 
 ```bash
 uv run torchrun --nnodes 16 --nproc-per-node 8 \
@@ -41,19 +41,26 @@ GLM-5.2 is used for text generation. Its model size is 753.33B checkpoint parame
 | Experts | 256 routed / 1 shared / 8 selected per token |
 | Configured Dtype | `bfloat16` |
 
+### Prepare the Recipe Environment
+
+Follow the [installation instructions](/get-started/installation) to set up a source checkout on each node. The Quick Start requires TileLang (included in the `cuda` extra) and HybridEP built for multi-node use. The repository's [Dockerfile](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile) includes the HybridEP, NVSHMEM, and RDMA dependencies; the base package alone does not provide this environment.
+
+The LoRA recipe loads pretrained `zai-org/GLM-5.2` weights and the `allenai/tulu-3-sft-mixture` dataset. Both workflows above set `checkpoint.enabled: false`, so they do not save trained weights or adapters. To retain the results, enable checkpoint saving in the recipe.
+
 ### Configuration
+
+These settings describe the LoRA Quick Start example.
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=128 |
+| Hardware | 8 H100 GPUs per node (recipe example) |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=128` |
 | Nodes | 16 |
-| Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=4096), LoRA, HybridEP (dispatcher=hybridep) |
-| Advanced | attention=tilelang, linear=torch, experts=torch_mm, dispatcher=hybridep, sequence length 4096 |
+| Features | Activation checkpointing (`activation_checkpointing=true`), packed sequences (`packed_sequence_size=4096`), LoRA, HybridEP (`dispatcher=hybridep`) |
+| Advanced | `attn=tilelang`, `linear=torch`, `experts=torch_mm`, `dispatcher=hybridep`, sequence length 4096 |
 
 ### More Recipes for This Model
 
-- [`glm_5.2_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml)
 - [`glm_5.2_tulu3_32k_tilelang_cp8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml)
 - [`glm_5.2_tulu3_4k_cudnn_100k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_cudnn_100k.yaml)
 - [`glm_5.2_tulu3_4k_tilelang_100k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml)
@@ -61,12 +68,9 @@ GLM-5.2 is used for text generation. Its model size is 753.33B checkpoint parame
 
 ## Available Models
 
-- [`zai-org/GLM-5.2`](https://huggingface.co/zai-org/GLM-5.2)
-
 | Checkpoint | Type |
 | --- | --- |
-| [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2) | Checkpoint documented on this page |
-| [`zai-org/GLM-5.2`](https://huggingface.co/zai-org/GLM-5.2) | Checkpoint documented on this page |
+| [`zai-org/GLM-5.2`](https://huggingface.co/zai-org/GLM-5.2) | Pretrained checkpoint for the documented workflows |
 
 ## Related Resources
 

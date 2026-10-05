@@ -4,7 +4,7 @@ description: "Fine-tune HuggingFaceTB/SmolVLM-Instruct with NeMo AutoModel using
 slug: model-coverage/vision-language-models/huggingfacetb/SmolVLM-Instruct
 ---
 
-[SmolVLM](https://huggingface.co/blog/smolvlm) is HuggingFace's compact vision language model designed for on-device and memory-constrained deployment, featuring an efficient image token compression strategy.
+[SmolVLM](https://huggingface.co/blog/smolvlm) is Hugging Face's compact vision language model designed for on-device and memory-constrained deployment, featuring an efficient image token compression strategy.
 
 Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
@@ -31,7 +31,7 @@ SmolVLM-Instruct is used for image-text-to-text. Its model size is 2.25B paramet
 | Property | Value |
 | --- | --- |
 | Task | Image-Text-to-Text |
-| **Architecture** | `SmolVLMForConditionalGeneration` |
+| **Architecture** | `Idefics3ForConditionalGeneration` (pinned checkpoint configuration) |
 | Parameters | 2.25B |
 | Hugging Face Organization | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB) |
 | Decoder Layers | 24 |
@@ -53,6 +53,6 @@ Read [smolvlm_instruct_medpix_peft.yaml](https://github.com/NVIDIA-NeMo/Automode
 
 ## Related Resources
 
-- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
 
 - [Checkpoint Configuration](https://huggingface.co/HuggingFaceTB/SmolVLM-Instruct/blob/81cd9a775a4d644f2faf4e7becff4559b46b14c7/config.json)

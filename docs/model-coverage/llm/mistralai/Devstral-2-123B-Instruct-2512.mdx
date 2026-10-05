@@ -19,7 +19,7 @@ automodel examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml --n
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Fine-Tuning | SQuAD; 1 node; TP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml) |
+| Low-Rank Adaptation (LoRA) Fine-Tuning | SQuAD; 1 node; tensor parallelism across 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml) |
 
 ## Model Context
 
@@ -32,36 +32,34 @@ Devstral-2-123B-Instruct-2512 is used for text generation. Its model size is 125
 | Parameters | 125.03B checkpoint parameters |
 | Decoder Layers | 88 |
 | Hidden Size | 12,288 |
-| Attention | 96 attention heads / 8 key-value heads |
+| Attention | 96 attention heads and 8 key-value heads |
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 131,072 |
 | Configured Dtype | `bfloat16` |
 
 ### Configuration
 
+The checked-in recipe specifies the following example setup.
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=8, pp_size=1, cp_size=1, ep_size=1 |
+| Hardware | 8 NVIDIA H100 80 GB GPUs |
+| Strategy | Fully Sharded Data Parallel v2 (FSDP2); `tp_size=8`, `pp_size=1`, `cp_size=1`, `ep_size=1` |
 | Nodes | 1 |
-| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), LoRA |
-| Advanced | bfloat16 |
+| Features | Checkpointing (`enabled=true`), activation checkpointing (`activation_checkpointing=true`), LoRA |
+| Advanced | `bfloat16` |
 
 ### Workflow Notes
 
-Follow the [installation instructions](/get-started/installation).
+The checkpoint stores FP8 weights. The recipe loads each rank's shard and dequantizes it to `bfloat16`. Leave `model.force_hf` and `model.quantization_config` unset, as in the recipe, to retain this loading path.
 
 ## Available Models
 
-- [`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Devstral-2-123B-Instruct-2512](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Checkpoint documented on this page |
 | [`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Checkpoint documented on this page |
 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
-
 - [Checkpoint Configuration](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512/blob/1613bf01adb5e1c6fdc196b46e6b173eae75eb4a/config.json)

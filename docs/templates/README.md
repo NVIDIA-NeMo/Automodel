@@ -15,8 +15,9 @@ Use these H2 headings in this exact order:
 5. Related Resources
 
 Every area must have content. Do not add a body H1, another H2, or the old
-Model Reference wrapper. Model Context contains a brief introduction, the architecture table, then
-by free-form prose, custom H3 or deeper headings, tables, code, and callouts.
+Model Reference wrapper. Model Context starts with a brief introduction followed
+by the architecture table. You can add free-form prose, custom H3 or deeper
+headings, tables, code, and callouts after the table.
 
 ## Required Content
 
@@ -102,8 +103,9 @@ When removing a recipe, update cards that reference it in the same PR. If anothe
 checked-in recipe still targets that exact checkpoint, update Quick Start and
 Choose a Workflow to use it. If the deleted recipe was the checkpoint's last
 recipe, delete its model card, remove its nightly navigation and provider-index
-entries, and repair incoming links. Remove cards for converted checkpoints when
-their last execution recipe is deleted as well.
+entries, and repair incoming links. For a published card, add a redirect in
+`docs/fern/docs.yml` to an appropriate surviving page. Remove cards for converted
+checkpoints when their last execution recipe is deleted as well.
 
 CI rejects cards whose launch or workflow links reference deleted YAMLs and cards
 without a remaining matching recipe. Deleting one workflow does not require
@@ -120,8 +122,10 @@ are outside `docs/model-coverage/`. There is no per-model exception list.
 
 ### GPU CI Enrollment
 
-Release CI automatically discovers LLM and VLM example YAMLs. When adding a
-recipe to support a model card, add its exact filename stem to `exempt_configs`
+Release CI automatically discovers YAMLs under `examples/llm_finetune/` and
+`examples/vlm_finetune/`. Performance CI discovers YAMLs under
+`examples/llm_benchmark/` and `examples/vlm_benchmark/`. When adding a recipe to
+support a model card, add its exact filename stem to `exempt_configs`
 in `tests/ci_tests/configs/<test_folder>/override_recipes.yml` until its GPU
 training is validated for CI. Record the reason there. This keeps the recipe
 available to readers and subject to documentation and YAML checks without

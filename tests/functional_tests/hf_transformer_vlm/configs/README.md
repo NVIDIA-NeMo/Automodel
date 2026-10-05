@@ -1,4 +1,4 @@
-# VLM regression fixtures
+# VLM Regression Fixtures
 
 These Gemma 3 configurations exercise Hugging Face compatibility, checkpointing,
 and distributed training with the local tiny models selected by the functional

@@ -4,7 +4,7 @@ description: "Fine-tune internlm/internlm3-8b-instruct with NeMo AutoModel using
 slug: model-coverage/large-language-models/internlm/internlm3-8b-instruct
 ---
 
-[InternLM](https://github.com/InternLM/InternLM) is a bilingual (Chinese-English) language model series from Shanghai AI Laboratory, with versions 1, 2, and 3 each improving on reasoning, instruction following, and long-context capabilities.
+[InternLM](https://github.com/InternLM/InternLM) is a bilingual Chinese and English language model series from Shanghai AI Laboratory. This page covers the instruction-tuned InternLM3 checkpoint and its low-rank adaptation (LoRA) fine-tuning recipe.
 
 Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
@@ -12,7 +12,7 @@ Set up NeMo AutoModel with the
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+Follow the [installation instructions](/get-started/installation). From the repository root, run the example on one node with 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
 
 ```bash
 uv run automodel examples/llm_finetune/internlm/internlm3_8b_instruct_squad_peft.yaml --nproc-per-node 8
@@ -26,28 +26,24 @@ uv run automodel examples/llm_finetune/internlm/internlm3_8b_instruct_squad_peft
 
 ## Model Context
 
-internlm3-8b-instruct is used for text generation. Its model size is 8B parameters.
+`internlm/internlm3-8b-instruct` is an instruction-tuned text-generation checkpoint. The upstream model name uses 8B; the pinned checkpoint metadata reports 8,804,241,408 parameters (about 8.80B).
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
-| **Architecture** | `InternLMForCausalLM` / `InternLM2ForCausalLM` / `InternLM3ForCausalLM` |
-| Parameters | 8B |
+| Architecture | `InternLM3ForCausalLM` |
+| Parameters | About 8.80B (checkpoint metadata) |
 | Hugging Face Organization | [internlm](https://huggingface.co/internlm) |
 | Decoder Layers | 48 |
 | Hidden Size | 4,096 |
-| Attention | 32 attention heads / 2 key-value heads |
+| Attention | 32 attention heads and 2 key-value heads |
 | Context Length | 32,768 tokens (checkpoint configuration) |
 | Vocabulary Size | 128,512 |
 | Configured Dtype | `bfloat16` |
 
-- `InternLMForCausalLM` - InternLM v1
-- `InternLM2ForCausalLM` - InternLM2
-- `InternLM3ForCausalLM` - InternLM3
-
 ### Recipe Setup
 
-Read [internlm3_8b_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/internlm/internlm3_8b_instruct_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/internlm/internlm3_8b_instruct_squad_peft.yaml) uses Fully Sharded Data Parallel v2 (FSDP2), activation checkpointing, `bfloat16`, and LoRA rank 8 with alpha 32. It loads `rajpurkar/squad` with a 512-token sequence length and runs 100 steps with a global batch size of 8. The model configuration sets `trust_remote_code: true` to load the checkpoint's custom implementation. Review these settings before running the example.
 
 ## Available Models
 
@@ -60,3 +56,4 @@ Read [internlm3_8b_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Auto
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 
 - [Checkpoint Configuration](https://huggingface.co/internlm/internlm3-8b-instruct/blob/28c99415adaf61767bd1c619f4f99f308fdfd223/config.json)
+- [Checkpoint Parameter Metadata](https://huggingface.co/api/models/internlm/internlm3-8b-instruct/revision/28c99415adaf61767bd1c619f4f99f308fdfd223)

@@ -9,9 +9,10 @@ The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), obtain access to the [gated checkpoint](https://huggingface.co/meta-llama/Llama-3.1-8B), and authenticate with an approved Hugging Face token (`HF_TOKEN`). Install `bitsandbytes` with the `cuda_source` extra, then run this quantized low-rank adaptation (QLoRA) example on SQuAD from the repository root, using eight GPUs on one node:
 
 ```bash
+uv pip install "nemo-automodel[cuda_source]"
 automodel examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml --nproc-per-node 8
 ```
 
@@ -19,8 +20,8 @@ automodel examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml --nproc-pe
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| QLoRA Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml) |
-| LoRA Fine-Tuning | Synthetic data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_1/llama3_1_8b_peft_benchmark.yaml) |
+| QLoRA Fine-Tuning | SQuAD; 8-GPU example launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml) |
+| LoRA Benchmark | Synthetic data; 10 steps | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_1/llama3_1_8b_peft_benchmark.yaml) |
 
 ## Model Context
 
@@ -40,13 +41,15 @@ Llama-3.1-8B is used for text generation. Its model size is 8.03B checkpoint par
 
 ### Configuration
 
+These settings describe the SQuAD QLoRA recipe and the Quick Start launch.
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1 |
-| Nodes | - |
-| Features | LoRA |
-| Advanced | bfloat16 |
+| Hardware | 8 GPUs for the example launch; GPU model unspecified |
+| Strategy | FSDP2; `tp_size: 1`, `cp_size: 1` |
+| Nodes | 1 (Quick Start launch) |
+| Features | QLoRA: LoRA adapters with 4-bit NF4 quantization |
+| Advanced | Quantization compute and storage: `bfloat16`; double quantization enabled |
 
 ### More Recipes for This Model
 
@@ -63,14 +66,10 @@ Llama-3.1-8B is used for text generation. Its model size is 8.03B checkpoint par
 
 ## Available Models
 
-- [`meta-llama/Llama-3.1-8B`](https://huggingface.co/meta-llama/Llama-3.1-8B)
-- [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Checkpoint documented on this page |
-| [`meta-llama/Llama-3.1-8B`](https://huggingface.co/meta-llama/Llama-3.1-8B) | Checkpoint documented on this page |
-| [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) | Checkpoint documented on this page |
+| [`meta-llama/Llama-3.1-8B`](https://huggingface.co/meta-llama/Llama-3.1-8B) | Pretrained checkpoint used by the Quick Start |
+| [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) | Instruction-tuned variant used by the customizer SFT and two-node QLoRA recipes |
 
 ## Related Resources
 

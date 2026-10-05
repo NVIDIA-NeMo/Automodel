@@ -4,13 +4,11 @@ description: "Use tencent/Hy-MT2-30B-A3B with NeMo AutoModel for language model 
 slug: model-coverage/large-language-models/tencent/Hy-MT2-30B-A3B
 ---
 
-[Hy-MT2-30B-A3B](https://huggingface.co/tencent/Hy-MT2-30B-A3B) is Tencent's translation Mixture-of-Experts language model with 30B total parameters and 3B activated per token. It features 48 transformer layers (layer 0 dense, layers 1-47 MoE), 128 routed experts plus 1 shared expert with top-8 sigmoid routing, Grouped Query Attention (32 Q / 4 KV heads), per-head QK RMSNorm, RoPE, and an in-forward fp32 upcast on the language-model head (`enable_lm_head_fp32`). It supports a 256K context window.
+[Hy-MT2-30B-A3B](https://huggingface.co/tencent/Hy-MT2-30B-A3B) is Tencent's mixture-of-experts (MoE) translation model with 30B total parameters and 3B active parameters per token. Its checkpoint configuration specifies 48 transformer layers and a maximum context length of 262,144 tokens.
 
 ## Quick Start
 
-From the repository root, run:
-
-Refer to the [NeMo AutoModel Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+Follow the [NeMo AutoModel Installation Guide](/get-started/installation), including the `cuda` extra for Transformer Engine. From the repository root, run this eight-GPU example:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml
@@ -20,32 +18,39 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | HellaSwag; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml) |
+| Full Fine-Tuning | HellaSwag; 8 GPUs; FSDP2 with EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml) |
 
 ## Model Context
 
-Hy-MT2-30B-A3B is used for text generation (moe, translation). Its model size is 30B total / 3B activated parameters.
+The example loads pretrained weights and fine-tunes all model parameters on HellaSwag for up to 100 steps.
 
 | Property | Value |
 | --- | --- |
-| Task | Text Generation (MoE, translation) |
-| **Architecture** | `HyMT2ForCausalLM` |
-| Parameters | 30B total / 3B activated |
+| Task | Translation |
+| Architecture | `HyMT2ForCausalLM` (AutoModel implementation) |
+| Checkpoint Architecture | `HYV3ForCausalLM` (resolved to `HyMT2ForCausalLM` by AutoModel) |
+| Parameters | 30B total; 3B active per token |
 | Hugging Face Organization | [tencent](https://huggingface.co/tencent) |
-| Decoder Layers | 48 |
+| Decoder Layers | 48 (1 dense layer followed by 47 MoE layers) |
 | Hidden Size | 2,048 |
-| Attention | 32 attention heads / 4 key-value heads |
+| Attention | Grouped query attention with 32 query heads and 4 key-value heads |
+| Attention Normalization | Per-head query and key RMS normalization |
+| Position Embeddings | Rotary position embeddings (RoPE) |
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 120,832 |
-| Experts | 128 routed / 1 shared / 8 selected per token |
+| Experts | 128 routed experts and 1 shared expert; 8 routed experts selected per token with sigmoid routing |
 
-### Model Overview
+The example uses Fully Sharded Data Parallelism version 2 (FSDP2) with expert parallelism across eight GPUs (EP8), BF16 weights, and activation checkpointing. The YAML targets eight GPUs with at least 80 GB of memory each.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+The recipe sets `distributed.moe.lm_head_precision: float32` to run the language-model head in FP32. The model casts hidden states to FP32 for this projection and casts logits back to the hidden states' original dtype.
+
+### Prepare the Environment
+
+Set up NeMo AutoModel with the [NeMo AutoModel container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation) with the `cuda` extra, which is also included in the `all` bundle. The recipe selects Transformer Engine attention (`model.backend.attn: te`), which requires this optional dependency.
 
 ## Available Models
 
-| Model | HF ID |
+| Model | Hugging Face ID |
 |---|---|
 | Hy-MT2-30B-A3B | [`tencent/Hy-MT2-30B-A3B`](https://huggingface.co/tencent/Hy-MT2-30B-A3B) |
 
@@ -53,5 +58,4 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
-
 - [Checkpoint Configuration](https://huggingface.co/tencent/Hy-MT2-30B-A3B/blob/d3ead4dba61c09aac60a261a96ad1df3e705febb/config.json)

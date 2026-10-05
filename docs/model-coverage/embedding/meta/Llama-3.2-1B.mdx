@@ -1,6 +1,6 @@
 ---
 title: "meta-llama/Llama-3.2-1B"
-description: "Use NeMo AutoModel to fine-tune meta-llama/Llama-3.2-1B for Embedding workflows with checked-in feature extraction recipes and documented distributed settings."
+description: "Fine-tune meta-llama/Llama-3.2-1B for text embeddings with the NeMo AutoModel bi-encoder recipe using FEVER and synthetic classification data."
 slug: model-coverage/embedding-models/meta/Llama-3.2-1B
 ---
 
@@ -9,56 +9,65 @@ The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Complete the [setup requirements](#setup-requirements), then launch embedding fine-tuning on one node with eight GPUs from the repository root:
 
 ```bash
-uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
+uv run --extra cuda --group dev automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
 ```
 
 ## Choose a Workflow
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Embedding Fine-Tuning | FEVER and synthetic classification data; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml) |
+| Embedding Fine-Tuning | FEVER and synthetic classification data; 1 node, 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml) |
 
 ## Model Context
 
-Llama-3.2-1B is used for feature extraction. Its model size is 1.24B checkpoint parameters.
+The recipe adapts Llama-3.2-1B for text embeddings using average pooling, L2 normalization, and non-causal attention.
 
 | Property | Value |
 | --- | --- |
 | Task | Feature extraction |
-| **Architecture** | `LlamaForCausalLM` |
+| Architecture | `LlamaForCausalLM` (checkpoint configuration) |
 | Parameters | 1.24B checkpoint parameters |
 | Decoder Layers | 16 |
 | Hidden Size | 2,048 |
-| Attention | 32 attention heads / 8 key-value heads |
-| Context Length | 131,072 tokens (checkpoint configuration) |
+| Attention | 32 attention heads and 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration); recipe limits queries and passages to 512 tokens each |
 | Vocabulary Size | 128,256 |
 | Configured Dtype | `bfloat16` |
+
+### Setup Requirements
+
+Follow the [installation instructions](/get-started/installation). For a source checkout, select the `cuda` extra for Transformer Engine's `FusedAdam` optimizer and the `dev` group for Liger (`use_liger_kernel: true`):
+
+```bash
+uv sync --locked --extra cuda --group dev
+```
+
+The checkpoint requires approved access. Request access on the [Hugging Face model page](https://huggingface.co/meta-llama/Llama-3.2-1B), accept its terms, and wait for approval. Set `HF_TOKEN` in your launch environment to a Hugging Face user access token with read access to that repository.
 
 ### Configuration
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1 |
-| Nodes | 1 |
-| Features | Checkpointing (enabled=true) |
-| Advanced | bfloat16 |
+| Hardware | 8 GPUs in the example launch; GPU model not specified |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size=1`, `cp_size=1` |
+| Nodes | 1 in the example launch |
+| Features | Checkpoint saving (`checkpoint.enabled=true`) |
+| Precision | `bfloat16` |
 
 ### Workflow Notes
 
-Follow the [installation instructions](/get-started/installation).
+The recipe uses the `query:` and `passage:` prefixes and saves checkpoints under `./output/llama3_2_1b_encoder/checkpoints`.
+
+With `step_scheduler.global_batch_size=128` and `step_scheduler.local_batch_size=4`, the data-parallel GPU count must divide 32. With the configured `tp_size=1` and `cp_size=1`, this is the total GPU count. When changing `--nproc-per-node`, preserve this constraint or adjust the batch sizes. The eight-GPU example uses four gradient-accumulation steps.
 
 ## Available Models
 
-- [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) | Checkpoint documented on this page |
-| [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | Checkpoint documented on this page |
+| [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) | Base checkpoint for embedding fine-tuning |
 
 ## Related Resources
 

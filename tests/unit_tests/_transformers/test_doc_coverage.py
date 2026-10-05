@@ -45,15 +45,6 @@ _DOC_ARCH_ALIASES = {
     "LlamaBidirectionalModel": "GritLM",
     # Multimodal retrieval variant covered by the existing NVIDIA Llama Nemotron embedding page.
     "LlamaNemotronVLModel": "llama-nemotron-embed-1b-v2",
-    # HF ships ``LlavaOnevisionForConditionalGeneration`` (lowercase "n");
-    # registry uses ``LlavaOneVisionForConditionalGeneration`` (the NVIDIA
-    # re-impl for LLaVA-OneVision-1.5 with RICE ViT).
-    "LlavaOneVisionForConditionalGeneration": "LlavaOnevisionForConditionalGeneration",
-    # Registry also exposes the NVIDIA LLaVA-OneVision-1.5 re-impl under the
-    # class name ``LLaVAOneVision1_5_ForConditionalGeneration`` (all-caps
-    # "LLaVA" + explicit "1_5_" infix). The same model is documented on the
-    # lmms-lab/llava-onevision page under ``LlavaOneVisionForConditionalGeneration``.
-    "LLaVAOneVision1_5_ForConditionalGeneration": "LlavaOneVisionForConditionalGeneration",
     # Ministral3 text model; covered on the Ministral3 / Ministral3-VL pages
     # that list the VLM arch ``Mistral3ForConditionalGeneration``.
     "Ministral3ForCausalLM": "Mistral3ForConditionalGeneration",
@@ -62,9 +53,8 @@ _DOC_ARCH_ALIASES = {
     # Mistral4 text model is the backbone of Mistral-Small-4 VLM; documented
     # on the Mistral-Small-4 page via the recipe path ``mistral4``.
     "Mistral4ForCausalLM": "mistral4",
-    # Qwen3-Omni and Qwen3-VL are documented with the VL-facing arch name; the
-    # registry wires their MoE backbones under these keys.
-    "Qwen3OmniMoeForConditionalGeneration": "Qwen3OmniForConditionalGeneration",
+    # Qwen3-VL is documented with the VL-facing arch name; the registry wires
+    # its MoE backbone under this key.
     "Qwen3VLMoeForConditionalGeneration": "Qwen3VLForConditionalGeneration",
     # Qwen3.5-MoE text and VL entry points share the unified Qwen3.5 page.
     "Qwen3_5MoeForCausalLM": "Qwen3.5-MoE",

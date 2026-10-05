@@ -6,13 +6,13 @@ slug: model-coverage/large-language-models/openai/gpt-oss-20b
 
 [GPT-OSS](https://huggingface.co/openai/gpt-oss-20b) is OpenAI's open-weight model family featuring QuickGELU activations and activation clamping for training stability.
 
-The documented workflows cover full-parameter fine-tuning, LoRA, packed sequences, and a DGX Spark LoRA configuration.
+The documented workflows cover full-parameter fine-tuning, low-rank adaptation (LoRA), packed sequences, and a DGX Spark LoRA configuration.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-From the repository root, run:
+This example uses eight GPUs. From the repository root, run:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml
@@ -22,7 +22,7 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.ya
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | HellaSwag; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml) |
+| Full Fine-Tuning | HellaSwag; eight-way expert parallelism (EP8) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml) |
 | LoRA Fine-Tuning | HellaSwag; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_peft.yaml) |
 | Full Fine-Tuning (Packed Sequences) | HellaSwag; EP8; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml) |
 | LoRA Fine-Tuning | HellaSwag; DGX Spark | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_single_gpu_peft.yaml) |
@@ -44,9 +44,11 @@ gpt-oss-20b is used for text generation. Its model size is 21B total / 3.6B acti
 | Vocabulary Size | 201,088 |
 | Experts | 32 routed / 4 selected per token |
 
+The recipes load pretrained `openai/gpt-oss-20b` weights and train on HellaSwag. The packed-sequence recipe sets `checkpoint.enabled: false`, so it does not save the fine-tuned model.
+
 ## Available Models
 
-| Model | HF ID |
+| Model | Hugging Face ID |
 |---|---|
 | GPT-OSS 20B | [`openai/gpt-oss-20b`](https://huggingface.co/openai/gpt-oss-20b) |
 

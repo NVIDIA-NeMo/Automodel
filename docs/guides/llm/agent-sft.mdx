@@ -59,7 +59,7 @@ npm run pull
 The coding agent runs on the Hugging Face router, so export a token before generating. `src/single-session.ts` raises `HF_TOKEN is not set` without it:
 
 ```bash
-export HF_TOKEN=<your-hugging-face-token>
+export HF_TOKEN="<your-hugging-face-token>"
 ```
 
 The user model runs locally under llama.cpp. Serve the first entry of `LOCAL_MODELS` on the port the generator expects:
@@ -104,8 +104,9 @@ function assertCompleted(session: AgentSession, who: string) {
 }
 ```
 
-Call it after each `prompt()` in the turn loop. The run then exits non-zero on the first failed
-turn instead of printing `Trace saved to ...`, so the batch path cannot count it as complete. Pi
+Call it after each `prompt()` in the turn loop. A single-session invocation then exits non-zero on the first failed
+turn instead of printing `Trace saved to ...`. The batch generator catches the error and marks that session as failed,
+but still exits with status 0; inspect its per-session failure messages before uploading. Pi
 streams the session file as the conversation goes, so a partial file still lands on disk and
 should be discarded rather than uploaded.
 
@@ -117,15 +118,17 @@ With the server up, generate a small validation batch before scaling up:
 BATCH_SIZE=8 CONCURRENCY=2 node src/generate.ts
 ```
 
-Upload the generated dataset with the current Hugging Face CLI:
+Upload the generated dataset with the current Hugging Face CLI, replacing `<owner>/<dataset>` with your dataset repository ID:
 
 ```bash
-hf upload <owner>/<dataset> dataset . --repo-type dataset --exclude '.git/*'
+hf upload "<owner>/<dataset>" dataset . --repo-type dataset --exclude '.git/*'
 ```
 
 ### Train on the Generated Traces
 
-This recipe is retired from the current example set. To reproduce the historical run, download its pinned configuration below. The run used [`examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/291a8f21681d86f0dbb4f91fb906d5219ea0d07a/examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml). It reads `julien-c/synthtraces` through `refs/convert/parquet` and renders traces with [`qwen2_5_synthtraces_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_synthtraces_chat_template.jinja):
+This recipe is retired from the current example set. To reproduce the historical run, download its pinned configuration below. The run used [`examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/291a8f21681d86f0dbb4f91fb906d5219ea0d07a/examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml). It reads `julien-c/synthtraces` through `refs/convert/parquet` and renders traces with [`qwen2_5_synthtraces_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_synthtraces_chat_template.jinja).
+
+First complete [Set Up Your Environment](#set-up-your-environment), then run the following commands from the AutoModel repository root. The downloaded configuration resolves the chat-template path relative to your working directory, so do not launch it from the SynthTraces generator checkout.
 
 ```bash
 curl -fL https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/291a8f21681d86f0dbb4f91fb906d5219ea0d07a/examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml \
@@ -184,12 +187,12 @@ docker run -it --rm --gpus all --ipc=host --network host -v $(pwd):/workspace nv
 After the container starts, log in to Hugging Face and change to the repository directory:
 
 ```bash
-huggingface-cli login   # for gated model/dataset access if needed
+hf auth login   # for gated model/dataset access if needed
 cd /opt/Automodel
 ```
 
 <Tip>
-Outside the container, install from source with `uv` (the project standard): `uv sync` from a checkout of the repo. Avoid `pip install` for development setups.
+Outside the container, run `uv sync` from an AutoModel checkout, then activate the environment with `source .venv/bin/activate` before running this guide's commands.
 
 </Tip>
 
@@ -263,7 +266,7 @@ Only the assistant and tool-call spans are supervised. The user prompt and tool 
 
 ## Evaluate the Base Model Before Fine-Tuning
 
-Use the following code to render a held-out prompt **up to the point the model should call a tool**, pass the `tools` schema through the chat template, and generate the response:
+Use the following code to render an example prompt **up to the point the model should call a tool**, pass the `tools` schema through the chat template, and generate the response:
 
 ```python
 import json
@@ -319,7 +322,7 @@ Greedy output is deterministic for a given model snapshot and Transformers versi
 </Note>
 
 <Note>
-For a rigorous, repeatable score, NeMo AutoModel ships a generation-based **tool-call accuracy** evaluator (`nemo_automodel.components.eval.tool_call_evaluator.ToolCallAccuracyEvaluator`). It builds held-out prompts with `make_agent_chat_eval_samples`, parses generated tool calls with `nemo_automodel.components.eval.tool_call_parser`, and compares them with the ground-truth calls. The [Launch Fine-Tuning](#launch-fine-tuning) workflow runs it automatically during training.
+For quantitative evaluation, NeMo AutoModel ships a generation-based **tool-call accuracy** evaluator (`nemo_automodel.components.eval.tool_call_evaluator.ToolCallAccuracyEvaluator`). It builds prompts from the configured evaluation split with `make_agent_chat_eval_samples`, parses generated tool calls with `nemo_automodel.components.eval.tool_call_parser`, and compares them with the ground-truth calls. The FSDP2 workflow skips this evaluator by default; see [Monitor Training](#monitor-training) to enable it or [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model) to run it offline.
 
 </Note>
 
@@ -327,7 +330,7 @@ For a rigorous, repeatable score, NeMo AutoModel ships a generation-based **tool
 
 ## Configure Your Training
 
-This recipe is retired from the current example set. To reproduce the historical run, download its pinned configuration below. The run used [`examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml). The configuration file contains the following key blocks:
+The function-calling walkthrough uses [`examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml), which remains in the example set. The configuration file contains the following key blocks:
 
 ```yaml
 model:
@@ -347,7 +350,7 @@ dataset:
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen2.5-3B
 
-# The generation-based tool-call accuracy evaluation runs at every validation step alongside val_loss.
+# FSDP2 skips generation evaluation unless run_on_fsdp2 is set to true.
 tool_call_eval:
   _target_: nemo_automodel.components.eval.tool_call_evaluator.ToolCallAccuracyEvaluator
   dataset_name: llamafactory/glaive_toolcall_en
@@ -356,6 +359,10 @@ tool_call_eval:
   max_new_tokens: 256
   max_prompt_tokens: 3584
 ```
+
+<Warning>
+The full-SFT and LoRA configurations train on `train` and validate on `train[:256]`. The full-SFT tool-call evaluator uses `train[:128]`, so these evaluation rows overlap the training data. For a held-out comparison, set `dataset.split: train[256:]` in the configuration before training, leaving the validation and evaluation slices unchanged. Scores from the unmodified configurations measure performance on training examples.
+</Warning>
 
 <Note>
 **Answer-only loss mask.** The agent dataset uses `answer_only_loss_mask` to supervise only the tokens that the model must produce (assistant text and `tool_calls`). User turns and tool responses are masked to `-100`, so the model is never trained to predict the environment. This behavior is enabled by default in `make_agent_chat_dataset`.
@@ -373,7 +380,7 @@ tool_call_eval:
 </Tip>
 
 <Warning>
-`seq_length` only takes effect when **`truncation: true`** (to cap length) or `padding: max_length` (to pad). With the defaults (`truncation: false`, `padding: false`), `seq_length` is ignored, and long traces pass through uncapped. This behavior risks an out-of-memory error. Set `truncation: true` if you want a hard cap.
+With the function-calling configuration's defaults, `seq_length` alone does not cap tokenization, and long traces pass through uncapped. Set **`truncation: true`** to cap tokenized length, or `padding: max_length` to pad shorter traces. The adapter also uses `seq_length` when `truncate_history: true` drops older exchanges or `filter_overlong: true` removes traces that still exceed the limit. Those options default to `false`; the SynthTraces recipe enables them.
 
 </Warning>
 
@@ -393,7 +400,7 @@ Monitor the following metrics:
 - **`val_loss`** is reported at every validation step.
 
 <Note>
-The command above runs under **FSDP2**, where the in-loop generation evaluation is skipped by default because generation with sharded weights is expensive. `tool_call_eval.run_on_fsdp2` defaults to `false`, so **`tool_call/accuracy` and the other `tool_call/*` keys do not appear in the logs of the command above**. Set `tool_call_eval.run_on_fsdp2: true` to compute them in-loop, or evaluate tool-call accuracy from a saved checkpoint as described in [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model).
+The command above runs under **FSDP2**, where the in-loop generation evaluation is skipped by default because generation with sharded weights is expensive. `tool_call_eval.run_on_fsdp2` defaults to `false`, so **tool-call scores such as `tool_call/name_correct` and `tool_call/args_exact_match` do not appear in the logs of the command above**. The diagnostic `tool_call/_disabled_fsdp2` indicates that evaluation was skipped. Set `tool_call_eval.run_on_fsdp2: true` to compute scores in-loop, or evaluate a saved checkpoint as described in [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model).
 
 </Note>
 
@@ -446,20 +453,39 @@ print(tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
 
 The fine-tuned model should emit a structured call such as `get_stock_price` with `{"symbol": "AAPL"}`.
 
+To compute tool-call metrics for both models, run the offline evaluator from the AutoModel repository root:
+
+```bash
+python examples/llm_finetune/agent/evaluate_tool_call.py \
+  --base-model-path Qwen/Qwen2.5-3B \
+  --dataset-name llamafactory/glaive_toolcall_en --split 'train[:128]' \
+  --max-eval-samples 128 --max-new-tokens 256 --max-prompt-tokens 3584 \
+  --output-file base_tool_call_metrics.json
+
+python examples/llm_finetune/agent/evaluate_tool_call.py \
+  --checkpoint-path checkpoints/LOWEST_VAL \
+  --base-model-path Qwen/Qwen2.5-3B \
+  --dataset-name llamafactory/glaive_toolcall_en --split 'train[:128]' \
+  --max-eval-samples 128 --max-new-tokens 256 --max-prompt-tokens 3584 \
+  --output-file finetuned_tool_call_metrics.json
+```
+
+These commands use the same evaluation slice. It is held out only if you excluded it from training as described in [Configure Your Training](#configure-your-training).
+
 ---
 
 ## Compare Results
 
-Replace the placeholders in the following table with tool-call accuracy values from your run:
+Fill in the following table with values from your evaluation JSON files:
 
 | Metric | Base | Fine-Tuned |
 |--------|------|-----------|
-| Tool-name accuracy | ~0.30 | ~0.95 |
-| Argument-match accuracy | ~0.15 | ~0.85 |
-| Overall tool-call accuracy | ~0.20 | ~0.83 |
+| Tool-name accuracy (`tool_call/name_correct`) | — | — |
+| Argument exact match (`tool_call/args_exact_match`) | — | — |
+| Valid argument JSON (`tool_call/args_json_valid`) | — | — |
 
 <Note>
-The numbers above are placeholders that show the expected *shape* of the result (low for the base model and high for the fine-tuned model). Replace them with values from the `tool_call/*` metrics in the training log or a checkpoint evaluation.
+The evaluator reports separate scores for tool names and arguments; it does not emit an overall `tool_call/accuracy` metric. Compare both models on the same evaluation samples.
 
 </Note>
 
@@ -467,10 +493,12 @@ The numbers above are placeholders that show the expected *shape* of the result 
 
 ## Use PEFT with LoRA
 
-For a single-GPU run, use the LoRA config [`examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml), which adds a `peft` block on top of the same dataset and eval setup:
+For a single-GPU run, use the LoRA config [`examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml). It uses the same dataset and validation slices with a `peft` block, but its `tool_call_eval` block is commented out. Launch training with one worker:
 
 ```bash
-automodel examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml
+automodel --nproc-per-node=1 examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml
 ```
+
+Use the offline evaluator above to score the saved adapter checkpoint.
 
 See the [SFT and PEFT guide](/recipes-e2e-examples/sft-peft) for tuning LoRA rank, alpha, and target modules.

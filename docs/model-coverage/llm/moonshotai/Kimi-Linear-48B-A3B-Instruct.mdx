@@ -4,28 +4,28 @@ description: "Fine-tune moonshotai/Kimi-Linear-48B-A3B-Instruct with NeMo AutoMo
 slug: model-coverage/large-language-models/moonshotai/Kimi-Linear-48B-A3B-Instruct
 ---
 
-[Kimi Linear](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) is a hybrid-attention Mixture-of-Experts language model from Moonshot AI. Most layers use Kimi Delta Attention (KDA), a gated linear-attention variant with a recurrent state, and the remaining layers use full Multi-Head Latent Attention (MLA). NeMo AutoModel ships a native `KimiLinear48BForCausalLM` implementation with expert parallelism, packed sequences, and context parallelism.
+[Kimi Linear](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) is a hybrid-attention mixture-of-experts (MoE) language model from Moonshot AI. Most layers use Kimi Delta Attention (KDA), a gated linear-attention variant with a recurrent state, and the remaining layers use full Multi-Head Latent Attention (MLA). NeMo AutoModel ships a native `KimiLinear48BForCausalLM` implementation with expert parallelism, packed sequences, and context parallelism.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-From the repository root, run:
+From the repository root, run this eight-GPU example with the required Flash Linear Attention (`fla`) extra:
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml
+uv run --extra fla automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml
 ```
 
 ## Choose a Workflow
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | HellaSwag; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml) |
-| Full Fine-Tuning (Packed Sequences) | HellaSwag; 1 node; CP8; EP8; 32,768-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp8.yaml) |
+| Full Fine-Tuning | HellaSwag; 1 node, 8 GPUs; expert parallelism (EP=8) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml) |
+| Full Fine-Tuning (Packed Sequences) | HellaSwag; 1 node, 8 GPUs; context parallelism (CP=8); EP=8; 32,768-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp8.yaml) |
 
 ## Model Context
 
-Kimi-Linear-48B-A3B-Instruct is used for text generation (hybrid linear attention, moe). Its model size is 48B total / 3B active parameters.
+Kimi-Linear-48B-A3B-Instruct combines linear attention with MoE layers for text generation. Moonshot AI reports 48B total parameters and 3B active parameters per token.
 
 | Property | Value |
 | --- | --- |
@@ -52,14 +52,18 @@ distinct identity, `kimi_linear_48b_a3b` / `KimiLinear48BForCausalLM`, and leave
 explicitly, which is what a published Moonshot checkpoint needs; checkpoints saved by
 NeMo AutoModel already carry the distinct identity and load without that override.
 
+<Note>
+Both the [HellaSwag](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml#L54-L71) and [packed-sequence](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp8.yaml#L61-L79) examples load base weights (`load_base_model: true`). They disable checkpoint saving (`checkpoint.enabled: false`), so they do not retain trained weights after the run.
+</Note>
+
 ### Supported Parallelism
 
 | Feature | Notes |
 |---|---|
-| FSDP2 | Default sharding strategy for the recipes below |
+| Fully Sharded Data Parallel v2 (FSDP2) | Default sharding strategy for the examples in Choose a Workflow |
 | Expert parallelism (EP) | Shards the MoE experts across ranks |
-| Context parallelism (CP) | Contiguous per-rank sequence shards. KDA passes its recurrent state from rank to rank, and MLA gathers the compressed KV latent |
-| Packed sequences | Document boundaries from the THD collater are honored by both layer types, including under CP |
+| Context parallelism (CP) | Contiguous per-rank sequence shards. KDA passes its recurrent state from rank to rank, and MLA gathers the compressed key-value latent |
+| Packed sequences | Document boundaries from `packed_sequence_thd_collater` are honored by both layer types, including under CP |
 
 ## Available Models
 

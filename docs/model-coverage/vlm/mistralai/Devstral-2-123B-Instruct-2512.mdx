@@ -10,7 +10,7 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-Run the checked-in recipe on one node with eight GPUs:
+From the repository root, run the recipe's example topology: one node with eight H100 80 GB GPUs.
 
 ```bash
 uv run automodel examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml \
@@ -41,13 +41,12 @@ Devstral-2-123B-Instruct-2512 is used for text generation. Its model size is 125
 | Vocabulary Size | 131,072 |
 | Configured Dtype | `bfloat16` |
 
-## Available Models
+The recipe loads the pretrained checkpoint's FP8 weights and dequantizes each shard to BF16 for LoRA fine-tuning.
 
-- [`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512)
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
-| [Devstral-2-123B-Instruct-2512](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Checkpoint documented on this page |
 | [`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Checkpoint documented on this page |
 
 ## Related Resources

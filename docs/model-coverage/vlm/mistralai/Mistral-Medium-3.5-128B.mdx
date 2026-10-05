@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` a
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). Allocate 8 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+Fine-tune the language model on MedPix-VQA with the vision tower frozen. Follow the [installation instructions](/get-started/installation) and complete [Recipe Setup](#recipe-setup). From the repository root on each of 8 nodes with 8 GPUs each, run:
 
 ```bash
 uv run torchrun --nnodes 8 --nproc-per-node 8 \
@@ -26,7 +26,7 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 ## Model Context
 
-Mistral-Medium-3.5-128B is used for image-text-to-text. Its model size is 127.70B checkpoint parameters.
+Mistral-Medium-3.5-128B is used for image-text-to-text. Its model size is 127.70B checkpoint parameters. Both recipes load pretrained weights and limit input sequences to 2,048 tokens. They set `checkpoint.enabled: false`, so they do not save fine-tuned checkpoints.
 
 | Property | Value |
 | --- | --- |
@@ -36,7 +36,7 @@ Mistral-Medium-3.5-128B is used for image-text-to-text. Its model size is 127.70
 | Parameters | 127.70B checkpoint parameters |
 | Decoder Layers | 88 |
 | Hidden Size | 12,288 |
-| Attention | 96 attention heads / 8 key-value heads |
+| Attention | 96 attention heads and 8 key-value heads |
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 131,072 |
 | Configured Dtype | `bfloat16` |
@@ -45,42 +45,26 @@ Mistral-Medium-3.5-128B is used for image-text-to-text. Its model size is 127.70
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=8, pp_size=8, cp_size=1, ep_size=1 |
+| Example Hardware | 8 H100 80 GB GPUs per node (64 GPUs total) |
+| Strategy | Fully Sharded Data Parallel (FSDP2); tensor parallelism (TP): `tp_size=8`; pipeline parallelism (PP): `pp_size=8`; `cp_size=1`, `ep_size=1` |
 | Nodes | 8 |
-| Features | Activation checkpointing (activation_checkpointing=true) |
-| Advanced | torch.bfloat16 |
-
-### More Recipes for This Model
-
-- [`mistral3p5_128b_medpix_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix_lora.yaml)
-
-### Setup and Additional Examples
-
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+| Features | Activation checkpointing (`activation_checkpointing=true`) |
+| Training Dtype | `torch.bfloat16` |
 
 ### Recipe Setup
 
-Read [mistral3p5_128b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+The hardware above is the recipes' example topology. Changing the GPU count requires compatible parallelism and batch settings. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
 
-### Workflow Notes
-
-Fine-tune mistralai/Mistral-Medium-3.5-128B: [mistral3p5_128b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml). 8 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+On every node, use the same repository checkout and environment. Set `NODE_RANK` to a unique value from `0` through `7`, and set `MASTER_ADDR` to the same reachable address of node `0`. Port `29500` must be reachable between nodes. The recipes load the checkpoint and `mmoukouba/MedPix-VQA` training and validation splits from Hugging Face.
 
 ## Available Models
 
-- [`mistralai/Mistral-Medium-3.5-128B`](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Mistral-Medium-3.5-128B](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B) | Checkpoint documented on this page |
 | [`mistralai/Mistral-Medium-3.5-128B`](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B) | Checkpoint documented on this page |
 
 ## Related Resources
 
-- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+- [Fine-Tune Gemma 3n (Related VLM Example)](/recipes-e2e-examples/gemma-3-3n)
 
 - [Checkpoint Configuration](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B/blob/22b2b868a15677cfa6061277ed2f653d1349a9ab/config.json)

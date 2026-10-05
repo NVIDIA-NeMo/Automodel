@@ -12,7 +12,7 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-From the repository root, run:
+Use an environment with Transformer Engine and DeepEP installed. From the repository root, run this eight-GPU HellaSwag fine-tuning example with eight-way expert parallelism (EP8):
 
 ```bash
 uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te.yaml \
@@ -49,9 +49,13 @@ Moonlight-16B-A3B is used for text generation. Its model size is 16B total / 3B 
 | Configured Dtype | `bfloat16` |
 | Upstream Training | 5.7T tokens with Muon |
 
+For a source installation, include the `moe` extra to install Transformer Engine and DeepEP; the `all` extra omits DeepEP.
+
+The [Quick Start YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) sets `checkpoint.enabled: false`, so running it without overrides saves no trained weights. The Quick Start command above enables checkpoint saving and sets the output directory to `checkpoints/moonlight`.
+
 ### Workflow Notes
 
-Fine-tune the base checkpoint: Use [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml). It fine-tunes on HellaSwag for two epochs with FSDP2 and eight-way expert parallelism.
+Fine-tune the base checkpoint: Use [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml). It fine-tunes on HellaSwag for two epochs with Fully Sharded Data Parallel version 2 (FSDP2) and eight-way expert parallelism.
 
 Fine-tune with packed sequences: Use [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml). It packs sequences to 1,024 tokens and uses `torch_mm` experts.
 

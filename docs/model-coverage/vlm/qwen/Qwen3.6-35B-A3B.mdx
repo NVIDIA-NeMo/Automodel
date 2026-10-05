@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `Qwen3_5MoeForConditionalGeneration`
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation) and [recipe setup notes](#model-context), then fine-tune on MedPix-VQA from the repository root:
 
 ```bash
 automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml --nproc-per-node 8
@@ -33,12 +33,18 @@ Qwen3.6-35B-A3B is used for image-text-to-text. Its model size is 35.95B checkpo
 | Parameters | 35.95B checkpoint parameters |
 | Decoder Layers | 40 |
 | Hidden Size | 2,048 |
-| Attention | 16 attention heads / 2 key-value heads |
-| Context Length | 262,144 tokens (checkpoint configuration) |
+| Attention | Hybrid linear and full attention: 16 query/key and 32 value heads in linear layers; 16 query and 2 key-value heads in full-attention layers |
+| Context Length | 262,144 tokens (checkpoint configuration); primary recipe limits inputs to 2,048 tokens |
 | Vocabulary Size | 248,320 |
-| Experts | 256 routed / 8 selected per token |
+| Experts | 256 routed experts; 8 routed experts and 1 shared expert active per token |
+
+The Quick Start launches on eight GPUs with expert parallelism (`ep_size: 8`). For a source installation, add `--extra moe` to the installation guide's `uv sync` command to install DeepEP; the `all` extra omits it.
+
+The LoRA and EP8/CP2 recipes disable checkpoint saving (`checkpoint.enabled: false`), so they do not save trained weights unless you enable it.
 
 ### Configuration
+
+These settings describe the primary recipe.
 
 | Setting | Configuration |
 | --- | --- |
@@ -46,24 +52,19 @@ Qwen3.6-35B-A3B is used for image-text-to-text. Its model size is 35.95B checkpo
 | Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=8 |
 | Nodes | - |
 | Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), DeepEP (dispatcher=deepep) |
-| Advanced | attention=sdpa, linear=torch, experts=gmm, dispatcher=deepep |
+| Advanced | `attn=sdpa`, `linear=torch`, `experts=torch_mm`, `dispatcher=deepep` |
 
 ### More Recipes for This Model
 
-- [`qwen3_6_35b_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_lora.yaml)
 - [`qwen3_6_35b_medpix_ep8cp2_4k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_medpix_ep8cp2_4k.yaml)
 
 ## Available Models
 
-- [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | Checkpoint documented on this page |
 | [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | Checkpoint documented on this page |
 
 ## Related Resources
 
-- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
-
+- [Gemma 3n fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
 - [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/995ad96eacd98c81ed38be0c5b274b04031597b0/config.json)

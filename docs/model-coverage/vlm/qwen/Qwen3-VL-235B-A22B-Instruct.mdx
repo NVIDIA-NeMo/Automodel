@@ -1,6 +1,6 @@
 ---
 title: "Qwen/Qwen3-VL-235B-A22B-Instruct"
-description: "Use NeMo AutoModel to fine-tune Qwen/Qwen3-VL-235B-A22B-Instruct for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+description: "Fine-tune Qwen/Qwen3-VL-235B-A22B-Instruct on MedPix-VQA with NeMo AutoModel, or benchmark training with synthetic data, pipeline parallelism, and expert parallelism."
 slug: model-coverage/vision-language-models/qwen/Qwen3-VL-235B-A22B-Instruct
 ---
 
@@ -9,20 +9,21 @@ The Hugging Face configuration declares the `Qwen3VLMoeForConditionalGeneration`
 
 ## Quick Start
 
-Allocate 32 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+Complete the [recipe prerequisites](#prepare-the-environment), then run from the repository root on each of 32 nodes with 8 GPUs. Set `NODE_RANK` to a unique value from 0 to 31 and `MASTER_ADDR` to the rank-0 node's address, reachable from every node.
 
 ```bash
-uv run torchrun --nnodes 32 --nproc-per-node 8 \
+uv run --no-sync torchrun --nnodes 32 --nproc-per-node 8 \
   --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
-  -m nemo_automodel.cli.app examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml
+  -m nemo_automodel.cli.app examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml \
+  --step_scheduler.local_batch_size=4
 ```
 
 ## Choose a Workflow
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Vision-Language Fine-Tuning | MedPix-VQA; 32 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml) |
-| Training Benchmark | Synthetic data; 32 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/qwen/qwen3_vl_235b_te_deepep.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 32 nodes; PP4; EP32; `step_scheduler.local_batch_size=4` | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml) |
+| Training Benchmark | Random initialization; synthetic data; 32 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/qwen/qwen3_vl_235b_te_deepep.yaml) |
 
 ## Model Context
 
@@ -35,37 +36,46 @@ Qwen3-VL-235B-A22B-Instruct is used for image-text-to-text. Its model size is 23
 | Parameters | 235.67B checkpoint parameters |
 | Decoder Layers | 94 |
 | Hidden Size | 4,096 |
-| Attention | 64 attention heads / 4 key-value heads |
+| Attention | 64 attention heads and 4 key-value heads |
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 151,936 |
-| Experts | 128 routed / 8 selected per token |
+| Experts | 128 routed experts; 8 selected per token |
 
-### Configuration
+### Prepare the Environment
+
+Follow the [installation guide](/get-started/installation) and prepare the checkout's environment on every node. For a source installation, select the `vlm` and `moe` extras. The `moe` extra includes Transformer Engine through `cuda` and the pinned `deep_ep` package, which builds HybridEP; the standard `all` extra omits `moe`.
+
+This multi-node recipe needs a HybridEP build with multi-node support. When building from source, set `HYBRID_EP_MULTINODE=1` and configure the CUDA and RDMA build dependencies as shown in the repository's [HybridEP container setup](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile). Use the same prepared environment on all nodes; `--no-sync` keeps the launch from changing it.
+
+The 32-node, 8-GPU launch is an example topology, not a hardware minimum. Changes to GPU counts also require compatible batch sizes and parallelism settings. PP and EP denote pipeline parallelism and expert parallelism. Every node needs access to the checkpoint and `mmoukouba/MedPix-VQA` dataset.
+
+### Fine-Tuning Configuration
+
+The Quick Start loads pretrained weights and trains on MedPix-VQA with the vision tower frozen and a collator limit of 2,048 tokens. The recipe sets `checkpoint.enabled: false`, so it does not save trained weights. Enable checkpoint saving and configure a persistent `checkpoint.checkpoint_dir` to retain the result.
+
+The launch uses the recipe's CI local batch size of 4. With 256 GPUs and `pp_size=4`, there are 64 data-parallel ranks: a local batch of 4 gives the configured global batch of 256. The YAML's default local batch of 8 is incompatible with that global batch on this topology.
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=32 |
+| Hardware | GPU model not specified by the recipe |
+| Strategy | Fully Sharded Data Parallelism (FSDP2); `tp_size=1`, `pp_size=4`, `cp_size=1`, `ep_size=32` |
 | Nodes | 32 |
-| Features | Transformer Engine, HybridEP (dispatcher=hybridep) |
-| Advanced | attention=sdpa, linear=te, experts=gmm, dispatcher=hybridep |
+| Features | Transformer Engine, HybridEP (`dispatcher=hybridep`) |
+| Advanced | `attn=sdpa`, `linear=te`, `experts=torch_mm`, `dispatcher=hybridep` |
 
 ### More Recipes for This Model
 
-- [`qwen3_vl_235b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/qwen/qwen3_vl_235b_te_deepep.yaml)
-- [`qwen3vl235b_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/qwen/qwen3vl235b_lora.yaml)
+The training benchmark above and the LoRA benchmark below initialize models from configuration rather than loading pretrained weights. Both use synthetic data, Transformer Engine attention, HybridEP, and disabled checkpoint saving.
+
+- [`qwen3vl235b_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/qwen/qwen3vl235b_lora.yaml): Low-rank adaptation (LoRA) benchmark for the text backbone on 8 nodes, with `pp_size=2` and `ep_size=32`.
 
 ## Available Models
 
-- [`Qwen/Qwen3-VL-235B-A22B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-235B-A22B-Instruct)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Qwen3-VL-235B-A22B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-235B-A22B-Instruct) | Checkpoint documented on this page |
 | [`Qwen/Qwen3-VL-235B-A22B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-235B-A22B-Instruct) | Checkpoint documented on this page |
 
 ## Related Resources
 
-- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
-
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n) (related vision-language example)
 - [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-VL-235B-A22B-Instruct/blob/710c13861be6c466e66de3f484069440b8f31389/config.json)

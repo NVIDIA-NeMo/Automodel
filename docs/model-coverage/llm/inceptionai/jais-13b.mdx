@@ -12,7 +12,7 @@ Set up NeMo AutoModel with the
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+Follow the [installation instructions](/get-started/installation) and complete the [checkpoint access setup](#recipe-setup). From the repository root, run the example on one node with 8 GPUs. GPU training and memory use still require validation.
 
 ```bash
 uv run automodel examples/llm_finetune/inceptionai/jais_13b_squad_peft.yaml --nproc-per-node 8
@@ -43,7 +43,9 @@ jais-13b is used for text generation. Its model size is 13B parameters.
 
 ### Recipe Setup
 
-Read [jais_13b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/inceptionai/jais_13b_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+This checkpoint is gated. Request access on the [Hugging Face model page](https://huggingface.co/inceptionai/jais-13b), then set `HF_TOKEN` in your training environment to a token from an account with access.
+
+The [jais_13b_squad_peft.yaml recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/inceptionai/jais_13b_squad_peft.yaml) uses `rajpurkar/squad`, `bfloat16`, rank-8 low-rank adaptation (LoRA), Fully Sharded Data Parallel version 2 (FSDP2), and activation checkpointing. It runs for 100 steps with 512-token sequences and enables `trust_remote_code: true` to load the checkpoint's custom model code.
 
 ## Available Models
 
