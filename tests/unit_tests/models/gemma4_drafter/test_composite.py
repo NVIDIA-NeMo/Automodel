@@ -285,6 +285,31 @@ class TestCompositeForward:
         assert comp.drafter_num_steps == 2
 
 
+def test_ordered_drafter_trains_on_full_vocabulary_logits(device_and_dtype):
+    """Issue #4022: a drafter with the ordered-embedding head yields the plain full-vocabulary logits."""
+    import copy
+
+    from nemo_automodel.components.models.gemma4_drafter.model import Gemma4DrafterForCausalLM
+
+    device, dtype = device_and_dtype
+    torch.manual_seed(0)
+    base, base_text_cfg = _build_tiny_base(device, dtype)
+    plain, _ = _build_tiny_drafter(base_text_cfg, device, dtype)
+    ordered_cfg = copy.deepcopy(plain.config)
+    ordered_cfg.use_ordered_embeddings = True
+    ordered_cfg.num_centroids = 4
+    ordered_cfg.centroid_intermediate_top_k = 1
+    ordered = Gemma4DrafterForCausalLM(ordered_cfg).to(device=device, dtype=dtype).eval()
+    missing, unexpected = ordered.load_state_dict(plain.state_dict(), strict=False)
+    assert not unexpected and all(key.startswith("masked_embedding.") for key in missing)
+
+    ids = _input_ids(base_text_cfg, device, seq=6)
+    with torch.no_grad():
+        expected = Gemma4WithDrafter(base, plain)(input_ids=ids).drafter_logits[0]
+        actual = Gemma4WithDrafter(base, ordered)(input_ids=ids).drafter_logits[0]
+    torch.testing.assert_close(actual, expected)
+
+
 # ---------------------------------------------------------------------------
 # Gradient flow on a joint loss — the most failure-prone path. Both losses
 # must reach the parameters the plan promises will be trained.
