@@ -27,6 +27,7 @@ import pytest
 import torch
 import torch.nn as nn
 from datasets import Dataset
+from jinja2 import TemplateError
 from PIL import Image
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel, WordPiece
@@ -621,7 +622,8 @@ def test_ministral3_exported_stock_processor_matches_training_image_preprocessin
         torch.testing.assert_close(inference[key], training[key])
 
 
-def test_ministral3_biencoder_processor_chat_template_matches_training_helpers(monkeypatch):
+@pytest.mark.parametrize("prompt_suffix", ["", " ", "  "])
+def test_ministral3_biencoder_processor_chat_template_matches_training_helpers(monkeypatch, prompt_suffix):
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     processor = Mistral3BiEncoderProcessor(
         image_processor=FakePixtralImageProcessor(),
@@ -630,22 +632,22 @@ def test_ministral3_biencoder_processor_chat_template_matches_training_helpers(m
         q_max_length=64,
         p_max_length=64,
         padding=False,
-        query_prefix="query: [INST]",
-        passage_prefix="passage: [INST]",
+        query_prefix="query: [INST]" + prompt_suffix,
+        passage_prefix="passage: [INST]" + prompt_suffix,
         chat_template='{{ bos_token }}[INST]{{ messages[0]["content"] }}[/INST]',
     )
     image = Image.new("RGB", (4, 4), (255, 0, 0))
 
     query_rendered = processor.apply_chat_template(
         [
-            {"role": "system", "content": "query: [INST]"},
+            {"role": "system", "content": "query: [INST]" + prompt_suffix},
             {"role": "user", "content": "literal [IMG]"},
         ],
         tokenize=False,
     )
     document_rendered = processor.apply_chat_template(
         [
-            {"role": "system", "content": [{"type": "text", "text": "passage: [INST]"}]},
+            {"role": "system", "content": [{"type": "text", "text": "passage: [INST]" + prompt_suffix}]},
             {
                 "role": "user",
                 "content": [
@@ -664,14 +666,90 @@ def test_ministral3_biencoder_processor_chat_template_matches_training_helpers(m
 
     query_inference = processor(text=[query_rendered], padding=False, return_tensors="pt")
     document_inference = processor(images=[image], text=[document_rendered], padding=False, return_tensors="pt")
+    document_inference_texts = processor.tokenizer.calls[-1]["texts"]
     query_training = processor.process_queries(["literal [IMG]"], padding=False)
+    assert processor.tokenizer.calls[-1]["texts"] == [query_rendered]
     document_training = processor.process_documents(
         {"images": [image], "texts": ["literal [IMG_END]"]},
         padding=False,
     )
 
+    assert processor.tokenizer.calls[-1]["texts"] == document_inference_texts
+
     torch.testing.assert_close(query_inference["input_ids"], query_training["input_ids"])
     torch.testing.assert_close(document_inference["input_ids"], document_training["input_ids"])
+
+
+@pytest.mark.parametrize("prefix", ["query:", "passage:"])
+@pytest.mark.parametrize("suffix", ["", " ", "  "])
+@pytest.mark.parametrize("structured_prefix", [False, True])
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("literal [IMG]", "literal [\u200cIMG]"),
+        (" literal", " literal"),
+        ([{"type": "image"}], "[IMG]"),
+        (
+            [{"type": "text", "text": "literal [IMG]"}, {"type": "image"}],
+            "[IMG] literal [\u200cIMG]",
+        ),
+        (
+            [{"type": "image_url", "image_url": {"url": "unused"}}, {"type": "text", "text": "doc"}],
+            "[IMG] doc",
+        ),
+    ],
+)
+def test_ministral3_chat_template_normalizes_prefix_spacing(
+    pixtral_processor, prefix, suffix, structured_prefix, content, expected
+):
+    system_content = [{"type": "text", "text": prefix + suffix}] if structured_prefix else prefix + suffix
+    rendered = pixtral_processor.apply_chat_template(
+        [{"role": "system", "content": system_content}, {"role": "user", "content": content}],
+        tokenize=False,
+    )
+
+    assert rendered == prefix + " " + expected
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "system", "content": "query:"}],
+        [{"role": "assistant", "content": "literal"}],
+        [{"role": "user", "content": "A"}, {"role": "user", "content": "B"}],
+        [
+            {"role": "system", "content": "query:"},
+            {"role": "user", "content": "A"},
+            {"role": "user", "content": "B"},
+        ],
+    ],
+)
+def test_ministral3_chat_template_rejects_invalid_message_roles(pixtral_processor, messages):
+    with pytest.raises(TemplateError, match="Retrieval inputs require one user message"):
+        pixtral_processor.apply_chat_template(messages, tokenize=False)
+
+
+def test_ministral3_chat_template_user_only_preserves_literal_control_tokens(pixtral_processor):
+    rendered = pixtral_processor.apply_chat_template(
+        [{"role": "user", "content": [{"type": "text", "text": "literal [IMG]"}, {"type": "image"}]}],
+        tokenize=False,
+    )
+
+    assert rendered == "[IMG] literal [\u200cIMG]"
+
+
+def test_ministral3_exported_chat_template_vllm_content_format(tmp_path):
+    # vLLM is an optional serving dependency, absent from the default CPU test environment.
+    hf_renderer = pytest.importorskip("vllm.renderers.hf", reason="Requires the optional vLLM serving dependency")
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+    )
+    processor.save_pretrained(tmp_path)
+    template = (tmp_path / "chat_template.jinja").read_text()
+
+    assert hf_renderer._detect_content_format(template, default="string") == "openai"
 
 
 def test_ministral3_biencoder_processor_structured_image_ids_match_flat_reference(pixtral_processor):
@@ -727,7 +805,7 @@ def test_ministral3_biencoder_processor_matches_real_checkpoint_pixtral_ids(tmp_
         SimpleNamespace(query_prefix="query:", passage_prefix="passage:", use_dataset_instruction=False),
         tokenizer=processor,
     )
-    assert export_prompts == {"query_prompt": "query:", "document_prompt": "passage:", "tokenizer": processor}
+    assert export_prompts == {"query_prompt": "query: ", "document_prompt": "passage: ", "tokenizer": processor}
 
     actual = processor.process_documents({"images": [image], "texts": ["ordinary document"]}, padding=False)
     expected = reference(
@@ -1455,7 +1533,8 @@ def test_mistral3_vlm_portable_export_allows_subclasses_to_explicitly_reassert_c
     assert model.get_hf_export_config().model_type == "mistral3"
 
 
-def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeypatch):
+@pytest.mark.parametrize("prefix_suffix", ["", " ", "  "])
+def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeypatch, prefix_suffix):
     from sentence_transformers import SentenceTransformer
 
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
@@ -1468,8 +1547,8 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
         q_max_length=16,
         p_max_length=32,
         padding=True,
-        query_prefix="query:",
-        passage_prefix="passage:",
+        query_prefix="query:" + prefix_suffix,
+        passage_prefix="passage:" + prefix_suffix,
     )
     config = _tiny_mistral3_bidirectional_vlm_config()
     assert hasattr(config, "image_token_id")
@@ -1479,10 +1558,7 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
         pooling="avg",
         l2_normalize=True,
     ).eval()
-    encoder.configure_sentence_transformer_prompts(
-        query_prompt="query:",
-        document_prompt="passage:",
-    )
+    _configure_sentence_transformer_export(encoder, processor, tokenizer=processor)
     assert encoder.sentence_transformer_export_config is not None
     assert encoder.sentence_transformer_export_config.input_mode == "structured_multimodal"
     image = Image.new("RGB", (16, 16), (255, 0, 0))
@@ -1512,8 +1588,8 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
     ]
     sentence_transformer_config = json.loads((tmp_path / "config_sentence_transformers.json").read_text())
     assert sentence_transformer_config["prompts"] == {
-        "query": "query:",
-        "document": "passage:",
+        "query": "query: ",
+        "document": "passage: ",
     }
     transformer_config = json.loads((tmp_path / "sentence_bert_config.json").read_text())
     assert transformer_config["max_seq_length"] == 48
@@ -1536,9 +1612,16 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
 
     reloaded_processor = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
     assert type(reloaded_processor) is PixtralProcessor
+    for prefix, text in (("query:", "Text query"), ("passage:", "Text doc")):
+        for suffix in ("", " ", "  "):
+            rendered = reloaded_processor.apply_chat_template(
+                [{"role": "system", "content": prefix + suffix}, {"role": "user", "content": text}],
+                tokenize=False,
+            )
+            assert rendered == prefix + " " + text
     sentence_transformer = SentenceTransformer(str(tmp_path), device="cpu", trust_remote_code=False)
     assert sentence_transformer.max_seq_length == 48
-    assert sentence_transformer.prompts == {"query": "query:", "document": "passage:"}
+    assert sentence_transformer.prompts == {"query": "query: ", "document": "passage: "}
     assert [type(module).__name__ for module in sentence_transformer] == ["Transformer", "Pooling", "Normalize"]
     assert type(sentence_transformer[0].processor) is PixtralProcessor
     assert sentence_transformer[1].pooling_mode == "mean"

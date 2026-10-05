@@ -129,17 +129,21 @@ _MISTRAL_RETRIEVAL_CHAT_TEMPLATE = r"""
     {{- raise_exception("User content must be a string or a list of text and image blocks") -}}
 {%- endif -%}
 {%- endmacro -%}
-{%- if messages | length == 1 and messages[0]["role"] == "user" -%}
-    {{- render_user_content(messages[0]["content"]) -}}
-{%- elif messages | length == 2
-    and messages[0]["role"] == "system"
-    and messages[1]["role"] == "user" -%}
-    {{- render_text_content(messages[0]["content"], "System content") -}}
-    {{- " " -}}
-    {{- render_user_content(messages[1]["content"]) -}}
-{%- else -%}
+{%- if not ((messages | length == 1 and messages[0]["role"] == "user")
+    or (messages | length == 2
+        and messages[0]["role"] == "system"
+        and messages[1]["role"] == "user")) -%}
     {{- raise_exception("Retrieval inputs require one user message with an optional leading system prefix") -}}
 {%- endif -%}
+{# Iterate messages so vLLM can trace message.content into the rendering macros. #}
+{%- for message in messages -%}
+    {%- if message["role"] == "system" -%}
+        {%- set prefix = render_text_content(message["content"], "System content") -%}
+        {{- prefix.rstrip(" ") ~ " " -}}
+    {%- else -%}
+        {{- render_user_content(message["content"]) -}}
+    {%- endif -%}
+{%- endfor -%}
 {%- endif -%}
 """.strip()
 
@@ -206,9 +210,15 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
     its tokenizer treats raw control markers as processor-owned, while its chat
     template marks externally supplied text for ordinary tokenization. Direct
     retrieval query/document helpers apply the same text marker because they do
-    not render the chat template. Saving defaults to the stock Pixtral class for
-    portable bi-encoder checkpoints; cross-encoder recipes preserve this class
-    because their evaluation path requires its custom batching helper.
+    not render the chat template. Newly constructed retrieval templates and training
+    helpers normalize trailing ASCII spaces in query/document prefixes and add one
+    separator before content. This changes inputs for configurations that previously
+    relied on repeated prefix separators. Existing stock processor exports retain
+    their saved template.
+
+    Saving defaults to the stock Pixtral class for portable bi-encoder checkpoints;
+    cross-encoder recipes preserve this class because their evaluation path requires
+    its custom batching helper.
     """
 
     _export_as_stock_processor = True
@@ -372,8 +382,9 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         self.p_max_length = p_max_length if p_max_length is not None else p_max_len
         self.rerank_max_length = rerank_max_length
         self.pad_to_multiple_of = pad_to_multiple_of
-        self.query_prefix = query_prefix
-        self.passage_prefix = passage_prefix
+        # Training helpers and the chat template own one separator after each prefix.
+        self.query_prefix = query_prefix.rstrip(" ")
+        self.passage_prefix = passage_prefix.rstrip(" ")
         self.padding = padding
         if image_longest_edge is not None:
             self.image_longest_edge = image_longest_edge
