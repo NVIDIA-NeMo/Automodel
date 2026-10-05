@@ -116,6 +116,11 @@ The following table compares the recipe components:
 | Collator | `BiEncoderCollator` | `CrossEncoderCollator` |
 | Training objective | Cross entropy over one positive plus negatives | Cross entropy over one positive plus negatives |
 
+For Python callers, `NeMoAutoModelCrossEncoder.from_pretrained` follows the Transformers positional argument
+convention: arguments after the checkpoint path are forwarded to the backbone constructor. Calls that previously
+passed the attention implementation as the second positional argument must now use a keyword, for example
+`NeMoAutoModelCrossEncoder.from_pretrained(checkpoint_path, attn_implementation="sdpa")`.
+
 The bi-encoder computes a query embedding and passage embeddings independently. The cross-encoder formats each
 query-passage pair into one sequence and predicts a score for each candidate passage.
 
@@ -314,9 +319,13 @@ distributed:
 ```
 
 For a cross-encoder, change `recipe`, `model._target_`, `dataset.model_type`, and `dataloader.collate_fn`
-to the cross-encoder values in the following example. Also set `model.num_labels: 1`, set the loss temperature under
-`model.temperature`, replace `q_max_len` and `p_max_len` with `rerank_max_length` in the collator, and use a separate
-`checkpoint.checkpoint_dir` such as `./output/llama3_2_1b_cross_encoder/checkpoints`.
+to the cross-encoder values in the following example. Also set `model.num_labels: 1`, choose model-side score scaling
+with `model.temperature`, replace `q_max_len` and `p_max_len` with `rerank_max_length` in the collator, and use a separate
+`checkpoint.checkpoint_dir` such as `./output/llama3_2_1b_cross_encoder/checkpoints`. The top-level `temperature`
+now scales the cross-encoder's listwise training and validation loss, as it does for the bi-encoder. When converting
+an existing cross-encoder config, set it to `1.0` to preserve the previous loss behavior. For a non-unit top-level
+temperature, keep `model.temperature: 1.0` so scores are not scaled twice. `model.temperature` also changes exported
+inference scores; the top-level temperature changes only the recipe loss.
 
 ## Configure a Bi-Encoder
 
@@ -829,6 +838,16 @@ The example produces one scalar tensor named `score`. Its value depends on the f
 
 Use a cross-encoder checkpoint to rerank a shortlist from a retriever. Cross-encoders score each query-passage pair
 jointly, so they are usually too expensive for first-stage full-corpus search.
+
+Text reranker training with `CrossEncoderCollator` saves its `prompt_template` as a named `reranking` tokenizer
+chat template. Sentence Transformers 5.6 or later applies that template automatically when you pass query/document
+pairs to `CrossEncoder.predict`. Both direct and consolidated saves preserve the template without adding custom
+Python code to the checkpoint. Any existing model requirement for `trust_remote_code` still applies.
+
+This export path supports right truncation and templates ending in `{query}` or `{passage}`. The tokenizer must
+represent its special tokens as a single-sequence prefix and suffix with zero token type IDs. Setup rejects
+incompatible tokenizers or templates because their training tokenization cannot be preserved by this export path.
+The checkpoint's inference limit comes from `tokenizer.model_max_length`; `rerank_max_length` remains the training limit.
 
 The following example loads a cross-encoder and ranks two passages:
 

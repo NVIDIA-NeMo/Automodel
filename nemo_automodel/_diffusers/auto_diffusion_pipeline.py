@@ -40,10 +40,11 @@ Usage:
     )
 """
 
+import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable
+from typing import TYPE_CHECKING, Any, Dict, Iterable
 
 import torch
 import torch.nn as nn
@@ -490,6 +491,75 @@ def _apply_parallelization(
     return pipe
 
 
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
+    from nemo_automodel.components._peft.lora import PeftConfig
+    from nemo_automodel.components.models.common import BackendConfig
+
+# A value a YAML / CLI override can assign to a model config field.
+ConfigFieldValue = bool | int | float | str | list[bool | int | float | str] | None
+
+
+def _transformer_dir(model_dir: str, subfolder: str = "transformer") -> str:
+    """Directory that holds the transformer's ``config.json``.
+
+    Diffusers repositories (those with a ``model_index.json``) keep it in ``subfolder``; single-model checkpoints
+    keep it at the root.
+    """
+    if os.path.isfile(os.path.join(model_dir, "model_index.json")):
+        return os.path.join(model_dir, subfolder)
+    return model_dir
+
+
+def _has_custom_model(transformer_dir: str) -> bool:
+    """Whether the transformer has a custom Automodel implementation.
+
+    This is the decision ``NeMoAutoModel.from_pretrained`` makes for LLMs and VLMs (``get_is_hf_model``): load the
+    config the same way and resolve it against ``ModelRegistry``. Diffusers transformer configs have no
+    ``architectures`` and are skipped before loading.
+    """
+    from nemo_automodel._transformers.model_init import get_hf_config, get_is_hf_model
+
+    config_path = os.path.join(transformer_dir, "config.json")
+    if not os.path.isfile(config_path):
+        return False
+    with open(config_path) as f:
+        if not json.load(f).get("architectures"):
+            return False
+    config = get_hf_config(transformer_dir, attn_implementation=None, trust_remote_code=False)
+    return not get_is_hf_model(config, force_hf=False)
+
+
+def has_custom_transformer(pretrained_model_name_or_path: str) -> bool:
+    """Whether ``NeMoAutoDiffusionPipeline.from_pretrained`` builds this checkpoint's transformer from a custom
+    Automodel implementation (and so returns a transformer-only pipeline)."""
+    return _has_custom_model(_transformer_dir(resolve_diffusion_model_dir(pretrained_model_name_or_path)))
+
+
+def _validate_custom_model_options(mesh_context: MeshContext | None, **options: bool | str | None) -> None:
+    """Check that no option a custom model cannot honor was requested.
+
+    ``options`` are the pipeline arguments that only work with a diffusers transformer because they call diffusers
+    APIs (``transformer_engine_linear``, ``fuse_qkv_projections``, ``attention_backend``, ...). Context parallelism
+    is not supported for custom models yet either.
+    """
+    requested = sorted(name for name, value in options.items() if value)
+    if requested:
+        raise ValueError(f"{requested} only work with a diffusers transformer; this checkpoint uses a custom model.")
+    if mesh_context is not None and mesh_context.cp_size > 1:
+        raise ValueError("Context parallelism is not supported for custom models yet (cp_size > 1).")
+
+
+def _apply_config_overrides(config: "PretrainedConfig", config_overrides: dict[str, ConfigFieldValue]) -> None:
+    """Set ``config_overrides`` on the loaded model config. Unknown fields are an error, so typos cannot pass silently."""
+    unknown = sorted(set(config_overrides) - set(config.to_dict()))
+    if unknown:
+        raise ValueError(f"config_overrides has fields that {type(config).__name__} does not define: {unknown}")
+    for key, value in config_overrides.items():
+        setattr(config, key, value)
+
+
 class NeMoAutoDiffusionPipeline:
     """
     Unified diffusion pipeline wrapper for all model types.
@@ -553,13 +623,19 @@ class NeMoAutoDiffusionPipeline:
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
+        backend: "BackendConfig | None" = None,
+        config_overrides: dict[str, ConfigFieldValue] | None = None,
         **kwargs,
-    ) -> DiffusionPipeline:
+    ) -> "DiffusionPipeline | NeMoAutoDiffusionPipeline":
         """
         Load pipeline from pretrained weights using DiffusionPipeline auto-detection.
 
         This method auto-detects the pipeline type from model_index.json and loads
         all components. Use this for finetuning existing models.
+
+        When the transformer's architecture has a custom Automodel implementation (``ModelRegistry``), only the
+        transformer is built, through ``NeMoAutoModelForDiffusion``, and a ``NeMoAutoDiffusionPipeline`` holding
+        it is returned; the diffusers-only options below are then rejected.
 
         No pipeline_spec is needed - the pipeline type is determined automatically.
 
@@ -587,21 +663,48 @@ class NeMoAutoDiffusionPipeline:
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             attention_backend: Optional diffusers attention backend name set on the transformer
                 before parallelization (context parallelism validates the backend at enable time).
+            backend: ``BackendConfig`` of a custom-model transformer.
+            config_overrides: Fields set on the custom-model transformer's config before it is built; every key
+                must be a field of that config.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
-            The loaded pipeline with requested components replaced by their parallelized modules.
+            The loaded diffusers pipeline with requested components replaced by their parallelized modules, or a
+            ``NeMoAutoDiffusionPipeline`` holding the custom-model transformer.
         """
-        if not DIFFUSERS_AVAILABLE:
-            raise RuntimeError(
-                "diffusers is required for NeMoAutoDiffusionPipeline.from_pretrained. "
-                "Install with: pip install nemo_automodel[diffusion]"
-            )
         logger.info("[INFO] Loading pipeline from pretrained: %s", pretrained_model_name_or_path)
 
         # Resolve to a local snapshot dir so a warm HF cache is not re-validated
         # (and potentially re-downloaded) over the network on every run.
         model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path)
+
+        transformer_dir = _transformer_dir(model_dir)
+        if _has_custom_model(transformer_dir):
+            if components_to_load is not None and set(components_to_load) - {"transformer"}:
+                raise ValueError("Custom-model pipelines load only the `transformer` component.")
+            _validate_custom_model_options(
+                mesh_context,
+                active_transformer=active_transformer,
+                transformer_engine_linear=transformer_engine_linear,
+                fuse_qkv_projections=fuse_qkv_projections,
+                attention_backend=attention_backend,
+            )
+            return cls._from_custom_model(
+                transformer_dir,
+                mesh_context=mesh_context,
+                torch_dtype=torch_dtype,
+                load_base_model=True,
+                load_for_training=load_for_training,
+                peft_cfg=peft_cfg,
+                backend=backend,
+                config_overrides=config_overrides,
+            )
+
+        if not DIFFUSERS_AVAILABLE:
+            raise RuntimeError(
+                "diffusers is required for NeMoAutoDiffusionPipeline.from_pretrained. "
+                "Install with: pip install nemo_automodel[diffusion]"
+            )
 
         # Use DiffusionPipeline.from_pretrained for auto-detection
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
@@ -737,6 +840,63 @@ class NeMoAutoDiffusionPipeline:
         return pipe
 
     @classmethod
+    def _from_custom_model(
+        cls,
+        transformer_dir: str,
+        *,
+        mesh_context: MeshContext | None,
+        torch_dtype: torch.dtype,
+        load_base_model: bool,
+        load_for_training: bool,
+        peft_cfg: "PeftConfig | None" = None,
+        backend: "BackendConfig | None" = None,
+        config_overrides: dict[str, ConfigFieldValue] | None = None,
+    ) -> "NeMoAutoDiffusionPipeline":
+        """Pipeline around a transformer built from its custom Automodel implementation.
+
+        Same as the LLM recipe's ``build_model``: ``NeMoAutoModelForDiffusion.from_config`` with a ``DistributedSetup``
+        does the sharding (FSDP2, expert parallelism), PEFT and sharded weight loading. ``config_overrides`` are
+        applied to the loaded model config (fields must exist on it).
+        """
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForDiffusion
+        from nemo_automodel._transformers.model_init import get_hf_config
+        from nemo_automodel.components.distributed.config import DistributedSetup
+
+        config = get_hf_config(transformer_dir, attn_implementation=None, trust_remote_code=False)
+        _apply_config_overrides(config, config_overrides or {})
+
+        distributed_setup = None
+        if mesh_context is not None:
+            distributed_setup = DistributedSetup(
+                mesh_context=mesh_context,
+                strategy_config=mesh_context.strategy_config,
+                moe_parallel_config=mesh_context.moe_parallel_config,
+                activation_checkpointing=mesh_context.activation_checkpointing,
+            )
+        model_kwargs = {"backend": backend} if backend is not None else {}
+
+        logger.info("[INFO] Building custom-model transformer %s from %s", config.architectures[0], transformer_dir)
+        transformer = NeMoAutoModelForDiffusion.from_config(
+            config,
+            distributed_setup=distributed_setup,
+            load_base_model=load_base_model,
+            torch_dtype=torch_dtype,
+            trust_remote_code=False,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+            peft_config=peft_cfg,
+            **model_kwargs,
+        )
+        if load_for_training and peft_cfg is None:
+            _ensure_params_trainable(transformer, "transformer")
+        pipe = cls(transformer=transformer)
+        if peft_cfg is not None:
+            # Same contract as the diffusers path: the recipe hands these to the checkpointer.
+            pipe._peft_config = peft_cfg
+            pipe._lora_params = [p for n, p in transformer.named_parameters() if "lora_" in n and p.requires_grad]
+        return pipe
+
+    @classmethod
     def from_config(
         cls,
         model_id: str,
@@ -751,6 +911,8 @@ class NeMoAutoDiffusionPipeline:
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
+        backend: "BackendConfig | None" = None,
+        config_overrides: dict[str, ConfigFieldValue] | None = None,
         **kwargs,
     ) -> "NeMoAutoDiffusionPipeline | DiffusionPipeline":
         """
@@ -759,14 +921,18 @@ class NeMoAutoDiffusionPipeline:
         This method uses the transformer_cls from pipeline_spec to create a model
         with random weights. Use this for pretraining from scratch.
 
-        Requires pipeline_spec in YAML config with at least:
+        For diffusers transformers, pipeline_spec in the YAML config needs at least:
             pipeline_spec:
                 transformer_cls: "FluxTransformer2DModel"  # or WanTransformer3DModel, etc.
                 subfolder: "transformer"
 
+        When the transformer config in ``subfolder`` names an architecture with a custom Automodel implementation,
+        the transformer is built through ``NeMoAutoModelForDiffusion`` instead; ``transformer_cls`` is not needed
+        and the diffusers-only options are rejected.
+
         Args:
             model_id: HuggingFace model ID or local path (for loading config)
-            pipeline_spec: Dict from YAML config with transformer_cls, subfolder, etc.
+            pipeline_spec: Dict from YAML config with subfolder and, for diffusers transformers, transformer_cls.
             torch_dtype: Data type for model parameters
             device: Device to load model to
             mesh_context: Resolved distributed topology and execution policy.
@@ -778,18 +944,39 @@ class NeMoAutoDiffusionPipeline:
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             attention_backend: Optional diffusers attention backend name set on the transformer
                 before parallelization (context parallelism validates the backend at enable time).
+            backend: ``BackendConfig`` of a custom-model transformer.
+            config_overrides: Fields set on the custom-model transformer's config before it is built; every key
+                must be a field of that config.
             **kwargs: Additional arguments
 
         Returns:
-            The initialized pipeline with requested components replaced by their parallelized modules.
+            The initialized diffusers pipeline with requested components replaced by their parallelized modules, or
+            a ``NeMoAutoDiffusionPipeline`` holding the randomly initialized custom-model transformer.
         """
+        # Parse and validate pipeline spec
+        spec = PipelineSpec.from_dict(pipeline_spec)
+        transformer_dir = _transformer_dir(resolve_diffusion_model_dir(model_id), spec.subfolder)
+        if _has_custom_model(transformer_dir):
+            _validate_custom_model_options(
+                mesh_context,
+                transformer_engine_linear=transformer_engine_linear,
+                fuse_qkv_projections=fuse_qkv_projections,
+                attention_backend=attention_backend,
+            )
+            return cls._from_custom_model(
+                transformer_dir,
+                mesh_context=mesh_context,
+                torch_dtype=torch_dtype,
+                load_base_model=False,
+                load_for_training=True,
+                backend=backend,
+                config_overrides=config_overrides,
+            )
         if not DIFFUSERS_AVAILABLE:
             raise RuntimeError(
                 "diffusers is required for NeMoAutoDiffusionPipeline.from_config. "
                 "Install with: pip install nemo_automodel[diffusion]"
             )
-        # Parse and validate pipeline spec
-        spec = PipelineSpec.from_dict(pipeline_spec)
         spec.validate_for_from_config()
 
         logger.info("[INFO] Initializing pipeline from config with random weights")
