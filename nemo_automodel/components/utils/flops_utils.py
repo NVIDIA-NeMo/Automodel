@@ -13,7 +13,21 @@
 # limitations under the License.
 
 import warnings
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, runtime_checkable
+
+
+@runtime_checkable
+class ModelFlopsConfig(Protocol):
+    """Configuration that owns its architecture's useful training FLOPs."""
+
+    def model_flops(self, *, gbs: int = 1, seq_len: int | None = None) -> float:
+        """Count global-step FLOPs for gbs unpadded sequences of seq_len tokens."""
+        ...
+
+
+def _config_model_flops(config: ModelFlopsConfig, gbs: int = 1, seq_len: int | None = None) -> float:
+    """Adapt a config-owned FLOPs method to the existing calculator signature."""
+    return config.model_flops(gbs=gbs, seq_len=seq_len)
 
 
 def calculate_mfu(
@@ -1983,6 +1997,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         composite config. Pass its text config explicitly when only text-backbone
         FLOPs are intended.
     """
+    if isinstance(config, ModelFlopsConfig):
+        return _config_model_flops
+
     # Get config class name
     config_class_name = config.__class__.__name__
 

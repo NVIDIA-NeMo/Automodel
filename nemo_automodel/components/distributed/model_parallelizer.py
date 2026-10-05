@@ -222,6 +222,9 @@ def _parallelize_moe(
             else moe.reshard_after_forward
         )
         enable_async_tensor_parallel = strategy_config.enable_async_tensor_parallel
+        enable_fsdp2_prefetch = strategy_config.enable_fsdp2_prefetch and mesh_context.pp_size == 1
+        fsdp2_backward_prefetch_depth = strategy_config.fsdp2_backward_prefetch_depth
+        fsdp2_forward_prefetch_depth = strategy_config.fsdp2_forward_prefetch_depth
         activation_checkpointing_scope = strategy_config.activation_checkpointing_scope
         frozen_multimodal_sharding = strategy_config.multimodal.frozen_sharding
     else:
@@ -231,6 +234,9 @@ def _parallelize_moe(
         offload_policy = None
         reshard_after_forward = moe.reshard_after_forward
         enable_async_tensor_parallel = False
+        enable_fsdp2_prefetch = False
+        fsdp2_backward_prefetch_depth = 2
+        fsdp2_forward_prefetch_depth = 1
         activation_checkpointing_scope = "all"
         frozen_multimodal_sharding = "root"
 
@@ -249,6 +255,9 @@ def _parallelize_moe(
         tp_shard_plan=tp_shard_plan,
         sequence_parallel=sequence_parallel,
         enable_async_tensor_parallel=enable_async_tensor_parallel,
+        enable_fsdp2_prefetch=enable_fsdp2_prefetch,
+        fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
+        fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
         frozen_multimodal_sharding=frozen_multimodal_sharding,
         reapply_trainability=mesh_context.reapply_trainability,
         model_parallelizer=parallelizer if parallelizer._customizes_moe_fsdp else None,

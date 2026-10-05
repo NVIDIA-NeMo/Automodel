@@ -164,6 +164,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
         return None
 
     fsdp_stub.fully_shard = fully_shard
+    fsdp_stub.FSDPModule = DummyBlock
 
     fsdp_fully_stub = types.ModuleType("torch.distributed.fsdp._fully_shard")
 
@@ -3750,3 +3751,113 @@ def test_apply_cp_mixed_full_and_linear_attention(monkeypatch):
     te_attn.set_context_parallel_group.assert_called_once()
     # linear_attention block: cp_mesh attached
     assert linear_attn._cp_mesh is cp_mesh
+
+
+@pytest.mark.parametrize("expert_shards", [False, True])
+@pytest.mark.parametrize("reshard", [True, 1, 4])
+def test_moe_prefetch_targets_only_ordered_backbone_parents(monkeypatch, expert_shards, reshard):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    shard = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", shard)
+    blocks = [DummyBlock() for _ in range(3)]
+    mtp = DummyBlock()
+    for block in [*blocks, mtp]:
+        block.set_modules_to_forward_prefetch = MagicMock()
+        block.set_modules_to_backward_prefetch = MagicMock()
+    model = DummyModel(blocks)
+    model.mtp = types.SimpleNamespace(layers=LayerContainer([mtp]))
+    monkeypatch.setattr(P, "_iter_moe_blocks", lambda outer, inner: iter([*blocks, mtp]))
+    P.apply_fsdp(
+        model,
+        fsdp_mesh=object(),
+        ep_enabled=True,
+        ep_shard_enabled=expert_shards,
+        ep_shard_mesh=object(),
+        reshard_after_forward=reshard,
+        enable_fsdp2_prefetch=True,
+        fsdp2_forward_prefetch_depth=1,
+        fsdp2_backward_prefetch_depth=2,
+    )
+    blocks[0].set_modules_to_forward_prefetch.assert_called_once_with([blocks[1]])
+    blocks[1].set_modules_to_forward_prefetch.assert_called_once_with([blocks[2]])
+    blocks[2].set_modules_to_forward_prefetch.assert_not_called()
+    blocks[0].set_modules_to_backward_prefetch.assert_not_called()
+    blocks[1].set_modules_to_backward_prefetch.assert_called_once_with([blocks[0]])
+    blocks[2].set_modules_to_backward_prefetch.assert_called_once_with([blocks[1], blocks[0]])
+    mtp.set_modules_to_forward_prefetch.assert_not_called()
+    mtp.set_modules_to_backward_prefetch.assert_not_called()
+    for block in blocks:
+        expert_call = _find_call_by_first_arg(shard, block.mlp.experts)
+        assert (expert_call is not None) is expert_shards
+
+
+@pytest.mark.parametrize(
+    "enabled,reshard,depth", [(False, True, 1), (True, False, 1), (True, True, 0), (True, True, -1)]
+)
+def test_moe_prefetch_disabled_and_zero_depth_controls(monkeypatch, enabled, reshard, depth):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    blocks = [DummyBlock() for _ in range(3)]
+    for block in blocks:
+        block.set_modules_to_forward_prefetch = MagicMock()
+        block.set_modules_to_backward_prefetch = MagicMock()
+    P.apply_fsdp(
+        DummyModel(blocks),
+        fsdp_mesh=object(),
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        reshard_after_forward=reshard,
+        enable_fsdp2_prefetch=enabled,
+        fsdp2_forward_prefetch_depth=depth,
+        fsdp2_backward_prefetch_depth=depth,
+    )
+    for block in blocks:
+        block.set_modules_to_forward_prefetch.assert_not_called()
+        block.set_modules_to_backward_prefetch.assert_not_called()
+
+
+def test_moe_prefetch_settings_reach_fsdp_wrapping(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    shard = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", shard)
+    world_mesh = FakeWorldMesh({"dp": 2, ("dp",): 2}, mesh_dim_names=["dp"])
+    P.parallelize_model(
+        DummyModel([]),
+        world_mesh,
+        None,
+        dp_axis_names=("dp",),
+        enable_fsdp2_prefetch=True,
+        fsdp2_forward_prefetch_depth=1,
+        fsdp2_backward_prefetch_depth=2,
+    )
+    assert shard.call_args.kwargs["enable_fsdp2_prefetch"] is True
+    assert shard.call_args.kwargs["fsdp2_forward_prefetch_depth"] == 1
+    assert shard.call_args.kwargs["fsdp2_backward_prefetch_depth"] == 2
+
+
+def test_moe_prefetch_excludes_unwrapped_parent_and_nested_units(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    first, last = DummyBlock(), DummyBlock()
+    unwrapped = types.SimpleNamespace(mlp=DummyMoE())
+    for block in [first, unwrapped, last]:
+        block.set_modules_to_forward_prefetch = MagicMock()
+        block.set_modules_to_backward_prefetch = MagicMock()
+    P.apply_fsdp(
+        DummyModel([first, unwrapped, last]),
+        fsdp_mesh=object(),
+        ep_enabled=True,
+        ep_shard_enabled=True,
+        ep_shard_mesh=object(),
+        reshard_after_forward=True,
+        enable_fsdp2_prefetch=True,
+        fsdp2_forward_prefetch_depth=1,
+        fsdp2_backward_prefetch_depth=1,
+    )
+    first.set_modules_to_forward_prefetch.assert_called_once_with([last])
+    last.set_modules_to_backward_prefetch.assert_called_once_with([first])
+    unwrapped.set_modules_to_forward_prefetch.assert_not_called()
+    unwrapped.set_modules_to_backward_prefetch.assert_not_called()

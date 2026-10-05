@@ -298,6 +298,17 @@ class TestMoE:
         assert result["moe_parallel_config"].reshard_after_forward is True
         assert result["moe_parallel_config"].wrap_outer_model is False
 
+    def test_integer_reshard_group_is_not_coerced_to_bool(self) -> None:
+        result = parse_distributed_section({"ep_size": 8, "moe": {"reshard_after_forward": 4}})
+        group_size = result["moe_parallel_config"].reshard_after_forward
+        assert type(group_size) is int
+        assert group_size == 4
+
+    @pytest.mark.parametrize("invalid", [0, -2, 4.0, "4"])
+    def test_rejects_invalid_reshard_group(self, invalid: int | float | str) -> None:
+        with pytest.raises(ValueError, match="positive integer FSDP shard count"):
+            parse_distributed_section({"ep_size": 8, "moe": {"reshard_after_forward": invalid}})
+
     def test_empty_moe_dict_uses_defaults(self):
         result = parse_distributed_section({"ep_size": 2, "moe": {}})
         assert isinstance(result["moe_parallel_config"], MoEParallelizerConfig)

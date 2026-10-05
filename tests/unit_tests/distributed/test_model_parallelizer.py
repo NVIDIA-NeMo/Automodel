@@ -191,3 +191,29 @@ def test_model_parallelizer_dispatches_non_fsdp2_strategies(monkeypatch, strateg
 
     assert ModelParallelizer().parallelize(model, context) is model
     executor.assert_called_once_with(model, context)
+
+
+@pytest.mark.parametrize("enabled,pp_size,expected", [(False, 1, False), (True, 1, True), (True, 2, False)])
+def test_moe_executor_threads_existing_prefetch_config(monkeypatch, enabled, pp_size, expected):
+    model = nn.Linear(2, 2)
+    context = SimpleNamespace(
+        ep_size=2,
+        pp_size=pp_size,
+        device_mesh=object(),
+        moe_mesh=object(),
+        strategy_config=FSDP2Config(
+            enable_fsdp2_prefetch=enabled,
+            fsdp2_forward_prefetch_depth=1,
+            fsdp2_backward_prefetch_depth=2,
+        ),
+        moe_parallel_config=None,
+        activation_checkpointing=False,
+        reapply_trainability=None,
+        parallelize_axis_kwargs=lambda: {},
+    )
+    executor = Mock()
+    monkeypatch.setattr("nemo_automodel.components.moe.parallelizer.parallelize_model", executor)
+    _parallelize_moe(model, context, parallelizer=ModelParallelizer())
+    assert executor.call_args.kwargs["enable_fsdp2_prefetch"] is expected
+    assert executor.call_args.kwargs["fsdp2_forward_prefetch_depth"] == 1
+    assert executor.call_args.kwargs["fsdp2_backward_prefetch_depth"] == 2

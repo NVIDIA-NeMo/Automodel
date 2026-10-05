@@ -550,6 +550,7 @@ class TestApplyModelInfrastructurePostShardInit:
         _, mock_ckpt = _run_apply_model_infrastructure(is_meta_device=True, load_base_model=False)
 
         mock_ckpt.initialize_model_weights.assert_called_once()
+        assert mock_ckpt.initialize_model_weights.call_args.kwargs["checkpoint_will_load"] is False
 
     def test_from_config_meta_does_not_call_load_base_model(self):
         """from_config path should NOT call load_base_model (no checkpoint to load)."""
@@ -562,7 +563,45 @@ class TestApplyModelInfrastructurePostShardInit:
         _, mock_ckpt = _run_apply_model_infrastructure(is_meta_device=True, load_base_model=True)
 
         mock_ckpt.initialize_model_weights.assert_called_once()
+        assert mock_ckpt.initialize_model_weights.call_args.kwargs["checkpoint_will_load"] is True
         mock_ckpt.load_base_model.assert_called_once()
+
+    def test_already_loaded_weights_are_not_reinitialized(self) -> None:
+        """A stale meta-construction flag must not overwrite weights already loaded by HF."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+
+        model = _DummyModel()
+        with torch.no_grad():
+            model.linear.weight.fill_(0.25)
+            model.linear.bias.fill_(0.5)
+        expected = {name: value.clone() for name, value in model.state_dict().items()}
+
+        @torch.no_grad()
+        def initialize_weights(dtype: torch.dtype = torch.float32) -> None:
+            model.linear.weight.zero_()
+            model.linear.bias.zero_()
+
+        model.initialize_weights = initialize_weights
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        ):
+            MockCheckpointer.return_value.initialize_model_weights = Checkpointer.initialize_model_weights
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=True,
+                pretrained_model_name_or_path="test/model",
+                weights_already_loaded=True,
+            )
+            MockCheckpointer.return_value.load_base_model.assert_not_called()
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
 
     def test_non_meta_skips_initialize_model_weights(self):
         """Non-meta device model should not call initialize_model_weights."""
@@ -753,7 +792,7 @@ class TestApplyModelInfrastructurePostShardInit:
             )
 
             mock_ckpt.initialize_model_weights.assert_called_once_with(
-                model, torch.device("cpu"), peft_init_method="xavier"
+                model, torch.device("cpu"), peft_init_method="xavier", checkpoint_will_load=False
             )
 
     def test_applies_rotary_fix_automatically_when_needed(self):
@@ -862,13 +901,15 @@ class TestLoadBeforeShardPath:
         """load_before_shard should call initialize_model_weights before load_base_model."""
         _, mock_ckpt, model = _run_apply_model_infrastructure_load_before_shard()
 
-        mock_ckpt.initialize_model_weights.assert_called_once_with(model, torch.device("cpu"), peft_init_method=None)
+        mock_ckpt.initialize_model_weights.assert_called_once_with(
+            model, torch.device("cpu"), peft_init_method=None, checkpoint_will_load=True
+        )
         mock_ckpt.load_base_model.assert_called_once_with(
             model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=True
         )
 
         init_idx = mock_ckpt.method_calls.index(
-            call.initialize_model_weights(model, torch.device("cpu"), peft_init_method=None)
+            call.initialize_model_weights(model, torch.device("cpu"), peft_init_method=None, checkpoint_will_load=True)
         )
         load_idx = mock_ckpt.method_calls.index(
             call.load_base_model(model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=True)

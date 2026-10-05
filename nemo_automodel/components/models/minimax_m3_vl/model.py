@@ -153,7 +153,9 @@ class MiniMaxM3TextModel(nn.Module):
             )
 
         gemma = getattr(config, "use_gemma_norm", False)
-        self.norm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
+        self.norm = MiniMaxM3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
 
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -421,7 +423,9 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 nn.init.trunc_normal_(
                     self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
                 )
-        cast_model_to_dtype(self, dtype)
+        # Preserve the declared FP32 gates. After FSDP wrapping, restoring
+        # DTensor .data after a cast cannot restore its local shard.
+        cast_model_to_dtype(self, dtype, skip_modules=("gate",))
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 
@@ -873,7 +877,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 nn.init.trunc_normal_(
                     self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
                 )
-        cast_model_to_dtype(self, dtype)
+        # Preserve the declared FP32 gates. After FSDP wrapping, restoring
+        # DTensor .data after a cast cannot restore its local shard.
+        cast_model_to_dtype(self, dtype, skip_modules=("gate",))
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 

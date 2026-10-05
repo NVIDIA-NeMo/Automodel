@@ -195,10 +195,19 @@ class MoEParallelizerConfig:
     # different number of tokens per expert than the forward pass, which makes
     # torch.utils.checkpoint raise a CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
-    reshard_after_forward: bool = False
+    # An integer retains this many FSDP shards after forward. It must divide
+    # each active FSDP shard group; PyTorch validates this once meshes exist.
+    reshard_after_forward: bool | int = False
     lm_head_precision: Union[str, torch.dtype] | None = None
     wrap_outer_model: bool = True
     mp_policy: MixedPrecisionPolicy | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the post-forward shard count before meshes are constructed."""
+        if not isinstance(self.reshard_after_forward, (bool, int)) or (
+            not isinstance(self.reshard_after_forward, bool) and self.reshard_after_forward < 1
+        ):
+            raise ValueError("moe.reshard_after_forward must be a bool or a positive integer FSDP shard count.")
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}

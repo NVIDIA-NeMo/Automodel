@@ -27,7 +27,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy, OffloadPolicy
 from torch.distributed.tensor import Replicate, Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
@@ -36,6 +36,9 @@ from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint
 from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
+)
+from nemo_automodel.components.distributed.fsdp_patches import (
+    patch_fsdp_post_forward_mesh_cache as _patch_fsdp_post_forward_mesh_cache,
 )
 from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
@@ -793,13 +796,18 @@ def apply_fsdp(
     ep_shard_mesh: DeviceMesh | None = None,
     mp_policy: MixedPrecisionPolicy | None = None,
     offload_policy: OffloadPolicy | None = None,
-    reshard_after_forward: bool = False,
+    reshard_after_forward: bool | int = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     model_parallelizer: "ModelParallelizer | None" = None,
+    enable_fsdp2_prefetch: bool = False,
+    fsdp2_backward_prefetch_depth: int = 2,
+    fsdp2_forward_prefetch_depth: int = 1,
 ) -> None:
     """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
+    if isinstance(reshard_after_forward, int) and not isinstance(reshard_after_forward, bool):
+        _patch_fsdp_post_forward_mesh_cache()
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
     # MoE normally keeps fully frozen skipped towers with an always-run root,
     # but trainable multimodal towers still get standalone FSDP units. Install
@@ -914,6 +922,7 @@ def apply_fsdp(
     if mtp_module is not None and hasattr(mtp_module, "layers"):
         mtp_block_ids = {id(b) for b in mtp_module.layers.children()}
 
+    prefetch_blocks: list[FSDPModule] = []
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)
         gate = getattr(moe_module, "gate", None)
@@ -972,6 +981,25 @@ def apply_fsdp(
             ignored_params=ignored_params or None,
             model_parallelizer=model_parallelizer,
         )
+        if isinstance(block, FSDPModule) and id(block) not in mtp_block_ids:
+            prefetch_blocks.append(block)
+
+    # Prefetch only the sequential backbone parents. Nested expert/gate FSDP
+    # units retain their own lifecycles; MTP heads may execute conditionally.
+    if enable_fsdp2_prefetch and reshard_after_forward is not False:
+        for i, block in enumerate(prefetch_blocks):
+            forward_targets = (
+                prefetch_blocks[i + 1 : i + 1 + fsdp2_forward_prefetch_depth]
+                if fsdp2_forward_prefetch_depth > 0
+                else []
+            )
+            backward_targets = [
+                prefetch_blocks[i - d] for d in range(1, fsdp2_backward_prefetch_depth + 1) if i - d >= 0
+            ]
+            if forward_targets:
+                block.set_modules_to_forward_prefetch(forward_targets)
+            if backward_targets:
+                block.set_modules_to_backward_prefetch(backward_targets)
 
     # Re-establish weight tying before detecting it: a device/dtype move during
     # from_pretrained (HF replaces param tensors) can silently break a tie set in
@@ -1175,7 +1203,7 @@ def parallelize_model(
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
-    reshard_after_forward: bool = False,
+    reshard_after_forward: bool | int = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
@@ -1183,6 +1211,9 @@ def parallelize_model(
     tp_shard_plan: dict[str, ParallelStyle] | str | None = None,
     sequence_parallel: bool = False,
     enable_async_tensor_parallel: bool = False,
+    enable_fsdp2_prefetch: bool = False,
+    fsdp2_backward_prefetch_depth: int = 2,
+    fsdp2_forward_prefetch_depth: int = 1,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     reapply_trainability: Callable[[nn.Module], None] | None = None,
     model_parallelizer: "ModelParallelizer | None" = None,
@@ -1290,6 +1321,9 @@ def parallelize_model(
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
             model_parallelizer=model_parallelizer,
+            enable_fsdp2_prefetch=enable_fsdp2_prefetch,
+            fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
+            fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
         )
         if cp_enabled:
             configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)
