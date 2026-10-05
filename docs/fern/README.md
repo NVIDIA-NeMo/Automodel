@@ -222,7 +222,7 @@ PR titles follow Conventional Commits (e.g., `docs(fern): add gemma4 fine-tuning
 | `Folder not found: ./product-docs/...` in `fern docs dev` | Run `make docs` once; library generation populates `product-docs/` |
 | `Unexpected closing tag`, especially after raw HTML such as `<img>` | Use valid MDX/JSX syntax, for example self-close void elements as `<img ... />`; `make docs-check` catches this before publish |
 | `[ERR_PNPM_IGNORED_BUILDS]` on first `fern docs dev` | pnpm 10+ blocks esbuild's postinstall — `pnpm config set onlyBuiltDependencies '["esbuild"]' --location global`, then `rm -rf ~/.fern/app-preview` and retry |
-| Broken-link warning for version-agnostic path | `fern docs broken-links` false-positives on links without a version slug; the URLMap-based `validate_fern_internal_links.py` is authoritative |
+| Broken-link warning for version-agnostic path | Check the destination against the current version navigation and verify it in the preview before treating the warning as a broken route |
 | `JSX expressions must have one parent element` | Wrap multi-element JSX in `<>...</>` or a `<div>` |
 | Card badges have no spacing | Use `<Tag>` (NeMo AutoModel landing pattern), not raw HTML; spacing comes from the `nvidia` global theme's CSS |
 | Old Sphinx URL breaks | Add a `redirects:` entry in `docs.yml` |
