@@ -117,3 +117,5 @@ ci:
   local_batch_size: 8
   nodes: 8
   time: "01:00:00"
+  env_vars:
+    REQUIRE_FINITE_METRICS: "true"

@@ -331,17 +331,19 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         else:
             out = torch.empty((rows_total, B * 2), dtype=dtype, device=blocks.device)
 
-        for r0 in range(0, rows_total, rows_per_chunk):
-            r1 = min(r0 + rows_per_chunk, rows_total)
+        # A partial slice of a sharded DTensor can redistribute into fresh
+        # storage. Mutating that slice's local tensor would leave ``out``
+        # uninitialized. Chunk the rank-local storage instead, preserving the
+        # block/scale/output row alignment and writing into the final buffer.
+        local_blocks = blocks.to_local() if hasattr(blocks, "to_local") else blocks
+        local_scales = scales.to_local() if hasattr(scales, "to_local") else scales
+        local_out = out.to_local() if hasattr(out, "to_local") else out
+        for r0 in range(0, local_blocks.shape[0], rows_per_chunk):
+            r1 = min(r0 + rows_per_chunk, local_blocks.shape[0])
 
-            blk = blocks[r0:r1]
-            exp = scales[r0:r1]
-            sub = out[r0:r1]
-
-            # Work on local shards to avoid DTensor advanced indexing
-            blk_local = blk.to_local() if hasattr(blk, "to_local") else blk
-            sub_local = sub.to_local() if hasattr(sub, "to_local") else sub
-            exp_local = exp.to_local() if hasattr(exp, "to_local") else exp
+            blk_local = local_blocks[r0:r1]
+            exp_local = local_scales[r0:r1]
+            sub_local = local_out[r0:r1]
 
             # Ensure uint8 for nibble extraction
             blk_local = blk_local.to(torch.uint8)
@@ -354,10 +356,10 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
             sub_local[:, 1::2] = lut[idx_hi_local]
 
             torch.ldexp(sub_local, exp_local, out=sub_local)
-            del idx_lo_local, idx_hi_local, blk_local, exp_local, sub_local, blk, exp, sub
+            del idx_lo_local, idx_hi_local, blk_local, exp_local, sub_local
 
         out = out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
-        del blocks, scales, lut
+        del blocks, scales, lut, local_blocks, local_scales, local_out
 
         # Final logical layout is (n_experts, 2880, hidden_dim) after transpose.
         out = out.transpose(1, 2).contiguous()
