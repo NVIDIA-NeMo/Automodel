@@ -93,6 +93,36 @@ def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def _attention_mask_to_bias(attention_mask: torch.Tensor, dtype: torch.dtype, *, qkv_format: str) -> torch.Tensor:
+    """Normalize padding and explicit masks to an additive attention bias.
+
+    Args:
+        attention_mask: Binary keep-mask of shape [batch, sequence] (including
+            floating-point 0/1 masks), or boolean keep/additive 0/negative mask
+            of shape [batch, 1, sequence, sequence]. THD also accepts an additive
+            mask of shape [tokens, tokens] or a binary key mask of shape [tokens].
+        dtype: Floating-point dtype of the consumer.
+        qkv_format: Input layout, 'bshd' or 'thd'.
+
+    Returns:
+        Additive mask of shape [batch, 1, queries, keys], with queries=1 for
+        a padding mask. Binary masked entries become negative infinity.
+    """
+    mask = attention_mask
+    if mask.ndim == 1:
+        mask = mask[None, None, None, :].bool()
+    elif mask.ndim == 2:
+        if qkv_format == "thd":
+            mask = mask[None, None]
+        else:
+            mask = mask[:, None, None, :].bool()
+    elif mask.ndim != 4:
+        raise ValueError("DeepSeek V3.2 expects a binary key mask or a 4D attention mask.")
+    if not mask.is_floating_point():
+        return torch.zeros_like(mask, dtype=dtype).masked_fill(~mask.bool(), float("-inf"))
+    return mask.to(dtype=dtype)
+
+
 class DeepseekV32Indexer(nn.Module):
     """Indexer for top-k sparse attention selection.
 
@@ -164,14 +194,20 @@ class DeepseekV32Indexer(nn.Module):
         """Compute top-k indices for sparse attention.
 
         Args:
-            x: Hidden states [B, S, hidden] or [T, hidden] for thd format
-            q_resid: Q lora residual from MLA [B, S, q_lora_rank] or [T, q_lora_rank]
-            freqs_cis: RoPE frequencies
-            attention_mask: Optional attention mask
-            **attn_kwargs: Additional attention kwargs (cu_seqlens, etc.)
+            x: Hidden states of shape [batch, sequence, hidden] or [tokens, hidden] for THD.
+            q_resid: Q low-rank residual of shape [batch, sequence, q_lora_rank]
+                or [tokens, q_lora_rank].
+            freqs_cis: Complex RoPE frequencies of shape [batch, sequence, rope_dim / 2]
+                or [tokens, rope_dim / 2], where rope_dim is qk_rope_head_dim.
+            attention_mask: Binary keep-mask of shape [batch, sequence], or boolean
+                keep/additive 0/negative mask of shape [batch, 1, sequence, sequence].
+                THD also accepts [tokens] binary or [tokens, tokens] additive masks.
+            **attn_kwargs: Additional backend metadata; unused by the dense indexer.
 
         Returns:
-            topk_indices: Indices of top-k positions [B, S, topk] or [T, topk]
+            Top-k key indices of shape [batch, sequence, min(index_topk, sequence)]
+            or [tokens, min(index_topk, tokens)]. When fewer than top-k keys are
+            valid, masked filler indices must be excluded by the final attention mask.
         """
         if len(x.shape) == 2:
             qkv_format = "thd"
@@ -251,15 +287,15 @@ class DeepseekV32Indexer(nn.Module):
             # Sum over heads
             scores = scores.sum(dim=1)  # [B, S, S]
 
-        # Apply attention mask if provided
+        # Padding masks are 0/1 keep-masks, not additive score offsets.
         if attention_mask is not None:
-            if qkv_format == "bshd":
-                scores = scores + attention_mask.squeeze(1)
-            else:
-                if attention_mask.dim() == 4:
-                    scores = scores + attention_mask.squeeze(0).squeeze(0)
-                else:
-                    scores = scores + attention_mask
+            mask_bias = _attention_mask_to_bias(attention_mask, scores.dtype, qkv_format=qkv_format)
+            mask_bias = mask_bias.squeeze(1) if qkv_format == "bshd" else mask_bias[0, 0]
+            scores = scores + mask_bias
+
+        # Causality must hold even when no mask was supplied by the caller.
+        future = torch.ones(seq_len, seq_len, dtype=torch.bool, device=scores.device).triu(1)
+        scores = scores.masked_fill(future, float("-inf"))
 
         # Select top-k indices
         actual_topk = min(self.index_topk, seq_len)
@@ -400,9 +436,11 @@ class DeepseekV32MLA(nn.Module):
             bsz: Batch size (only used for bshd format)
             n_heads: Number of attention heads to expand to
             dtype: Data type for the output tensor
-            attention_mask: Optional attention mask to combine with (for SDPA)
-            union_across_batches: If True, union top-k across batches (for TE);
-                                  if False, keep per-batch masks (for SDPA)
+            attention_mask: Binary keep-mask of shape [batch, sequence], or boolean
+                keep/additive 0/negative mask of shape [batch, 1, sequence, sequence].
+                THD also accepts [tokens] binary or [tokens, tokens] additive masks.
+            union_across_batches: Whether to union top-k across batch rows.
+                Defaults to False to preserve each sample's selection for both backends.
             as_bool: If True, return a boolean keep-mask (True = attend).
 
         Returns:
@@ -440,18 +478,17 @@ class DeepseekV32MLA(nn.Module):
                 sparse_mask = make_sparse_mask((bsz, seq_len, seq_len), topk_indices)
                 sparse_mask = sparse_mask.unsqueeze(1).expand(-1, n_heads, -1, -1)
 
-        # Combine with existing attention mask if provided
+        # Top-k fills its result with masked positions when fewer than k keys
+        # are valid. Reapply causality after scatter so those fillers cannot leak.
+        future = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).triu(1)
+        sparse_mask = sparse_mask.masked_fill(future, False if as_bool else float("-inf"))
+
         if attention_mask is not None:
+            mask_bias = _attention_mask_to_bias(attention_mask, dtype, qkv_format=qkv_format)
             if as_bool:
-                if attention_mask.is_floating_point():
-                    attention_mask = attention_mask >= 0
-                else:
-                    attention_mask = attention_mask.bool()
-                if attention_mask.dim() == 2:
-                    attention_mask = attention_mask[:, None, None, :]
-                sparse_mask = attention_mask & sparse_mask
+                sparse_mask = sparse_mask & (mask_bias >= 0)
             else:
-                sparse_mask = attention_mask.to(dtype=sparse_mask.dtype) + sparse_mask
+                sparse_mask = sparse_mask + mask_bias
 
         return sparse_mask
 
@@ -462,6 +499,21 @@ class DeepseekV32MLA(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ):
+        """Apply sparse causal MLA.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden] or [tokens, hidden] for THD.
+            freqs_cis: Complex RoPE tensor of shape [batch, sequence, rope_dim / 2]
+                or [tokens, rope_dim / 2], where rope_dim is qk_rope_head_dim.
+            attention_mask: Binary keep-mask of shape [batch, sequence], or boolean
+                keep/additive 0/negative mask of shape [batch, 1, sequence, sequence].
+                THD also accepts [tokens] binary or [tokens, tokens] additive masks.
+            **attn_kwargs: Backend metadata, including packed cumulative lengths
+                of shape [documents + 1] when using THD attention.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden] or [tokens, hidden].
+        """
         if len(x.shape) == 2:
             qkv_format = "thd"
             num_tokens = x.shape[0]
@@ -480,7 +532,7 @@ class DeepseekV32MLA(nn.Module):
         # Build sparse bias/mask from top-k indices based on backend
         if self.backend.attn == "te":
             # For TE: build sparse bias for core_attention_bias (must match Q/K/V dtype)
-            # Union across batches since TE expects [1, n_heads, S, S]
+            # TE accepts per-sample bias: do not union selections across the batch.
             sparse_mask = self._build_sparse_mask(
                 topk_indices,
                 seq_len,
@@ -488,8 +540,8 @@ class DeepseekV32MLA(nn.Module):
                 bsz,
                 n_heads=self.n_heads,
                 dtype=x.dtype,
-                attention_mask=None,
-                union_across_batches=True,
+                attention_mask=attention_mask,
+                union_across_batches=False,
             )
         else:
             # For SDPA: build sparse mask, keep per-batch masks
@@ -547,11 +599,16 @@ class DeepseekV32MLA(nn.Module):
         if self.backend.attn == "te":
             # For TE: use core_attention_bias for sparse attention
             q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
-                q, k, v, attention_mask, self.backend.attn, **attn_kwargs
+                q,
+                k,
+                v,
+                attention_mask if attention_mask is not None and attention_mask.ndim == 2 else None,
+                self.backend.attn,
+                **attn_kwargs,
             )
             # Add sparse mask as core_attention_bias
             _attn_kwargs["core_attention_bias_type"] = "post_scale_bias"
-            _attn_kwargs["core_attention_bias"] = sparse_mask
+            _attn_kwargs["core_attention_bias"] = sparse_mask.contiguous()
         else:
             # For SDPA: use sparse mask (already combined with attention_mask)
             q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
