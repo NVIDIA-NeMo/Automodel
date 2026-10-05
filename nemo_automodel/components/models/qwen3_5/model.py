@@ -402,7 +402,13 @@ class Qwen3_5DenseBlock(Block):
                 [axes, batch, sequence].
             packed_gdn_metadata: Optional model-forward-owned packing metadata;
                 tensor layouts are documented by :class:`GatedDeltaPackedMetadata`.
-            **attn_kwargs: Backend-specific attention arguments.
+            **attn_kwargs: Packed or THD metadata: ``_packed_seq_ids`` has shape
+                [batch, sequence] with 1-based document IDs and zero padding.
+                ``packed_token_indices`` has shape [batch, sequence] with row-local
+                positions and -1 padding, or [tokens] indexing flattened batch
+                and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
+                with row-local boundaries and -1 padding, or [documents + 1] for
+                flattened/THD inputs. ``max_seqlen`` is an integer document length.
 
         Returns:
             Hidden states of shape [batch, sequence, hidden].
@@ -429,6 +435,8 @@ class Qwen3_5DenseBlock(Block):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                packed_token_indices=attn_kwargs.get("packed_token_indices"),
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
 
         if packed_gdn_metadata is not None:
@@ -529,7 +537,11 @@ class Qwen3_5DenseTextBackbone(nn.Module):
             output_hidden_states: Accepted for Hugging Face compatibility and
                 ignored.
             **attn_kwargs: Backend-specific attention arguments, including optional
-                ``_packed_seq_ids`` of shape [batch, sequence].
+                ``_packed_seq_ids`` of shape [batch, sequence], ``packed_token_indices``
+                of shape [batch, sequence] or [tokens], ``cu_seqlens`` of shape
+                [batch, max_documents + 1] or [documents + 1], and integer
+                ``max_seqlen``. Batch-major metadata uses -1 padding. Explicit
+                token metadata is supported without context parallelism.
 
         Returns:
             Model output whose ``last_hidden_state`` has shape [batch, sequence,
@@ -552,6 +564,11 @@ class Qwen3_5DenseTextBackbone(nn.Module):
             position_ids = position_ids[1:]
 
         if getattr(self, "_cp_enabled", False):
+            if attn_kwargs.get("packed_token_indices") is not None or attn_kwargs.get("cu_seqlens") is not None:
+                raise ValueError(
+                    "Qwen3.5 packed sequence metadata is unsupported with load-balanced context parallelism. "
+                    "Disable packing or use the supported SDPA block-diagonal CP path for Qwen3.5-MoE."
+                )
             attention_mask = None
             padding_mask = None
 
@@ -570,6 +587,8 @@ class Qwen3_5DenseTextBackbone(nn.Module):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                packed_token_indices=attn_kwargs.get("packed_token_indices"),
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
 
         for decoder_layer in self.layers.values():
@@ -693,6 +712,8 @@ class Qwen3_5Model(HFQwen3_5Model):
 class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     """Qwen3.5 dense causal LM with optional Megatron-style MTP head."""
 
+    _uses_native_fa4 = True
+    requires_packed_sequence_metadata = True
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
@@ -791,6 +812,32 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
+        """Compute causal-LM logits and optional multi-token prediction states.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence].
+            attention_mask: Optional document/validity mask of shape [batch, sequence]
+                or block-causal mask of shape [batch, 1, sequence, sequence].
+            position_ids: Optional text positions of shape [batch, sequence] or
+                multi-axis positions of shape [3, batch, sequence] or
+                [4, batch, sequence] including a leading text-position axis.
+            past_key_values: Optional HF cache; cached generation is unsupported.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            labels: Optional targets of shape [batch, sequence], ignored here.
+            use_cache: Whether to cache states; only False or None is supported.
+            logits_to_keep: Trailing token count (zero means all), or position
+                indices of shape [selected_tokens] indexing the sequence axis.
+            **kwargs: Backbone arguments, including ``_packed_seq_ids`` of shape
+                [batch, sequence], ``packed_token_indices`` of shape [batch, sequence]
+                or [tokens], ``cu_seqlens`` of shape [batch, max_documents + 1] or
+                [documents + 1], and integer ``max_seqlen``. Batch-major metadata
+                uses -1 padding and is removed before the separate MTP sublayers.
+
+        Returns:
+            Logits of shape [batch, selected_sequence, vocab], final hidden states
+            of shape [batch, sequence, hidden], and optional per-depth MTP states
+            with the same hidden-state layout.
+        """
         del labels
         kwargs.pop("output_hidden_states", None)
         effective_use_cache = False if use_cache is None else use_cache
@@ -810,6 +857,11 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:
+            mtp_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"packed_token_indices", "cu_seqlens", "cu_seqlens_padded", "max_seqlen"}
+            }
             source_embeds = inputs_embeds if inputs_embeds is not None else self.model.embed_tokens(input_ids)
             rotary_position_ids, text_position_ids = _split_qwen3_5_position_ids(
                 position_ids,
@@ -840,7 +892,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
                     position_ids=rotary_position_ids,
                     attention_mask=causal_mask,
                     rotary_emb=self.model.rotary_emb,
-                    **kwargs,
+                    **mtp_kwargs,
                 )
             else:
                 mtp_per_depth_h = self.mtp(
@@ -850,7 +902,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
                     position_ids=rotary_position_ids,
                     attention_mask=causal_mask,
                     rotary_emb=self.model.rotary_emb,
-                    **kwargs,
+                    **mtp_kwargs,
                 )
 
         return Qwen3_5CausalLMOutputWithPast(
@@ -900,6 +952,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     hidden states, matching the dense text-only MTP architecture.
     """
 
+    _uses_native_fa4 = True
+    requires_packed_sequence_metadata = True
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
@@ -1537,6 +1591,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     "cache_position",
                     "cu_seqlens",
                     "cu_seqlens_padded",
+                    "packed_token_indices",
                     "max_seqlen",
                     "mm_token_type_ids",
                     "padding_mask",

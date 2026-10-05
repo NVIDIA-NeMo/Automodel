@@ -82,7 +82,8 @@ dependencies = [
     "torch>=2.6.0",
     "torchdata",
     "transformers==5.15.1",
-    "torchao",
+    # peft>=0.20 raises ImportError from get_peft_model() when an installed torchao is older than 0.16.0.
+    "torchao>=0.16.0",
     "flashoptim>=0.1.3",
     # 0.6.4 pins nvidia-cutlass-dsl==4.6.2, matching what flash_attn.cute requires at the
     # pinned FLASH_ATTN_REF. Both import `cutlass`, so they have to agree. (0.6.1 pinned 4.6.0.)
@@ -574,6 +575,36 @@ ignore_imports = [
     # flattened ep axis is absent from mesh_dim_names and cannot be indexed directly.
     "nemo_automodel.components.training.utils -> nemo_automodel.components.distributed.mesh_utils",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Datasets must not directly import models or attention"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.datasets"]
+forbidden_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel.components.attention",
+]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Models and attention must not directly import datasets"
+type = "forbidden"
+source_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel.components.attention",
+]
+forbidden_modules = ["nemo_automodel.components.datasets"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Models must not import recipe configuration"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.models"]
+forbidden_modules = [
+    "nemo_automodel.components.config",
+    "nemo_automodel.recipes",
+]
+allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
 name = "Distributed infrastructure must not import model implementations"

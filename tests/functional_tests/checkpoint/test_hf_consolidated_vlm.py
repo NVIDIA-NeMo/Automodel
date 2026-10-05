@@ -540,7 +540,7 @@ def test_consolidated_vlm_checkpoint():
     # compare the recipe configs
     with open(Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
-    compare_configs(trainer.cfg.raw_config, restored_config)
+    compare_configs(trainer.cfg.to_yaml_dict(use_orig_values=True), restored_config)
 
     # load consolidated model using HF API and verify it's the same as the trained model
     consolidated_model = (
