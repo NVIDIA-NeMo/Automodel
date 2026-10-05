@@ -15,6 +15,7 @@
 """Exercise MXFP4 chunk writes through real distributed tensor storage."""
 
 from datetime import timedelta
+from itertools import product
 from unittest.mock import patch
 
 import pytest
@@ -65,11 +66,13 @@ def _dequantize_worker(rank: int, rendezvous: str) -> None:
             output.to_local().fill_(float("nan"))
             return output
 
-        for mesh_shape in ((2, 1), (1, 2)):
-            mesh = DeviceMesh("cpu", torch.arange(2).reshape(mesh_shape), mesh_dim_names=("ep", "ep_shard"))
+        for mesh_shape, mesh_dim_names in product(((2, 1), (1, 2)), (("ep", "ep_shard"), ("ep_shard", "ep"))):
+            mesh = DeviceMesh("cpu", torch.arange(2).reshape(mesh_shape), mesh_dim_names=mesh_dim_names)
             # HF load metadata replicates feature shards before MXFP4 decoding.
-            distributed_blocks = distribute_tensor(blocks, mesh, [Shard(0), Replicate()])
-            distributed_scales = distribute_tensor(scales, mesh, [Shard(0), Replicate()])
+            # FSDP orders the axes as (ep_shard, ep); exercise both orders.
+            placements = [Shard(0) if name == "ep" else Replicate() for name in mesh_dim_names]
+            distributed_blocks = distribute_tensor(blocks, mesh, placements)
+            distributed_scales = distribute_tensor(scales, mesh, placements)
             for dtype in (torch.float32, torch.bfloat16):
                 for chunk_rows in (7, 32, 128):
                     # Keep this real Gloo/DTensor test on CPU, including on GPU CI runners.
@@ -80,7 +83,7 @@ def _dequantize_worker(rank: int, rendezvous: str) -> None:
                         actual = adapter._convert_moe_packed_tensors(
                             distributed_blocks, distributed_scales, dtype=dtype, rows_per_chunk=chunk_rows
                         )
-                    assert actual.placements == (Shard(0), Shard(2))
+                    assert actual.placements == tuple(Shard(0) if name == "ep" else Shard(2) for name in mesh_dim_names)
                     torch.testing.assert_close(actual.full_tensor(), expected.to(dtype), rtol=0, atol=0)
     finally:
         dist.destroy_process_group()

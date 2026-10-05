@@ -47,9 +47,10 @@ _BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr
 # dispatches on the faster single-operation path.
 _BIAS_CHUNK_ROWS = 4096
 _BIAS_CHUNK_THRESHOLD = 12288
-# Above this size, materializing both grouped-GEMM intermediates can exhaust
-# memory even when bias additions themselves are bounded. Recompute row chunks
-# during backward instead of retaining full expert-MLP activations.
+# Above this size, materializing both grouped-GEMM intermediates for biased experts
+# can exhaust memory even when bias additions themselves are bounded. Recompute
+# row chunks during backward instead of retaining full expert-MLP activations.
+# Bias-free experts retain whole-dispatch GEMMs for throughput.
 _EXPERT_MLP_CHUNK_BYTES = 256 * 1024 * 1024
 
 

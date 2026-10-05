@@ -920,7 +920,7 @@ class TestGroupedExpertsDeepEP:
             mock_init_buffer.assert_called_once_with(mock_mesh.get_group.return_value)
 
     @pytest.mark.parametrize(
-        ("threshold_delta", "expect_chunked"),
+        ("threshold_delta", "above_chunk_threshold"),
         [pytest.param(0, False, id="at-threshold"), pytest.param(-1, True, id="above-threshold")],
     )
     @pytest.mark.parametrize("expert_bias", [False, True])
@@ -930,7 +930,7 @@ class TestGroupedExpertsDeepEP:
         moe_config,
         monkeypatch,
         threshold_delta,
-        expect_chunked,
+        above_chunk_threshold,
         expert_bias,
         use_mxfp8,
     ):
@@ -997,14 +997,14 @@ class TestGroupedExpertsDeepEP:
             gate_up_bytes + threshold_delta,
         )
         output = experts(*args[:4])
-        assert gemm_rows == ([2, 2, 2, 2, 1, 1] if expert_bias and not use_mxfp8 and expect_chunked else [5, 5])
+        assert gemm_rows == ([2, 2, 2, 2, 1, 1] if expert_bias and not use_mxfp8 and above_chunk_threshold else [5, 5])
         actual_grads = torch.autograd.grad(output, targets, upstream)
         torch.testing.assert_close(output, expected)
         for actual, reference in zip(actual_grads, expected_grads):
             torch.testing.assert_close(actual, reference)
 
-    def test_grouped_experts_deepep_forward_excludes_mxfp8_from_chunked_path(self, moe_config, monkeypatch):
-        """Large MXFP8 dispatches retain their quantized whole-dispatch implementation."""
+    def test_grouped_experts_deepep_forward_preserves_bias_free_mxfp8_backend(self, moe_config, monkeypatch):
+        """Bias-free whole-dispatch execution forwards the requested MXFP8 backend."""
         backend = BackendConfig(experts="torch_mm_mxfp8", dispatcher="deepep")
         experts = GroupedExpertsDeepEP(moe_config, backend=backend)
         args = self._prepare_forward_path(experts, num_tokens=2)
@@ -1221,12 +1221,21 @@ class TestGroupedExpertsDeepEP:
         if permuted_probs is not None:
             torch.testing.assert_close(permuted_probs.grad, expected_probs.grad)
 
-    @pytest.mark.parametrize("dispatcher,chunked", [("torch", False), ("deepep", False), ("deepep", True)])
+    @pytest.mark.parametrize(
+        "dispatcher,above_chunk_threshold", [("torch", False), ("deepep", False), ("deepep", True)]
+    )
     @pytest.mark.parametrize("checkpoint_mode", ["full", "selective"])
     @pytest.mark.parametrize("apply_router_weight_after_down", [False, True])
     @pytest.mark.parametrize("expert_bias", [False, True])
     def test_forward_checkpoint_preserves_outputs_and_gradients(
-        self, moe_config, monkeypatch, dispatcher, chunked, checkpoint_mode, apply_router_weight_after_down, expert_bias
+        self,
+        moe_config,
+        monkeypatch,
+        dispatcher,
+        above_chunk_threshold,
+        checkpoint_mode,
+        apply_router_weight_after_down,
+        expert_bias,
     ):
         """Production dispatch preserves every gradient under full and selective checkpointing."""
         config = replace(
@@ -1301,7 +1310,9 @@ class TestGroupedExpertsDeepEP:
             experts.token_dispatcher.token_unpermutation.side_effect = lambda output: output
         monkeypatch.setattr("nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: dense_mm)
         monkeypatch.setattr("nemo_automodel.components.moe.experts._BIAS_CHUNK_ROWS", 3)
-        monkeypatch.setattr("nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES", 0 if chunked else 2**30)
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES", 0 if above_chunk_threshold else 2**30
+        )
         hidden = torch.randn(11, 8, requires_grad=True)
         probs = torch.rand(11, 1, requires_grad=True)
         mask = torch.ones(11, dtype=torch.bool)

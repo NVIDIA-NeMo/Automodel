@@ -297,8 +297,25 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         dtype: torch.dtype = torch.bfloat16,
         rows_per_chunk: int = 32768 * 1024,
     ) -> torch.Tensor:
-        """
-        Convert the mxfp4 weights to bfloat16.
+        """Decode packed MXFP4 expert weights into independent floating-point storage.
+
+        Args:
+            blocks: Uint8 tensor of shape [experts, output_features, groups, packed_bytes], where each group stores
+                ``packed_bytes`` pairs of FP4 values, low nibble first. Checkpoints use 16 bytes per group.
+                DTensor inputs may shard the expert axis on at most one mesh axis, with the expert count divisible
+                by that axis's size; all other placements must replicate. ``scales`` must use the same mesh and
+                placements. These are global shapes; each rank decodes its local expert rows. CPU inputs may move
+                to CUDA when distributed execution has more than one rank.
+            scales: Uint8 tensor of shape [experts, output_features, groups], with one biased base-2 exponent per
+                group. The decoded values are multiplied by ``2 ** (scales - 127)``. Must share ``blocks``' device.
+            dtype: Floating-point output dtype.
+            rows_per_chunk: Maximum number of flattened rank-local [packed_bytes] rows decoded per chunk.
+
+        Returns:
+            Tensor of shape [experts, input_features, output_features], where
+            ``input_features = groups * packed_bytes * 2``, in ``dtype`` with independent storage. Inputs are not
+            mutated. For DTensors, the returned global shape uses expert-axis sharding on ``ep``, output-feature
+            sharding on ``ep_shard``, and replication on other named mesh axes when either axis is present.
 
         Source: https://github.com/huggingface/transformers/blob/869735d37d0f929311ac6611728c482a4414ba8c/src/transformers/integrations/mxfp4.py#L77
         """
