@@ -1,0 +1,79 @@
+---
+title: "rajpurkar/squad"
+description: "Explore rajpurkar/squad: extractive question answering, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/rajpurkar/squad
+---
+
+SQuAD pairs questions with passages and annotated answers. The source is hosted as [rajpurkar/squad](https://huggingface.co/datasets/rajpurkar/squad).
+
+## Task
+
+**Extractive question answering.**
+
+| Property | Description |
+| --- | --- |
+| Input | A passage and a question about that passage. |
+| Target | An answer span, including its character offset in the passage. |
+| Modality | Text |
+| Language | en |
+| License Metadata | cc-by-sa-4.0 |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "id": "synthetic-qa-1",
+  "title": "A park visit",
+  "context": "Mira planted an oak tree.",
+  "question": "What did Mira plant?",
+  "answers": {
+    "text": [
+      "an oak tree"
+    ],
+    "answer_start": [
+      13
+    ]
+  }
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `context` | string | Passage that contains the answer. |
+| `question` | string | Question about the passage. |
+| `answers` | object | Lists of answer text and zero-based character offsets. |
+
+The table shows the `plain_text` Hub configuration. Other configurations, when available, are listed on the [Hub dataset page](https://huggingface.co/datasets/rajpurkar/squad).
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `plain_text` | `train` | 87,599 |
+| `plain_text` | `validation` | 10,570 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/rajpurkar/squad/blob/7b6d24c440a36b6815f21b70d25016731768db1f/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Llama 3.2 1B; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) |
+| Encoder-Decoder Fine-Tuning | T5-small; separate source and target tokens | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_finetune/t5/t5_small_squad.yaml) |
+
+**Adapter:** [`make_squad_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/squad.py).
+
+The causal loader takes the first annotated answer, places the passage and question in the prompt, and masks prompt tokens from the loss. It uses the tokenizer chat template when available. The T5 recipe uses `make_seq2seq_dataset` instead.
+
+The Llama recipe uses `train` for training and limits `validation` to 64 examples. That limit is a recipe setting, not the size of the upstream validation split.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/rajpurkar/squad)
+- [Upstream card at revision `7b6d24c4`](https://huggingface.co/datasets/rajpurkar/squad/blob/7b6d24c440a36b6815f21b70d25016731768db1f/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/squad.py)
+- [Dataset catalog](/dataset-coverage/overview)

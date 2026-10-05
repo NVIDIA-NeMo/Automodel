@@ -1,0 +1,80 @@
+---
+title: "julien-c/synthtraces"
+description: "Explore julien-c/synthtraces: coding-agent interaction, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/julien-c/synthtraces
+---
+
+SynthTraces contains synthetic coding-agent sessions. The source is hosted as [julien-c/synthtraces](https://huggingface.co/datasets/julien-c/synthtraces).
+
+## Task
+
+**Coding-agent interaction.** Sessions can include tool activity and additional trace metadata. This short example shows a session without tool calls.
+
+| Property | Description |
+| --- | --- |
+| Input | A coding request, conversation history, and available tools. |
+| Target | Assistant responses and tool actions within the session. |
+| Modality | Text |
+| Language | en |
+| License Metadata | mit |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "session_id": "synthetic-session-1",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write a Python function that doubles a number."
+    },
+    {
+      "role": "assistant",
+      "content": "def double(x):\n    return 2 * x"
+    }
+  ],
+  "tools": [],
+  "num_user_messages": 1,
+  "num_tool_calls": 0
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `session_id` | string | Session identifier. |
+| `messages` | list of JSON objects | Conversation turns. |
+| `tools` | list of JSON objects | Tools available in the session. |
+| `num_tool_calls` | integer | Recorded tool-call count. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 2,876 |
+
+Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=julien-c%2Fsynthtraces) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Agent Fine-Tuning | Qwen2.5 3B; 8,192-token limit | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml) |
+
+**Adapter:** [`make_agent_chat_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/agent_chat.py).
+
+The example loads `revision: refs/convert/parquet`, removes samples without assistant turns, trims an incomplete final turn, and enables history truncation and overlength filtering. These operations can reduce the row count. The pinned upstream card below describes the source; the recipe selects the converted Parquet revision.
+
+The example reserves `train[:64]` for validation and trains on `train[64:]`.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/julien-c/synthtraces)
+- [Upstream card at revision `2641d21a`](https://huggingface.co/datasets/julien-c/synthtraces/blob/2641d21a28fc9765f262d193e8fe8caec3b2347d/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/agent_chat.py)
+- [Dataset catalog](/dataset-coverage/overview)

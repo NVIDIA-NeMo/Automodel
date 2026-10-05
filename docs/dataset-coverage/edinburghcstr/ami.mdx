@@ -1,0 +1,72 @@
+---
+title: "edinburghcstr/ami"
+description: "Explore edinburghcstr/ami: meeting speech recognition, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/edinburghcstr/ami
+---
+
+AMI supplies meeting recordings and transcripts. The source is hosted as [edinburghcstr/ami](https://huggingface.co/datasets/edinburghcstr/ami).
+
+## Task
+
+**Meeting speech recognition.** The example uses the ihm configuration. The waveform is omitted from the illustrative record.
+
+| Property | Description |
+| --- | --- |
+| Input | A segment of speech audio. |
+| Target | The corresponding transcript. |
+| Modality | Audio and text |
+| Language | en |
+| License Metadata | cc-by-4.0 |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "audio": {
+    "path": "synthetic-speech.wav",
+    "bytes": null
+  },
+  "text": "THE MEETING BEGINS AT NINE"
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `audio` | audio | Audio segment; decoding yields a waveform and sampling rate. |
+| `text` | string | Transcript for the audio segment. |
+
+The table shows the `ihm` Hub configuration. Other configurations, when available, are listed on the [Hub dataset page](https://huggingface.co/datasets/edinburghcstr/ami).
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `ihm` | `train` | 108,502 |
+| `ihm` | `validation` | 13,098 |
+| `ihm` | `test` | 12,643 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/edinburghcstr/ami/blob/46f28f2503e2ec48f8867a84eef356c70476beab/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Speech Fine-Tuning | Qwen2.5-Omni 3B; ihm | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml) |
+| Mixed-Corpus Speech Fine-Tuning | Six English sources; access requirements apply | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml) |
+
+**Adapter:** [`make_hf_audio_asr_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/datasets.py).
+
+The standalone example selects `ihm`, resamples audio to 16,000 Hz, and filters clips shorter than one second. Audio decoding occurs lazily. The mixed-source example also includes AMI and normalizes all source transcripts to uppercase text without punctuation except apostrophes.
+
+The standalone and mixed-source examples read AMI `train`. The upstream validation and test splits are available but are not configured as validation datasets in these examples.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/edinburghcstr/ami)
+- [Upstream card at revision `46f28f25`](https://huggingface.co/datasets/edinburghcstr/ami/blob/46f28f2503e2ec48f8867a84eef356c70476beab/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/datasets.py)
+- [Dataset catalog](/dataset-coverage/overview)

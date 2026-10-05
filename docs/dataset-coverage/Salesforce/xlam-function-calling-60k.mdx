@@ -1,0 +1,68 @@
+---
+title: "Salesforce/xlam-function-calling-60k"
+description: "Explore Salesforce/xlam-function-calling-60k: function calling, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/Salesforce/xlam-function-calling-60k
+---
+
+xLAM function-calling data pairs user requests with tool specifications and expected calls. The source is hosted as [Salesforce/xlam-function-calling-60k](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k).
+
+## Task
+
+**Function calling.** The upstream format stores tool definitions and answers as serialized JSON; the example retains that storage shape.
+
+| Property | Description |
+| --- | --- |
+| Input | A user query and a set of callable tools. |
+| Target | One or more function names with their argument values. |
+| Modality | Text |
+| Language | en |
+| License Metadata | cc-by-4.0 |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "query": "Add 4 and 5.",
+  "tools": "[{\"name\":\"add\",\"description\":\"Add two integers.\",\"parameters\":{\"a\":{\"type\":\"int\",\"required\":true},\"b\":{\"type\":\"int\",\"required\":true}}}]",
+  "answers": "[{\"name\":\"add\",\"arguments\":{\"a\":4,\"b\":5}}]"
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `query` | string | User request. |
+| `tools` | JSON string | Tool names, descriptions, and parameter schemas. |
+| `answers` | JSON string | Expected function names and argument objects. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | - |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k/blob/26d14ebfe18b1f7b524bd39b404b50af5dc97866/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Function-Calling Fine-Tuning | FunctionGemma 270M; xLAM adapter | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_finetune/gemma/functiongemma_xlam.yaml) |
+
+**Adapter:** [`make_xlam_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/xlam.py).
+
+The adapter converts the query, tool definitions, and expected calls into the model chat format. Use the dedicated xLAM loader for the raw source schema. Obtain access to both the dataset and FunctionGemma checkpoint before launching.
+
+The recipe uses `train` and evaluates the first 256 training rows. Create a disjoint holdout when measuring generalization.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k)
+- [Upstream card at revision `26d14ebf`](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k/blob/26d14ebfe18b1f7b524bd39b404b50af5dc97866/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/xlam.py)
+- [Dataset catalog](/dataset-coverage/overview)

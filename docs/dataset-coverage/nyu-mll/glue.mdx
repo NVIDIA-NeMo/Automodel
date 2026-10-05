@@ -1,0 +1,72 @@
+---
+title: "nyu-mll/glue"
+description: "Explore nyu-mll/glue: natural language understanding, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/nyu-mll/glue
+---
+
+GLUE groups natural language understanding datasets. This card illustrates MRPC, its sentence-pair paraphrase classification task. The source is hosted as [nyu-mll/glue](https://huggingface.co/datasets/nyu-mll/glue).
+
+## Task
+
+**Natural language understanding.** GLUE is a collection of classification, entailment, paraphrase, and similarity tasks. The record and field table below use `mrpc`, the subset used by the AutoModel example.
+
+| Property | Description |
+| --- | --- |
+| Input | Sentence pairs for the MRPC paraphrase task illustrated here. |
+| Target | A binary equivalence label for MRPC. |
+| Modality | Text |
+| Language | en |
+| License Metadata | other |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "sentence1": "The train arrived at noon.",
+  "sentence2": "At midday, the train reached the station.",
+  "label": 1,
+  "idx": 0
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `sentence1` | string | First sentence in the pair. |
+| `sentence2` | string | Second sentence in the pair. |
+| `label` | class label | MRPC: 0 is not_equivalent; 1 is equivalent. |
+| `idx` | integer | Example index. |
+
+The table shows `mrpc`, the configuration illustrated on this page. GLUE also provides other task configurations on the [Hub dataset page](https://huggingface.co/datasets/nyu-mll/glue).
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `mrpc` | `train` | 3,668 |
+| `mrpc` | `validation` | 408 |
+| `mrpc` | `test` | 1,725 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/nyu-mll/glue/blob/bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Sequence Classification | RoBERTa-large LoRA; MRPC | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml) |
+
+**Adapter:** [`GLUE_MRPC`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/seq_cls.py).
+
+The loader calls `load_dataset("glue", "mrpc", ...)`, using the legacy Hub alias for `nyu-mll/glue`. It tokenizes both sentences together and returns a classification label. The example covers MRPC; it does not establish recipe coverage for every GLUE task.
+
+The example uses MRPC `train` and `validation`. The upstream test split is included for reference.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/nyu-mll/glue)
+- [Upstream card at revision `bcdcba79`](https://huggingface.co/datasets/nyu-mll/glue/blob/bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/seq_cls.py)
+- [Dataset catalog](/dataset-coverage/overview)

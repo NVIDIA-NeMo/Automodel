@@ -1,0 +1,76 @@
+---
+title: "llamafactory/glaive_toolcall_en"
+description: "Explore llamafactory/glaive_toolcall_en: function calling, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/llamafactory/glaive_toolcall_en
+---
+
+This Glaive function-calling conversion is used by. The source is hosted as [llamafactory/glaive_toolcall_en](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en).
+
+## Task
+
+**Function calling.** The example preserves the source's serialized tools field. JSON inside that string must be decoded before treating it as a tool list.
+
+| Property | Description |
+| --- | --- |
+| Input | A conversation and the available tool definitions. |
+| Target | The assistant tool call and, when present, its follow-up response. |
+| Modality | Text |
+| Language | en |
+| License Metadata | apache-2.0 |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "conversations": [
+    {
+      "from": "human",
+      "value": "What is 4 plus 5?"
+    },
+    {
+      "from": "function_call",
+      "value": "{\"name\":\"add\",\"arguments\":{\"a\":4,\"b\":5}}"
+    }
+  ],
+  "tools": "[{\"name\":\"add\",\"description\":\"Add two integers.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"}},\"required\":[\"a\",\"b\"]}}]"
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `conversations` | list of objects | ShareGPT-style from/value turns, including tool-call turns. |
+| `tools` | JSON string | Available function definitions. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | - |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en/blob/8e31881f7a149e3fab97e829a2958f8433c5d997/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Qwen2.5 3B; 4,096-token limit | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml) |
+| LoRA Fine-Tuning | Qwen2.5 3B; 4,096-token limit | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml) |
+
+**Adapter:** [`make_agent_chat_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/agent_chat.py).
+
+The agent-chat loader normalizes ShareGPT-style conversation turns and tool definitions before rendering the tokenizer chat template. Use the agent-chat loader for this source instead of treating its serialized tool calls as plain prompt/completion pairs.
+
+Both examples train on `train` and evaluate `train[:256]`. This is an overlapping diagnostic slice, not an independent held-out split.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en)
+- [Upstream card at revision `8e31881f`](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en/blob/8e31881f7a149e3fab97e829a2958f8433c5d997/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/agent_chat.py)
+- [Dataset catalog](/dataset-coverage/overview)

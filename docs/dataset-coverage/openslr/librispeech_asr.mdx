@@ -1,0 +1,72 @@
+---
+title: "openslr/librispeech_asr"
+description: "Explore openslr/librispeech_asr: read-speech recognition, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/openslr/librispeech_asr
+---
+
+LibriSpeech ASR provides read audiobook speech. The AutoModel mixture selects the clean 100-hour training split. The source is hosted as [openslr/librispeech_asr](https://huggingface.co/datasets/openslr/librispeech_asr).
+
+## Task
+
+**Read-speech recognition.** The example uses the clean configuration. The waveform is omitted from the illustrative record.
+
+| Property | Description |
+| --- | --- |
+| Input | A segment of speech audio. |
+| Target | The corresponding transcript. |
+| Modality | Audio and text |
+| Language | en |
+| License Metadata | cc-by-4.0 |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "audio": {
+    "path": "synthetic-speech.wav",
+    "bytes": null
+  },
+  "text": "THE MEETING BEGINS AT NINE"
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `audio` | audio | Audio segment; decoding yields a waveform and sampling rate. |
+| `text` | string | Transcript for the audio segment. |
+
+The table shows the `clean` Hub configuration. Other configurations, when available, are listed on the [Hub dataset page](https://huggingface.co/datasets/openslr/librispeech_asr).
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `clean` | `train.100` | 28,539 |
+| `clean` | `train.360` | 104,014 |
+| `clean` | `validation` | 2,703 |
+| `clean` | `test` | 2,620 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/openslr/librispeech_asr/blob/71cacbfb7e2354c4226d01e70d77d5fca3d04ba1/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Mixed-Corpus Speech Fine-Tuning | Qwen2.5-Omni 3B; six English sources | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml) |
+
+**Adapter:** [`make_multi_en_asr_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/multi_en.py).
+
+The mixture maps `text` to `text`, adds a source label, normalizes transcripts to uppercase, removes punctuation except apostrophes, and decodes audio lazily at 16,000 Hz.  The recipe uses AMI, Earnings22, VoxPopuli, GigaSpeech, SPGISpeech, and LibriSpeech together. Override `dataset.sources` to change the mixture.
+
+The mixture uses `clean` / `train.100` from this source. The recipe does not configure a validation dataset; duration and empty-text filtering can reduce the loaded count.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/openslr/librispeech_asr)
+- [Upstream card at revision `71cacbfb`](https://huggingface.co/datasets/openslr/librispeech_asr/blob/71cacbfb7e2354c4226d01e70d77d5fca3d04ba1/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/multi_en.py)
+- [Dataset catalog](/dataset-coverage/overview)

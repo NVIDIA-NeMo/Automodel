@@ -1,0 +1,71 @@
+---
+title: "HuggingFaceFW/fineweb-edu"
+description: "Explore HuggingFaceFW/fineweb-edu: causal language modeling on educational text, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/HuggingFaceFW/fineweb-edu
+---
+
+FineWeb-Edu filters web text for educational content. The source is hosted as [HuggingFaceFW/fineweb-edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu).
+
+## Task
+
+**Causal language modeling on educational text.** The record shows raw Hub fields before any tokenizer-specific preprocessing.
+
+| Property | Description |
+| --- | --- |
+| Input | The preceding tokens in a web document. |
+| Target | The next token; source rows contain documents rather than instruction/answer pairs. |
+| Modality | Text |
+| Language | en |
+| License Metadata | odc-by |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "text": "A triangle has three sides. Its interior angles sum to 180 degrees in a plane.",
+  "url": "https://example.org/synthetic-article",
+  "language": "en",
+  "score": 3.5
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `text` | string | Web document used for language modeling. |
+| `url` | string | Source document URL. |
+| `language` | string | Language annotation. |
+| `score` | number | Educational-quality score assigned by the filtering pipeline. |
+
+The table shows the `sample-10BT` Hub configuration. Other configurations, when available, are listed on the [Hub dataset page](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu).
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `sample-10BT` | `train` | 9,672,101 |
+
+Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=HuggingFaceFW%2Ffineweb-edu) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Pretraining | GPT-2; 1,024-token sequences | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_pretrain/megatron_pretrain_gpt2.yaml) |
+
+**Adapter:** [`MegatronPretraining`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/megatron_dataset.py).
+
+Follow [the pretraining guide](/recipes-e2e-examples/pretraining) to download text and run [the Megatron preprocessor](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/tools/preprocess_megatron_dataset.py) with the GPT-2 tokenizer. The recipe expects `fineweb_edu/megatron_gpt2/processed_data_*_text_document*` and writes split mappings separately. Megatron indexed files are not interchangeable with nanoGPT shards.
+
+The recipe partitions prepared documents with `0.99, 0.01, 0.00` for train, validation, and test. It requests 1,024 validation samples; these are local training configurations, not upstream dataset sizes.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu)
+- [Upstream card at revision `87f09149`](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu/blob/87f09149ef4734204d70ed1d046ddc9ca3f2b8f9/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/megatron_dataset.py)
+- [Preparation reference](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/docs/guides/llm/pretraining.mdx)
+- [Dataset catalog](/dataset-coverage/overview)

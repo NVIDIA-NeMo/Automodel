@@ -1,0 +1,79 @@
+---
+title: "liuhaotian/LLaVA-Pretrain"
+description: "Explore liuhaotian/LLaVA-Pretrain: image-caption alignment, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/liuhaotian/LLaVA-Pretrain
+---
+
+LLaVA-Pretrain provides image-caption conversations for visual feature alignment. The source is hosted as [liuhaotian/LLaVA-Pretrain](https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain).
+
+## Task
+
+**Image-caption alignment.** The Hub repository distributes conversation JSON, a metadata JSON file, and an image archive for visual feature alignment.
+
+| Property | Description |
+| --- | --- |
+| Input | An image and a short instruction about it. |
+| Target | A caption describing the image. |
+| Modality | Image and text |
+| Language | en |
+| License Metadata | other |
+
+The publisher requires compliance with the underlying image-source licenses and restricts the redistributed image archive to research reproduction. See the upstream card for the source-specific conditions.
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "id": "synthetic-image-1",
+  "image": "synthetic-scene.jpg",
+  "conversations": [
+    {
+      "from": "human",
+      "value": "Describe the image.\n<image>"
+    },
+    {
+      "from": "gpt",
+      "value": "A red canoe rests beside a lake."
+    }
+  ]
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | Image/conversation identifier. |
+| `image` | string | Relative image filename in the image archive. |
+| `conversations` | list of objects | Human/gpt turns with from and value fields. |
+
+The source is distributed as `blip_laion_cc_sbu_558k.json`, a companion metadata JSON file, and `images.zip`. The publisher describes the LCS-558K collection; no loader-specific split count is asserted here.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `Conversation JSON + images.zip` | `Source files` | - |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain/blob/70f9d1e5e1a697fe35830875cfc7de1dd590d727/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| ViSpec Stage-2 Training | Qwen2.5-VL 7B; regenerated long responses | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/speculative/vispec/qwen2_5_vl_vispec.yaml) |
+
+**Adapter:** [`make_meta_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
+
+Extract the source images into the image root expected by [the regeneration tool](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/speculative/regenerate_vlm.py). Run ViSpec stage 1 before stage 2, regenerate long responses using the target model, and set both `dataset.path_or_dataset` and `recipe_args.draft_init_from` in the stage-2 YAML. Raw short captions do not provide the intended long-response training data.
+
+The example regeneration command selects up to 68,000 source items. The training loader reads the generated `meta.json`; this limit is not the upstream dataset size.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain)
+- [Upstream card at revision `70f9d1e5`](https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain/blob/70f9d1e5e1a697fe35830875cfc7de1dd590d727/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py)
+- [Dataset catalog](/dataset-coverage/overview)

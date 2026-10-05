@@ -1,0 +1,65 @@
+---
+title: "ORGANIZATION/DATASET-NAME"
+description: "Describe the Hub dataset, its task, and the NeMo AutoModel recipe connections."
+slug: dataset-coverage/ORGANIZATION/DATASET-NAME
+---
+
+Introduce the upstream dataset and link its canonical Hugging Face dataset page.
+Keep the dataset's identity independent of a particular model or training recipe.
+
+## Task
+
+Name the upstream task and explain what a model learns or predicts from this data.
+For a companion corpus, explain its role rather than inventing a supervised target.
+
+| Property | Description |
+| --- | --- |
+| Input | What is given to the model? |
+| Target | What should the model predict, generate, or retrieve? |
+| Modality | Text, image, audio, or a combination. |
+| Language | Verified upstream language metadata, if available. |
+| License Metadata | Publisher-declared metadata; preserve qualifications and source-specific terms. |
+
+## Example Record
+
+Label this as a **synthetic example**. Use invented values in the verified Hub
+schema, retaining meaningful types and nesting. State that illustrative media
+paths stand in for binary data. Do not silently present an AutoModel-transformed
+record as the raw Hub format.
+
+```json
+{
+  "SOURCE_FIELD": "Invented value demonstrating the task."
+}
+```
+
+## Schema and Splits
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `SOURCE_FIELD` | string | What this field represents in the task. |
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| Verified Hub configuration | Verified split or source filename | Verified count, or a dash |
+
+Identify the illustrated configuration if the Hub repository has several schemas.
+Cite revision-pinned source metadata, or date viewer metadata when it is the source
+of counts. Keep upstream splits separate from local training slices and mixtures.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Recipe-backed workflow | Model and relevant data requirements | Link to the exact checked-in YAML. |
+
+Link the adapter and explain any required preparation, field conversion, mixture
+membership, or validation overlap. Recipe existence does not establish benchmark
+results. Keep launch instructions in the linked recipe or guide.
+
+## Related Resources
+
+- Canonical Hub dataset link.
+- Upstream card at a full, immutable revision.
+- AutoModel loader or preparation source.
+- [Dataset catalog](/dataset-coverage/overview)

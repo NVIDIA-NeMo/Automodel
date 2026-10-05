@@ -1,0 +1,75 @@
+---
+title: "jihwan1205/perfectblend-qwen3-8b-regen"
+description: "Explore jihwan1205/perfectblend-qwen3-8b-regen: conversation response generation, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/jihwan1205/perfectblend-qwen3-8b-regen
+---
+
+This PerfectBlend derivative contains conversations regenerated with Qwen3 8B. The source is hosted as [jihwan1205/perfectblend-qwen3-8b-regen](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen).
+
+## Task
+
+**Conversation response generation.** The Hub records are conversations. AutoModel uses them as inputs to speculative draft training, where the target model supplies additional supervision.
+
+| Property | Description |
+| --- | --- |
+| Input | A conversation prompt or preceding turns. |
+| Target | Assistant turns regenerated with the dataset's named target model. |
+| Modality | Text |
+| Language | Not declared in Hub metadata |
+| License Metadata | Not declared in Hub metadata; consult the upstream source |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "id": 0,
+  "conversations": [
+    {
+      "role": "user",
+      "content": "Name one use for an empty jar."
+    },
+    {
+      "role": "assistant",
+      "content": "An empty jar can hold pencils."
+    }
+  ]
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | integer | Record identifier. |
+| `conversations` | list of objects | Conversation turns with role and content. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 1,418,401 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen/blob/cbe50897f5ce9e059fdf53850dfb17b91b3f3e3f/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Parallel EAGLE Draft Training | Qwen3 8B target; prepared Parquet files | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/speculative/p-eagle/qwen_peagle_perfectblend.yaml) |
+
+**Adapter:** [`ChatDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py).
+
+The recipe comments provide a preparation command that downloads Parquet shards and renames `conversations` to `messages`. It writes `./cache/dataset/perfectblend-qwen3-8b-regen-messages`, which is the recipe's configured input. Keep regenerated responses aligned with the target checkpoint.
+
+The recipe reads `train[:70000]` from the prepared directory and does not configure validation.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen)
+- [Upstream card at revision `cbe50897`](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen/blob/cbe50897f5ce9e059fdf53850dfb17b91b3f3e3f/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py)
+- [Dataset catalog](/dataset-coverage/overview)

@@ -1,0 +1,75 @@
+---
+title: "Tevatron/colpali"
+description: "Explore Tevatron/colpali: visual document retrieval, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/Tevatron/colpali
+---
+
+This Tevatron conversion of ColPali supplies retrieval queries and positive and negative document references. The source is hosted as [Tevatron/colpali](https://huggingface.co/datasets/Tevatron/colpali).
+
+## Task
+
+**Visual document retrieval.**
+
+| Property | Description |
+| --- | --- |
+| Input | A text query and a collection of document-page images. |
+| Target | Relevant document IDs and mined negative document IDs. |
+| Modality | Text queries and document images |
+| Language | Not declared in Hub metadata |
+| License Metadata | Not declared in Hub metadata; consult the upstream source |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "query_id": "synthetic-query-1",
+  "query_text": "Which page contains the monthly budget?",
+  "positive_document_ids": [
+    "page-1"
+  ],
+  "negative_document_ids": [
+    "page-2"
+  ]
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `query_id` | string | Query identifier. |
+| `query_text` | string | Retrieval query. |
+| `positive_document_ids` | list of strings | Relevant pages in the companion corpus. |
+| `negative_document_ids` | list of strings | Negative pages used for training. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 118,195 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/Tevatron/colpali/blob/394d6a60d4a45deaddf7dac2260f18e3c2fc36ce/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Visual Embedding Fine-Tuning | Nemotron VL 1B; prepared ColPali plus MIRACL | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml) |
+
+**Adapter:** [`RetrievalDatasetConfig`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/retrieval_dataset.py).
+
+Run [the ColPali conversion notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb) to download both sources and write local corpus shards and `colpali_train.json`. Set `dataset.data_dir_list` in the recipe to the generated JSON path. The example mixes 5,000 ColPali samples with 5,000 MIRACL samples. For full-scale data loading, follow [the normalization guide](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/nemotron_vl_1b/README.md).
+
+The conversion notebook uses `train` from the query and corpus datasets. Corpus test rows are not training queries.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/Tevatron/colpali)
+- [Upstream card at revision `394d6a60`](https://huggingface.co/datasets/Tevatron/colpali/blob/394d6a60d4a45deaddf7dac2260f18e3c2fc36ce/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/retrieval_dataset.py)
+- [Preparation reference](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb)
+- [Dataset catalog](/dataset-coverage/overview)

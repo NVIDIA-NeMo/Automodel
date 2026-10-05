@@ -1,0 +1,424 @@
+[
+  {
+    "id": "rajpurkar/squad",
+    "card": "docs/dataset-coverage/rajpurkar/squad.mdx",
+    "task": "Extractive question answering",
+    "recipes": [
+      "examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml",
+      "examples/llm_finetune/t5/t5_small_squad.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/squad.py",
+    "evidence": [],
+    "revision": "7b6d24c440a36b6815f21b70d25016731768db1f"
+  },
+  {
+    "id": "Rowan/hellaswag",
+    "card": "docs/dataset-coverage/Rowan/hellaswag.mdx",
+    "task": "Multiple-choice commonsense inference",
+    "recipes": [
+      "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/hellaswag.py",
+    "evidence": [],
+    "revision": "218ec52e09a7e7462a5400043bb9a69a41d06b76",
+    "aliases": [
+      "rowan/hellaswag"
+    ]
+  },
+  {
+    "id": "allenai/tulu-3-sft-mixture",
+    "card": "docs/dataset-coverage/allenai/tulu-3-sft-mixture.mdx",
+    "task": "Instruction following and conversation",
+    "recipes": [
+      "examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp1_flashoptim.yaml",
+      "examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/chat_dataset.py",
+    "evidence": [],
+    "revision": "b14afda60f1bbebe55d5d2fa1e4df5042f97f8be"
+  },
+  {
+    "id": "Muennighoff/natural-instructions",
+    "card": "docs/dataset-coverage/Muennighoff/natural-instructions.mdx",
+    "task": "Instruction-conditioned text generation",
+    "recipes": [
+      "examples/llm_finetune/llama3_1/llama3_1_8b_columnmapped_lora.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/column_mapped_text_instruction_dataset.py",
+    "evidence": [],
+    "revision": "a29a9757125f4bb1c26445ad0d2ef7d9b2cc9c4c"
+  },
+  {
+    "id": "lm-provers/FineProofs-SFT",
+    "card": "docs/dataset-coverage/lm-provers/FineProofs-SFT.mdx",
+    "task": "Mathematical reasoning and proof generation",
+    "recipes": [
+      "examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/chat_dataset.py",
+    "evidence": [],
+    "revision": "73661e62811cf2940a0d3f82788a4f4332204c2f"
+  },
+  {
+    "id": "llamafactory/glaive_toolcall_en",
+    "card": "docs/dataset-coverage/llamafactory/glaive_toolcall_en.mdx",
+    "task": "Function calling",
+    "recipes": [
+      "examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml",
+      "examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/agent_chat.py",
+    "evidence": [],
+    "revision": "8e31881f7a149e3fab97e829a2958f8433c5d997"
+  },
+  {
+    "id": "julien-c/synthtraces",
+    "card": "docs/dataset-coverage/julien-c/synthtraces.mdx",
+    "task": "Coding-agent interaction",
+    "recipes": [
+      "examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/agent_chat.py",
+    "evidence": [],
+    "revision": "2641d21a28fc9765f262d193e8fe8caec3b2347d"
+  },
+  {
+    "id": "Salesforce/xlam-function-calling-60k",
+    "card": "docs/dataset-coverage/Salesforce/xlam-function-calling-60k.mdx",
+    "task": "Function calling",
+    "recipes": [
+      "examples/llm_finetune/gemma/functiongemma_xlam.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/xlam.py",
+    "evidence": [],
+    "revision": "26d14ebfe18b1f7b524bd39b404b50af5dc97866"
+  },
+  {
+    "id": "nvidia/Nemotron-Post-Training-Dataset-v2",
+    "card": "docs/dataset-coverage/nvidia/Nemotron-Post-Training-Dataset-v2.mdx",
+    "task": "Instruction following and reasoning",
+    "recipes": [
+      "examples/dllm_sft/qwen3_8b_idlm.yaml",
+      "examples/dllm_sft/nemotron_nano30b_dflash.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/chat_dataset.py",
+    "evidence": [],
+    "revision": "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
+  },
+  {
+    "id": "nyu-mll/glue",
+    "card": "docs/dataset-coverage/nyu-mll/glue.mdx",
+    "task": "Natural language understanding",
+    "recipes": [
+      "examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/seq_cls.py",
+    "evidence": [],
+    "revision": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+    "aliases": [
+      "glue"
+    ]
+  },
+  {
+    "id": "xlangai/spider",
+    "card": "docs/dataset-coverage/xlangai/spider.mdx",
+    "task": "Text-to-SQL generation",
+    "recipes": [
+      "examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_spider_peft.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/vlm/datasets.py",
+    "evidence": [],
+    "revision": "0c350918f3f29ec754f1181c65cdce76cd6c133c"
+  },
+  {
+    "id": "richardr1126/spider-schema",
+    "card": "docs/dataset-coverage/richardr1126/spider-schema.mdx",
+    "task": "Database-schema lookup for text-to-SQL",
+    "recipes": [
+      "examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_spider_peft.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/vlm/datasets.py",
+    "evidence": [],
+    "revision": "e383e6f78716d2e50db5e80f084ece642ecb150f"
+  },
+  {
+    "id": "ise-uiuc/Magicoder-OSS-Instruct-75K",
+    "card": "docs/dataset-coverage/ise-uiuc/Magicoder-OSS-Instruct-75K.mdx",
+    "task": "Code generation",
+    "recipes": [
+      "examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/vlm/datasets.py",
+    "evidence": [],
+    "revision": "5f839b1f368a76b161028bb9edff055db34022b2"
+  },
+  {
+    "id": "mmoukouba/MedPix-VQA",
+    "card": "docs/dataset-coverage/mmoukouba/MedPix-VQA.mdx",
+    "task": "Visual question answering",
+    "recipes": [
+      "examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml",
+      "examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/vlm/datasets.py",
+    "evidence": [],
+    "revision": "69eb219d477ab8699296da1fd6b89beb768042d3"
+  },
+  {
+    "id": "naver-clova-ix/cord-v2",
+    "card": "docs/dataset-coverage/naver-clova-ix/cord-v2.mdx",
+    "task": "Receipt information extraction",
+    "recipes": [
+      "examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/vlm/datasets.py",
+    "evidence": [],
+    "revision": "7f0115a4b758a71d6473b8d085751692da2fef98"
+  },
+  {
+    "id": "quintend/rdr-items",
+    "card": "docs/dataset-coverage/quintend/rdr-items.mdx",
+    "task": "Image-to-text generation",
+    "recipes": [
+      "examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml",
+      "examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/vlm/datasets.py",
+    "evidence": [],
+    "revision": "3fd0b1c937a8c437c9ff0f4780b58c077fd2b364"
+  },
+  {
+    "id": "Shopify/product-catalogue",
+    "card": "docs/dataset-coverage/Shopify/product-catalogue.mdx",
+    "task": "Product taxonomy classification",
+    "recipes": [
+      "examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_full.yaml",
+      "examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_lora.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/vlm/datasets.py",
+    "evidence": [],
+    "revision": "002ca15536bb015ebc47b99cc2d716d7040bb09e"
+  },
+  {
+    "id": "edinburghcstr/ami",
+    "card": "docs/dataset-coverage/edinburghcstr/ami.mdx",
+    "task": "Meeting speech recognition",
+    "recipes": [
+      "examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml",
+      "examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/audio/datasets.py",
+    "evidence": [],
+    "revision": "46f28f2503e2ec48f8867a84eef356c70476beab"
+  },
+  {
+    "id": "ysdede/commonvoice_17_tr_fixed",
+    "card": "docs/dataset-coverage/ysdede/commonvoice_17_tr_fixed.mdx",
+    "task": "Turkish speech recognition",
+    "recipes": [
+      "examples/vlm_finetune/phi4/phi4_mm_cv17.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/audio/datasets.py",
+    "evidence": [],
+    "revision": "9d8a025f1ae7c5a2f5c43298c7c4910b03995a4b"
+  },
+  {
+    "id": "nvidia/embed-nemotron-dataset-v1",
+    "card": "docs/dataset-coverage/nvidia/embed-nemotron-dataset-v1.mdx",
+    "task": "Text retrieval and representation learning",
+    "recipes": [
+      "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
+      "examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/retrieval_dataset.py",
+    "evidence": [],
+    "revision": "f457c3e2da4af3b9dd2818685d411b26298d7cbb"
+  },
+  {
+    "id": "Tevatron/colpali",
+    "card": "docs/dataset-coverage/Tevatron/colpali.mdx",
+    "task": "Visual document retrieval",
+    "recipes": [
+      "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/retrieval_dataset.py",
+    "evidence": [
+      "examples/retrieval/bi_encoder/prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb"
+    ],
+    "revision": "394d6a60d4a45deaddf7dac2260f18e3c2fc36ce"
+  },
+  {
+    "id": "Tevatron/colpali-corpus",
+    "card": "docs/dataset-coverage/Tevatron/colpali-corpus.mdx",
+    "task": "Visual document retrieval corpus",
+    "recipes": [
+      "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/retrieval_dataset.py",
+    "evidence": [
+      "examples/retrieval/bi_encoder/prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb"
+    ],
+    "revision": "afd2f86ba2e6c7d62c781a03aafb005f6b8c2b85"
+  },
+  {
+    "id": "sanchit-gandhi/earnings22_split",
+    "card": "docs/dataset-coverage/sanchit-gandhi/earnings22_split.mdx",
+    "task": "Earnings-call speech recognition",
+    "recipes": [
+      "examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/audio/multi_en.py",
+    "evidence": [],
+    "revision": "f9fb35f4134e32b9c8100199d949398fd6d08a5f"
+  },
+  {
+    "id": "facebook/voxpopuli",
+    "card": "docs/dataset-coverage/facebook/voxpopuli.mdx",
+    "task": "Parliamentary speech recognition",
+    "recipes": [
+      "examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/audio/multi_en.py",
+    "evidence": [],
+    "revision": "42f01879c780b4a2e90ec0b4f616c2ece526e4f1"
+  },
+  {
+    "id": "speechcolab/gigaspeech",
+    "card": "docs/dataset-coverage/speechcolab/gigaspeech.mdx",
+    "task": "English speech recognition",
+    "recipes": [
+      "examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/audio/multi_en.py",
+    "evidence": [],
+    "revision": "63c0836b643dc6136a608de041e56b67c12649b3"
+  },
+  {
+    "id": "kensho/spgispeech",
+    "card": "docs/dataset-coverage/kensho/spgispeech.mdx",
+    "task": "English speech recognition",
+    "recipes": [
+      "examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/audio/multi_en.py",
+    "evidence": [],
+    "revision": "14e69dd3b80e968282ca55d3eb2b39cc9db2b62e"
+  },
+  {
+    "id": "openslr/librispeech_asr",
+    "card": "docs/dataset-coverage/openslr/librispeech_asr.mdx",
+    "task": "Read-speech recognition",
+    "recipes": [
+      "examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/audio/multi_en.py",
+    "evidence": [],
+    "revision": "71cacbfb7e2354c4226d01e70d77d5fca3d04ba1"
+  },
+  {
+    "id": "openai/gsm8k",
+    "card": "docs/dataset-coverage/openai/gsm8k.mdx",
+    "task": "Multi-step mathematical question answering",
+    "recipes": [
+      "examples/dllm_sft/diffusion_gemma_lora.yaml",
+      "examples/dllm_sft/diffusion_gemma_sft.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/chat_dataset.py",
+    "evidence": [
+      "examples/dllm_sft/prep_gsm8k.py"
+    ],
+    "revision": "740312add88f781978c0658806c59bc2815b9866"
+  },
+  {
+    "id": "HuggingFaceFW/fineweb",
+    "card": "docs/dataset-coverage/HuggingFaceFW/fineweb.mdx",
+    "task": "Causal language modeling",
+    "recipes": [
+      "examples/llm_pretrain/nanogpt_pretrain.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/nanogpt_dataset.py",
+    "evidence": [
+      "examples/llm_pretrain/nanogpt_pretrain.yaml"
+    ],
+    "revision": "9bb295ddab0e05d785b879661af7260fed5140fc"
+  },
+  {
+    "id": "HuggingFaceFW/fineweb-edu",
+    "card": "docs/dataset-coverage/HuggingFaceFW/fineweb-edu.mdx",
+    "task": "Causal language modeling on educational text",
+    "recipes": [
+      "examples/llm_pretrain/megatron_pretrain_gpt2.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/megatron_dataset.py",
+    "evidence": [
+      "docs/guides/llm/pretraining.mdx"
+    ],
+    "revision": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+  },
+  {
+    "id": "togethercomputer/CoderForge-Preview",
+    "card": "docs/dataset-coverage/togethercomputer/CoderForge-Preview.mdx",
+    "task": "Coding-agent trajectory modeling",
+    "recipes": [
+      "examples/long_context_validation/qwen3_32b/qwen3_32b_coderforge_cp16_128k_lowerLR.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/chat_dataset.py",
+    "evidence": [
+      "examples/long_context_validation/qwen3_32b/README.md"
+    ],
+    "revision": "060fca96cf723b2ebab3181e9e59fafd273df3cb"
+  },
+  {
+    "id": "frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct",
+    "card": "docs/dataset-coverage/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct.mdx",
+    "task": "Conversation response generation",
+    "recipes": [
+      "examples/speculative/eagle3/llama_eagle3_perfectblend.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/chat_dataset.py",
+    "evidence": [],
+    "revision": "c8cf5337f3a4bed5ba9da7362446cc5111fd24f1"
+  },
+  {
+    "id": "jihwan1205/perfectblend-qwen3-8b-regen",
+    "card": "docs/dataset-coverage/jihwan1205/perfectblend-qwen3-8b-regen.mdx",
+    "task": "Conversation response generation",
+    "recipes": [
+      "examples/speculative/p-eagle/qwen_peagle_perfectblend.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/chat_dataset.py",
+    "evidence": [
+      "examples/speculative/p-eagle/qwen_peagle_perfectblend.yaml"
+    ],
+    "revision": "cbe50897f5ce9e059fdf53850dfb17b91b3f3e3f"
+  },
+  {
+    "id": "liuhaotian/LLaVA-Pretrain",
+    "card": "docs/dataset-coverage/liuhaotian/LLaVA-Pretrain.mdx",
+    "task": "Image-caption alignment",
+    "recipes": [
+      "examples/speculative/vispec/qwen2_5_vl_vispec.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/vlm/datasets.py",
+    "evidence": [
+      "examples/speculative/vispec/qwen2_5_vl_vispec.yaml"
+    ],
+    "revision": "70f9d1e5e1a697fe35830875cfc7de1dd590d727"
+  },
+  {
+    "id": "lambda/naruto-blip-captions",
+    "card": "docs/dataset-coverage/lambda/naruto-blip-captions.mdx",
+    "task": "Text-conditioned image generation",
+    "recipes": [
+      "examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/diffusion/loader.py",
+    "evidence": [
+      "examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml"
+    ],
+    "revision": "1ed13e8ef280bd45e3bbac4cfa8bbd9d64ec9f89",
+    "aliases": [
+      "lambdalabs/naruto-blip-captions"
+    ]
+  }
+]

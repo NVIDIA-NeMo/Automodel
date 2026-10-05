@@ -66,6 +66,11 @@ jobs:
       - name: Generate model coverage tables
         run: python3 tests/ci_tests/utils/sync_model_coverage_tables.py
 
+      - name: Validate dataset cards
+        run: |
+          python3 -m pip install 'PyYAML==6.0.3'
+          make -C docs/fern docs-dataset-cards
+
       - name: Apply Fern code styles
         run: python3 tools/apply_fern_code_styles.py
 

@@ -1,0 +1,68 @@
+---
+title: "ise-uiuc/Magicoder-OSS-Instruct-75K"
+description: "Explore ise-uiuc/Magicoder-OSS-Instruct-75K: code generation, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/ise-uiuc/Magicoder-OSS-Instruct-75K
+---
+
+Magicoder OSS-Instruct supplies programming problems and solutions. The source is hosted as [ise-uiuc/Magicoder-OSS-Instruct-75K](https://huggingface.co/datasets/ise-uiuc/Magicoder-OSS-Instruct-75K).
+
+## Task
+
+**Code generation.**
+
+| Property | Description |
+| --- | --- |
+| Input | A programming problem. |
+| Target | A program or explanation solving the problem. |
+| Modality | Text |
+| Language | Not declared in Hub metadata |
+| License Metadata | mit |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "lang": "python",
+  "problem": "Write a function that returns the square of a number.",
+  "solution": "def square(x):\n    return x * x"
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `lang` | string | Programming language. |
+| `problem` | string | Programming task. |
+| `solution` | string | Expected solution. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 75,197 |
+
+Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=ise-uiuc%2FMagicoder-OSS-Instruct-75K) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Joint Drafter Training | Gemma 4 4B; Tulu 3/Magicoder mixture | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml) |
+
+**Adapter:** [`make_tulu3_magicoder_text_mix_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
+
+The loader turns each nonempty problem and solution into user and assistant turns. It interleaves Tulu 3 and Magicoder with sampling probabilities 0.8 and 0.2 and `stopping_strategy="all_exhausted"`. The recipe trains on both sources; it is not a Magicoder-only run.
+
+The recipe reads `train` from both sources. Validation builds another mixture from the same training splits with a different seed and a 200-row cap, so it is not a disjoint holdout.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/ise-uiuc/Magicoder-OSS-Instruct-75K)
+- [Upstream card at revision `5f839b1f`](https://huggingface.co/datasets/ise-uiuc/Magicoder-OSS-Instruct-75K/blob/5f839b1f368a76b161028bb9edff055db34022b2/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py)
+- [Dataset catalog](/dataset-coverage/overview)

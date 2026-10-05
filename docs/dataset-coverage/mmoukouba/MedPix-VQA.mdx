@@ -1,0 +1,73 @@
+---
+title: "mmoukouba/MedPix-VQA"
+description: "Explore mmoukouba/MedPix-VQA: visual question answering, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/mmoukouba/MedPix-VQA
+---
+
+MedPix-VQA pairs medical images with questions and answers. The source is hosted as [mmoukouba/MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA).
+
+## Task
+
+**Visual question answering.**
+
+| Property | Description |
+| --- | --- |
+| Input | A medical image and a question about it. |
+| Target | A text answer grounded in that image. |
+| Modality | Image and text |
+| Language | en |
+| License Metadata | apache-2.0 |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "image_id": {
+    "path": "synthetic-xray.png",
+    "bytes": null
+  },
+  "question": "Which body part is shown?",
+  "answer": "The hand."
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `image_id` | image | Image value, despite the column name ending in _id. |
+| `question` | string | Question associated with the image. |
+| `answer` | string | Reference answer. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 17,420 |
+| `default` | `validation` | 3,080 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/mmoukouba/MedPix-VQA/blob/69eb219d477ab8699296da1fd6b89beb768042d3/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Gemma 3 4B; 1,000 training rows | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml) |
+| LoRA Fine-Tuning | Gemma 3 4B; 1,000 training rows | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml) |
+
+**Adapter:** [`make_medpix_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
+
+The loader creates a user turn containing the image and question, followed by the answer. It keeps rows Arrow-backed and defers image decoding to data access. The example explicitly selects `mmoukouba/MedPix-VQA`, overriding the loader's different default dataset ID.
+
+The full fine-tuning example uses `train[:1000]` and `validation[:500]`; the LoRA example uses `validation[:100]`. The publisher describes splitting by image to avoid overlap between training and validation.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/mmoukouba/MedPix-VQA)
+- [Upstream card at revision `69eb219d`](https://huggingface.co/datasets/mmoukouba/MedPix-VQA/blob/69eb219d477ab8699296da1fd6b89beb768042d3/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py)
+- [Dataset catalog](/dataset-coverage/overview)

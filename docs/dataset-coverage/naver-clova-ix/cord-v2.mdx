@@ -1,0 +1,71 @@
+---
+title: "naver-clova-ix/cord-v2"
+description: "Explore naver-clova-ix/cord-v2: receipt information extraction, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/naver-clova-ix/cord-v2
+---
+
+CORD v2 supplies receipt images and structured annotations. The source is hosted as [naver-clova-ix/cord-v2](https://huggingface.co/datasets/naver-clova-ix/cord-v2).
+
+## Task
+
+**Receipt information extraction.** The serialized annotation is the source representation. Training adapters may transform that JSON structure into a model-specific text sequence.
+
+| Property | Description |
+| --- | --- |
+| Input | An image of a receipt. |
+| Target | Structured receipt fields, including purchased items and totals. |
+| Modality | Image and structured text |
+| Language | Not declared in Hub metadata |
+| License Metadata | cc-by-4.0 |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "image": {
+    "path": "synthetic-receipt.png",
+    "bytes": null
+  },
+  "ground_truth": "{\"gt_parse\": {\"menu\": [{\"nm\": \"Tea\", \"cnt\": \"1\", \"price\": \"2.50\"}], \"total\": {\"total_price\": \"2.50\"}}}"
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `image` | image | Receipt image. |
+| `ground_truth` | JSON string | Structured annotation containing gt_parse or gt_parses. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 800 |
+| `default` | `validation` | 100 |
+| `default` | `test` | 100 |
+
+Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=naver-clova-ix%2Fcord-v2) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Receipt Fine-Tuning | Gemma 3 4B; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml) |
+
+**Adapter:** [`make_cord_v2_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
+
+The loader parses the `ground_truth` JSON and serializes the chosen parse with `json2token`, sorting keys. If multiple parses are present, it samples one. The user turn contains the receipt image and a fixed instruction; the assistant target is the serialized structure.
+
+The example uses `train` and `validation` and caps validation at 64 rows.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/naver-clova-ix/cord-v2)
+- [Upstream card at revision `7f0115a4`](https://huggingface.co/datasets/naver-clova-ix/cord-v2/blob/7f0115a4b758a71d6473b8d085751692da2fef98/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py)
+- [Dataset catalog](/dataset-coverage/overview)

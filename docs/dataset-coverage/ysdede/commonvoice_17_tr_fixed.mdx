@@ -1,0 +1,72 @@
+---
+title: "ysdede/commonvoice_17_tr_fixed"
+description: "Explore ysdede/commonvoice_17_tr_fixed: turkish speech recognition, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/ysdede/commonvoice_17_tr_fixed
+---
+
+This Common Voice 17 Turkish derivative is used by the. The source is hosted as [ysdede/commonvoice_17_tr_fixed](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_fixed).
+
+## Task
+
+**Turkish speech recognition.** The waveform is omitted from the illustrative record.
+
+| Property | Description |
+| --- | --- |
+| Input | A segment of speech audio. |
+| Target | The corresponding transcript. |
+| Modality | Audio and text |
+| Language | tr |
+| License Metadata | cc0-1.0 |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "audio": {
+    "path": "synthetic-speech.wav",
+    "bytes": null
+  },
+  "transcription": "Bugün hava güzel."
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `audio` | audio | Audio segment; decoding yields a waveform and sampling rate. |
+| `transcription` | string | Transcript for the audio segment. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 26,501 |
+| `default` | `test` | 9,650 |
+| `default` | `validation` | 8,639 |
+| `default` | `validated` | 46,345 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_fixed/blob/9d8a025f1ae7c5a2f5c43298c7c4910b03995a4b/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Speech Fine-Tuning | Phi-4 multimodal; Turkish transcripts | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/phi4/phi4_mm_cv17.yaml) |
+
+**Adapter:** [`make_cv17_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/datasets.py).
+
+The loader builds conversations from the transcription text and decodes audio lazily into mono float32 waveforms at 16,000 Hz. Keep the Phi-4 audio collator from the example; an image-only collator does not supply this model's audio inputs.
+
+The example uses `train` and `validation`. The other upstream splits are listed for reference.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_fixed)
+- [Upstream card at revision `9d8a025f`](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_fixed/blob/9d8a025f1ae7c5a2f5c43298c7c4910b03995a4b/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/datasets.py)
+- [Dataset catalog](/dataset-coverage/overview)

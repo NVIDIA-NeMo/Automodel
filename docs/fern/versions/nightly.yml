@@ -982,6 +982,132 @@ navigation:
       - page: "Overview"
         path: ../../guides/dataset-overview.mdx
         slug: overview
+      - section: "Dataset Cards"
+        slug: cards
+        contents:
+          - page: "Overview"
+            path: ../../dataset-coverage/index.mdx
+            slug: overview
+          - section: "Text and Code"
+            slug: text
+            contents:
+              - page: "allenai/tulu-3-sft-mixture"
+                path: ../../dataset-coverage/allenai/tulu-3-sft-mixture.mdx
+                slug: allenai/tulu-3-sft-mixture
+              - page: "frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct"
+                path: ../../dataset-coverage/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct.mdx
+                slug: frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct
+              - page: "HuggingFaceFW/fineweb"
+                path: ../../dataset-coverage/HuggingFaceFW/fineweb.mdx
+                slug: HuggingFaceFW/fineweb
+              - page: "HuggingFaceFW/fineweb-edu"
+                path: ../../dataset-coverage/HuggingFaceFW/fineweb-edu.mdx
+                slug: HuggingFaceFW/fineweb-edu
+              - page: "ise-uiuc/Magicoder-OSS-Instruct-75K"
+                path: ../../dataset-coverage/ise-uiuc/Magicoder-OSS-Instruct-75K.mdx
+                slug: ise-uiuc/Magicoder-OSS-Instruct-75K
+              - page: "jihwan1205/perfectblend-qwen3-8b-regen"
+                path: ../../dataset-coverage/jihwan1205/perfectblend-qwen3-8b-regen.mdx
+                slug: jihwan1205/perfectblend-qwen3-8b-regen
+              - page: "julien-c/synthtraces"
+                path: ../../dataset-coverage/julien-c/synthtraces.mdx
+                slug: julien-c/synthtraces
+              - page: "llamafactory/glaive_toolcall_en"
+                path: ../../dataset-coverage/llamafactory/glaive_toolcall_en.mdx
+                slug: llamafactory/glaive_toolcall_en
+              - page: "lm-provers/FineProofs-SFT"
+                path: ../../dataset-coverage/lm-provers/FineProofs-SFT.mdx
+                slug: lm-provers/FineProofs-SFT
+              - page: "Muennighoff/natural-instructions"
+                path: ../../dataset-coverage/Muennighoff/natural-instructions.mdx
+                slug: Muennighoff/natural-instructions
+              - page: "nvidia/Nemotron-Post-Training-Dataset-v2"
+                path: ../../dataset-coverage/nvidia/Nemotron-Post-Training-Dataset-v2.mdx
+                slug: nvidia/Nemotron-Post-Training-Dataset-v2
+              - page: "nyu-mll/glue"
+                path: ../../dataset-coverage/nyu-mll/glue.mdx
+                slug: nyu-mll/glue
+              - page: "openai/gsm8k"
+                path: ../../dataset-coverage/openai/gsm8k.mdx
+                slug: openai/gsm8k
+              - page: "rajpurkar/squad"
+                path: ../../dataset-coverage/rajpurkar/squad.mdx
+                slug: rajpurkar/squad
+              - page: "richardr1126/spider-schema"
+                path: ../../dataset-coverage/richardr1126/spider-schema.mdx
+                slug: richardr1126/spider-schema
+              - page: "Rowan/hellaswag"
+                path: ../../dataset-coverage/Rowan/hellaswag.mdx
+                slug: Rowan/hellaswag
+              - page: "Salesforce/xlam-function-calling-60k"
+                path: ../../dataset-coverage/Salesforce/xlam-function-calling-60k.mdx
+                slug: Salesforce/xlam-function-calling-60k
+              - page: "togethercomputer/CoderForge-Preview"
+                path: ../../dataset-coverage/togethercomputer/CoderForge-Preview.mdx
+                slug: togethercomputer/CoderForge-Preview
+              - page: "xlangai/spider"
+                path: ../../dataset-coverage/xlangai/spider.mdx
+                slug: xlangai/spider
+          - section: "Vision and Language"
+            slug: vision
+            contents:
+              - page: "liuhaotian/LLaVA-Pretrain"
+                path: ../../dataset-coverage/liuhaotian/LLaVA-Pretrain.mdx
+                slug: liuhaotian/LLaVA-Pretrain
+              - page: "mmoukouba/MedPix-VQA"
+                path: ../../dataset-coverage/mmoukouba/MedPix-VQA.mdx
+                slug: mmoukouba/MedPix-VQA
+              - page: "naver-clova-ix/cord-v2"
+                path: ../../dataset-coverage/naver-clova-ix/cord-v2.mdx
+                slug: naver-clova-ix/cord-v2
+              - page: "quintend/rdr-items"
+                path: ../../dataset-coverage/quintend/rdr-items.mdx
+                slug: quintend/rdr-items
+              - page: "Shopify/product-catalogue"
+                path: ../../dataset-coverage/Shopify/product-catalogue.mdx
+                slug: Shopify/product-catalogue
+          - section: "Speech"
+            slug: audio
+            contents:
+              - page: "edinburghcstr/ami"
+                path: ../../dataset-coverage/edinburghcstr/ami.mdx
+                slug: edinburghcstr/ami
+              - page: "facebook/voxpopuli"
+                path: ../../dataset-coverage/facebook/voxpopuli.mdx
+                slug: facebook/voxpopuli
+              - page: "kensho/spgispeech"
+                path: ../../dataset-coverage/kensho/spgispeech.mdx
+                slug: kensho/spgispeech
+              - page: "openslr/librispeech_asr"
+                path: ../../dataset-coverage/openslr/librispeech_asr.mdx
+                slug: openslr/librispeech_asr
+              - page: "sanchit-gandhi/earnings22_split"
+                path: ../../dataset-coverage/sanchit-gandhi/earnings22_split.mdx
+                slug: sanchit-gandhi/earnings22_split
+              - page: "speechcolab/gigaspeech"
+                path: ../../dataset-coverage/speechcolab/gigaspeech.mdx
+                slug: speechcolab/gigaspeech
+              - page: "ysdede/commonvoice_17_tr_fixed"
+                path: ../../dataset-coverage/ysdede/commonvoice_17_tr_fixed.mdx
+                slug: ysdede/commonvoice_17_tr_fixed
+          - section: "Retrieval"
+            slug: retrieval
+            contents:
+              - page: "nvidia/embed-nemotron-dataset-v1"
+                path: ../../dataset-coverage/nvidia/embed-nemotron-dataset-v1.mdx
+                slug: nvidia/embed-nemotron-dataset-v1
+              - page: "Tevatron/colpali"
+                path: ../../dataset-coverage/Tevatron/colpali.mdx
+                slug: Tevatron/colpali
+              - page: "Tevatron/colpali-corpus"
+                path: ../../dataset-coverage/Tevatron/colpali-corpus.mdx
+                slug: Tevatron/colpali-corpus
+          - section: "Image Generation"
+            slug: diffusion
+            contents:
+              - page: "lambda/naruto-blip-captions"
+                path: ../../dataset-coverage/lambda/naruto-blip-captions.mdx
+                slug: lambda/naruto-blip-captions
       - page: "Text Dataset"
         path: ../../guides/llm/dataset.mdx
         slug: text-dataset

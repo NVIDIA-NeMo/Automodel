@@ -1,0 +1,75 @@
+---
+title: "Rowan/hellaswag"
+description: "Explore Rowan/hellaswag: multiple-choice commonsense inference, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/Rowan/hellaswag
+---
+
+HellaSwag supplies contexts, candidate continuations, and a gold-choice label. The source is hosted as [Rowan/hellaswag](https://huggingface.co/datasets/Rowan/hellaswag). Existing AutoModel examples use its `rowan/hellaswag` alias.
+
+## Task
+
+**Multiple-choice commonsense inference.** The Hub task is multiple-choice selection. The AutoModel adapter below uses the labeled continuation as a generation target.
+
+| Property | Description |
+| --- | --- |
+| Input | A situation description and four possible continuations. |
+| Target | The index of the most plausible continuation. |
+| Modality | Text |
+| Language | en |
+| License Metadata | Not declared in Hub metadata; consult the upstream source |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+
+```json
+{
+  "ctx": "A person fills a watering can and walks to the garden.",
+  "endings": [
+    "They water the plants.",
+    "They put the can in a toaster.",
+    "They paint the sky.",
+    "They fold the water into a box."
+  ],
+  "label": "0"
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ctx` | string | Context preceding the continuation. |
+| `endings` | list of strings | Candidate continuations. |
+| `label` | string | Zero-based gold-choice index for labeled rows. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 39,905 |
+| `default` | `test` | 10,003 |
+| `default` | `validation` | 10,042 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/Rowan/hellaswag/blob/218ec52e09a7e7462a5400043bb9a69a41d06b76/README.md) before local filtering. A dash means this page does not assert a count for that source.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Completion Fine-Tuning | Llama 3.2 1B; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml) |
+
+**Adapter:** [`HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/hellaswag.py).
+
+The loader selects `endings[int(label)]` as the target and uses `ctx` as the prompt. This workflow trains on the gold continuation; it does not calculate multiple-choice benchmark accuracy. Use labeled splits with this loader.
+
+The example trains on `train` and uses a 64-row slice of `validation`. The upstream test split is listed for reference; its unlabeled rows are unsuitable for this supervised loader.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/Rowan/hellaswag)
+- [Upstream card at revision `218ec52e`](https://huggingface.co/datasets/Rowan/hellaswag/blob/218ec52e09a7e7462a5400043bb9a69a41d06b76/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/hellaswag.py)
+- [Dataset catalog](/dataset-coverage/overview)
