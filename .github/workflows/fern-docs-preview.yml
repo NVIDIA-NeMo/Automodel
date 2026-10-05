@@ -204,8 +204,8 @@ jobs:
               if visited > 1000:
                   raise ValueError("Data navigation is too large or contains recursive aliases")
               item = pending.pop()
-              if not isinstance(item, dict) or set(item) - {"section", "page", "path", "slug", "contents", "link", "href"}:
-                  raise ValueError("Data navigation allows only sections, pages, and internal links")
+              if not isinstance(item, dict) or set(item) - {"section", "page", "path", "slug", "contents"}:
+                  raise ValueError("Data navigation allows only sections and pages")
               for key, value in item.items():
                   if key == "contents":
                       if not isinstance(value, list):
@@ -219,8 +219,6 @@ jobs:
                       raise ValueError("Data navigation must reference an existing staged Markdown page")
                   if any(part.startswith(".") or part == "components" for part in page.relative_to(docs).parts):
                       raise ValueError("Data navigation cannot reference hidden files or components")
-              if "href" in item and item["href"] != "/nemo/automodel/nightly/model-coverage/overview":
-                  raise ValueError("Data navigation links may only point to the nightly model overview")
           matches = [i for i, item in enumerate(preview["navigation"]) if item.get("slug") == "datasets"]
           if len(matches) != 1:
               raise ValueError("Expected one Data section in trusted navigation")

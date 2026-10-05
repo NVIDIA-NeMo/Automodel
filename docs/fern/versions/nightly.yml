@@ -982,9 +982,7 @@ navigation:
       - page: "Overview"
         path: ../../guides/dataset-overview.mdx
         slug: overview
-      - link: "Model Cards"
-        href: /nemo/automodel/nightly/model-coverage/overview
-      - section: "Dataset Cards"
+      - section: "Dataset Catalog"
         slug: cards
         contents:
           - page: "Overview"

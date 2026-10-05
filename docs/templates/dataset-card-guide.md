@@ -22,7 +22,7 @@ A model card's recipe table can link a dataset by its stable route:
 ```
 
 Add the card to `docs/dataset-coverage/catalog.json`, the catalog landing page,
-and the nightly **Data > Dataset Cards** navigation. The catalog records canonical
+and the nightly **Data > Dataset Catalog** navigation. The catalog records canonical
 IDs, aliases used by examples, tasks, recipe paths, evidence from adapters and
 preparation scripts, and the upstream metadata revision. Keep preparation-only
 sources and mixture components tied to an actual example; a generic local-file

@@ -88,9 +88,6 @@ class PreviewNavigationTests(unittest.TestCase):
         actual = yaml.safe_load(self.target.read_text())
         self.assertEqual(actual["navigation"][0], self.original["navigation"][0])
         self.assertEqual(actual["navigation"][1], data)
-        self.assertIn(
-            {"link": "Model Cards", "href": "/nemo/automodel/nightly/model-coverage/overview"}, data["contents"]
-        )
 
     def test_rejects_paths_outside_staged_docs(self) -> None:
         (self.root / "outside.mdx").write_text("Private file")
@@ -116,8 +113,13 @@ class PreviewNavigationTests(unittest.TestCase):
     def test_rejects_environment_interpolation(self) -> None:
         self._reject({"page": "${FERN_TOKEN}", "path": "../../dataset-coverage/example/toy.mdx"})
 
-    def test_rejects_external_links(self) -> None:
-        for href in ("https://example.com", "//example.com", "/nemo/automodel/../../secret"):
+    def test_rejects_link_entries(self) -> None:
+        for href in (
+            "https://example.com",
+            "//example.com",
+            "/nemo/automodel/../../secret",
+            "/nemo/automodel/nightly/model-coverage/overview",
+        ):
             with self.subTest(href=href):
                 self._reject({"link": "Models", "href": href})
 

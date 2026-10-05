@@ -256,7 +256,7 @@ Approved upstream PR mirrors that change docs or preview inputs receive an autom
 | `fern-docs-preview.yml` | Push to an approved `pull-request/[0-9]+` mirror with docs or preview changes | Restore archives, stage PR pages with trusted configuration and tooling from `main`, publish the preview, and update its comment |
 | `publish-fern-docs.yml` | Push to `main` affecting docs inputs, `docs/v*` tag, or manual dispatch | Restore archives and publish to `docs.nvidia.com/nemo/automodel` |
 
-The preview and production publication steps use the `DOCS_FERN_TOKEN` organization secret. The preview validates and imports the PR's Data navigation, including dataset cards and the link to the nightly model overview. Navigation outside Data comes from `main`, so PR-only changes to other sections may not appear in the automatic preview. Use the local preview to inspect those navigation changes.
+The preview and production publication steps use the `DOCS_FERN_TOKEN` organization secret. The preview validates and imports the PR's Data navigation, including dataset cards. Navigation outside Data comes from `main`, so PR-only changes to other sections may not appear in the automatic preview. Use the local preview to inspect those navigation changes.
 
 ## Cut a New Version Train
 
