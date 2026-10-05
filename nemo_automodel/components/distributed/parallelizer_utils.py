@@ -262,7 +262,6 @@ def _mp_policy_with_param_dtype(
     object.__setattr__(mp_policy_copy, "param_dtype", param_dtype)
     if param_dtype == torch.float32:
         object.__setattr__(mp_policy_copy, "reduce_dtype", torch.float32)
-        object.__setattr__(mp_policy_copy, "output_dtype", torch.float32)
         # FP32 compute modules own any required input cast. Casting at the nested
         # FSDP boundary changes the module-visible input dtype and can make an
         # activation-checkpoint recompute disagree with the original forward.
@@ -496,9 +495,6 @@ def fully_shard_by_dtype(
         if len(grouped_params) == 2:
             parent_key = next(key for key in grouped_params if key != least_items_key)
             parent_policy = _mp_policy_with_param_dtype(mp_policy, parent_key[1])
-            if mp_policy is not None:
-                # Group compute dtype does not define the mixed module's output contract.
-                object.__setattr__(parent_policy, "output_dtype", mp_policy.output_dtype)
             _call_fully_shard(
                 module,
                 mesh,

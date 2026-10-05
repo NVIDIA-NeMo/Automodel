@@ -15,14 +15,16 @@
 """Real FSDP output preservation using the native Qwen3-Next FP32 SSM gate.
 
 This is a boundary-test fixture, not Qwen3-Next's full forward: the real model
-feeds its FP32 decay gate into a recurrence. Here an explicit activation cast
-feeds a BF16 projection while the original gate remains a separate FP32 output.
-Both dtype-group orderings and activation-checkpoint recomputation are exercised.
+feeds its FP32 decay gate into a recurrence. Here explicit activation casts
+surround the projection while its BF16 result and the FP32 gate remain separate outputs.
+Uniform FP32 compute, both mixed-group orderings, caller output policies, and
+activation-checkpoint recomputation are exercised.
 """
 
 import copy
 from dataclasses import replace
 from datetime import timedelta
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -39,9 +41,9 @@ from nemo_automodel.components.distributed.parallelizer_utils import fully_shard
 
 
 class _GateAndProjection(nn.Module):
-    """Exercise a real FP32 gate with model-owned BF16 activation consumption."""
+    """Exercise a real FP32 gate with model-owned activation conversions."""
 
-    def __init__(self, *, fp32_parent: bool) -> None:
+    def __init__(self, *, fp32_parent: bool, projection_dtype: torch.dtype = torch.bfloat16) -> None:
         from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextSSMGate
 
         super().__init__()
@@ -50,9 +52,11 @@ class _GateAndProjection(nn.Module):
             self._fp32_params.A_log.copy_(torch.linspace(-0.7, 0.2, 4))
             self._fp32_params.dt_bias.copy_(torch.linspace(-0.3, 0.4, 4))
         # Group selection counts parameter tensors: the gate has two, while the
-        # BF16 group has one or three. This deliberately avoids a tie.
+        # BF16 group has one or three. This deliberately avoids a tie. FP32
+        # projections instead put every parameter in one uniform compute group.
+        self.projection_dtype = projection_dtype
         self.projections = nn.ModuleList(
-            nn.Linear(4, 4, bias=False, dtype=torch.bfloat16) for _ in range(1 if fp32_parent else 3)
+            nn.Linear(4, 4, bias=False, dtype=projection_dtype) for _ in range(1 if fp32_parent else 3)
         )
 
     def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -72,8 +76,8 @@ class _GateAndProjection(nn.Module):
         assert gate.dtype == torch.float32
         activation = inputs + gate.to(inputs.dtype)
         for projection in self.projections:
-            assert projection.weight.dtype == torch.bfloat16
-            activation = projection(activation)
+            assert projection.weight.dtype == self.projection_dtype
+            activation = projection(activation.to(self.projection_dtype)).to(inputs.dtype)
         return activation, gate
 
 
@@ -103,32 +107,45 @@ def _worker(rank: int, rendezvous: str) -> None:
         assert policy.param_dtype == torch.bfloat16
         assert policy.cast_forward_inputs is False
         assert policy.output_dtype is None
-        for fp32_parent in (False, True):
-            for checkpoint in (False, True):
+        for parent_kind in ("bf16", "mixed_fp32", "uniform_fp32"):
+            for output_dtype, checkpoint in product((None, torch.bfloat16, torch.float32), (False, True)):
                 torch.manual_seed(4150)
-                model = _GateAndProjection(fp32_parent=fp32_parent).to(device)
+                uniform_fp32 = parent_kind == "uniform_fp32"
+                model = _GateAndProjection(
+                    fp32_parent=parent_kind != "bf16",
+                    projection_dtype=torch.float32 if uniform_fp32 else torch.bfloat16,
+                ).to(device)
                 reference = copy.deepcopy(model)
-                legacy = copy.deepcopy(model) if not fp32_parent else None
+                legacy = copy.deepcopy(model) if parent_kind == "bf16" and output_dtype is None else None
+                case_policy = replace(
+                    policy,
+                    param_dtype=torch.float32 if uniform_fp32 else torch.bfloat16,
+                    output_dtype=output_dtype,
+                )
                 gate, projection = model._fp32_params, model.projections[0]
                 if checkpoint:
                     model = checkpoint_wrapper(model)
                 fully_shard_by_dtype(
                     model,
                     mesh=mesh,
-                    mp_policy=policy,
+                    mp_policy=case_policy,
                     offload_policy=None,
                     fp32_compute_module_names=("_fp32_params",),
                 )
                 assert isinstance(model, FSDPModule)
-                assert isinstance(gate, FSDPModule) is (not fp32_parent)
-                assert isinstance(projection, FSDPModule) is fp32_parent
+                assert isinstance(gate, FSDPModule) is (parent_kind == "bf16")
+                assert isinstance(projection, FSDPModule) is (parent_kind == "mixed_fp32")
                 inputs = torch.linspace(-0.9, 0.8, 24, device=device, dtype=torch.bfloat16).reshape(2, 3, 4)
                 inputs.requires_grad_()
                 reference_inputs = inputs.detach().clone().requires_grad_()
                 actual = model(inputs)
                 expected = reference(reference_inputs)
-                assert actual[0].dtype == torch.bfloat16
-                assert actual[1].dtype == torch.float32
+                # Apply the requested output contract only at the reference
+                # module boundary, independently of the sharding helper.
+                if output_dtype is not None:
+                    expected = tuple(output.to(output_dtype) for output in expected)
+                assert actual[0].dtype == (output_dtype or torch.bfloat16)
+                assert actual[1].dtype == (output_dtype or torch.float32)
                 for output, reference_output in zip(actual, expected):
                     torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
                 # Nonuniform cotangents exercise every projection and both gate
@@ -180,8 +197,8 @@ def _worker(rank: int, rendezvous: str) -> None:
                     assert not torch.equal(legacy_output[1].float(), expected[1])
                 if rank == 0:
                     print(
-                        f"fp32_parent={fp32_parent}, checkpoint={checkpoint}: "
-                        "mixed output dtypes, outputs, input/parameter gradients and SGD step match reference",
+                        f"parent={parent_kind}, output_dtype={output_dtype}, checkpoint={checkpoint}: "
+                        "output dtypes, outputs, input/parameter gradients and SGD step match reference",
                         flush=True,
                     )
                 dist.barrier()

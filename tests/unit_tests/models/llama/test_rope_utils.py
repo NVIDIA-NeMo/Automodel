@@ -28,7 +28,7 @@ import torch
 from transformers import LlamaConfig
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding
+from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding, apply_rotary_pos_emb
 
 
 def _build_rope(
@@ -289,18 +289,19 @@ def test_rope_unknown_type_raises():
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("config_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     ("fused", "layout", "cp_size"),
     [(False, "bshd", 1), (False, "thd", 1), (True, "bshd", 1), (True, "bshd", 2), (True, "thd", 1), (True, "thd", 2)],
 )
-def test_rope_returns_activation_dtype_without_rounding_raw_angles(dtype, fused, layout, cp_size):
-    """Cast final coefficients for attention while retaining FP32 fused angles."""
+def test_rope_keeps_coefficients_and_raw_angles_in_fp32(dtype, config_dtype, fused, layout, cp_size):
+    """Retain FP32 coefficients and raw angles independently of activation/config dtype."""
     config = LlamaConfig(
         hidden_size=32,
         num_attention_heads=4,
         num_key_value_heads=4,
         head_dim=8,
-        dtype=torch.float32,
+        dtype=config_dtype,
         rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
     )
     rope = LlamaRotaryEmbedding(config, rope_fusion=fused)
@@ -318,9 +319,9 @@ def test_rope_returns_activation_dtype_without_rounding_raw_angles(dtype, fused,
     frequencies = torch.tensor([1.0, 0.1, 0.01, 0.001], dtype=torch.float32)
     angles = torch.outer(torch.arange(cache_length, dtype=torch.float32), frequencies).repeat(1, 2)
     expected_angles = angles[positions]
-    assert result[0].dtype == result[1].dtype == dtype
-    torch.testing.assert_close(result[0], expected_angles.cos().to(dtype), rtol=0, atol=0)
-    torch.testing.assert_close(result[1], expected_angles.sin().to(dtype), rtol=0, atol=0)
+    assert result[0].dtype == result[1].dtype == torch.float32
+    torch.testing.assert_close(result[0], expected_angles.cos(), rtol=0, atol=0)
+    torch.testing.assert_close(result[1], expected_angles.sin(), rtol=0, atol=0)
     assert rope._cos_cache.dtype == rope._sin_cache.dtype == torch.float32
     torch.testing.assert_close(rope._cos_cache, angles.cos(), rtol=0, atol=0)
     torch.testing.assert_close(rope._sin_cache, angles.sin(), rtol=0, atol=0)
@@ -331,3 +332,76 @@ def test_rope_returns_activation_dtype_without_rounding_raw_angles(dtype, fused,
         assert not torch.equal(result[2], result[2].to(torch.bfloat16).float())
     else:
         assert len(result) == 2
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_rope_rebuilds_fp32_cache_after_module_cast(fused):
+    """A warm cache rounded by Module.to must be recomputed, not upcast."""
+    rope = _build_rope(rope_fusion=fused)
+    x = torch.zeros(1, 263, 32, dtype=torch.bfloat16)
+    positions = torch.arange(263).unsqueeze(0)
+    original = tuple(tensor.clone() for tensor in rope(x, positions))
+    rope.to(torch.bfloat16)
+    assert rope._cos_cache.dtype == torch.bfloat16
+
+    rebuilt = rope(x, positions)
+    for actual, expected in zip(rebuilt, original):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert actual.dtype == torch.float32
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize(
+    ("q_dtype", "k_dtype"),
+    [(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32), (torch.float32, torch.float16)],
+)
+def test_rope_fp32_rotation_outputs_and_gradients(packed, q_dtype, k_dtype):
+    """Compare rotation and its VJP with an independent complex-number oracle."""
+    torch.manual_seed(4150)
+    batch, length, heads, kv_heads, dim = 2, 11, 4, 2, 8
+    q_shape = (batch * length, heads, dim) if packed else (batch, heads, length, dim)
+    k_shape = (batch * length, kv_heads, dim) if packed else (batch, kv_heads, length, dim)
+    q = torch.randn(q_shape, dtype=q_dtype, requires_grad=True)
+    k = torch.randn(k_shape, dtype=k_dtype, requires_grad=True)
+    # Nonzero long positions and nontrivial frequencies expose early coefficient rounding.
+    positions = torch.arange(batch * length).reshape(batch, length) + 257
+    frequencies = torch.tensor([1.0, 0.1, 0.01, 0.001], dtype=torch.float32)
+    angles = positions.float().unsqueeze(-1) * frequencies
+    config = LlamaConfig(
+        hidden_size=heads * dim,
+        num_attention_heads=heads,
+        head_dim=dim,
+        dtype=torch.bfloat16,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+    rope = LlamaRotaryEmbedding(config)
+    if packed:
+        angles = angles.flatten(0, 1)
+        positions = positions.flatten()
+    x_shape = (batch * length, heads * dim) if packed else (batch, length, heads * dim)
+    cos, sin = rope(torch.zeros(x_shape, dtype=torch.bfloat16), positions, qkv_format="thd" if packed else "bshd")
+    actual = apply_rotary_pos_emb(q, k, cos, sin)
+    phase = torch.complex(angles.cos(), angles.sin()).unsqueeze(1)
+
+    for source, output in zip((q, k), actual):
+        source_real, source_imag = source.detach().float().chunk(2, dim=-1)
+        expected_complex = torch.complex(source_real, source_imag) * phase
+        expected = torch.cat((expected_complex.real, expected_complex.imag), dim=-1).to(source.dtype)
+        assert output.dtype == source.dtype
+        upstream = torch.randn_like(output)
+        grad_real, grad_imag = upstream.float().chunk(2, dim=-1)
+        expected_grad_complex = torch.complex(grad_real, grad_imag) * phase.conj()
+        expected_grad = torch.cat((expected_grad_complex.real, expected_grad_complex.imag), -1).to(source.dtype)
+        output.backward(upstream)
+        # Complex multiplication may contract FP32 operations differently;
+        # reduced-precision outputs/gradients must still agree bit for bit.
+        tolerance = 2 * torch.finfo(torch.float32).eps if source.dtype == torch.float32 else 0
+        torch.testing.assert_close(source.grad, expected_grad, rtol=tolerance, atol=tolerance)
+        torch.testing.assert_close(output, expected, rtol=tolerance, atol=tolerance)
+
+    # BF16 Q/K must still be consumable with a BF16 V by attention.
+    if not packed and q_dtype == k_dtype == torch.bfloat16:
+        value = torch.randn(k_shape, dtype=k_dtype)
+        attention = torch.nn.functional.scaled_dot_product_attention(*actual, value, enable_gqa=True)
+        assert attention.dtype == q_dtype
+        assert torch.isfinite(attention).all()

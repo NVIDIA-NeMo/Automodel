@@ -82,7 +82,7 @@ def _record_embedding(_module, _args, output: torch.Tensor, observations: list[t
 
 
 def _check_dense_models(mesh: DeviceMesh, device: torch.device) -> None:
-    """Preserve dense-model eager outputs and gradients after removing input casts."""
+    """Compare dense-model FP32 RoPE with an unsharded reference using identical inputs."""
     from transformers import LlamaConfig, Qwen2Config, Qwen3Config
 
     from nemo_automodel.components.models.common import BackendConfig
@@ -114,31 +114,36 @@ def _check_dense_models(mesh: DeviceMesh, device: torch.device) -> None:
         model = model_cls(
             config, backend=BackendConfig(linear="torch", attn="sdpa", rms_norm="torch_fp32", rope_fusion=False)
         ).to(device)
-        legacy = copy.deepcopy(model)
-        for candidate, casting in ((model, False), (legacy, True)):
-            active_policy = replace(policy, cast_forward_inputs=casting)
-            for block in candidate.model.layers:
-                fully_shard(block, mesh=mesh, mp_policy=active_policy)
-            fully_shard(candidate, mesh=mesh, mp_policy=active_policy)
+        reference = copy.deepcopy(model)
+        buffers = dict(reference.named_buffers(remove_duplicate=False))
+        reference.to(dtype=torch.bfloat16)
+        for name, buffer in buffers.items():
+            owner, _, local_name = name.rpartition(".")
+            setattr(reference.get_submodule(owner), local_name, buffer)
+        for block in model.model.layers:
+            fully_shard(block, mesh=mesh, mp_policy=policy)
+        fully_shard(model, mesh=mesh, mp_policy=policy)
         ids = torch.tensor([[1, 2, 3, 4, 5]], device=device)
         positions = torch.tensor([[0, 1, 255, 511, 1028]], device=device)
         actual = model(ids, position_ids=positions, use_cache=False).logits
-        expected = legacy(ids, position_ids=positions, use_cache=False).logits
+        expected = reference(ids, position_ids=positions, use_cache=False).logits
         assert actual.dtype == torch.bfloat16
         assert torch.isfinite(actual).all()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         actual.float().square().mean().backward()
         expected.float().square().mean().backward()
         for (name, parameter), (reference_name, reference_parameter) in zip(
-            model.named_parameters(), legacy.named_parameters()
+            model.named_parameters(), reference.named_parameters()
         ):
             assert name == reference_name
             assert parameter.grad is not None, name
             gradient = parameter.grad.full_tensor()
             assert torch.isfinite(gradient).all(), name
-            torch.testing.assert_close(gradient, reference_parameter.grad.full_tensor(), rtol=0, atol=0, msg=name)
+            # FSDP accumulates into FP32 master parameters; the unsharded
+            # reference owns BF16 parameters. Compare values without rounding.
+            torch.testing.assert_close(gradient.float(), reference_parameter.grad.float(), rtol=0, atol=0, msg=name)
         if dist.get_rank() == 0:
-            print(f"{model_cls.__name__}: eager outputs and gradients match legacy cast=True", flush=True)
+            print(f"{model_cls.__name__}: FP32 RoPE outputs and gradients match unsharded reference", flush=True)
         dist.barrier()
 
 
