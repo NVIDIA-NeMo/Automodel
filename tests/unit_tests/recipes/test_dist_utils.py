@@ -88,8 +88,11 @@ class TestParsing:
 
     @pytest.mark.parametrize("path", ["strategy", "strategy_target", "moe_target"])
     @pytest.mark.parametrize("cast_forward_inputs", [None, False, True])
-    def test_mp_policy_input_cast_default_and_override(self, path, cast_forward_inputs):
-        policy_kwargs = {"param_dtype": "bfloat16", "reduce_dtype": "float32", "output_dtype": "float32"}
+    @pytest.mark.parametrize("output_dtype", ["omitted", None, "bfloat16", "float32"])
+    def test_mp_policy_cast_defaults_and_overrides(self, path, cast_forward_inputs, output_dtype):
+        policy_kwargs = {"param_dtype": "bfloat16", "reduce_dtype": "float32"}
+        if output_dtype != "omitted":
+            policy_kwargs["output_dtype"] = output_dtype
         if path != "strategy":
             policy_kwargs["_target_"] = MixedPrecisionPolicy
         if cast_forward_inputs is not None:
@@ -104,11 +107,12 @@ class TestParsing:
         assert config.mp_policy.cast_forward_inputs is (False if cast_forward_inputs is None else cast_forward_inputs)
         assert config.mp_policy.param_dtype is torch.bfloat16
         assert config.mp_policy.reduce_dtype is torch.float32
-        assert config.mp_policy.output_dtype is torch.float32
+        expected_output_dtype = {"omitted": None, None: None, "bfloat16": torch.bfloat16, "float32": torch.float32}
+        assert config.mp_policy.output_dtype is expected_output_dtype[output_dtype]
 
     @pytest.mark.parametrize("moe", [False, True])
     def test_mp_policy_custom_factory_and_object_are_preserved(self, moe):
-        policy = MixedPrecisionPolicy(param_dtype=torch.float16, cast_forward_inputs=True)
+        policy = MixedPrecisionPolicy(param_dtype=torch.float16, output_dtype=torch.float32, cast_forward_inputs=True)
 
         def factory(param_dtype: torch.dtype) -> MixedPrecisionPolicy:
             assert param_dtype is torch.float16
@@ -119,6 +123,7 @@ class TestParsing:
             result = parse_distributed_section(cfg)
             assert result["moe_parallel_config" if moe else "strategy_config"].mp_policy is policy
             assert policy.cast_forward_inputs is True
+            assert policy.output_dtype is torch.float32
 
     @pytest.mark.parametrize("strategy", ["megatron_fsdp", "megatron-fsdp", "mfsdp"])
     def test_megatron_fsdp_names(self, strategy):
@@ -287,9 +292,10 @@ class TestPipeline:
         assert result["pp_enabled"] is False
         assert "pipeline parallelism is disabled" in caplog.text
 
-    def test_pipeline_dtype_defaults_to_mp_policy_output_dtype(self):
-        """Unset pipeline.dtype is derived from the FSDP mp_policy output dtype (bf16 default)."""
+    def test_pipeline_dtype_defaults_to_param_dtype_when_output_is_preserved(self):
+        """Without an output cast, ordinary BF16 computation still uses BF16 pipeline buffers."""
         result = parse_distributed_section({"pp_size": 2, "pipeline": {}})
+        assert result["strategy_config"].mp_policy.output_dtype is None
         assert result["pipeline_config"].dtype == torch.bfloat16
 
     def test_pipeline_dtype_explicit_match_kept(self, caplog):

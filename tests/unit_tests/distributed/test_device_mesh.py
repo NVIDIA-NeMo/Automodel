@@ -86,6 +86,7 @@ def test_distributed_setup_config_accepts_megatron_fsdp_names(strategy, captured
 @pytest.mark.parametrize("config", [FSDP2Config(), FSDP2Config(mp_policy=None)])
 def test_mesh_context_build_accepts_existing_config(captured_raw_mesh_call, config):
     assert config.mp_policy.cast_forward_inputs is False
+    assert config.mp_policy.output_dtype is None
 
     ctx = MeshContext.build(config, world_size=8)
 

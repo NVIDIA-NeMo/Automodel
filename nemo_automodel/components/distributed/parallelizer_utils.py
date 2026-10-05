@@ -495,10 +495,14 @@ def fully_shard_by_dtype(
             )
         if len(grouped_params) == 2:
             parent_key = next(key for key in grouped_params if key != least_items_key)
+            parent_policy = _mp_policy_with_param_dtype(mp_policy, parent_key[1])
+            if mp_policy is not None:
+                # Group compute dtype does not define the mixed module's output contract.
+                object.__setattr__(parent_policy, "output_dtype", mp_policy.output_dtype)
             _call_fully_shard(
                 module,
                 mesh,
-                _mp_policy_with_param_dtype(mp_policy, parent_key[1]),
+                parent_policy,
                 offload_policy,
                 reshard_after_forward,
                 ignored_params,

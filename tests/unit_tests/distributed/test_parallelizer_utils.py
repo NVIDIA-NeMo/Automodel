@@ -847,6 +847,42 @@ def test_fully_shard_by_dtype_internal_child_preserves_natural_output_dtype(monk
     assert mp_policy.output_dtype == torch.float32
 
 
+@pytest.mark.parametrize(
+    ("use_policy", "output_dtype"),
+    [(False, None), (True, None), (True, torch.bfloat16), (True, torch.float32)],
+)
+def test_fully_shard_by_dtype_fp32_mixed_parent_preserves_caller_output_dtype(monkeypatch, use_policy, output_dtype):
+    """A mixed parent's FP32 parameter group must not override its output contract."""
+    calls: list[tuple[nn.Module, MixedPrecisionPolicy | None]] = []
+
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+        calls.append((mod, mp_policy))
+
+    monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard)
+    model = ToyModel(a_dtype=torch.bfloat16, b_dtype_l1=torch.float32, b_dtype_l2=torch.float32)
+    _tag_hf_compute_dtype(model)
+    policy = (
+        MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, output_dtype=output_dtype)
+        if use_policy
+        else None
+    )
+    fully_shard_by_dtype(model, mesh=object(), mp_policy=policy, offload_policy=object())
+
+    assert [module for module, _ in calls] == [model.a, model]
+    child_policy, parent_policy = (call[1] for call in calls)
+    if policy is None:
+        assert child_policy is parent_policy is None
+        return
+    assert child_policy.param_dtype == torch.bfloat16
+    assert child_policy.output_dtype is None
+    assert parent_policy.param_dtype == parent_policy.reduce_dtype == torch.float32
+    assert parent_policy.output_dtype == output_dtype
+    assert parent_policy.cast_forward_inputs is False
+    assert parent_policy is not policy
+    assert policy.param_dtype == policy.reduce_dtype == torch.bfloat16
+    assert policy.output_dtype == output_dtype
+
+
 def test_fully_shard_by_dtype_excludes_ep_params(monkeypatch):
     """Ignored EP experts do not affect grouping and remain excluded from the block unit."""
 

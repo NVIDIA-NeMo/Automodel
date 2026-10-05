@@ -222,7 +222,7 @@ def _build_diffusion_mesh_context(
             "mp_policy": MixedPrecisionPolicy(
                 param_dtype=param_dtype,
                 reduce_dtype=reduce_dtype,
-                output_dtype=compute_dtype,
+                output_dtype=None,
                 cast_forward_inputs=False,
             ),
             # CPU offload: sharded params + optimizer state live on host RAM and are

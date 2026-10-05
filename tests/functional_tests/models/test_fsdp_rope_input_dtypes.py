@@ -154,6 +154,7 @@ def _worker(rank: int, rendezvous: str) -> None:
         mesh = init_device_mesh("cuda", (2,))
         policy = FSDP2Config().mp_policy
         assert policy.cast_forward_inputs is False
+        assert policy.output_dtype is None
         assert policy.param_dtype == torch.bfloat16
         for fusion in (False, True):
             for checkpoint in (False, True):

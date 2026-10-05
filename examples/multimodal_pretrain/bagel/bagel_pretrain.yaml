@@ -63,7 +63,7 @@ distributed:
   mp_policy:
     param_dtype: bfloat16
     reduce_dtype: bfloat16
-    output_dtype: bfloat16
+    output_dtype: null
     cast_forward_inputs: false
 
 dataset:

@@ -433,7 +433,7 @@ class ModelParallelizer:
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
-                output_dtype=torch.float32,
+                output_dtype=None,
                 cast_forward_inputs=False,
             )
 
