@@ -2,24 +2,20 @@
 #
 # Trains only a token-gated LoRA adapter on a frozen Qwen3: the adapter is on for the noisy x_t copy
 # and off for the clean x_0 copy, whose logits are the frozen AR teacher for the total-variation loss.
-# A short 3-stage block-size curriculum (2 -> 4 -> 8) exercises the stage switches within 12 steps.
-# Data: one shard of the official training set, open-thoughts/OpenThoughts3-1.2M at the revision the
-# official prepare_openthoughts.py pins (ShareGPT conversations, converted by ChatDataset). Fetch it with:
-#   hf download open-thoughts/OpenThoughts3-1.2M data/train-00000-of-00120.parquet --repo-type dataset \
-#     --revision 61bcf9d4eb38b30295efc2021227a63cc5bb34c8 --local-dir <dir>
-# and pass --dataset.path_or_dataset_id <dir>/data/train-00000-of-00120.parquet
+# A short 3-stage block-size curriculum (2 -> 4 -> 8) exercises the stage switches within 6 steps.
+# Data: uno_smoke_data.jsonl holds the first 32 rows of open-thoughts/OpenThoughts3-1.2M (Apache-2.0,
+# revision 61bcf9d4, the official Uno training set) in its ShareGPT format, truncated to 1500/2000 characters.
 #
-# Run on 2 GPUs:
-#   torchrun --nproc-per-node 2 nemo_automodel/recipes/dllm/train_ft.py -c tests/functional_tests/dllm/uno_smoke.yaml
+# Launched by L2_DLLM_Uno_Smoke.sh.
 
 recipe: DiffusionLMSFTRecipe
 
 step_scheduler:
   global_batch_size: 2
   local_batch_size: 1
-  max_steps: 12
+  max_steps: 6
   num_epochs: 1
-  ckpt_every_steps: 6
+  ckpt_every_steps: 1000
   val_every_steps: 1000
 
 dist_env:
@@ -42,9 +38,7 @@ peft:
   dropout: 0.0
 
 checkpoint:
-  enabled: true
-  checkpoint_dir: checkpoints/uno_smoke
-  model_save_format: safetensors
+  enabled: false
 
 distributed:
   strategy: fsdp2
@@ -52,8 +46,8 @@ distributed:
   tp_size: 1
   cp_size: 1
   activation_checkpointing: true
-  mp_policy:
-    param_dtype: bfloat16
+  mp_policy:              # fp32 end to end, like the SCDD smoke test
+    param_dtype: float32
     reduce_dtype: float32
     output_dtype: float32
 
@@ -66,11 +60,11 @@ dllm:
   tv_weight: 1.0
   kl_weight: 0.0
   block_curriculum:
-    tokens_per_step: 4096  # global_batch_size * seq_length
+    tokens_per_step: 1024  # global_batch_size * seq_length
     stages:
-      - {block_size: 2, tokens: 16384}
-      - {block_size: 4, tokens: 16384}
-      - {block_size: 8, tokens: 16384}
+      - {block_size: 2, tokens: 2048}
+      - {block_size: 4, tokens: 2048}
+      - {block_size: 8, tokens: 2048}
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -82,9 +76,8 @@ clip_grad_norm:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
-  path_or_dataset_id: openthoughts3/data/train-00000-of-00120.parquet
-  split: "train[:256]"
-  seq_length: 2048
+  path_or_dataset_id: tests/functional_tests/dllm/uno_smoke_data.jsonl
+  seq_length: 512
   padding: max_length
   truncation: true
   unshifted: true
