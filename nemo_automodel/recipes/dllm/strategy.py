@@ -31,12 +31,13 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components._peft.lora import lora_token_gate
 from nemo_automodel.components.attention.idlm_mask import (
     create_idlm_block_mask,
     create_idlm_sdpa_mask,
@@ -52,10 +53,12 @@ from nemo_automodel.components.distributed.context_parallel import ContextParall
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.dllm_loss import (
     BlockDiffusionCrossEntropyLoss,
+    DLLMLossOutput,
     HybridDiffusionLLMLoss,
     IDLMLoss,
     MDLMCrossEntropyLoss,
     SCDDLoss,
+    UnoDistillLoss,
     scdd_schedule,
 )
 
@@ -508,7 +511,7 @@ class IDLMStrategy(DLLMStrategy):
             mask_dtype = autocast_dtype if autocast_dtype is not None else torch.float32
             block_mask = create_idlm_sdpa_mask(L, self.block_size, attn, device=device, dtype=mask_dtype)
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx, self._forward_context(model, noisy_input_ids):
             out = model(
                 input_ids=concat_input_ids,
                 attention_mask=block_mask,
@@ -516,8 +519,8 @@ class IDLMStrategy(DLLMStrategy):
                 use_cache=False,
             )
             logits = out.logits if not torch.is_tensor(out) else out
-            loss_result = recipe.dllm_loss_fn(
-                logits, clean_input_ids, noise_mask, attn, seq_len=L, num_diffusion_tokens=num_diffusion_tokens
+            loss_result = self._compute_loss(
+                recipe, logits, clean_input_ids, noise_mask, attn, seq_len=L, num_diffusion_tokens=num_diffusion_tokens
             )
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())
@@ -525,6 +528,134 @@ class IDLMStrategy(DLLMStrategy):
 
             if is_train:
                 (microbatch_loss * recipe._get_dp_group_size(include_cp=True)).backward()
+
+    def _forward_context(self, model: nn.Module, noisy_input_ids: torch.Tensor) -> AbstractContextManager:
+        """Context entered around the ``[x_t | x_0]`` forward and backward; none for I-DLM.
+
+        Args:
+            model: The trained model part.
+            noisy_input_ids: Tensor of shape [batch, sequence] holding the ``x_t`` copy.
+
+        Returns:
+            A context manager covering both the forward and the backward pass.
+        """
+        return nullcontext()
+
+    def _compute_loss(
+        self,
+        recipe,
+        logits: torch.Tensor,
+        clean_input_ids: torch.Tensor,
+        noise_mask: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        seq_len: int,
+        num_diffusion_tokens: int,
+    ) -> DLLMLossOutput:
+        """Score the ``[x_t | x_0]`` logits with the configured loss.
+
+        Args:
+            recipe: The dLLM recipe owning ``dllm_loss_fn``.
+            logits: Tensor of shape [batch, 2 * sequence, vocab] ordered ``[x_t | x_0]``.
+            clean_input_ids: Tensor of shape [batch, sequence] with the clean ``x_0`` tokens.
+            noise_mask: Bool Tensor of shape [batch, sequence] marking corrupted (supervised) positions.
+            valid_mask: Tensor of shape [batch, sequence] marking non-padding positions.
+            seq_len: Length ``sequence`` of one copy.
+            num_diffusion_tokens: Global supervised-token count used as the loss denominator.
+
+        Returns:
+            The loss module's :class:`DLLMLossOutput`.
+        """
+        return recipe.dllm_loss_fn(
+            logits, clean_input_ids, noise_mask, valid_mask, seq_len=seq_len, num_diffusion_tokens=num_diffusion_tokens
+        )
+
+
+class UnoStrategy(IDLMStrategy):
+    """Strategy for Uno diffusion-adapter training (Sahoo et al., 2026; arXiv:2609.04010).
+
+    Trains a LoRA adapter on a frozen AR model so that, with the adapter on, the model drafts a block
+    of tokens in parallel that the adapter-off model verifies losslessly. Follows the official Uno
+    training code (``ifm-ai/uno`` ``training/``) on top of the I-DLM ``[x_t | x_0]`` layout and mask:
+
+    - Corruption: every supervised (response) token in ``x_t`` is replaced by a uniform random id in
+      ``[0, max(input_ids) + 1)`` over the microbatch, as in the official SDAR
+      ``forward_add_noise_packed(noise="uniform")`` (rate fixed to 1) — :func:`corrupt_uniform_random`
+      with ``eps=1``.
+    - Forward: the LoRA adapter is gated on for the ``x_t`` half only
+      (:func:`~nemo_automodel.components._peft.lora.lora_token_gate`, the official
+      ``TokenwiseLoraRouter``), so the ``x_0`` half is the frozen AR teacher in the same forward.
+    - Loss: :class:`UnoDistillLoss` (total variation, optional reverse KL) between the two halves.
+
+    Requires a ``peft:`` LoRA config on the model.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._noise_high: int | None = None
+
+    def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
+        self.block_size = int(dllm_cfg.get("block_length", 1))
+        return UnoDistillLoss(
+            tv_weight=float(dllm_cfg.get("tv_weight", 1.0)),
+            kl_weight=float(dllm_cfg.get("kl_weight", 0.0)),
+            chunk_size=dllm_cfg.get("loss_chunk_size", 1024),
+        )
+
+    def pre_step(self, recipe, batches) -> tuple[int, int]:
+        num_noise = 0
+        num_supervised = 0
+        for microbatch_idx, batch in enumerate(batches):
+            # The official noise draws replacements from [0, max(input_ids) + 1) over the whole microbatch.
+            self._noise_high = int(batch["input_ids"].max()) + 1
+            noisy_input_ids, noise_mask, p_mask = recipe._apply_corruption(
+                batch["input_ids"], batch["loss_mask"], microbatch_idx=microbatch_idx
+            )
+            batch["_noisy_input_ids"] = noisy_input_ids
+            batch["_noise_mask"] = noise_mask
+            batch["_p_mask"] = p_mask
+            batch["_clean_input_ids"] = batch["input_ids"].clone()
+            num_noise += int(noise_mask.sum().item())
+            num_supervised += int(batch["loss_mask"].sum().item())
+        return num_noise, num_supervised
+
+    def apply_corruption(
+        self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
+    ):
+        if self._noise_high is None:
+            raise RuntimeError("UnoStrategy.apply_corruption must run inside pre_step, which sets the noise range.")
+        return corrupt_uniform_random(
+            input_ids, loss_mask, self._noise_high, block_size=None, eps=1.0, generator=generator
+        )
+
+    def _forward_context(self, model: nn.Module, noisy_input_ids: torch.Tensor) -> AbstractContextManager:
+        """Gate the LoRA adapter on for the ``x_t`` half of the ``[x_t | x_0]`` sequence.
+
+        Args:
+            model: The LoRA-patched model part.
+            noisy_input_ids: Tensor of shape [batch, sequence] holding the ``x_t`` copy.
+
+        Returns:
+            :func:`lora_token_gate` context with a bool gate of shape [batch, 2 * sequence].
+        """
+        noisy_half = torch.ones_like(noisy_input_ids, dtype=torch.bool)
+        gate = torch.cat([noisy_half, torch.zeros_like(noisy_half)], dim=1)
+        return lora_token_gate(model, gate)
+
+    def _compute_loss(
+        self,
+        recipe,
+        logits: torch.Tensor,
+        clean_input_ids: torch.Tensor,
+        noise_mask: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        seq_len: int,
+        num_diffusion_tokens: int,
+    ) -> DLLMLossOutput:
+        return recipe.dllm_loss_fn(
+            logits, noise_mask, valid_mask, seq_len=seq_len, num_diffusion_tokens=num_diffusion_tokens
+        )
 
 
 class DFlashStrategy(DLLMStrategy):
@@ -1155,6 +1286,7 @@ DLLM_STRATEGIES: Dict[str, type] = {
     "scdd": SCDDStrategy,
     "hybrid": HybridStrategy,
     "idlm": IDLMStrategy,
+    "uno": UnoStrategy,
     "dflash": DFlashStrategy,
     "block_diffusion": BlockDiffusionStrategy,
 }

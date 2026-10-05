@@ -20,12 +20,14 @@ from pathlib import Path
 import pytest
 import torch
 
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.loss.dllm_loss import (
     BlockDiffusionCrossEntropyLoss,
     DFlashDecayLoss,
     IDLMLoss,
     MDLMCrossEntropyLoss,
     SCDDLoss,
+    UnoDistillLoss,
 )
 from nemo_automodel.recipes.dllm.strategy import (
     DLLM_STRATEGIES,
@@ -35,6 +37,7 @@ from nemo_automodel.recipes.dllm.strategy import (
     IDLMStrategy,
     MDLMStrategy,
     SCDDStrategy,
+    UnoStrategy,
     _build_target_layer_ids,
     get_dllm_strategy,
 )
@@ -447,6 +450,123 @@ class TestIDLMStrategy:
         # is_train=True ran a real backward: draft params carry finite grads.
         grads = [p.grad for p in model.parameters() if p.grad is not None]
         assert grads and all(torch.isfinite(g).all() for g in grads)
+
+
+# ---------------------------------------------------------------------------
+# UnoStrategy tests
+# ---------------------------------------------------------------------------
+
+
+class TestUnoStrategy:
+    @pytest.fixture
+    def strategy(self):
+        return UnoStrategy()
+
+    def test_resolves_from_registry(self):
+        assert isinstance(get_dllm_strategy("uno"), UnoStrategy)
+
+    def test_create_loss_fn_reads_weights_and_block_length(self, strategy):
+        loss_fn = strategy.create_loss_fn({"block_length": 8, "tv_weight": 0.5, "kl_weight": 0.25})
+        assert isinstance(loss_fn, UnoDistillLoss)
+        assert (loss_fn.tv_weight, loss_fn.kl_weight, strategy.block_size) == (0.5, 0.25, 8)
+        default = strategy.create_loss_fn({})
+        assert (default.tv_weight, default.kl_weight) == (1.0, 0.0)  # released recipe: TV only
+
+    def test_pre_step_replaces_every_response_token_within_the_microbatch_range(self, strategy):
+        """Official noise: rate 1 over the response, ids drawn from [0, max(input_ids) + 1) of the microbatch."""
+        generator = torch.Generator().manual_seed(0)
+
+        def apply_corruption(input_ids, loss_mask, microbatch_idx=0):
+            return strategy.apply_corruption(
+                input_ids, loss_mask, 999, eps=1e-3, block_size=None, half_life_ratio=None, generator=generator
+            )
+
+        input_ids = torch.randint(0, 50, (2, 16))
+        input_ids[1, 0] = 70  # microbatch max lives in another row's prompt
+        loss_mask = torch.zeros(2, 16, dtype=torch.long)
+        loss_mask[:, 8:] = 1
+        batch = {"input_ids": input_ids, "loss_mask": loss_mask}
+        num_noise, num_supervised = strategy.pre_step(
+            types.SimpleNamespace(_apply_corruption=apply_corruption), [batch]
+        )
+
+        assert num_noise == num_supervised == 16
+        assert torch.equal(batch["_noise_mask"], loss_mask.bool())
+        assert torch.equal(batch["_noisy_input_ids"][:, :8], input_ids[:, :8])
+        response = batch["_noisy_input_ids"][:, 8:]
+        assert ((response >= 0) & (response <= 70)).all()
+        assert torch.equal(batch["_clean_input_ids"], input_ids)
+
+    def test_apply_corruption_outside_pre_step_raises(self, strategy):
+        with pytest.raises(RuntimeError, match="pre_step"):
+            strategy.apply_corruption(
+                torch.zeros(1, 4, dtype=torch.long),
+                torch.ones(1, 4),
+                999,
+                eps=1e-3,
+                block_size=None,
+                half_life_ratio=None,
+            )
+
+    def test_forward_backward_gates_lora_to_the_noisy_half(self, strategy):
+        """x_t logits use the adapter, x_0 logits are the frozen base, and only LoRA weights train."""
+        torch.manual_seed(0)
+        vocab, seq_len = 32, 6
+        loss_fn = strategy.create_loss_fn({"block_length": 2, "loss_chunk_size": 4})
+
+        class _TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(vocab, 8)
+                self.q_proj = torch.nn.Linear(8, 8)
+                self.head = torch.nn.Linear(8, vocab)
+                self.config = types.SimpleNamespace(_attn_implementation="sdpa")
+
+            def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
+                return types.SimpleNamespace(logits=self.head(self.q_proj(self.embed(input_ids))))
+
+        model = _TinyModel()
+        apply_lora_to_linear_modules(model, PeftConfig(target_modules=["q_proj"], dim=4, alpha=8, use_triton=False))
+        torch.nn.init.normal_(model.q_proj.lora_B.weight, std=0.5)
+
+        seen = {}
+
+        def recording_loss(logits, *args, **kwargs):
+            seen["logits"] = logits.detach()
+            return loss_fn(logits, *args, **kwargs)
+
+        recipe = types.SimpleNamespace(
+            dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+            model_parts=[model],
+            distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+            te_fp8=None,
+            device_mesh=None,
+            dllm_loss_fn=recording_loss,
+            _dllm_loss_buffer=[],
+            _get_dp_group_size=lambda include_cp=True: 1.0,
+        )
+        clean = torch.randint(0, vocab, (1, seq_len))
+        noise_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+        noise_mask[:, seq_len // 2 :] = True
+        noisy = clean.clone()
+        noisy[noise_mask] = torch.randint(0, vocab, (int(noise_mask.sum()),))
+        batch = {"_clean_input_ids": clean, "_noisy_input_ids": noisy, "_noise_mask": noise_mask}
+        loss_buffer = []
+
+        strategy.forward_backward(
+            recipe, 0, batch, loss_buffer=loss_buffer, num_diffusion_tokens=int(noise_mask.sum()), num_batches=1
+        )
+
+        with torch.no_grad():
+            adapted = model(noisy).logits
+            hidden = model.embed(clean)
+            base = model.head(torch.nn.functional.linear(hidden, model.q_proj.weight, model.q_proj.bias))
+        torch.testing.assert_close(seen["logits"][:, :seq_len], adapted)
+        torch.testing.assert_close(seen["logits"][:, seq_len:], base)
+        assert model.q_proj._lora_token_gate is None
+        assert len(loss_buffer) == 1 and torch.isfinite(loss_buffer[0])
+        trained = {name for name, p in model.named_parameters() if p.grad is not None}
+        assert trained == {"q_proj.lora_A.weight", "q_proj.lora_B.weight"}
 
 
 # ---------------------------------------------------------------------------
