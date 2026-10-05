@@ -863,6 +863,14 @@ navigation:
             contents:
               - page: "llama-nemotron-rerank-1b-v2"
                 path: ../../model-coverage/reranker/nvidia/llama-bidirectional.mdx
+          - section: "Qwen"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRhoCAABXRUJQVlA4TA4CAAAvE8AEAGcFIZIkxVbNY/Bv6plh+n9nuz6YcNxIkiLlov927u8YurvSYdu2gUTnfv+Nv5p/hWnbMNntKVrkn4KCCAZISRgFERBE+P8jEI0Ej4DAsFALBXNAhP/Ev66YmQmZDgELASkymxiMntnpmUzMo5+e5J8w3ekiUqR7MpMm8PV+ZqfnOEyTIkz/nvEfzfeXLJPK6DHALCQ8txtdXIZKVp8jU8kI5wuY9ytfOf6iB5MkQ6ByEiAuTGD94/dR4KdAgUmICCwYkAIIJBwhIAgCywOJAyORESQLMgA+BYEBIZAVOa7PxujhmOWSWiiRZJv1N5vzhwWc0zf8QUYnokdjgCAAAOFktq06I3vZtm3bdi1r2TZfOe8HXUT/Fbhto4x5B78AvEKcwNwDKvgU4wiKuLYF+Y3ZDLVM5YIQP3HczUl/gjk28hdxYqX8r2X7dfVlfGIsVYw5sDzKHH1rWaIsa8vn9UzSBpg0ceA6t/p5cGj4v6crRWIXJKPidLE7KDQiLDwkPVmEOeZjRmattTQIpmc+PaTxCMBBle3OPMYrMP/O9c0Og2OnNqBvbq/5m11qnX7bL+bYC3Fe4d3k1E5W4Oj8ysFVAZewO6yqi42ty7yaw4XeyhKTj6/d0QQ3tLbVZdy/HxV98J2fVMcT/tByjs/ajSQFOBOO4YS+vClJjANuEOR9yVFPfhP15q8p"/></svg>'
+            slug: qwen
+            path: ../../model-coverage/reranker/qwen/index.mdx
+            contents:
+              - page: "Qwen3-Reranker-4B"
+                path: ../../model-coverage/reranker/qwen/qwen3-reranker-4b.mdx
+                slug: Qwen3-Reranker-4B
       - page: "Troubleshooting"
         path: ../../model-coverage/troubleshooting.mdx
         slug: troubleshooting
