@@ -14,26 +14,14 @@
 
 from pathlib import Path
 
-import pytest
-import yaml
-
 from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-OLMO_CONFIGS = (
-    "olmo_2_0425_1b_instruct_squad.yaml",
-    "olmo_2_0425_1b_instruct_squad_peft.yaml",
-)
 
 
-@pytest.mark.parametrize("config_name", OLMO_CONFIGS)
-def test_olmo_datasets_use_generation_marked_chat_template(config_name):
-    config_path = REPO_ROOT / "examples" / "llm_finetune" / "olmo" / config_name
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-
-    train_template = config["dataset"]["chat_template"]
-    assert config["validation_dataset"]["chat_template"] == train_template
-
-    template_path = REPO_ROOT / train_template
-    assert template_path.is_file()
-    assert GENERATION_REGEX.search(template_path.read_text(encoding="utf-8"))
+def test_olmo_chat_template_uses_generation_markers() -> None:
+    # The OLMo recipes were retired, but their reusable chat template is still shipped.
+    template_path = REPO_ROOT / "examples" / "llm_finetune" / "olmo" / "chat_template.jinja"
+    template = template_path.read_text(encoding="utf-8")
+    assert GENERATION_REGEX.search(template) is not None
+    assert template.count("{% generation %}") == template.count("{% endgeneration %}") >= 1
