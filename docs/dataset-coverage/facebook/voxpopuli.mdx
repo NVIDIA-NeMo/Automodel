@@ -4,23 +4,23 @@ description: "Explore facebook/voxpopuli: parliamentary speech recognition, a sy
 slug: dataset-coverage/facebook/voxpopuli
 ---
 
-VoxPopuli provides parliamentary speech. The AutoModel mixture selects its English configuration. The source is hosted as [facebook/voxpopuli](https://huggingface.co/datasets/facebook/voxpopuli).
+VoxPopuli provides speech from European Parliament recordings. The AutoModel mixture selects its English configuration. The source is hosted as [facebook/voxpopuli](https://huggingface.co/datasets/facebook/voxpopuli).
 
 ## Task
 
-**Parliamentary speech recognition.** The example uses the en configuration. The waveform is omitted from the illustrative record.
+**Parliamentary speech recognition.** Transcribe a speech segment into text. The example uses the English (`en`) configuration.
 
 | Property | Description |
 | --- | --- |
 | Input | A segment of speech audio. |
 | Target | The corresponding transcript. |
 | Modality | Audio and text |
-| Language | Multilingual; see upstream language list |
-| License Metadata | cc0-1.0, other |
+| Language | Multilingual source; English (`en`) in this recipe |
+| License Metadata | `cc0-1.0`, `other`; see the [upstream licensing information](https://huggingface.co/datasets/facebook/voxpopuli/blob/42f01879c780b4a2e90ec0b4f616c2ece526e4f1/README.md#licensing-information), which also links the raw-data terms. |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. The `audio` object shows an undecoded path-and-bytes representation with the waveform omitted. Its path is a placeholder, not a downloadable file.
 
 ```json
 {
@@ -28,7 +28,7 @@ This **synthetic example** uses invented values in selected source fields; it is
     "path": "synthetic-speech.wav",
     "bytes": null
   },
-  "normalized_text": "THE MEETING BEGINS AT NINE"
+  "normalized_text": "the meeting begins at nine."
 }
 ```
 
@@ -38,8 +38,8 @@ The table describes the task-bearing fields in the example. The source may also 
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `audio` | audio | Audio segment; decoding yields a waveform and sampling rate. |
-| `normalized_text` | string | Transcript for the audio segment. |
+| `audio` | `Audio` | A speech segment sampled at 16,000 Hz; shown undecoded in the example. |
+| `normalized_text` | string | Normalized transcript for the audio segment; distinct from the source's `raw_text` field. |
 
 The table shows the `en` Hub configuration. Other configurations, when available, are listed on the [Hub dataset page](https://huggingface.co/datasets/facebook/voxpopuli).
 
@@ -49,7 +49,7 @@ The table shows the `en` Hub configuration. Other configurations, when available
 | `en` | `validation` | 1,753 |
 | `en` | `test` | 1,842 |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/facebook/voxpopuli/blob/42f01879c780b4a2e90ec0b4f616c2ece526e4f1/README.md) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/facebook/voxpopuli/blob/42f01879c780b4a2e90ec0b4f616c2ece526e4f1/README.md) before local filtering.
 
 ## Use with NeMo AutoModel
 
@@ -61,7 +61,7 @@ Counts come from [upstream metadata at the linked revision](https://huggingface.
 
 The mixture maps `normalized_text` to `text`, adds a source label, normalizes transcripts to uppercase, removes punctuation except apostrophes, and decodes audio lazily at 16,000 Hz. The loader takes at most 4,000 English training rows before later filtering. The recipe uses AMI, Earnings22, VoxPopuli, GigaSpeech, SPGISpeech, and LibriSpeech together. Override `dataset.sources` to change the mixture.
 
-The mixture uses `en` / `train` from this source. The recipe does not configure a validation dataset; duration and empty-text filtering can reduce the loaded count.
+The mixture uses the `train` split of the `en` configuration from this source. The recipe does not configure a validation dataset; duration and empty-text filtering can reduce the loaded count.
 
 ## Related Resources
 

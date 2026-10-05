@@ -9,7 +9,8 @@ Keep the dataset's identity independent of a particular model or training recipe
 
 ## Task
 
-Name the upstream task and explain what a model learns or predicts from this data.
+Name the upstream task using the task label in `docs/dataset-coverage/catalog.json`
+and explain what a model learns or predicts from this data.
 For a companion corpus, explain its role rather than inventing a supervised target.
 
 | Property | Description |
@@ -52,6 +53,9 @@ of counts. Keep upstream splits separate from local training slices and mixtures
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
 | Recipe-backed workflow | Model and relevant data requirements | Link to the exact checked-in YAML. |
+
+Include a link for every recipe listed for this dataset in
+`docs/dataset-coverage/catalog.json`.
 
 Link the adapter and explain any required preparation, field conversion, mixture
 membership, or validation overlap. Recipe existence does not establish benchmark

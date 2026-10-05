@@ -382,7 +382,7 @@
   {
     "id": "jihwan1205/perfectblend-qwen3-8b-regen",
     "card": "docs/dataset-coverage/jihwan1205/perfectblend-qwen3-8b-regen.mdx",
-    "task": "Conversation response generation",
+    "task": "Speculative decoding draft training",
     "recipes": [
       "examples/speculative/p-eagle/qwen_peagle_perfectblend.yaml"
     ],

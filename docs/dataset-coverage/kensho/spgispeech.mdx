@@ -1,26 +1,28 @@
 ---
 title: "kensho/spgispeech"
-description: "Explore kensho/spgispeech: english speech recognition, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+description: "Explore kensho/spgispeech for English speech recognition, with a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
 slug: dataset-coverage/kensho/spgispeech
 ---
 
-SPGISpeech supplies transcribed business audio. The AutoModel mixture selects configuration `S`. The source is hosted as [kensho/spgispeech](https://huggingface.co/datasets/kensho/spgispeech).
+SPGISpeech supplies audio and transcripts from public earnings calls. The NeMo AutoModel mixture selects configuration `S`. The source is hosted as [kensho/spgispeech](https://huggingface.co/datasets/kensho/spgispeech).
 
 ## Task
 
-**English speech recognition.** The example uses the S configuration. The waveform is omitted from the illustrative record.
+**English speech recognition.** The example uses the `S` configuration. The waveform is omitted from the illustrative record.
 
 | Property | Description |
 | --- | --- |
 | Input | A segment of speech audio. |
 | Target | The corresponding transcript. |
 | Modality | Audio and text |
-| Language | en |
-| License Metadata | other |
+| Language | English (`en`) |
+| License Metadata | `other`; custom [Kensho Terms of Usage](https://huggingface.co/datasets/kensho/spgispeech/blob/14e69dd3b80e968282ca55d3eb2b39cc9db2b62e/README.md). |
+
+Access is gated. Before running the recipe, accept the dataset's terms on its [Hub page](https://huggingface.co/datasets/kensho/spgispeech) and authenticate with a Hugging Face account that has access.
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. The `audio` object illustrates the undecoded representation. Its path is a placeholder, and the audio bytes are omitted.
 
 ```json
 {
@@ -28,17 +30,17 @@ This **synthetic example** uses invented values in selected source fields; it is
     "path": "synthetic-speech.wav",
     "bytes": null
   },
-  "transcript": "THE MEETING BEGINS AT NINE"
+  "transcript": "Revenue grew by nine percent."
 }
 ```
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The table describes the task-bearing fields in the example. The source also includes `wav_filename` (string) and `wav_filesize` (32-bit integer).
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `audio` | audio | Audio segment; decoding yields a waveform and sampling rate. |
+| `audio` | audio | Audio segment with a 16,000 Hz sampling rate in the source metadata. |
 | `transcript` | string | Transcript for the audio segment. |
 
 The table shows the `S` Hub configuration. Other configurations, when available, are listed on the [Hub dataset page](https://huggingface.co/datasets/kensho/spgispeech).
@@ -49,7 +51,7 @@ The table shows the `S` Hub configuration. Other configurations, when available,
 | `S` | `validation` | 39,304 |
 | `S` | `test` | 39,341 |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/kensho/spgispeech/blob/14e69dd3b80e968282ca55d3eb2b39cc9db2b62e/README.md) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/kensho/spgispeech/blob/14e69dd3b80e968282ca55d3eb2b39cc9db2b62e/README.md) before local filtering.
 
 ## Use with NeMo AutoModel
 
@@ -59,9 +61,9 @@ Counts come from [upstream metadata at the linked revision](https://huggingface.
 
 **Adapter:** [`make_multi_en_asr_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/multi_en.py).
 
-The mixture maps `transcript` to `text`, adds a source label, normalizes transcripts to uppercase, removes punctuation except apostrophes, and decodes audio lazily at 16,000 Hz.  The recipe uses AMI, Earnings22, VoxPopuli, GigaSpeech, SPGISpeech, and LibriSpeech together. Override `dataset.sources` to change the mixture.
+The mixture maps `transcript` to `text`, adds a `source` label, normalizes transcripts to uppercase, removes punctuation except apostrophes, and decodes audio lazily at 16,000 Hz. The recipe uses AMI, Earnings22, VoxPopuli, GigaSpeech, SPGISpeech, and LibriSpeech together. Override `dataset.sources` to change the mixture.
 
-The mixture uses `S` / `train` from this source. The recipe does not configure a validation dataset; duration and empty-text filtering can reduce the loaded count.
+The mixture uses the `train` split of configuration `S` from this source. The recipe does not configure a validation dataset. It keeps audio clips from 1 to 30 seconds and removes empty transcripts after normalization, so the loaded count can be lower than the Hub count.
 
 ## Related Resources
 

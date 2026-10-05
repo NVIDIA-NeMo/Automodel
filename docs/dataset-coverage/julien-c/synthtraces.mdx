@@ -1,6 +1,6 @@
 ---
 title: "julien-c/synthtraces"
-description: "Explore julien-c/synthtraces: coding-agent interaction, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+description: "Synthetic coding-agent sessions with conversation messages and tool definitions for agent fine-tuning in NeMo AutoModel."
 slug: dataset-coverage/julien-c/synthtraces
 ---
 
@@ -15,12 +15,12 @@ SynthTraces contains synthetic coding-agent sessions. The source is hosted as [j
 | Input | A coding request, conversation history, and available tools. |
 | Target | Assistant responses and tool actions within the session. |
 | Modality | Text |
-| Language | en |
-| License Metadata | mit |
+| Language | English |
+| License Metadata | MIT (`mit`) |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in selected fields from the Hub's converted session rows; it is not a copied dataset row.
 
 ```json
 {
@@ -43,22 +43,23 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The table describes the selected fields in the example. These fields belong to the Hub's converted session rows, which the recipe loads from `refs/convert/parquet`. The original files on the default branch are Pi event streams. Converted rows also include fields such as `prompt`, `metadata`, and `trace`.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `session_id` | string | Session identifier. |
 | `messages` | list of JSON objects | Conversation turns. |
 | `tools` | list of JSON objects | Tools available in the session. |
+| `num_user_messages` | integer | Recorded user-message count. |
 | `num_tool_calls` | integer | Recorded tool-call count. |
 
-These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+The Hub viewer reports the following split before any AutoModel sampling or preprocessing.
 
 | Configuration | Split or Source | Rows |
 | --- | --- | --- |
 | `default` | `train` | 2,876 |
 
-Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=julien-c%2Fsynthtraces) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=julien-c%2Fsynthtraces) before local filtering.
 
 ## Use with NeMo AutoModel
 
@@ -68,7 +69,7 @@ Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-se
 
 **Adapter:** [`make_agent_chat_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/agent_chat.py).
 
-The example loads `revision: refs/convert/parquet`, removes samples without assistant turns, trims an incomplete final turn, and enables history truncation and overlength filtering. These operations can reduce the row count. The pinned upstream card below describes the source; the recipe selects the converted Parquet revision.
+The example removes samples without assistant turns, trims messages after the final assistant turn, and drops older conversation exchanges to fit the 8,192-token limit. It filters out sessions that still exceed the limit after history truncation. These filters can reduce the row count.
 
 The example reserves `train[:64]` for validation and trains on `train[64:]`.
 

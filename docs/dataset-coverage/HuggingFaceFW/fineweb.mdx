@@ -1,10 +1,10 @@
 ---
 title: "HuggingFaceFW/fineweb"
-description: "Explore HuggingFaceFW/fineweb: causal language modeling, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+description: "FineWeb English web text for language model pretraining, with source fields, sample-10BT split metadata, and the NeMo AutoModel nanoGPT recipe."
 slug: dataset-coverage/HuggingFaceFW/fineweb
 ---
 
-FineWeb provides web text for language model pretraining. The source is hosted as [HuggingFaceFW/fineweb](https://huggingface.co/datasets/HuggingFaceFW/fineweb).
+FineWeb provides cleaned, deduplicated English web text from Common Crawl for language model pretraining. The source is hosted as [HuggingFaceFW/fineweb](https://huggingface.co/datasets/HuggingFaceFW/fineweb).
 
 ## Task
 
@@ -13,14 +13,14 @@ FineWeb provides web text for language model pretraining. The source is hosted a
 | Property | Description |
 | --- | --- |
 | Input | The preceding tokens in a web document. |
-| Target | The next token; source rows contain documents rather than instruction/answer pairs. |
+| Target | The next token; source rows contain documents rather than instruction and answer pairs. |
 | Modality | Text |
-| Language | en |
-| License Metadata | odc-by |
+| Language | English (`en`) |
+| License Metadata | `odc-by` |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row.
 
 ```json
 {
@@ -32,7 +32,7 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The table describes the fields shown in the example. Source rows also include identifiers, crawl metadata, a language score, and a token count.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -40,13 +40,13 @@ The table describes the task-bearing fields in the example. The source may also 
 | `url` | string | Source document URL. |
 | `language` | string | Language annotation. |
 
-The table shows the `sample-10BT` Hub configuration. Other configurations, when available, are listed on the [Hub dataset page](https://huggingface.co/datasets/HuggingFaceFW/fineweb).
+The `sample-10BT` Hub configuration contains approximately 10 billion GPT-2 tokens. Other configurations are listed on the [Hub dataset page](https://huggingface.co/datasets/HuggingFaceFW/fineweb).
 
 | Configuration | Split or Source | Rows |
 | --- | --- | --- |
 | `sample-10BT` | `train` | 14,868,862 |
 
-Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=HuggingFaceFW%2Ffineweb) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=HuggingFaceFW%2Ffineweb) before local filtering.
 
 ## Use with NeMo AutoModel
 

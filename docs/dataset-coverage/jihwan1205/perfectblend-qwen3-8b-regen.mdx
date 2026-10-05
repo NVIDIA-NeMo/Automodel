@@ -1,26 +1,26 @@
 ---
 title: "jihwan1205/perfectblend-qwen3-8b-regen"
-description: "Explore jihwan1205/perfectblend-qwen3-8b-regen: conversation response generation, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+description: "Qwen3-8B-regenerated conversations for speculative draft training, with source schema, a synthetic example, splits, and a NeMo AutoModel recipe."
 slug: dataset-coverage/jihwan1205/perfectblend-qwen3-8b-regen
 ---
 
-This PerfectBlend derivative contains conversations regenerated with Qwen3 8B. The source is hosted as [jihwan1205/perfectblend-qwen3-8b-regen](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen).
+This derivative of [Open Perfect Blend](https://huggingface.co/datasets/mlabonne/open-perfectblend) contains conversations regenerated with `Qwen/Qwen3-8B`. The source is hosted as [jihwan1205/perfectblend-qwen3-8b-regen](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen).
 
 ## Task
 
-**Conversation response generation.** The Hub records are conversations. AutoModel uses them as inputs to speculative draft training, where the target model supplies additional supervision.
+**Speculative decoding draft training.** The upstream dataset is intended to train draft models whose predictions align with `Qwen/Qwen3-8B`. Its records pair conversation prompts with regenerated assistant responses. NeMo AutoModel uses these conversations for parallel EAGLE draft training, with additional supervision from the target model.
 
 | Property | Description |
 | --- | --- |
 | Input | A conversation prompt or preceding turns. |
-| Target | Assistant turns regenerated with the dataset's named target model. |
+| Target | Assistant turns regenerated with `Qwen/Qwen3-8B`. |
 | Modality | Text |
 | Language | Not declared in Hub metadata |
-| License Metadata | Not declared in Hub metadata; consult the upstream source |
+| License Metadata | No license identifier is declared in Hub metadata. The upstream card refers to [Open Perfect Blend](https://huggingface.co/datasets/mlabonne/open-perfectblend) for license details. |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values with the source schema; it is not a copied dataset row.
 
 ```json
 {
@@ -28,24 +28,31 @@ This **synthetic example** uses invented values in selected source fields; it is
   "conversations": [
     {
       "role": "user",
-      "content": "Name one use for an empty jar."
+      "content": "Name one use for an empty jar.",
+      "thinking": null
     },
     {
       "role": "assistant",
-      "content": "An empty jar can hold pencils."
+      "content": "An empty jar can hold pencils.",
+      "thinking": null
     }
-  ]
+  ],
+  "status": "success"
 }
 ```
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The pinned source schema contains the following fields, including the fields within each conversation turn.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `id` | integer | Record identifier. |
-| `conversations` | list of objects | Conversation turns with role and content. |
+| `id` | int64 | Record identifier. |
+| `conversations` | list of objects | Ordered conversation turns. |
+| `conversations[].role` | string | Speaker role, such as `user` or `assistant`. |
+| `conversations[].content` | string | Message text. |
+| `conversations[].thinking` | null | Thinking content; declared as null in the pinned schema. |
+| `status` | string | Regeneration status, such as `success`. |
 
 These are upstream splits or source files, before any AutoModel sampling or preprocessing.
 
@@ -53,7 +60,7 @@ These are upstream splits or source files, before any AutoModel sampling or prep
 | --- | --- | --- |
 | `default` | `train` | 1,418,401 |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen/blob/cbe50897f5ce9e059fdf53850dfb17b91b3f3e3f/README.md) before local filtering. A dash means this page does not assert a count for that source.
+The schema and count come from [upstream metadata at the linked revision](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen/blob/cbe50897f5ce9e059fdf53850dfb17b91b3f3e3f/README.md), before local filtering.
 
 ## Use with NeMo AutoModel
 

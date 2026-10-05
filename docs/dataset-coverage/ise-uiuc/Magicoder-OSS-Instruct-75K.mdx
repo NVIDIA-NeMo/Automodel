@@ -4,7 +4,7 @@ description: "Explore ise-uiuc/Magicoder-OSS-Instruct-75K: code generation, a sy
 slug: dataset-coverage/ise-uiuc/Magicoder-OSS-Instruct-75K
 ---
 
-Magicoder OSS-Instruct supplies programming problems and solutions. The source is hosted as [ise-uiuc/Magicoder-OSS-Instruct-75K](https://huggingface.co/datasets/ise-uiuc/Magicoder-OSS-Instruct-75K).
+Magicoder OSS-Instruct supplies programming problems and solutions generated with `gpt-3.5-turbo-1106`. The source is hosted as [ise-uiuc/Magicoder-OSS-Instruct-75K](https://huggingface.co/datasets/ise-uiuc/Magicoder-OSS-Instruct-75K).
 
 ## Task
 
@@ -16,11 +16,13 @@ Magicoder OSS-Instruct supplies programming problems and solutions. The source i
 | Target | A program or explanation solving the problem. |
 | Modality | Text |
 | Language | Not declared in Hub metadata |
-| License Metadata | mit |
+| License Metadata | `mit` |
+
+The [upstream card](https://huggingface.co/datasets/ise-uiuc/Magicoder-OSS-Instruct-75K/blob/5f839b1f368a76b161028bb9edff055db34022b2/README.md) asks users to consider OpenAI's usage policy when adopting this generated dataset.
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row.
 
 ```json
 {
@@ -46,13 +48,13 @@ These are upstream splits or source files, before any AutoModel sampling or prep
 | --- | --- | --- |
 | `default` | `train` | 75,197 |
 
-Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=ise-uiuc%2FMagicoder-OSS-Instruct-75K) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=ise-uiuc%2FMagicoder-OSS-Instruct-75K) before local filtering.
 
 ## Use with NeMo AutoModel
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Joint Drafter Training | Gemma 4 4B; Tulu 3/Magicoder mixture | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml) |
+| Joint Drafter Training | Gemma 4 4B; Tulu 3 and Magicoder mixture | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml) |
 
 **Adapter:** [`make_tulu3_magicoder_text_mix_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
 

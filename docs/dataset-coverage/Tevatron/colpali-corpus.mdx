@@ -4,7 +4,7 @@ description: "Explore Tevatron/colpali-corpus: visual document retrieval corpus,
 slug: dataset-coverage/Tevatron/colpali-corpus
 ---
 
-This Tevatron conversion of ColPali supplies the page-image corpus referenced by its training queries. The source is hosted as [Tevatron/colpali-corpus](https://huggingface.co/datasets/Tevatron/colpali-corpus).
+This Tevatron conversion of ColPali supplies the page-image corpus referenced by the query rows in [Tevatron/colpali](/dataset-coverage/Tevatron/colpali). The source is hosted as [Tevatron/colpali-corpus](https://huggingface.co/datasets/Tevatron/colpali-corpus).
 
 ## Task
 
@@ -12,15 +12,15 @@ This Tevatron conversion of ColPali supplies the page-image corpus referenced by
 
 | Property | Description |
 | --- | --- |
-| Input | A document ID returned by retrieval or referenced by a query row. |
-| Target | The corresponding page image and any accompanying text. |
-| Modality | Text queries and document images |
+| Input | Candidate documents: document-page images, associated text, document IDs, and source labels. |
+| Target | No standalone supervised target. Query text and relevance labels come from `Tevatron/colpali`. |
+| Modality | Document images and associated text |
 | Language | Not declared in Hub metadata |
 | License Metadata | Not declared in Hub metadata; consult the upstream source |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in the source fields; it is not a copied dataset row. The image is represented by a placeholder path instead of binary image data. The path does not refer to a downloadable file.
 
 ```json
 {
@@ -36,7 +36,7 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The table lists all four fields declared in the pinned upstream metadata.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -52,7 +52,7 @@ These are upstream splits or source files, before any AutoModel sampling or prep
 | `default` | `train` | 118,195 |
 | `default` | `test` | 500 |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/Tevatron/colpali-corpus/blob/afd2f86ba2e6c7d62c781a03aafb005f6b8c2b85/README.md) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/Tevatron/colpali-corpus/blob/afd2f86ba2e6c7d62c781a03aafb005f6b8c2b85/README.md) before local filtering.
 
 ## Use with NeMo AutoModel
 
@@ -62,7 +62,7 @@ Counts come from [upstream metadata at the linked revision](https://huggingface.
 
 **Adapter:** [`RetrievalDatasetConfig`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/retrieval_dataset.py).
 
-Run [the ColPali conversion notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb) to download both sources and write local corpus shards and `colpali_train.json`. Set `dataset.data_dir_list` in the recipe to the generated JSON path. The example mixes 5,000 ColPali samples with 5,000 MIRACL samples. For full-scale data loading, follow [the normalization guide](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/nemotron_vl_1b/README.md).
+Run [the ColPali conversion notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb) to download both sources and write local corpus shards and `colpali_train.json`. Replace the ColPali entry in `dataset.data_dir_list` with the generated JSON path. The example mixes 5,000 ColPali samples with 5,000 MIRACL samples. For full-scale data loading, follow [the normalization guide](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/nemotron_vl_1b/README.md).
 
 The conversion notebook uses `train` from the query and corpus datasets. Corpus test rows are not training queries.
 

@@ -8,19 +8,19 @@ AMI supplies meeting recordings and transcripts. The source is hosted as [edinbu
 
 ## Task
 
-**Meeting speech recognition.** The example uses the ihm configuration. The waveform is omitted from the illustrative record.
+**Meeting speech recognition.** The example uses the `ihm` configuration. The waveform is omitted from the illustrative record.
 
 | Property | Description |
 | --- | --- |
 | Input | A segment of speech audio. |
 | Target | The corresponding transcript. |
 | Modality | Audio and text |
-| Language | en |
-| License Metadata | cc-by-4.0 |
+| Language | English (`en`) |
+| License Metadata | `cc-by-4.0` |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. The `audio` field shows the undecoded `bytes` and `path` representation used by the loader. The audio path is a placeholder, not a downloadable file.
 
 ```json
 {
@@ -49,16 +49,16 @@ The table shows the `ihm` Hub configuration. Other configurations, when availabl
 | `ihm` | `validation` | 13,098 |
 | `ihm` | `test` | 12,643 |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/edinburghcstr/ami/blob/46f28f2503e2ec48f8867a84eef356c70476beab/README.md) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/edinburghcstr/ami/blob/46f28f2503e2ec48f8867a84eef356c70476beab/README.md) before local filtering.
 
 ## Use with NeMo AutoModel
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Speech Fine-Tuning | Qwen2.5-Omni 3B; ihm | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml) |
+| Speech Fine-Tuning | Qwen2.5-Omni 3B; `ihm` | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml) |
 | Mixed-Corpus Speech Fine-Tuning | Six English sources; access requirements apply | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml) |
 
-**Adapter:** [`make_hf_audio_asr_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/datasets.py).
+**Adapters:** The standalone example uses [`make_hf_audio_asr_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/datasets.py). The mixed-source example uses [`make_multi_en_asr_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/multi_en.py).
 
 The standalone example selects `ihm`, resamples audio to 16,000 Hz, and filters clips shorter than one second. Audio decoding occurs lazily. The mixed-source example also includes AMI and normalizes all source transcripts to uppercase text without punctuation except apostrophes.
 

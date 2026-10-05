@@ -2,7 +2,7 @@
 # Runs from this directory (docs/fern/). Invoke as:
 #
 #     cd docs/fern && make docs
-#     # or from anywhere in the repo:
+#     # or from the repository root:
 #     make -C docs/fern docs
 #
 # CI workflows under `.github/workflows/fern-docs-*.yml` are the source of
@@ -31,15 +31,15 @@ help:
 	@echo "========================================"
 	@echo ""
 	@echo "Run from this directory ('cd docs/fern && make <target>')"
-	@echo "or from anywhere in the repo ('make -C docs/fern <target>')."
+	@echo "or from the repository root ('make -C docs/fern <target>')."
 	@echo ""
 	@echo "  make docs-login             FIRST-TIME SETUP — provision Fern account + CLI auth"
 	@echo "  make docs                   Generate library reference and start Fern dev server"
 	@echo "  make docs-stitch            Restore frozen backward-version pages from the $(ARCHIVE_REF) branch"
-	@echo "  make docs-check             Run MDX syntax validation + 'fern check'"
+	@echo "  make docs-check             Validate dataset cards, MDX syntax, and Fern configuration"
 	@echo "  make docs-mdx-check         Run MDX syntax validation"
-	@echo "  make docs-model-tables      Generate release-log and model-registry tables"
-	@echo "  make docs-dataset-cards     Validate Hub dataset cards and example coverage"
+	@echo "  make docs-model-tables      Generate release-log and model-registry tables (requires uv)"
+	@echo "  make docs-dataset-cards     Validate Hub dataset cards and example coverage (requires uv)"
 	@echo "  make docs-preview           Build a shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)"
 	@echo "  make docs-publish           Trigger the 'Publish Fern Docs' workflow on origin/main"
 	@echo "  make docs-generate-library  Regenerate the autodoc library reference under product-docs/"
@@ -110,12 +110,14 @@ docs-check: docs-dataset-cards docs-model-tables docs-stitch
 	$(MAKE) _docs-mdx-check; \
 	fern check
 
+# Keep this docs-only dependency separate from the training environment.
+# Match the PyYAML pin used by the Fern CI workflow.
 docs-model-tables:
-	python3 "$(REPO_ROOT)/tests/ci_tests/utils/sync_model_coverage_tables.py"
+	uv run --no-project --with 'PyYAML==6.0.3' python3 "$(REPO_ROOT)/tests/ci_tests/utils/sync_model_coverage_tables.py"
 
 docs-dataset-cards:
-	python3 -m unittest discover -s "$(REPO_ROOT)/tests/unit_tests/tools" -p test_dataset_cards.py
-	python3 "$(REPO_ROOT)/tools/validate_dataset_cards.py"
+	uv run --no-project --with 'PyYAML==6.0.3' python3 -m unittest discover -s "$(REPO_ROOT)/tests/unit_tests/tools" -p test_dataset_cards.py
+	uv run --no-project --with 'PyYAML==6.0.3' python3 "$(REPO_ROOT)/tools/validate_dataset_cards.py"
 
 docs-mdx-check: docs-model-tables docs-stitch
 	@set -e; \

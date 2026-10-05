@@ -8,7 +8,7 @@ CORD v2 supplies receipt images and structured annotations. The source is hosted
 
 ## Task
 
-**Receipt information extraction.** The serialized annotation is the source representation. Training adapters may transform that JSON structure into a model-specific text sequence.
+**Receipt information extraction.** Predict structured receipt fields from an image. The source stores its annotation as a JSON string, which the AutoModel adapter converts into a model-specific text sequence.
 
 | Property | Description |
 | --- | --- |
@@ -16,11 +16,12 @@ CORD v2 supplies receipt images and structured annotations. The source is hosted
 | Target | Structured receipt fields, including purchased items and totals. |
 | Modality | Image and structured text |
 | Language | Not declared in Hub metadata |
-| License Metadata | cc-by-4.0 |
+| License Metadata | `cc-by-4.0` (Creative Commons Attribution 4.0) |
+| Access | Public and ungated in the Hub metadata retrieved on 2026-10-05. |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. The image path is a placeholder for receipt image data and does not refer to a downloadable file. The `ground_truth` string illustrates selected fields within `gt_parse`.
 
 ```json
 {
@@ -34,22 +35,22 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The upstream schema contains these two fields.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `image` | image | Receipt image. |
-| `ground_truth` | JSON string | Structured annotation containing gt_parse or gt_parses. |
+| `ground_truth` | JSON string | Serialized receipt annotation. The adapter reads `gt_parse`, or `gt_parses` when present. |
 
-These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+These are upstream splits before any AutoModel sampling or preprocessing.
 
-| Configuration | Split or Source | Rows |
+| Configuration | Split | Rows |
 | --- | --- | --- |
 | `default` | `train` | 800 |
 | `default` | `validation` | 100 |
 | `default` | `test` | 100 |
 
-Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=naver-clova-ix%2Fcord-v2) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=naver-clova-ix%2Fcord-v2) before local filtering.
 
 ## Use with NeMo AutoModel
 
@@ -59,9 +60,9 @@ Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-se
 
 **Adapter:** [`make_cord_v2_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
 
-The loader parses the `ground_truth` JSON and serializes the chosen parse with `json2token`, sorting keys. If multiple parses are present, it samples one. The user turn contains the receipt image and a fixed instruction; the assistant target is the serialized structure.
+The loader parses the `ground_truth` JSON and serializes the chosen parse with `json2token`, sorting keys in descending order. If multiple parses are present, it samples one. The user turn contains the receipt image and the fixed instruction "Describe this image." The assistant target is the serialized receipt structure.
 
-The example uses `train` and `validation` and caps validation at 64 rows.
+The example uses `train` and `validation` without setting a sample limit. The adapter accepts `limit_dataset_samples` to restrict a split when needed.
 
 ## Related Resources
 

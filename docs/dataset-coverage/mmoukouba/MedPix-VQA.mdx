@@ -1,6 +1,6 @@
 ---
 title: "mmoukouba/MedPix-VQA"
-description: "Explore mmoukouba/MedPix-VQA: visual question answering, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+description: "Medical visual question answering with mmoukouba/MedPix-VQA: source fields, a synthetic example, dataset splits, and NeMo AutoModel fine-tuning recipes."
 slug: dataset-coverage/mmoukouba/MedPix-VQA
 ---
 
@@ -15,12 +15,13 @@ MedPix-VQA pairs medical images with questions and answers. The source is hosted
 | Input | A medical image and a question about it. |
 | Target | A text answer grounded in that image. |
 | Modality | Image and text |
-| Language | en |
-| License Metadata | apache-2.0 |
+| Language | English (`en`) |
+| License Metadata | `apache-2.0` |
+| Access | Public and ungated in the pinned Hub metadata. |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in the source fields; it is not a copied dataset row. The `image_id` object illustrates an undecoded image value. Its path is a placeholder, not a downloadable file.
 
 ```json
 {
@@ -28,6 +29,8 @@ This **synthetic example** uses invented values in selected source fields; it is
     "path": "synthetic-xray.png",
     "bytes": null
   },
+  "mode": "radiograph",
+  "case_id": "synthetic-case-001",
   "question": "Which body part is shown?",
   "answer": "The hand."
 }
@@ -35,22 +38,24 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The pinned source metadata declares the following fields. The AutoModel loader uses `image_id`, `question`, and `answer`.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `image_id` | image | Image value, despite the column name ending in _id. |
+| `image_id` | image | Image value, despite the column name ending in `_id`. |
+| `mode` | string | Publisher-provided mode or context for the image. |
+| `case_id` | string | Case identifier. |
 | `question` | string | Question associated with the image. |
 | `answer` | string | Reference answer. |
 
-These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+These are upstream splits, before any AutoModel sampling or preprocessing.
 
-| Configuration | Split or Source | Rows |
+| Configuration | Split | Rows |
 | --- | --- | --- |
 | `default` | `train` | 17,420 |
 | `default` | `validation` | 3,080 |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/mmoukouba/MedPix-VQA/blob/69eb219d477ab8699296da1fd6b89beb768042d3/README.md) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/mmoukouba/MedPix-VQA/blob/69eb219d477ab8699296da1fd6b89beb768042d3/README.md) before local filtering.
 
 ## Use with NeMo AutoModel
 
@@ -61,7 +66,7 @@ Counts come from [upstream metadata at the linked revision](https://huggingface.
 
 **Adapter:** [`make_medpix_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
 
-The loader creates a user turn containing the image and question, followed by the answer. It keeps rows Arrow-backed and defers image decoding to data access. The example explicitly selects `mmoukouba/MedPix-VQA`, overriding the loader's different default dataset ID.
+The loader creates a user turn containing the image and question, followed by an assistant turn containing the answer. It keeps rows Arrow-backed and defers image decoding to data access. Both examples explicitly select `mmoukouba/MedPix-VQA`, overriding the loader's different default dataset ID.
 
 The full fine-tuning example uses `train[:1000]` and `validation[:500]`; the LoRA example uses `validation[:100]`. The publisher describes splitting by image to avoid overlap between training and validation.
 

@@ -1,26 +1,29 @@
 ---
 title: "ysdede/commonvoice_17_tr_fixed"
-description: "Explore ysdede/commonvoice_17_tr_fixed: turkish speech recognition, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+description: "Turkish speech recognition with Common Voice 17: source schema, a synthetic record, upstream splits, and the NeMo AutoModel Phi-4 multimodal recipe."
 slug: dataset-coverage/ysdede/commonvoice_17_tr_fixed
 ---
 
-This Common Voice 17 Turkish derivative is used by the. The source is hosted as [ysdede/commonvoice_17_tr_fixed](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_fixed).
+The [ysdede/commonvoice_17_tr_fixed](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_fixed) dataset is a processed version of Common Voice 17 Turkish speech used by the NeMo AutoModel Phi-4 multimodal fine-tuning example.
+
+The upstream card describes resampling audio to 16 kHz, trimming silence, removing clips shorter than one second, and normalizing transcripts before publishing the dataset.
 
 ## Task
 
-**Turkish speech recognition.** The waveform is omitted from the illustrative record.
+**Turkish speech recognition.** Train a model to transcribe Turkish speech into text.
 
 | Property | Description |
 | --- | --- |
 | Input | A segment of speech audio. |
 | Target | The corresponding transcript. |
 | Modality | Audio and text |
-| Language | tr |
-| License Metadata | cc0-1.0 |
+| Language | Turkish (`tr`) |
+| License Metadata | `cc0-1.0` |
+| Access | Public and not gated in the retrieved Hub metadata. |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. The audio path is a placeholder, and the waveform is omitted.
 
 ```json
 {
@@ -34,23 +37,23 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The table describes the task-bearing fields in the example. The source also includes `duration`, `up_votes`, `down_votes`, `age`, `gender`, and `accent` metadata.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `audio` | audio | Audio segment; decoding yields a waveform and sampling rate. |
+| `audio` | Audio | Audio segment with a declared sampling rate of 16,000 Hz. |
 | `transcription` | string | Transcript for the audio segment. |
 
-These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+The upstream `default` configuration provides four splits:
 
-| Configuration | Split or Source | Rows |
+| Configuration | Split | Rows |
 | --- | --- | --- |
 | `default` | `train` | 26,501 |
 | `default` | `test` | 9,650 |
 | `default` | `validation` | 8,639 |
 | `default` | `validated` | 46,345 |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_fixed/blob/9d8a025f1ae7c5a2f5c43298c7c4910b03995a4b/README.md) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/ysdede/commonvoice_17_tr_fixed/blob/9d8a025f1ae7c5a2f5c43298c7c4910b03995a4b/README.md). The upstream card reports removing records shared with `train`, `test`, or `validation` from this derivative's `validated` split.
 
 ## Use with NeMo AutoModel
 
@@ -60,9 +63,9 @@ Counts come from [upstream metadata at the linked revision](https://huggingface.
 
 **Adapter:** [`make_cv17_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/datasets.py).
 
-The loader builds conversations from the transcription text and decodes audio lazily into mono float32 waveforms at 16,000 Hz. Keep the Phi-4 audio collator from the example; an image-only collator does not supply this model's audio inputs.
+The loader retains `audio` and `transcription`, builds conversations from the transcript, and decodes audio lazily into mono `float32` waveforms at 16,000 Hz by default. Use the example's `phi4_mm_collate_fn` collator to pass these waveforms and conversations to the Phi-4 processor.
 
-The example uses `train` and `validation`. The other upstream splits are listed for reference.
+The example loads `train` and `validation` without additional row filtering. The other upstream splits are listed for reference.
 
 ## Related Resources
 

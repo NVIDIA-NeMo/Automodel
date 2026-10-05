@@ -1,26 +1,26 @@
 ---
 title: "frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct"
-description: "Explore frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct: conversation response generation, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+description: "Text conversations for response generation, with source schema, split metadata, and an EAGLE-3 draft-training example in NeMo AutoModel."
 slug: dataset-coverage/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct
 ---
 
-This PerfectBlend derivative contains conversations regenerated with Llama 3.1 8B Instruct. The source is hosted as [frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct](https://huggingface.co/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct).
+This dataset stores text conversations as lists of turns with `role` and `content` fields. The source is hosted as [frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct](https://huggingface.co/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct).
 
 ## Task
 
-**Conversation response generation.** The Hub records are conversations. AutoModel uses them as inputs to speculative draft training, where the target model supplies additional supervision.
+**Conversation response generation**, inferred from the conversation schema. Given a prompt or preceding turns, the model produces an assistant response. The pinned upstream card does not declare a task or describe the response-regeneration process.
 
 | Property | Description |
 | --- | --- |
 | Input | A conversation prompt or preceding turns. |
-| Target | Assistant turns regenerated with the dataset's named target model. |
+| Target | Assistant responses in the conversation. |
 | Modality | Text |
 | Language | Not declared in Hub metadata |
 | License Metadata | Not declared in Hub metadata; consult the upstream source |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in the source schema; it is not a copied dataset row.
 
 ```json
 {
@@ -40,20 +40,22 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The pinned upstream schema declares the following fields.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `id` | integer | Record identifier. |
-| `conversations` | list of objects | Conversation turns with role and content. |
+| `id` | int64 | Record identifier. |
+| `conversations` | list of objects | Ordered conversation turns. |
+| `conversations[].role` | string | Speaker role for a turn. |
+| `conversations[].content` | string | Text of the turn. |
 
-These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+The upstream metadata lists one split, before any AutoModel sampling or preprocessing.
 
 | Configuration | Split or Source | Rows |
 | --- | --- | --- |
 | `default` | `train` | 1,418,731 |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct/blob/c8cf5337f3a4bed5ba9da7362446cc5111fd24f1/README.md) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct/blob/c8cf5337f3a4bed5ba9da7362446cc5111fd24f1/README.md) before local filtering.
 
 ## Use with NeMo AutoModel
 
@@ -63,9 +65,9 @@ Counts come from [upstream metadata at the linked revision](https://huggingface.
 
 **Adapter:** [`ChatDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py).
 
-The chat loader accepts `conversations` and converts ShareGPT or OpenAI-style turns to messages. The target model supplies draft-training supervision. The example packs to 2,048 tokens and selects at most 200,000 training rows; no local column rename is needed for this recipe.
+For this dataset, `ChatDataset` converts the `conversations` entries with `role` and `content` fields into `messages`; no local column rename is needed. The EAGLE-3 recipe trains a draft model using hidden states and logits supplied by a frozen Llama 3.1 8B Instruct target model.
 
-The example selects `train[:200000]` and sets `val_data_path` to null.
+The example selects `train[:200000]`, packs sequences into 2,048-token rows, and disables validation with `val_data_path: null`.
 
 ## Related Resources
 

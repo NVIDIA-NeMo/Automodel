@@ -8,21 +8,22 @@ Embed Nemotron Dataset v1 packages retrieval training sources. The source is hos
 
 ## Task
 
-**Text retrieval and representation learning.** This example illustrates a query row. Companion corpus configurations store the text for those IDs; a query row is not a self-contained passage pair.
+**Text retrieval and representation learning.** The example below illustrates a query row from the `FEVER` configuration. Its companion `FEVER_corpus` configuration stores the document text for the referenced IDs; a query row is not a self-contained passage pair. Some other configurations require external text resolution.
 
 | Property | Description |
 | --- | --- |
 | Input | A query and candidate documents in a referenced corpus. |
 | Target | Relevant document IDs, contrasted with negative document IDs. |
 | Modality | Text queries and documents |
-| Language | multilingual |
-| License Metadata | Not declared in Hub metadata; consult the upstream source |
+| Language | Multilingual collection |
+| Access | Public and ungated in Hub metadata retrieved 2026-10-05 |
+| License Metadata | No single collection-wide license; component terms apply |
 
-The collection aggregates separately sourced datasets. Consult the pinned upstream card and each component source for its terms; the top-level Hub metadata does not declare a single license.
+The [pinned upstream card](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1/blob/f457c3e2da4af3b9dd2818685d411b26298d7cbb/README.md) describes the collection as research and development only. It assigns CC BY-SA 4.0 to `FEVER` and `MIRACL`, CC BY 4.0 to `SyntheticClassificationData`, and each other component's accompanying license to that component. It also notes that distributed models trained with `SyntheticClassificationData` may be subject to Llama 3.3 or Llama 4 redistribution and use requirements. Consult the upstream terms for details.
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in the `FEVER` query schema; it is not a copied dataset row. The document IDs illustrate references to corpus records.
 
 ```json
 {
@@ -44,23 +45,24 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The table describes the fields in the `FEVER` query configuration. Other configurations can use different identifier types or require text resolution.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `question_id` | integer or string by subset | Query identifier. |
+| `question_id` | integer (`int64`) | Query identifier. |
 | `question` | string | Query text. |
 | `corpus_id` | string | Identifier of the associated corpus. |
-| `pos_doc` | list of objects | Relevant document references. |
-| `neg_doc` | list of objects | Negative document references. |
+| `pos_doc` | list of objects with string `id` | Relevant document references. |
+| `neg_doc` | list of objects with string `id` | Negative document references. |
 
-The table shows the `FEVER` query configuration. The paired `FEVER_corpus` configuration contains documents. Other query/corpus pairs are available on the [Hub dataset page](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1).
+The paired `FEVER_corpus` configuration contains string `id` and `text` fields. Other query and corpus pairs are available on the [Hub dataset page](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1).
 
 | Configuration | Split or Source | Rows |
 | --- | --- | --- |
 | `FEVER` | `train` | 140,085 |
+| `FEVER_corpus` | `train` | 235,948 |
 
-Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=nvidia%2Fembed-nemotron-dataset-v1) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=nvidia%2Fembed-nemotron-dataset-v1) before local filtering.
 
 ## Use with NeMo AutoModel
 
@@ -73,7 +75,7 @@ Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-se
 
 The direct `hf://` loader reads each subset's `dataset_metadata.json`, query configuration, and companion corpus configuration. It rejects `ids_only=true` metadata. Use [the preparation guide](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/README.md) for sources that need external text resolution.
 
-The direct example selects FEVER and SyntheticClassificationData. The loader reads the query configuration and its `<subset>_corpus` configuration from `train`.
+The direct example selects `FEVER` and `SyntheticClassificationData`. The loader reads the query configuration and its `<subset>_corpus` configuration from `train`.
 
 ## Related Resources
 

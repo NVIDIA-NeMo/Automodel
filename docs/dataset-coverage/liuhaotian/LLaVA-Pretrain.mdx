@@ -1,6 +1,6 @@
 ---
 title: "liuhaotian/LLaVA-Pretrain"
-description: "Explore liuhaotian/LLaVA-Pretrain: image-caption alignment, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+description: "Explore liuhaotian/LLaVA-Pretrain: image-caption alignment, a synthetic record, source schema and files, and NeMo AutoModel recipe links."
 slug: dataset-coverage/liuhaotian/LLaVA-Pretrain
 ---
 
@@ -15,14 +15,14 @@ LLaVA-Pretrain provides image-caption conversations for visual feature alignment
 | Input | An image and a short instruction about it. |
 | Target | A caption describing the image. |
 | Modality | Image and text |
-| Language | en |
-| License Metadata | other |
+| Language | English (`en`) |
+| License Metadata | `other` |
 
-The publisher requires compliance with the underlying image-source licenses and restricts the redistributed image archive to research reproduction. See the upstream card for the source-specific conditions.
+The publisher requires compliance with the underlying image-source licenses and restricts the redistributed image archive to research reproduction. The upstream card also requires compliance with the BLIP license if you use its synthetic captions. See the [upstream card](https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain/blob/70f9d1e5e1a697fe35830875cfc7de1dd590d727/README.md) for the source-specific conditions.
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. The image filename is a placeholder and does not refer to a downloadable file.
 
 ```json
 {
@@ -43,21 +43,21 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The table describes the fields in the conversation JSON illustrated above. The companion metadata JSON includes image filenames, image URLs, and synthetic BLIP captions.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `id` | string | Image/conversation identifier. |
+| `id` | string | Identifier for the image-caption conversation. |
 | `image` | string | Relative image filename in the image archive. |
-| `conversations` | list of objects | Human/gpt turns with from and value fields. |
+| `conversations` | list of objects | Turns with a `from` role (`human` or `gpt`) and a `value` string. |
 
-The source is distributed as `blip_laion_cc_sbu_558k.json`, a companion metadata JSON file, and `images.zip`. The publisher describes the LCS-558K collection; no loader-specific split count is asserted here.
+The source is distributed as `blip_laion_cc_sbu_558k.json`, `blip_laion_cc_sbu_558k_meta.json`, and `images.zip`. The publisher calls this collection LCS-558K but does not declare named splits or exact split counts in the linked metadata.
 
 | Configuration | Split or Source | Rows |
 | --- | --- | --- |
-| `Conversation JSON + images.zip` | `Source files` | - |
+| Not declared | `blip_laion_cc_sbu_558k.json` and `images.zip` | - |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain/blob/70f9d1e5e1a697fe35830875cfc7de1dd590d727/README.md) before local filtering. A dash means this page does not assert a count for that source.
+Source-file information comes from [upstream metadata at the linked revision](https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain/blob/70f9d1e5e1a697fe35830875cfc7de1dd590d727/README.md). A dash means this page does not assert a count for that source.
 
 ## Use with NeMo AutoModel
 

@@ -1,10 +1,10 @@
 ---
 title: "nyu-mll/glue"
-description: "Explore nyu-mll/glue: natural language understanding, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+description: "Use GLUE's MRPC sentence-pair classification task with NeMo AutoModel, including its source schema, labels, splits, and a synthetic example."
 slug: dataset-coverage/nyu-mll/glue
 ---
 
-GLUE groups natural language understanding datasets. This card illustrates MRPC, its sentence-pair paraphrase classification task. The source is hosted as [nyu-mll/glue](https://huggingface.co/datasets/nyu-mll/glue).
+The General Language Understanding Evaluation (GLUE) benchmark groups natural language understanding datasets. This card covers the Microsoft Research Paraphrase Corpus (MRPC), a sentence-pair paraphrase classification task. The source is hosted as [nyu-mll/glue](https://huggingface.co/datasets/nyu-mll/glue).
 
 ## Task
 
@@ -15,12 +15,12 @@ GLUE groups natural language understanding datasets. This card illustrates MRPC,
 | Input | Sentence pairs for the MRPC paraphrase task illustrated here. |
 | Target | A binary equivalence label for MRPC. |
 | Modality | Text |
-| Language | en |
-| License Metadata | other |
+| Language | English |
+| License Metadata | `other`; the [upstream card](https://huggingface.co/datasets/nyu-mll/glue/blob/bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c/README.md) refers readers to each source dataset's original license. |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in the MRPC source fields; it is not a copied dataset row.
 
 ```json
 {
@@ -33,14 +33,14 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The table describes the four fields in the upstream `mrpc` schema.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `sentence1` | string | First sentence in the pair. |
 | `sentence2` | string | Second sentence in the pair. |
-| `label` | class label | MRPC: 0 is not_equivalent; 1 is equivalent. |
-| `idx` | integer | Example index. |
+| `label` | class label | `0` is `not_equivalent`; `1` is `equivalent`. |
+| `idx` | int32 | Example index. |
 
 The table shows `mrpc`, the configuration illustrated on this page. GLUE also provides other task configurations on the [Hub dataset page](https://huggingface.co/datasets/nyu-mll/glue).
 
@@ -50,7 +50,7 @@ The table shows `mrpc`, the configuration illustrated on this page. GLUE also pr
 | `mrpc` | `validation` | 408 |
 | `mrpc` | `test` | 1,725 |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/nyu-mll/glue/blob/bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c/README.md) before local filtering. A dash means this page does not assert a count for that source.
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/nyu-mll/glue/blob/bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c/README.md) before local filtering.
 
 ## Use with NeMo AutoModel
 

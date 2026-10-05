@@ -1,6 +1,6 @@
 ---
 title: "lambda/naruto-blip-captions"
-description: "Explore lambda/naruto-blip-captions: text-conditioned image generation, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+description: "Naruto images with BLIP-generated captions for text-to-image fine-tuning: source fields, a synthetic example, splits, and a NeMo AutoModel recipe."
 slug: dataset-coverage/lambda/naruto-blip-captions
 ---
 
@@ -8,19 +8,19 @@ Naruto BLIP Captions pairs images with automatically generated captions. The sou
 
 ## Task
 
-**Text-conditioned image generation.** The illustrative record uses an invented scene. The actual Hub source contains Naruto images with BLIP captions.
+**Text-conditioned image generation.** Each source record pairs a Naruto image with a BLIP-generated caption that conditions image generation.
 
 | Property | Description |
 | --- | --- |
 | Input | A caption describing an image. |
-| Target | The paired image; the same pair can also illustrate image captioning. |
+| Target | The paired image. |
 | Modality | Image and text |
 | Language | Not declared in Hub metadata |
 | License Metadata | Not declared in Hub metadata; consult the upstream source |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses an invented scene and caption; it is not a copied dataset row. The `image` object is a JSON representation of image data. Its path is a placeholder, not a downloadable file; loaded source images are PIL images.
 
 ```json
 {
@@ -34,11 +34,11 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The upstream card documents two source fields:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `image` | image | Image paired with the caption. |
+| `image` | image | JPEG image of varying size, decoded as a PIL image. |
 | `text` | string | BLIP-generated caption for the source image. |
 
 These are upstream splits or source files, before any AutoModel sampling or preprocessing.
@@ -47,7 +47,7 @@ These are upstream splits or source files, before any AutoModel sampling or prep
 | --- | --- | --- |
 | `default` | `train` | - |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/lambda/naruto-blip-captions/blob/1ed13e8ef280bd45e3bbac4cfa8bbd9d64ec9f89/README.md) before local filtering. A dash means this page does not assert a count for that source.
+The [upstream card at the linked revision](https://huggingface.co/datasets/lambda/naruto-blip-captions/blob/1ed13e8ef280bd45e3bbac4cfa8bbd9d64ec9f89/README.md) documents the `train` split but does not state its row count. The dash means this page does not assert a count.
 
 ## Use with NeMo AutoModel
 
@@ -55,7 +55,7 @@ Counts come from [upstream metadata at the linked revision](https://huggingface.
 | --- | --- | --- |
 | Text-to-Image Fine-Tuning | Qwen-Image-2.1; prepared cache; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml) |
 
-**Adapter:** [`build_text_to_image_multiresolution_dataloader`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/diffusion/loader.py).
+**Adapter:** [`build_text_to_image_multiresolution_dataloader`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/diffusion/collate_fns.py#L256).
 
 The checked-in recipe refers to the older Hub alias `lambdalabs/naruto-blip-captions`, which now resolves to `lambda/naruto-blip-captions`. The preprocessing command in the linked recipe materializes the images and captions, then produces the latent/text-embedding cache expected by the diffusion dataloader. Set `data.dataloader.cache_dir` to the preprocessing output directory and choose `checkpoint.checkpoint_dir` before training with [the diffusion entry point](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/diffusion/finetune/finetune.py). This workflow requires a diffusers build containing `QwenImage21Pipeline`.
 
@@ -65,5 +65,5 @@ The upstream card provides a single `train` split. The selected recipe does not 
 
 - [Hub dataset and source files](https://huggingface.co/datasets/lambda/naruto-blip-captions)
 - [Upstream card at revision `1ed13e8e`](https://huggingface.co/datasets/lambda/naruto-blip-captions/blob/1ed13e8ef280bd45e3bbac4cfa8bbd9d64ec9f89/README.md)
-- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/diffusion/loader.py)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/diffusion/collate_fns.py#L256)
 - [Dataset catalog](/dataset-coverage/overview)

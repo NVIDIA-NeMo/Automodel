@@ -4,23 +4,23 @@ description: "Explore Muennighoff/natural-instructions: instruction-conditioned 
 slug: dataset-coverage/Muennighoff/natural-instructions
 ---
 
-This preprocessed Natural Instructions dataset expresses tasks through definitions, inputs, and targets. The source is hosted as [Muennighoff/natural-instructions](https://huggingface.co/datasets/Muennighoff/natural-instructions).
+This preprocessed Super-Natural-Instructions dataset expresses tasks through definitions, inputs, and targets. The source is hosted as [Muennighoff/natural-instructions](https://huggingface.co/datasets/Muennighoff/natural-instructions).
 
 ## Task
 
-**Instruction-conditioned text generation.** This Hub repository is a preprocessed version of Natural Instructions. Different tasks can request classification, extraction, or generation through the same text fields.
+**Instruction-conditioned text generation.** Different tasks can request classification, extraction, or generation through the same text fields.
 
 | Property | Description |
 | --- | --- |
 | Input | A task definition and task input. |
 | Target | The text output requested by the definition. |
 | Modality | Text |
-| Language | en |
+| Language | English (`en`) |
 | License Metadata | Not declared in Hub metadata; consult the upstream source |
 
 ## Example Record
 
-This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Media paths, when shown, stand in for binary image or audio data and do not refer to downloadable files.
+This **synthetic example** uses invented values in the source fields; it is not a copied dataset row.
 
 ```json
 {
@@ -34,10 +34,12 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The [upstream preprocessing script](https://huggingface.co/datasets/Muennighoff/natural-instructions/blob/a29a9757125f4bb1c26445ad0d2ef7d9b2cc9c4c/get_ni.py) writes the following fields, with one record for each target of an input.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
+| `task_name` | string | Name of the source task. |
+| `id` | string | Source instance identifier; repeated when an instance has multiple targets. |
 | `definition` | string | Natural-language task instruction. |
 | `inputs` | string | Instance to solve. |
 | `targets` | string | Expected output for this instance. |
@@ -49,9 +51,11 @@ These are upstream splits or source files, before any AutoModel sampling or prep
 | `Repository directories` | `train` | - |
 | `Repository directories` | `test` | - |
 
-Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/Muennighoff/natural-instructions/blob/a29a9757125f4bb1c26445ad0d2ef7d9b2cc9c4c/README.md) before local filtering. A dash means this page does not assert a count for that source.
+The [repository files at the linked revision](https://huggingface.co/datasets/Muennighoff/natural-instructions/tree/a29a9757125f4bb1c26445ad0d2ef7d9b2cc9c4c) contain `train` and `test` directories, with no separate `validation` directory. A dash means this page does not assert a row count for that source.
 
 ## Use with NeMo AutoModel
+
+The example recipe uses low-rank adaptation (LoRA) for fine-tuning.
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
@@ -59,7 +63,7 @@ Counts come from [upstream metadata at the linked revision](https://huggingface.
 
 **Adapter:** [`ColumnMappedTextInstructionDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/column_mapped_text_instruction_dataset.py).
 
-The example maps `definition` to context, `inputs` to question, and `targets` to answer. The upstream card notes that an input can occur with different outputs; account for that when constructing a held-out set.
+The example maps `definition` to `context`, `inputs` to `question`, and `targets` to `answer`. The upstream card notes that an input can occur with different outputs. If you construct a held-out set, keep records with the same `id` or `inputs` together to avoid overlapping inputs across splits.
 
 The example uses the upstream `train` split. Its validation configuration is commented out.
 
