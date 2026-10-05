@@ -158,6 +158,8 @@ def apply_rotary_emb_half_split(x: torch.Tensor, freqs_cis: torch.Tensor, qkv_fo
     dims (``apply_rotary_emb``). ``freqs_cis`` is the same complex table used by the MLA
     (``exp(i * theta_j * pos)`` for ``j in [0, d/2)``); its real/imag parts are the cos/sin
     for frequency ``j``, so the rotation angles match the interleaved path exactly.
+    Compute the rotation in FP32, as in the official DeepSeek implementation and
+    vLLM's CUDA indexer RoPE, then cast the result back to the input dtype.
 
     Args:
         x: Rope slice, ``[B, S, H, d]`` / ``[B, S, d]`` (bshd) or ``[T, H, d]`` / ``[T, d]`` (thd).
@@ -172,11 +174,10 @@ def apply_rotary_emb_half_split(x: torch.Tensor, freqs_cis: torch.Tensor, qkv_fo
         fc = freqs_cis.reshape(x.shape[0], *([1] * (x.dim() - 2)), half)
     else:
         fc = freqs_cis.reshape(x.shape[0], x.shape[1], *([1] * (x.dim() - 3)), half)
-    cos = fc.real.to(x.dtype)
-    sin = fc.imag.to(x.dtype)
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+    cos = fc.real
+    sin = fc.imag
+    x1, x2 = x.float().chunk(2, dim=-1)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(x.dtype)
 
 
 def apply_rotary_emb_qk(

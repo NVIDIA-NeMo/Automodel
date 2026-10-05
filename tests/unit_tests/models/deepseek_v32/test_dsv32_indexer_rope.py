@@ -14,8 +14,11 @@
 
 """The DSA indexer must rotate the leading rope dims of Q/K with half-split RoPE.
 
+The indexer selection cases below exercise sequences longer than top-k. Direct helper
+cases also check the BF16 precision path against an independent complex rotation.
+
 A wrong rope layout only changes which keys are selected once the sequence is longer than
-``index_topk`` (below that the indexer keeps every causal key), so every case here uses
+``index_topk`` (below that the indexer keeps every causal key), so every selection case uses
 ``seq_len > index_topk`` and compares the selected key sets of the late positions.
 """
 
@@ -25,6 +28,7 @@ from transformers.models.deepseek_v32.configuration_deepseek_v32 import Deepseek
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32Indexer as HFDeepseekV32Indexer
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.deepseek_v3.rope_utils import apply_rotary_emb_half_split
 from nemo_automodel.components.models.deepseek_v32 import layers as dsv32_layers
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
 from nemo_automodel.components.models.deepseek_v32.layers import DeepseekV32Indexer
@@ -130,3 +134,50 @@ def test_thd_layout_selects_the_same_keys_as_bshd(indexer):
     for b in range(BATCH):
         thd = indexer(x[b], q_resid[b], freqs_cis[b], attention_mask=causal)
         torch.testing.assert_close(_late_sets(thd[None]), _late_sets(bshd[b : b + 1]))
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"))],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("qkv_format,with_heads", [("bshd", True), ("bshd", False), ("thd", True), ("thd", False)])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_half_split_rotation_preserves_fp32_arithmetic(
+    device: str, dtype: torch.dtype, qkv_format: str, with_heads: bool, noncontiguous: bool
+) -> None:
+    """Check Q/K forward and input gradients against an independent complex rotation."""
+    torch.manual_seed(19)
+    shape = (2, 11) if qkv_format == "bshd" else (11,)
+    angles = torch.arange(11, device=device, dtype=torch.float32)[:, None] * torch.linspace(
+        0.13, 1.37, 32, device=device
+    )
+    freqs = torch.polar(torch.ones_like(angles), angles)
+    if qkv_format == "bshd":
+        freqs = freqs.expand(2, -1, -1)
+    if with_heads:
+        shape += (3,)
+    storage = torch.randn(*shape, 128 if noncontiguous else 64, device=device, dtype=dtype)
+    x = (storage[..., ::2] if noncontiguous else storage).requires_grad_()
+    reference_input = x.detach().clone().requires_grad_()
+    # DeepSeek official non-interleaved layout: the two halves are the real and
+    # imaginary parts of each complex pair. Preserve the FP32 frequency table
+    # and round only after multiplication, as in vLLM's CUDA RoPE arithmetic.
+    reference_float = reference_input.float()
+    complex_input = torch.complex(reference_float[..., :32], reference_float[..., 32:])
+    rotated = complex_input * (freqs.unsqueeze(-2) if with_heads else freqs)
+    expected = torch.cat((rotated.real, rotated.imag), dim=-1).to(dtype)
+
+    actual = apply_rotary_emb_half_split(x, freqs, qkv_format)
+    assert actual.shape == x.shape
+    assert actual.dtype == dtype
+    # CUDA complex multiply may fuse FP32 arithmetic; allow its near-zero
+    # cancellation error, but no BF16-relative tolerance. The old BF16
+    # arithmetic differs by 0.015625 and fails this bound.
+    relative_tolerance = 0.0 if dtype == torch.bfloat16 else 1e-6
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=relative_tolerance)
+
+    upstream_grad = torch.randn_like(actual)
+    actual_grad = torch.autograd.grad(actual, x, upstream_grad)[0]
+    expected_grad = torch.autograd.grad(expected, reference_input, upstream_grad)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, atol=1e-6, rtol=relative_tolerance)
