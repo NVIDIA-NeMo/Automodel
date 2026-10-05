@@ -602,6 +602,7 @@ class UnoStrategy(IDLMStrategy):
         # [_stage_end_steps[i - 1], _stage_end_steps[i]) with block size _stage_block_sizes[i].
         self._stage_end_steps: list[int] = []
         self._stage_block_sizes: list[int] = []
+        self._tokens_per_step: int | None = None
 
     def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
         self.block_size = int(dllm_cfg.get("block_length", 1))
@@ -643,6 +644,33 @@ class UnoStrategy(IDLMStrategy):
             self._stage_end_steps.append(end_step)
             self._stage_block_sizes.append(block_size)
             previous_end, previous_block = end_step, block_size
+        self._tokens_per_step = tokens_per_step
+
+    def setup_extra(self, recipe) -> None:
+        """Run the I-DLM checks, then the official curriculum runtime checks (``train.py``).
+
+        ``tokens_per_step`` must equal ``step_scheduler.global_batch_size * dataset.seq_length`` or every
+        stage boundary lands on the wrong step; a ``max_steps`` other than the last stage's end step
+        truncates the curriculum or trains past it at the final block size.
+        """
+        super().setup_extra(recipe)
+        if not self._stage_end_steps:
+            return
+        global_batch_size = recipe.cfg.get("step_scheduler.global_batch_size", None)
+        seq_length = recipe.cfg.get("dataset.seq_length", None)
+        if global_batch_size is not None and seq_length is not None:
+            expected = int(global_batch_size) * int(seq_length)
+            if self._tokens_per_step != expected:
+                raise ValueError(
+                    f"dllm.block_curriculum.tokens_per_step={self._tokens_per_step} must equal "
+                    f"step_scheduler.global_batch_size * dataset.seq_length = {expected}."
+                )
+        if recipe.step_scheduler.max_steps != self._stage_end_steps[-1]:
+            logger.warning(
+                "step_scheduler.max_steps=%d differs from the block curriculum's last stage end step %d.",
+                recipe.step_scheduler.max_steps,
+                self._stage_end_steps[-1],
+            )
 
     def pre_step(self, recipe, batches) -> tuple[int, int]:
         if self._stage_end_steps:

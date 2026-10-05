@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.dllm_loss import (
     BlockDiffusionCrossEntropyLoss,
     DFlashDecayLoss,
@@ -41,7 +42,6 @@ from nemo_automodel.recipes.dllm.strategy import (
     _build_target_layer_ids,
     get_dllm_strategy,
 )
-
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -629,6 +629,36 @@ class TestUnoStrategy:
     def test_invalid_curriculum_is_rejected(self, strategy, dllm_cfg, match):
         with pytest.raises(ValueError, match=match):
             strategy.create_loss_fn(dllm_cfg)
+
+    @staticmethod
+    def _curriculum_recipe(global_batch_size, seq_length, max_steps):
+        return types.SimpleNamespace(
+            cfg=ConfigNode(
+                {"step_scheduler": {"global_batch_size": global_batch_size}, "dataset": {"seq_length": seq_length}}
+            ),
+            step_scheduler=types.SimpleNamespace(max_steps=max_steps),
+            distributed_config=types.SimpleNamespace(cp_size=1),
+            model_parts=[
+                types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=151936))
+            ],
+            mask_token_id=151669,
+        )
+
+    def test_setup_extra_accepts_the_official_batch_and_steps(self, strategy, caplog):
+        strategy.create_loss_fn({"block_curriculum": self.OFFICIAL_CURRICULUM})
+        strategy.setup_extra(self._curriculum_recipe(128, 4096, 28125))
+        assert "differs from the block curriculum" not in caplog.text
+
+    def test_setup_extra_rejects_tokens_per_step_that_mismatches_the_batch(self, strategy):
+        """As official ``train.py``: tokens_per_step must equal global_batch_size * seq_length."""
+        strategy.create_loss_fn({"block_curriculum": self.OFFICIAL_CURRICULUM})
+        with pytest.raises(ValueError, match="global_batch_size \\* dataset.seq_length = 262144"):
+            strategy.setup_extra(self._curriculum_recipe(64, 4096, 28125))
+
+    def test_setup_extra_warns_when_max_steps_differs_from_the_curriculum(self, strategy, caplog):
+        strategy.create_loss_fn({"block_curriculum": self.OFFICIAL_CURRICULUM})
+        strategy.setup_extra(self._curriculum_recipe(128, 4096, 1000))
+        assert "differs from the block curriculum's last stage end step 28125" in caplog.text
 
 
 # ---------------------------------------------------------------------------
