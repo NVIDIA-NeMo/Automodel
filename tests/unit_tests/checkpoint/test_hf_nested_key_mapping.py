@@ -19,8 +19,11 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
 from safetensors.torch import save_file
 from torch.distributed.checkpoint.api import CheckpointException
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
 from transformers import (
     InternVLConfig,
     InternVLForConditionalGeneration,
@@ -285,3 +288,23 @@ def test_qwen25vl_explicit_mapping_overrides_class_rules(qwen_reference: Qwen2_5
     assert (
         _get_key_renaming_mapping("visual.patch_embed.proj.weight", mapping) == "model.visual.patch_embed.proj.weight"
     )
+
+
+def test_qwen25vl_fsdp_preserves_class_key_mapping(
+    tmp_path: Path, qwen_reference: Qwen2_5_VLForConditionalGeneration
+) -> None:
+    """Real FSDP wrapping must preserve the HF class's root checkpoint renames."""
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
+    try:
+        fully_shard(qwen_reference, mesh=init_device_mesh("cpu", (1,)))
+        assert type(qwen_reference) is not Qwen2_5_VLForConditionalGeneration
+        mapping = get_combined_key_mapping("qwen2_5_vl", model=qwen_reference)
+        expected = "model.language_model.embed_tokens.weight"
+        assert _get_key_renaming_mapping("model.embed_tokens.weight", mapping) == expected
+        assert _get_key_renaming_mapping(expected, mapping) == expected
+        assert (
+            _get_key_renaming_mapping("visual.patch_embed.proj.weight", mapping)
+            == "model.visual.patch_embed.proj.weight"
+        )
+    finally:
+        dist.destroy_process_group()

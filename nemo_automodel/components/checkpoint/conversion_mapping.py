@@ -229,17 +229,20 @@ def get_combined_key_mapping(
 
     # Try to get conversion mapping from transformers and extract simple renamings
     if _TRANSFORMERS_AVAILABLE:
-        # Model-instance lookup honors HF's class-specific root rules as well as
-        # model-type defaults. Looking up only model_type drops task-head renames.
-        conversions = (
-            get_model_conversion_mapping(model, add_legacy=False)
-            if model is not None
-            else get_checkpoint_conversion_mapping(model_type)
-        )
+        conversions = get_checkpoint_conversion_mapping(model_type)
+        if model is not None:
+            # HF registers some root rules by class rather than model_type.
+            # FSDP adds a subclass, so retain the first registered base class's
+            # rules instead of relying on the wrapper's generated class name.
+            for model_class in type(model).__mro__:
+                class_conversions = get_checkpoint_conversion_mapping(model_class.__name__)
+                if class_conversions is not None:
+                    conversions = class_conversions
+                    break
         if conversions:
             for conv in conversions:
-                # Flatten only root renames; nested rules must retain their scope.
-                if WeightRenaming is not None and isinstance(conv, WeightRenaming) and conv.scope_prefix is None:
+                # Only extract simple WeightRenaming, not WeightConverter
+                if WeightRenaming is not None and isinstance(conv, WeightRenaming):
                     # WeightRenaming stores patterns as source_patterns and target_patterns (as lists)
                     sources = getattr(conv, "source_patterns", None)
                     targets = getattr(conv, "target_patterns", None)
@@ -257,7 +260,7 @@ def get_combined_key_mapping(
         if model is not None:
             scoped_renamings = [
                 conversion
-                for conversion in conversions
+                for conversion in get_model_conversion_mapping(model, add_legacy=False)
                 if isinstance(conversion, WeightRenaming) and conversion.scope_prefix is not None
             ]
             if scoped_renamings:
