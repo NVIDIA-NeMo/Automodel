@@ -39,7 +39,7 @@ Fern has no native way to source a version train's prose from another git ref: `
 ```text
 docs/                                ← nightly MDX (top level)
 ├── index.mdx, breaking-changes.mdx, release-notes.mdx, ...
-├── about/, guides/, model-coverage/, dataset-cards/, launcher/, api-reference/
+├── about/, guides/, model-coverage/, dataset-coverage/, launcher/, api-reference/
 ├── *.png / *.jpg                    ← page-scoped images
 └── fern/                            ← infra only
     ├── fern.config.json             # Org slug + Fern CLI pin (5.139.0)
