@@ -45,8 +45,8 @@ def test_llm_benchmark_configs_define_required_benchmark_fields():
     assert not violations, "Benchmark configs are missing required fields:\n" + "\n".join(violations)
 
 
-def test_super35_vl_benchmark_uses_accessible_shared_ci_inputs():
-    config = Path("examples/llm_benchmark/nemotron/super35_vl_text_8k_ep16_fused_adam.yaml")
+def test_nemotron_super_v3_hybridep_benchmark_uses_shared_ci_inputs():
+    config = Path("examples/llm_benchmark/nemotron/nemotron_super_v3_te_hybridep_8k_ep16_gb200.yaml")
     recipe = YAML(typ="safe").load(config)
 
     assert recipe["model"]["config"]["_target_"] == "nemo_automodel.NeMoAutoConfig.from_pretrained"
@@ -56,6 +56,9 @@ def test_super35_vl_benchmark_uses_accessible_shared_ci_inputs():
     )
     assert recipe["step_scheduler"]["local_batch_size"] == 2
     assert "known_issue_id" not in recipe["ci"]
+    assert "freeze_config" not in recipe
+    assert "multimodal" not in recipe["distributed"]
+    assert "flops_scope" not in recipe["benchmark"]
 
     jobs = generate_job(config, {}, "performance", "llm_benchmark", ".")
 
@@ -67,7 +70,7 @@ def test_super35_vl_benchmark_uses_accessible_shared_ci_inputs():
     assert job["variables"]["TEST_NODE_COUNT"] == 4
     assert job["variables"]["CONFIG_NPROC_PER_NODE"] == 4
     assert job["variables"]["RESERVED_CLUSTER_TAG"] == "/gb200/"
-    assert job["variables"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert "CUDA_VISIBLE_DEVICES" not in job["variables"]
 
 
 def test_qwen35_moe_lora_benchmark_disables_mtp():
