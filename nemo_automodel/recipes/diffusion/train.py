@@ -223,6 +223,7 @@ def _build_diffusion_mesh_context(
                 param_dtype=param_dtype,
                 reduce_dtype=reduce_dtype,
                 output_dtype=compute_dtype,
+                cast_forward_inputs=False,
             ),
             # CPU offload: sharded params + optimizer state live on host RAM and are
             # paged to GPU per-block during forward/backward (saves GPU memory, adds H2D).

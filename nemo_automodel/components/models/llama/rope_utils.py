@@ -348,7 +348,7 @@ class LlamaRotaryEmbedding(nn.Module):
 
         Args:
             x: Hidden states ``[B, S, H]`` or packed ``[T, H]``; used for
-                device placement. ``H`` is hidden size.
+                device placement and the returned cos/sin dtype. ``H`` is hidden size.
             position_ids: Position IDs ``[B, S]`` or packed local IDs ``[T]``.
             qkv_format: ``"bshd"`` for padded batches or ``"thd"`` for a
                 packed total-token layout.
@@ -358,7 +358,7 @@ class LlamaRotaryEmbedding(nn.Module):
         Returns:
             Cosine and sine tensors ``[B, S, D]`` or ``[T, D]``. When fused
             RoPE is enabled, the tuple also carries a global raw-frequency
-            table ``[S, 1, 1, D]`` as its third item.
+            table ``[S, 1, 1, D]`` as its third item, retaining its cache dtype.
         """
         if qkv_format not in ("bshd", "thd"):
             raise ValueError(f"Unsupported qkv_format={qkv_format!r}; expected 'bshd' or 'thd'.")
@@ -375,10 +375,10 @@ class LlamaRotaryEmbedding(nn.Module):
                 flat_position_ids = position_ids.reshape(-1)
                 cos = self._cos_cache[flat_position_ids]
                 sin = self._sin_cache[flat_position_ids]
-                return cos, sin, self._freqs_cache[:global_seq_len]
+                return cos.to(x.dtype), sin.to(x.dtype), self._freqs_cache[:global_seq_len]
             cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
             sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
-            return cos, sin, self._freqs_cache[:seq_len]
+            return cos.to(x.dtype), sin.to(x.dtype), self._freqs_cache[:seq_len]
 
         # Non-fused: gather per-position. Size the cache to the highest requested
         # position -- ``position_ids`` can exceed its own length (e.g. EAGLE TTT
@@ -389,7 +389,7 @@ class LlamaRotaryEmbedding(nn.Module):
         # Gather per-position; identical to ``cos_cache[:seq_len]`` for arange.
         cos = self._cos_cache[position_ids]
         sin = self._sin_cache[position_ids]
-        return cos, sin
+        return cos.to(x.dtype), sin.to(x.dtype)
 
 
 # Aliases for HuggingFace compatibility

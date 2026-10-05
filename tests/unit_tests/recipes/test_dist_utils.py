@@ -19,6 +19,7 @@ Typed validation tests live in ``tests/unit_tests/distributed/test_mesh.py``.
 
 import pytest
 import torch
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.config import (
@@ -84,6 +85,40 @@ class TestParsing:
     def test_default_strategy_is_fsdp2(self):
         result = parse_distributed_section({})
         assert isinstance(result["strategy_config"], FSDP2Config)
+
+    @pytest.mark.parametrize("path", ["strategy", "strategy_target", "moe_target"])
+    @pytest.mark.parametrize("cast_forward_inputs", [None, False, True])
+    def test_mp_policy_input_cast_default_and_override(self, path, cast_forward_inputs):
+        policy_kwargs = {"param_dtype": "bfloat16", "reduce_dtype": "float32", "output_dtype": "float32"}
+        if path != "strategy":
+            policy_kwargs["_target_"] = MixedPrecisionPolicy
+        if cast_forward_inputs is not None:
+            policy_kwargs["cast_forward_inputs"] = cast_forward_inputs
+        cfg = (
+            {"ep_size": 2, "moe": {"mp_policy": policy_kwargs}}
+            if path == "moe_target"
+            else {"mp_policy": policy_kwargs}
+        )
+        result = parse_distributed_section(cfg)
+        config = result["moe_parallel_config" if path == "moe_target" else "strategy_config"]
+        assert config.mp_policy.cast_forward_inputs is (False if cast_forward_inputs is None else cast_forward_inputs)
+        assert config.mp_policy.param_dtype is torch.bfloat16
+        assert config.mp_policy.reduce_dtype is torch.float32
+        assert config.mp_policy.output_dtype is torch.float32
+
+    @pytest.mark.parametrize("moe", [False, True])
+    def test_mp_policy_custom_factory_and_object_are_preserved(self, moe):
+        policy = MixedPrecisionPolicy(param_dtype=torch.float16, cast_forward_inputs=True)
+
+        def factory(param_dtype: torch.dtype) -> MixedPrecisionPolicy:
+            assert param_dtype is torch.float16
+            return policy
+
+        for value in (policy, {"_target_": factory, "param_dtype": "float16"}):
+            cfg = {"ep_size": 2, "moe": {"mp_policy": value}} if moe else {"mp_policy": value}
+            result = parse_distributed_section(cfg)
+            assert result["moe_parallel_config" if moe else "strategy_config"].mp_policy is policy
+            assert policy.cast_forward_inputs is True
 
     @pytest.mark.parametrize("strategy", ["megatron_fsdp", "megatron-fsdp", "mfsdp"])
     def test_megatron_fsdp_names(self, strategy):

@@ -818,7 +818,7 @@ def apply_fsdp(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=torch.bfloat16,
-            cast_forward_inputs=True,
+            cast_forward_inputs=False,
         )
     experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())

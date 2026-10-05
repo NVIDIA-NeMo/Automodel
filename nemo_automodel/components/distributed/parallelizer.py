@@ -434,6 +434,7 @@ class ModelParallelizer:
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
+                cast_forward_inputs=False,
             )
 
         # Install this only when NeMo actually enters FSDP2 sharding.

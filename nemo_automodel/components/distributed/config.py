@@ -328,7 +328,7 @@ class FSDP2Config:
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=torch.bfloat16,
-            cast_forward_inputs=True,
+            cast_forward_inputs=False,
         )
     )
     offload_policy: CPUOffloadPolicy | None = None
@@ -353,7 +353,7 @@ class FSDP2Config:
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
                 output_dtype=torch.bfloat16,
-                cast_forward_inputs=True,
+                cast_forward_inputs=False,
             )
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
             self.activation_checkpointing_scope

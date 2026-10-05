@@ -286,3 +286,48 @@ def test_rope_unknown_type_raises():
     config.rope_scaling = bogus
     with pytest.raises(ValueError, match="Unsupported RoPE rope_type"):
         LlamaRotaryEmbedding(config)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    ("fused", "layout", "cp_size"),
+    [(False, "bshd", 1), (False, "thd", 1), (True, "bshd", 1), (True, "bshd", 2), (True, "thd", 1), (True, "thd", 2)],
+)
+def test_rope_returns_activation_dtype_without_rounding_raw_angles(dtype, fused, layout, cp_size):
+    """Cast final coefficients for attention while retaining FP32 fused angles."""
+    config = LlamaConfig(
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8,
+        dtype=torch.float32,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+    rope = LlamaRotaryEmbedding(config, rope_fusion=fused)
+    length = 263  # Includes angle 257, which BF16 cannot represent exactly.
+    offset = 257 if not fused else (length if layout == "thd" and cp_size == 2 else 0)
+    positions = torch.arange(length) + offset
+    shape = (length, 32) if layout == "thd" else (1, length, 32)
+    if layout == "bshd":
+        positions = positions.unsqueeze(0)
+    x = torch.zeros(shape, dtype=dtype)
+    result = rope(x, positions, qkv_format=layout, cp_size=cp_size)
+
+    # Standard base-10000, dimension-8 RoPE: frequency_i = 10000 ** (-2*i/8).
+    cache_length = max(length + offset, length * (cp_size if fused and layout == "thd" else 1))
+    frequencies = torch.tensor([1.0, 0.1, 0.01, 0.001], dtype=torch.float32)
+    angles = torch.outer(torch.arange(cache_length, dtype=torch.float32), frequencies).repeat(1, 2)
+    expected_angles = angles[positions]
+    assert result[0].dtype == result[1].dtype == dtype
+    torch.testing.assert_close(result[0], expected_angles.cos().to(dtype), rtol=0, atol=0)
+    torch.testing.assert_close(result[1], expected_angles.sin().to(dtype), rtol=0, atol=0)
+    assert rope._cos_cache.dtype == rope._sin_cache.dtype == torch.float32
+    torch.testing.assert_close(rope._cos_cache, angles.cos(), rtol=0, atol=0)
+    torch.testing.assert_close(rope._sin_cache, angles.sin(), rtol=0, atol=0)
+    if fused:
+        assert result[2].dtype == torch.float32
+        torch.testing.assert_close(result[2], angles[:, None, None, :], rtol=0, atol=0)
+        assert result[2][257, 0, 0, 0].item() == 257
+        assert not torch.equal(result[2], result[2].to(torch.bfloat16).float())
+    else:
+        assert len(result) == 2
