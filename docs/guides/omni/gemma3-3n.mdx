@@ -1,11 +1,13 @@
 ---
 title: "Fine-Tune Gemma 3n"
-description: ""
+description: "Fine-tune Gemma 3n on MedPix-VQA with NeMo AutoModel using full fine-tuning or LoRA, then load a checkpoint for image-text generation."
 position: 11
 ---
-This document explains how to fine-tune Gemma 3n using NeMo AutoModel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML.
+This guide explains how to fine-tune Gemma 3n on MedPix-VQA using NeMo AutoModel. It covers supervised fine-tuning (SFT), parameter-efficient fine-tuning (PEFT) with Low-Rank Adaptation (LoRA), YAML configuration, and inference from a saved checkpoint.
 
 To set up your environment to run NeMo AutoModel, follow the [Installation Guide](/get-started/installation).
+
+Before downloading the model, accept the access conditions on the [Gemma 3n model page](https://huggingface.co/google/gemma-3n-E4B-it) and authenticate your environment with a Hugging Face account that has access. Run the commands in this guide from the repository root with your NeMo AutoModel environment activated.
 
 ## Data
 
@@ -36,7 +38,7 @@ The preprocessing pipeline performs the following steps:
 
 1. **Loads the dataset** using the Hugging Face `datasets` library.
 2. **Extracts question-answer pairs** by processing the `question` and `answer` fields from the dataset.
-3. **Converts to the Hugging Face message list format** to restructure the data into a chat-style format compatible with the Autoprocessor's `apply_chat_template` function.
+3. **Converts to the Hugging Face message list format** to restructure the data into a chat-style format compatible with the processor's `apply_chat_template` method.
 
 ```python
 # Example of the conversation format created
@@ -57,9 +59,9 @@ conversation = [
 
 ### Use the Collate Functions
 
-NeMo AutoModel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
+NeMo AutoModel provides specialized collate functions for different vision-language model (VLM) processors. The collate function batches examples and prepares them for model input.
 
-Gemma 3n models work seamlessly with the Hugging Face `AutoProcessor` and use the default collate function:
+Gemma 3n models use the Hugging Face `AutoProcessor` and the default collate function:
 
 ```python
 from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn
@@ -81,22 +83,7 @@ The default collate function:
 When using a custom dataset with a model whose Hugging Face `AutoProcessor` supports the `apply_chat_template` method, you'll need to convert your data into the Hugging Face message list format expected by the `apply_chat_template`.
 We provide [examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/datasets.py) demonstrating how to perform this conversion.
 
-Some models, such as [Qwen2.5 VL](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct), have specific preprocessing requirements and require custom collate functions. For instance, Qwen2.5-VL uses the `qwen_vl_utils.process_vision_info` function to process images:
-
-```python
-
-texts = [processor.apply_chat_template(example["conversation"], tokenize=False) for example in examples]
-image_inputs = [process_vision_info(example["conversation"])[0] for example in examples]
-
-batch = processor(
-    text=texts,
-    images=image_inputs,
-    padding=True,
-    return_tensors="pt",
-)
-
-```
-If your dataset requires custom preprocessing logic, you can define a custom collate function. To use it, specify the function in your YAML configuration:
+For models with specific preprocessing requirements, select a model-specific collate function in your YAML configuration. For example, [Qwen2.5-VL](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) uses `qwen2_5_collate_fn` as shown below. Keep `default_collate_fn` for Gemma 3n.
 
 ```yaml
 dataloader:
@@ -119,13 +106,11 @@ NeMo AutoModel uses a flexible configuration system that combines YAML configura
 The simplest way to run fine-tuning is with a YAML configuration file. We provide configs for Gemma 3n.
 
 <Note>
-These VLM recipes require the optional `vlm` dependency set, plus `vlm-media` for Qwen vision preprocessing (`qwen_vl_utils`). If you see `ImportError: qwen_vl_utils is not installed`, install both first:
+Install the optional `vlm` dependencies before running the Gemma 3n recipes:
 
 ```bash
-uv sync --frozen --extra vlm --extra vlm-media
+uv sync --frozen --extra vlm
 ```
-
-(If you're using pip: `pip3 install "nemo-automodel[vlm,vlm-media]"`.)
 
 </Note>
 
@@ -134,7 +119,7 @@ uv sync --frozen --extra vlm --extra vlm-media
 * **Single-GPU**
 
 ```bash
-automodel examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml
+automodel --nproc-per-node=1 examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml
 ```
 
 * **Multi-GPU**
@@ -178,7 +163,7 @@ To run PEFT with Gemma 3n:
 automodel examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix_peft.yaml
 ```
 
-The LoRA configuration excludes vision components and the language-model head from adaptation to preserve pre-trained visual representations:
+The LoRA configuration excludes vision and audio components and the language-model head from adaptation:
 
 ```yaml
 peft:
@@ -196,9 +181,13 @@ peft:
   use_triton: True
 ```
 
-### Checkpointing
+The orange curve below shows an example Gemma 3n PEFT training run on MedPix-VQA. The green curve is a historical Gemma 3 run included in the plot.
 
-We support training state checkpointing in either [Safetensors](https://huggingface.co/docs/safetensors/en) or [PyTorch DCP](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html) format.
+![Example MedPix-VQA training loss for Gemma 3n in orange and historical Gemma 3 in green](./medpix_peft.jpg)
+
+### Configure Checkpointing
+
+Set `model_save_format` to `safetensors` to save model weights in [Safetensors](https://huggingface.co/docs/safetensors/en) format, or to `torch_save` to use [PyTorch Distributed Checkpoint (DCP)](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html). Optimizer state is saved separately using DCP.
 
 ```yaml
 checkpoint:
@@ -208,11 +197,12 @@ checkpoint:
   save_consolidated: false
 ```
 
-#### Integrate Weights & Biases
+### Integrate Weights & Biases
 
-You can enable W&B logging by setting your API key and configuring the logger:
+To enable Weights & Biases (W&B) logging, install the optional `wandb` dependencies from the repository root and set your API key:
 
 ```bash
+uv sync --frozen --extra vlm --extra wandb
 export WANDB_API_KEY="your-wandb-api-key"
 ```
 
@@ -244,13 +234,13 @@ uv run examples/vlm_generate/generate.py \
     --image /path/to/image.jpg
 ```
 
-The output can be either `text` (default) or `json`, with an optional write file.
+Use `--output-format json` for JSON output; the default is `text`. To save the output to a file, set `--output-file /path/to/output.txt`.
 
-For models trained on MedPix-VQA, load the trained checkpoint and generate outputs using the following command. Be sure to specify the same base model used during training:
+For models trained on MedPix-VQA, load the trained checkpoint and generate outputs using the following command. Specify the same base model used during training, and replace the example checkpoint path with a saved `epoch_*_step_*` directory from your run:
 
 ```bash
 uv run examples/vlm_generate/generate.py \
-    --checkpoint-path vlm_checkpoints/epoch_0_step_200 \
+    --checkpoint-path vlm_checkpoints/epoch_0_step_100 \
     --prompt "What medical condition is shown in this image?" \
     --base-model-path google/gemma-3n-e4b-it \
     --image medical_image.jpg
@@ -258,11 +248,11 @@ uv run examples/vlm_generate/generate.py \
 
 For a PEFT checkpoint, the script detects `model/adapter_model.safetensors`, restores the LoRA configuration from `model/adapter_config.json` and `model/automodel_peft_config.json`, applies LoRA to the base model, and loads the adapter weights automatically. Supply the original base model with `--base-model-path`; no separate PEFT flags are required.
 
-Run the following command to load and generate from adapters trained on MedPix-VQA:
+The PEFT recipe also saves checkpoints under `vlm_checkpoints/` by default. To load adapters trained on MedPix-VQA, use a saved checkpoint from your PEFT run:
 
 ```bash
 uv run examples/vlm_generate/generate.py \
-    --checkpoint-path peft_vlm_checkpoints/epoch_0_step_200/ \
+    --checkpoint-path vlm_checkpoints/epoch_0_step_100/ \
     --prompt "What medical condition is shown in this image?" \
     --image-url medical_image.jpg \
     --base-model-path google/gemma-3n-e4b-it
@@ -274,18 +264,12 @@ Given the following image:
 
 And the prompt:
 
-```
+```text
 How does the interhemispheric fissure appear in this image?
-```
-
-Example Gemma 3 response:
-
-```
-The interhemispheric fissure appears as a dark streak, indicating significant tissue loss.
 ```
 
 Example Gemma 3n response:
 
-```
+```text
 The interhemispheric fissure appears somewhat obscured by the fluid-filled mass.
 ```

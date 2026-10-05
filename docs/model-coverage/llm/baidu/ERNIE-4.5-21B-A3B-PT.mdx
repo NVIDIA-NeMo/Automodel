@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `Ernie4_5_MoeForCausalLM` architectu
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), then activate an environment with Transformer Engine and DeepEP installed. From the repository root, run full fine-tuning on HellaSwag with eight GPUs on one node:
 
 ```bash
 automodel examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml --nproc-per-node 8
@@ -19,7 +19,7 @@ automodel examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml --nproc
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | HellaSwag; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml) |
+| Full Fine-Tuning | HellaSwag; eight expert-parallel ranks | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml) |
 
 ## Model Context
 
@@ -32,33 +32,32 @@ ERNIE-4.5-21B-A3B-PT is used for text generation. Its model size is 21.95B check
 | Parameters | 21.95B checkpoint parameters |
 | Decoder Layers | 28 |
 | Hidden Size | 2,560 |
-| Attention | 20 attention heads / 4 key-value heads |
+| Attention | 20 attention heads and 4 key-value heads |
 | Context Length | 131,072 tokens (checkpoint configuration) |
 | Vocabulary Size | 103,424 |
 | Configured Dtype | `bfloat16` |
 
 ### Configuration
 
+These settings describe the linked recipe and the Quick Start launch.
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=8 |
-| Nodes | - |
-| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), Transformer Engine, DeepEP (dispatcher=deepep) |
-| Advanced | bfloat16, attention=te, linear=torch, experts=torch_mm, dispatcher=deepep |
+| Hardware | Eight GPUs for the Quick Start; GPU model and memory capacity are not specified in the recipe |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=8` |
+| Nodes | One for the Quick Start |
+| Features | Checkpointing (`checkpoint.enabled=true`), activation checkpointing (`activation_checkpointing=true`), Transformer Engine, DeepEP (`dispatcher=deepep`) |
+| Advanced | `torch_dtype=bfloat16`, `attn=te`, `linear=torch`, `experts=torch_mm`, `dispatcher=deepep` |
 
 ### Workflow Notes
 
-Follow the [installation instructions](/get-started/installation).
+The recipe selects Transformer Engine attention and DeepEP dispatch. For a source installation, select the `moe` extra, which includes both dependencies; the `all` extra omits DeepEP. See the [installation instructions](/get-started/installation) for environment setup.
 
 ## Available Models
 
-- [`baidu/ERNIE-4.5-21B-A3B-PT`](https://huggingface.co/baidu/ERNIE-4.5-21B-A3B-PT)
-
 | Checkpoint | Type |
 | --- | --- |
-| [ERNIE-4.5-21B-A3B-PT](https://huggingface.co/baidu/ERNIE-4.5-21B-A3B-PT) | Checkpoint documented on this page |
-| [`baidu/ERNIE-4.5-21B-A3B-PT`](https://huggingface.co/baidu/ERNIE-4.5-21B-A3B-PT) | Checkpoint documented on this page |
+| [`baidu/ERNIE-4.5-21B-A3B-PT`](https://huggingface.co/baidu/ERNIE-4.5-21B-A3B-PT) | Full fine-tuning checkpoint |
 
 ## Related Resources
 

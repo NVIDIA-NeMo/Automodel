@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `LLaVAOneVision1_5_ForConditionalGen
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation) and [recipe prerequisites](#workflow-notes). In your installed environment, run low-rank adaptation (LoRA) fine-tuning on `quintend/rdr-items` from the repository root. This example uses eight GPUs on one node:
 
 ```bash
 automodel examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml --nproc-per-node 8
@@ -19,7 +19,7 @@ automodel examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml --npro
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Fine-Tuning | RDR Items | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml) |
+| LoRA Fine-Tuning | RDR Items; 8-GPU example | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml) |
 
 ## Model Context
 
@@ -41,27 +41,26 @@ LLaVA-OneVision-1.5-8B-Instruct is used for image-text-to-text. Its model size i
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1 |
-| Nodes | - |
-| Features | Checkpointing (enabled=true), LoRA |
-| Advanced | - |
+| Hardware | 8 GPUs in the example launch; GPU model and memory unspecified |
+| Strategy | FSDP2; `tp_size=1`, `cp_size=1` |
+| Nodes | 1 in the example launch |
+| Features | Checkpoint saving (`enabled=true`), LoRA |
+| Attention Backend | FlashAttention 2 (`attn_implementation: flash_attention_2`) |
 
 ### Workflow Notes
 
-Follow the [installation instructions](/get-started/installation).
+The recipe selects FlashAttention 2, which requires the `fa` extra in addition to the VLM dependencies. For a source installation, add `--extra fa` to the installation guide's `uv sync` command. The `fa` extra is excluded from `all`.
+
+The recipe loads pretrained weights and trains on image descriptions from `quintend/rdr-items`. It saves checkpoints under `checkpoints/`. The eight-GPU launch is an example topology; the recipe does not specify a minimum GPU memory requirement.
 
 ## Available Models
 
-- [`lmms-lab/LLaVA-OneVision-1.5-8B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct)
-
 | Checkpoint | Type |
 | --- | --- |
-| [LLaVA-OneVision-1.5-8B-Instruct](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct) | Checkpoint documented on this page |
-| [`lmms-lab/LLaVA-OneVision-1.5-8B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct) | Checkpoint documented on this page |
+| [`lmms-lab/LLaVA-OneVision-1.5-8B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct) | Pretrained checkpoint for LoRA fine-tuning |
 
 ## Related Resources
 
-- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+- [Gemma 3n fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
 
 - [Checkpoint Configuration](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct/blob/e137910552d616eb0f7305147ca054311a90c542/config.json)

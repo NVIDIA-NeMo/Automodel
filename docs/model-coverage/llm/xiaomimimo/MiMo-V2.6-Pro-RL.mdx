@@ -8,12 +8,12 @@ slug: model-coverage/large-language-models/xiaomimimo/MiMo-V2.6-Pro-RL
 
 ## Quick Start
 
-After [installation](/get-started/installation) and [recipe setup](#recipe-setup), fine-tune on packed Tulu3 text. Allocate 32 nodes with 4 GB200 GPUs each. Run this command on every node, setting `NODE_RANK` to its zero-based node index and `MASTER_ADDR` to the first node's address.
+After [installation](/get-started/installation) and [recipe setup](#recipe-setup), fine-tune on packed Tulu3 text. Allocate 32 nodes with 4 GB200 GPUs each. Run from the repository root on every node, setting `NODE_RANK` to its zero-based node index and `MASTER_ADDR` to the first node's address.
 
 ```bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True USE_MNNVL=1
 export NVTE_FUSED_ATTN=1 NVTE_FLASH_ATTN=0 NVTE_UNFUSED_ATTN=0
-uv run torchrun --nnodes 32 --nproc-per-node 4 \
+uv run --extra all --group dev torchrun --nnodes 32 --nproc-per-node 4 \
   --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
   -m nemo_automodel.cli.app examples/llm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps.yaml
 ```
@@ -42,10 +42,14 @@ MiMo-V2.6-Pro-RL combines a hybrid-attention language backbone with a vision enc
 | Vocabulary Size | 152,576 |
 | Experts | 384 routed / 8 selected per token |
 | Vision Encoder Dimensions | 28 layers; hidden size 1,280 |
-| Vision Encoder | `MiMoVisionTransformer` is attached as `self.visual` when `vision_config` is not `None`. |
+| Vision Encoder | MiMo vision transformer; frozen in both MedPix-VQA recipes. |
 | Recipe Hardware | GB200 nodes with 4 GPUs per node; 32 nodes for full fine-tuning and 8 nodes for LoRA. |
 
+All three recipes load pretrained weights and run for 100 steps. They set `checkpoint.enabled: false`, so they do not save trained weights or LoRA adapters.
+
 ### Recipe Setup
+
+All three recipes use `FusedLinearCrossEntropy`, which requires `cut-cross-entropy` from the `dev` dependency group. The quick-start command selects the `all` extra and the `dev` group; the `all` extra alone does not include this loss dependency.
 
 The packed Tulu3 recipe requires Transformer Engine >= 2.19, cuDNN >= 9.26, and HybridEP with MNNVL. Keep each 64-GPU expert-parallel group within one NVLink domain. The quick-start command includes the environment variables required for a direct run; the YAML's `ci.env_vars` applies only to CI.
 

@@ -4,13 +4,13 @@ description: "Use Qwen/Qwen3.5-4B with NeMo AutoModel for vision-language fine-t
 slug: model-coverage/vision-language-models/qwen/Qwen3.5-4B
 ---
 
-Qwen3.5 is Alibaba Cloud's unified vision-language model series, including dense and MoE variants for image and multimodal understanding tasks.
+Qwen3.5-4B is a dense vision-language model in Alibaba Cloud's Qwen3.5 series for image and multimodal understanding tasks.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-From the repository root, run:
+The example launches eight GPU workers. From the repository root, run:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml
@@ -24,33 +24,32 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_5_4b.yam
 
 ## Model Context
 
-Qwen3.5-4B is used for image-text-to-text. Its model size is 4B parameters.
+Qwen3.5-4B pairs a 4B-class language model with a vision encoder. The recipe loads pretrained weights for full fine-tuning on MedPix-VQA, trains both the vision tower and language model with fully sharded data parallelism (FSDP2), and saves checkpoints to `/tmp/checkpoints/qwen3_5_4b/`.
 
 | Property | Value |
 | --- | --- |
 | Task | Image-Text-to-Text |
-| **Architecture** | `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration` |
-| Parameters | 4B |
+| Architecture | `Qwen3_5ForConditionalGeneration` |
+| Language Model Size | 4B (upstream designation) |
+| Parameters | Approximately 4.66B stored checkpoint parameters (Hugging Face metadata) |
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
 | Decoder Layers | 32 |
 | Hidden Size | 2,560 |
-| Attention | 16 attention heads / 4 key-value heads |
+| Attention | 24 Gated DeltaNet layers and 8 gated-attention layers |
+| Gated Attention Heads | 16 query heads and 4 key-value heads |
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 248,320 |
 
-- `Qwen3_5ForConditionalGeneration` - dense models
-- `Qwen3_5MoeForConditionalGeneration` - MoE models
+### Related MoE Workflows
 
-### Fine-Tuning
-
-See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+For a related mixture-of-experts (MoE) workflow using Qwen3.5-397B-A17B, see [Fine-Tune Qwen3.5-VL](/recipes-e2e-examples/qwen3-5-vl).
 
 #### Validated Large-Model, Long-Context Scale
 
 The Qwen3.5-MoE VLM training path has been validated at both
 **397-billion-parameter model scale** and **128K context length**.
 Qwen3.5-397B-A17B completed a 10-step end-to-end training run on 256 H100 GPUs
-with FSDP2, CP64, EP64, packed sequences, full activation checkpointing, and a
+with FSDP2, context parallelism (CP64), expert parallelism (EP64), packed sequences, full activation checkpointing, and a
 trainable vision tower. The workload mixed text, image, and video data and
 included genuine examples of approximately 120K tokens.
 
@@ -61,6 +60,8 @@ convergence result. The public
 provides a starting configuration for that checkpoint; use the
 [122B EP8/CP32 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml)
 as the published 128K long-context reference.
+
+Both published MoE recipes use MedPix-VQA and disable checkpoint saving. For source installations, add `--extra moe` to the [installation guide's](/get-started/installation) `uv sync --locked --all-groups --extra all` command to install HybridEP. Build HybridEP with `HYBRID_EP_MULTINODE=1` for these multi-node recipes and set `TORCH_CUDA_ARCH_LIST` for the target GPUs. Follow the [Dockerfile's HybridEP build setup](https://github.com/NVIDIA-NeMo/Automodel/blob/c79ba55eb77527138337288220df04bc5939483c/docker/Dockerfile#L150-L180) for communication dependencies (RDMA core, NCCL/DOCA, and NVSHMEM), `RDMA_CORE_HOME`, and CUDA include paths. The 122B recipe also uses Transformer Engine's `FusedAdam` from the `cuda` extra and `FusedLinearCrossEntropy`, which requires `cut-cross-entropy` from the `dev` dependency group. The `all` extra includes `cuda`, and `--all-groups` includes `dev`.
 
 Dense Qwen3.5 and Qwen3.5-MoE support context-parallel vision frame sharding. The
 Qwen3.5-MoE path composes expert and context parallelism with packed sequences; see the
@@ -75,6 +76,7 @@ Qwen3.5-MoE path composes expert and context parallelism with packed sequences; 
 ## Related Resources
 
 - [Qwen](https://huggingface.co/Qwen)
-- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
-
+- [Fine-Tune Qwen3.5-VL (397B MoE)](/recipes-e2e-examples/qwen3-5-vl)
 - [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-4B/blob/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a/config.json)
+- [Upstream Model Card](https://huggingface.co/Qwen/Qwen3.5-4B/blob/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a/README.md)
+- [Checkpoint Metadata](https://huggingface.co/api/models/Qwen/Qwen3.5-4B/revision/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a)

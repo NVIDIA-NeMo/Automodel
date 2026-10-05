@@ -13,9 +13,9 @@
 # limitations under the License.
 
 
-# To run this recipe:
-#   automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
+# For environment setup and a multi-node launch example, see the model card:
+#   docs/model-coverage/vlm/qwen/Qwen3-VL-235B-A22B-Instruct.mdx
+# The example uses 32 nodes with 8 GPUs each and --step_scheduler.local_batch_size=4.
 
 recipe: FinetuneRecipeForVLM
 

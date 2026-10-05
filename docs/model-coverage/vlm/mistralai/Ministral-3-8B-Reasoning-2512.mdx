@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` a
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), including the `vlm` and `vlm-media` extras. From the repository root, fine-tune on MedPix-VQA with the example's eight-GPU launch:
 
 ```bash
 automodel examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml --nproc-per-node 8
@@ -19,7 +19,7 @@ automodel examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml --nproc-per-no
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Vision-Language Fine-Tuning | MedPix-VQA | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 8-GPU example | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml) |
 
 ## Model Context
 
@@ -41,27 +41,24 @@ Ministral-3-8B-Reasoning-2512 is used for image-text-to-text. Its model size is 
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1 |
-| Nodes | - |
-| Features | Checkpointing (enabled=true) |
-| Advanced | torch.bfloat16 |
+| Hardware | 8 GPUs in the example launch; GPU model and memory are not specified |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); `tp_size: 1`, `cp_size: 1` |
+| Nodes | 1 for the local Quick Start |
+| Features | Checkpoint saving enabled; `safetensors` format in `vlm_checkpoints/` |
+| Advanced | `torch.bfloat16`; `attn_implementation: eager`; `torch.optim.AdamW` |
 
 ### Workflow Notes
 
-Follow the [installation instructions](/get-started/installation).
+The recipe loads pretrained weights and freezes the vision tower while fine-tuning the language model. It uses `mmoukouba/MedPix-VQA`, with `train[:1000]` for training and `validation[:500]` for validation. It runs for one epoch with a global batch size of 8 and a local batch size of 1.
 
 ## Available Models
 
-- [`mistralai/Ministral-3-8B-Reasoning-2512`](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Ministral-3-8B-Reasoning-2512](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512) | Checkpoint documented on this page |
-| [`mistralai/Ministral-3-8B-Reasoning-2512`](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512) | Checkpoint documented on this page |
+| [`mistralai/Ministral-3-8B-Reasoning-2512`](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512) | Pretrained checkpoint used by the fine-tuning recipe |
 
 ## Related Resources
 
-- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+- [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
 
 - [Checkpoint Configuration](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512/blob/81eaece1948f3875421d9a45bc55487d10e2d894/config.json)

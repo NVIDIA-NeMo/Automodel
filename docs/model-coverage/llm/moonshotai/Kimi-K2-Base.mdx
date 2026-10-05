@@ -1,15 +1,15 @@
 ---
 title: "moonshotai/Kimi-K2-Base"
-description: "Use NeMo AutoModel to fine-tune moonshotai/Kimi-K2-Base for LLM workflows with checked-in text generation recipes and documented distributed settings."
+description: "Benchmark moonshotai/Kimi-K2-Base training on synthetic data with NeMo AutoModel, Transformer Engine, HybridEP, and a documented distributed configuration."
 slug: model-coverage/large-language-models/moonshotai/Kimi-K2-Base
 ---
 
-[Kimi-K2-Base](https://huggingface.co/moonshotai/Kimi-K2-Base) has a checked-in NeMo AutoModel recipe for text generation.
+[Kimi-K2-Base](https://huggingface.co/moonshotai/Kimi-K2-Base) has a checked-in NeMo AutoModel recipe for benchmarking training on synthetic data. The recipe initializes the model from configuration rather than loading checkpoint weights.
 The Hugging Face configuration declares the `DeepseekV3ForCausalLM` architecture.
 
 ## Quick Start
 
-Allocate 32 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+This example benchmarks training on synthetic data across 32 nodes with 8 GPUs each. Complete the prerequisites in Model Context, then run the command from the repository root on every node.
 
 ```bash
 uv run torchrun --nnodes 32 --nproc-per-node 8 \
@@ -34,34 +34,34 @@ Kimi-K2-Base is used for text generation. Its model size is 1026.47B checkpoint 
 | Parameters | 1026.47B checkpoint parameters |
 | Decoder Layers | 61 |
 | Hidden Size | 7,168 |
-| Attention | 64 attention heads / 64 key-value heads |
-| Context Length | 131,072 tokens (checkpoint configuration) |
+| Attention | 64 attention heads and 64 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration); 4,096 tokens in the benchmark recipe |
 | Vocabulary Size | 163,840 |
-| Experts | 384 routed / 1 shared / 8 selected per token |
+| Experts | 384 routed experts and 1 shared expert; 8 routed experts selected per token |
 | Configured Dtype | `bfloat16` |
 
 ### Configuration
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=8, cp_size=1, ep_size=32 |
+| Hardware | 8 GPUs per node (launch example) |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=8`, `cp_size=1`, `ep_size=32` |
 | Nodes | 32 |
-| Features | Activation checkpointing (activation_checkpointing=true), Transformer Engine, DeepEP (dispatcher=deepep) |
-| Advanced | attention=te, linear=te, experts=gmm, dispatcher=deepep |
+| Features | Activation checkpointing (`activation_checkpointing=true`), Transformer Engine, HybridEP (`dispatcher=hybridep`) |
+| Advanced | `attn=te`, `linear=te`, `experts=torch_mm`, `dispatcher=hybridep` |
 
 ### Workflow Notes
 
-Follow the [installation instructions](/get-started/installation).
+1. Follow the [installation instructions](/get-started/installation). Use the same source checkout and environment on all nodes, with Transformer Engine and HybridEP available.
+2. Set `NODE_RANK` to a unique integer from 0 through 31 on each node. Set `MASTER_ADDR` to the rank-0 node's address on every node, reachable on port 29500.
+
+The recipe uses pipeline parallelism (`pp_size=8`) and expert parallelism (`ep_size=32`). It enables synthetic balanced routing (`fake_balanced_gate=true`), runs 30 steps with 10 warmup steps, and disables checkpoint saving. These settings measure benchmark performance; they do not define a fine-tuning workflow.
 
 ## Available Models
 
-- [`moonshotai/Kimi-K2-Base`](https://huggingface.co/moonshotai/Kimi-K2-Base)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Kimi-K2-Base](https://huggingface.co/moonshotai/Kimi-K2-Base) | Checkpoint documented on this page |
-| [`moonshotai/Kimi-K2-Base`](https://huggingface.co/moonshotai/Kimi-K2-Base) | Checkpoint documented on this page |
+| [`moonshotai/Kimi-K2-Base`](https://huggingface.co/moonshotai/Kimi-K2-Base) | Model configuration used by the benchmark |
 
 ## Related Resources
 

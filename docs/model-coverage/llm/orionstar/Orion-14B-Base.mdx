@@ -4,7 +4,7 @@ description: "Fine-tune OrionStarAI/Orion-14B-Base with NeMo AutoModel using a c
 slug: model-coverage/large-language-models/orionstar/Orion-14B-Base
 ---
 
-[Orion](https://github.com/OrionStarAI/Orion) is a bilingual (Chinese-English) language model from OrionStar AI, with 14B parameters and strong performance on Chinese benchmarks.
+[Orion-14B-Base](https://huggingface.co/OrionStarAI/Orion-14B-Base/blob/b988a511e9c880a465e704c57e3f297a3e7ef282/README.md) is a 14B-parameter multilingual language model from OrionStarAI. It was pretrained on 2.5 trillion tokens in languages including Chinese, English, Japanese, and Korean.
 
 Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
@@ -43,7 +43,9 @@ Orion-14B-Base is used for text generation. Its model size is 14B parameters.
 
 ### Recipe Setup
 
-Read [orion_14b_base_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/orionstarai/orion_14b_base_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/orionstarai/orion_14b_base_squad_peft.yaml) loads the pretrained checkpoint with `trust_remote_code: true`. It uses fully sharded data parallelism (FSDP2), activation checkpointing, and LoRA with rank 8 and alpha 32.
+
+The example runs for 100 steps on 1,024 SQuAD training examples, with 64 validation examples and a sequence length of 512 tokens. Checkpoint saving is enabled, with output under `checkpoints/orion_14b_base`.
 
 ## Available Models
 

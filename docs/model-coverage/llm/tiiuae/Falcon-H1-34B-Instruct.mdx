@@ -1,15 +1,15 @@
 ---
 title: "tiiuae/Falcon-H1-34B-Instruct"
-description: "Use NeMo AutoModel to fine-tune tiiuae/Falcon-H1-34B-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
+description: "Fine-tune tiiuae/Falcon-H1-34B-Instruct with NeMo AutoModel using LoRA on SQuAD and the checked-in distributed training recipe."
 slug: model-coverage/large-language-models/tiiuae/Falcon-H1-34B-Instruct
 ---
 
-[Falcon-H1-34B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct) has a checked-in NeMo AutoModel recipe for text generation.
+[Falcon-H1-34B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct) has a checked-in NeMo AutoModel recipe for low-rank adaptation (LoRA) fine-tuning on SQuAD.
 The Hugging Face configuration declares the `FalconH1ForCausalLM` architecture.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), then run LoRA fine-tuning on SQuAD from the repository root. This example launches eight GPU processes on one node:
 
 ```bash
 automodel examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml --nproc-per-node 8
@@ -19,11 +19,11 @@ automodel examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml --
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Fine-Tuning | SQuAD; 1 node; TP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml) |
+| LoRA Fine-Tuning | SQuAD; 1 node; 8 GPUs; tensor parallel size 4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml) |
 
 ## Model Context
 
-Falcon-H1-34B-Instruct is used for text generation. Its model size is 33.64B checkpoint parameters.
+Falcon-H1-34B-Instruct combines Transformer attention and Mamba state space layers for text generation. Its checkpoint contains 33.64B parameters.
 
 | Property | Value |
 | --- | --- |
@@ -32,7 +32,7 @@ Falcon-H1-34B-Instruct is used for text generation. Its model size is 33.64B che
 | Parameters | 33.64B checkpoint parameters |
 | Decoder Layers | 72 |
 | Hidden Size | 5,120 |
-| Attention | 20 attention heads / 4 key-value heads |
+| Attention | 20 attention heads and 4 key-value heads |
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 261,120 |
 | Configured Dtype | `bfloat16` |
@@ -41,24 +41,21 @@ Falcon-H1-34B-Instruct is used for text generation. Its model size is 33.64B che
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=4, cp_size=1 |
+| Hardware | 8 GPUs in the example launch; GPU model unspecified |
+| Strategy | Fully Sharded Data Parallel (FSDP2); tensor parallel size `tp_size=4`, context parallel size `cp_size=1` |
 | Nodes | 1 |
 | Features | LoRA |
-| Advanced | bf16 |
+| Precision | `bfloat16` (`bf16` in the recipe) |
 
 ### Workflow Notes
 
-Follow the [installation instructions](/get-started/installation).
+The recipe loads pretrained weights and fine-tunes on SQuAD for 100 steps. Checkpoint saving is disabled (`checkpoint.enabled: false`), so this example does not save fine-tuned weights. Set `checkpoint.enabled: true` in the YAML to save checkpoints.
 
 ## Available Models
 
-- [`tiiuae/Falcon-H1-34B-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Falcon-H1-34B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct) | Checkpoint documented on this page |
-| [`tiiuae/Falcon-H1-34B-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct) | Checkpoint documented on this page |
+| [`tiiuae/Falcon-H1-34B-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct) | Pretrained instruction checkpoint for LoRA fine-tuning |
 
 ## Related Resources
 

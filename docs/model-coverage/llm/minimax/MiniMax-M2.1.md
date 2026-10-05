@@ -1,14 +1,14 @@
 ---
 title: "MiniMaxAI/MiniMax-M2.1"
-description: "Use MiniMaxAI/MiniMax-M2.1 with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+description: "Fine-tune MiniMaxAI/MiniMax-M2.1 on HellaSwag with NeMo AutoModel using pipeline and expert parallelism."
 slug: model-coverage/large-language-models/minimax/MiniMax-M2.1
 ---
 
-[MiniMax-M2](https://huggingface.co/MiniMaxAI) is MiniMax's large Mixture-of-Experts language model with linear attention for efficient long-context inference.
+[MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1) is a mixture-of-experts (MoE) language model for text generation. NeMo AutoModel provides full fine-tuning recipes on HellaSwag using pipeline parallelism (PP) and expert parallelism (EP).
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). Allocate 8 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+After [installation](/get-started/installation) and [recipe setup](#recipe-setup), run this HellaSwag full fine-tuning example from the repository root on each of 8 nodes with 8 GPUs. Set `NODE_RANK` and `MASTER_ADDR` as described below.
 
 ```bash
 uv run torchrun --nnodes 8 --nproc-per-node 8 \
@@ -26,7 +26,7 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 ## Model Context
 
-MiniMax-M2.1 is used for text generation (moe). Its model size is 229B total / 10B active parameters.
+MiniMax-M2.1 uses 256 routed experts, selecting 8 per token. The dimensions and context limit below describe the checkpoint configuration.
 
 | Property | Value |
 |---|---|
@@ -41,73 +41,35 @@ MiniMax-M2.1 is used for text generation (moe). Its model size is 229B total / 1
 | Vocabulary Size | 200,064 |
 | Experts | 256 routed / 8 selected per token |
 
-### Architecture
-
-- `MiniMaxM2ForCausalLM`
-
 ### Fine-Tuning
 
 See the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.mdx).
 
-### Setup and Additional Examples
+### Set Up the Environment
 
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
+1. Clone the repository and install from source ([full instructions](/get-started/installation)):
 
-```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras
-```
+   ```bash
+   git clone https://github.com/NVIDIA-NeMo/Automodel.git
+   cd Automodel
+   uv sync --locked --all-groups --all-extras
+   ```
 
-<Note>
-This recipe was validated on **8 nodes × 8 GPUs (64 H100s)**. See the [Launcher Guide](../../../launcher/slurm.mdx) for multi-node setup.
+2. Complete [Recipe Setup](#recipe-setup), then run the [Quick Start](#quick-start) command on every node.
 
-</Note>
-
-**2. Run the recipe** from inside the repo:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml
-```
-
-<Accordion title="Run with Docker">
-**1. Pull the container** and mount a checkpoint directory:
-
-```bash
-docker run --gpus all -it --rm \
-  --shm-size=8g \
-  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.06.00
-```
-
-**2.** Navigate to the AutoModel directory (where the recipes are):
-
-```bash
-cd /opt/Automodel
-```
-
-**3. Run the recipe**:
-
-```bash
-automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml
-```
-</Accordion>
-
-See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
+For container setup, see the [Installation Guide](/get-started/installation). Use the [Slurm Launcher Guide](/job-launchers/slurm-cluster) to prepare a multi-node environment.
 
 ### Recipe Setup
 
-Read [minimax_m2.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml) configures PP2 and EP32, with 8 nodes in its CI settings. The Quick Start uses 8 GPUs per node (64 processes); this is the example topology, not a measured hardware minimum.
 
-### Workflow Notes
+The Quick Start recipe sets `checkpoint.enabled: false`, so it does not save trained weights.
 
-Fine-tune MiniMaxAI/MiniMax-M2.1: [minimax_m2.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml). 8 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+Use the same checkout and environment on every node. Set `NODE_RANK` to a unique value from `0` through `7`, and set `MASTER_ADDR` on all nodes to the address of node `0`. Ensure that address is reachable on port `29500`.
+
+The recipe loads `MiniMaxAI/MiniMax-M2.1` and `rowan/hellaswag` from Hugging Face and selects Transformer Engine and HybridEP backends. Ensure these backends are available in the environment on every node before launching.
 
 ## Available Models
-
-- **MiniMax-M2.1**
-- **MiniMax-M2.5**
-- **MiniMax-M2.7**
 
 | Model | HF ID |
 |---|---|

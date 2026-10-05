@@ -8,7 +8,7 @@ slug: model-coverage/reranking-models/meta/Llama-3.2-1B
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), prepare the [recipe data](#recipe-setup), and launch from the repository root on eight GPUs. Validate memory use for your hardware.
+Follow the [developer installation instructions](/get-started/installation), complete the [recipe setup](#recipe-setup), and launch from the repository root on eight GPUs. Validate memory use for your hardware.
 
 ```bash
 uv run automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-node 8
@@ -37,6 +37,8 @@ Llama-3.2-1B is used for text reranking. Its model size is 1.24B (checkpoint ten
 | Configured Dtype | `bfloat16` |
 
 ### Recipe Setup
+
+Use the developer installation from a source checkout with the `all` extra and all dependency groups. This includes Transformer Engine for the configured `FusedAdam` optimizer. Request access to the gated [Hugging Face checkpoint](https://huggingface.co/meta-llama/Llama-3.2-1B) and set `HF_TOKEN` to a token from an approved account before launching.
 
 The checked-in configuration uses FSDP2 with tensor and context parallel sizes of one. It selects `meta-llama/Llama-3.2-1B` directly for cross-encoder training. The language-model checkpoint is adapted as a cross-encoder with one output label and average pooling. The recipe reads the Hugging Face dataset locations listed in `dataset.data_dir_list`; ensure access before launching. This workflow trains the language-model checkpoint as a reranker.
 

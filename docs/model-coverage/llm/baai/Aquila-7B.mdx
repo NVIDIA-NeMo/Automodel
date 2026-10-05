@@ -39,11 +39,11 @@ Aquila-7B is used for text generation. Its model size is 7B parameters.
 | Attention | 32 attention heads |
 | Context Length | 2,048 tokens (checkpoint configuration) |
 | Vocabulary Size | 100,008 |
-| Configured Dtype | `float16` |
+| Checkpoint Dtype | `float16` |
 
 ### Recipe Setup
 
-Read [aquila_7b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/baai/aquila_7b_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+The [aquila_7b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/baai/aquila_7b_squad_peft.yaml) LoRA example loads `BAAI/Aquila-7B` with `dtype: bfloat16` and `trust_remote_code: true`. It uses `rajpurkar/squad` with 512-token sequences and writes checkpoints to `checkpoints/aquila_7b`.
 
 ## Available Models
 

@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` a
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), then run full fine-tuning on SQuAD with the recipe's eight-GPU example launch from the repository root:
 
 ```bash
 automodel examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml --nproc-per-node 8
@@ -19,8 +19,8 @@ automodel examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml --nproc
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml) |
-| LoRA Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml) |
+| Full Fine-Tuning | SQuAD; 8-GPU example launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml) |
+| LoRA Fine-Tuning | SQuAD; 1-GPU example launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml) |
 
 ## Model Context
 
@@ -33,33 +33,28 @@ Devstral-Small-2-24B-Instruct-2512 is used for text generation. Its model size i
 | Parameters | 24.01B checkpoint parameters |
 | Decoder Layers | 40 |
 | Hidden Size | 5,120 |
-| Attention | 32 attention heads / 8 key-value heads |
+| Attention | 32 query heads and 8 key-value heads |
 | Context Length | 393,216 tokens (checkpoint configuration) |
 | Vocabulary Size | 131,072 |
 | Configured Dtype | `bfloat16` |
 
-### Configuration
+### Full Fine-Tuning Configuration
+
+These settings describe the full fine-tuning recipe used in Quick Start.
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1 |
-| Nodes | - |
-| Features | Checkpointing (enabled=true) |
-| Advanced | - |
-
-### More Recipes for This Model
-
-- [`devstral2_small_2512_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml)
+| Hardware | 8 GPUs in the example launch |
+| Strategy | FSDP2; `tp_size: 1`, `cp_size: 1` |
+| Nodes | Not specified in the recipe YAML |
+| Features | Training checkpoint saves enabled (`checkpoint.enabled: true`) |
+| Advanced | Sequence packing disabled (`packed_sequence_size: 0`) |
 
 ## Available Models
 
-- [`mistralai/Devstral-Small-2-24B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Devstral-Small-2-24B-Instruct-2512](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512) | Checkpoint documented on this page |
-| [`mistralai/Devstral-Small-2-24B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512) | Checkpoint documented on this page |
+| [`mistralai/Devstral-Small-2-24B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512) | Checkpoint used by both fine-tuning recipes |
 
 ## Related Resources
 

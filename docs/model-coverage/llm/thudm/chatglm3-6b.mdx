@@ -39,13 +39,13 @@ chatglm3-6b is used for text generation. Its model size is 6B parameters.
 | Attention | 32 attention heads / 2 key-value heads |
 | Context Length | 8,192 tokens (checkpoint configuration) |
 | Vocabulary Size | 65,024 |
-| Configured Dtype | `float16` |
+| Checkpoint Dtype | `float16` |
 
-- `ChatGLMModel` / `ChatGLMForConditionalGeneration`
+The checkpoint declares `ChatGLMModel`; its `AutoModelForCausalLM` mapping loads `ChatGLMForConditionalGeneration`.
 
 ### Recipe Setup
 
-Read [chatglm3_6b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/zai_org/chatglm3_6b_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/zai_org/chatglm3_6b_squad_peft.yaml) loads pretrained weights in `bfloat16` with `trust_remote_code: true` and applies low-rank adaptation (LoRA). It configures fully sharded data parallelism (`fsdp2`), activation checkpointing, and up to 100 training steps. The SQuAD subsets contain 1,024 training and 64 validation examples, with a 512-token sequence length. Checkpoint saving is enabled under `checkpoints/chatglm3_6b`.
 
 ## Available Models
 

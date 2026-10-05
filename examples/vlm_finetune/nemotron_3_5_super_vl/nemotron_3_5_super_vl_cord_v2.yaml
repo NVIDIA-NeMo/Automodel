@@ -20,11 +20,11 @@
 # Sizing: 4 nodes x 8 H100 (~65 GiB/GPU): 512 experts -> ep_size 32, global_batch_size 8 with
 # cp_size 4 gives dp=8 -> one sample per rank per step; 400 steps = 4 epochs of the 800-sample
 # train split. The final checkpoint is exported as
-# consolidated HuggingFace safetensors (save_consolidated: final) for the inference/eval step
+# consolidated Hugging Face safetensors (save_consolidated: final) for the inference/eval step
 # in the CORD-v2 guide (docs/guides/vlm/nemotron-3-5-super-vl.mdx).
 #
-# Run (4 nodes):
-#   automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml --nproc-per-node 8 --nnodes 4
+# For four-node launch commands, see Step 3 ("Launch Fine-Tuning") in
+# docs/guides/vlm/nemotron-3-5-super-vl.mdx.
 
 recipe: FinetuneRecipeForVLM
 
@@ -131,8 +131,7 @@ optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   betas: [0.9, 0.95]
   eps: 1e-8
-  # Full-parameter SFT of a 67B: lower than the 33B guide's 1e-4, scaled for the
-  # 8-sample global batch.
+  # Full-parameter SFT of Nemotron 3.5 Super VL with an 8-sample global batch.
   lr: 5.0e-5
   weight_decay: 0.01
   master_weights: true

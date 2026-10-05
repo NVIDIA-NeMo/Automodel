@@ -8,8 +8,10 @@ slug: model-coverage/diffusion/wan-ai/Wan2.1-T2V-14B-Diffusers
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
+Follow the [installation instructions](/get-started/installation) and the
+[diffusion setup and data preparation guide](/recipes-e2e-examples/diffusion-fine-tuning).
+Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the recipe,
+then run from the repository root on eight GPUs:
 
 ```bash
 uv run torchrun --nproc-per-node=8 \
@@ -39,13 +41,17 @@ Wan2.1-T2V-14B-Diffusers is used for text to video. Its model size is 14.29B che
 
 ### Configuration
 
+The following settings describe the checked-in recipes and Quick Start.
+Both recipes use data parallel size 8 (DP8). Low-rank adaptation (LoRA) trains
+adapters with rank 64 and requires Transformer Engine for its configured optimizer.
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | - |
-| Nodes | - |
-| Features | Checkpointing (enabled=true) |
-| Advanced | float32 |
+| Hardware | GPU model and memory are not specified in these recipes. |
+| Strategy | Fully Sharded Data Parallel v2 (FSDP2); `dp_size: 8`, `dp_replicate_size: 1`; tensor, context, and pipeline parallel sizes are 1. |
+| Nodes | The Quick Start launches on one node with eight GPUs. |
+| Features | Checkpoint saving and compilation enabled; activation checkpointing disabled. |
+| Advanced | Full fine-tuning: `float32` model storage and `bfloat16` compute. LoRA: `bfloat16` base weights and compute by default. Both recipes use `bfloat16` gradient reduction. |
 
 ### More Recipes for This Model
 
@@ -53,11 +59,8 @@ Wan2.1-T2V-14B-Diffusers is used for text to video. Its model size is 14.29B che
 
 ## Available Models
 
-- [`Wan-AI/Wan2.1-T2V-14B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Wan2.1-T2V-14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) | Checkpoint documented on this page |
 | [`Wan-AI/Wan2.1-T2V-14B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) | Checkpoint documented on this page |
 
 ## Related Resources

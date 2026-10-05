@@ -1,83 +1,105 @@
-# Fine-Tune MiniMax-M3
+---
+title: "Fine-Tune MiniMax-M3"
+description: "Prepare multimodal data and launch MiniMax-M3 supervised fine-tuning or LoRA with NeMo AutoModel on a Slurm cluster."
+---
 
 ## Introduction
 
-[MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) is MiniMaxAI's 428B A22B Mixture-of-Experts first vision-language model combining long-context reasoning, agentic workflows, and creative capabilities in a single platform. The multimodal MoE model evolved from MiniMax M2 along three axes — width, attention, and visual grounding.
+[MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) is MiniMaxAI's mixture-of-experts (MoE) vision-language model combining long-context reasoning, agentic workflows, and creative capabilities in a single platform. The [upstream model card](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/README.md) reports approximately 428B total parameters and 23B active parameters. The multimodal MoE model evolved from MiniMax M2 along three axes — width, attention, and visual grounding.
 
-MiniMax-M3 enables advanced use cases such as long-form video understanding, extended coding tasks (8+ hours), and high-quality design workflows.
+MiniMaxAI describes MiniMax-M3's long-horizon agentic coding and cowork capabilities in the [upstream model card](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/README.md).
 
-To set up your environment to fine-tune this model with NeMo AutoModel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
+To set up your environment to fine-tune this model with NeMo AutoModel, follow the [installation guide](/get-started/installation).
 
 ## Model Overview
 
 ### Architecture
 
-- **Model type:** 428B total / 22B active MoE vision-language model.
-- **Language module:** MiniMax-M2.7 backbone with 60 layers (3 dense + 57 MoE), 64 attention heads, 128 experts, block-sparse DSA attention on the MoE layers and a 512k context length.
+- **Model type:** MoE vision-language model with approximately 428B total parameters and 23B active parameters.
+- **Language module:** MiniMax-M2.7 backbone with 60 layers (3 dense and 57 MoE), 64 attention heads, 128 experts, block-sparse attention on the MoE layers, and a 1M-token context window.
 - **Vision module:**  CLIP-style ViT with 32 layers and dynamic resolution image input from 336×336 up to 2016×2016
-- **Precision targets:** BF16 and MXFP8
-- **Hardware target:** trained on Hopper GPUs.
+- **Fine-tuning precision:** The recipes linked below load BF16 model weights (`model.torch_dtype: bfloat16`).
+
+The [upstream checkpoint configuration](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/config.json) sets `max_position_embeddings` to 1,048,576. The fine-tuning recipes linked below set the data collator's `max_length` to 2,048; the model's context window does not describe the sequence length used by these recipes.
 
 ## Data
 
 ### Multimodal Supervised Fine-Tuning Data
 
-Use image/video instruction data that matches the target agent workflow. Good candidates include:
+Use image and video instruction data that matches the target agent workflow. Good candidates include:
 
 - frontend mockup-to-project examples,
 - screenshot-debugging conversations,
 - structured data-processing tasks with visual context,
-- image/video question-answer pairs for bounded task execution.
+- image and video question-answer pairs for bounded task execution.
 
-For a full walkthrough of how multimodal datasets are preprocessed and integrated into NeMo AutoModel, including chat-template conversion and collate functions, see the [Multi-Modal Dataset Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/dataset.mdx#multi-modal-datasets).
+For a full walkthrough of how multimodal datasets are preprocessed and integrated into NeMo AutoModel, including chat-template conversion and collate functions, see the [Multi-Modal Dataset Guide](/datasets/multi-modal-dataset).
 
 ## Launch Training
 
-NeMo AutoModel supports several ways to launch training: the AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on Slurm batch jobs, multi-node configuration, and environment variables, see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide.
+For Slurm batch jobs, multi-node configuration, and environment variables, follow the [Run on a Cluster](/job-launchers/slurm-cluster) guide. Choose one of the checked-in recipes:
 
-### Standalone Slurm Skeleton
+- The [full supervised fine-tuning (SFT) recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) provides an example topology of 16 nodes with eight H100 GPUs per node, pipeline parallelism of 4, and expert parallelism of 32.
+- The [low-rank adaptation (LoRA) recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml) uses eight nodes with eight GPUs per node, pipeline parallelism of 4, and expert parallelism of 8.
 
-Before running, make sure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide.
+These are the supplied recipe configurations. Both use BF16 model weights and the HybridEP dispatcher.
 
-```bash
-export TRANSFORMERS_OFFLINE=1
-export HF_HOME=/path/to/hf_cache
-export HF_DATASETS_OFFLINE=1
-export WANDB_API_KEY=your_wandb_key
+The full SFT recipe enables checkpoint saving with `checkpoint.enabled: true`. The LoRA recipe sets `checkpoint.enabled: false` and saves no trained adapters unless you set `checkpoint.enabled` to `true` before launch.
 
-srun --output=output.out \
-     --error=output.err \
-     --container-image /path/to/automodel26.04.image.sqsh \
-     --no-container-mount-home bash -c "
-  CUDA_DEVICE_MAX_CONNECTIONS=1 automodel \
-  /path/to/minimax_m3_vl.yaml \
-  --nproc-per-node=8 \
-  --model.pretrained_model_name_or_path=/path/to/MiniMax-M3 \
-  --processor.pretrained_model_name_or_path=/path/to/MiniMax-M3"
-```
+### Prepare the Cluster Environment
 
-Use the checked-in [full SFT recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) or [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml).
-
-
-**Before you start**:
-
-- Clone or mirror the model checkpoint locally before launching a multi-node run.
-- Ensure `HF_HOME` points to a shared cache visible from all nodes.
+- Use an AutoModel container with HybridEP built for multi-node execution (`HYBRID_EP_MULTINODE=1` at build time) and the communication dependencies configured in the repository [Dockerfile](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile).
+- Clone or mirror the model checkpoint and processor files locally before launching a multi-node run.
+- Place the recipe, checkpoint, and Hugging Face cache in a shared directory visible from all nodes and mount it into the container.
 - Cache the dataset locally if running with `HF_DATASETS_OFFLINE=1`.
 - Configure the `wandb` section in the recipe to record loss, throughput, and memory curves.
 
+### Launch From a Slurm Allocation
+
+Run this skeleton inside an existing allocation with 16 nodes and eight GPUs per node for the full SFT recipe. For LoRA, use the LoRA recipe and an allocation with eight nodes and eight GPUs per node. Replace the image and shared-directory placeholders with your cluster paths. The command starts one `torchrun` process per node, with all nodes joining the same rendezvous.
+
+```bash
+export TRANSFORMERS_OFFLINE=1
+export HF_HOME=/path/to/shared/hf_cache
+export HF_DATASETS_OFFLINE=1
+export WANDB_API_KEY=your_wandb_key
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=29500
+
+srun --output=output.out \
+     --error=output.err \
+     --nodes="$SLURM_NNODES" \
+     --ntasks="$SLURM_NNODES" \
+     --ntasks-per-node=1 \
+     --gpus-per-node=8 \
+     --container-image=/path/to/automodel.image.sqsh \
+     --container-mounts=/path/to/shared:/path/to/shared \
+     --export=ALL \
+     --no-container-mount-home bash -c '
+  CUDA_DEVICE_MAX_CONNECTIONS=1 torchrun \
+  --nnodes="$SLURM_NNODES" \
+  --nproc-per-node=8 \
+  --rdzv_id="$SLURM_JOB_ID" \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
+  -m nemo_automodel.cli.app \
+  /path/to/shared/minimax_m3_vl_sft_ep32pp4.yaml \
+  --model.pretrained_model_name_or_path=/path/to/shared/MiniMax-M3 \
+  --processor.pretrained_model_name_or_path=/path/to/shared/MiniMax-M3'
+```
+
 ## Training Results
 
-The SFT and LoRA fine-tuning loss curves are shown below.
+The following loss curves were included in the original NeMo AutoModel MiniMax-M3 guide for SFT and LoRA runs. They are historical results; the guide does not record the checkpoint revision or full run configuration for these runs.
 
 **SFT**
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/minimax_m3_sft.png" alt="Minimax-M3 SFT training loss curve" width="700" />
+  <img src="./minimax_m3_sft.png" alt="MiniMax-M3 SFT training loss curve" width="700" />
 </p>
 
 **LoRA**
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/minimax_m3_lora.png" alt="Minimax-M3 LoRA training loss curve" width="700" />
+  <img src="./minimax_m3_lora.png" alt="MiniMax-M3 LoRA training loss curve" width="700" />
 </p>

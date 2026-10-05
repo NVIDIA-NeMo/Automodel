@@ -8,7 +8,7 @@ slug: model-coverage/large-language-models/moonshotai/Kimi-K3
 
 ## Quick Start
 
-Allocate 64 nodes with 4 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+Fine-tune on HellaSwag using the recipe's 64-node NVIDIA GB200 setup with four GPUs per node. Complete the prerequisites in [Model Context](#model-context), then run this command from the repository root on every node:
 
 ```bash
 uv run torchrun --nnodes 64 --nproc-per-node 4 \
@@ -24,7 +24,7 @@ uv run torchrun --nnodes 64 --nproc-per-node 4 \
 
 ## Model Context
 
-Kimi-K3 is used for text generation (moe, hybrid attention). Its model size is 2.8T total / 104B activated parameters.
+The recipe fine-tunes Kimi-K3's text decoder for text generation. Its mixture-of-experts (MoE) architecture combines Kimi Delta Attention with Gated Multi-head Latent Attention.
 
 | Property | Value |
 |---|---|
@@ -40,9 +40,19 @@ Kimi-K3 is used for text generation (moe, hybrid attention). Its model size is 2
 | Experts | 896 routed / 2 shared / 16 selected per token |
 | Configured Dtype | `bfloat16` |
 
+### Prepare to Launch
+
+As configured, the [example recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k3_hellaswag.yaml) stops after 100 steps (`step_scheduler.max_steps: 100`) and does not save trained weights (`checkpoint.enabled: false`).
+
+1. [Install NeMo AutoModel](/get-started/installation) and make the repository checkout available on every node.
+2. Set `NODE_RANK` to a unique integer from `0` to `63` on each node.
+3. Set `MASTER_ADDR` on every node to the same hostname or IP address of the rank-zero node, reachable by all nodes. Ensure port `29500` is available for the rendezvous.
+
+See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for cluster setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for distributed configuration.
+
 ### Architecture
 
-- Hybrid attention alternates groups of three Kimi Delta Attention (KDA) layers with a Gated Multi-head Latent Attention (MLA) layer.
+- Hybrid attention uses groups of three Kimi Delta Attention (KDA) layers followed by a Gated Multi-head Latent Attention (MLA) layer, with an additional Gated MLA layer at the end.
 - Attention Residuals operate over 12-layer blocks. Pipeline stages preserve these block boundaries and carry the residual state between stages.
 - Stable LatentMoE routes each token to 16 of 896 routed experts and includes two shared experts. The expert MLPs use SiTU-GLU.
 - The released checkpoint uses MXFP4 weights. The example recipe dequantizes the base checkpoint while loading it for BF16 training.
@@ -63,12 +73,10 @@ The combined EP32 and PP8 configuration is validated on 256 GB200 GPUs.
 | Checkpoint | Type |
 | --- | --- |
 | [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) | Checkpoint documented on this page |
-| [Kimi K3 model card](https://huggingface.co/moonshotai/Kimi-K3) | Checkpoint documented on this page |
 
 ## Related Resources
 
 - [Kimi K3 model card](https://huggingface.co/moonshotai/Kimi-K3)
 - [Kimi K3 technical report](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf)
 - [NeMo AutoModel Kimi K3 implementation](https://github.com/NVIDIA-NeMo/Automodel/pull/3259)
-
 - [Checkpoint Configuration](https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json)

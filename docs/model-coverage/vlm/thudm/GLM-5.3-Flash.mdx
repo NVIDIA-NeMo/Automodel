@@ -12,7 +12,7 @@ Manifold-Constrained Hyper-Connections (mHC).
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). Allocate 9 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+Complete the [recipe setup](#recipe-setup), then fine-tune on MedPix-VQA from the repository root. Allocate 9 nodes with 8 GPUs each. Run the command on every node, setting `NODE_RANK` to 0 through 8 and `MASTER_ADDR` to the same rank-0 hostname.
 
 ```bash
 uv run torchrun --nnodes 9 --nproc-per-node 8 \
@@ -28,7 +28,7 @@ uv run torchrun --nnodes 9 --nproc-per-node 8 \
 
 ## Model Context
 
-GLM-5.3-Flash is used for image-text-to-text. Its model size is 320B total, 18B active parameters.
+GLM-5.3-Flash is used for image-text-to-text. Its model size is 320B total, 18B active parameters. The recipe loads pretrained weights and trains on MedPix-VQA for 100 optimizer steps. It sets `checkpoint.enabled: false`, so it does not save fine-tuned weights.
 
 | Property | Value |
 |---|---|
@@ -54,8 +54,9 @@ GLM-5.3-Flash is used for image-text-to-text. Its model size is 320B total, 18B 
   feed-forward sublayers.
 - The first three decoder layers use dense feed-forward networks. The remaining
   42 layers use 288 routed experts with top-8 routing and one shared expert.
-- KPool-DSA selects up to 2,048 token positions through four-token pools before
-  running sparse latent attention over a shared 512-wide K/V representation.
+- KPool-DSA selects up to 2,048 token positions through four-token pools and
+  includes up to three trailing tokens from an incomplete pool before running
+  sparse latent attention over a shared 512-wide K/V representation.
 
 ### Supported Training Path
 
@@ -152,19 +153,32 @@ for SDPA and 1.2337 for cuDNN.
   supported with TP1 and PP1.
 - Full-model single-GPU checkpoint loading and training are not supported. Use
   the distributed checkpoint initialization path.
-- The recipe freezes the embeddings and vision tower while training the
-  language backbone.
+- The current recipe freezes the vision tower and trains the language backbone,
+  including token embeddings. The recorded validation configuration above used
+  frozen embeddings.
 - The cuDNN sparse-attention path requires SM90 or later, cuDNN Frontend, and
   FlashMLA. Use `backend.attn: sdpa` as the portable reference path.
 
-### Setup and Additional Examples
+### Recipe Setup
 
-Clone and install NeMo AutoModel from source:
+Follow the [installation instructions](/get-started/installation). The recipe
+uses HybridEP across nine nodes. Before installing from source, prepare its
+CUDA and RDMA build dependencies using the
+[repository Dockerfile](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile)
+as a reference. Set `RDMA_CORE_HOME` to the directory containing the RDMA
+`include` and `lib` directories. Build DeepEP with `HYBRID_EP_MULTINODE=1` and
+`TORCH_CUDA_ARCH_LIST=9.0` for the documented H100 topology; its defaults disable
+multi-node support and target Blackwell.
+
+Clone and install NeMo AutoModel on each node. The `moe` extra supplies DeepEP
+and FLA; the `dev` group supplies `cut-cross-entropy` for the recipe's
+`FusedLinearCrossEntropy` loss:
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
-uv sync --locked --all-groups --all-extras
+HYBRID_EP_MULTINODE=1 TORCH_CUDA_ARCH_LIST=9.0 \
+  uv sync --locked --extra all --extra moe --group dev
 ```
 
 The cuDNN backend also requires FlashMLA's `flash_mla_sparse_fwd`, which is not
@@ -178,23 +192,16 @@ git -C /tmp/FlashMLA submodule update --init --recursive
 uv pip install --no-build-isolation /tmp/FlashMLA
 ```
 
-The recipe requires 9 nodes with 8 GPUs per node. Launch it through the cluster
-launcher from inside the repository:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml
-```
+Use the [Quick Start](#quick-start) command on each of the nine allocated
+nodes. For Slurm submission, adapt `slurm.sub` using the
+[Slurm Launcher Guide](/job-launchers/slurm-cluster), with nine nodes, eight
+GPUs per node, and `CONFIG` set to the recipe path shown above.
 
 <Note>
-Use the [Slurm Launcher Guide](/job-launchers/slurm-cluster) to configure the
-multi-node launch. If FlashMLA or cuDNN Frontend is unavailable, change
+If FlashMLA or cuDNN Frontend is unavailable, change
 `model.backend.attn` to `sdpa`; KDA still requires the FLA dependency.
 
 </Note>
-
-### Recipe Setup
-
-Read [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
 
 ### Workflow Notes
 
@@ -204,7 +211,6 @@ Fine-tune zai-org/GLM-5.3-Flash: [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps
 
 | Checkpoint | Type |
 | --- | --- |
-| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | Checkpoint documented on this page |
 | [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | Checkpoint documented on this page |
 
 ## Related Resources
@@ -212,5 +218,4 @@ Fine-tune zai-org/GLM-5.3-Flash: [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps
 - [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 - [GLM-5 technical report](https://arxiv.org/abs/2602.15763)
 - [FlashMLA](https://github.com/deepseek-ai/FlashMLA)
-
 - [Checkpoint Configuration](https://huggingface.co/zai-org/GLM-5.3-Flash/blob/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a/config.json)

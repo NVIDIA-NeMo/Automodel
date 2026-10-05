@@ -10,10 +10,10 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-From the repository root, run:
+The example launches eight GPU workers on one node. From the repository root, run:
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml
+uv run --extra all automodel --nproc-per-node=8 examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml
 ```
 
 ## Choose a Workflow
@@ -24,20 +24,26 @@ uv run automodel --nproc-per-node=8 examples/audio_finetune/qwen2_5_omni_asr/ami
 
 ## Model Context
 
-Qwen2.5-Omni-3B is used for omnimodal (text/image/audio/video). Its model size is 3B parameters.
+Qwen2.5-Omni-3B accepts text, image, audio, and video inputs. The full checkpoint reports approximately 5.54B parameters in its [pinned metadata](https://huggingface.co/api/models/Qwen/Qwen2.5-Omni-3B/revision/f75b40e3da2003cdd6e1829b1f420ca70797c34e). NeMo AutoModel loads the Thinker stack; Talker and token-to-waveform weights are excluded.
 
 | Property | Value |
 | --- | --- |
-| Task | Omnimodal (Text/Image/Audio/Video) |
+| Task | Omnimodal understanding (text, image, audio, and video) |
 | **Architecture** | `Qwen2_5OmniForConditionalGeneration` |
-| Parameters | 3B |
+| Parameters | 5.54B (full checkpoint) |
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
 | Decoder Layers | 36 |
 | Hidden Size | 2,048 |
-| Attention | 16 attention heads / 2 key-value heads |
+| Attention | 16 attention heads and 2 key-value heads |
 | Context Length | 32,768 tokens (checkpoint configuration) |
 | Vocabulary Size | 151,936 |
 | Configured Dtype | `bfloat16` |
+
+The decoder, hidden size, attention, context length, and vocabulary values above describe the Thinker text configuration.
+
+The AMI recipe loads pretrained weights, fine-tunes the audio tower and language model, and freezes the vision tower. It uses Fully Sharded Data Parallelism v2 (FSDP2) and enables checkpoint saving to `result/checkpoints/qwen2_5_omni_asr_ami`.
+
+The Quick Start selects the `all` extra, which includes Transformer Engine for the recipe's `linear: te` backend, `soundfile` for audio decoding, and the `cli` dependencies.
 
 The registry wires the Qwen2.5-Omni Thinker backbone under the following architecture keys:
 

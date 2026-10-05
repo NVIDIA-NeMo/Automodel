@@ -828,7 +828,7 @@ navigation:
       - page: "Retrieval Fine-Tuning"
         path: ../../guides/llm/retrieval-finetune.mdx
         slug: retrieval-finetune
-      - page: "Gemma 3 / 3n"
+      - page: "Gemma 3n"
         path: ../../guides/omni/gemma3-3n.mdx
         slug: gemma-3-3n
       - page: "Gemma 4 31B"

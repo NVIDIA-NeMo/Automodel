@@ -8,17 +8,17 @@ slug: model-coverage/large-language-models/google-t5/t5-small
 
 ## Quick Start
 
-From the repository root, run:
+After [installing NeMo AutoModel](/get-started/installation), run the SQuAD fine-tuning recipe on one GPU from the repository root:
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/t5/t5_small_squad.yaml
+uv run automodel --nproc-per-node=1 examples/llm_finetune/t5/t5_small_squad.yaml
 ```
 
 ## Choose a Workflow
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/t5/t5_small_squad.yaml) |
+| Full Fine-Tuning | SQuAD; 1 GPU on 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/t5/t5_small_squad.yaml) |
 
 ## Model Context
 

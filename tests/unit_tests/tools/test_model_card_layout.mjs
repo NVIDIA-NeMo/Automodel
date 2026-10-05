@@ -156,6 +156,43 @@ Custom model notes.
   assert.deepEqual(check(validCard.replace("## Available Models", notes + "\n## Available Models")), []);
 });
 
+for (const format of ["md", "mdx"]) {
+  for (const [property, value] of [
+    ["Architecture", "TestForCausalLM"],
+    ["Task", "Text Generation"],
+    ["Parameters", "1B"],
+  ]) {
+    test(`short ${property} rows return diagnostics in ${format}`, () => {
+      const source = validCard.replace(`| ${property} | ${value} |`, `| ${property} |`);
+      const diagnostics = check(source, recipes, format);
+      assert.ok(
+        diagnostics.some(({ message }) => message.includes(`nonempty ${property} row`)),
+        JSON.stringify(diagnostics),
+      );
+    });
+  }
+
+  test(`checkpoint overrides at the end of Example Setup preserve cell boundaries in ${format}`, () => {
+    const override = "--model.pretrained_model_name_or_path provider/Test-Model";
+    const source = validCard
+      .replace(`--nproc-per-node 8`, `--nproc-per-node 8 ${override}`)
+      .replace("SQuAD; eight GPUs", `SQuAD; eight GPUs; ${override}`);
+    assert.deepEqual(check(source, recipes, format), []);
+  });
+
+  test(`a commented recipe launch plus python --version fails in ${format}`, () => {
+    const source = validCard.replace(
+      `uv run automodel ${recipe} --nproc-per-node 8`,
+      `# uv run automodel ${recipe} --nproc-per-node 8\npython --version`,
+    );
+    const diagnostics = check(source, recipes, format);
+    assert.ok(
+      diagnostics.some(({ message }) => message.includes("Quick Start requires a shell")),
+      JSON.stringify(diagnostics),
+    );
+  });
+}
+
 for (const [name, source, diagnostic] of [
   ["missing section", validCard.replace("## Model Context\n", ""), "level-two sections"],
   ["renamed section", validCard.replace("## Quick Start", "## Getting Started"), "level-two sections"],
@@ -444,6 +481,26 @@ test("automodel requires a YAML recipe target", () => {
     ),
   );
 });
+
+for (const format of ["md", "mdx"]) {
+  for (const command of ["automodel", "python -m nemo_automodel.cli.app"]) {
+    test(`${command} requires a nonempty YAML recipe target in ${format}`, () => {
+      const source = validCard.replace("uv run automodel", `uv run ${command}`);
+      assert.deepEqual(check(source, recipes, format), []);
+      for (const config of [
+        { model: recipeConfig.model },
+        { ...recipeConfig, recipe: null },
+        { ...recipeConfig, recipe: "" },
+      ]) {
+        const diagnostics = check(source, new Map([[recipe, config]]), format);
+        assert.ok(
+          diagnostics.some(({ message }) => message.includes("has no recipe target")),
+          JSON.stringify({ command, config, diagnostics }),
+        );
+      }
+    });
+  }
+}
 
 test("tokenizer and processor checkpoint mismatches fail", () => {
   for (const owner of ["tokenizer", "processor"]) {

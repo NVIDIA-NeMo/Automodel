@@ -4,14 +4,14 @@ description: "Fine-tune MiniMaxAI/MiniMax-M3 text-only on Tulu-3 or with MedPix 
 slug: model-coverage/vision-language-models/minimax/MiniMax-M3
 ---
 
-[MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) is MiniMaxAI's 428B A22B Mixture-of-Experts first vision-language model combining long-context reasoning, agentic workflows, and creative capabilities in a single platform.
+[MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) is a mixture-of-experts (MoE) vision-language model with approximately 428 billion total parameters and 23 billion active parameters. Use NeMo AutoModel to fine-tune it on MedPix image-question pairs or Tulu-3 text conversations.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). Allocate 16 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+Complete the [recipe setup](#recipe-setup). This MedPix fine-tuning example uses 16 nodes with 8 GPUs each. From the repository root on every node, set `NODE_RANK` to a unique rank from 0 to 15 and `MASTER_ADDR` to node 0's reachable hostname, then run:
 
 ```bash
-uv run torchrun --nnodes 16 --nproc-per-node 8 \
+uv run --no-sync torchrun --nnodes 16 --nproc-per-node 8 \
   --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
   -m nemo_automodel.cli.app examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml
 ```
@@ -27,71 +27,54 @@ uv run torchrun --nnodes 16 --nproc-per-node 8 \
 
 ## Model Context
 
-MiniMax-M3 is used for image-text-to-text / video-text-to-text. Its model size is 427.04B checkpoint parameters.
+MiniMax-M3 accepts text, images, and video as input and generates text. The checkpoint contains 427.04 billion parameters. The examples below use image-question pairs or text conversations.
 
 | Property | Value |
 |---|---|
-| **Task** | Image-Text-to-Text / Video-Text-to-Text |
-| **Architecture** | `MiniMaxM3SparseForConditionalGeneration` - 428B total / 22B active MoE VLM |
+| **Task** | Image-Text-to-Text and Video-Text-to-Text |
+| **Architecture** | `MiniMaxM3SparseForConditionalGeneration` - approximately 428B total and 23B active parameters |
 | **Language Module** | MiniMax-M2.7 backbone, 60 layers, 128 experts, MiniMax Sparse Attention (MSA) |
-| **Vision Module** |  CLIP-style ViT, 32 layers, image size 336x336 up to 2016x2016 |
-| **Context Window** | 512k tokens |
-| **Precision** | BF16 and MXFP8 |
-| **HF Org** | [MiniMaxAI](https://huggingface.co/MiniMaxAI) |
+| **Vision Module** | CLIP-style vision transformer (ViT), 32 layers, image size 336x336 up to 2016x2016 |
+| **Recipe Precision** | BF16 |
+| **Hugging Face Organization** | [MiniMaxAI](https://huggingface.co/MiniMaxAI) |
 | Parameters | 427.04B checkpoint parameters |
 | Decoder Layers | 60 |
 | Hidden Size | 6,144 |
-| Attention | 64 attention heads / 4 key-value heads |
+| Attention | 64 attention heads and 4 key-value heads |
 | Context Length | 1,048,576 tokens (checkpoint configuration) |
 | Vocabulary Size | 200,064 |
-| Experts | 128 routed / 1 shared / 4 selected per token |
+| Experts | 128 routed experts, 1 shared expert, and 4 routed experts selected per token |
 | Configured Dtype | `bfloat16` |
-
-### Positioning
-
-MiniMax-M3 targets advanced use cases such as long-form video understanding, extended coding tasks (8+ hours), and high-quality design workflows supporting upto 1M context length.
 
 ### Architecture
 
-- **Language backbone:** derived from  MiniMax-M2.7 with 60 layers (3 dense + 57 MoE), 64 attention heads, 128 experts, block-sparse attention called MiniMax Sparse Attention (MSA) on the MoE layers and a 512k context length.
-- **Vision backbone:** CLIP-style ViT with 32 layers and dynamic resolution image input from 336x336 up to 2016x2016.
-- **Optimization target:** trained on Hopper GPUs, with BF16 and FP8 support.
+- **Language backbone:** MiniMax-M2.7 backbone with 60 layers (3 dense and 57 MoE), 64 attention heads, 128 routed experts, and MiniMax Sparse Attention (MSA) on the MoE layers. The checkpoint configuration sets a context length of 1,048,576 tokens.
+- **Vision backbone:** CLIP-style vision transformer (ViT) with 32 layers and dynamic image resolution from 336x336 to 2016x2016.
+- **Example hardware:** the full MedPix recipe specifies 16 nodes with 8 H100 GPUs per node. This is the example topology, not a measured minimum.
 
-### Key Strengths
+### Upstream Capabilities
 
-- **Ultra-long context via MSA (MiniMax Sparse Attention).** A block-sparse attention design that avoids full attention's quadratic cost enabling up to 1M-token context.
-- **Frontier coding and agentic performance.** Positioned as a coding and agent-first model, with strong benchmark numbers and good at multi-turn, collaborative agent behavior.
-- **Native multimodality (image, video, desktop use).** It supports image and video input and can operate a desktop computer.
-- **Long-horizon autonomous execution on complex real-world tasks.** Can work over hours to a full day without human intervention.
-
-### Example Recipes
-
-- [Full SFT - MedPix, EP32 + PP4](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml)
-- [Full SFT - MedPix CP2 comparison](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp2_medpix_2k.yaml)
-- [Full SFT - Tulu 3 text, CP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml)
-- [LoRA - MedPix, PP4 + EP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml)
-
-See the [MiniMax-M3 fine-tuning guide](/recipes-e2e-examples/minimax-m3) for the training setup and launch notes.
-
-### Setup and Additional Examples
-
-Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
-hardware and data requirements. Follow the [installation instructions](/get-started/installation)
-before launching a recipe.
+The [pinned upstream model card](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/README.md) describes native text, image, and video training, sparse attention for long contexts, and coding and collaborative agent capabilities. The linked AutoModel recipes fine-tune on MedPix at 2,048 tokens or Tulu-3 at 16,384 tokens; they do not validate the full checkpoint context length or agent workflows.
 
 ### Recipe Setup
 
-Read [minimax_m3_vl_sft_ep32pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+The recipes select Transformer Engine linear layers and HybridEP dispatch. HybridEP comes from the pinned DeepEP package, which the `all` extra alone omits. Before following the [source installation instructions](/get-started/installation), prepare the communication libraries and build settings in the repository [Dockerfile](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile), including `HYBRID_EP_MULTINODE=1`. Then include the `moe` extra alongside `all`: `uv sync --locked --all-groups --extra all --extra moe`. The launch command uses `--no-sync` to preserve the prepared environment.
+
+All four recipes load pretrained `MiniMaxAI/MiniMax-M3` weights and use the model's processor with `trust_remote_code: true`. Make the checkpoint and dataset accessible on every node; cache them in advance for offline runs. The image recipes load `mmoukouba/MedPix-VQA`, and the text recipe loads `allenai/tulu-3-sft-mixture`.
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation. In the workflow table, PP, CP, and EP mean pipeline, context, and expert parallelism; LoRA means low-rank adaptation. Keep the recipe's parallelism and batch settings consistent with its GPU allocation.
 
 ### Workflow Notes
 
-Fine-tune MiniMaxAI/MiniMax-M3: [minimax_m3_vl_sft_ep32pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+The Quick Start recipe enables checkpoint saving under `vlm_checkpoints/minimax_m3_vl_sft_ep32pp4/`. The MedPix CP2 comparison, Tulu-3 CP8, and LoRA recipes set `checkpoint.enabled: false`, so they do not save trained weights. Set it to `true` and choose a writable `checkpoint.checkpoint_dir` to retain their results.
+
+See the [MiniMax-M3 fine-tuning guide](/recipes-e2e-examples/minimax-m3) for additional launch notes and training results.
 
 ## Available Models
 
-- **MiniMax-M3** - registered as `MiniMaxM3SparseForConditionalGeneration` model class.
+- **MiniMax-M3** - registered as the `MiniMaxM3SparseForConditionalGeneration` model class.
 
-| Model | HF ID |
+| Model | Hugging Face ID |
 |---|---|
 | MiniMax-M3 | [`MiniMaxAI/MiniMax-M3`](https://huggingface.co/MiniMaxAI/MiniMax-M3) |
 

@@ -4,11 +4,11 @@ description: "Fine-tune inclusionAI/LLaDA2.1-mini as a mixture-of-experts diffus
 slug: model-coverage/dllm/inclusionai/LLaDA2.1-mini
 ---
 
-[LLaDA 2.1](https://huggingface.co/inclusionAI/LLaDA2.1-mini) is a mixture-of-experts diffusion language model supported through its Hugging Face remote-code implementation.
+[LLaDA2.1-mini](https://huggingface.co/inclusionAI/LLaDA2.1-mini) is a mixture-of-experts (MoE) diffusion language model supported through its Hugging Face remote-code implementation.
 
 ## Quick Start
 
-From the repository root, run:
+After [installing NeMo AutoModel](/get-started/installation), run this full fine-tuning example on eight GPUs from the repository root:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/dllm_sft/llada2_sft.yaml
@@ -23,20 +23,20 @@ uv run automodel --nproc-per-node=8 examples/dllm_sft/llada2_sft.yaml
 
 ## Model Context
 
-LLaDA2.1-mini is used for diffusion language modeling (moe). Its model size is 16.26B checkpoint parameters.
+The checkpoint configuration defines the following architecture settings.
 
 | Property | Value |
 |---|---|
 | **Task** | Diffusion Language Modeling (MoE) |
 | **Architecture** | `LLaDA2MoeModelLM` with Hugging Face `trust_remote_code` |
-| **HF Org** | [inclusionAI](https://huggingface.co/inclusionAI) |
+| **Hugging Face Organization** | [inclusionAI](https://huggingface.co/inclusionAI) |
 | Parameters | 16.26B checkpoint parameters |
 | Decoder Layers | 20 |
 | Hidden Size | 2,048 |
-| Attention | 16 attention heads / 4 key-value heads |
+| Attention | 16 attention heads and 4 key-value heads |
 | Context Length | 32,768 tokens (checkpoint configuration) |
 | Vocabulary Size | 157,184 |
-| Experts | 256 routed / 1 shared / 8 selected per token |
+| Experts | 256 routed experts and 1 shared expert; 8 routed experts selected per token |
 | Configured Dtype | `bfloat16` |
 
 ### Recipe Notes

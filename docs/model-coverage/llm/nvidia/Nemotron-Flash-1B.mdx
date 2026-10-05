@@ -7,7 +7,7 @@ slug: model-coverage/large-language-models/nvidia/Nemotron-Flash-1B
 [NVIDIA Nemotron-Flash](https://huggingface.co/nvidia/Nemotron-Flash-1B) is a compact, fast language model designed for low-latency inference workloads.
 
 <Note>
-This model requires `trust_remote_code: true` in your recipe YAML.
+Both recipes set `trust_remote_code: true` under `model` and `model.config` to load the checkpoint's custom model and configuration code.
 
 </Note>
 
@@ -15,11 +15,13 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-From the repository root, run:
+From the repository root, launch the example on eight GPUs on one node:
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml
+uv run --extra cuda --extra fa --extra fla automodel --nproc-per-node=8 examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml
 ```
+
+The command selects the [required CUDA dependencies](#model-context).
 
 ## Choose a Workflow
 
@@ -30,7 +32,7 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/nemotron_flash/nemotro
 
 ## Model Context
 
-Nemotron-Flash-1B is used for text generation. Its model size is 1B parameters.
+Nemotron-Flash-1B is a hybrid base model for text generation with approximately 1 billion parameters.
 
 | Property | Value |
 | --- | --- |
@@ -43,8 +45,11 @@ Nemotron-Flash-1B is used for text generation. Its model size is 1B parameters.
 | Attention | 16 attention heads / 4 key-value heads |
 | Context Length | 36,000 tokens (checkpoint configuration) |
 | Vocabulary Size | 131,072 |
-| Experts | 1 routed / 1 selected per token |
 | Configured Dtype | `bfloat16` |
+
+The checkpoint's custom model code requires a CUDA environment with Mamba, FlashAttention 2, and Flash Linear Attention. Use the `cuda` extra for `mamba-ssm` and `causal-conv1d`, `fa` for `flash-attn`, and `fla` for `flash-linear-attention`, as shown in the Quick Start.
+
+Both recipes load pretrained weights and fine-tune on `rajpurkar/squad` using Fully Sharded Data Parallelism version 2 (FSDP2), with tensor and context parallelism set to 1. Checkpoint saving is enabled in both recipes.
 
 ## Available Models
 

@@ -4,13 +4,13 @@ description: "Fine-tune stepfun-ai/Step-3.5-Flash with NeMo AutoModel: checked-i
 slug: model-coverage/large-language-models/stepfun-ai/Step-3.5-Flash
 ---
 
-[Step-3.5-Flash](https://huggingface.co/stepfun-ai/Step-3.5-Flash) is a Mixture-of-Experts language model from Stepfun AI, designed for efficient inference.
+[Step-3.5-Flash](https://huggingface.co/stepfun-ai/Step-3.5-Flash) is a mixture-of-experts (MoE) language model from Stepfun AI, designed for efficient inference.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-Allocate 16 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+For this example, allocate 16 nodes with 8 GPUs each. Complete the prerequisites in [Model Context](#model-context), then run from the repository root on every node. Set a unique `NODE_RANK` from 0 to 15 and the same `MASTER_ADDR` to node 0's reachable address; port 29500 must be reachable.
 
 ```bash
 uv run torchrun --nnodes 16 --nproc-per-node 8 \
@@ -26,20 +26,26 @@ uv run torchrun --nnodes 16 --nproc-per-node 8 \
 
 ## Model Context
 
-Step-3.5-Flash is used for text generation (moe). Its model size is 196B total / 11B active parameters.
+The [upstream model card](https://huggingface.co/stepfun-ai/Step-3.5-Flash/blob/ab446a3de5e171ea341227e24bb1f090e1b771f7/README.md) reports approximately 196B total parameters and 11B active parameters per token.
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (MoE) |
 | **Architecture** | `Step3p5ForCausalLM` |
-| Parameters | 196B total / 11B active |
+| Parameters | Approximately 196B total; 11B active per token (upstream-reported) |
 | Hugging Face Organization | [stepfun-ai](https://huggingface.co/stepfun-ai) |
 | Decoder Layers | 45 |
 | Hidden Size | 4,096 |
-| Attention | 64 attention heads |
+| Attention | 64 heads in full-attention layers; 96 in sliding-attention layers |
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 128,896 |
 | Configured Dtype | `bfloat16` |
+
+The recipe loads pretrained weights and fine-tunes on `rowan/hellaswag`. It uses Fully Sharded Data Parallel v2 (FSDP2), pipeline parallelism with 2 stages (PP2), and expert parallelism across 32 ranks (EP32). The launch command uses the recipe's 16-node CI setting; this is an example topology, not a minimum hardware requirement.
+
+Use an environment with Transformer Engine for attention and linear layers, and HybridEP for expert dispatch, on every node. Transformer Engine is in the `cuda` extra; HybridEP requires the [container build's setup](https://github.com/NVIDIA-NeMo/Automodel/blob/c79ba55eb77527138337288220df04bc5939483c/docker/Dockerfile#L150-L183) when installing from source. The base package alone does not provide these backends.
+
+The recipe sets `checkpoint.enabled: false`, so it does not save trained weights. Enable checkpoint saving before launching if you need to retain the result.
 
 ## Available Models
 
@@ -51,5 +57,4 @@ Step-3.5-Flash is used for text generation (moe). Its model size is 196B total /
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
-
 - [Checkpoint Configuration](https://huggingface.co/stepfun-ai/Step-3.5-Flash/blob/ab446a3de5e171ea341227e24bb1f090e1b771f7/config.json)

@@ -9,8 +9,9 @@ The Hugging Face configuration declares the `Gemma4ForConditionalGeneration` arc
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
+Follow the [installation instructions](/get-started/installation), then run this command from the repository root
+to fine-tune the pretrained checkpoint on MedPix-VQA using one node with eight GPUs.
+This is the recipe's example topology; review its batch and parallelism settings before changing the GPU count.
 
 ```bash
 uv run automodel examples/vlm_finetune/gemma4/gemma4_4b.yaml \
@@ -21,8 +22,8 @@ uv run automodel examples/vlm_finetune/gemma4/gemma4_4b.yaml \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Vision-Language Fine-Tuning | MedPix-VQA | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml) |
-| Vision-Language Fine-Tuning | Synthetic data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b_mock.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml) |
+| Vision-Language Fine-Tuning | Synthetic data; checkpoint saving disabled | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b_mock.yaml) |
 
 ## Model Context
 
@@ -32,28 +33,33 @@ gemma-4-E4B-it is used for image-text-to-text. Its model size is 8.00B checkpoin
 | --- | --- |
 | Task | Image-text-to-text |
 | **Architecture** | `Gemma4ForConditionalGeneration` |
-| Drafter Architecture | `Gemma4AssistantForCausalLM` |
+| Drafter Architecture (Joint-Training Recipes) | `Gemma4AssistantForCausalLM` (separate assistant checkpoint) |
 | Parameters | 8.00B checkpoint parameters |
 | Decoder Layers | 42 |
 | Hidden Size | 2,560 |
-| Attention | 8 attention heads / 2 key-value heads |
+| Attention | 8 attention heads and 2 key-value heads |
 | Context Length | 131,072 tokens (checkpoint configuration) |
 | Vocabulary Size | 262,144 |
 | Configured Dtype | `bfloat16` |
 
 ### Configuration
 
+The Quick Start recipe loads pretrained weights and fine-tunes the language model while freezing the vision and audio towers.
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1 |
-| Nodes | - |
-| Features | Checkpointing (enabled=true) |
-| Advanced | torch.bfloat16 |
+| Hardware | 8 GPUs in the example launch; GPU model unspecified |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); `tp_size=1`, `cp_size=1` |
+| Nodes | 1 in the example launch |
+| Checkpoint Saving | Enabled; output directory: `vlm_checkpoints/gemma4_4b/` |
+| Training Dtype | `torch.bfloat16` |
+
+The synthetic-data recipe loads the same pretrained checkpoint but disables checkpoint saving, so it does not save fine-tuned weights.
+The two Tulu 3 text recipes also disable checkpoint saving.
+The joint-drafter recipes load both the base checkpoint and the separate `google/gemma-4-E4B-it-assistant` checkpoint.
 
 ### More Recipes for This Model
 
-- [`gemma4_4b_mock.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b_mock.yaml)
 - [`gemma4_4b_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b_peft.yaml)
 - [`gemma4_4b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b_te.yaml)
 - [`gemma4_e4b_tulu3_text_cp16_64k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_cp16_64k.yaml)
@@ -63,15 +69,12 @@ gemma-4-E4B-it is used for image-text-to-text. Its model size is 8.00B checkpoin
 
 ## Available Models
 
-- [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it) | Checkpoint documented on this page |
-| [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) | Checkpoint documented on this page |
+| [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) | Base checkpoint used by the recipes on this page |
+| [`google/gemma-4-E4B-it-assistant`](https://huggingface.co/google/gemma-4-E4B-it-assistant) | Additional checkpoint used by the joint-drafter recipes |
 
 ## Related Resources
 
-- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
-
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
 - [Checkpoint Configuration](https://huggingface.co/google/gemma-4-E4B-it/blob/ee0ef6023621cff504d758262d4e04895a5af4a2/config.json)

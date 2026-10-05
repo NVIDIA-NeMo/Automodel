@@ -4,13 +4,13 @@ description: "Fine-tune openbmb/MiniCPM5-1B with NeMo AutoModel: checked-in reci
 slug: model-coverage/large-language-models/openbmb/MiniCPM5-1B
 ---
 
-[MiniCPM](https://github.com/OpenBMB/MiniCPM) is a compact language model series from OpenBMB and Tsinghua University, designed to deliver strong performance at small parameter counts using model merging and continuous training techniques.
+[MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B/blob/87179e5c1f455ef22e6223592d2d61351b525bfc/README.md) is a compact, dense language model from OpenBMB for text generation. Use the recipes below for full fine-tuning or low-rank adaptation (LoRA) on the Stanford Question Answering Dataset (SQuAD).
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-From the repository root, run:
+These commands use eight GPUs on one node. From the repository root, run either workflow:
 
 ```bash
 # Full fine-tuning
@@ -29,30 +29,26 @@ uv run automodel examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml --npr
 
 ## Model Context
 
-MiniCPM5-1B is used for text generation. Its model size is 1B parameters.
+MiniCPM5-1B is a dense model for text generation with approximately 1.08 billion parameters.
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
-| **Architecture** | `MiniCPMForCausalLM` / `MiniCPM3ForCausalLM` / `MiniCPM5ForCausalLM` |
-| Parameters | 1B |
+| Architecture | `LlamaForCausalLM` |
+| Parameters | 1,080,632,832 |
 | Hugging Face Organization | [openbmb](https://huggingface.co/openbmb) |
 | Decoder Layers | 24 |
 | Hidden Size | 1,536 |
-| Attention | 16 attention heads / 2 key-value heads |
+| Attention | 16 attention heads and 2 key-value heads |
 | Context Length | 131,072 tokens (checkpoint configuration) |
 | Vocabulary Size | 130,560 |
 | Configured Dtype | `bfloat16` |
 
-- `MiniCPMForCausalLM` - MiniCPM v1/v2
-- `MiniCPM3ForCausalLM` - MiniCPM3
-- `MiniCPM5ForCausalLM` - MiniCPM5
-
 ### Workflow Notes
 
-See [Available Models](#available-models).
+Both recipes load pretrained weights from `openbmb/MiniCPM5-1B` and fine-tune on SQuAD for 100 steps using fully sharded data parallelism (FSDP2).
 
-Follow the [installation instructions](/get-started/installation).
+The LoRA recipe sets `checkpoint.enabled: false`, so it does not save trained adapters. Set `enabled: true` in its `checkpoint` block to retain the training output. The full fine-tuning recipe uses the default checkpoint saving configuration.
 
 ## Available Models
 

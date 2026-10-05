@@ -23,6 +23,7 @@ const markdownProcessor = createProcessor({
 });
 
 function textContent(node) {
+  if (!node) return "";
   if (["html", "mdxFlowExpression", "mdxTextExpression"].includes(node.type)) return "";
   return node.value ?? (node.children ?? []).map(textContent).join("");
 }
@@ -261,6 +262,7 @@ export function validateModelCard(source, template, format = "mdx", recipes = ne
           report(parameters, "Parameters must state a numeric parameter count");
         for (const row of rows) {
           if (
+            row.children.length < 2 ||
             row.children.some(
               (cell) =>
                 !textContent(cell).trim() ||
@@ -403,11 +405,13 @@ function validateRecipes(nodes, headings, modelId, recipes, report) {
   const commands = quickStart
     .flatMap((node) => descendants(node, "code"))
     .filter((node) => ["bash", "sh", "shell", "console"].includes(node.lang));
-  const launches = commands.filter(
-    (node) =>
-      /(?:^|\s)(?:automodel|torchrun|python(?:3)?)(?:\s|$)/m.test(node.value.replace(/^\s*#.*$/gm, "")) &&
-      /\bexamples\/[\w./+-]+\.ya?ml\b/.test(node.value),
-  );
+  const launches = commands.filter((node) => {
+    const text = node.value.replace(/^\s*#.*$/gm, "");
+    return (
+      /(?:^|\s)(?:automodel|torchrun|python(?:3)?)(?:\s|$)/m.test(text) &&
+      /\bexamples\/[\w./+-]+\.ya?ml\b/.test(text)
+    );
+  });
   if (launches.length === 0)
     report(
       headings[0],
@@ -428,7 +432,7 @@ function validateRecipes(nodes, headings, modelId, recipes, report) {
         report(launch, `Quick Start recipe does not exist: ${file}`);
         continue;
       }
-      if (/\bautomodel\s+/.test(text) && !config.recipe)
+      if (/(?:\bautomodel\s+|-m\s+nemo_automodel\.cli\.app\s+)/.test(text) && !config.recipe)
         report(launch, `${file} has no recipe target; use its documented Python entry point`);
       const id = effectiveModel(config, text);
       if (!listed(id))
@@ -466,7 +470,7 @@ function validateRecipes(nodes, headings, modelId, recipes, report) {
         continue;
       }
       if (workflowRecipes.has(file)) report(row, `workflow recipe is listed more than once: ${file}`);
-      const id = effectiveModel(config, textContent(row));
+      const id = effectiveModel(config, row.children.map(textContent).join(" "));
       if (!listed(id))
         report(
           row,

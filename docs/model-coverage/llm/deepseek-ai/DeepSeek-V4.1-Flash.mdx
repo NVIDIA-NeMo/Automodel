@@ -14,7 +14,7 @@ at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). Allocate 16 nodes with 4 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+Follow the [installation instructions](/get-started/installation) and complete the [recipe setup](#recipe-setup). Allocate 16 nodes with 4 GB200 GPUs each in one NVLink domain. From the repository root, run this command on every node with `NODE_RANK` set to 0-15 and `MASTER_ADDR` set to node 0's reachable address.
 
 ```bash
 uv run torchrun --nnodes 16 --nproc-per-node 4 \
@@ -35,7 +35,7 @@ uv run torchrun --nnodes 16 --nproc-per-node 4 \
 
 ## Model Context
 
-DeepSeek-V4.1-Flash is used for text generation. Its model size is approximately 749B native backbone, including Engram and vision; excludes auxiliary prediction modules parameters.
+DeepSeek-V4.1-Flash is used for text generation. Its native backbone has approximately 749B parameters, including Engram and vision but excluding auxiliary prediction modules.
 
 | Property | Value |
 |---|---|
@@ -44,12 +44,12 @@ DeepSeek-V4.1-Flash is used for text generation. Its model size is approximately
 | Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
 | Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
 | Configuration | `DeepseekV41Config` with typed `text_config` and `vision_config` |
-| Decoder Layers | 40 |
+| Transformer Layers | 40: 20 causal encoder layers and 20 decoder layers |
 | Hidden Size | 5,120 |
-| Attention | 64 attention heads / 1 key-value heads |
+| Attention | 64 attention heads and 1 key-value head |
 | Context Length | 1,048,576 tokens (checkpoint configuration) |
 | Vocabulary Size | 129,280 |
-| Experts | 384 routed / 1 shared / 6 selected per token |
+| Experts | 384 routed experts and 1 shared expert; 6 routed experts selected per token |
 | Configured Dtype | `bfloat16` |
 | Parameters | Approximately 749B native backbone, including Engram and vision; excludes auxiliary prediction modules |
 
@@ -67,7 +67,7 @@ receive the owner divisor once before clipping.
 | [HellaSwag EP64](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) | 16 nodes x 4 GB200; EP64, owner64, TP1/PP1/CP1; global batch 64, local batch 1 | BF16 moments; checkpoint saving disabled |
 | [HellaSwag EP64, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) | 16 nodes x 8 H100 80 GB; EP64 with ep_shard2, owner128, TP1/PP1/CP1; global batch 128, local batch 1 | BF16 moments; checkpoint saving disabled; see [H100 80 GB Systems](#h100-80-gb-systems) |
 
-The configuration requests 100 updates with validation every 50 updates,
+The GB200 HellaSwag configuration requests 100 updates with validation every 50 updates,
 activation checkpointing, and reshard-after-forward. It uses no gradient
 accumulation or additional expert FSDP shard axis, and requests a one-hour
 allocation. W&B logging is disabled by default; set `wandb.enable: true` to
@@ -81,7 +81,7 @@ training configuration require separate memory and restoration validation.
 
 </Note>
 
-Place all 64 ranks in one verified NVLink domain with static rank ordering.
+For GB200 HellaSwag, place all 64 ranks in one verified NVLink domain with static rank ordering.
 The model and recipe use `attn: tilelang`, `linear: torch`,
 `rms_norm: torch_fp32`, `experts: torch_mm`, and `dispatcher: hybridep`.
 Set `model.backend.rms_norm: te` to use Transformer Engine RMSNorm for the
@@ -104,10 +104,10 @@ input shapes.
 
 ### Context Parallelism
 
-Unpacked, right-padded text supports context parallelism with contiguous sequence
-shards. Set `distributed.cp_size` and retain the same global batch size when
+Right-padded text and packed text support context parallelism with contiguous
+sequence shards. Set `distributed.cp_size` and retain the same global batch size when
 comparing CP sizes. The model's sharder pads the global sequence so each rank
-owns complete compression groups and preserves global position IDs. Shift
+owns complete compression groups and preserves token position IDs. Shift
 labels before sharding and use the recipe's external loss; direct `labels=`
 loss is unavailable when CP is active.
 
@@ -115,8 +115,9 @@ Queries and hidden activations remain local. Window KV, newly compressed KV,
 and index keys are gathered across the CP group; reused compressed KV retains
 its gradient history across layers. Engram gathers integer token history for
 N-gram hashing, then looks up only the local tokens through the existing row
-owners. CP does not gather full Engram tables. TP, PP, packed documents, and
-image inputs remain outside this CP path.
+owners. CP does not gather full Engram tables. Packed text uses the model-owned
+sharder to preserve document boundaries and document-local position IDs. TP,
+PP, and image inputs remain outside this CP path.
 
 The [Tulu3 CP recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp.yaml)
 uses 4,096-token sequences, TE RMSNorm, EP64, and 64 Engram owners. At global
@@ -218,8 +219,10 @@ is not supported.
 Recipe initialization uses the NeMo AutoModel wrapper's internal Checkpointer and DCP
 path to load the base checkpoint into the distributed model.
 
-Text inputs use unpacked `input_ids [batch, sequence]`, right padding, and
-zero-based positions. The optional `labels [batch, sequence]` API computes
+Unpacked text inputs use `input_ids [batch, sequence]`, right padding, and
+zero-based positions. Packed text also uses `input_ids [batch, sequence]` with
+`seq_lens` document lengths; packed CP inputs must pass through the model-owned
+sharder. The optional `labels [batch, sequence]` API computes
 shifted causal cross-entropy with `-100` ignored. Attention KV and index
 quantize and dequantize boundaries remain part of every forward and use
 straight-through gradients; there is no quantization toggle.
@@ -252,7 +255,7 @@ sample rather than broad prompt coverage.
 
 | Metric | PR `d5c8b5e4` Native-Combine Streamed-40 Result |
 |---|---:|
-| Mean KL(reference || native) | 0.0034285025 |
+| Mean KL(reference \|\| native) | 0.0034285025 |
 | P95 KL | 0.0003751850 |
 | Maximum KL | 3.8604531288 |
 | Logit cosine | 0.9939242168 |
@@ -291,8 +294,9 @@ restoration, or full-model convergence.
 
 ### Current Scope
 
-THD packing, TP, PP, incremental generation caches, bounded decoder replay,
-and million-token training are unsupported. Image inputs also require
+TP, PP, incremental generation caches, bounded decoder replay,
+and million-token training are unsupported. Packed text is supported, including
+with context parallelism. Image inputs require
 unpacked batches. Indexers remain frozen because hard top-k selection has no
 language-model gradient; indexer distillation is outside this implementation.
 Native DSpark draft training is available through the
@@ -302,12 +306,6 @@ Fine-tuning does not reproduce the report's
 Engram pretraining optimizer. Bitwise training continuation is not established
 for the TileLang backward kernels.
 
-### Setup and Additional Examples
-
-Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
-hardware and data requirements. Follow the [installation instructions](/get-started/installation)
-before launching a recipe.
-
 ### Recipe Setup
 
 Read [deepseek_v41_flash_hellaswag_ep64_16nodes.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
@@ -316,11 +314,7 @@ Read [deepseek_v41_flash_hellaswag_ep64_16nodes.yaml](https://github.com/NVIDIA-
 
 | Goal | Start Here |
 | --- | --- |
-| Review the recipe requirements | [prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py) |
-
-### Workflow Notes
-
-Fine-tune deepseek-ai/DeepSeek-V4.1-Flash: [deepseek_v41_flash_hellaswag_ep64_16nodes.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml). 16 nodes, 4 GPUs per node; see [Recipe Setup](#recipe-setup).
+| Prepare Tulu3 data for offline runs | [prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py) |
 
 ## Available Models
 

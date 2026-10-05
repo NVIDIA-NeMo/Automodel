@@ -4,12 +4,12 @@ description: "Use NeMo AutoModel to fine-tune MiniMaxAI/MiniMax-M2.7 for LLM wor
 slug: model-coverage/large-language-models/minimax/MiniMax-M2.7
 ---
 
-[MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) has a checked-in NeMo AutoModel recipe for text generation.
+[MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) has NeMo AutoModel recipes for full fine-tuning and low-rank adaptation (LoRA) on HellaSwag.
 The Hugging Face configuration declares the `MiniMaxM2ForCausalLM` architecture.
 
 ## Quick Start
 
-Allocate 8 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+For full fine-tuning on HellaSwag, complete the prerequisites in Model Context. This example uses 8 nodes with 8 GPUs each. Set `NODE_RANK` to a unique value from `0` to `7` and `MASTER_ADDR` to node 0's reachable hostname or IP address. Run from the repository root on every node.
 
 ```bash
 uv run torchrun --nnodes 8 --nproc-per-node 8 \
@@ -35,33 +35,34 @@ MiniMax-M2.7 is used for text generation. Its model size is 228.69B checkpoint p
 | Parameters | 228.69B checkpoint parameters |
 | Decoder Layers | 62 |
 | Hidden Size | 3,072 |
-| Attention | 48 attention heads / 8 key-value heads |
+| Attention | 48 attention heads and 8 key-value heads |
 | Context Length | 204,800 tokens (checkpoint configuration) |
 | Vocabulary Size | 200,064 |
-| Experts | 256 routed / 8 selected per token |
+| Experts | 256 routed experts; 8 selected per token |
 | Configured Dtype | `bfloat16` |
+
+### Prepare the Environment
+
+Follow the [installation guide](/get-started/installation) and make the same repository checkout and environment available on every node. The recipes use Transformer Engine for attention and HybridEP for expert dispatch; both must be available in that environment. For the Quick Start launch, every node must be able to reach `MASTER_ADDR` on port `29500`.
+
+Both recipes set `checkpoint.enabled: false`. Set `checkpoint.enabled: true` to save trained weights.
 
 ### Configuration
 
+These settings describe the full fine-tuning recipe used in Quick Start. The node count comes from the recipe's `ci.nodes` setting. PP denotes pipeline parallelism; EP denotes expert parallelism. FSDP2 denotes Fully Sharded Data Parallel version 2.
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=2, cp_size=1, ep_size=16 |
+| Hardware | 8 GPUs per node in the example launch |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=2`, `cp_size=1`, `ep_size=16` |
 | Nodes | 8 |
-| Features | Activation checkpointing (activation_checkpointing=true), Transformer Engine, HybridEP (dispatcher=hybridep) |
-| Advanced | attention=te, linear=te, experts=torch_mm, dispatcher=hybridep |
-
-### More Recipes for This Model
-
-- [`minimax_m2.7_hellaswag_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_lora.yaml)
+| Features | Activation checkpointing (`activation_checkpointing=true`), Transformer Engine, HybridEP (`dispatcher=hybridep`) |
+| Advanced | `attn=te`, `linear=te`, `experts=torch_mm`, `dispatcher=hybridep` |
 
 ## Available Models
 
-- [`MiniMaxAI/MiniMax-M2.7`](https://huggingface.co/MiniMaxAI/MiniMax-M2.7)
-
 | Checkpoint | Type |
 | --- | --- |
-| [MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) | Checkpoint documented on this page |
 | [`MiniMaxAI/MiniMax-M2.7`](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) | Checkpoint documented on this page |
 
 ## Related Resources

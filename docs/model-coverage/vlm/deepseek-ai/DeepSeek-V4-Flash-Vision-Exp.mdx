@@ -1,6 +1,6 @@
 ---
 title: "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
-description: "Use NeMo AutoModel to fine-tune deepseek-ai/DeepSeek-V4-Flash-Vision-Exp for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+description: "Fine-tune deepseek-ai/DeepSeek-V4-Flash-Vision-Exp on MedPix-VQA with NeMo AutoModel using the 16-node recipe with pipeline and expert parallelism."
 slug: model-coverage/vision-language-models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
 ---
 
@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `DeepseekV4ForCausalLM` architecture
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). Allocate 16 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+From the repository root, run this MedPix-VQA fine-tuning example on 16 nodes with 8 GPUs each. Set `NODE_RANK` (0-15) and `MASTER_ADDR` (the rank-0 host) on every node, and complete the [recipe setup](#recipe-setup) before launching.
 
 ```bash
 uv run torchrun --nnodes 16 --nproc-per-node 8 \
@@ -21,63 +21,51 @@ uv run torchrun --nnodes 16 --nproc-per-node 8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; pipeline parallelism 4; expert parallelism 32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml) |
 
 ## Model Context
 
-DeepSeek-V4-Flash-Vision-Exp is used for image-text-to-text. Its model size is 304.6B native parameters: 284.3B language backbone / 0.47B vision / 19.83B auxiliary MTP.
+DeepSeek-V4-Flash-Vision-Exp combines a language backbone with a vision encoder for image-text-to-text tasks. Its native parameter count includes auxiliary multi-token prediction (MTP) modules, which this fine-tuning recipe disables.
 
 | Property | Value |
 | --- | --- |
 | Task | Image-text-to-text |
-| **Architecture** | `DeepseekV4ForCausalLM` |
+| Architecture | `DeepseekV4ForCausalLM` |
 | Decoder Layers | 43 |
 | Hidden Size | 4,096 |
-| Attention | 64 attention heads / 1 key-value heads |
-| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Attention | 64 attention heads and 1 key-value head |
+| Context Length | 1,048,576 tokens in the checkpoint configuration; 4,096-token recipe sequences |
 | Vocabulary Size | 129,280 |
-| Experts | 256 routed / 1 shared / 6 selected per token |
-| Vision Encoder | 32 layers / 1,024 hidden size / 16 attention heads / 14 x 14 patches |
+| Experts | 256 routed experts and 1 shared expert; 6 routed experts selected per token |
+| Vision Encoder | 32 layers; hidden size 1,024; 16 attention heads; 14 x 14 patches |
 | Configured Dtype | `bfloat16` |
-| Parameters | 304.6B native parameters: 284.3B language backbone / 0.47B vision / 19.83B auxiliary MTP |
+| Parameters | 304.6B native parameters: 284.3B language backbone, 0.47B vision, and 19.83B auxiliary MTP |
 
 The parameter split includes three auxiliary prediction modules; the fine-tuning recipe sets `num_nextn_predict_layers: 0` and trains the language and vision backbone.
+
+The example loads pretrained weights and fine-tunes on the `train` split of `mmoukouba/MedPix-VQA` for at most 100 steps. It sets `checkpoint.enabled: false`, so the run does not save training checkpoints.
 
 ### Configuration
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=32 |
-| Nodes | 16 |
-| Features | Activation checkpointing (activation_checkpointing=true), HybridEP (dispatcher=hybridep) |
-| Advanced | bfloat16, attention=tilelang, linear=torch, experts=torch_mm, dispatcher=hybridep |
-
-### Setup and Additional Examples
-
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+| Hardware | GPU model not specified in the recipe |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); `tp_size=1`, `pp_size=4`, `cp_size=1`, `ep_size=32` |
+| Nodes | 16 nodes with 8 GPUs each |
+| Features | Activation checkpointing (`activation_checkpointing=true`); HybridEP (`dispatcher=hybridep`) |
+| Advanced | `torch_dtype=bfloat16`, `attn=tilelang`, `linear=torch`, `experts=torch_mm`, `dispatcher=hybridep` |
 
 ### Recipe Setup
 
-Read [deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
-
-### Workflow Notes
-
-Fine-tune deepseek-ai/DeepSeek-V4-Flash-Vision-Exp: [deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
-
-Follow the [installation instructions](/get-started/installation).
+1. Follow the [source installation instructions](/get-started/installation). Install the `cuda` and `vlm` extras, both included in `all`, for TileLang, TileKernels, and vision preprocessing.
+2. Install HybridEP with multi-node support and its NVSHMEM and RDMA dependencies, following the checked-in [Dockerfile setup](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile). HybridEP requires installation separately from the standard `all` extras.
+3. Ensure every node can access the model checkpoint and `mmoukouba/MedPix-VQA`. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the recipe's 16-node allocation.
 
 ## Available Models
 
-- [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp)
-
 | Checkpoint | Type |
 | --- | --- |
-| [DeepSeek-V4-Flash-Vision-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) | Checkpoint documented on this page |
-| [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) | Checkpoint documented on this page |
+| [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) | Pretrained checkpoint for full fine-tuning |
 
 ## Related Resources
 

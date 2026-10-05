@@ -13,7 +13,7 @@ The 1.3B fine-tuning configuration uses 16 data-parallel ranks. Use the
 
 ## Quick Start
 
-Allocate 2 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on each node, configure data paths, and run:
+Complete the prerequisites in [Model Context](#model-context). Allocate two nodes with eight GPUs each. Set `NODE_RANK` to `0` or `1` and `MASTER_ADDR` to node 0's reachable address. From the repository root, run this command on both nodes:
 
 ```bash
 uv run torchrun --nnodes 2 --nproc-per-node 8 \
@@ -25,7 +25,7 @@ uv run torchrun --nnodes 2 --nproc-per-node 8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | Prepared video cache; DP16 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml) |
+| Full Fine-Tuning | Prepared video cache; 16 data-parallel ranks | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml) |
 | Pretraining | Prepared video cache | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/wan2_1_t2v_flow.yaml) |
 
 ## Model Context
@@ -35,20 +35,26 @@ Wan2.1-T2V-1.3B-Diffusers is used for text-to-video. Its model size is 1.3B para
 | Property | Value |
 | --- | --- |
 | Task | Text-to-Video |
-| **Architecture** | DiT (Flow Matching) |
+| Architecture | Diffusion transformer (DiT), trained with flow matching |
 | Parameters | 1.3B |
 | Hugging Face Organization | [Wan-AI](https://huggingface.co/Wan-AI) |
 | Transformer Blocks | 30 |
 | Hidden Size | 1,536 |
 | Attention | 12 attention heads |
 
-### Task
+### Prepare the Recipe
 
-- Text-to-Video (T2V)
+Before the multi-node fine-tuning launch:
+
+1. Follow the [diffusion installation instructions](/recipes-e2e-examples/diffusion-fine-tuning) to install the `diffusion` and `diffusion-media` extras.
+2. [Prepare a Wan video cache](/datasets/diffusion-dataset) and set `data.dataloader.cache_dir` in the fine-tuning YAML to its directory, accessible from both nodes. The loader expects pre-encoded `.meta` files.
+3. Set `checkpoint.checkpoint_dir` to a persistent output directory.
+
+The recipe sets `step_scheduler.global_batch_size` to `16`: 16 data-parallel ranks each process one sample with `local_batch_size: 1`.
 
 ## Available Models
 
-| Model | HF ID |
+| Model | Hugging Face ID |
 |---|---|
 | Wan 2.1 T2V 1.3B | [`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) |
 
@@ -56,5 +62,4 @@ Wan2.1-T2V-1.3B-Diffusers is used for text-to-video. Its model size is 1.3B para
 
 - [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning)
 - [Dataset Preparation](/datasets/diffusion-dataset)
-
 - [Checkpoint Configuration](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers/blob/0fad780a534b6463e45facd96134c9f345acfa5b/transformer/config.json)

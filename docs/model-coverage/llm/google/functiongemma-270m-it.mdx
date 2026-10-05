@@ -8,7 +8,7 @@ slug: model-coverage/large-language-models/google/functiongemma-270m-it
 
 ## Quick Start
 
-From the repository root, run:
+Complete the [prerequisites](#prerequisites), then run this eight-GPU example from the repository root.
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xlam.yaml
@@ -22,20 +22,24 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xl
 
 ## Model Context
 
-functiongemma-270m-it is used for function calling / text generation. Its model size is 270M parameters.
+`google/functiongemma-270m-it` generates function calls from text. It is intended for task-specific fine-tuning.
 
 | Property | Value |
 |---|---|
-| **Task** | Function Calling / Text Generation |
+| **Task** | Text-Only Function Calling |
 | **Architecture** | `Gemma3ForCausalLM` |
 | **Parameters** | 270M |
-| **HF Org** | [google](https://huggingface.co/google) |
+| **Hugging Face Organization** | [google](https://huggingface.co/google) |
 | Decoder Layers | 18 |
 | Hidden Size | 640 |
-| Attention | 4 attention heads / 1 key-value heads |
+| Attention | 4 attention heads and 1 key-value head |
 | Context Length | 32,768 tokens (checkpoint configuration) |
 | Vocabulary Size | 262,144 |
 | Configured Dtype | `bfloat16` |
+
+### Prerequisites
+
+[Install NeMo AutoModel](/get-started/installation), accept Google's usage license on the [model page](https://huggingface.co/google/functiongemma-270m-it), and authenticate the training environment with a Hugging Face token that can access the checkpoint.
 
 ### Recipe Notes
 

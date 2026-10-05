@@ -24,7 +24,7 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/nemotron/nemotron_pars
 
 ## Model Context
 
-NVIDIA-Nemotron-Parse-v1.1 is used for document parsing. Its model size is < 1B parameters.
+The example uses eight GPUs with fully sharded data parallelism (FSDP2). It fine-tunes the language model on CORD-v2 while keeping the vision encoder frozen, and saves checkpoints to `vlm_checkpoints/`.
 
 | Property | Value |
 | --- | --- |
@@ -42,11 +42,7 @@ Launch the end-to-end Nemotron Parse fine-tuning tutorial on Brev with a single 
 
 [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM)
 
-See also the [tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/nemotron-parse/finetune.ipynb) and the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
-
-### Workflow Notes
-
-Supervised fine-tuning (SFT) - Nemotron-Parse on CORD-v2: Use [nemotron_parse_v1_1.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml). Dataset: cord-v2. [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM)
+See also the [tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/nemotron-parse/finetune.ipynb) and the [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
 ## Available Models
 
@@ -56,6 +52,6 @@ Supervised fine-tuning (SFT) - Nemotron-Parse on CORD-v2: Use [nemotron_parse_v1
 
 ## Related Resources
 
-- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+- [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
 
 - [Checkpoint Configuration](https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-v1.1/blob/fd1e3c6ba0b61a6dcab5a905f0ff92c5b19f14a4/config.json)

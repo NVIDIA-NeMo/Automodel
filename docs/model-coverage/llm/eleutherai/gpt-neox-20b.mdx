@@ -4,7 +4,7 @@ description: "Fine-tune EleutherAI/gpt-neox-20b with NeMo AutoModel using a chec
 slug: model-coverage/large-language-models/eleutherai/gpt-neox-20b
 ---
 
-[GPT-NeoX](https://github.com/EleutherAI/gpt-neox) is EleutherAI's large-scale language model architecture. The same `GPTNeoXForCausalLM` architecture is used by the Pythia scaling suite, OpenAssistant, Databricks Dolly, and StableLM models.
+GPT-NeoX-20B is EleutherAI's pretrained autoregressive language model, trained on the Pile using the [GPT-NeoX library](https://github.com/EleutherAI/gpt-neox). Use the example below to fine-tune `EleutherAI/gpt-neox-20b` with low-rank adaptation (LoRA) on SQuAD.
 
 Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
@@ -39,11 +39,11 @@ gpt-neox-20b is used for text generation. Its model size is 20B parameters.
 | Attention | 64 attention heads |
 | Context Length | 2,048 tokens (checkpoint configuration) |
 | Vocabulary Size | 50,432 |
-| Configured Dtype | `float16` |
+| Checkpoint Dtype | `float16` |
 
 ### Recipe Setup
 
-Read [gpt_neox_20b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+The [gpt_neox_20b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml) example uses SQuAD (`rajpurkar/squad`) with 512-token sequences and runs for 100 steps. It loads the model in `bfloat16` and uses LoRA with rank 8, fully sharded data parallelism (FSDP2), and activation checkpointing.
 
 ## Available Models
 

@@ -8,7 +8,9 @@ slug: model-coverage/diffusion/diffusers/LTX-2.3-Diffusers
 
 ## Quick Start
 
-From the repository root, run:
+Before launching, follow the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning) to install the diffusion dependencies and prepare an LTX-2.3 video and audio cache. In the selected YAML recipe, set `data.dataloader.cache_dir` to that cache and `checkpoint.checkpoint_dir` to your checkpoint output directory.
+
+From the repository root, launch the full fine-tuning recipe on one node with eight GPUs:
 
 ```bash
 uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
@@ -19,8 +21,8 @@ uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | Prepared video cache; 1 node; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) |
-| LoRA Fine-Tuning | Prepared video cache; 1 node; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml) |
+| Full Fine-Tuning | Prepared video and audio cache; 1 node; 8 data-parallel ranks | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) |
+| LoRA Fine-Tuning | Prepared video and audio cache; 1 node; 8 data-parallel ranks | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml) |
 
 ## Model Context
 
@@ -30,7 +32,7 @@ LTX-2.3-Diffusers is used for text-to-video. Its model size is 18.99B checkpoint
 |---|---|
 | **Task** | Text-to-Video |
 | **Architecture** | Diffusion Transformer (Flow Matching) |
-| **HF Org** | [diffusers](https://huggingface.co/diffusers) |
+| **Hugging Face Organization** | [diffusers](https://huggingface.co/diffusers) |
 | Parameters | 18.99B checkpoint parameters |
 | Transformer Blocks | 48 |
 | Hidden Size | 4,096 |

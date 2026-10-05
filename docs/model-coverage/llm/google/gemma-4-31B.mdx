@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `Gemma4ForConditionalGeneration` arc
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). Allocate 4 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+Follow the [installation instructions](/get-started/installation) and complete the [recipe setup](#recipe-setup). From the repository root, run this command once per node on 4 nodes with 8 GPUs each to fine-tune the language model on Tulu-3. Set `NODE_RANK` and `MASTER_ADDR` as described below.
 
 ```bash
 uv run torchrun --nnodes 4 --nproc-per-node 8 \
@@ -22,11 +22,11 @@ uv run torchrun --nnodes 4 --nproc-per-node 8 \
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
 | Full Fine-Tuning | Tulu-3; 4 nodes | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml) |
-| Full Fine-Tuning | Prepared CoderForge data; CP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml) |
+| Full Fine-Tuning | Prepared CoderForge data; context parallelism across 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml) |
 
 ## Model Context
 
-gemma-4-31B is used for text generation. Its model size is 32.68B checkpoint parameters.
+The recipes fine-tune the language model in `google/gemma-4-31B` on text-only data while freezing its vision tower. Hugging Face reports 32.68B checkpoint parameters, including the multimodal components.
 
 | Property | Value |
 | --- | --- |
@@ -35,48 +35,38 @@ gemma-4-31B is used for text generation. Its model size is 32.68B checkpoint par
 | Parameters | 32.68B checkpoint parameters |
 | Decoder Layers | 60 |
 | Hidden Size | 5,376 |
-| Attention | 32 attention heads; 16 key-value heads in sliding layers / 4 in global layers |
-| Context Length | 262,144 tokens (checkpoint configuration) |
+| Attention | 32 attention heads; 16 key-value heads in sliding layers and 4 in global layers |
+| Context Length | 262,144 tokens (checkpoint configuration); 2,048-token Tulu-3 packing and 65,536-token CoderForge sequences |
 | Vocabulary Size | 262,144 |
 | Configured Dtype | `bfloat16` |
 
 ### Configuration
 
+These settings describe the Tulu-3 recipe used in Quick Start. Its 4-node topology is an example configuration, not a minimum hardware requirement.
+
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Hardware | 8 GPUs per node; GPU model and memory are not specified |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); `tp_size=1`, `cp_size=1` |
 | Nodes | 4 |
-| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true) |
-| Advanced | torch.bfloat16 |
-
-### More Recipes for This Model
-
-- [`gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml)
-
-### Setup and Additional Examples
-
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+| Features | Checkpoint saving (`checkpoint.enabled=true`) and activation checkpointing (`activation_checkpointing=true`) |
+| Model Dtype | `torch.bfloat16` |
 
 ### Recipe Setup
 
-Read [gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+Before running the Tulu-3 command:
 
-### Workflow Notes
+1. Make the repository checkout available on every node and run from its root so the recipe can load `examples/convergence/tulu3/models/gemma4-31b/chat_template.jinja`. The recipe supplies this template because the base checkpoint does not include one.
+2. Ensure the environment includes Transformer Engine for the configured `FusedAdam` optimizer and can load `google/gemma-4-31B` and `allenai/tulu-3-sft-mixture` from Hugging Face.
+3. Set `NODE_RANK` to a unique value from `0` to `3` on each node. Set `MASTER_ADDR` on all nodes to the address of node `0`, reachable on port `29500`. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the allocation.
 
-Fine-tune google/gemma-4-31B: [gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml). 4 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+For the CoderForge workflow, replace `dataset.path_or_dataset_id`, `dataset.tokenizer.pretrained_model_name_or_path`, and `checkpoint.checkpoint_dir` with your prepared data, tokenizer, and checkpoint-output paths. Preserve the supplied `dataset.chat_template` for assistant-only loss masking. The recipe comments describe 128 ranks with context parallelism (`cp_size=8`) and 16 data-parallel replicas.
 
 ## Available Models
 
-- [`google/gemma-4-31B`](https://huggingface.co/google/gemma-4-31B)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Gemma-4-31B](https://huggingface.co/google/gemma-4-31B) | Checkpoint documented on this page |
-| [`google/gemma-4-31B`](https://huggingface.co/google/gemma-4-31B) | Checkpoint documented on this page |
+| [`google/gemma-4-31B`](https://huggingface.co/google/gemma-4-31B) | Base checkpoint for text-only fine-tuning |
 
 ## Related Resources
 

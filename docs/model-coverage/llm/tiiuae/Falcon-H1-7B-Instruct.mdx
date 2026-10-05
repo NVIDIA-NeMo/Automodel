@@ -4,11 +4,11 @@ description: "Fine-tune tiiuae/Falcon-H1-7B-Instruct with NeMo AutoModel: checke
 slug: model-coverage/large-language-models/tiiuae/Falcon-H1-7B-Instruct
 ---
 
-[tiiuae/Falcon-H1-7B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-7B-Instruct) is the checkpoint used by the NeMo AutoModel LoRA fine-tuning recipe below.
+[tiiuae/Falcon-H1-7B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-7B-Instruct) is the checkpoint used by the NeMo AutoModel low-rank adaptation (LoRA) fine-tuning recipe below.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), prepare the [recipe data](#recipe-setup), and launch from the repository root on eight GPUs. Validate memory use for your hardware.
+Follow the [installation instructions](/get-started/installation) and review the [recipe setup](#recipe-setup), then launch the example from the repository root on eight GPUs. Validate memory use for your hardware.
 
 ```bash
 uv run automodel examples/llm_finetune/falcon/falcon_h1_7b_instruct_squad_peft.yaml --nproc-per-node 8
@@ -31,21 +31,23 @@ Falcon-H1-7B-Instruct is used for text generation. Its model size is 7.59B (chec
 | Parameters | 7.59B (checkpoint tensor count) |
 | Decoder Layers | 44 |
 | Hidden Size | 3,072 |
-| Attention | 12 attention heads; 2 KV heads |
+| Attention | 12 attention heads; 2 key-value heads |
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 130,049 |
 | Configured Dtype | `bfloat16` |
-| State Space | Mamba state dimension 256; SSM width 3072; 24 Mamba heads |
+| State Space | Mamba state dimension 256; state-space model (SSM) width 3,072; 24 Mamba heads |
 
 ### Recipe Setup
 
-The checked-in configuration uses FSDP2 with tensor and context parallel sizes of one. It selects `tiiuae/Falcon-H1-7B-Instruct` directly for LoRA fine-tuning. The SQuAD dataset factory supplies the training and validation splits. Inspect sequence length, batch size, and optimizer settings in the recipe before selecting hardware.
+The checked-in configuration uses Fully Sharded Data Parallel version 2 (FSDP2) with tensor and context parallel sizes of one. It loads pretrained weights from `tiiuae/Falcon-H1-7B-Instruct` for LoRA fine-tuning. The dataset factory automatically loads and tokenizes the `rajpurkar/squad` training and validation splits from Hugging Face. Review batch size and optimizer settings in the recipe before selecting hardware.
 
-Checkpoint dimensions and the rounded tensor count come from the revision-pinned sources below. The checkpoint context limit is separate from the training sequence length configured by the recipe.
+Checkpoint saving is disabled (`checkpoint.enabled: false`), so this example does not save the trained adapters. Set `checkpoint.enabled` to `true` before launching to retain them.
+
+Checkpoint dimensions and the rounded tensor count come from the revision-pinned sources below. The checkpoint context limit does not describe the sequence lengths used in this training example.
 
 ## Available Models
 
-| Model | HF ID |
+| Model | Hugging Face ID |
 | --- | --- |
 | Falcon-H1-7B-Instruct | [`tiiuae/Falcon-H1-7B-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-7B-Instruct) |
 

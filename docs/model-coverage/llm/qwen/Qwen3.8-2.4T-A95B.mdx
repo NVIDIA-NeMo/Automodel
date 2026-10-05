@@ -8,7 +8,7 @@ slug: model-coverage/large-language-models/qwen/Qwen3.8-2.4T-A95B
 
 ## Quick Start
 
-Allocate 64 nodes with 4 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+For this recipe, allocate 64 nodes with 4 GPUs each. Complete the setup in [Model Context](#model-context), then run this command from the repository root on every node:
 
 ```bash
 uv run torchrun --nnodes 64 --nproc-per-node 4 \
@@ -24,7 +24,7 @@ uv run torchrun --nnodes 64 --nproc-per-node 4 \
 
 ## Model Context
 
-Qwen3.8-2.4T-A95B is used for text generation (moe, hybrid attention). Its model size is 2.4T total parameters.
+Qwen3.8-2.4T-A95B is a mixture-of-experts (MoE) text model with hybrid attention.
 
 | Property | Value |
 |---|---|
@@ -39,6 +39,14 @@ Qwen3.8-2.4T-A95B is used for text generation (moe, hybrid attention). Its model
 | Attention | 64 attention heads / 4 key-value heads |
 | Vocabulary Size | 248,320 |
 | Configured Dtype | `bfloat16` |
+
+### Prepare the Environment
+
+1. Follow the [installation guide](/get-started/installation) and use the same NeMo AutoModel environment and repository checkout on every node.
+2. Ensure every node can access the pretrained checkpoint and the `Rowan/hellaswag` dataset.
+3. Set `NODE_RANK` to a unique value from `0` to `63` on each node. Set `MASTER_ADDR` to the same reachable hostname or IP address of node `0` on every node.
+
+See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for cluster setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for expert and pipeline parallelism configuration.
 
 ### Architecture
 
@@ -55,17 +63,18 @@ Qwen3.8-2.4T-A95B is used for text generation (moe, hybrid attention). Its model
 | Expert Parallelism | EP32 |
 | Pipeline Parallelism | PP8 |
 | Workload | HellaSwag next-token prediction |
-| Scale | 64 nodes / 256 GPUs |
+| Scale | 64 GB200 nodes with 4 GPUs each (256 GPUs) |
 | Duration | 100 training steps |
 
 The validated 64-node run loaded the public split-FP8 checkpoint and completed a full-model HellaSwag SFT run. This validates the training mechanics and checkpoint layout, not model convergence.
+
+The recipe loads pretrained weights and trains on `Rowan/hellaswag`. It sets `checkpoint.enabled: false`, so it does not save fine-tuned weights. Enable checkpoint saving before launching if you need to retain the trained model.
 
 ## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
 | [Qwen3.8-2.4T-A95B](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) | Checkpoint documented on this page |
-| [Qwen3.8-2.4T-A95B model card](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) | Checkpoint documented on this page |
 
 ## Related Resources
 

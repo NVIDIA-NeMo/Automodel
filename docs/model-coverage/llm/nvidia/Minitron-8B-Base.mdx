@@ -4,7 +4,7 @@ description: "Fine-tune nvidia/Minitron-8B-Base with NeMo AutoModel using a chec
 slug: model-coverage/large-language-models/nvidia/Minitron-8B-Base
 ---
 
-[NVIDIA Nemotron](https://www.nvidia.com/en-us/ai-data-science/foundation-models/) and [Minitron](https://developer.nvidia.com/blog/how-to-prune-and-distill-llama-3-1-8b-to-an-nvidia-llama-3-1-minitron-4b-model/) are NVIDIA's family of language models. Minitron models are produced by pruning and distilling larger Llama/Nemotron models into compact, high-performance checkpoints.
+[Minitron-8B-Base](https://huggingface.co/nvidia/Minitron-8B-Base/blob/e2c30f2d4c8751f21b33be2b403d10d5f373ffc1/README.md) is NVIDIA's 8B-parameter base language model, produced by pruning Nemotron-4 15B and continuing training with distillation. Use this page to run low-rank adaptation (LoRA) fine-tuning on SQuAD with NeMo AutoModel.
 
 Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
@@ -43,7 +43,7 @@ Minitron-8B-Base is used for text generation. Its model size is 8B parameters.
 
 ### Recipe Setup
 
-Read [minitron_8b_base_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml) loads pretrained weights and configures 100 training steps with 1,024 training samples and 64 validation samples from `rajpurkar/squad`, truncated to 512 tokens. It uses Fully Sharded Data Parallel version 2 (FSDP2) with activation checkpointing. Checkpoint saving is enabled every 50 steps under `checkpoints/minitron_8b_base`.
 
 ## Available Models
 

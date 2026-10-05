@@ -8,7 +8,8 @@ Qwen3.8-Flash-Next is a hybrid-attention Mixture-of-Experts (MoE) model with fou
 persistent HyperConnection streams and an Engram N-gram Embedding table (named
 `ple` in the checkpoint configuration). NeMo AutoModel supports the language-only
 `Qwen3_8_FlashNextForConditionalGeneration` path for supervised fine-tuning
-(SFT). All backbone parameters are trainable except the QSA indexers, whose
+(SFT). All backbone parameters are trainable except the Qwen Sparse Attention
+(QSA) indexers, whose
 reference path exposes discrete top-k IDs but no auxiliary loss or
 straight-through gradient.
 
@@ -30,7 +31,9 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 ## Model Context
 
-Qwen3.8-Flash-Next is used for text generation (moe, hybrid attention, engram n-gram embedding). Its model size is 125B backbone with 6B activated per token, plus the 51.2B Engram table; the checkpoint's 4B MTP head is not loaded parameters.
+Qwen3.8-Flash-Next combines a 125B-parameter backbone, with 6B parameters activated
+per token, and a 51.2B-parameter Engram table. NeMo AutoModel does not load the
+checkpoint's 4B-parameter multi-token prediction (MTP) head.
 
 | Property | Value |
 |---|---|
@@ -41,9 +44,8 @@ Qwen3.8-Flash-Next is used for text generation (moe, hybrid attention, engram n-
 | **Experts** | 512 routed experts, top-10 routing, plus one shared expert per layer |
 | **Engram** | One 51.2B-parameter N-gram Embedding table in decoder layer 2 |
 | **Sequence length** | 262,144 native; validated here at 4,096 tokens |
-| Decoder Layers | 48 |
 | Hidden Size | 2,560 |
-| Attention | 24 attention heads / 2 key-value heads |
+| QSA Attention | 24 query heads and 2 key-value heads |
 | Vocabulary Size | 248,320 |
 
 ### Architecture
@@ -131,11 +133,11 @@ per-row routing IDs and passing Engram/GDN/QSA activation gates.
 
 ### Recipe Notes
 
-The recipe loads [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
-directly from the Hugging Face Hub. Allocate 8 nodes with 8 GPUs per node and
-launch the recipe through your cluster launcher.
-See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node
-setup.
+The recipe loads pretrained
+[Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) weights
+and the `rowan/hellaswag` dataset from the Hugging Face Hub. It runs up to 100
+optimizer steps and saves distributed checkpoints under
+`checkpoints/qwen3_8_flash_next_180b_hellaswag_ep64`.
 
 ### Current Scope
 
@@ -145,8 +147,8 @@ setup.
   `BlockMask`, avoiding materialized dense per-head attention scores; the same
   code path serves dense, packed, and context-parallel layouts. CPU execution
   retains a bounded-workspace PyTorch numerical oracle; tests can also call
-  that oracle directly. CUDA execution requires the `flex` backend and never
-  silently falls back. The
+  that oracle directly. The documented recipe selects the `flex` backend;
+  CUDA execution never silently falls back to the numerical oracle. The
   discrete QSA indexers are frozen because the supplied inference reference
   and checkpoint define neither an indexer auxiliary loss nor a
   straight-through estimator; main attention Q/K/V and the rest of the
@@ -170,19 +172,23 @@ setup.
   Left padding, interior padding, TP, PP, MTP, and vision and video training
   remain unsupported.
 
-### Setup and Additional Examples
-
-Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
-hardware and data requirements. Follow the [installation instructions](/get-started/installation)
-before launching a recipe.
-
 ### Recipe Setup
 
-Read [qwen3_8_flash_next_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
-
-### Workflow Notes
-
-Fine-tune Qwen/Qwen3.8-Flash-Next: [qwen3_8_flash_next_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml). 8 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+1. Prepare an environment with Transformer Engine for `FusedAdam` and HybridEP
+   for expert dispatch. Transformer Engine is in the `cuda` extra; HybridEP is
+   not included in the standard `all` extra. The
+   [AutoModel container build](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile)
+   configures HybridEP's multi-node dependencies.
+2. Allocate 8 nodes with 8 GPUs each for this EP64 recipe. Make the repository,
+   checkpoint, and dataset available on every node. Run from the repository
+   root, setting `NODE_RANK` to a unique value from 0 through 7 and `MASTER_ADDR`
+   to the address of node 0 reachable from every node. See the
+   [Slurm Launcher Guide](/job-launchers/slurm-cluster) for allocation setup.
+3. On the validated InfiniBand cluster image, export `NCCL_NET_PLUGIN=none` and
+   `NCCL_NET=IB` on every node before launching. As noted in the
+   [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml),
+   these settings avoid the image's injected network provider, which corrupted
+   cross-node Engram payloads.
 
 ## Available Models
 

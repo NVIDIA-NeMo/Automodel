@@ -4,11 +4,11 @@ description: "Convert and fine-tune Qwen/Qwen3-8B as a diffusion language model 
 slug: model-coverage/dllm/qwen/Qwen3-8B
 ---
 
-The I-DLM recipe converts the autoregressive [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) checkpoint into a diffusion language model using an all-masked block-diffusion objective.
+The Introspective Diffusion Language Model (I-DLM) recipe converts the autoregressive [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) checkpoint into a diffusion language model using an all-masked block-diffusion objective.
 
 ## Quick Start
 
-From the repository root, run:
+After [installing NeMo AutoModel](/get-started/installation), run this example from the repository root on one node with eight GPUs:
 
 ```bash
 uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
@@ -30,7 +30,7 @@ Qwen3-8B is used for diffusion language modeling. Its model size is 8B parameter
 | **Task** | Diffusion Language Modeling |
 | **Architecture** | `Qwen3ForCausalLM` with the I-DLM objective |
 | **Parameters** | 8B |
-| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+| **Hugging Face Organization** | [Qwen](https://huggingface.co/Qwen) |
 | Decoder Layers | 36 |
 | Hidden Size | 4,096 |
 | Attention | 32 attention heads / 8 key-value heads |

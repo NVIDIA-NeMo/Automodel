@@ -8,7 +8,7 @@ slug: model-coverage/dllm/z-lab/Qwen3-4B-DFlash-b16
 
 ## Quick Start
 
-From the repository root, run:
+After [installing NeMo AutoModel](/get-started/installation), run this eight-GPU example from the repository root to fine-tune the draft model on Tulu-3 while keeping `Qwen/Qwen3-4B` frozen:
 
 ```bash
 uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
@@ -19,7 +19,7 @@ uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| DFlash Fine-Tuning | Tulu-3 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) |
+| DFlash Fine-Tuning | Tulu-3; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) |
 
 ## Model Context
 
@@ -40,6 +40,8 @@ Qwen3-4B-DFlash-b16 is used for diffusion draft-model training. Its model size i
 | Configured Dtype | `bfloat16` |
 
 ### Recipe Notes
+
+The recipe uses fully sharded data parallelism (FSDP2), `bfloat16` model weights, and a training sequence length of 3,072 tokens. The 40,960-token value above comes from the checkpoint configuration.
 
 See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
 

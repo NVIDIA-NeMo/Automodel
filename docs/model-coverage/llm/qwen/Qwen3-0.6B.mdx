@@ -4,13 +4,13 @@ description: "Use Qwen/Qwen3-0.6B with NeMo AutoModel for language model fine-tu
 slug: model-coverage/large-language-models/qwen/Qwen3-0.6B
 ---
 
-[Qwen3](https://qwenlm.github.io/blog/qwen3/) is Alibaba Cloud's third-generation dense language model series, featuring improved reasoning, instruction following, and multilingual capabilities over Qwen2.
+Qwen3-0.6B is a dense causal language model in Alibaba Cloud's [Qwen3](https://qwenlm.github.io/blog/qwen3/) family, with support for text generation, reasoning, and multilingual tasks.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-From the repository root, run:
+On a node with eight GPUs, run the HellaSwag example from the repository root:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml
@@ -24,7 +24,7 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_0p6b_hellas
 
 ## Model Context
 
-Qwen3-0.6B is used for text generation. Its model size is 0.6B parameters.
+Qwen3-0.6B is a text generation model with 0.6 billion parameters.
 
 | Property | Value |
 | --- | --- |
@@ -38,6 +38,10 @@ Qwen3-0.6B is used for text generation. Its model size is 0.6B parameters.
 | Context Length | 40,960 tokens (checkpoint configuration) |
 | Vocabulary Size | 151,936 |
 | Configured Dtype | `bfloat16` |
+
+The example loads pretrained `Qwen/Qwen3-0.6B` weights and fine-tunes on `rowan/hellaswag` using Fully Sharded Data Parallel (FSDP2).
+
+The recipe sets `checkpoint.enabled: false`, so the run does not save fine-tuned weights. Set `checkpoint.enabled: true` in the recipe before running if you need saved checkpoints.
 
 ## Available Models
 

@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe:
-#   automodel examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
+# Run from the repository root on each of 8 nodes with 8 GPUs per node (64 workers).
+# Set NODE_RANK to a unique value from 0 to 7 on each node. Set MASTER_ADDR to
+# node 0's hostname or IP address, using the same address on all nodes. All nodes
+# must be able to reach this address on port 29500.
+#   uv run torchrun --nnodes 8 --nproc-per-node 8 \
+#     --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+#     -m nemo_automodel.cli.app examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 512
-  local_batch_size: 32
+  local_batch_size: 8
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2

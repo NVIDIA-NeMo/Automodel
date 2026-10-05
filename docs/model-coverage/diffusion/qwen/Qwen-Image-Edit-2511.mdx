@@ -8,8 +8,9 @@ slug: model-coverage/diffusion/qwen/Qwen-Image-Edit-2511
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
+Follow the [installation instructions](/get-started/installation), then complete the
+[preparation steps](#prepare-for-fine-tuning). From the repository root, launch full fine-tuning
+on eight GPUs on one node:
 
 ```bash
 uv run torchrun --nproc-per-node=8 \
@@ -21,7 +22,7 @@ uv run torchrun --nproc-per-node=8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | Prepared image-editing cache; 1 node; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) |
+| Full Fine-Tuning | Prepared image-editing cache; 1 node; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) |
 | Image Editing | Input image and edit prompt | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml) |
 
 ## Model Context
@@ -37,28 +38,33 @@ Qwen-Image-Edit-2511 is used for image to image. Its model size is 20.43B checkp
 | Attention | 24 attention heads |
 | **Architecture** | `QwenImageTransformer2DModel` |
 
-### Configuration
+### Prepare for Fine-Tuning
+
+Install the `diffusion` and `diffusion-media` extras described in the
+[diffusion fine-tuning guide](/recipes-e2e-examples/diffusion-fine-tuning).
+Prepare an image-editing cache with the `image-edit` subcommand in
+[`preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py)
+and `--processor qwen_image_edit`.
+In `qwen_image_edit_2511_flow.yaml`, set `data.dataloader.cache_dir` to the prepared cache directory
+and `checkpoint.checkpoint_dir` to your checkpoint output directory before launching training.
+
+### Fine-Tuning Configuration
+
+The fine-tuning recipe declares these example settings:
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | - |
+| Hardware | 8 H100 GPUs |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); `dp_size=8` |
 | Nodes | 1 |
-| Features | Checkpointing (enabled=true) |
-| Advanced | bfloat16 |
-
-### More Recipes for This Model
-
-- [`generate_qwen_image_edit.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml)
+| Features | Activation checkpointing; checkpoint saving |
+| Advanced | `bfloat16`; native attention |
 
 ## Available Models
 
-- [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
-
 | Checkpoint | Type |
 | --- | --- |
-| [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Checkpoint documented on this page |
-| [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Checkpoint documented on this page |
+| [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Base checkpoint for fine-tuning and image editing |
 
 ## Related Resources
 

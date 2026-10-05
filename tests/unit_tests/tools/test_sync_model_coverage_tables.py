@@ -118,7 +118,7 @@ slug: model-coverage/diffusion/test/model
 | | |
 |---|---|
 | **Task** | Text-to-Image |
-| **Architecture** | DiT (Flow Matching) |
+| **Architecture** | `TestDiffusionTransformer` |
 | **HF Org** | [Test-Owner](https://huggingface.co/Test-Owner) |
 
 </Info>
@@ -247,6 +247,20 @@ def test_registry_table_uses_documentation_aliases_for_native_models():
         "| `DocumentedArchitecture` (`NativeArchitecture`) | NeMo native | "
         "`nemo_automodel.components.models.native.model.NativeArchitecture` |"
     ) in generated
+
+
+def test_registry_table_distinguishes_diffusion_transformer_and_native_implementations() -> None:
+    generated = _render_registry_table(
+        [("NativeModel", "models.native", "NativeModel")],
+        {"ExternalModel", "NativeModel", "TestDiffusionTransformer"},
+        {},
+        diffusion_architectures={"NativeModel", "TestDiffusionTransformer"},
+    )
+
+    assert "| `TestDiffusionTransformer` | Hugging Face | `diffusers` |" in generated
+    assert "| `ExternalModel` | Hugging Face | `transformers` |" in generated
+    assert "| `NativeModel` | NeMo native | `models.native.NativeModel` |" in generated
+    assert generated.count("| `NativeModel` |") == 1
 
 
 def test_doc_arch_aliases_are_parsed_from_the_coverage_test():
@@ -920,9 +934,9 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
         len([line for line in homepage.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]) == TABLE_ROW_COUNT
     )
     assert "[Model-0](/model-coverage/large-language-models/test/model)" in homepage
-    assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in (
-        tmp_path / "docs" / "model-coverage" / "overview.mdx"
-    ).read_text(encoding="utf-8")
+    registry = (tmp_path / "docs" / "model-coverage" / "overview.mdx").read_text(encoding="utf-8")
+    assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in registry
+    assert "| `TestDiffusionTransformer` | Hugging Face | `diffusers` |" in registry
     assert _sync_tables(tmp_path, check=True, validate_model_cards=False) == []
 
 

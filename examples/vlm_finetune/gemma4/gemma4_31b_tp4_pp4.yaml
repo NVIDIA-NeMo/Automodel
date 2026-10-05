@@ -14,7 +14,7 @@
 
 # Multi-node (4 nodes) fine-tune of Gemma4 31B with TP=4, PP=4 and DP=2.
 # Topology: 4 nodes x 8 GPUs = 32 GPUs total (TP4 x PP4 x DP2).
-# Gemma4 31B has 46 decoder layers; PP=4 splits them across 4 stages.
+# Gemma4 31B has 60 decoder layers; PP=4 splits them across 4 stages.
 #
 # Per-node launch (set MASTER_ADDR to the rendezvous host and NODE_RANK
 # per node, e.g. via SLURM/MPI):

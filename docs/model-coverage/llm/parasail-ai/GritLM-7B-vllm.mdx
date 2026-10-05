@@ -4,7 +4,7 @@ description: "Fine-tune parasail-ai/GritLM-7B-vllm with NeMo AutoModel using a c
 slug: model-coverage/large-language-models/parasail-ai/GritLM-7B-vllm
 ---
 
-[GritLM](https://github.com/ContextualAI/gritlm) (Generative Representational Instruction Tuning) is a unified model that performs both generative language modeling and text embedding in a single model, from Parasail AI.
+`parasail-ai/GritLM-7B-vllm` is Parasail AI's fork of [GritLM](https://github.com/ContextualAI/gritlm), a Mistral-based model for text generation and text embedding. The fork changes the architecture name in the checkpoint configuration for use with vLLM.
 
 Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
@@ -12,7 +12,7 @@ Set up NeMo AutoModel with the
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+Run this low-rank adaptation (LoRA) example from the repository root on one node with 8 GPUs. GPU training and memory use still require validation on your hardware.
 
 ```bash
 uv run automodel examples/llm_finetune/parasail_ai/gritlm_7b_vllm_squad_peft.yaml --nproc-per-node 8
@@ -26,28 +26,30 @@ uv run automodel examples/llm_finetune/parasail_ai/gritlm_7b_vllm_squad_peft.yam
 
 ## Model Context
 
-GritLM-7B-vllm is used for text generation + embedding. Its model size is 7B parameters.
+GritLM-7B-vllm is a 7B-class model for text generation and text embedding. The example recipe fine-tunes next-token prediction on SQuAD.
 
 | Property | Value |
 | --- | --- |
-| Task | Text Generation + Embedding |
+| Task | Text Generation and Text Embedding |
 | **Architecture** | `GritLM` |
 | Parameters | 7B |
 | Hugging Face Organization | [parasail-ai](https://huggingface.co/parasail-ai) |
 | Decoder Layers | 32 |
 | Hidden Size | 4,096 |
-| Attention | 32 attention heads / 8 key-value heads |
+| Attention | 32 attention heads and 8 key-value heads |
 | Context Length | 32,768 tokens (checkpoint configuration) |
 | Vocabulary Size | 32,000 |
 | Configured Dtype | `bfloat16` |
 
 ### Recipe Setup
 
-Read [gritlm_7b_vllm_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/parasail_ai/gritlm_7b_vllm_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/parasail_ai/gritlm_7b_vllm_squad_peft.yaml) loads pretrained weights with `trust_remote_code: true` and applies LoRA with rank 8 and alpha 32. It uses Fully Sharded Data Parallel (FSDP2) with activation checkpointing and runs for 100 steps on 1,024 SQuAD training examples truncated to at most 512 tokens.
+
+Checkpoint saving is enabled under `checkpoints/gritlm_7b_vllm`.
 
 ## Available Models
 
-| Model | HF ID |
+| Model | Hugging Face ID |
 |---|---|
 | GritLM 7B vllm | [`parasail-ai/GritLM-7B-vllm`](https://huggingface.co/parasail-ai/GritLM-7B-vllm) |
 
@@ -56,3 +58,4 @@ Read [gritlm_7b_vllm_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/b
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 
 - [Checkpoint Configuration](https://huggingface.co/parasail-ai/GritLM-7B-vllm/blob/d6ec7afefec5032020b47db967a86e556312c957/config.json)
+- [Upstream Model Card](https://huggingface.co/parasail-ai/GritLM-7B-vllm/blob/d6ec7afefec5032020b47db967a86e556312c957/README.md)
