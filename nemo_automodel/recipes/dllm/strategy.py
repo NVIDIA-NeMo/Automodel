@@ -29,6 +29,7 @@ register it in :data:`DLLM_STRATEGIES`.  No changes to the recipe are required.
 
 from __future__ import annotations
 
+import bisect
 import logging
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
@@ -586,6 +587,10 @@ class UnoStrategy(IDLMStrategy):
       (:func:`~nemo_automodel.components._peft.lora.lora_token_gate`, the official
       ``TokenwiseLoraRouter``), so the ``x_0`` half is the frozen AR teacher in the same forward.
     - Loss: :class:`UnoDistillLoss` (total variation, optional reverse KL) between the two halves.
+    - Block size: fixed ``dllm.block_length``, or the official increasing block-size curriculum
+      ``dllm.block_curriculum`` (``training/curriculum.py``): ``tokens_per_step`` plus ``stages`` of
+      ``{block_size, tokens}``; a stage ends at optimizer step ``cumulative_tokens // tokens_per_step``.
+      The stage is a pure function of the optimizer step, so resume works at any step.
 
     Requires a ``peft:`` LoRA config on the model.
     """
@@ -593,16 +598,60 @@ class UnoStrategy(IDLMStrategy):
     def __init__(self):
         super().__init__()
         self._noise_high: int | None = None
+        # Block-size curriculum as parallel lists: stage i covers optimizer steps
+        # [_stage_end_steps[i - 1], _stage_end_steps[i]) with block size _stage_block_sizes[i].
+        self._stage_end_steps: list[int] = []
+        self._stage_block_sizes: list[int] = []
 
     def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
         self.block_size = int(dllm_cfg.get("block_length", 1))
+        curriculum = dllm_cfg.get("block_curriculum", None)
+        if curriculum is not None:
+            if dllm_cfg.get("block_length", None) is not None:
+                raise ValueError("Set either dllm.block_length or dllm.block_curriculum, not both.")
+            self._parse_block_curriculum(curriculum)
+            self.block_size = self._stage_block_sizes[0]
         return UnoDistillLoss(
             tv_weight=float(dllm_cfg.get("tv_weight", 1.0)),
             kl_weight=float(dllm_cfg.get("kl_weight", 0.0)),
             chunk_size=dllm_cfg.get("loss_chunk_size", 1024),
         )
 
+    def _parse_block_curriculum(self, curriculum) -> None:
+        """Validate the official curriculum format and record each stage's end step.
+
+        Mirrors ``BlockCurriculumPlan.from_yaml``: block sizes strictly increase and every stage
+        spans at least one optimizer step.
+        """
+        tokens_per_step = int(curriculum.get("tokens_per_step", 0))
+        if tokens_per_step <= 0:
+            raise ValueError("dllm.block_curriculum.tokens_per_step must be a positive integer.")
+        stages = curriculum.get("stages", None)
+        if not stages:
+            raise ValueError("dllm.block_curriculum.stages must be a non-empty list of {block_size, tokens}.")
+        cumulative_tokens, previous_end, previous_block = 0, 0, 0
+        for stage in stages:
+            block_size, tokens = int(stage.get("block_size", 0)), int(stage.get("tokens", 0))
+            if block_size <= 0 or tokens <= 0:
+                raise ValueError(f"Curriculum stage {stage} needs positive block_size and tokens.")
+            if block_size <= previous_block:
+                raise ValueError("Curriculum block sizes must be strictly increasing.")
+            cumulative_tokens += tokens
+            end_step = cumulative_tokens // tokens_per_step
+            if end_step <= previous_end:
+                raise ValueError(f"Curriculum stage block_size={block_size} is shorter than one step.")
+            self._stage_end_steps.append(end_step)
+            self._stage_block_sizes.append(block_size)
+            previous_end, previous_block = end_step, block_size
+
     def pre_step(self, recipe, batches) -> tuple[int, int]:
+        if self._stage_end_steps:
+            # Steps past the last stage keep its block size, as the official trainer clamps to max_steps - 1.
+            step = min(int(recipe.step_scheduler.step), self._stage_end_steps[-1] - 1)
+            block_size = self._stage_block_sizes[bisect.bisect_right(self._stage_end_steps, step)]
+            if block_size != self.block_size:
+                logger.info("Uno block-size curriculum: step %d uses block_size=%d", step, block_size)
+            self.block_size = block_size
         num_noise = 0
         num_supervised = 0
         for microbatch_idx, batch in enumerate(batches):

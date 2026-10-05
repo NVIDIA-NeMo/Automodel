@@ -568,6 +568,68 @@ class TestUnoStrategy:
         trained = {name for name, p in model.named_parameters() if p.grad is not None}
         assert trained == {"q_proj.lora_A.weight", "q_proj.lora_B.weight"}
 
+    # Official ``training/configs/uno_3epoch_curriculum.yaml``: 2x8 GPUs x batch 8 x 4096 tokens.
+    OFFICIAL_CURRICULUM = {
+        "tokens_per_step": 524288,
+        "stages": [
+            {"block_size": 2, "tokens": 2457862144},
+            {"block_size": 4, "tokens": 2457337856},
+            {"block_size": 6, "tokens": 2457862144},
+            {"block_size": 8, "tokens": 2457337856},
+            {"block_size": 12, "tokens": 2457862144},
+            {"block_size": 16, "tokens": 2457337856},
+        ],
+    }
+
+    @pytest.mark.parametrize(
+        ("step", "block_size"),
+        [(0, 2), (4687, 2), (4688, 4), (9375, 6), (23437, 12), (23438, 16), (28124, 16), (40000, 16)],
+    )
+    def test_official_curriculum_picks_block_size_from_the_optimizer_step(self, strategy, step, block_size):
+        """Stage boundaries match the official plan (alternating 4,688/4,687-step halves); steps past the
+        last stage keep its block size."""
+        strategy.create_loss_fn({"block_curriculum": self.OFFICIAL_CURRICULUM})
+        assert strategy.block_size == 2
+        assert strategy._stage_end_steps == [4688, 9375, 14063, 18750, 23438, 28125]
+        recipe = types.SimpleNamespace(step_scheduler=types.SimpleNamespace(step=step))
+        assert strategy.pre_step(recipe, []) == (0, 0)
+        assert strategy.block_size == block_size
+
+    def test_without_curriculum_block_length_stays_fixed(self, strategy):
+        strategy.create_loss_fn({"block_length": 8})
+        strategy.pre_step(types.SimpleNamespace(step_scheduler=types.SimpleNamespace(step=10**6)), [])
+        assert strategy.block_size == 8
+
+    @pytest.mark.parametrize(
+        ("dllm_cfg", "match"),
+        [
+            ({"block_length": 4, "block_curriculum": OFFICIAL_CURRICULUM}, "not both"),
+            ({"block_curriculum": {"stages": [{"block_size": 2, "tokens": 8}]}}, "tokens_per_step"),
+            ({"block_curriculum": {"tokens_per_step": 8, "stages": []}}, "non-empty"),
+            (
+                {
+                    "block_curriculum": {
+                        "tokens_per_step": 8,
+                        "stages": [{"block_size": 4, "tokens": 8}, {"block_size": 4, "tokens": 8}],
+                    }
+                },
+                "strictly increasing",
+            ),
+            (
+                {
+                    "block_curriculum": {
+                        "tokens_per_step": 8,
+                        "stages": [{"block_size": 2, "tokens": 8}, {"block_size": 4, "tokens": 4}],
+                    }
+                },
+                "shorter than one step",
+            ),
+        ],
+    )
+    def test_invalid_curriculum_is_rejected(self, strategy, dllm_cfg, match):
+        with pytest.raises(ValueError, match=match):
+            strategy.create_loss_fn(dllm_cfg)
+
 
 # ---------------------------------------------------------------------------
 # DFlashStrategy — anchor-block sampling (CPU, no model loading)
