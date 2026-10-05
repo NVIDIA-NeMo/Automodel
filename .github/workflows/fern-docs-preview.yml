@@ -165,13 +165,68 @@ jobs:
                   rm -f -- "$RUNNER_TEMP/fern-preview/$path" ;;
               esac
             done < "$RUNNER_TEMP/fern-deleted-paths"
-            # Navigation, components and tooling stay on the trusted branch.
+            # Components and tooling stay on the trusted branch. Data navigation
+            # is validated and overlaid separately below.
             (cd pr-source && find "$ROOT" -regextype posix-extended -type f \
               -regex "$CONTENT" ! -path '*/.*' ! -path '*/components/*' \
               -exec cp --parents -- '{}' "$RUNNER_TEMP/fern-preview/" \;)
           done
           printf '%s\n' '{"organization":"nvidia","version":"5.139.0"}' \
             > "$RUNNER_TEMP/fern-preview/docs/fern/fern.config.json"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.8.22
+
+      - name: Stage validated Data navigation
+        run: |
+          uv run --no-project --with 'PyYAML==6.0.3' python -I - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          import yaml
+
+          docs = Path(os.environ["RUNNER_TEMP"], "fern-preview/docs").resolve()
+          target = docs / "fern/versions/nightly.yml"
+          source = Path("pr-source/docs/fern/versions/nightly.yml")
+          preview = yaml.safe_load(target.read_text())
+          proposed = yaml.safe_load(source.read_text())
+          sections = [item for item in proposed["navigation"] if item.get("slug") == "datasets"]
+          if len(sections) != 1:
+              raise ValueError("Expected one Data navigation section with slug 'datasets'")
+          data = sections[0]
+          pending = [data]
+          visited = 0
+          while pending:
+              visited += 1
+              if visited > 1000:
+                  raise ValueError("Data navigation is too large or contains recursive aliases")
+              item = pending.pop()
+              if not isinstance(item, dict) or set(item) - {"section", "page", "path", "slug", "contents", "link", "href"}:
+                  raise ValueError("Data navigation allows only sections, pages, and internal links")
+              for key, value in item.items():
+                  if key == "contents":
+                      if not isinstance(value, list):
+                          raise ValueError("Data navigation contents must be a list")
+                      pending.extend(value)
+                  elif not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9 /_.()+,-]+", value):
+                      raise ValueError("Data navigation values must be literal text or local paths")
+              if "path" in item:
+                  page = (target.parent / item["path"]).resolve()
+                  if not page.is_relative_to(docs) or page.suffix not in {".md", ".mdx"} or not page.is_file():
+                      raise ValueError("Data navigation must reference an existing staged Markdown page")
+                  if any(part.startswith(".") or part == "components" for part in page.relative_to(docs).parts):
+                      raise ValueError("Data navigation cannot reference hidden files or components")
+              if "href" in item and item["href"] != "/nemo/automodel/nightly/model-coverage/overview":
+                  raise ValueError("Data navigation links may only point to the nightly model overview")
+          matches = [i for i, item in enumerate(preview["navigation"]) if item.get("slug") == "datasets"]
+          if len(matches) != 1:
+              raise ValueError("Expected one Data section in trusted navigation")
+          preview["navigation"][matches[0]] = data
+          target.write_text(yaml.safe_dump(preview, sort_keys=False, allow_unicode=True))
+          PY
 
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

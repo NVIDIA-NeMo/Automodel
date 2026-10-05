@@ -74,6 +74,9 @@ jobs:
       - name: Validate dataset cards
         run: uv run --no-project --with 'PyYAML==6.0.3' make -C docs/fern docs-dataset-cards
 
+      - name: Test preview navigation staging
+        run: make -C docs/fern docs-preview-navigation
+
       - name: Apply Fern code styles
         run: python3 tools/apply_fern_code_styles.py
 

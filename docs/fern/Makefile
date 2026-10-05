@@ -23,7 +23,7 @@ REPO_ROOT := $(shell git rev-parse --show-toplevel)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check docs-model-tables docs-dataset-cards _docs-mdx-check
+.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check docs-model-tables docs-dataset-cards docs-preview-navigation _docs-mdx-check
 
 help:
 	@echo ""
@@ -103,7 +103,7 @@ docs: docs-model-tables docs-stitch docs-generate-library
 	python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
 	fern docs dev
 
-docs-check: docs-dataset-cards docs-model-tables docs-stitch
+docs-check: docs-dataset-cards docs-preview-navigation docs-model-tables docs-stitch
 	@set -e; \
 	trap 'python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
 	python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
@@ -118,6 +118,9 @@ docs-model-tables:
 docs-dataset-cards:
 	uv run --no-project --with 'PyYAML==6.0.3' python3 -m unittest discover -s "$(REPO_ROOT)/tests/unit_tests/tools" -p test_dataset_cards.py
 	uv run --no-project --with 'PyYAML==6.0.3' python3 "$(REPO_ROOT)/tools/validate_dataset_cards.py"
+
+docs-preview-navigation:
+	uv run --no-project --with 'PyYAML==6.0.3' python3 -m unittest discover -s "$(REPO_ROOT)/tests/unit_tests/tools" -p test_fern_preview.py
 
 docs-mdx-check: docs-model-tables docs-stitch
 	@set -e; \

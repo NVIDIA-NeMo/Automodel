@@ -199,7 +199,7 @@ Required org secret: **`DOCS_FERN_TOKEN`**, scoped to the fixed Fern CLI library
 
 Approved upstream PR mirrors that change docs or preview inputs get a preview URL posted as a 🌿 comment. Fork-origin PRs must first pass the mirror approval process; direct fork pushes do not publish previews. The workflow verifies the current PR head before publishing its comment and removes stale preview comments when docs changes are reverted.
 
-Preview configuration, navigation, components and tooling come from `main`; PR page content overlays that trusted tree. Newer main-only pages remain available, while explicit PR page deletions are applied relative to the merge base. Deleting a page still referenced by trusted navigation can fail the build until that navigation is updated on `main`. Archived v0.4/v0.5 pages come from `docs-archive`.
+Preview configuration, components, tooling, and navigation outside the Data section come from `main`; PR page content overlays that trusted tree. The preview imports the PR's Data navigation after validating its fields and local page paths, so new dataset cards appear under **Data → Dataset Cards**. **Data → Model Cards** links to the nightly model overview. Newer main-only pages remain available, while explicit PR page deletions are applied relative to the merge base. Deleting a page still referenced by trusted navigation outside Data can fail the build until that navigation is updated on `main`. Archived v0.4/v0.5 pages come from `docs-archive`.
 
 The preview workflow pins Fern 5.139.0, sets `FERN_NO_VERSION_REDIRECTION=true`, and verifies the exact expected preview host before commenting. It does not execute PR package scripts or make authenticated page-link requests.
 
