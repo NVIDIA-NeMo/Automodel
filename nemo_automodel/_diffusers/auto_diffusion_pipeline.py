@@ -531,6 +531,12 @@ def _has_custom_model(transformer_dir: str) -> bool:
     return not get_is_hf_model(config, force_hf=False)
 
 
+def has_custom_transformer(pretrained_model_name_or_path: str) -> bool:
+    """Whether ``NeMoAutoDiffusionPipeline.from_pretrained`` builds this checkpoint's transformer from a custom
+    Automodel implementation (and so returns a transformer-only pipeline)."""
+    return _has_custom_model(_transformer_dir(resolve_diffusion_model_dir(pretrained_model_name_or_path)))
+
+
 def _validate_custom_model_options(mesh_context: MeshContext | None, **options: bool | str | None) -> None:
     """Check that no option a custom model cannot honor was requested.
 
