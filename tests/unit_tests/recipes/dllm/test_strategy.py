@@ -1516,3 +1516,26 @@ def test_shipped_scdd_recipe_builds_its_strategy_and_loss():
     # The mask id must be inside the vocabulary the uniform channel samples over.
     assert 0 <= dllm_cfg["mask_token_id"] < dllm_cfg["vocab_size"]
     assert cfg["distributed"]["cp_size"] == 1, "SCDD rejects context parallelism"
+
+
+def test_shipped_uno_recipe_builds_its_strategy_and_loss():
+    """The go-to recipe must stay loadable and consistent: a mismatched curriculum or batch would
+    otherwise only surface on an 8-GPU run."""
+    import yaml
+
+    config_path = REPO_ROOT / "examples" / "dllm_sft" / "qwen3_8b_uno.yaml"
+    cfg = yaml.safe_load(config_path.read_text())
+    dllm_cfg = cfg["dllm"]
+
+    strategy = get_dllm_strategy(dllm_cfg["mode"])
+    assert isinstance(strategy, UnoStrategy)
+    loss_fn = strategy.create_loss_fn(dllm_cfg)
+    assert isinstance(loss_fn, UnoDistillLoss)
+    # Released Uno-Qwen3-8B recipe: TV only, curriculum 2 -> 16, 28,125 steps, LoRA r=128 / alpha=2048.
+    assert (loss_fn.tv_weight, loss_fn.kl_weight) == (1.0, 0.0)
+    assert strategy._stage_block_sizes == [2, 4, 6, 8, 12, 16]
+    assert strategy._stage_end_steps[-1] == cfg["step_scheduler"]["max_steps"] == 28125
+    tokens_per_step = cfg["step_scheduler"]["global_batch_size"] * cfg["dataset"]["seq_length"]
+    assert dllm_cfg["block_curriculum"]["tokens_per_step"] == tokens_per_step
+    assert (cfg["peft"]["dim"], cfg["peft"]["alpha"]) == (128, 2048)
+    assert cfg["distributed"]["cp_size"] == 1, "Uno rejects context parallelism"
