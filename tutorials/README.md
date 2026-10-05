@@ -10,6 +10,7 @@ End-to-end tutorials covering the LLM customization lifecycle using [NeMo AutoMo
 | Evaluation | Standard benchmarks | Evaluate AutoModel checkpoints with lm-evaluation-harness. | Coming soon | Coming soon |
 | Reasoning SFT | Reasoning instruction data | Fine-tune a model to selectively enable chain-of-thought reasoning via system prompt control. | Coming soon | Coming soon |
 | [**Nemotron Parse Fine-Tuning**](./nemotron-parse/finetune.ipynb) | [Invoices](https://huggingface.co/datasets/katanaml-org/invoices-donut-data-v1) | Fine-tune Nemotron Parse v1.1 for structured document extraction. | L40S | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy?launchableID=env-3E4KEpLPd6a7KBEDSvQfKelkgTO) |
+| [**Embedding (Bi-Encoder) Fine-Tuning**](./embedding-biencoder/finetune.ipynb) | [embed-nemotron-dataset-v1](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1) | Contrastive fine-tuning of Llama-3.2-1B with in-batch and hard negatives for semantic search and dense retrieval. | L40S | Coming soon |
 
 ## Prerequisites
 
