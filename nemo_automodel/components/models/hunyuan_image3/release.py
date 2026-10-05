@@ -26,7 +26,7 @@ from typing import Any
 
 import torch
 
-from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import (
+from nemo_automodel.components.models.hunyuan_image3.flow_adapter import (
     PROMPT_IDS_KEY,
     PROMPT_SUFFIX_IDS_KEY,
     UNCOND_PROMPT_IDS_KEY,

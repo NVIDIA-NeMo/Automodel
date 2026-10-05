@@ -30,12 +30,12 @@ import numpy as np
 import torch
 from PIL import Image
 
-from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import (
+from nemo_automodel.components.distributed.utils import FirstRankPerNode
+from nemo_automodel.components.models.hunyuan_image3.flow_adapter import (
     PROMPT_IDS_KEY,
     PROMPT_SUFFIX_IDS_KEY,
     UNCOND_PROMPT_IDS_KEY,
 )
-from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.models.hunyuan_image3.release import HunyuanImage3PromptTokenizer, load_release_vae
 
 logger = logging.getLogger(__name__)
