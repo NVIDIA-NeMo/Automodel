@@ -24,24 +24,24 @@ def test_native_hf_round_trip_preserves_every_tensor():
         torch.testing.assert_close(restored[key], value, rtol=0.0, atol=0.0)
 
 
-def test_adapter_routes_flat_hyperconnection_and_kda_fp32_parameters():
+def test_adapter_renames_flat_hyperconnection_and_keeps_kda_checkpoint_dtypes():
     adapter = tiny_glm5_next_model().state_dict_adapter
     hf_state = {
         "model.language_model.layers.0.hc_attn_fn": torch.randn(8, 32),
         "model.language_model.layers.0.hc_attn_base": torch.randn(8),
         "model.language_model.layers.0.hc_attn_scale": torch.randn(3),
-        "model.language_model.layers.0.self_attn.A_log": torch.randn(2),
-        "model.language_model.layers.0.self_attn.dt_bias": torch.randn(8),
+        "model.language_model.layers.0.self_attn.A_log": torch.randn(2, dtype=torch.bfloat16),
+        "model.language_model.layers.0.self_attn.dt_bias": torch.randn(8, dtype=torch.bfloat16),
     }
 
     native = adapter.from_hf(dict(hf_state))
 
     assert native["model.language_model.layers.0.attn_hc.fn"].shape == (8, 32)
-    assert native["model.language_model.layers.0.attn_hc._fp32_params.base"].dtype is torch.float32
-    assert native["model.language_model.layers.0.attn_hc._fp32_params.scale"].dtype is torch.float32
-    assert native["model.language_model.layers.0.self_attn._fp32_params.A_log"].shape == (2,)
-    assert native["model.language_model.layers.0.self_attn._fp32_params.A_log"].dtype is torch.float32
-    assert native["model.language_model.layers.0.self_attn._fp32_params.dt_bias"].dtype is torch.float32
+    assert native["model.language_model.layers.0.attn_hc.base"].shape == (8,)
+    assert native["model.language_model.layers.0.attn_hc.scale"].shape == (3,)
+    assert native["model.language_model.layers.0.self_attn.A_log"].shape == (2,)
+    assert native["model.language_model.layers.0.self_attn.A_log"].dtype is torch.bfloat16
+    assert native["model.language_model.layers.0.self_attn.dt_bias"].dtype is torch.bfloat16
     assert adapter.to_hf(native).keys() == hf_state.keys()
 
 

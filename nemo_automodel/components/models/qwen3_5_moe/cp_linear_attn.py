@@ -41,8 +41,8 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     torch_recurrent_gated_delta_rule,
 )
 
+from nemo_automodel.components.models.common.fp32_gates import gdn_decay_gate, pin_gdn_params_fp32
 from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
-from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelState
@@ -78,44 +78,19 @@ class _AllGatherConcatFn(Function):
         return grad_local, None, None
 
 
-class _SSMGateParam:
-    """Get-only (non-data) descriptor exposing an ``SSMGate`` param as an attribute.
-
-    Lets ``self.A_log`` / ``self.dt_bias`` resolve to the fp32 ``SSMGate`` holder
-    (``self._fp32_params``) without a ``__getattr__`` monkeypatch. Being a non-data
-    descriptor, it does not intercept assignment, so HF's ``__init__`` doing
-    ``self.A_log = nn.Parameter(...)`` still routes through ``nn.Module.__setattr__``
-    into ``_parameters`` (where it lives until ``install_ssm_gate`` moves it).
-    """
-
-    def __init__(self, name: str):
-        self.name = name
-
-    def __get__(self, obj, owner=None):
-        if obj is None:
-            return self
-        return getattr(obj._fp32_params, self.name)
-
-
 class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     """Drop-in replacement for ``Qwen3_5MoeGatedDeltaNet`` with FLA Context Parallelism.
 
-    The SSM-gating params (``A_log``/``dt_bias``) are moved into a fp32 ``SSMGate``
-    submodule (``_fp32_params``) at construction so they keep fp32 storage (master
-    weights) even under a bf16 bulk dtype, and so FSDP can shard them in their own
-    dtype-uniform fp32 group. ``A_log``/``dt_bias`` remain readable as attributes via
-    get-only descriptors that resolve to the submodule — no ``__getattr__`` patch.
+    The decay-gate parameters ``A_log`` and ``dt_bias`` keep their HF names and are
+    stored in fp32 regardless of the model dtype: ``A_log`` is exponentiated, so
+    bf16 rounding becomes a proportional error on the decay rate that the
+    recurrence compounds across the sequence. Under FSDP2 mixed precision the
+    model's ``_keep_in_fp32_modules_strict`` keeps them in fp32 compute.
 
     ``_cp_mesh`` is set externally by the parallelizer to enable context parallelism.
     """
 
     _cp_mesh: DeviceMesh | None
-    # Get-only (non-data) descriptors: reads resolve to the fp32 ``SSMGate`` holder,
-    # while writes during HF ``__init__`` (``self.A_log = nn.Parameter(...)``) still
-    # land in ``_parameters`` (handled by ``nn.Module.__setattr__``) before we move
-    # them into the holder.
-    A_log = _SSMGateParam("A_log")
-    dt_bias = _SSMGateParam("dt_bias")
 
     def __init__(self, config, layer_idx: int):
         super().__init__(config, layer_idx)
@@ -140,17 +115,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         self.causal_conv1d_update = fast_causal_conv1d_update
         self.chunk_gated_delta_rule = chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
-        # HF created bare ``A_log``/``dt_bias`` in ``_parameters``; move them into a
-        # native fp32 ``SSMGate`` submodule (built directly, not relocated at runtime).
-        install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config))
-
-    def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
-        """Compute the gating value ``g`` via the fp32 ``SSMGate`` submodule.
-
-        Computing inside the submodule's forward keeps FSDP's unshard/reshard
-        lifecycle natural for the isolated fp32 group.
-        """
-        return self._fp32_params(a)
+        pin_gdn_params_fp32(self)
 
     def _forward_no_cp(
         self,
@@ -283,7 +248,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         value = value.reshape(eff_batch, eff_seq_len, -1, self.head_v_dim)
 
         beta = b.sigmoid()
-        g = self._compute_gate(a)
+        g = gdn_decay_gate(a, self.A_log, self.dt_bias)
 
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -684,7 +649,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
 
         # ---- Gate & beta ----
         beta = b.sigmoid()
-        g = self._compute_gate(a)
+        g = gdn_decay_gate(a, self.A_log, self.dt_bias)
 
         # GVA: repeat q/k heads to match v heads
         if self.num_v_heads // self.num_k_heads > 1:
@@ -724,59 +689,3 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 cp_group=cp_group,
             )
         return output
-
-
-# SSM-gating params kept in fp32 storage (regardless of the model's bulk dtype)
-# and isolated in the ``_fp32_params`` SSMGate submodule for FSDP.
-_FP32_PARAM_NAMES = ("A_log", "dt_bias")
-
-
-class SSMGate(torch.nn.Module):
-    """Owns the fp32 SSM-gating params (``A_log``/``dt_bias``) and computes the gate.
-
-    Keeping these in a dedicated submodule lets FSDP shard them in their own
-    dtype-uniform fp32 group (true master weights), and computing the gate inside
-    ``forward`` keeps FSDP's unshard/reshard lifecycle natural.
-    """
-
-    def __init__(self, num_v_heads: int, dtype: torch.dtype = torch.float32):
-        super().__init__()
-        self.A_log = torch.nn.Parameter(torch.empty(num_v_heads, dtype=dtype))
-        self.dt_bias = torch.nn.Parameter(torch.empty(num_v_heads, dtype=dtype))
-
-    def forward(self, a: torch.Tensor) -> torch.Tensor:
-        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-
-
-def install_ssm_gate(mod, fp32_dtype=torch.float32):
-    """Move ``mod``'s HF-created bare ``A_log``/``dt_bias`` into a fp32 ``SSMGate``.
-
-    HF's GatedDeltaNet ``__init__`` creates ``A_log``/``dt_bias`` as bare params in
-    ``mod._parameters``. This relocates them into an :class:`SSMGate` submodule
-    registered as ``_fp32_params`` (casting to ``fp32_dtype``), so they keep fp32
-    storage under a bf16 bulk dtype and get their own dtype-uniform FSDP group.
-    Attribute access (``self.A_log``/``self.dt_bias``) continues to work via the
-    :class:`_SSMGateParam` descriptors on ``CPAwareGatedDeltaNet`` — no
-    ``__getattr__`` patch. Returns the gate submodule.
-    """
-    num_v_heads = mod._parameters["A_log"].shape[0]
-    gate = SSMGate(num_v_heads, dtype=fp32_dtype)
-    for pname in _FP32_PARAM_NAMES:
-        param = mod._parameters.pop(pname)
-        if param.dtype != fp32_dtype:
-            param.data = param.data.to(fp32_dtype)
-        setattr(gate, pname, param)  # overwrite the freshly-built empty param
-    mod.add_module("_fp32_params", gate)
-    return gate
-
-
-def _resolve_ssm_dtype(config):
-    """Resolve the fp32 storage dtype for the SSM-gating params from ``config``.
-
-    Honors ``mamba_ssm_dtype`` when present; otherwise defaults to AutoModel's
-    fp32 training-storage contract for ``A_log``/``dt_bias``.
-    """
-    ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
-    if isinstance(ssm_dtype, str):
-        ssm_dtype = dtype_from_str(ssm_dtype)
-    return ssm_dtype or torch.float32

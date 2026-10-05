@@ -62,7 +62,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
-    _has_dtensor_params,
     cast_model_to_dtype,
     compute_lm_head_logits,
 )
@@ -85,7 +84,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
 )
-from nemo_automodel.components.models.deepseek_v4.parallelization import PARALLELIZER
+from nemo_automodel.components.models.deepseek_v4.parallelization import DeepseekV4ModelParallelizer
 from nemo_automodel.components.models.deepseek_v4.processing import (
     COMPRESS_PAD_TO,
     IMAGE,
@@ -1536,13 +1535,8 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if self.mtp is not None:
             for sublayer in self.mtp.layers:
                 sublayer.init_weights(buffer_device=buffer_device)
-        # After FSDP2 wrapping, parameter dtypes must already be correct from
-        # construction-time metadata. A blanket ``model.to(bf16)`` would
-        # downcast fp32 DTensors before checkpoint load can fill them.
-        if _has_dtensor_params(self):
-            return
         cast_model_to_dtype(self, dtype)
 
 
-DeepseekV4ForCausalLM.parallelizer = PARALLELIZER
+DeepseekV4ForCausalLM.parallelizer = DeepseekV4ModelParallelizer()
 ModelClass = DeepseekV4ForCausalLM

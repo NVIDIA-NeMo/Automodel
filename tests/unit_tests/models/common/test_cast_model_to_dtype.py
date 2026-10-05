@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
-
+import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard, distribute_tensor
 
+import nemo_automodel.components.models.common.utils as utils_module
 from nemo_automodel.components.models.common.utils import (
     _get_fp32_module_keywords,
     _get_strict_fp32_module_keywords,
-    _has_dtensor_params,
-    _restore_fp32_buffers,
-    _restore_fp32_modules,
     cast_frozen_modules_to_compute_dtype,
     cast_model_to_dtype,
 )
@@ -236,37 +236,6 @@ class TestGetFp32ModuleKeywords:
 
 
 # ---------------------------------------------------------------------------
-# Tests for _restore_fp32_modules()
-# ---------------------------------------------------------------------------
-
-
-class TestRestoreFp32Modules:
-    def test_matching_modules_restored(self):
-        model = SimpleModel()
-        model.to(torch.bfloat16)
-        assert model.norm.weight.dtype == torch.bfloat16
-
-        _restore_fp32_modules(model, ["norm"])
-        assert model.norm.weight.dtype == torch.float32
-
-    def test_non_matching_modules_unchanged(self):
-        model = SimpleModel()
-        model.to(torch.bfloat16)
-
-        _restore_fp32_modules(model, ["norm"])
-        assert model.linear1.weight.dtype == torch.bfloat16
-        assert model.linear2.weight.dtype == torch.bfloat16
-
-    def test_empty_keywords_noop(self):
-        model = SimpleModel()
-        model.to(torch.bfloat16)
-
-        _restore_fp32_modules(model, [])
-        # Everything stays bf16
-        assert model.norm.weight.dtype == torch.bfloat16
-
-
-# ---------------------------------------------------------------------------
 # Tests for cast_model_to_dtype()
 # ---------------------------------------------------------------------------
 
@@ -381,52 +350,6 @@ class TestCastModelToDtype:
         for p in model.parameters():
             assert p.dtype == torch.float16
 
-    def test_skip_modules_left_untouched(self):
-        """Submodules named in ``skip_modules`` keep their original dtype."""
-
-        class Model(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.linear = nn.Linear(4, 4)
-                self._fp32_params = nn.Linear(4, 4)
-
-        model = Model()
-        cast_model_to_dtype(model, torch.bfloat16, skip_modules=("_fp32_params",))
-
-        # Regular submodule is cast; the skipped holder stays fp32.
-        assert model.linear.weight.dtype == torch.bfloat16
-        assert model._fp32_params.weight.dtype == torch.float32
-
-    def test_skip_modules_nested_and_restored(self):
-        """Nested skip_modules are preserved and re-attached after the cast."""
-
-        class Inner(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self._fp32_params = nn.Linear(2, 2)
-                self.proj = nn.Linear(2, 2)
-
-        class Model(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.block = Inner()
-
-        model = Model()
-        cast_model_to_dtype(model, torch.bfloat16, skip_modules=("_fp32_params",))
-
-        assert model.block.proj.weight.dtype == torch.bfloat16
-        # Holder preserved in fp32 and re-attached (still reachable on the module).
-        assert model.block._fp32_params.weight.dtype == torch.float32
-        assert model.block._fp32_params is dict(model.block.named_modules())["_fp32_params"]
-
-    def test_skip_modules_empty_is_noop(self):
-        """An empty skip_modules tuple casts everything (default behavior)."""
-        model = SimpleModel()
-        cast_model_to_dtype(model, torch.bfloat16, skip_modules=())
-
-        for p in model.parameters():
-            assert p.dtype == torch.bfloat16
-
     def test_set_valued_keep_in_fp32_preserved(self):
         # Mirrors HF converting _keep_in_fp32_modules (list) to a set on the instance —
         # the gemma4_moe/diffusion_gemma case. cast_model_to_dtype must still restore it.
@@ -445,68 +368,63 @@ class TestCastModelToDtype:
 
 
 # ---------------------------------------------------------------------------
-# Tests for DTensor-aware casting
+# Tests for sharded (DTensor) models
 # ---------------------------------------------------------------------------
 
 
-class TestDTensorAwareCasting:
-    def test_has_dtensor_params_false_for_plain_model(self):
-        model = SimpleModel()
-        assert not _has_dtensor_params(model)
+@pytest.fixture
+def cpu_mesh():
+    """Single-rank gloo mesh so parameters can be turned into real DTensors on CPU."""
+    dist.init_process_group("gloo", rank=0, world_size=1, store=dist.HashStore())
+    try:
+        yield init_device_mesh("cpu", (1,))
+    finally:
+        dist.destroy_process_group()
 
-    def test_dtensor_params_only_buffers_restored(self):
-        """When model has DTensor params, only buffers of matching modules are restored to fp32."""
-        model = ModelWithFp32Modules()
 
-        with patch("nemo_automodel.components.models.common.utils._has_dtensor_params", return_value=True):
-            cast_model_to_dtype(model, torch.bfloat16)
+def _shard_parameters(model: nn.Module, mesh) -> None:
+    """Replace every parameter with a Shard(0) DTensor of the same dtype and value."""
+    for module in model.modules():
+        for name, param in list(module.named_parameters(recurse=False)):
+            sharded = distribute_tensor(param.detach(), mesh, [Shard(0)])
+            module.register_parameter(name, nn.Parameter(sharded, requires_grad=param.requires_grad))
 
-        # Parameters should be bf16 — FSDP2 requires uniform dtype
-        for p in model.parameters():
-            assert p.dtype == torch.bfloat16
 
-    def test_dtensor_strict_fp32_params_restored(self):
-        """Strict fp32 modules are already isolated as their own FSDP units, so they can be restored."""
-        model = ModelWithStrictFp32()
+class TestShardedCasting:
+    def test_fp32_storage_cast_to_fp32_leaves_sharded_params_untouched(self, cpu_mesh):
+        """The post-shard ``initialize_weights(dtype=<storage dtype>)`` call is a no-op on params."""
+        model = ModelWithStrictFp32Parameter()
+        model.mixer.scale.data = torch.tensor([1.001, -2.003, 0.3333, 17.125])
+        _shard_parameters(model, cpu_mesh)
+        before = {name: param for name, param in model.named_parameters()}
 
-        with patch("nemo_automodel.components.models.common.utils._has_dtensor_params", return_value=True):
-            cast_model_to_dtype(model, torch.bfloat16)
+        cast_model_to_dtype(model, torch.float32)
 
-        assert model.head.weight.dtype == torch.float32
+        for name, param in model.named_parameters():
+            assert param is before[name]
+            assert param.dtype == torch.float32
+        torch.testing.assert_close(model.mixer.scale.full_tensor(), torch.tensor([1.001, -2.003, 0.3333, 17.125]))
+
+    def test_bf16_storage_cast_restores_fp32_buffers_of_sharded_model(self, cpu_mesh):
+        """Buffers are never sharded, so fp32 buffers are still restored after FSDP wrapping."""
+        model = ModelWithStrictFp32Buffer().to(torch.bfloat16)
+        model.router.e_score_correction_bias = torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32)
+        _shard_parameters(model, cpu_mesh)
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
         assert model.linear.weight.dtype == torch.bfloat16
+        assert model.router.e_score_correction_bias.dtype == torch.float32
+        torch.testing.assert_close(model.router.e_score_correction_bias, torch.tensor([1.001, -2.003, 0.3333, 17.125]))
 
-    def test_dtensor_buffers_in_matching_modules_restored(self):
-        """Buffers in fp32-keyword-matching modules are cast to fp32 even with DTensor params."""
+    def test_mixed_storage_sharded_fp32_param_raises(self, cpu_mesh):
+        """A sharded fp32-contract param inside a bf16 model is the unsupported mixed-storage layout."""
+        model = ModelWithStrictFp32Parameter()
+        model.linear.to(torch.bfloat16)
+        _shard_parameters(model, cpu_mesh)
 
-        class ModelWithNormBuffer(nn.Module):
-            _keep_in_fp32_modules = ["norm"]
-
-            def __init__(self):
-                super().__init__()
-                self.linear = nn.Linear(4, 4)
-                self.norm = nn.LayerNorm(4)
-                self.norm.register_buffer("e_score_bias", torch.zeros(4))
-
-        model = ModelWithNormBuffer()
-
-        with patch("nemo_automodel.components.models.common.utils._has_dtensor_params", return_value=True):
+        with pytest.raises(RuntimeError, match="mixer.scale is an fp32-contract parameter"):
             cast_model_to_dtype(model, torch.bfloat16)
-
-        # Parameters stay bf16
-        assert model.norm.weight.dtype == torch.bfloat16
-        assert model.linear.weight.dtype == torch.bfloat16
-        # Buffer in matching module is restored to fp32
-        assert model.norm.e_score_bias.dtype == torch.float32
-
-    def test_fp32_restore_applied_for_plain_params(self):
-        """When model has plain tensor params, fp32 restore works normally."""
-        model = ModelWithFp32Modules()
-
-        with patch("nemo_automodel.components.models.common.utils._has_dtensor_params", return_value=False):
-            cast_model_to_dtype(model, torch.bfloat16)
-
-        assert model.norm.weight.dtype == torch.float32
-        assert model.linear.weight.dtype == torch.bfloat16
 
 
 class _VLMLike(nn.Module):
@@ -586,15 +504,13 @@ class TestCastFrozenModulesToComputeDtype:
         This mirrors the sharded frozen-tower case (e.g. gemma4 vision tower in the root
         FSDP unit): FSDP all-gathers the params to the compute dtype itself, but never casts
         buffers, so an fp32 buffer would promote bf16 activations back to fp32. We simulate a
-        DTensor param with a ``nn.Parameter`` subclass and patch the ``DTensor`` symbol the
-        function imports at call time.
+        DTensor param with a ``nn.Parameter`` subclass and patch the module's ``DTensor`` symbol.
         """
-        import torch.distributed.tensor as dt_mod
 
         class _FakeDTensor(nn.Parameter):
             pass
 
-        monkeypatch.setattr(dt_mod, "DTensor", _FakeDTensor, raising=False)
+        monkeypatch.setattr(utils_module, "DTensor", _FakeDTensor)
 
         model = _VLMLike()
         # Mark the frozen proj weight as a "sharded" param (DTensor-like instance).
@@ -665,37 +581,3 @@ class TestRopeBufferPreserved:
         model = self._rope_model(["freqs_cis"], buffer_name="freqs_cis", module_name="model")
         cast_model_to_dtype(model, torch.bfloat16)
         assert model.model.freqs_cis.dtype == torch.float32
-
-
-class TestRestoreFp32Buffers:
-    def test_buffers_restored_params_untouched(self):
-        """_restore_fp32_buffers casts buffers but not parameters."""
-
-        class Model(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.norm = nn.LayerNorm(4)
-                self.norm.register_buffer("bias_buf", torch.zeros(4))
-
-        model = Model()
-        model.to(torch.bfloat16)
-        _restore_fp32_buffers(model, ["norm"])
-
-        assert model.norm.bias_buf.dtype == torch.float32
-        assert model.norm.weight.dtype == torch.bfloat16
-
-    def test_non_matching_buffers_unchanged(self):
-        """Buffers in non-matching modules stay in the cast dtype."""
-
-        class Model(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.linear = nn.Linear(4, 4)
-                self.linear.register_buffer("scale", torch.ones(4))
-                self.norm = nn.LayerNorm(4)
-
-        model = Model()
-        model.to(torch.bfloat16)
-        _restore_fp32_buffers(model, ["norm"])
-
-        assert model.linear.scale.dtype == torch.bfloat16

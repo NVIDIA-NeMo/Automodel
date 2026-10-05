@@ -27,7 +27,6 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
     Qwen3VLMoeTextRotaryEmbedding,
-    Qwen3VLMoeVisionRotaryEmbedding,
 )
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
@@ -36,7 +35,10 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import (
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -44,38 +46,6 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .state_dict_adapter import Qwen3VLMoeStateDictAdapter
-
-
-class Fp32SafeQwen3VLMoeTextRotaryEmbedding(Qwen3VLMoeTextRotaryEmbedding):
-    """Ensure inv_freq stays in float32"""
-
-    def _apply(self, fn: Any, recurse: bool = True):
-        fp32_buffers = {
-            name: buf.detach().clone().to(torch.float32)
-            for name, buf in self.named_buffers(recurse=False)
-            if name in ("inv_freq", "original_inv_freq")
-        }
-        result = super()._apply(fn, recurse=recurse)
-        for name, fp32_buffer in fp32_buffers.items():
-            current = getattr(self, name)
-            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
-        return result
-
-
-class Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionRotaryEmbedding):
-    """Ensure the vision rotary inv_freq buffer remains float32."""
-
-    def _apply(self, fn: Any, recurse: bool = True):
-        fp32_buffers = {
-            name: buf.detach().clone().to(torch.float32)
-            for name, buf in self.named_buffers(recurse=False)
-            if name in ("inv_freq", "original_inv_freq")
-        }
-        result = super()._apply(fn, recurse=recurse)
-        for name, fp32_buffer in fp32_buffers.items():
-            current = getattr(self, name)
-            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
-        return result
 
 
 class Qwen3VLMoeBlock(Block):
@@ -339,7 +309,7 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         self.norm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
         )
-        self.rotary_emb = Fp32SafeQwen3VLMoeTextRotaryEmbedding(config=config)
+        self.rotary_emb = Qwen3VLMoeTextRotaryEmbedding(config=config)
 
     def forward(
         self,
@@ -458,6 +428,15 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
+    # ``cast_model_to_dtype`` snapshots/restores matched fp32 buffers around its bulk
+    # cast, and ``cast_frozen_modules_to_compute_dtype`` exempts matched names, so the
+    # text rotary (``language_model.rotary_emb``) and vision rotary
+    # (``visual.rotary_pos_emb``) ``inv_freq`` buffers keep their exact fp32 values
+    # under shared bf16/fp16 casts, including the frozen-vision recipes' cast.
+    # Class-level: ``super().__init__()`` runs ``post_init`` -> ``initialize_weights``
+    # -> the first cast before the constructor body.
+    _keep_in_fp32_modules: list[str] = ["rotary_emb", "rotary_pos_emb"]
+
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
@@ -542,18 +521,6 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                 self.backend,
                 dtype=model_dtype,
             )
-
-        vision_model = getattr(self.model, "visual")
-        rotary = vision_model.rotary_pos_emb
-        dim = rotary.inv_freq.shape[0] * 2
-        fp32_safe_rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(dim)
-        fp32_safe_rotary.register_buffer(
-            "inv_freq",
-            rotary.inv_freq.detach().clone().to(torch.float32, copy=True),
-            persistent=False,
-        )
-        fp32_safe_rotary.to(rotary.inv_freq.device)
-        vision_model.rotary_pos_emb = fp32_safe_rotary
 
     def get_input_embeddings(self):
         return self.model.language_model.embed_tokens

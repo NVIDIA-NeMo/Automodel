@@ -68,6 +68,8 @@ gradient. The
 validated cluster runs used NCCL's internal IB transport
 (`NCCL_NET_PLUGIN=none` and `NCCL_NET=IB`).
 
+Full-parameter FSDP2 training requires `model.dtype: float32`; see [Mixed-Precision Training](/development/mixed-precision-training#models-with-intrinsically-fp32-parameters).
+
 ## Numerical Validation
 
 The released checkpoint was compared with its SGLang reference on two fixed

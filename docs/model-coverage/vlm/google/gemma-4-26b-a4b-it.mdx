@@ -17,6 +17,8 @@ uv run automodel examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml \
   --nproc-per-node 8
 ```
 
+Full-parameter FSDP2 training requires `model.dtype: float32`; see [Mixed-Precision Training](/development/mixed-precision-training#models-with-intrinsically-fp32-parameters).
+
 ## Choose a Workflow
 
 | Goal | Start Here |

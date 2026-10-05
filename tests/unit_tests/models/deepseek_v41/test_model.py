@@ -32,10 +32,9 @@ from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from nemo_automodel._transformers.capabilities import _is_deepseek_v4
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallelizer_utils import with_fp32_compute_override
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
 from nemo_automodel.components.models.deepseek_v41.attention import DeepseekV41AttentionState
 from nemo_automodel.components.models.deepseek_v41.config import (
@@ -399,7 +398,6 @@ def test_v41_uses_unified_moe_parallelization() -> None:
     model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
     assert not _is_deepseek_v4_model(model)
     assert isinstance(get_model_parallelizer(model), ModelParallelizer)
-    assert not dsv4_fsdp._is_deepseek_v4_module(model)
     assert not _is_deepseek_v4(model)
     assert _is_deepseek_v4(SimpleNamespace(config=SimpleNamespace(model_type="deepseek_v4")))
     for layer in model.model.layers.values():
@@ -428,12 +426,10 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=None, cast_forward_inputs=False
         )
         for module in model.model.layers.values():
-            fully_shard_by_dtype(
+            fully_shard(
                 module,
                 mesh=mesh,
-                mp_policy=policy,
-                offload_policy=None,
-                fp32_compute_module_names=tuple(strict_names),
+                mp_policy=with_fp32_compute_override(module, policy, tuple(strict_names)),
                 reshard_after_forward=True,
             )
         fully_shard(model.model.embed_tokens, mesh=mesh, mp_policy=policy, reshard_after_forward=True)
@@ -451,9 +447,9 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
 
         torch.manual_seed(419 + rank)
         # This covers real CPU FSDP wrapping and initialization, not a CUDA
-        # all-gather or forward. The requested compute dtype must not replace
-        # either BF16 storage or explicitly requested FP32 master storage.
-        model.initialize_weights(torch.device("cpu"), dtype=torch.bfloat16)
+        # all-gather or forward. Like the recipe, the post-shard call requests the
+        # storage dtype, which must leave every local shard's dtype in place.
+        model.initialize_weights(torch.device("cpu"), dtype=storage_dtype)
         for name, parameter in model.named_parameters():
             assert parameter is parameters[name], name
             assert parameter.dtype == parameter.to_local().dtype == expected_dtypes[name], name
@@ -477,8 +473,11 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("storage_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32_master"])
-def test_fsdp_initialization_preserves_local_storage_dtype_and_checkpoint_values(
-    tmp_path: Path, storage_dtype: torch.dtype
-) -> None:
-    mp.spawn(_fsdp_initialization_worker, args=(str(tmp_path / "rendezvous"), storage_dtype), nprocs=2, join=True)
+@pytest.mark.requires_param_dtype_override
+@pytest.mark.runtime_budget(
+    30, hard_timeout=70, reason="Spawns two gloo FSDP workers that wrap, initialize and reload a tiny model."
+)
+def test_fsdp_initialization_preserves_local_storage_dtype_and_checkpoint_values(tmp_path: Path) -> None:
+    # FSDP2 keeps one storage dtype per unit, so strict fp32 parameters share a
+    # unit with the projections only under fp32 master weights.
+    mp.spawn(_fsdp_initialization_worker, args=(str(tmp_path / "rendezvous"), torch.float32), nprocs=2, join=True)

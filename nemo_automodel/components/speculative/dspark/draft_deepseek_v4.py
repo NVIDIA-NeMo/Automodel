@@ -28,7 +28,6 @@ from transformers.activations import ACT2FN
 from nemo_automodel.components.attention.dflash_mask import create_dflash_sdpa_mask
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v4.layers import (
-    DeepseekV4FP32Parameter,
     DeepseekV4GroupedLinear,
     DeepseekV4RotaryEmbedding,
     _apply_partial_rope,
@@ -100,7 +99,7 @@ class DeepseekV4DSparkAttention(nn.Module):
             config.o_groups,
         )
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
-        self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
+        self.sinks = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
 
     def forward(
         self,
@@ -281,8 +280,7 @@ class DeepseekV4DSparkModel(nn.Module):
         ``inv_freq`` to bf16 and dephase RoPE with absolute position, eroding draft
         acceptance (the mismatch grows with position, and a bf16 round-trip cannot
         be undone by upcasting). Snapshot the fp32 frequencies before the cast and
-        restore them after (the Fp32Safe rotary idiom used elsewhere in the repo),
-        so the buffer never makes a bf16 round-trip.
+        restore them after, so the buffer never makes a bf16 round-trip.
         """
         rotary_emb = getattr(self, "rotary_emb", None)
         inv_freq = getattr(rotary_emb, "inv_freq", None) if rotary_emb is not None else None

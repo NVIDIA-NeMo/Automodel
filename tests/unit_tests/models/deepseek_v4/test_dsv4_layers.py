@@ -900,63 +900,22 @@ class TestDeepseekV4HyperConnection:
 class TestDeepseekV4OptimizedKernels:
     """Numerical equivalence tests for optional DSV4 kernel dispatch."""
 
-    def test_full_tensor_if_dtensor_clones_gathered_value(self, monkeypatch):
-        """Returned fp32 holder values must not alias storage FSDP may reshard."""
-        full = torch.arange(4, dtype=torch.float32, requires_grad=True)
-
-        class FakeDTensor:
-            def full_tensor(self):
-                return full
-
-        monkeypatch.setattr(dsv4_layers, "DTensor", FakeDTensor)
-
-        gathered = dsv4_layers._full_tensor_if_dtensor(FakeDTensor())
-
-        assert torch.equal(gathered, full)
-        assert gathered.data_ptr() != full.data_ptr()
-        gathered.sum().backward()
-        assert torch.equal(full.grad, torch.ones_like(full))
-
-    def test_full_tensor_if_dtensor_clones_regular_tensor(self):
-        """FSDP can reshard a regular-looking tensor returned from an fp32 holder."""
-        tensor = torch.arange(4, dtype=torch.float32, requires_grad=True)
-
-        gathered = dsv4_layers._full_tensor_if_dtensor(tensor)
-
-        assert torch.equal(gathered, tensor)
-        assert gathered.data_ptr() != tensor.data_ptr()
-        gathered.sum().backward()
-        assert torch.equal(tensor.grad, torch.ones_like(tensor))
-
-    def test_eager_attention_with_sink_passes_reference_to_sinks_holder(self):
-        """FSDP2-wrapped fp32 sink holders need a tensor input during recompute."""
+    def test_eager_attention_with_sink_reads_the_fp32_sinks_parameter(self):
+        """The per-head sink is a plain fp32 parameter cast to the logit dtype on use."""
         batch, heads, seq_len, dim = 1, 2, 3, 4
-        q = torch.randn(batch, heads, seq_len, dim)
-        kv = torch.randn(batch, 1, seq_len, dim)
-        sinks = torch.randn(heads)
-
-        class SinksParam:
-            def __init__(self, value):
-                self.value = value
-                self.reference_shape = None
-
-            def __call__(self, reference):
-                self.reference_shape = reference.shape
-                return self.value
+        q = torch.randn(batch, heads, seq_len, dim, dtype=torch.bfloat16)
+        kv = torch.randn(batch, 1, seq_len, dim, dtype=torch.bfloat16)
 
         class DummyModule:
             num_key_value_groups = heads
             training = False
+            sinks = torch.nn.Parameter(torch.randn(heads, dtype=torch.float32))
 
-            def __init__(self, value):
-                self.sinks_param = SinksParam(value)
-
-        module = DummyModule(sinks)
-
-        output, _ = eager_attention_with_sink(module, q, kv, kv, None, scaling=dim**-0.5)
+        output, probs = eager_attention_with_sink(DummyModule(), q, kv, kv, None, scaling=dim**-0.5)
 
         assert output.shape == (batch, seq_len, heads, dim)
-        assert module.sinks_param.reference_shape == q.shape
+        assert output.dtype == torch.bfloat16
+        assert probs.shape == (batch, heads, seq_len, seq_len)
 
     @pytest.mark.parametrize(
         "device",

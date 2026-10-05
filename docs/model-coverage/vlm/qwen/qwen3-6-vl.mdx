@@ -14,6 +14,8 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_6_27b.ya
 
 Install the `vlm-media` extra before running these recipes. See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
+Full-parameter FSDP2 training requires `model.dtype: float32`; see [Mixed-Precision Training](/development/mixed-precision-training#models-with-intrinsically-fp32-parameters).
+
 ## Model Reference
 
 ### Model Architecture

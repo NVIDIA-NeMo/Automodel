@@ -75,8 +75,8 @@ model:
   config:
     _target_: nemo_automodel.components.models.kimi_k3.config.KimiK3TextConfig
     architectures: [KimiK3ForCausalLM]
-    dtype: bfloat16
-  torch_dtype: bfloat16
+    dtype: float32
+  dtype: float32
   trust_remote_code: false
   kda_mode: chunk
   use_liger_kernel: false

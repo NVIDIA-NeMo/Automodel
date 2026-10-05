@@ -26,6 +26,8 @@ The Tulu-3 text recipe runs on 4 nodes:
 uv run automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml --nnodes 4 --nproc-per-node 8
 ```
 
+Full-parameter FSDP2 training requires `model.dtype: float32`; see [Mixed-Precision Training](/development/mixed-precision-training#models-with-intrinsically-fp32-parameters).
+
 ## Choose a Workflow
 
 | Goal | Start Here |

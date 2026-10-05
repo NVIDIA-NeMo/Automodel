@@ -26,6 +26,8 @@ Each sparse feed-forward layer routes a token to 6 of 256 experts and also evalu
 
 NeMo AutoModel retains the checkpoint's fused expert layout and supports expert parallelism for both variants. The full Inkling recipe also uses pipeline parallelism.
 
+Full-parameter FSDP2 training requires `model.dtype: float32`; see [Mixed-Precision Training](/development/mixed-precision-training#models-with-intrinsically-fp32-parameters).
+
 ## Example HF Models
 
 | Model | HF ID |

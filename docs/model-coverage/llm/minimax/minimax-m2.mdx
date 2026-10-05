@@ -21,6 +21,8 @@ From the repository root, run:
 uv run automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml
 ```
 
+Full-parameter FSDP2 training requires `model.dtype: float32`; see [Mixed-Precision Training](/development/mixed-precision-training#models-with-intrinsically-fp32-parameters).
+
 ## Choose a Workflow
 
 | Goal | Start Here |

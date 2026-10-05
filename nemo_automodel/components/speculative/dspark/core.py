@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.models.common.utils import _get_strict_fp32_module_keywords
 from nemo_automodel.components.speculative.dspark.loss import compute_dspark_loss
 
 
@@ -72,6 +73,8 @@ class DSparkTrainerModule(nn.Module):
     ):
         super().__init__()
         self.draft_model = draft_model
+        # The wrapper is the FSDP2 root unit, so it carries the draft's fp32 compute contract.
+        self._keep_in_fp32_modules_strict = _get_strict_fp32_module_keywords(draft_model)
         self.loss_decay_gamma = loss_decay_gamma
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)

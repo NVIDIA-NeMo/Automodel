@@ -32,6 +32,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     _should_use_hf_native_gradient_checkpointing,
     apply_selective_activation_checkpointing,
 )
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ def parallelize_ddp(
         logger.info("World size is 1, skipping parallelization.")
         model = model.to(device)
         if device.type == "cuda":
-            model = model.to(torch.bfloat16)
+            cast_model_to_dtype(model, torch.bfloat16)
         if config.activation_checkpointing:
             if is_selective_activation_checkpointing(config.activation_checkpointing):
                 apply_selective_activation_checkpointing(

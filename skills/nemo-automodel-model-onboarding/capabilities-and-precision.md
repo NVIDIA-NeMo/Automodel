@@ -80,31 +80,37 @@ checkpoints keep it fp32, MoE sigmoid-gate bias (`e_score_correction_bias`),
 attention-sink bias, and per-head `scale`.
 
 If the model has such params, declare `_keep_in_fp32_modules_strict` as
-parameter-name substrings. Sharding (`fully_shard_by_dtype`) reads this list and
-uses fp32 compute dtype for matching params while other params use
-`mp_policy.param_dtype`.
-
-For a NeMo-native model class:
+strict substrings of the HF parameter names, tokens that cannot match other
+params (for example `"linear_attn.A_log"`, not `"A_log"` alone when another
+module could contain that substring):
 
 ```python
 class NewMoEForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 ```
 
-Trainable fp32 params inside mixed modules should live in a small
-`_fp32_params` holder rather than as bare params beside bf16 bulk weights. Call
-the holder in `forward`, keep it out of broad dtype casts with
-`cast_model_to_dtype(..., skip_modules=("_fp32_params",))`, and make the
-state-dict adapter strip or route holder keys plus upcast loaded tensors to
-fp32.
+Declare each such param as a plain attribute of the module that uses it,
+constructed with `dtype=torch.float32` regardless of the model dtype, and have
+that module cast its own inputs to fp32; FSDP casts block inputs to
+`param_dtype`. State-dict adapters do no dtype work for these params:
+checkpoint loads copy into the existing fp32 parameters and HF exports pin
+them to F32 in the checkpointer from the same declaration.
+
+Each block is one FSDP2 unit. Its mixed-precision policy keeps the declared
+params in fp32 through per-parameter mixed precision
+(`MixedPrecisionPolicy.param_dtype_override_fn`, PyTorch >= 2.15) while other
+params compute in `mp_policy.param_dtype`. The override preserves storage dtype,
+so fp32 compute requires fp32 storage: train these models with
+`model.dtype: float32`. A pinned param stored in bf16 is rejected at sharding
+time with an error naming the parameter.
 
 For HF-derived models with fp32 runtime params, build the fp32 structure in the
 model or layer constructor. Do not use a runtime monkeypatch, and do not infer
 the contract globally from a broad module path or a parameter name alone.
 
-Always declare the pin. Checkpoint load can auto-record original HF dtypes as a
-fallback, but quantized, from-scratch, and unusual checkpoint paths may skip
-that recording.
+Always declare the pin. It is the single source of truth: it selects the
+parameters that keep fp32 compute under FSDP2, that `cast_model_to_dtype`
+restores to fp32, and that HF exports write as F32.
 
 ## Frozen Submodules
 

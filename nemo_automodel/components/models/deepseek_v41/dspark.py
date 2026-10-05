@@ -139,7 +139,7 @@ class _DeepseekV41DSparkAttention(DeepseekV41Attention):
         # to the softmax denominator, matching the released sparse-attention op.
         kv = torch.cat((kv, kv.new_zeros(batch, 1, self.head_dim)), dim=1)
         bias = attention_mask.expand(-1, self.num_heads, -1, -1).float()
-        sink = self.sinks_param(query).view(1, self.num_heads, 1, 1).expand(batch, -1, draft_sequence, -1)
+        sink = self.attn_sink.view(1, self.num_heads, 1, 1).expand(batch, -1, draft_sequence, -1)
         bias = torch.cat((bias, sink), dim=-1)
         if self.backend.attn == "sdpa":
             attended = F.scaled_dot_product_attention(
@@ -549,7 +549,7 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
     _keep_in_fp32_modules_strict = [
         "attn_hc",
         "ffn_hc",
-        "attn.sinks_param",
+        "attn.attn_sink",
         "bias_vl",
         "confidence_head",
     ]

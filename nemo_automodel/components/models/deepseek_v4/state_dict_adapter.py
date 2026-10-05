@@ -113,7 +113,7 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     #      attributes onto the Indexer itself (``indexer.{ape,kv_norm,wgate,wkv}``).
     #
     # Both renames must run before the generic ``attn.(.+)`` catch-all.
-    (re.compile(r"^layers\.(\d+)\.attn\.attn_sink$"), r"model.layers.\1.self_attn.sinks_param.weight"),
+    (re.compile(r"^layers\.(\d+)\.attn\.attn_sink$"), r"model.layers.\1.self_attn.sinks"),
     # Indexer in HF is nested under Compressor (Compressor.indexer); on disk
     # Indexer is a sibling of Compressor with its OWN nested compressor:
     #   on-disk  layers.X.attn.indexer.compressor.{ape,norm,wgate,wkv}
@@ -128,7 +128,7 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     ),
     (
         re.compile(r"^layers\.(\d+)\.attn\.indexer\.compressor\.ape$"),
-        r"model.layers.\1.self_attn.compressor.indexer.ape_param.weight",
+        r"model.layers.\1.self_attn.compressor.indexer.ape",
     ),
     (
         re.compile(r"^layers\.(\d+)\.attn\.indexer\.compressor\.wgate\.(.+)$"),
@@ -147,10 +147,6 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     (
         re.compile(r"^layers\.(\d+)\.attn\.compressor\.norm\.(.+)$"),
         r"model.layers.\1.self_attn.compressor.kv_norm.\2",
-    ),
-    (
-        re.compile(r"^layers\.(\d+)\.attn\.compressor\.ape$"),
-        r"model.layers.\1.self_attn.compressor.ape_param.weight",
     ),
     (re.compile(r"^layers\.(\d+)\.attn\.(.+)$"), r"model.layers.\1.self_attn.\2"),
     # MoE gate (score weight + optional bias correction + hash table)
@@ -654,7 +650,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         (re.compile(r"^lm_head\.(.+)$"), r"head.\1"),
         (re.compile(r"^model\.layers\.(\d+)\.input_layernorm\.(.+)$"), r"layers.\1.attn_norm.\2"),
         (re.compile(r"^model\.layers\.(\d+)\.post_attention_layernorm\.(.+)$"), r"layers.\1.ffn_norm.\2"),
-        (re.compile(r"^model\.layers\.(\d+)\.self_attn\.sinks_param\.weight$"), r"layers.\1.attn.attn_sink"),
+        (re.compile(r"^model\.layers\.(\d+)\.self_attn\.sinks$"), r"layers.\1.attn.attn_sink"),
         # Indexer reverse: our ``compressor.indexer.*`` -> on-disk ``indexer.*``
         # with the nested compressor un-flattened for projections.
         (
@@ -662,7 +658,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             r"layers.\1.attn.indexer.compressor.norm.\2",
         ),
         (
-            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.indexer\.ape_param\.weight$"),
+            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.indexer\.ape$"),
             r"layers.\1.attn.indexer.compressor.ape",
         ),
         (
@@ -681,10 +677,6 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         (
             re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.kv_norm\.(.+)$"),
             r"layers.\1.attn.compressor.norm.\2",
-        ),
-        (
-            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.ape_param\.weight$"),
-            r"layers.\1.attn.compressor.ape",
         ),
         (re.compile(r"^model\.layers\.(\d+)\.self_attn\.(.+)$"), r"layers.\1.attn.\2"),
         # Gate (bias correction key mapped back to `bias`)

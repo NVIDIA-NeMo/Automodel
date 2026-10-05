@@ -51,6 +51,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
+  dtype: float32
   # MTP head predicts the next 2 tokens. mtp_use_repeated_layer reuses ONE physical MTP
   # layer across both depths (weight-tied), so the param count matches a 1-depth MTP. The
   # block-type pattern auto-resolves from Ultra's mtp_layers_block_type: ["attention", "moe"].

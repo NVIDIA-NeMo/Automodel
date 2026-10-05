@@ -16,8 +16,10 @@ import importlib
 import inspect
 import logging
 import warnings
+import weakref
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import lru_cache
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Dict, Generator, List, Sequence, Tuple, Union
@@ -26,6 +28,7 @@ import torch
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
+    CheckpointWrapper,
     checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
@@ -81,6 +84,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
 )
 from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce, translate_to_lora
 from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 if TYPE_CHECKING:
@@ -123,7 +127,6 @@ except (ImportError, FileNotFoundError, OSError):
         "MixedPrecisionPolicy", (), {"_msg": _MEGATRON_FSDP_050_REQUIRED_MSG}
     )
 
-# Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
 import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
 
 logger = logging.getLogger(__name__)
@@ -250,9 +253,18 @@ def _fully_shard_untied_input_output_embeddings(
 
 
 class ModelParallelizer:
-    """Single model-owned parallelization sidecar contract."""
+    """Single model-owned parallelization sidecar contract.
 
-    _customizes_moe_fsdp = False
+    Every FSDP2 unit a parallelizer creates goes through
+    :meth:`_fully_shard_module`, which applies the model's fp32 compute contract
+    (``_keep_in_fp32_modules_strict``) to the unit's mixed-precision policy. The
+    contract is resolved once per model by :meth:`_bind_model`; sidecars that
+    shard outside :meth:`_apply` wrap their sharding in it.
+    """
+
+    def __init__(self) -> None:
+        self._fp32_compute_module_names: tuple[str, ...] = ()
+        self._module_names: weakref.WeakKeyDictionary[nn.Module, str] | None = None
 
     def parallelize(
         self,
@@ -265,8 +277,86 @@ class ModelParallelizer:
 
         return _apply_model_parallelizer(self, model, mesh_context)
 
+    @contextmanager
+    def _bind_model(self, model: nn.Module) -> Generator[None, None, None]:
+        """Resolve ``model``'s fp32 compute contract for every unit sharded inside the block.
+
+        Records the strict fp32 tokens and each module's model-level name
+        (checkpoint wrappers are transparent), so model-level tokens such as
+        ``lm_head`` resolve inside the unit that owns them.
+        """
+        from nemo_automodel.components.models.common.utils import _get_strict_fp32_module_keywords
+
+        previous = (self._fp32_compute_module_names, self._module_names)
+        self._fp32_compute_module_names = tuple(_get_strict_fp32_module_keywords(model))
+        self._module_names = weakref.WeakKeyDictionary(
+            (module, canonical_parameter_fqn(f"{name}.").rstrip(".")) for name, module in model.named_modules()
+        )
+        try:
+            yield
+        finally:
+            self._fp32_compute_module_names, self._module_names = previous
+
+    def _fsdp_unit_mp_policy(
+        self,
+        module: nn.Module,
+        mp_policy: MixedPrecisionPolicy | None,
+        ignored_params: set[nn.Parameter] | None,
+    ) -> MixedPrecisionPolicy | None:
+        """Return the mixed-precision policy for the FSDP unit rooted at ``module``.
+
+        Parameters under the fp32 contract keep fp32 compute through
+        ``param_dtype_override_fn`` (see ``with_fp32_compute_override``). A leaf
+        unit made only of such parameters, e.g. an ``lm_head`` named in the
+        contract, computes in fp32 outright: its inputs are cast to fp32 and it
+        returns fp32 activations, since nothing in the unit can consume
+        ``mp_policy.param_dtype`` inputs.
+
+        Raises:
+            RuntimeError: ``module`` was not part of the bound model, so its
+                model-level name and contract cannot be resolved.
+        """
+        wrapped = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
+        if self._module_names is None:
+            module_name = ""
+        elif wrapped in self._module_names:
+            module_name = self._module_names[wrapped]
+        else:
+            raise RuntimeError(
+                f"{type(wrapped).__name__} was not part of the model when parallelization started, so its "
+                "fp32 compute contract cannot be resolved."
+            )
+        policy = parallelizer_utils.with_fp32_compute_override(
+            module, mp_policy, self._fp32_compute_module_names, ignored_params, module_name=module_name
+        )
+        if policy is mp_policy or any(
+            isinstance(child, FSDPModule) for child in module.modules() if child is not module
+        ):
+            return policy
+        ignored_param_ids = {id(param) for param in ignored_params or ()}
+        trainable = [
+            param
+            for _, param in parallelizer_utils.fsdp_unit_named_parameters(module)
+            if id(param) not in ignored_param_ids and param.requires_grad and param.dtype.is_floating_point
+        ]
+        if not all(policy.param_dtype_override_fn(param) == torch.float32 for param in trainable):
+            return policy
+        return replace(
+            policy,
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+            cast_forward_inputs=True,
+            param_dtype_override_fn=None,
+        )
+
     def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
-        """Apply the FSDP2 primitive used by this model sidecar."""
+        """Shard ``module`` as one FSDP2 unit under the model's fp32 compute contract.
+
+        Sidecars overriding this hook call ``super()._fully_shard_module`` or
+        :meth:`_fsdp_unit_mp_policy` so their units keep the contract.
+        """
+        kwargs["mp_policy"] = self._fsdp_unit_mp_policy(module, kwargs.get("mp_policy"), kwargs.get("ignored_params"))
         return fully_shard(module, **kwargs)
 
     def _validate_tp_mesh(self, model: nn.Module, tp_mesh: DeviceMesh) -> None:
@@ -458,45 +548,46 @@ class ModelParallelizer:
                         "or use a single shared embedding module."
                     )
 
-        # Find transformer layers and apply parallelisms
-        self._apply_fsdp_sharding(
-            model,
-            dp_mesh,
-            mp_policy,
-            offload_policy,
-            enable_fsdp2_prefetch,
-            fsdp2_backward_prefetch_depth,
-            fsdp2_forward_prefetch_depth,
-            reshard_after_forward,
-            frozen_multimodal_sharding=frozen_multimodal_sharding,
-            ignored_multimodal_params=ignored_multimodal_params,
-        )
+        with self._bind_model(model):
+            # Find transformer layers and apply parallelisms
+            self._apply_fsdp_sharding(
+                model,
+                dp_mesh,
+                mp_policy,
+                offload_policy,
+                enable_fsdp2_prefetch,
+                fsdp2_backward_prefetch_depth,
+                fsdp2_forward_prefetch_depth,
+                reshard_after_forward,
+                frozen_multimodal_sharding=frozen_multimodal_sharding,
+                ignored_multimodal_params=ignored_multimodal_params,
+            )
 
-        input_embedding_reshard_after_forward = (
-            reshard_after_forward if reshard_after_forward is not None else not pp_enabled
-        )
-        _fully_shard_untied_input_output_embeddings(
-            model,
-            mesh=dp_mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            input_reshard_after_forward=input_embedding_reshard_after_forward,
-            shard_module=self._fully_shard_module,
-        )
+            input_embedding_reshard_after_forward = (
+                reshard_after_forward if reshard_after_forward is not None else not pp_enabled
+            )
+            _fully_shard_untied_input_output_embeddings(
+                model,
+                mesh=dp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                input_reshard_after_forward=input_embedding_reshard_after_forward,
+                shard_module=self._fully_shard_module,
+            )
 
-        # Apply FSDP to the root model
-        # Do not reshard after forward for root model because its parameters
-        # will be used in backward immediately
-        root_ignored_params = ignored_params_for_root(model, ignored_multimodal_params)
-        root_kwargs = {
-            "mesh": dp_mesh,
-            "mp_policy": mp_policy,
-            "reshard_after_forward": False,
-            "offload_policy": offload_policy,
-        }
-        if root_ignored_params is not None:
-            root_kwargs["ignored_params"] = root_ignored_params
-        model = self._fully_shard_module(model, **root_kwargs)
+            # Apply FSDP to the root model
+            # Do not reshard after forward for root model because its parameters
+            # will be used in backward immediately
+            root_ignored_params = ignored_params_for_root(model, ignored_multimodal_params)
+            root_kwargs = {
+                "mesh": dp_mesh,
+                "mp_policy": mp_policy,
+                "reshard_after_forward": False,
+                "offload_policy": offload_policy,
+            }
+            if root_ignored_params is not None:
+                root_kwargs["ignored_params"] = root_ignored_params
+            model = self._fully_shard_module(model, **root_kwargs)
 
         cp_enabled = "cp" in device_mesh.mesh_dim_names and device_mesh["cp"].size() > 1
         if cp_enabled:

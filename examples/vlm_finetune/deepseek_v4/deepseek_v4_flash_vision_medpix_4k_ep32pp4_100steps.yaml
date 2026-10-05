@@ -36,7 +36,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
   trust_remote_code: false
-  torch_dtype: bfloat16
+  dtype: float32
   # Visual pseudo-token shifting is not defined by the released MTP path.
   num_nextn_predict_layers: 0
   backend:

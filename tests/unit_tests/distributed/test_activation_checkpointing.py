@@ -347,8 +347,8 @@ def test_submodule_checkpointing_preserves_canonical_state_dict_keys_for_propert
     class Mixer(nn.Module):
         def __init__(self):
             super().__init__()
-            self._fp32_params = nn.Module()
-            self._fp32_params.A_log = nn.Parameter(torch.ones(2))
+            self.extra = nn.Module()
+            self.extra.A_log = nn.Parameter(torch.ones(2))
 
     class AliasLayer(nn.Module):
         def __init__(self):
@@ -370,7 +370,7 @@ def test_submodule_checkpointing_preserves_canonical_state_dict_keys_for_propert
     assert isinstance(layer.mixer, CheckpointWrapper)
     assert isinstance(ac.unwrap_checkpoint_wrapper(layer.mixer), Mixer)
     assert [name for name, _ in layer.named_children()] == ["mixer"]
-    assert list(layer.state_dict()) == ["mixer._fp32_params.A_log"]
+    assert list(layer.state_dict()) == ["mixer.extra.A_log"]
 
 
 @pytest.mark.skipif(

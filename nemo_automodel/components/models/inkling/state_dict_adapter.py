@@ -85,11 +85,11 @@ def _native_to_raw_key(key: str) -> str:
     key = key.replace(".self_attn.o_proj.weight", ".attn.wo_ud.weight")
     key = key.replace(".self_attn.q_norm.weight", ".attn.q_norm.weight")
     key = key.replace(".self_attn.k_norm.weight", ".attn.k_norm.weight")
-    key = key.replace(".self_attn.k_sconv._fp32_params.weight", ".attn.k_sconv.weight")
-    key = key.replace(".self_attn.v_sconv._fp32_params.weight", ".attn.v_sconv.weight")
+    key = key.replace(".self_attn.k_sconv.conv1d.weight", ".attn.k_sconv.weight")
+    key = key.replace(".self_attn.v_sconv.conv1d.weight", ".attn.v_sconv.weight")
     key = key.replace(".self_attn.rel_logits_proj.proj", ".attn.rel_logits_proj.proj")
-    key = key.replace(".attn_sconv._fp32_params.weight", ".attn_sconv.weight")
-    key = key.replace(".mlp_sconv._fp32_params.weight", ".mlp_sconv.weight")
+    key = key.replace(".attn_sconv.conv1d.weight", ".attn_sconv.weight")
+    key = key.replace(".mlp_sconv.conv1d.weight", ".mlp_sconv.weight")
     key = key.replace(".input_layernorm.weight", ".attn_norm.weight")
     key = key.replace(".post_attention_layernorm.weight", ".mlp_norm.weight")
     key = key.replace(".mlp.experts.gate_and_up_projs", ".mlp.experts.w13_weight")
@@ -98,7 +98,7 @@ def _native_to_raw_key(key: str) -> str:
     key = key.replace(".mlp.shared_experts.down_proj", ".mlp.shared_experts.shared_w2_weight")
     key = key.replace(".mlp.gate_up_proj", ".mlp.w13_dn.weight")
     key = key.replace(".mlp.down_proj", ".mlp.w2_md.weight")
-    key = key.replace(".mlp.gate._fp32_params.e_score_correction_bias", ".mlp.gate.bias")
+    key = key.replace(".mlp.gate.e_score_correction_bias", ".mlp.gate.bias")
     return key
 
 
@@ -133,11 +133,11 @@ def _raw_to_native_key(key: str) -> str:
     key = key.replace(".attn.wo_ud.weight", ".self_attn.o_proj.weight")
     key = key.replace(".attn.q_norm.weight", ".self_attn.q_norm.weight")
     key = key.replace(".attn.k_norm.weight", ".self_attn.k_norm.weight")
-    key = key.replace(".attn.k_sconv.weight", ".self_attn.k_sconv._fp32_params.weight")
-    key = key.replace(".attn.v_sconv.weight", ".self_attn.v_sconv._fp32_params.weight")
+    key = key.replace(".attn.k_sconv.weight", ".self_attn.k_sconv.conv1d.weight")
+    key = key.replace(".attn.v_sconv.weight", ".self_attn.v_sconv.conv1d.weight")
     key = key.replace(".attn.rel_logits_proj.proj", ".self_attn.rel_logits_proj.proj")
-    key = key.replace(".attn_sconv.weight", ".attn_sconv._fp32_params.weight")
-    key = key.replace(".mlp_sconv.weight", ".mlp_sconv._fp32_params.weight")
+    key = key.replace(".attn_sconv.weight", ".attn_sconv.conv1d.weight")
+    key = key.replace(".mlp_sconv.weight", ".mlp_sconv.conv1d.weight")
     key = key.replace(".attn_norm.weight", ".input_layernorm.weight")
     key = key.replace(".mlp_norm.weight", ".post_attention_layernorm.weight")
     key = key.replace(".mlp.experts.w13_weight", ".mlp.experts.gate_and_up_projs")
@@ -146,7 +146,7 @@ def _raw_to_native_key(key: str) -> str:
     key = key.replace(".mlp.shared_experts.shared_w2_weight", ".mlp.shared_experts.down_proj")
     key = key.replace(".mlp.w13_dn.weight", ".mlp.gate_up_proj")
     key = key.replace(".mlp.w2_md.weight", ".mlp.down_proj")
-    key = key.replace(".mlp.gate.bias", ".mlp.gate._fp32_params.e_score_correction_bias")
+    key = key.replace(".mlp.gate.bias", ".mlp.gate.e_score_correction_bias")
     return key
 
 
@@ -262,15 +262,9 @@ class InklingStateDictAdapter(StateDictAdapter):
                     shared_parts.setdefault(prefix, {})[projection] = value
                 continue
 
-            native_key = key.replace(
-                ".mlp.gate.e_score_correction_bias",
-                ".mlp.gate._fp32_params.e_score_correction_bias",
-            )
-            native_key = native_key.replace(".k_sconv.conv1d.weight", ".k_sconv._fp32_params.weight")
-            native_key = native_key.replace(".v_sconv.conv1d.weight", ".v_sconv._fp32_params.weight")
-            native_key = native_key.replace(".attn_sconv.conv1d.weight", ".attn_sconv._fp32_params.weight")
-            native_key = native_key.replace(".mlp_sconv.conv1d.weight", ".mlp_sconv._fp32_params.weight")
-            state_dict[native_key] = value
+            # Transformers keys for the short convolutions and the router
+            # correction bias already equal the native names.
+            state_dict[key] = value
 
         for prefix, parts in dense_parts.items():
             if set(parts) != {"gate_proj", "up_proj"}:

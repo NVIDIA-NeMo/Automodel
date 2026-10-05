@@ -1464,18 +1464,14 @@ def _release_model_memory() -> None:
 # modules qualify — a generic leaf such as ``proj`` or ``scale`` (from
 # Gemma4's ``router.proj``/``router.scale``) would pin ``q_proj``,
 # ``down_proj``, and friends fp32 across the whole bf16 reference.
-_HF_FP32_LEAF_ALIASES = ("e_score_correction_bias",)
+_HF_FP32_LEAF_ALIASES = ("e_score_correction_bias", "A_log", "dt_bias")
 
 
 def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
     """Infer vanilla-HF fp32 names from AutoModel's model-owned checkpoint contract."""
     from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
-    from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
-        FP32_GDN_PARAM_NAMES,
-        has_gated_delta_net_fp32_checkpoint_contract,
-    )
 
-    module_names = list(FP32_GDN_PARAM_NAMES) if has_gated_delta_net_fp32_checkpoint_contract(hf_config) else []
+    module_names: list[str] = []
     model_cls = _resolve_custom_model_cls_for_config(hf_config)
     for name in getattr(model_cls, "_keep_in_fp32_modules_strict", None) or ():
         if name not in module_names:

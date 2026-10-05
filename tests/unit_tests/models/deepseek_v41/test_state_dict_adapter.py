@@ -29,12 +29,17 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 from transformers import PreTrainedModel
 
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    CheckpointingConfig,
+    _pin_strict_fp32_export_dtypes,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import (
     DeepseekV41StateDictAdapter,
+    _native_key,
     dequantize_checkpoint_weight,
 )
 from nemo_automodel.components.moe.config import MoEConfig
@@ -154,7 +159,7 @@ def test_released_projection_names_and_grouped_experts_roundtrip() -> None:
     assert "model.layers.0.attn_hc.fn" in native
     assert "model.layers.0.ffn_hc.scale" in native
     assert "model.layers.0.ffn.gate.e_score_correction_bias" in native
-    assert "model.layers.0.attn.sinks_param.weight" in native
+    assert "model.layers.0.attn.attn_sink" in native
     assert "model.layers.0.attn.compressor.norm.weight" in native
     assert "model.layers.0.ffn.shared_experts.gate_proj.weight" in native
     assert "model.hc_head" not in native
@@ -431,7 +436,7 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size
         for released, native, value in (
             (
                 "layers.0.attn.attn_sink",
-                "model.layers.0.attn.sinks_param.weight",
+                "model.layers.0.attn.attn_sink",
                 torch.tensor([1.00123, -0.33337, 2.00456, -3.00091]),
             ),
             (
@@ -554,6 +559,59 @@ def test_generic_checkpoint_keys_and_optional_tower_weights_are_preserved() -> N
     assert exported.keys() == source.keys()
     for key, value in source.items():
         torch.testing.assert_close(exported[key], value, rtol=0, atol=0)
-    assert adapter.forced_hf_dtype_mapping(native) == {
-        key: "float32" for key, value in source.items() if value.dtype == torch.float32
-    }
+
+
+def test_bf16_export_pins_only_strict_fp32_parameters() -> None:
+    """An fp32-stored V4.1 export pins exactly the ``_keep_in_fp32_modules_strict`` tensors to F32.
+
+    Every tensor is fp32 in memory, so a "value dtype is fp32" rule would double the size of
+    a bf16 export; the strict tokens select the mHC, sink, router-bias and head tensors only.
+    """
+    config = DeepseekV41Config(
+        vision_config={"num_hidden_layers": 0},
+        text_config=DeepseekV41TextConfig(
+            vocab_size=64,
+            hidden_size=64,
+            moe_intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            head_dim=32,
+            qk_rope_head_dim=16,
+            q_lora_rank=65,
+            o_lora_rank=32,
+            o_groups=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            compress_ratios=[0],
+            kv_source_layer_ids=[],
+            index_source_layer_ids=[],
+            index_head_dim=32,
+            candidate_source_layer_id=-1,
+            engram_layer_ids=[],
+            dspark_noise_token_id=0,
+            dtype="float32",
+        ),
+    )
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="torch")
+    with torch.device("meta"):
+        model = DeepseekV41ForCausalLM(config, backend=backend)
+    native = model.state_dict()
+    assert all(value.dtype is torch.float32 for value in native.values() if value.is_floating_point())
+    exported = model.state_dict_adapter.to_hf(native)
+
+    forced = _pin_strict_fp32_export_dtypes([model], exported, {"embed.weight": "BF16"})
+
+    strict_tokens = model._keep_in_fp32_modules_strict
+    expected = {key for key in exported if any(token in _native_key(key) for token in strict_tokens)}
+    assert {key for key, dtype in forced.items() if dtype == "F32"} == expected
+    assert forced["embed.weight"] == "BF16"
+    assert {
+        "layers.0.hc_attn_base",
+        "layers.0.hc_attn_scale",
+        "layers.0.hc_ffn_base",
+        "layers.0.attn.attn_sink",
+        "layers.0.ffn.gate.bias",
+        "head.weight",
+    } <= expected
+    assert not any(".experts." in key or key == "norm.weight" or key.startswith("embed.") for key in expected)
+    assert len(expected) < len(exported) // 2

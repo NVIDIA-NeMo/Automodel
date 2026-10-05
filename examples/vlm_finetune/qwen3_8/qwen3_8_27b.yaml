@@ -44,7 +44,7 @@ model:
     rms_norm: torch
     rope_fusion: false
   attn_implementation: sdpa
-  torch_dtype: bfloat16
+  dtype: float32
   text_config:
     mtp_num_hidden_layers: 1
   mtp_loss_scaling_factor: 0.1

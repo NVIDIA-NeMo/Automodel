@@ -104,15 +104,6 @@ class TestQwen3_5MTPConfig:
 
 
 class TestQwen3_5MTPModel:
-    def test_dense_adapter_routes_fp32_linear_attn_keys(self):
-        # The native backbone builds the fp32 ``_fp32_params`` SSMGate holder at
-        # construction, so the adapter must rename ``_fp32_params.A_log`` keys back
-        # to the bare HF layout at the save/load boundary.
-        cfg = _tiny_config(mtp_num_hidden_layers=1)
-        model = Qwen3_5ForCausalLM(cfg, backend=_backend())
-
-        assert model.state_dict_adapter.route_linear_attn_fp32_params
-
     def test_mtp_disabled_matches_hf_forward(self):
         cfg = _tiny_config(mtp_num_hidden_layers=0, use_cache=False)
         torch.manual_seed(1234)
@@ -165,13 +156,6 @@ class TestQwen3_5MTPModel:
 
 
 class TestQwen3_5VLMMTPModel:
-    def test_vlm_adapter_routes_fp32_linear_attn_keys(self):
-        # Same native fp32 SSMGate routing as the text-only model (see above).
-        cfg = _tiny_vlm_config(mtp_num_hidden_layers=1)
-        model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend())
-
-        assert model.state_dict_adapter.route_linear_attn_fp32_params
-
     def test_vlm_prepares_mtp_inputs_for_context_parallelism(self):
         cfg = _tiny_vlm_config(mtp_num_hidden_layers=1)
         model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend())

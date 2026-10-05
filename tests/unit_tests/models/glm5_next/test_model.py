@@ -10,7 +10,9 @@ from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextLinearAttention,
     Glm5NextSparseAttention,
 )
-from nemo_automodel.components.models.glm5_next.model import build_glm5_next_moe_config
+from nemo_automodel.components.models.glm5_next.model import (
+    build_glm5_next_moe_config,
+)
 from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config, tiny_glm5_next_model
 
 
@@ -243,12 +245,32 @@ def test_hybrid_layer_pattern_and_parallel_capabilities():
     assert "cudnn" in model._packed_cp_attn_backends
 
 
-def test_hyperconnection_fp32_parameters_have_a_dedicated_fsdp_holder():
-    hyperconnection = tiny_glm5_next_model().model.language_model.layers["0"].attn_hc
+def _expected_fp32_parameter_names() -> set[str]:
+    """Return the fp32-contract parameter names of the tiny hybrid model."""
+    config = tiny_glm5_next_config().text_config
+    names = set()
+    for index, block_type in enumerate(config.layer_types):
+        prefix = f"model.language_model.layers.{index}"
+        names.update(f"{prefix}.{site}.{name}" for site in ("attn_hc", "ffn_hc") for name in ("base", "scale"))
+        if block_type == "linear_attention":
+            names.update(f"{prefix}.self_attn.{name}" for name in ("A_log", "dt_bias"))
+    return names
 
-    assert set(dict(hyperconnection.named_parameters(recurse=False))) == {"fn"}
-    assert set(dict(hyperconnection._fp32_params.named_parameters())) == {"base", "scale"}
-    assert all(parameter.dtype is torch.float32 for parameter in hyperconnection._fp32_params.parameters())
+
+def test_fp32_contract_parameters_receive_finite_gradients():
+    torch.manual_seed(5)
+    model = tiny_glm5_next_model().train()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    document_ids = torch.tensor([[1, 1, 1, 2, 2, 2]], dtype=torch.int32)
+
+    model(input_ids=input_ids, attention_mask=document_ids).logits.square().mean().backward()
+
+    parameters = dict(model.named_parameters())
+    for name in _expected_fp32_parameter_names():
+        grad = parameters[name].grad
+        assert grad is not None, name
+        assert grad.dtype is torch.float32, name
+        assert torch.isfinite(grad).all(), name
 
 
 def test_moe_router_correction_bias_only_controls_expert_selection():
@@ -271,7 +293,7 @@ def test_short_sequence_training_uses_chunk_kda_and_reaches_kda_parameters(monke
     monkeypatch.setattr(glm5_next_layers, "_chunk_kda", fake_chunk_kda)
     # PyTorch short convolution and gate keep the test free of Triton compilation.
     monkeypatch.setattr(glm5_next_layers, "_SHORT_CONV_OK", False)
-    monkeypatch.setattr(glm5_next_layers, "_KDA_GATE_OK", False)
+    monkeypatch.setattr(glm5_next_layers, "HAVE_FUSED_KDA_GATE", False)
     config = tiny_glm5_next_config().text_config
     config.hidden_size, config.linear_head_dim, config.linear_num_heads = 128, 64, 2
     config.linear_conv_kernel_dim = 4

@@ -888,12 +888,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
     # modules afterwards (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb"]
-    # Gemma4Gate already computes routing in fp32 (softmax over 128 near-tied
-    # experts is ill-conditioned in bf16), upcasting from bf16 storage, so no
-    # AutoModel param needs pinning. These are HF's spellings of the same
-    # modules: they hold the vanilla-HF reference (ckpt_robustness tests) to the
-    # same fp32 routing contract instead of letting it round the router to bf16.
-    _keep_in_fp32_modules_strict = ["router.proj", "router.scale"]
+    # No fp32-contract parameters: Gemma4Gate upcasts its bf16 ``proj`` / ``scale``
+    # storage to fp32 in forward (softmax over 128 near-tied experts is
+    # ill-conditioned in bf16), so nothing is pinned fp32 for FSDP.
     # CP submesh, recorded by _cp_shard_batch_aux_only the first time the dispatch
     # hands the model the CP submesh; None means the forward embeds/shards nothing
     # for CP.

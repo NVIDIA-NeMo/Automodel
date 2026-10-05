@@ -47,6 +47,8 @@ MiniMax-M3 targets advanced use cases such as long-form video understanding, ext
 |---|---|
 | MiniMax-M3 | [`MiniMaxAI/MiniMax-M3`](https://huggingface.co/MiniMaxAI/MiniMax-M3) |
 
+Full-parameter FSDP2 training requires `model.dtype: float32`; see [Mixed-Precision Training](/development/mixed-precision-training#models-with-intrinsically-fp32-parameters).
+
 ## Example Recipes
 
 - [Full SFT - MedPix, EP32 + PP4](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml)

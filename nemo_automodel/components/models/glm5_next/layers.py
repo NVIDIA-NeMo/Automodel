@@ -24,6 +24,7 @@ from nemo_automodel.components.models.common.cudnn_sparse_attention import (
     cudnn_sparse_attention,
     is_cudnn_sparse_attention_available,
 )
+from nemo_automodel.components.models.common.fp32_gates import HAVE_FUSED_KDA_GATE, kda_decay_gate
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
@@ -39,7 +40,6 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 _FLA_MSG = "GLM-5.3 KDA requires the flash-linear-attention/fla extra for GPU training."
 _SHORT_CONV_OK, _fla_causal_conv1d = safe_import_from("fla.modules.conv", "causal_conv1d", msg=_FLA_MSG)
 _CHUNK_KDA_OK, _chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
-_KDA_GATE_OK, _fused_kda_gate = safe_import_from("fla.ops.kda.gate", "fused_kda_gate", msg=_FLA_MSG)
 
 
 class Glm5NextRMSNorm(nn.Module):
@@ -79,43 +79,14 @@ class Glm5NextUnweightedRMSNorm(nn.Module):
         )
 
 
-class Glm5NextHyperConnectionFp32Params(nn.Module):
-    """Own mHC parameters that must remain fp32 under FSDP mixed precision."""
-
-    def __init__(self, mix_size: int) -> None:
-        super().__init__()
-        self.base = nn.Parameter(torch.empty(mix_size, dtype=torch.float32))
-        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-
-    def forward(
-        self,
-        pre_w: torch.Tensor,
-        post_w: torch.Tensor,
-        comb_w: torch.Tensor,
-        hc: int,
-        eps: float,
-        sinkhorn_iters: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build FP32 mHC weights while this holder's FSDP unit is unsharded."""
-        pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
-        pre_scale, post_scale, comb_scale = self.scale.unbind(0)
-        pre = torch.sigmoid(pre_w * pre_scale + pre_b) + eps
-        post = 2 * torch.sigmoid(post_w * post_scale + post_b)
-        comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-        comb = torch.softmax(comb_logits, dim=-1) + eps
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-        for _ in range(sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-        return pre, post, comb
-
-
 class Glm5NextHyperConnection(nn.Module):
     """Manifold-constrained mixer for ``hc_mult`` residual streams.
 
     ``hidden_streams`` is ``[batch, sequence, hc_mult, hidden]``. The returned
     tensors are ``post [batch, sequence, hc_mult]``, ``comb [batch, sequence,
     hc_mult, hc_mult]`` and ``collapsed [batch, sequence, hidden]``.
+    ``base`` and ``scale`` are fp32 regardless of the model dtype; FSDP keeps
+    them fp32 through ``_keep_in_fp32_modules_strict``.
     """
 
     def __init__(self, config: Glm5NextTextConfig) -> None:
@@ -127,31 +98,30 @@ class Glm5NextHyperConnection(nn.Module):
         mix = (2 + self.hc_mult) * self.hc_mult
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * config.hidden_size, dtype=dtype))
-        self._fp32_params = Glm5NextHyperConnectionFp32Params(mix)
-
-    @property
-    def base(self) -> nn.Parameter:
-        """Expose the checkpoint's flat mHC base parameter."""
-        return self._fp32_params.base
-
-    @property
-    def scale(self) -> nn.Parameter:
-        """Expose the checkpoint's flat mHC scale parameter."""
-        return self._fp32_params.scale
+        self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32))
+        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build Sinkhorn mixing weights and collapse streams for one sublayer."""
-        hc = self.hc_mult
+        """Build the fp32 Sinkhorn mixing weights and collapse the streams for one sublayer.
+
+        Returns:
+            ``(post, comb, collapsed)``: the fp32 post-mixing and combination weights after
+            the base/scale affine map and sigmoid / softmax / Sinkhorn normalization, and
+            the pre-mixed stream in the input dtype.
+        """
+        hc, eps = self.hc_mult, self.hc_eps
         flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
-        pre, post, comb = self._fp32_params(
-            pre_w,
-            post_w,
-            comb_w,
-            hc,
-            self.hc_eps,
-            self.hc_sinkhorn_iters,
-        )
+        pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
+        pre_scale, post_scale, comb_scale = self.scale.unbind(0)
+        pre = torch.sigmoid(pre_w.float() * pre_scale + pre_b) + eps
+        post = 2 * torch.sigmoid(post_w.float() * post_scale + post_b)
+        comb_logits = comb_w.float().view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
+        comb = torch.softmax(comb_logits, dim=-1) + eps
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        for _ in range(self.hc_sinkhorn_iters - 1):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
         collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
         return post, comb, collapsed
 
@@ -224,33 +194,6 @@ def _rms_norm_gated(hidden_size: int, eps: float, dtype: torch.dtype) -> nn.Modu
     return _TorchRMSNormGated(hidden_size, eps, dtype)
 
 
-class Glm5NextKDAFp32Params(nn.Module):
-    """Own recurrent-decay parameters that must remain fp32 under FSDP."""
-
-    def __init__(self, num_heads: int, projection_size: int) -> None:
-        super().__init__()
-        # Keep the native layout identical to the released checkpoint.  Besides
-        # avoiding a state-dict reshape, this matters under FSDP: checkpoint
-        # planning sees a DTensor sharded along dimension zero and cannot remove
-        # that dimension before the parameter is materialized for forward.
-        self.A_log = nn.Parameter(torch.empty(num_heads, dtype=torch.float32))
-        self.dt_bias = nn.Parameter(torch.empty(projection_size, dtype=torch.float32))
-
-    def forward(self, gate: torch.Tensor, head_dim: int, lower_bound: float | None) -> torch.Tensor:
-        """Return log-decay gates ``[batch, sequence, heads, head_dim]``."""
-        gate = gate.reshape(*gate.shape[:-1], -1, head_dim)
-        if _KDA_GATE_OK and gate.is_cuda:
-            return _fused_kda_gate(
-                gate,
-                self.A_log.contiguous(),
-                dt_bias=self.dt_bias.contiguous(),
-                lower_bound=lower_bound,
-            )
-        gate = gate.float() + self.dt_bias.view(1, 1, -1, head_dim)
-        decay = self.A_log.view(1, 1, -1, 1).exp()
-        return lower_bound * torch.sigmoid(decay * gate) if lower_bound is not None else -decay * F.softplus(gate)
-
-
 def _torch_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -299,7 +242,13 @@ class Glm5NextLinearAttention(nn.Module):
         self.q_conv1d = _short_conv(self.projection_size, self.conv_size, dtype)
         self.k_conv1d = _short_conv(self.projection_size, self.conv_size, dtype)
         self.v_conv1d = _short_conv(self.projection_size, self.conv_size, dtype)
-        self._fp32_params = Glm5NextKDAFp32Params(self.num_heads, self.projection_size)
+        # The recurrent-decay parameters are fp32 regardless of the model dtype.
+        # Keep the native layout identical to the released checkpoint.  Besides
+        # avoiding a state-dict reshape, this matters under FSDP: checkpoint
+        # planning sees a DTensor sharded along dimension zero and cannot remove
+        # that dimension before the parameter is materialized for forward.
+        self.A_log = nn.Parameter(torch.empty(self.num_heads, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(torch.empty(self.projection_size, dtype=torch.float32))
         self.f_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=dtype)
         self.f_b_proj = nn.Linear(self.head_dim, self.projection_size, bias=False, dtype=dtype)
         self.b_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False, dtype=dtype)
@@ -308,16 +257,6 @@ class Glm5NextLinearAttention(nn.Module):
         self.o_norm = _rms_norm_gated(self.head_dim, config.rms_norm_eps, dtype)
         self.o_proj = nn.Linear(self.projection_size, config.hidden_size, bias=False, dtype=dtype)
         self._cp_mesh = None
-
-    @property
-    def A_log(self) -> nn.Parameter:
-        """Expose the checkpoint's flat ``A_log`` parameter name."""
-        return self._fp32_params.A_log
-
-    @property
-    def dt_bias(self) -> nn.Parameter:
-        """Expose the checkpoint's flat ``dt_bias`` parameter name."""
-        return self._fp32_params.dt_bias
 
     def setup_cp_attention(self, cp_mesh) -> None:
         """Attach the one-dimensional contiguous CP mesh."""
@@ -372,7 +311,14 @@ class Glm5NextLinearAttention(nn.Module):
         shape = (*hidden_states.shape[:-1], self.num_heads, self.head_dim)
         q, k, v = q.view(shape).contiguous(), k.view(shape).contiguous(), v.view(shape).contiguous()
         gate = self.f_b_proj(self.f_a_proj(hidden_states)).contiguous()
-        gate = self._fp32_params(gate, self.head_dim, self.config.linear_lower_bound).contiguous()
+        gate = kda_decay_gate(
+            gate.reshape(*gate.shape[:-1], -1, self.head_dim),
+            self.A_log,
+            self.dt_bias,
+            head_dim=self.head_dim,
+            lower_bound=self.config.linear_lower_bound,
+            use_fused=HAVE_FUSED_KDA_GATE and gate.is_cuda,
+        ).contiguous()
         beta = self.b_proj(hidden_states).float().sigmoid().contiguous()
         if _CHUNK_KDA_OK and hidden_states.is_cuda:
             # The chunk kernel runs at every sequence length: FLA's fused_recurrent_kda

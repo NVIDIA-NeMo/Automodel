@@ -325,8 +325,7 @@ class Glm5_2DSparkModel(nn.Module):
         ``freqs`` table to bf16 and dephase RoPE with absolute position, eroding draft
         acceptance (the mismatch grows with position, and a bf16 round-trip cannot be
         undone by upcasting). Snapshot the fp32 frequencies before the cast and restore
-        them after (the Fp32Safe rotary idiom used elsewhere in the repo), so the buffer
-        never makes a bf16 round-trip.
+        them after, so the buffer never makes a bf16 round-trip.
         """
         freqs = getattr(self, "freqs", None)
         freqs_fp32 = (

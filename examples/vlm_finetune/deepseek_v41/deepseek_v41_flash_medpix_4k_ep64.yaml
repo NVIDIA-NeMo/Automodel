@@ -35,7 +35,7 @@ model:
     revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
   trust_remote_code: false
   load_base_model: true
-  torch_dtype: bfloat16
+  dtype: float32
   use_liger_kernel: false
   use_sdpa_patching: false
   backend:
@@ -69,7 +69,6 @@ distributed:
   moe:
     reshard_after_forward: true
     wrap_outer_model: true
-    lm_head_precision: float32
     mp_policy:
       _target_: torch.distributed.fsdp.MixedPrecisionPolicy
       param_dtype: bfloat16

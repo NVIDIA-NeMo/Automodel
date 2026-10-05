@@ -133,31 +133,8 @@ def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch)
     call.assert_called_once_with(model, context, parallelizer=parallelizer)
 
 
-def test_moe_executor_uses_generic_sharding_by_default(monkeypatch):
+def test_moe_executor_receives_the_model_parallelizer(monkeypatch):
     parallelizer = ModelParallelizer()
-    model = nn.Linear(2, 2)
-    context = SimpleNamespace(
-        ep_size=2,
-        device_mesh=object(),
-        moe_mesh=object(),
-        strategy_config=FSDP2Config(),
-        moe_parallel_config=None,
-        activation_checkpointing=False,
-        reapply_trainability=None,
-        parallelize_axis_kwargs=lambda: {},
-    )
-    executor = Mock()
-    monkeypatch.setattr("nemo_automodel.components.moe.parallelizer.parallelize_model", executor)
-
-    assert _parallelize_moe(model, context, parallelizer=parallelizer) is model
-    assert executor.call_args.kwargs["model_parallelizer"] is None
-
-
-def test_moe_executor_receives_opted_in_model_parallelizer(monkeypatch):
-    class MoEModelParallelizer(ModelParallelizer):
-        _customizes_moe_fsdp = True
-
-    parallelizer = MoEModelParallelizer()
     model = nn.Linear(2, 2)
     context = SimpleNamespace(
         ep_size=2,

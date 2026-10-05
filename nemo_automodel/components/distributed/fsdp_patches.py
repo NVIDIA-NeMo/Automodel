@@ -12,81 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PyTorch FSDP compatibility patches owned by distributed infrastructure."""
+"""PyTorch FSDP compatibility patches owned by distributed infrastructure.
+
+Every patch here is required on PyTorch 2.12 and returns without installing
+once upstream FSDP2 covers the same case; each one checks exactly one upstream
+attribute as its version boundary.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Any
-
-
-def _widest_float_dtype(dtypes: Iterable[Any]) -> Any:
-    """Return the float dtype among ``dtypes`` that every other one converts into losslessly.
-
-    Args:
-        dtypes: Gradient dtypes from a single reduce-scatter group.
-
-    Returns:
-        The dtype with the largest element size; ties resolve to float32 over
-        the 2-byte float types.
-    """
-    import torch
-
-    return max(dtypes, key=lambda dtype: (torch.finfo(dtype).bits, dtype is torch.float32))
+import functools
 
 
 def patch_fsdp_uniform_reduce_dtype() -> None:
     """Give every FSDP2 reduce-scatter group local gradients of one dtype.
 
-    Gradient accumulation leaves a group holding ``reduce_dtype`` accumulations
-    for the parameters used so far, while any parameter whose gradient joins
-    later -- a locally unused parameter zero-filled by PyTorch's public API or
-    :func:`patch_fsdp_unused_param_reduction`, or one whose gradient lands after
-    its group's post-backward already ran -- contributes ``param_dtype``.
-    ``foreach_reduce`` then aborts with ``FSDP reduce-scatter expects uniform
-    gradient dtype``.
+    PyTorch 2.12 ``foreach_reduce`` asserts ``FSDP reduce-scatter expects
+    uniform gradient dtype``. Gradient accumulation leaves a group holding
+    ``reduce_dtype`` accumulations for the parameters used so far, while any
+    parameter whose gradient joins later -- a locally unused parameter
+    zero-filled by :func:`patch_fsdp_unused_param_reduction`, or one whose
+    gradient lands after its group's post-backward already ran -- contributes
+    ``param_dtype``. Widen the minority gradients to the promoted dtype right
+    before ``foreach_reduce`` copies them into its ``reduce_dtype`` buffer: no
+    value changes and FSDP2's own bookkeeping is left exactly as upstream leaves
+    it. Uniform groups pass straight through.
 
-    Normalize and widen gradients at the last possible moment, inside
-    ``foreach_reduce`` itself. That placement matters:
-
-    * ``FSDPParam`` normally unwraps gradients through
-      ``_get_grad_inner_tensor``. PyTorch versions whose public unused-parameter
-      API appends ``zeros_like(unsharded_param)`` directly can still leave a
-      ``DTensor`` in this list, so unwrap that residual value before sizing the
-      reduce-scatter buffer;
-    * FSDP2's own bookkeeping (``unsharded_param.grad`` /
-      ``unsharded_accumulated_grad``) is left exactly as upstream leaves it, so
-      no later reader of that state sees anything unusual;
-    * ``foreach_reduce`` immediately copies these gradients into a
-      ``reduce_dtype`` buffer anyway, so widening first changes no value.
-
-    Uniform groups are passed straight through, so the upstream assertion still
-    fires for genuinely inconsistent gradients such as fp8 weights that fail to
-    produce higher-precision ones. The patch is process-global and idempotent.
+    PyTorch >= 2.15 promotes the group's dtypes itself
+    (``FSDPParamGroup._get_reduce_dtype``) and packs mixed gradients with
+    ``chunk_cat_mixed_dtype``, so the patch returns without installing. The
+    patch is process-global and idempotent.
     """
     try:
+        import torch
         import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
         import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
     except ImportError:
+        return
+    if hasattr(param_group.FSDPParamGroup, "_get_reduce_dtype"):
         return
 
     original_foreach_reduce = collectives.foreach_reduce
     if getattr(original_foreach_reduce, "_automodel_uniform_reduce_dtype", False):
         return
+    # Anything outside these (integers, fp8) is passed through untouched so
+    # PyTorch's own uniformity assertion still reports inconsistent gradients.
+    widenable = {torch.float16, torch.bfloat16, torch.float32}
 
     def foreach_reduce_uniform_dtype(fsdp_params, unsharded_grads, *args, **kwargs):
-        from torch.distributed.tensor import DTensor
-
-        # PyTorch 2.13a0's unused-parameter branch can append a DTensor zero
-        # directly, while gradients from used parameters are already local
-        # tensors. Besides making ``fsdp.chunk_cat`` reject the mixed list, the
-        # DTensor's global numel makes FSDP size a global-shape staging buffer.
-        # Current PyTorch routes the zero through ``_get_grad_inner_tensor``;
-        # localizing here is the equivalent compatibility path for that build.
-        unsharded_grads[:] = [grad.to_local() if isinstance(grad, DTensor) else grad for grad in unsharded_grads]
         dtypes = {grad.dtype for grad in unsharded_grads}
-        if len(dtypes) > 1 and all(dtype.is_floating_point for dtype in dtypes):
-            target = _widest_float_dtype(dtypes)
+        if len(dtypes) > 1 and dtypes <= widenable:
+            target = functools.reduce(torch.promote_types, dtypes)
             # Mutate in place: ``foreach_reduce`` frees the gradients by clearing
             # this list, and that must still release the caller's references.
             unsharded_grads[:] = [grad if grad.dtype is target else grad.to(target) for grad in unsharded_grads]
@@ -100,11 +76,13 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
 def patch_fsdp_unused_param_reduction() -> None:
     """Backport FSDP2 unused-parameter reduction when the public API is absent.
 
-    The patch is process-global and idempotent. It only fills a missing local
-    gradient with zeros immediately before FSDP2 post-backward reduction, so
-    ranks that skipped a parameter still participate in the same collective as
-    ranks that used it. Callers must first prefer the public
-    ``FSDPModule.set_reduce_scatter_unused_params`` API.
+    Fill a missing local gradient with zeros immediately before FSDP2
+    post-backward reduction, so ranks that skipped a parameter still
+    participate in the same collective as ranks that used it. PyTorch >= 2.15
+    provides ``FSDPModule.set_reduce_scatter_unused_params`` (its zero goes
+    through ``FSDPParam.unsharded_zero_grad_data``), so the patch returns
+    without installing and callers enable the public API per unit instead. The
+    patch is process-global and idempotent.
 
     Raises:
         RuntimeError: If the installed PyTorch exposes neither the public API
@@ -112,6 +90,7 @@ def patch_fsdp_unused_param_reduction() -> None:
     """
     try:
         import torch
+        from torch.distributed.fsdp import FSDPModule
         from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
         from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
     except ImportError as error:
@@ -119,6 +98,8 @@ def patch_fsdp_unused_param_reduction() -> None:
             "Context parallelism requires FSDP unused-parameter reduction, but this PyTorch "
             "version provides neither the public API nor the compatible FSDP2 implementation."
         ) from error
+    if hasattr(FSDPModule, "set_reduce_scatter_unused_params"):
+        return
 
     original_post_backward = FSDPParamGroup.post_backward
     if getattr(original_post_backward, "_automodel_reduce_scatter_unused_params", False):
@@ -127,6 +108,8 @@ def patch_fsdp_unused_param_reduction() -> None:
     def _post_backward_with_unused_param_reduction(self, *args, **kwargs):
         if self.reduce_grads and self._training_state == TrainingState.PRE_BACKWARD:
             for fsdp_param in self.fsdp_params:
+                # Same lazy-state check as upstream post_backward: a unit that
+                # never ran forward has no unsharded parameter to zero-fill.
                 if not hasattr(fsdp_param, "_unsharded_param"):
                     continue
                 if fsdp_param.unsharded_accumulated_grad is not None:
@@ -134,10 +117,9 @@ def patch_fsdp_unused_param_reduction() -> None:
                 param = fsdp_param.unsharded_param
                 if param.requires_grad and param.grad is None:
                     # ``zeros_like`` on the *unsharded* parameter is the dtype
-                    # autograd would have produced under any precision policy
-                    # (bf16 compute over fp32 storage, an fp32-pinned unit, or no
-                    # casting at all). ``_align_accumulated_grad_dtype`` then
-                    # promotes it to ``reduce_dtype`` if the group is accumulating.
+                    # autograd would have produced under the unit's precision
+                    # policy; ``patch_fsdp_uniform_reduce_dtype`` widens it if
+                    # the group is already accumulating in ``reduce_dtype``.
                     param.grad = torch.zeros_like(param, memory_format=torch.preserve_format)
         return original_post_backward(self, *args, **kwargs)
 
@@ -148,15 +130,21 @@ def patch_fsdp_unused_param_reduction() -> None:
 def patch_fsdp_accumulated_grad_guard() -> None:
     """Guard FSDP2 post-backward against params that were never unsharded.
 
-    PyTorch FSDP2 creates ``_unsharded_param`` lazily from an FSDP unit's
-    forward pre-hook. If a separately wrapped unit is skipped by the batch
-    (for example a vision tower on text-only data), deferred post-backward can
-    dereference that missing field. Missing lazy state means there is no
-    unsharded grad to upcast, so the exact missing-field case can return early.
+    PyTorch 2.12 creates ``_unsharded_param`` lazily from an FSDP unit's
+    forward pre-hook, and ``FSDPParam.to_accumulated_grad_if_needed``
+    dereferences it unconditionally. If a separately wrapped unit is skipped
+    by the batch (for example a vision tower on text-only data), deferred
+    post-backward raises ``AttributeError`` there. Missing lazy state means
+    there is no unsharded grad to upcast, so that exact case returns early.
+
+    PyTorch >= 2.15 removed ``to_accumulated_grad_if_needed`` and reads the
+    lazy field defensively, so the patch returns without installing.
     """
     try:
         from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
-    except Exception:
+    except ImportError:
+        return
+    if not hasattr(FSDPParam, "to_accumulated_grad_if_needed"):
         return
 
     orig = FSDPParam.to_accumulated_grad_if_needed

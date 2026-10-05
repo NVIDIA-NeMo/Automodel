@@ -77,12 +77,15 @@ def test_reattaches_chat_template_from_hub_cache(mock_auto_processor, mock_hf_hu
     mock_auto_processor.from_pretrained.return_value = proc
     mock_hf_hub_download.return_value = "/cache/MiniMax-M3/chat_template.jinja"
 
-    with mock.patch(
-        "nemo_automodel.components.models.minimax_m3_vl.processing.os.path.isfile",
-        return_value=False,
-    ), mock.patch(
-        "builtins.open",
-        mock.mock_open(read_data="HUB-TEMPLATE"),
+    with (
+        mock.patch(
+            "nemo_automodel.components.models.minimax_m3_vl.processing.os.path.isfile",
+            return_value=False,
+        ),
+        mock.patch(
+            "builtins.open",
+            mock.mock_open(read_data="HUB-TEMPLATE"),
+        ),
     ):
         out = build_minimax_m3_vl_processor("MiniMaxAI/MiniMax-M3", trust_remote_code=True)
 

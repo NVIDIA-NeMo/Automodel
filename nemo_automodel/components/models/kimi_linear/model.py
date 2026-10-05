@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +32,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common.fp32_gates import HAVE_FUSED_KDA_GATE, kda_decay_gate
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packing import (
     flatten_packed_sequence_metadata,
@@ -73,52 +73,11 @@ _FUSED_RMSNORM_GATED_OK, FusedRMSNormGated = safe_import_from(
 )
 _CHUNK_KDA_OK, chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
 _RECURRENT_KDA_OK, fused_recurrent_kda = safe_import_from("fla.ops.kda", "fused_recurrent_kda", msg=_FLA_MSG)
-_KDA_GATE_OK, fused_kda_gate = safe_import_from("fla.ops.kda.gate", "fused_kda_gate", msg=_FLA_MSG)
-try:
-    _FUSED_KDA_GATE_HAS_G_BIAS = _KDA_GATE_OK and "g_bias" in inspect.signature(fused_kda_gate).parameters
-except (TypeError, ValueError):
-    _FUSED_KDA_GATE_HAS_G_BIAS = False
 
 
 def _require_fla() -> None:
-    if not all((_SHORT_CONV_OK, _FUSED_RMSNORM_GATED_OK, _CHUNK_KDA_OK, _RECURRENT_KDA_OK, _KDA_GATE_OK)):
+    if not all((_SHORT_CONV_OK, _FUSED_RMSNORM_GATED_OK, _CHUNK_KDA_OK, _RECURRENT_KDA_OK, HAVE_FUSED_KDA_GATE)):
         raise UnavailableError(_FLA_MSG)
-
-
-def _fused_kda_gate(g: torch.Tensor, a_log: torch.Tensor, head_dim: int, dt_bias: torch.Tensor) -> torch.Tensor:
-    """Call FLA fused KDA gate across FLA versions.
-
-    Args:
-        g: Tensor of shape [batch, sequence, heads * head_dim].
-        a_log: Tensor of shape [1, 1, heads, 1].
-        head_dim: Per-head KDA dimension.
-        dt_bias: Tensor of shape [heads * head_dim].
-
-    Returns:
-        Tensor of shape [batch, sequence, heads, head_dim].
-    """
-    if _FUSED_KDA_GATE_HAS_G_BIAS:
-        return fused_kda_gate(g, a_log, head_dim, g_bias=dt_bias)
-    gate_input = g if g.shape[-1] == head_dim else g.reshape(*g.shape[:-1], -1, head_dim)
-    return fused_kda_gate(gate_input, a_log, dt_bias=dt_bias)
-
-
-def _torch_kda_gate(g: torch.Tensor, a_log: torch.Tensor, head_dim: int, dt_bias: torch.Tensor) -> torch.Tensor:
-    """Torch equivalent of FLA's KDA gate.
-
-    Args:
-        g: Tensor of shape [batch, sequence, heads * head_dim] or [batch, sequence, heads, head_dim].
-        a_log: Tensor of shape [1, 1, heads, 1].
-        head_dim: Per-head KDA dimension.
-        dt_bias: Tensor of shape [heads * head_dim].
-
-    Returns:
-        Tensor of shape [batch, sequence, heads, head_dim].
-    """
-    gate = g if g.shape[-1] == head_dim else g.reshape(*g.shape[:-1], -1, head_dim)
-    num_heads = gate.shape[-2]
-    gate = gate.float() + dt_bias.float().view(num_heads, head_dim)
-    return -a_log.float().view(num_heads, 1).exp() * F.softplus(gate)
 
 
 def _index_first_axis(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -471,58 +430,12 @@ class KimiMLAAttention(nn.Module):
             self.kv_a_layernorm.reset_parameters()
 
 
-class _KimiKDAFp32Param:
-    """Descriptor exposing a KDA fp32 parameter from the ``_fp32_params`` holder."""
-
-    def __init__(self, name: str) -> None:
-        self.name = name
-
-    def __get__(
-        self, obj: nn.Module | None, owner: type[nn.Module] | None = None
-    ) -> nn.Parameter | "_KimiKDAFp32Param":
-        del owner
-        if obj is None:
-            return self
-        holder = obj._modules.get("_fp32_params")
-        if holder is not None:
-            return getattr(holder, self.name)
-        param = obj._parameters.get(self.name)
-        if param is not None:
-            return param
-        raise AttributeError(f"{type(obj).__name__} has no KDA fp32 parameter {self.name!r}.")
-
-
-class KimiKDAFp32Params(nn.Module):
-    """Owns Kimi KDA fp32 recurrent-decay parameters and computes the gate."""
-
-    def __init__(self, num_heads: int, projection_size: int) -> None:
-        super().__init__()
-        self.A_log = nn.Parameter(torch.empty(num_heads, dtype=torch.float32).view(1, 1, num_heads, 1))
-        self.dt_bias = nn.Parameter(torch.empty(projection_size, dtype=torch.float32))
-
-    def forward(self, g: torch.Tensor, head_dim: int, use_fused_gate: bool = True) -> torch.Tensor:
-        """Compute KDA decay gate while holder params are unsharded by FSDP.
-
-        Args:
-            g: Tensor of shape [batch, sequence, heads * head_dim].
-            head_dim: Per-head KDA dimension.
-            use_fused_gate: Whether to use FLA's fused KDA gate kernel.
-
-        Returns:
-            Tensor of shape [batch, sequence, heads, head_dim].
-        """
-        a_log = self.A_log.contiguous()
-        dt_bias = self.dt_bias.contiguous()
-        if use_fused_gate:
-            return _fused_kda_gate(g, a_log, head_dim, dt_bias)
-        return _torch_kda_gate(g, a_log, head_dim, dt_bias)
-
-
 class KimiDeltaAttention(nn.Module):
-    """Kimi Delta Attention backed by FLA KDA kernels."""
+    """Kimi Delta Attention backed by FLA KDA kernels.
 
-    A_log = _KimiKDAFp32Param("A_log")
-    dt_bias = _KimiKDAFp32Param("dt_bias")
+    ``A_log`` and ``dt_bias`` are fp32 regardless of the model dtype;
+    ``_keep_in_fp32_modules_strict`` names them so FSDP2 keeps them in fp32.
+    """
 
     def __init__(self, config: KimiLinear48BConfig, layer_idx: int) -> None:
         _require_fla()
@@ -565,7 +478,8 @@ class KimiDeltaAttention(nn.Module):
             dtype=dtype,
         )
 
-        self._fp32_params = KimiKDAFp32Params(self.num_heads, projection_size)
+        self.A_log = nn.Parameter(torch.empty(1, 1, self.num_heads, 1, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(torch.empty(projection_size, dtype=torch.float32))
         self.f_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False, dtype=dtype)
         self.f_b_proj = nn.Linear(self.head_dim, projection_size, bias=False, dtype=dtype)
         self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False, dtype=dtype)
@@ -731,7 +645,14 @@ class KimiDeltaAttention(nn.Module):
         k = k.reshape(*k.shape[:-1], self.num_k_heads, self.head_k_dim).contiguous()
         v = v.reshape(*v.shape[:-1], self.num_heads, self.head_dim).contiguous()
         beta = beta.contiguous()
-        g = self._fp32_params(g, self.head_dim, getattr(self.config, "kda_use_fused_gate", True)).contiguous()
+        g = kda_decay_gate(
+            g,
+            self.A_log,
+            self.dt_bias,
+            head_dim=self.head_dim,
+            lower_bound=None,
+            use_fused=self.config.kda_use_fused_gate,
+        ).contiguous()
         use_qk_l2norm_in_kernel = getattr(self.config, "kda_use_qk_l2norm_in_kernel", True)
         if not use_qk_l2norm_in_kernel:
             q = F.normalize(q.float(), p=2, dim=-1, eps=1e-6).to(q.dtype)
@@ -1155,8 +1076,9 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
     """Kimi Linear causal LM with native trainable MoE layers."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
-    _keep_in_fp32_modules = ["_fp32_params", "e_score_correction_bias"]
-    _keep_in_fp32_modules_strict = ["_fp32_params", "e_score_correction_bias"]
+    # KDA decay parameters keep fp32 (HF names, prefixed with the attention attribute so they
+    # cannot match MLA layers), as does the router correction bias.
+    _keep_in_fp32_modules_strict = ["self_attn.A_log", "self_attn.dt_bias", "e_score_correction_bias"]
     # Kimi Linear owns context parallelism end to end: it shards the batch itself
     # (contiguous slices, as FLA's CP kernels require) and each layer type carries
     # its own transport, so CP does not depend on the attention backend.
@@ -1362,7 +1284,7 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
                 a=-cutoff_factor * final_out_std,
                 b=cutoff_factor * final_out_std,
             )
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
 
 
 ModelClass = KimiLinear48BForCausalLM

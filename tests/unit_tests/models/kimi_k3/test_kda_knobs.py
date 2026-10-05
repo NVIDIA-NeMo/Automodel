@@ -124,7 +124,7 @@ def test_conv_backend_reaches_the_short_convolutions():
     if kmod._short_conv_backend_kwargs("cuda") != {"backend": "cuda"}:
         pytest.skip("the installed FLA ShortConvolution has no backend parameter")
     reference = kmod.KimiDeltaAttention(_small_config(), layer_idx=0)
-    assert reference.q_conv1d._fp32_params.backend == "triton"
+    assert reference.q_conv1d.backend == "triton"
 
     try:
         import causal_conv1d  # noqa: F401
@@ -137,7 +137,7 @@ def test_conv_backend_reaches_the_short_convolutions():
         warnings.simplefilter("ignore")
         knobbed = kmod.KimiDeltaAttention(_small_config(kda_conv_backend="cuda"), layer_idx=0)
     for conv in (knobbed.q_conv1d, knobbed.k_conv1d, knobbed.v_conv1d):
-        assert conv._fp32_params.backend == expected
+        assert conv.backend == expected
 
 
 def test_default_options_keep_the_reference_path_and_never_request_the_final_state(monkeypatch):

@@ -40,7 +40,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: thinkingmachines/Inkling-Small
-  torch_dtype: bfloat16
+  dtype: float32
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa

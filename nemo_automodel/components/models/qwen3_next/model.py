@@ -27,6 +27,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.fp32_gates import GDN_FP32_PARAM_TOKENS
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -53,8 +54,8 @@ class Block(nn.Module):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
-            # fp32-aware GatedDeltaNet: keeps the intrinsically-fp32 A_log/dt_bias decay
-            # gate in fp32 under FSDP mixed precision (see Qwen3NextFp32GatedDeltaNet).
+            # fp32-aware GatedDeltaNet: A_log/dt_bias are fp32 parameters and the decay
+            # gate is computed in fp32 (see Qwen3NextFp32GatedDeltaNet).
             self.linear_attn = Qwen3NextFp32GatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(config, layer_idx, backend)
@@ -273,7 +274,9 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     _uses_native_fa4 = True
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
-    _keep_in_fp32_modules_strict = ["_fp32_params"]
+    # Intrinsically-fp32 GatedDeltaNet gate parameters (HF names). cast_model_to_dtype
+    # restores them to fp32 and ModelParallelizer keeps them computing in fp32.
+    _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -321,10 +324,6 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
-        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
-        if "_fp32_params" not in keep_fp32:
-            keep_fp32.append("_fp32_params")
-        self._keep_in_fp32_modules = keep_fp32
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3NextStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
@@ -421,7 +420,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

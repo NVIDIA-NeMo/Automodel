@@ -16,7 +16,7 @@
 
 The DSV4 compressor's DeepseekV4Indexer feeds its outputs through
 ``topk(...).indices``, which is non-differentiable. No gradient ever reaches
-the indexer's wkv / wgate / ape_param / wq_b / weights_proj params, so AdamW
+the indexer's wkv / wgate / ape / wq_b / weights_proj params, so AdamW
 never allocates lazy state slots for them, and DCP checkpoint resume fails
 with ``RuntimeError: Missing key in checkpoint state_dict:
 optim.state.model.layers.{i}.self_attn.compressor.indexer.wkv.weight.step.``
@@ -45,7 +45,7 @@ class _FakeIndexer(nn.Module):
         super().__init__()
         self.wkv = nn.Linear(dim, dim, bias=False)
         self.wgate = nn.Linear(dim, dim, bias=False)
-        self.ape_param = nn.Linear(dim, dim, bias=False)
+        self.ape = nn.Parameter(torch.zeros(4, dim))
         self.wq_b = nn.Linear(dim, dim, bias=False)
         self.weights_proj = nn.Linear(dim, dim, bias=False)
 

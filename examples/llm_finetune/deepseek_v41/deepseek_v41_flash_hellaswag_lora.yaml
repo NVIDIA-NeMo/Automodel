@@ -107,7 +107,6 @@ distributed:
   moe:
     reshard_after_forward: true
     wrap_outer_model: true
-    lm_head_precision: float32
     # Single-pass mHC carries FP32 coefficients alongside BF16 residuals.
     # Preserve each module's explicit casts across FSDP boundaries.
     mp_policy:

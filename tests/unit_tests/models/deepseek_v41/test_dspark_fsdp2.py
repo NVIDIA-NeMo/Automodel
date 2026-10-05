@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real CPU/Gloo regression for the mixed-dtype DeepSeek V4.1 DSpark FSDP path."""
+"""Real CPU/Gloo regression for the DeepSeek V4.1 DSpark FSDP path.
+
+FSDP2 keeps one storage dtype per unit, so the draft trains from fp32 master
+weights; the bf16 mixed-precision policy computes in bf16 except for the
+strict fp32 parameters, which keep fp32 compute through the per-parameter
+override the base ``ModelParallelizer`` installs on every unit.
+"""
 
 from __future__ import annotations
 
@@ -25,14 +31,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.distributed.activation_checkpointing import apply_submodule_checkpointing
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
@@ -81,15 +86,11 @@ def _config(dtype: str = "bfloat16") -> DeepseekV41TextConfig:
 def _fully_shard_model(model: DeepseekV41DSparkModel, mesh: DeviceMesh, dtype: torch.dtype) -> None:
     """Apply the same layer and root FSDP2 wrapping used by the DSpark recipe."""
     policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32)
-    for layer in model.layers:
-        fully_shard_by_dtype(
-            layer,
-            mesh=mesh,
-            mp_policy=policy,
-            offload_policy=None,
-            fp32_compute_module_names=tuple(model._keep_in_fp32_modules_strict),
-        )
-    fully_shard(model, mesh=mesh, mp_policy=policy)
+    parallelizer = ModelParallelizer()
+    with parallelizer._bind_model(model):
+        for layer in model.layers:
+            parallelizer._fully_shard_module(layer, mesh=mesh, mp_policy=policy)
+        parallelizer._fully_shard_module(model, mesh=mesh, mp_policy=policy)
 
 
 def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir: str) -> None:
@@ -102,12 +103,12 @@ def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir
         torch.manual_seed(17)
         mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("dp",))
         model = DeepseekV41DSparkModel(
-            _config(),
+            _config(dtype="float32"),
             BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch"),
             num_anchors=1,
             enable_confidence_head=True,
         )
-        cast_model_to_dtype(model, torch.bfloat16)
+        assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
         model.set_embedding_head_trainable(False)
         if activation_checkpointing:
             apply_submodule_checkpointing(list(model.layers), has_kv_sharing=False)
@@ -168,8 +169,9 @@ def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir
     hard_timeout=70,
     reason="Spawns two FSDP workers, compiles draft forward/backward, and saves and restores a sharded checkpoint.",
 )
+@pytest.mark.requires_param_dtype_override
 @pytest.mark.parametrize("activation_checkpointing", [False, True])
-def test_bf16_dspark_fsdp_forward_backward_checkpoint_roundtrip(
+def test_fp32_master_dspark_fsdp_forward_backward_checkpoint_roundtrip(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, activation_checkpointing: bool
 ) -> None:
     # Other unit-test modules disable compilation during collection. Spawned workers

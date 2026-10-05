@@ -999,17 +999,6 @@ class TestConvertSingleTensorToHf:
         assert result[0][0] == "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"
         assert torch.equal(result[0][1], tensor)
 
-    def test_strips_fp32_holder_segment_on_save(self, adapter):
-        # The fp32 SSM-gating holder is stripped back to the bare HF key on save.
-        tensor = torch.randn(8)
-        fqn = "model.language_model.layers.0.linear_attn._fp32_params.A_log"
-
-        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
-
-        assert len(result) == 1
-        assert result[0][0] == "model.language_model.layers.0.linear_attn.A_log"
-        assert torch.equal(result[0][1], tensor)
-
     def test_non_expert_tensor_passthrough(self, adapter):
         tensor = torch.randn(64, 64)
         fqn = "model.language_model.layers.0.self_attn.q_proj.weight"
@@ -1122,8 +1111,11 @@ class TestConvertSingleTensorToHf:
 # ---------------------------------------------------------------------------
 class TestConditionalGenerationStateDictAdapterWiring:
     def test_passes_top_level_model_name_to_state_dict_adapter(self):
-        class DummyRotary:
-            inv_freq = torch.ones(4)
+        class DummyRotary(torch.nn.Module):
+            # A real module: the constructor swaps its class to the fp32-safe rotary in place.
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("inv_freq", torch.ones(4), persistent=False)
 
         class DummyVisual:
             def __init__(self):
@@ -1140,16 +1132,6 @@ class TestConditionalGenerationStateDictAdapterWiring:
 
         class DummyMTPConfig:
             enabled = False
-
-        class DummyFp32SafeRotary:
-            def __init__(self, dim):
-                self.dim = dim
-
-            def register_buffer(self, *args, **kwargs):
-                pass
-
-            def to(self, *args, **kwargs):
-                return self
 
         adapter_calls = []
 
@@ -1177,11 +1159,6 @@ class TestConditionalGenerationStateDictAdapterWiring:
             patch.object(qwen3_5_moe_model, "initialize_linear_module", Mock(return_value=Mock())),
             patch.object(qwen3_5_moe_model, "build_mtp_config_from_hf", Mock(return_value=DummyMTPConfig())),
             patch.object(qwen3_5_moe_model, "Qwen3_5MoeStateDictAdapter", DummyAdapter),
-            patch.object(
-                qwen3_5_moe_model,
-                "Fp32SafeQwen3_5MoeVisionRotaryEmbedding",  # pragma: allowlist secret
-                DummyFp32SafeRotary,
-            ),
         ):
             qwen3_5_moe_model.Qwen3_5MoeForConditionalGeneration(config, backend=backend)
 
@@ -1289,148 +1266,3 @@ class TestFromHFEpShard:
         # No ep_shard slicing — full transposed tensor
         assert local_gate.shape == (n_experts, hidden, inter)
         torch.testing.assert_close(local_gate, gate_up_hf.transpose(1, 2).to(adapter.dtype))
-
-
-class TestFp32ParamRouting:
-    """Routing/stripping of SSM-gating params into/out of the fp32 holder."""
-
-    def test_strip_fp32_params_removes_holder_segment(self):
-        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _strip_fp32_params
-
-        assert (
-            _strip_fp32_params("model.language_model.layers.0.linear_attn._fp32_params.A_log")
-            == "model.language_model.layers.0.linear_attn.A_log"
-        )
-        assert (
-            _strip_fp32_params("model.language_model.layers.0.linear_attn._fp32_params.dt_bias")
-            == "model.language_model.layers.0.linear_attn.dt_bias"
-        )
-
-    def test_strip_fp32_params_passthrough(self):
-        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _strip_fp32_params
-
-        for key in (
-            "model.language_model.layers.0.self_attn.q_proj.weight",
-            "model.language_model.layers.0.linear_attn.norm.weight",
-        ):
-            assert _strip_fp32_params(key) == key
-
-    def test_route_fp32_params_routes_gating_keys(self):
-        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _route_fp32_params
-
-        assert (
-            _route_fp32_params("model.language_model.layers.0.linear_attn.A_log")
-            == "model.language_model.layers.0.linear_attn._fp32_params.A_log"
-        )
-        assert (
-            _route_fp32_params("model.language_model.layers.0.linear_attn.dt_bias")
-            == "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
-        )
-
-    def test_route_fp32_params_passthrough(self):
-        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import _route_fp32_params
-
-        # Already routed, non-gating param, and a non-linear_attn A_log all pass through.
-        for key in (
-            "model.language_model.layers.0.linear_attn._fp32_params.A_log",
-            "model.language_model.layers.0.linear_attn.norm.weight",
-            "model.some.other.path.A_log",
-        ):
-            assert _route_fp32_params(key) == key
-
-    def test_route_strip_round_trip(self):
-        from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import (
-            _route_fp32_params,
-            _strip_fp32_params,
-        )
-
-        bare = "model.language_model.layers.3.linear_attn.A_log"
-        assert _strip_fp32_params(_route_fp32_params(bare)) == bare
-
-    def test_from_hf_routes_gating_keys_into_holder(self, adapter):
-        # On load, bare HF SSM-gating keys are routed into the fp32 holder.
-        hf_state = {
-            "model.language_model.layers.0.linear_attn.A_log": torch.randn(8),
-            "model.language_model.layers.0.linear_attn.dt_bias": torch.randn(8),
-        }
-
-        out = adapter.from_hf(hf_state)
-
-        assert "model.language_model.layers.0.linear_attn._fp32_params.A_log" in out
-        assert "model.language_model.layers.0.linear_attn._fp32_params.dt_bias" in out
-        assert "model.language_model.layers.0.linear_attn.A_log" not in out
-
-    def test_to_hf_strips_a_log_holder(self, adapter):
-        sd = {"model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)}
-        out = adapter.to_hf(sd)
-        assert "model.language_model.layers.0.linear_attn.A_log" in out
-        assert all("_fp32_params" not in k for k in out)
-
-    def test_to_hf_strips_dt_bias_holder(self, adapter):
-        sd = {"model.language_model.layers.2.linear_attn._fp32_params.dt_bias": torch.ones(4)}
-        out = adapter.to_hf(sd)
-        assert "model.language_model.layers.2.linear_attn.dt_bias" in out
-        assert all("_fp32_params" not in k for k in out)
-
-    def test_to_hf_upcasts_gdn_fp32_params_saved_as_bf16(self, adapter):
-        sd = {
-            "model.language_model.layers.0.linear_attn._fp32_params.A_log": torch.zeros(4, dtype=torch.bfloat16),
-            "model.language_model.layers.0.linear_attn._fp32_params.dt_bias": torch.ones(4, dtype=torch.bfloat16),
-            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
-        }
-
-        out = adapter.to_hf(sd)
-
-        assert out["model.language_model.layers.0.linear_attn.A_log"].dtype == torch.float32
-        assert out["model.language_model.layers.0.linear_attn.dt_bias"].dtype == torch.float32
-        q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
-        assert out[q_proj_key] is sd[q_proj_key]
-        assert out[q_proj_key].dtype == torch.bfloat16
-
-    def test_forced_hf_dtype_mapping_marks_gdn_fp32_params(self, adapter):
-        state_dict = {
-            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.float32),
-            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.float32),
-            "model.language_model.layers.0.linear_attn.conv1d.weight": torch.zeros(4, dtype=torch.float32),
-            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.float32),
-        }
-
-        assert adapter.forced_hf_dtype_mapping(state_dict) == {
-            "model.language_model.layers.0.linear_attn.A_log": "F32",
-            "model.language_model.layers.0.linear_attn.dt_bias": "F32",
-        }
-
-    def test_convert_single_tensor_strips_holder(self, adapter):
-        result = adapter.convert_single_tensor_to_hf(
-            "model.language_model.layers.1.linear_attn._fp32_params.A_log", torch.zeros(4)
-        )
-        assert [k for k, _ in result] == ["model.language_model.layers.1.linear_attn.A_log"]
-
-    def test_convert_single_tensor_upcasts_gdn_fp32_params(self, adapter):
-        result = adapter.convert_single_tensor_to_hf(
-            "model.language_model.layers.1.linear_attn._fp32_params.dt_bias",
-            torch.zeros(4, dtype=torch.bfloat16),
-        )
-        assert result[0][0] == "model.language_model.layers.1.linear_attn.dt_bias"
-        assert result[0][1].dtype == torch.float32
-
-    def test_bare_key_unchanged(self, adapter):
-        result = adapter.convert_single_tensor_to_hf("model.language_model.layers.0.linear_attn.A_log", torch.zeros(4))
-        assert [k for k, _ in result] == ["model.language_model.layers.0.linear_attn.A_log"]
-
-    def test_from_hf_routes_and_upcasts_gdn_fp32_params_loaded_as_bf16(self, adapter):
-        hf_state = {
-            "model.language_model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.bfloat16),
-            "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.bfloat16),
-            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
-        }
-
-        out = adapter.from_hf(hf_state)
-
-        a_log_key = "model.language_model.layers.0.linear_attn._fp32_params.A_log"
-        dt_bias_key = "model.language_model.layers.0.linear_attn._fp32_params.dt_bias"
-        q_proj_key = "model.language_model.layers.0.self_attn.q_proj.weight"
-        assert out[a_log_key].dtype == torch.float32
-        assert out[dt_bias_key].dtype == torch.float32
-        assert out[q_proj_key] is hf_state[q_proj_key]
-        assert out[q_proj_key].dtype == torch.bfloat16

@@ -12,21 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-owned distributed parallelization for DeepSeek-V4."""
+"""Model-owned distributed parallelization for DeepSeek-V4 and DeepSeek-V4.1.
+
+The shared :class:`ModelParallelizer` already keeps the parameters named in the
+model's ``_keep_in_fp32_modules_strict`` in fp32 inside each unit and runs the
+all-fp32 ``lm_head`` unit in fp32. DeepSeek-V4 only adds the HCA parameter-sync
+group, which is known only once the FSDP mesh is.
+"""
+
+from __future__ import annotations
+
+from torch import nn
+from torch.distributed import ProcessGroup
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
+from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4Compressor
+
+
+def _hca_param_sync_group_from_1d_mesh(mesh: DeviceMesh | None) -> ProcessGroup | None:
+    """Return the 1D PyTorch FSDP2 group used for HCA graph alignment.
+
+    HCA graph alignment is an FSDP/FSDP2 parameter-sync invariant: ranks that
+    synchronize the same sharded HCA parameters must agree on whether the HCA
+    compressor path participates in backward. Only a 1D FSDP2 mesh names that
+    domain unambiguously; a multi-dimensional mesh would need an explicit owner
+    dimension to avoid reducing across unrelated parallel groups, so alignment
+    is disabled there instead of using a broader or wrong group.
+    """
+    if mesh is None or mesh.ndim != 1 or mesh.size() <= 1:
+        return None
+    return mesh.get_group()
+
+
+def _attach_hca_param_sync_group(module: nn.Module, mesh: DeviceMesh | None) -> None:
+    """Bind the FSDP mesh's parameter-sync group to every HCA compressor in ``module``.
+
+    The FSDP2 mesh is only known while wrapping, so the group is attached here
+    instead of through public model configuration.
+    """
+    process_group = _hca_param_sync_group_from_1d_mesh(mesh)
+    for submodule in module.modules():
+        if isinstance(submodule, DeepseekV4Compressor):
+            submodule._set_hca_param_sync_group(process_group)
 
 
 class DeepseekV4ModelParallelizer(ModelParallelizer):
-    """Keep DeepSeek-V4 reference-sensitive parameters in fp32 FSDP units."""
+    """Shared parallelization plus the HCA parameter-sync group per FSDP unit."""
 
-    _customizes_moe_fsdp = True
+    def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
+        _attach_hca_param_sync_group(module, kwargs["mesh"])
+        return super()._fully_shard_module(module, **kwargs)
 
-    def _fully_shard_module(self, module, **kwargs):
-        return fully_shard_deepseek_v4(module, **kwargs)
 
-
-PARALLELIZER = DeepseekV4ModelParallelizer()
-
-__all__ = ["PARALLELIZER"]
+__all__ = ["DeepseekV4ModelParallelizer"]

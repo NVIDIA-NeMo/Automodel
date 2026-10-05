@@ -71,19 +71,15 @@ class TestRenameHfKey:
         assert _rename_hf_key("layers.0.attn.wkv.weight") == "model.layers.0.self_attn.wkv.weight"
 
     def test_attn_attn_sink(self):
-        # ``attn_sink`` (HF) maps to a callable parameter holder so FSDP2 can
-        # shard it as its own fp32 unit while ``module.sinks`` still exposes
-        # the tensor to attention.
-        assert _rename_hf_key("layers.0.attn.attn_sink") == "model.layers.0.self_attn.sinks_param.weight"
+        # ``attn_sink`` (HF) is the plain fp32 ``sinks`` parameter of the attention module.
+        assert _rename_hf_key("layers.0.attn.attn_sink") == "model.layers.0.self_attn.sinks"
 
     def test_attn_compressor_ape(self):
-        assert _rename_hf_key("layers.2.attn.compressor.ape") == (
-            "model.layers.2.self_attn.compressor.ape_param.weight"
-        )
+        assert _rename_hf_key("layers.2.attn.compressor.ape") == "model.layers.2.self_attn.compressor.ape"
 
     def test_attn_indexer_compressor_ape(self):
         assert _rename_hf_key("layers.2.attn.indexer.compressor.ape") == (
-            "model.layers.2.self_attn.compressor.indexer.ape_param.weight"
+            "model.layers.2.self_attn.compressor.indexer.ape"
         )
 
     def test_gate_weight(self):
@@ -242,13 +238,10 @@ class TestDeepSeekV4StateDictAdapterToHF:
 
     def test_internal_key_to_hf_fp32_holders(self):
         adapter = _make_adapter()
-        assert adapter._internal_key_to_hf("model.layers.0.self_attn.sinks_param.weight") == "layers.0.attn.attn_sink"
+        assert adapter._internal_key_to_hf("model.layers.0.self_attn.sinks") == "layers.0.attn.attn_sink"
+        assert adapter._internal_key_to_hf("model.layers.2.self_attn.compressor.ape") == "layers.2.attn.compressor.ape"
         assert (
-            adapter._internal_key_to_hf("model.layers.2.self_attn.compressor.ape_param.weight")
-            == "layers.2.attn.compressor.ape"
-        )
-        assert (
-            adapter._internal_key_to_hf("model.layers.2.self_attn.compressor.indexer.ape_param.weight")
+            adapter._internal_key_to_hf("model.layers.2.self_attn.compressor.indexer.ape")
             == "layers.2.attn.indexer.compressor.ape"
         )
 

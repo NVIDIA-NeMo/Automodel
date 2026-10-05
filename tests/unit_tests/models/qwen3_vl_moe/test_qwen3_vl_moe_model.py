@@ -25,12 +25,12 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
 )
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
+    Qwen3VLMoeTextRotaryEmbedding,
+    Qwen3VLMoeVisionRotaryEmbedding,
 )
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_vl_moe.model import (
-    Fp32SafeQwen3VLMoeTextRotaryEmbedding,
-    Fp32SafeQwen3VLMoeVisionRotaryEmbedding,
     ModelClass,
     Qwen3VLMoeBlock,
     Qwen3VLMoeForConditionalGeneration,
@@ -126,41 +126,6 @@ def vl_config(text_config):
         deepstack_visual_indexes=[0, 1],
     )
     return Qwen3VLMoeConfig(text_config=text_config.to_dict(), vision_config=vision_cfg)
-
-
-@_requires_cuda
-class TestFp32SafeRotaryEmbeddings:
-    def test_text_rotary_inv_freq_remains_fp32(self, text_config):
-        rotary = Fp32SafeQwen3VLMoeTextRotaryEmbedding(config=text_config)
-        originals = {
-            name: buf.detach().clone()
-            for name, buf in rotary.named_buffers(recurse=False)
-            if name in ("inv_freq", "original_inv_freq")
-        }
-
-        rotary = rotary.to(torch.float16)
-
-        assert originals
-        for name, original in originals.items():
-            buf = getattr(rotary, name)
-            assert buf.dtype == torch.float32
-            torch.testing.assert_close(buf.float(), original.float())
-
-    def test_vision_rotary_inv_freq_remains_fp32(self):
-        rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(dim=16)
-        originals = {
-            name: buf.detach().clone()
-            for name, buf in rotary.named_buffers(recurse=False)
-            if name in ("inv_freq", "original_inv_freq")
-        }
-
-        rotary = rotary.to(torch.float16)
-
-        assert originals
-        for name, original in originals.items():
-            buf = getattr(rotary, name)
-            assert buf.dtype == torch.float32
-            torch.testing.assert_close(buf.float(), original.float())
 
 
 @_requires_cuda
@@ -262,7 +227,7 @@ class TestQwen3VLMoeTextModelBackend:
         assert model.backend is backend_config
         assert model.embed_tokens.num_embeddings == text_config.vocab_size
         assert len(model.layers) == text_config.num_hidden_layers
-        assert isinstance(model.rotary_emb, Fp32SafeQwen3VLMoeTextRotaryEmbedding)
+        assert isinstance(model.rotary_emb, Qwen3VLMoeTextRotaryEmbedding)
 
     def test_forward_skips_norm_when_none(self, text_config, backend_config, moe_config, device):
         """Test that forward() skips norm layer when it is None (PP support)."""
@@ -383,8 +348,10 @@ class TestQwen3VLMoeForConditionalGeneration:
         assert model.model.moe_config is model.model.language_model.moe_config
 
         vision_model = getattr(model.model, "visual")
-        assert isinstance(vision_model.rotary_pos_emb, Fp32SafeQwen3VLMoeVisionRotaryEmbedding)
+        assert isinstance(vision_model.rotary_pos_emb, Qwen3VLMoeVisionRotaryEmbedding)
         assert vision_model.rotary_pos_emb.inv_freq.dtype == torch.float32
+        # The keep-in-fp32 name lists are the only thing protecting the rotary buffers.
+        assert {"rotary_emb", "rotary_pos_emb"} <= set(model._keep_in_fp32_modules)
 
     def test_pad_token_id_defaults_to_negative_one_when_missing(self, vl_config, backend_config, moe_config):
         """Test that pad_token_id defaults to -1 when text_config.pad_token_id is 0 (falsy)."""

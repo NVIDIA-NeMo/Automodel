@@ -15,7 +15,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
-  torch_dtype: bfloat16
+  dtype: float32
   text_config:
     # The BF16 checkpoint has no MTP weights.
     num_mtp_modules: 0

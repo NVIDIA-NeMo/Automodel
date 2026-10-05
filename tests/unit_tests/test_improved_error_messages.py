@@ -90,8 +90,9 @@ class TestModelsAlias:
     ``nemo_automodel.components.models``."""
 
     def test_alias_package_is_same_object(self):
-        import nemo_automodel.components.models as real
         import nemo_automodel.models as alias
+
+        import nemo_automodel.components.models as real
 
         assert alias is real
 
@@ -294,7 +295,7 @@ class TestCheckpointDtypeRestoration:
         assert model.linear.weight.dtype == torch.bfloat16
         assert model.norm.weight.dtype == torch.float32
 
-    def test_restore_loaded_model_dtype_keeps_gdn_params_fp32(self):
+    def test_restore_loaded_model_dtype_keeps_strict_fp32_params_fp32(self):
         from nemo_automodel._transformers.model_init import _restore_loaded_model_dtype
 
         class LinearAttn(torch.nn.Module):
@@ -305,6 +306,8 @@ class TestCheckpointDtypeRestoration:
                 self.other = torch.nn.Parameter(torch.ones(4))
 
         class DummyModel(torch.nn.Module):
+            _keep_in_fp32_modules_strict = ["linear_attn.A_log", "linear_attn.dt_bias"]
+
             def __init__(self):
                 super().__init__()
                 self.model = torch.nn.Module()
@@ -333,13 +336,10 @@ class TestCheckpointDtypeRestoration:
 
         linear_attn = model.model.language_model.layers[0].linear_attn
         assert linear_attn.A_log.dtype == torch.float32
-        assert linear_attn.A_log._hf_compute_dtype == torch.float32
         assert linear_attn.dt_bias.dtype == torch.float32
-        assert linear_attn.dt_bias._hf_compute_dtype == torch.float32
         assert linear_attn.other.dtype == torch.bfloat16
-        assert linear_attn.other._hf_compute_dtype == torch.bfloat16
 
-    def test_restore_loaded_model_dtype_does_not_force_non_gdn_arch_fp32(self):
+    def test_restore_loaded_model_dtype_follows_checkpoint_without_strict_declaration(self):
         from nemo_automodel._transformers.model_init import _restore_loaded_model_dtype
 
         class LinearAttn(torch.nn.Module):
@@ -368,7 +368,6 @@ class TestCheckpointDtypeRestoration:
             )
 
         assert model.layer.linear_attn.A_log.dtype == torch.bfloat16
-        assert model.layer.linear_attn.A_log._hf_compute_dtype == torch.bfloat16
 
     def test_restore_loaded_model_dtype_preserves_tied_weights(self):
         from nemo_automodel._transformers.model_init import _restore_loaded_model_dtype

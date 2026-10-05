@@ -60,7 +60,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -81,12 +80,6 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     dsv4_sparse_attention,
 )
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
-
-
-def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
-    if isinstance(tensor, DTensor):
-        tensor = tensor.full_tensor()
-    return tensor.clone()
 
 
 def _dsv4_kernel_backend(backend: BackendConfig) -> str:
@@ -656,11 +649,7 @@ def eager_attention_with_sink(
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.shape[-1]]
-    if hasattr(module, "sinks_param"):
-        sinks = module.sinks_param(query)
-    else:
-        sinks = module.sinks
-    sinks = sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
     combined = torch.cat([attn_weights, sinks.to(attn_weights.dtype)], dim=-1)
     combined = combined - combined.max(dim=-1, keepdim=True).values
     probs = F.softmax(combined, dim=-1, dtype=torch.float32)[..., :-1]
@@ -693,18 +682,6 @@ def _build_indexer_topk_compressed_mask(
     )  # [B, S, P]
 
 
-class DeepseekV4FP32Parameter(nn.Module):
-    """Callable holder for fp32 tensors that need their own FSDP unit."""
-
-    def __init__(self, value: torch.Tensor):
-        super().__init__()
-        self.weight = nn.Parameter(value.to(torch.float32))
-
-    def forward(self, reference: torch.Tensor | None = None) -> torch.Tensor:
-        del reference
-        return _full_tensor_if_dtensor(self.weight)
-
-
 class DeepseekV4Indexer(nn.Module):
     """HF PR 45616 port.  Picks the top-k compressed positions per query when
     ``compress_ratio == 4``.  Owns its own pool at ``index_head_dim`` plus a
@@ -728,16 +705,12 @@ class DeepseekV4Indexer(nn.Module):
         proj_dim = 2 * self.head_dim  # overlap mode
         self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
-        self.ape_param = DeepseekV4FP32Parameter(torch.zeros(self.compress_ratio, proj_dim, dtype=torch.float32))
+        self.ape = nn.Parameter(torch.zeros(self.compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module(
             "torch_fp32", self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype
         )
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
-
-    @property
-    def ape(self) -> torch.Tensor:
-        return self.ape_param()
 
     def forward(
         self,
@@ -771,7 +744,7 @@ class DeepseekV4Indexer(nn.Module):
             _pool_windows(
                 ready_kv,
                 ready_gate,
-                self.ape_param(hidden_states_fp32),
+                self.ape,
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
@@ -873,16 +846,12 @@ class DeepseekV4Compressor(nn.Module):
         proj_dim = coff * head_dim
         self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
-        self.ape_param = DeepseekV4FP32Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
+        self.ape = nn.Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps, dtype=model_dtype)
         self.indexer: DeepseekV4Indexer | None = (
             DeepseekV4Indexer(config, backend=self.backend) if compress_ratio == 4 else None
         )
         self._hca_param_sync_group = None
-
-    @property
-    def ape(self) -> torch.Tensor:
-        return self.ape_param()
 
     def _set_hca_param_sync_group(self, process_group) -> None:
         self._hca_param_sync_group = process_group
@@ -964,7 +933,7 @@ class DeepseekV4Compressor(nn.Module):
             _pool_windows(
                 ready_kv,
                 ready_gate,
-                self.ape_param(hidden_states_fp32),
+                self.ape,
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
@@ -1237,17 +1206,13 @@ class DeepseekV4Attention(nn.Module):
             config.o_groups,
         )
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
-        self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
+        self.sinks = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
 
         self.compressor = (
             DeepseekV4Compressor(config, self.compress_ratio, self.head_dim, backend=self.backend)
             if self.compress_ratio
             else None
         )
-
-    @property
-    def sinks(self) -> torch.Tensor:
-        return self.sinks_param()
 
     def setup_cp_attention(self, cp_mesh) -> None:
         """Model-owned context-parallel hook, called by ``moe.parallelizer.apply_cp``.
@@ -1431,7 +1396,7 @@ class DeepseekV4Attention(nn.Module):
             attn_output = dsv4_sparse_attention(
                 q.transpose(1, 2).contiguous(),
                 full_kv.squeeze(1).contiguous(),
-                self.sinks_param(q),
+                self.sinks,
                 topk_idxs,
                 self.scaling,
                 backend=attn_backend,
@@ -1462,11 +1427,11 @@ class DeepseekV4Attention(nn.Module):
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
         for norm in (self.q_norm, self.kv_norm):
             norm.reset_parameters()
-        nn.init.zeros_(self.sinks_param.weight)
+        nn.init.zeros_(self.sinks)
         if self.compressor is not None:
             for mod in self.compressor.modules():
                 if isinstance(mod, nn.Linear):
                     nn.init.trunc_normal_(mod.weight, mean=0.0, std=init_std)
-            nn.init.zeros_(self.compressor.ape_param.weight)
+            nn.init.zeros_(self.compressor.ape)
             if self.compressor.indexer is not None:
-                nn.init.zeros_(self.compressor.indexer.ape_param.weight)
+                nn.init.zeros_(self.compressor.indexer.ape)

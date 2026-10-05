@@ -39,7 +39,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: moonshotai/Kimi-K3
-  torch_dtype: bfloat16
+  dtype: float32
   trust_remote_code: false
   config:
     architectures: [KimiK3ForCausalLM]

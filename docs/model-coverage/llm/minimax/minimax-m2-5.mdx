@@ -17,6 +17,8 @@ automodel examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml --npro
 
 Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
+Full-parameter FSDP2 training requires `model.dtype: float32`; see [Mixed-Precision Training](/development/mixed-precision-training#models-with-intrinsically-fp32-parameters).
+
 ## Choose a Workflow
 
 | Goal | Start Here |

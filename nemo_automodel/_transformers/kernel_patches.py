@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 
 # Models build their CP/fp32-gate-aware modules at construction; no load-time
 # runtime patching is registered here. (Qwen3.5 dense/MoE build the native
-# CPAwareGatedDeltaNet + fp32 SSMGate in their model __init__.)
+# CPAwareGatedDeltaNet with bare fp32 A_log/dt_bias in their model __init__.)
 _MODEL_RUNTIME_PATCHES = {}
 
 

@@ -251,7 +251,7 @@ def _parallelize_moe(
         enable_async_tensor_parallel=enable_async_tensor_parallel,
         frozen_multimodal_sharding=frozen_multimodal_sharding,
         reapply_trainability=mesh_context.reapply_trainability,
-        model_parallelizer=parallelizer if parallelizer._customizes_moe_fsdp else None,
+        model_parallelizer=parallelizer,
         **mesh_context.parallelize_axis_kwargs(),
     )
     return model

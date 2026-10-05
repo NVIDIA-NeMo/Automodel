@@ -66,8 +66,15 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
     # Keep the multimodal forward under PP so stage 0 can consume media chunks.
     _pp_keep_self_forward: bool = True
 
-    # Short convolutions and router correction bias use callable fp32 holders.
-    _keep_in_fp32_modules_strict = ["_fp32_params"]
+    # Short convolutions and the router correction bias stay fp32 under FSDP
+    # mixed precision; the tokens are matched as substrings of the FQN.
+    _keep_in_fp32_modules_strict = [
+        "k_sconv.conv1d",
+        "v_sconv.conv1d",
+        "attn_sconv.conv1d",
+        "mlp_sconv.conv1d",
+        "gate.e_score_correction_bias",
+    ]
 
     @dataclass(frozen=True)
     class ModelCapabilities:

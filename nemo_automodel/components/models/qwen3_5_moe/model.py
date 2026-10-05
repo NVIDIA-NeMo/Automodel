@@ -43,7 +43,6 @@ try:
         Qwen3_5MoeGatedDeltaNet,
         Qwen3_5MoeModelOutputWithPast,
         Qwen3_5MoeTextRotaryEmbedding,
-        Qwen3_5MoeVisionRotaryEmbedding,
     )
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
         Qwen3_5MoeModel as HFQwen3_5MoeModel,
@@ -58,7 +57,6 @@ except ModuleNotFoundError:
     Qwen3_5MoeGatedDeltaNet = _make_missing("Qwen3_5MoeGatedDeltaNet")
     Qwen3_5MoeModelOutputWithPast = _make_missing("Qwen3_5MoeModelOutputWithPast")
     Qwen3_5MoeTextRotaryEmbedding = _make_missing("Qwen3_5MoeTextRotaryEmbedding")
-    Qwen3_5MoeVisionRotaryEmbedding = _make_missing("Qwen3_5MoeVisionRotaryEmbedding")
     HFQwen3_5MoeModel = _make_missing("Qwen3_5MoeModel")
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
@@ -74,6 +72,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
     maybe_distribute_visual,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common.fp32_gates import GDN_FP32_PARAM_TOKENS
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
@@ -86,7 +85,10 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import (
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+)
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     prepare_gated_delta_packed_metadata,
@@ -493,34 +495,6 @@ def build_qwen3_5_moe_mtp(
     )
 
 
-class Fp32SafeQwen3_5MoeTextRotaryEmbedding(Qwen3_5MoeTextRotaryEmbedding):
-    """Ensure inv_freq stays in float32 across ``.to(dtype)`` calls."""
-
-    def _apply(self, fn: Any, recurse: bool = True):
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
-        result = super()._apply(fn, recurse=recurse)
-        self.register_buffer(
-            "inv_freq",
-            inv_freq_fp32.to(device=self.inv_freq.device),
-            persistent=False,
-        )
-        return result
-
-
-class Fp32SafeQwen3_5MoeVisionRotaryEmbedding(Qwen3_5MoeVisionRotaryEmbedding):
-    """Ensure the vision rotary inv_freq buffer remains float32."""
-
-    def _apply(self, fn: Any, recurse: bool = True):
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
-        result = super()._apply(fn, recurse=recurse)
-        self.register_buffer(
-            "inv_freq",
-            inv_freq_fp32.to(device=self.inv_freq.device),
-            persistent=False,
-        )
-        return result
-
-
 # ---------------------------------------------------------------------------
 # VL composite model (wraps HF Qwen3_5MoeModel to expose backend language_model)
 # ---------------------------------------------------------------------------
@@ -687,7 +661,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # M-RoPE (interleaved) — use HF implementation, kept in fp32
-        self.rotary_emb = Fp32SafeQwen3_5MoeTextRotaryEmbedding(config=config)
+        self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
 
     def forward(
         self,
@@ -845,6 +819,11 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     requires_packed_sequence_metadata = True
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _pp_keep_self_forward: bool = True
+    # The text rotary's fp32 ``inv_freq`` buffers (``model.rotary_emb``) survive every
+    # ``cast_model_to_dtype`` / ``cast_frozen_modules_to_compute_dtype`` by name.
+    _keep_in_fp32_modules: list[str] = ["rotary_emb"]
+    # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
+    _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -926,11 +905,6 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             else None
         )
         self.moe_config = self.model.moe_config
-
-        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
-        if "_fp32_params" not in keep_fp32:
-            keep_fp32.append("_fp32_params")
-        self._keep_in_fp32_modules = keep_fp32
 
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3_5MoeStateDictAdapter(
@@ -1133,7 +1107,7 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 for sublayer in self.mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
             self.model.rotary_emb.device = buffer_device
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -1154,7 +1128,16 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
-    _keep_in_fp32_modules_strict = ["_fp32_params"]
+    # ``cast_model_to_dtype`` snapshots/restores matched fp32 buffers around its bulk
+    # cast, and ``cast_frozen_modules_to_compute_dtype`` exempts matched names, so the
+    # text rotary (``language_model.rotary_emb``) and vision rotary
+    # (``visual.rotary_pos_emb``) ``inv_freq`` buffers keep their exact fp32 values
+    # under shared bf16/fp16 casts, including the frozen-vision recipes' cast.
+    # Class-level: ``super().__init__()`` runs ``post_init`` -> ``initialize_weights``
+    # -> the first cast before the constructor body.
+    _keep_in_fp32_modules: list[str] = ["rotary_emb", "rotary_pos_emb"]
+    # GatedDeltaNet decay-gate parameters stay fp32 (storage and FSDP2 compute).
+    _keep_in_fp32_modules_strict: list[str] = [*GDN_FP32_PARAM_TOKENS]
     # Packed CP uses the model-owned block-diagonal SDPA dispatch. Generic
     # hybrid CP also supports TE for unpacked sequences, but TE has no route
     # through this packed attention contract.
@@ -1278,15 +1261,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         # Expose moe_config for FSDP sync mixin
         self.model.moe_config = self.model.language_model.moe_config
 
-        # Keep the SSM-gating params (A_log/dt_bias) — isolated in each
-        # linear_attn ``_fp32_params`` holder at construction — in fp32 storage
-        # even when the model's bulk dtype is bf16. cast_model_to_dtype() (called
-        # from initialize_weights) honors this AutoModel training-storage contract.
-        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
-        if "_fp32_params" not in keep_fp32:
-            keep_fp32.append("_fp32_params")
-        self._keep_in_fp32_modules = keep_fp32
-
         self.vocab_size = text_config.vocab_size
         pad_token_id = getattr(text_config, "pad_token_id", None)
         self.pad_token_id = pad_token_id if pad_token_id is not None else -1
@@ -1301,19 +1275,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 pretrained_model_name_or_path=getattr(config, "_name_or_path", None)
                 or getattr(config, "name_or_path", None),
             )
-
-        # Wrap vision rotary embedding with fp32-safe version
-        vision_model = getattr(self.model, "visual")
-        rotary = vision_model.rotary_pos_emb
-        dim = rotary.inv_freq.shape[0] * 2
-        fp32_safe_rotary = Fp32SafeQwen3_5MoeVisionRotaryEmbedding(dim)
-        fp32_safe_rotary.register_buffer(
-            "inv_freq",
-            rotary.inv_freq.detach().clone().to(torch.float32, copy=True),
-            persistent=False,
-        )
-        fp32_safe_rotary.to(rotary.inv_freq.device)
-        vision_model.rotary_pos_emb = fp32_safe_rotary
 
     def _encode_vision_for_cp(
         self,
@@ -1904,11 +1865,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 for sublayer in mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
 
-        # Skip the SSM-gating holders so they keep fp32 storage (master weights):
-        # cast_model_to_dtype cannot reliably restore fp32 once FSDP2-sharded, so it
-        # detaches them and never casts them. The MoE parallelizer's dtype-aware
-        # sharder places each holder in its own fp32 FSDP group.
-        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype)
 
         with buffer_device:
             self.model.language_model.rotary_emb.device = buffer_device

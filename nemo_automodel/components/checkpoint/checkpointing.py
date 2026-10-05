@@ -14,6 +14,7 @@
 
 import gc
 import glob
+import itertools
 import json
 import logging
 import os
@@ -91,6 +92,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.components.models.common.utils import _get_strict_fp32_module_keywords
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
@@ -290,27 +292,53 @@ def _normalize_dtype_mapping_to_state_dict_keys(
     return normalized
 
 
-def _apply_adapter_forced_dtype_mapping(
-    model: nn.Module,
+def _pin_strict_fp32_export_dtypes(
+    model_parts: list[nn.Module],
     state_dict: dict[str, torch.Tensor],
     fqn_to_dtype_mapping: dict[str, str],
 ) -> dict[str, str]:
-    """Let model adapters override original HF dtype metadata for export-only keys."""
-    model = _unwrap_ddp_model(model)
-    adapter = getattr(model, "state_dict_adapter", None)
-    forced_dtype_mapping = getattr(adapter, "forced_hf_dtype_mapping", None)
-    if not callable(forced_dtype_mapping):
+    """Pin the model's strict-fp32 tensors to ``F32`` in the consolidated-export dtype map.
+
+    ``_keep_in_fp32_modules_strict`` tokens are matched as substrings of the canonical
+    native FQN of every floating parameter and buffer, exactly like the dtype-cast helpers
+    that keep those tensors fp32 in the live model. The first part's state-dict adapter maps
+    each match to its exported key(s) with ``convert_single_tensor_to_hf`` (adapters such as
+    DeepSeek V4.1 rename keys on export); models without an adapter export native names.
+    Exported keys that are not in ``state_dict`` (PEFT exports, other pipeline stages) are
+    ignored and the original HF header dtypes of all other keys are left untouched.
+
+    Args:
+        model_parts: Local model parts (one entry without pipeline parallelism).
+        state_dict: Exported (HF-keyed) state dict about to be saved.
+        fqn_to_dtype_mapping: Baseline exported-key -> safetensors dtype string map.
+
+    Returns:
+        The baseline map with every exported strict-fp32 key set to ``"F32"``.
+    """
+    model_parts = [_unwrap_ddp_model(part) for part in model_parts]
+    if not model_parts:
+        return fqn_to_dtype_mapping
+    tokens = _get_strict_fp32_module_keywords(model_parts[0])
+    if not tokens:
         return fqn_to_dtype_mapping
 
-    forced = forced_dtype_mapping(state_dict)
-    if not forced:
-        return fqn_to_dtype_mapping
-
+    adapter = getattr(model_parts[0], "state_dict_adapter", None)
     normalized = dict(fqn_to_dtype_mapping)
-    state_dict_key_set = set(state_dict)
-    for fqn, dtype_str in forced.items():
-        if fqn in state_dict_key_set:
-            normalized[fqn] = dtype_str
+    for part in model_parts:
+        named_tensors = itertools.chain(
+            part.named_parameters(remove_duplicate=False), part.named_buffers(remove_duplicate=False)
+        )
+        for name, tensor in named_tensors:
+            fqn = canonical_parameter_fqn(name)
+            if not tensor.is_floating_point() or not any(token in fqn for token in tokens):
+                continue
+            if adapter is None:
+                exported_keys = [fqn]
+            else:
+                exported_keys = [key for key, _ in adapter.convert_single_tensor_to_hf(fqn, tensor)]
+            for key in exported_keys:
+                if key in state_dict:
+                    normalized[key] = "F32"
     return normalized
 
 
@@ -2165,8 +2193,8 @@ fi
         Build FQN to target safetensors dtype mapping for consolidated export.
 
         Original HF safetensors headers provide the baseline mapping when available.
-        Model-owned adapter overrides are applied even for config-only runs so
-        intrinsically fp32 tensors retain their required export dtype.
+        The model's ``_keep_in_fp32_modules_strict`` tensors are pinned to ``F32`` even
+        for config-only runs, so a bf16 export keeps them in full precision.
         """
         if not _should_write_hf_metadata(self.config):
             return None
@@ -2185,7 +2213,9 @@ fi
                 normalized_dtype_mapping = _normalize_dtype_mapping_to_state_dict_keys(
                     dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
                 )
-        normalized_dtype_mapping = _apply_adapter_forced_dtype_mapping(model, state_dict, normalized_dtype_mapping)
+        normalized_dtype_mapping = _pin_strict_fp32_export_dtypes(
+            model_state.model, state_dict, normalized_dtype_mapping
+        )
         return normalized_dtype_mapping or None
 
     def _get_storage_writer(
@@ -2727,12 +2757,11 @@ def _load_full_state_dict_into_model(
     enqueuing hundreds of NCCL broadcasts that rank 0 cannot keep up with,
     leading to a 60 s NCCL watchdog timeout.
 
-    After loading, floating-point parameters are converted to match the
-    checkpoint dtype.  PyTorch's ``set_model_state_dict`` uses *copy*
-    semantics (``assign=False``) for non-meta parameters, which preserves
-    the model's initialisation dtype instead of the checkpoint dtype.
-    The post-load fixup ensures the safetensors dtype (e.g. bf16) is
-    honoured.
+    Both branches below copy into the existing (non-meta) parameters
+    (``assign=False``), so every parameter keeps the dtype it was constructed
+    with: a bf16 checkpoint tensor copied into an fp32
+    ``_keep_in_fp32_modules_strict`` parameter is upcast exactly, and the
+    checkpoint dtype never leaks into the model.
 
     Args:
         model_parts: List of model parts (for pipeline parallelism)

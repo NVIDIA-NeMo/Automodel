@@ -93,15 +93,33 @@ def _causal_conv1d(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.T
     return output[:, :, :sequence].to(hidden_states.dtype)
 
 
-class _InklingShortConvolutionFP32(nn.Module):
-    """Run one short convolution inside a dtype-uniform fp32 FSDP unit."""
+class InklingShortConvolution(nn.Module):
+    """Residual causal short convolution computed in fp32.
+
+    ``conv1d`` mirrors the Transformers module layout so the native parameter
+    name equals the checkpoint name. It is constructed in fp32 regardless of
+    the model dtype; FSDP keeps it fp32 through ``_keep_in_fp32_modules_strict``.
+    """
 
     def __init__(self, hidden_size: int, conv_kernel_size: int, layer_idx: int, conv_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.conv_idx = conv_idx
         self.conv_kernel_size = conv_kernel_size
-        self.weight = nn.Parameter(torch.empty(hidden_size, 1, conv_kernel_size, dtype=torch.float32))
+        self.conv1d = nn.Conv1d(
+            hidden_size,
+            hidden_size,
+            conv_kernel_size,
+            padding=conv_kernel_size - 1,
+            groups=hidden_size,
+            bias=False,
+            dtype=torch.float32,
+        )
+
+    @torch.no_grad()
+    def init_weights(self, init_std: float) -> None:
+        """Initialize the fp32 depthwise-convolution weights."""
+        nn.init.normal_(self.conv1d.weight, mean=0.0, std=init_std)
 
     def forward(
         self,
@@ -110,12 +128,12 @@ class _InklingShortConvolutionFP32(nn.Module):
         conv_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Apply the causal short convolution with a residual connection.
+        """Apply the causal short convolution with a residual connection in fp32.
 
         Args:
             hidden_states: Tensor of shape ``[batch, sequence, hidden]``. Internally
-                transposed to ``[batch, hidden, sequence]`` for the depthwise
-                ``conv1d`` and transposed back before the residual add.
+                cast to fp32 and transposed to ``[batch, hidden, sequence]`` for the
+                depthwise ``conv1d``, then transposed back before the residual add.
             past_key_values: Optional cache holding the per-layer conv state; updated
                 in place during incremental decoding.
             conv_mask: Optional boolean padding mask of shape ``[batch, sequence]``
@@ -123,13 +141,14 @@ class _InklingShortConvolutionFP32(nn.Module):
 
         Returns:
             torch.Tensor: Tensor of shape ``[batch, sequence, hidden]`` (input plus
-            convolution output).
+            convolution output) in the input dtype.
         """
-        residual = hidden_states
-        hidden_states = _mask_padding_states(hidden_states, conv_mask)
+        input_dtype = hidden_states.dtype
+        residual = hidden_states.float()
+        hidden_states = _mask_padding_states(residual, conv_mask)
         seq_len = hidden_states.shape[1]
         hidden_states = hidden_states.transpose(1, 2)
-        weight = self.weight
+        weight = self.conv1d.weight
 
         use_precomputed_states = past_key_values is not None and past_key_values.has_previous_state(
             self.layer_idx, self.conv_idx
@@ -152,47 +171,7 @@ class _InklingShortConvolutionFP32(nn.Module):
             if past_key_values is not None:
                 hidden_states = hidden_states[:, :, -seq_len:]
 
-        return hidden_states.transpose(1, 2) + residual
-
-
-class InklingShortConvolution(nn.Module):
-    """Keep short-convolution weights in a model-owned fp32 holder."""
-
-    def __init__(self, hidden_size: int, conv_kernel_size: int, layer_idx: int, conv_idx: int) -> None:
-        super().__init__()
-        self._fp32_params = _InklingShortConvolutionFP32(hidden_size, conv_kernel_size, layer_idx, conv_idx)
-
-    @torch.no_grad()
-    def init_weights(self, init_std: float) -> None:
-        """Initialize the fp32 depthwise-convolution weights."""
-        nn.init.normal_(self._fp32_params.weight, mean=0.0, std=init_std)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        past_key_values: Any | None = None,
-        conv_mask: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        """Run the short convolution in fp32 and cast the result back.
-
-        Args:
-            hidden_states: Tensor of shape ``[batch, sequence, hidden]``.
-            past_key_values: Optional cache holding the per-layer conv state.
-            conv_mask: Optional boolean padding mask of shape ``[batch, sequence]``.
-
-        Returns:
-            torch.Tensor: Tensor of shape ``[batch, sequence, hidden]`` in the input
-            dtype.
-        """
-        input_dtype = hidden_states.dtype
-        output = self._fp32_params(
-            hidden_states.float(),
-            past_key_values=past_key_values,
-            conv_mask=conv_mask,
-            **kwargs,
-        )
-        return output.to(dtype=input_dtype)
+        return (hidden_states.transpose(1, 2) + residual).to(dtype=input_dtype)
 
 
 def build_inkling_moe_config(text_config, backend: BackendConfig) -> MoEConfig:
@@ -233,18 +212,6 @@ def build_inkling_moe_config(text_config, backend: BackendConfig) -> MoEConfig:
     )
 
 
-class InklingCorrectionBias(nn.Module):
-    """Own and apply Inkling's trained fp32 router correction bias."""
-
-    def __init__(self, num_experts: int) -> None:
-        super().__init__()
-        self.e_score_correction_bias = nn.Parameter(torch.empty(num_experts, dtype=torch.float32))
-
-    def forward(self, routed_scores: torch.Tensor) -> torch.Tensor:
-        """Add the correction bias in the routing score dtype."""
-        return routed_scores + self.e_score_correction_bias.to(routed_scores.dtype)
-
-
 class InklingGate(nn.Module):
     """Top-k router matching ``transformers`` ``InklingTopkRouter``.
 
@@ -269,14 +236,8 @@ class InklingGate(nn.Module):
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.weight = nn.Parameter(torch.empty(self.n_total_experts, config.hidden_size, dtype=model_dtype))
         self.global_scale = nn.Parameter(torch.ones(1, dtype=model_dtype))
-        # Keep the trained correction bias in a callable fp32 FSDP unit. Calling
-        # the holder is required for its unshard/reshard hooks to run.
-        self._fp32_params = InklingCorrectionBias(self.num_experts)
-
-    @property
-    def e_score_correction_bias(self) -> nn.Parameter:
-        """Expose the correction bias under the Transformers-compatible name."""
-        return self._fp32_params.e_score_correction_bias
+        # The trained correction bias is fp32 regardless of the model dtype.
+        self.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts, dtype=torch.float32))
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route tokens to experts.
@@ -299,7 +260,7 @@ class InklingGate(nn.Module):
 
         scores = router_logits.sigmoid()
         routed_scores = scores[..., : -self.n_shared_experts]
-        scores_for_choice = self._fp32_params(routed_scores)
+        scores_for_choice = routed_scores + self.e_score_correction_bias.to(routed_scores.dtype)
         topk_indices = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)[1]
 
         routed_logits = router_logits[..., : -self.n_shared_experts]

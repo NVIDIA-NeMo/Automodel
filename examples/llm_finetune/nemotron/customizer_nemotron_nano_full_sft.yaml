@@ -9,7 +9,7 @@ rng:
   ranked: true
 model:
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-  torch_dtype: auto
+  dtype: float32
   trust_remote_code: true
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   attn_implementation: sdpa

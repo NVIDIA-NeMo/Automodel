@@ -66,7 +66,7 @@ model:
       num_hidden_layers: 0
   trust_remote_code: false
   load_base_model: true
-  torch_dtype: bfloat16
+  dtype: float32
   use_liger_kernel: false
   use_sdpa_patching: false
   backend:
@@ -94,7 +94,6 @@ distributed:
   moe:
     reshard_after_forward: false
     wrap_outer_model: true
-    lm_head_precision: float32
     # Single-pass mHC carries FP32 coefficients alongside BF16 residuals.
     # Preserve each module's explicit casts across FSDP boundaries.
     mp_policy:

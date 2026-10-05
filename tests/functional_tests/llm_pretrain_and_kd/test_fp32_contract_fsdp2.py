@@ -1,5 +1,4 @@
-#!/bin/bash
-# Copyright (c) 2026, NVIDIA CORPORATION.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -xeuo pipefail
+from tests.utils.test_utils import run_test_script
 
-export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+TEST_FOLDER = "llm_pretrain_and_kd"
+FP32_CONTRACT_FSDP2_FILENAME = "L2_Fp32ContractFSDP2.sh"
 
-torchrun --nproc_per_node=2 --nnodes=1 \
-    tests/functional_tests/training/run_fully_shard_by_dtype_param_dtype.py
+
+class TestFp32ContractFSDP2:
+    def test_fp32_contract_matches_unsharded_reference(self):
+        run_test_script(TEST_FOLDER, FP32_CONTRACT_FSDP2_FILENAME)

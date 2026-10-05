@@ -50,6 +50,7 @@ from nemo_automodel._transformers.sentence_transformer_export import (
 )
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 
 logger = logging.get_logger(__name__)
 
@@ -158,11 +159,18 @@ def _get_supported_backbone_class(
 
 
 def _move_to_extracted_dtype(model: nn.Module, extracted_model: nn.Module) -> nn.Module:
-    """Move a newly-built model to the dtype used by the extracted model."""
+    """Cast a newly-built model to the dtype used by the extracted model.
+
+    Goes through ``cast_model_to_dtype`` so the model's ``_keep_in_fp32_modules`` /
+    ``_keep_in_fp32_modules_strict`` tensors (fp32 rotary ``inv_freq`` buffers, fp32
+    gate parameters) keep their exact values instead of being rounded by a raw ``.to``.
+    """
     for parameter in extracted_model.parameters():
-        return model.to(dtype=parameter.dtype)
+        cast_model_to_dtype(model, parameter.dtype)
+        return model
     for buffer in extracted_model.buffers():
-        return model.to(dtype=buffer.dtype)
+        cast_model_to_dtype(model, buffer.dtype)
+        return model
     return model
 
 

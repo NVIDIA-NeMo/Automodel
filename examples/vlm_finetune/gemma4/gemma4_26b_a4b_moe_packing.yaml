@@ -23,7 +23,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: google/gemma-4-26B-A4B-it
-  torch_dtype: torch.bfloat16
+  dtype: float32
   trust_remote_code: true
   attn_implementation: eager
   backend:

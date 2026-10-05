@@ -78,21 +78,6 @@ def test_update_moe_gate_bias_no_op_when_factor_zero():
     mock_update_bias.assert_not_called()
 
 
-def test_tiny_kimi_with_kda_initializes_fp32_params_when_fla_available():
-    _require_fla()
-
-    model = KimiLinear48BForCausalLM(_tiny_kimi_config(use_kda=True), backend=_backend_config())
-    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
-    kda_attn = model.model.layers["0"].self_attn
-
-    assert model.model.layers["0"].is_linear_attn
-    assert kda_attn.A_log.dtype == torch.float32
-    assert kda_attn.dt_bias.dtype == torch.float32
-    assert torch.isfinite(kda_attn.A_log).all()
-    assert torch.isfinite(kda_attn.dt_bias).all()
-    _assert_floating_state_finite(model)
-
-
 def test_kimi_moe_uses_hf_routing_numerics():
     model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     moe_layer = model.model.layers["1"].mlp
@@ -322,12 +307,7 @@ def test_kda_short_sequences_use_the_configured_chunk_kernel(monkeypatch):
     for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
         monkeypatch.setattr(attn, name, _PassThroughConv())
     monkeypatch.setattr(attn, "o_norm", _PassThroughNorm())
-
-    class _PassThroughGate(torch.nn.Module):
-        def forward(self, g, *args):
-            return g
-
-    monkeypatch.setattr(attn, "_fp32_params", _PassThroughGate())
+    monkeypatch.setattr(kimi_linear_model, "kda_decay_gate", lambda g, *args, **kwargs: g)
 
     for training in (True, False):
         attn.train(training)

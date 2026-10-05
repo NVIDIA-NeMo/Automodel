@@ -84,17 +84,18 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
             image_token_id=0,
             dtype="bfloat16",
         )
-        model = DeepseekV41ForCausalLM(
-            config,
-            backend=BackendConfig(
-                attn="eager",
-                linear="torch",
-                rms_norm="torch_fp32",
-                experts="torch_mm",
-                dispatcher="torch",
-                enable_hf_state_dict_adapter=False,
-            ),
-        ).cuda(rank)
+        backend = BackendConfig(
+            attn="eager",
+            linear="torch",
+            rms_norm="torch_fp32",
+            experts="torch_mm",
+            dispatcher="torch",
+            enable_hf_state_dict_adapter=False,
+        )
+        # The unsharded reference computes in bf16 storage; the sharded model
+        # holds the same values as fp32 master weights because FSDP2 keeps one
+        # storage dtype per unit and computes in bf16 through its policy.
+        model = DeepseekV41ForCausalLM(config, backend=backend).cuda(rank)
         model.initialize_weights(torch.device("cuda", rank), dtype=torch.bfloat16)
         # Odd 3x5 patch grid -> two rows, three merged tokens and a newline per row.
         types = torch.tensor([[-1, 0, 1, 1, 1, 2, 1, 1, 1, 2, 3, -1, -1]], device=rank)
@@ -121,6 +122,12 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
             assert expected_grads[f"model.{name}"].abs().sum() > 0
         model.zero_grad(set_to_none=True)
         pixels.grad = None
+        reference_state = model.state_dict()
+        config.text_config.dtype = torch.float32
+        config.dtype = torch.float32
+        model = DeepseekV41ForCausalLM(config, backend=backend).cuda(rank)
+        model.load_state_dict(reference_state)
+        assert all(p.dtype == torch.float32 for p in model.parameters())
         mesh = MeshContext.build(
             FSDP2Config(
                 mp_policy=MixedPrecisionPolicy(
@@ -148,7 +155,7 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
                 assert grad is not None, name
                 if isinstance(grad, DTensor):
                     grad = grad.full_tensor()
-                torch.testing.assert_close(grad, expected_grad, rtol=0.03, atol=0.003, msg=name)
+                torch.testing.assert_close(grad.to(expected_grad.dtype), expected_grad, rtol=0.03, atol=0.003, msg=name)
             torch.testing.assert_close(pixels.grad, expected_pixel_grad, rtol=0.03, atol=0.003)
             model.zero_grad(set_to_none=True)
             pixels.grad = None

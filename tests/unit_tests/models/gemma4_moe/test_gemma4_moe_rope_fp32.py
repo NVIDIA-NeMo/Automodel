@@ -96,3 +96,18 @@ def test_initialize_weights_bf16_keeps_rope_inv_freq_fp32():
     # A regular weight must still be bf16 (the cast actually happened).
     reg_weight = model.model.language_model.layers["0"].self_attn.q_proj.weight
     assert reg_weight.dtype == torch.bfloat16
+
+
+def test_no_strict_fp32_parameters_router_upcasts_in_forward():
+    """Gemma4 pins no parameter fp32: ``Gemma4Gate`` upcasts its bf16 ``proj`` / ``scale`` in forward.
+
+    The strict list therefore stays empty, so neither ``cast_model_to_dtype`` nor the FSDP
+    fp32-compute override treats any Gemma4 parameter as an fp32-contract parameter.
+    """
+    config = Gemma4Config(text_config=_make_text_config())
+    model = Gemma4ForConditionalGeneration(config, backend=_make_cpu_backend())
+
+    assert not model._keep_in_fp32_modules_strict
+    gate = model.model.language_model.layers["0"].moe.gate
+    assert gate.proj.weight.dtype == torch.bfloat16
+    assert gate.scale.dtype == torch.bfloat16
