@@ -1,0 +1,447 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""CPU behavior tests for model-owned multimodal mining encoding."""
+
+import gc
+import json
+import weakref
+from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
+import torch
+from PIL import Image
+
+from nemo_automodel.recipes.retrieval.mining_encoder import (
+    CheckpointMiningEncoder,
+    CheckpointMiningEncoderConfig,
+    SentenceTransformerMiningEncoder,
+)
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.models.ministral_bidirectional.processor import load_image
+from nemo_automodel.recipes.retrieval.mine_hard_negatives import MineHardNegativesRecipe
+
+
+class _PixelProcessor:
+    def __init__(self) -> None:
+        self.documents = []
+
+    def process_queries(self, queries, return_tensors):
+        assert return_tensors == "pt"
+        return {"input_ids": torch.tensor([[1.0, 0.0] for _ in queries])}
+
+    def process_documents(self, documents, return_tensors):
+        assert return_tensors == "pt"
+        self.documents.extend(documents)
+        pixels = torch.tensor([float(document["image"]) for document in documents]).reshape(-1, 1, 1, 1)
+        return {
+            "input_ids": torch.ones((len(documents), 2)),
+            "pixel_values": pixels,
+            "image_sizes": torch.ones((len(documents), 2), dtype=torch.long),
+        }
+
+
+class _PixelModel(torch.nn.Module):
+    def encode(self, inputs):
+        pixels = inputs.get("pixel_values")
+        if pixels is None:
+            return inputs["input_ids"]
+        values = pixels.flatten(start_dim=1).mean(dim=1)
+        return torch.stack((values, 1.0 - values), dim=1)
+
+
+class _ImageProcessor:
+    def __init__(self) -> None:
+        self.documents = []
+
+    def process_documents(self, documents, return_tensors):
+        assert return_tensors == "pt"
+        self.documents.extend(documents)
+        pixels = [load_image(document["image"]).convert("RGB").getpixel((0, 0))[0] / 255 for document in documents]
+        return {
+            "input_ids": torch.ones((len(documents), 2)),
+            "pixel_values": torch.tensor(pixels).reshape(-1, 1, 1, 1),
+            "image_sizes": torch.ones((len(documents), 2), dtype=torch.long),
+        }
+
+
+def _png_bytes() -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), color=(255, 0, 0)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _use_native_checkpoint(monkeypatch, model):
+    monkeypatch.setattr("nemo_automodel.recipes.retrieval.mining_encoder.cached_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained",
+        MagicMock(return_value=model),
+    )
+
+
+def test_typed_config_owns_processor_construction(monkeypatch):
+    processor = _PixelProcessor()
+    from_pretrained = MagicMock(return_value=processor)
+    config = ConfigNode(
+        {
+            "_target_": CheckpointMiningEncoderConfig,
+        }
+    ).instantiate()
+
+    model = _PixelModel()
+    model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
+    model.config = SimpleNamespace(name_or_path="", _commit_hash=None)
+    _use_native_checkpoint(monkeypatch, model)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.retrieval.mining_encoder.import_module",
+        lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=from_pretrained)),
+    )
+    model.source_model_path = "/resolved-snapshot"
+    encoder = config.build(model_name_or_path="/resolved-snapshot", device=torch.device("cpu"))
+
+    assert encoder.processor is processor
+    from_pretrained.assert_called_once_with("/resolved-snapshot")
+
+
+def test_checkpoint_processor_uses_pinned_revision(monkeypatch):
+    load = MagicMock(return_value=_PixelProcessor())
+    model = _PixelModel()
+    model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
+    model.config = SimpleNamespace(name_or_path="org/model", _commit_hash="pinned-sha")
+    _use_native_checkpoint(monkeypatch, model)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.retrieval.mining_encoder.import_module",
+        lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=load)),
+    )
+    model.source_model_path = "/snapshot"
+    CheckpointMiningEncoderConfig().build(model_name_or_path="/snapshot", device=torch.device("cpu"))
+    load.assert_called_once_with("org/model", revision="pinned-sha")
+
+
+def test_checkpoint_without_registered_processor_is_rejected(monkeypatch):
+    model = _PixelModel()
+    model.model = SimpleNamespace()
+    _use_native_checkpoint(monkeypatch, model)
+    with pytest.raises(ValueError, match="does not declare a supported retrieval processor"):
+        CheckpointMiningEncoderConfig().build(model_name_or_path="/snapshot", device=torch.device("cpu"))
+
+
+def test_sentence_transformer_checkpoint_is_selected_without_loading_automodel(tmp_path, monkeypatch):
+    (tmp_path / "modules.json").write_text("[]")
+    (tmp_path / "config_sentence_transformers.json").write_text(json.dumps({"model_type": "SentenceTransformer"}))
+    sentence_transformer = MagicMock()
+    sentence_transformer.__iter__.return_value = iter([SimpleNamespace(pooling_mode="mean")])
+    load = MagicMock(return_value=sentence_transformer)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.retrieval.mining_encoder.safe_import",
+        lambda _: (True, SimpleNamespace(SentenceTransformer=load)),
+    )
+
+    encoder = CheckpointMiningEncoderConfig().build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
+
+    assert isinstance(encoder, SentenceTransformerMiningEncoder)
+    assert encoder.pooling == "avg"
+    load.assert_called_once_with(str(tmp_path), device="cpu", trust_remote_code=False, model_kwargs=None)
+
+
+def test_checkpoint_without_sentence_transformer_modules_uses_automodel(tmp_path, monkeypatch):
+    model = _PixelModel()
+    model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
+    model.config = SimpleNamespace(name_or_path=str(tmp_path), _commit_hash=None)
+    model.to = MagicMock(return_value=model)
+    model.eval = MagicMock()
+    load_model = MagicMock(return_value=model)
+    load_processor = MagicMock(return_value=_PixelProcessor())
+    monkeypatch.setattr("nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained", load_model)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.retrieval.mining_encoder.import_module",
+        lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=load_processor)),
+    )
+
+    encoder = CheckpointMiningEncoderConfig().build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
+
+    assert isinstance(encoder, CheckpointMiningEncoder)
+    load_model.assert_called_once_with(str(tmp_path), use_liger_kernel=False, use_sdpa_patching=True)
+    load_processor.assert_called_once_with(str(tmp_path))
+
+
+def test_cross_encoder_checkpoint_is_not_loaded_as_embedding_model(tmp_path, monkeypatch):
+    (tmp_path / "modules.json").write_text("[]")
+    (tmp_path / "config_sentence_transformers.json").write_text(json.dumps({"model_type": "CrossEncoder"}))
+    import_st = MagicMock()
+    monkeypatch.setattr("nemo_automodel.recipes.retrieval.mining_encoder.safe_import", import_st)
+
+    with pytest.raises(ValueError, match="not a SentenceTransformer embedding model"):
+        CheckpointMiningEncoderConfig().build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
+
+    import_st.assert_not_called()
+
+
+def test_sentence_transformer_adapter_preserves_checkpoint_inference_defaults():
+    model = MagicMock()
+    model.__iter__.return_value = iter([SimpleNamespace(pooling_mode="mean")])
+    model.encode_query.return_value = np.ones((1, 2))
+    model.encode_document.side_effect = [np.array([[1.0, 0.0]]), np.array([[0.0, 1.0]])]
+    encoder = SentenceTransformerMiningEncoder(
+        model=model,
+    )
+
+    encoder.encode_queries(["question"], batch_size=1)
+    embeddings = encoder.encode_documents([{"text": "text"}, {"text": "caption", "image": _png_bytes()}], batch_size=2)
+
+    model.encode_query.assert_called_once_with(["question"], batch_size=1)
+    np.testing.assert_array_equal(embeddings, [[1.0, 0.0], [0.0, 1.0]])
+    text_call, message_call = model.encode_document.call_args_list
+    assert text_call.args[0] == ["text"]
+    assert message_call.args[0][0][0]["content"][0]["image"].getpixel((0, 0)) == (255, 0, 0)
+    assert message_call.args[0][0][0]["content"][1] == {"type": "text", "text": "caption"}
+    assert text_call.kwargs == message_call.kwargs == {"batch_size": 2}
+
+
+def test_pixels_change_same_text_embeddings_and_ranking_excludes_positive():
+    processor = _PixelProcessor()
+    encoder = CheckpointMiningEncoder(
+        model=_PixelModel(),
+        processor=processor,
+        device=torch.device("cpu"),
+    )
+    documents = [
+        {"text": "same", "image": 0.99},
+        {"text": "same", "image": 0.80},
+        {"text": "same", "image": 0.20},
+    ]
+
+    query_embeddings = encoder.encode_queries(["query"], batch_size=1)
+    document_embeddings = encoder.encode_documents(documents, batch_size=3)
+
+    assert np.isfinite(document_embeddings).all()
+    assert not np.array_equal(document_embeddings[1], document_embeddings[2])
+    assert processor.documents == documents
+
+    recipe = MineHardNegativesRecipe.__new__(MineHardNegativesRecipe)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    negative_indices, _, _ = recipe._mine_hard_negatives(
+        query_embeddings,
+        document_embeddings,
+        [[0]],
+        batch_size=1,
+        num_negs=1,
+    )
+    assert negative_indices == [[1]]
+
+
+def test_image_only_and_mixed_documents_preserve_available_content():
+    processor = _PixelProcessor()
+    encoder = CheckpointMiningEncoder(
+        model=_PixelModel(),
+        processor=processor,
+        device=torch.device("cpu"),
+    )
+
+    embeddings = encoder.encode_documents(
+        [{"text": "", "image": 0.25}, {"title": "A", "text": "caption", "image": 0.75}],
+        batch_size=2,
+    )
+
+    assert embeddings.shape == (2, 2)
+    assert processor.documents == [
+        {"image": 0.25, "text": ""},
+        {"image": 0.75, "text": "A caption"},
+    ]
+
+
+def test_missing_image_path_fails_with_configured_path(tmp_path):
+    missing_path = tmp_path / "missing.png"
+    with pytest.raises(FileNotFoundError, match=str(missing_path)):
+        load_image(str(missing_path))
+
+
+def test_unsupported_image_diagnostic_does_not_expose_payload():
+    payload = b"private-image-payload"
+
+    with pytest.raises(ValueError, match="Invalid image type: bytes") as error:
+        load_image(payload)
+
+    assert "private-image-payload" not in str(error.value)
+
+
+@pytest.mark.parametrize("binary_type", [bytes, bytearray, memoryview])
+def test_binary_images_are_wrapped_for_the_strict_processor(binary_type):
+    payload = binary_type(_png_bytes())
+    processor = _ImageProcessor()
+    encoder = CheckpointMiningEncoder(
+        model=_PixelModel(),
+        processor=processor,
+        device=torch.device("cpu"),
+    )
+
+    embeddings = encoder.encode_documents([{"text": "caption", "image": payload}], batch_size=1)
+
+    assert embeddings.shape == (1, 2)
+    assert np.isfinite(embeddings).all()
+    assert processor.documents == [{"text": "caption", "image": {"bytes": bytes(payload)}}]
+
+
+def test_document_without_usable_text_or_image_is_rejected():
+    encoder = CheckpointMiningEncoder(
+        model=_PixelModel(),
+        processor=_PixelProcessor(),
+        device=torch.device("cpu"),
+    )
+
+    with pytest.raises(ValueError, match="doc-7.*no encodable text or image"):
+        encoder.encode_documents(
+            [{"_mining_document_id": "doc-7", "text": "", "image": None}],
+            batch_size=1,
+        )
+
+
+class _LargeValueModel(torch.nn.Module):
+    def __init__(self, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(2, 2, bias=False, dtype=dtype)
+        with torch.no_grad():
+            self.projection.weight.copy_(torch.eye(2) * 70000)
+
+    def encode(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Project inputs without changing the checkpoint's weight dtype.
+
+        Args:
+            inputs: Token features in ``input_ids`` of shape [batch, hidden].
+
+        Returns:
+            Projected features of shape [batch, hidden].
+        """
+        return self.projection(inputs["input_ids"].to(self.projection.weight.dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_mining_preserves_checkpoint_dynamic_range(monkeypatch, dtype):
+    # Exercise CUDA precision policy with real CPU matrix math and autocast.
+    # Only device transport is substituted; this does not qualify GPU execution.
+    tensor_to = torch.Tensor.to
+    autocast = torch.amp.autocast
+
+    def cpu_transport(tensor: torch.Tensor, device, *args, **kwargs) -> torch.Tensor:
+        """Move inputs to the CPU proxy.
+
+        Args:
+            tensor: Tensor of arbitrary shape whose layout is preserved.
+            device: Requested device or dtype.
+            *args: Additional Tensor.to options.
+            **kwargs: Additional Tensor.to options.
+
+        Returns:
+            Tensor with the same shape and requested dtype on CPU.
+        """
+        if device == torch.device("cuda"):
+            device = torch.device("cpu")
+        return tensor_to(tensor, device, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", cpu_transport)
+    monkeypatch.setattr(torch.amp, "autocast", lambda device, **kwargs: autocast("cpu", **kwargs))
+    model = _LargeValueModel(dtype)
+    encoder = CheckpointMiningEncoder(model=model, processor=_PixelProcessor(), device=torch.device("cuda"))
+    result = encoder.encode_queries(["query"], batch_size=1)
+    expected = model.projection.weight.detach().float().numpy()[:, 0][None, :]
+    np.testing.assert_array_equal(result, expected)
+    assert np.isfinite(result).all()
+
+
+@pytest.mark.parametrize("backend", ["native", "sentence_transformers"])
+def test_document_normalization_preserves_modalities_and_content(backend):
+    model = MagicMock()
+    processor = MagicMock()
+    if backend == "native":
+        encoder = CheckpointMiningEncoder(model=_PixelModel(), processor=processor, device=torch.device("cpu"))
+        processor.process_documents.return_value = {"input_ids": torch.ones(4, 2)}
+    else:
+        encoder = SentenceTransformerMiningEncoder(
+            model=model,
+        )
+        model.encode_document.side_effect = [np.ones((1, 2)), np.ones((2, 2)), np.ones((1, 2))]
+    image = Image.new("RGB", (2, 2))
+    documents = [
+        {"image": image, "text": None},
+        {"image": "", "text": "  passage  "},
+        {"image": image, "text": " \t "},
+        {"image": image, "text": "caption", "title": "Title"},
+    ]
+
+    embeddings = encoder.encode_documents(documents, batch_size=4)
+
+    assert embeddings.shape == (4, 2)
+    if backend == "native":
+        assert processor.process_documents.call_args.args[0] == [
+            {"image": image, "text": ""},
+            {"image": None, "text": "  passage  "},
+            {"image": image, "text": ""},
+            {"image": image, "text": "Title caption"},
+        ]
+    else:
+        text_call, image_call, message_call = model.encode_document.call_args_list
+        assert text_call.args[0] == ["  passage  "]
+        assert image_call.args[0] == [image, image]
+        assert message_call.args[0] == [
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": image}, {"type": "text", "text": "Title caption"}],
+                }
+            ]
+        ]
+
+    with pytest.raises(ValueError, match="doc-7.*no encodable text or image"):
+        encoder.encode_documents([{"_mining_document_id": "doc-7", "image": "", "text": "  "}], batch_size=1)
+
+
+@pytest.mark.parametrize("backend", ["legacy", "native", "sentence_transformers"])
+def test_recipe_unload_releases_model_and_preserves_metadata(backend):
+    recipe = MineHardNegativesRecipe(ConfigNode({}))
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=False)
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    model.pooling_mode = "mean"
+    model.pooling = "avg"
+    model.l2_normalize = False
+    model_reference = weakref.ref(model)
+    parameter_reference = weakref.ref(next(model.parameters()))
+    if backend == "legacy":
+        recipe.model = model
+    else:
+        if backend == "native":
+            encoder = CheckpointMiningEncoder(model=model, processor=_PixelProcessor(), device=torch.device("cpu"))
+        else:
+            model[0].pooling_mode = "mean"
+            encoder = SentenceTransformerMiningEncoder(
+                model=model,
+            )
+        recipe.multimodal_encoder = encoder
+        recipe._model_pooling = encoder.pooling
+        recipe._model_l2_normalize = encoder.l2_normalize
+    del model
+
+    recipe._unload_model()
+    recipe._unload_model()
+    gc.collect()
+
+    assert model_reference() is None
+    assert parameter_reference() is None
+    assert recipe._model_pooling == "avg"
+    assert recipe._model_l2_normalize is False
+    if backend != "legacy":
+        with pytest.raises(RuntimeError, match="already been released"):
+            encoder.encode_queries(["question"], batch_size=1)

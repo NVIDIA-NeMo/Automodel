@@ -29,6 +29,7 @@ class _OneStepScheduler:
         self.is_val_step = False
         self.is_ckpt_step = False
         self.sigterm_flag = False
+        self.sigterm_received = False
 
     def set_epoch(self, epoch):
         self.epoch = epoch

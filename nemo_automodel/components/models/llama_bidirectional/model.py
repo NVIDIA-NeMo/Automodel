@@ -94,6 +94,7 @@ class LlamaBidirectionalModel(LlamaModel):
         super().__init__(config)
         # Transformers mask builders read this per-attention flag; dual-mode parity tests guard that upstream contract.
         is_causal = getattr(config, "is_causal", False)
+        config.is_causal = is_causal
         for layer in self.layers:
             layer.self_attn.is_causal = is_causal
 
@@ -148,7 +149,11 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
 
     @property
     def effective_score_temperature(self) -> float:
-        """Return the temperature applied to score logits by this model."""
+        """Return the temperature applied to score logits by this model.
+
+        Returns:
+            The divisor applied inside the scoring backbone.
+        """
         return float(self.config.temperature)
 
     # TODO: remove this once we upgrade to transformers 5.9.x
@@ -249,12 +254,12 @@ ModelClass = [LlamaBidirectionalModel, LlamaBidirectionalForSequenceClassificati
 
 
 def _register_with_hf_auto_classes():
-    """Register bidirectional models with HuggingFace Auto classes.
+    """Register bidirectional Llama types with Hugging Face Auto classes.
 
-    This is needed so that AutoModel.from_config(LlamaBidirectionalConfig)
-    works inside LlamaForSequenceClassification.__init__.
+    Enables ``AutoConfig``, ``AutoModel``, and ``AutoModelForSequenceClassification``
+    to resolve their corresponding bidirectional config and model classes.
     """
-    from transformers import AutoConfig, AutoModel
+    from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
 
     try:
         AutoConfig.register(LlamaBidirectionalConfig.model_type, LlamaBidirectionalConfig)
@@ -262,6 +267,12 @@ def _register_with_hf_auto_classes():
         pass  # Already registered
     try:
         AutoModel.register(LlamaBidirectionalConfig, LlamaBidirectionalModel)
+    except ValueError:
+        pass  # Already registered
+    try:
+        AutoModelForSequenceClassification.register(
+            LlamaBidirectionalConfig, LlamaBidirectionalForSequenceClassification
+        )
     except ValueError:
         pass  # Already registered
 

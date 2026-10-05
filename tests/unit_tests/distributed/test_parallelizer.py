@@ -3163,8 +3163,8 @@ class TestExtractModelLayers:
         assert len(result) == 5
         assert not any(isinstance(r, nn.ModuleList) for r in result)
 
-    def test_retrieval_wrapper_unwraps_llama_nemotron_vl_groups(self):
-        """Retrieval wrappers should not fall back to the largest-layer heuristic."""
+    def test_retrieval_wrapper_discovers_llama_nemotron_vl_groups(self):
+        """Structural discovery finds both towers through a retrieval wrapper."""
 
         class LlamaNemotronVLModel(nn.Module):
             def __init__(self):
@@ -3195,7 +3195,7 @@ class TestExtractModelLayers:
         assert len(groups["vision"]) == 2
         assert result == groups["language"] + groups["vision"]
 
-    def test_retrieval_wrapper_unwraps_ministral_bidirectional_language_layers(self):
+    def test_retrieval_wrapper_discovers_ministral_bidirectional_language_layers(self):
         """The mainline Ministral bidirectional text encoder remains language-only."""
 
         class Ministral3BidirectionalModel(nn.Module):
@@ -3217,8 +3217,8 @@ class TestExtractModelLayers:
         assert len(groups["language"]) == 3
         assert result == groups["language"]
 
-    def test_retrieval_wrapper_unwraps_private_mistral3_vdr_layers(self):
-        """The private Mistral3 VDR wrapper exposes language and vision layers."""
+    def test_retrieval_wrapper_discovers_mistral3_vl_layers(self):
+        """Structural discovery finds Mistral3 language and vision layers through a wrapper."""
 
         class Mistral3BidirectionalModel(nn.Module):
             def __init__(self):
@@ -3244,8 +3244,8 @@ class TestExtractModelLayers:
         assert len(groups["vision"]) == 2
         assert result == groups["language"] + groups["vision"]
 
-    def test_retrieval_wrapper_resolves_registered_mistral3_reranker_layers(self):
-        """The Mistral3 reranker registration exposes language and vision layers."""
+    def test_retrieval_wrapper_discovers_mistral3_reranker_layers(self):
+        """Structural discovery finds both towers through the extra reranker model nesting."""
 
         class Mistral3BidirectionalModel(nn.Module):
             def __init__(self):

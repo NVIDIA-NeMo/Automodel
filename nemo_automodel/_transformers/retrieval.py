@@ -30,6 +30,8 @@ from transformers import (
     FineGrainedFP8Config,
     PretrainedConfig,
     PreTrainedModel,
+    PreTrainedTokenizerBase,
+    ProcessorMixin,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import ModelOutput, logging
@@ -39,6 +41,7 @@ from nemo_automodel._transformers.sentence_transformer_export import (
     SentenceTransformerExportConfig,
     SentenceTransformerWrapperOptions,
     _cache_hub_source_legal_assets,
+    _CrossEncoderMetadataExporter,
     _load_sentence_transformer_wrapper_options,
     _resolve_cached_source_model_path,
     _resolve_cached_source_repository_path,
@@ -253,9 +256,16 @@ def _resolve_text_backbone_is_causal(
     is_causal: bool | None,
     *,
     default: bool | None = None,
-) -> bool:
+) -> bool | None:
     """Resolve explicit and saved policies before consulting a model's native mode."""
     saved_policy = _get_config_value(_get_text_config(config), "is_causal")
+    if getattr(model.config, "is_encoder_decoder", False) is True:
+        if is_causal is not None or saved_policy is not None or default is not None:
+            raise ValueError(
+                "Retrieval is_causal overrides are not supported for encoder-decoder models; "
+                "leave is_causal unset to preserve native scoring attention."
+            )
+        return None
     if is_causal is not None or saved_policy is not None:
         return _resolve_is_causal(config, is_causal)
     if default is not None:
@@ -263,13 +273,15 @@ def _resolve_text_backbone_is_causal(
     return _get_native_text_backbone_is_causal(model)
 
 
-def _set_text_backbone_is_causal(model: PreTrainedModel, is_causal: bool) -> None:
+def _set_text_backbone_is_causal(model: PreTrainedModel, is_causal: bool | None) -> None:
     """Persist and apply is_causal to a retrieval model's text backbone.
 
     Composite models are scoped to their text tower so that changing the text
     attention mode never changes vision attention. Custom retrieval checkpoints
     remain loadable for backward compatibility and honor the same policy as stock backbones.
     """
+    if is_causal is None:
+        return
     text_backbone, text_config = _get_text_backbone(model)
     if isinstance(text_config, dict):
         text_config["is_causal"] = is_causal
@@ -501,12 +513,14 @@ def build_encoder_backbone(
     model_name_or_path: str,
     task: str,
     trust_remote_code: bool = False,
-    pooling: Optional[str] = None,
-    extract_submodel: Optional[str] = None,
-    num_labels: Optional[int] = None,
-    temperature: Optional[float] = None,
-    is_causal: bool | None = None,
+    pooling: str | None = None,
+    extract_submodel: str | None = None,
+    num_labels: int | None = None,
+    temperature: float | None = None,
     loaded_config: PretrainedConfig | None = None,
+    is_causal: bool | None = None,
+    *,
+    model_args: tuple[Any, ...] = (),
     **hf_kwargs: Any,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
@@ -532,6 +546,7 @@ def build_encoder_backbone(
         is_causal: Whether the retrieval text backbone uses causal self-attention. When omitted, a saved policy is
             restored; otherwise embedding defaults to bidirectional and scoring preserves the backbone's native mode.
         loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
+        model_args: Positional arguments forwarded to the backbone model constructor.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -559,16 +574,11 @@ def build_encoder_backbone(
             model_load_kwargs = {**hf_kwargs, "quantization_config": fp8_dequantization_config}
         model = AutoModel.from_pretrained(
             model_name_or_path,
+            *model_args,
             trust_remote_code=trust_remote_code,
             **model_load_kwargs,
         )
         extracted_model = _extract_submodel(model, extract_submodel)
-        effective_is_causal = _resolve_text_backbone_is_causal(
-            extracted_model,
-            extracted_model.config,
-            is_causal,
-            default=False if task == "embedding" else None,
-        )
         backbone = _build_backbone_from_extracted_submodel(
             extracted_model,
             task=task,
@@ -576,10 +586,19 @@ def build_encoder_backbone(
             num_labels=num_labels,
             temperature=temperature,
         )
+        effective_is_causal = _resolve_text_backbone_is_causal(
+            backbone,
+            extracted_model.config,
+            is_causal,
+            default=False if task == "embedding" else None,
+        )
         _set_text_backbone_is_causal(backbone, effective_is_causal)
         return backbone
 
     backbone_model_class = _get_supported_backbone_class(model_type, task)
+    supports_config = getattr(backbone_model_class, "supports_config", None)
+    if supports_config is not None and not supports_config(config):
+        backbone_model_class = None
     if backbone_model_class is not None:
         if pooling is not None:
             hf_kwargs["pooling"] = pooling
@@ -588,7 +607,7 @@ def build_encoder_backbone(
         if temperature is not None:
             hf_kwargs["temperature"] = temperature
         backbone = backbone_model_class.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
+            model_name_or_path, *model_args, trust_remote_code=trust_remote_code, **hf_kwargs
         )
     else:
         # Fallback: use HuggingFace Auto classes for model types not in SUPPORTED_BACKBONES
@@ -597,10 +616,12 @@ def build_encoder_backbone(
             hf_kwargs["num_labels"] = num_labels
         if task == "score":
             backbone = AutoModelForSequenceClassification.from_pretrained(
-                model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
+                model_name_or_path, *model_args, trust_remote_code=trust_remote_code, **hf_kwargs
             )
         else:
-            backbone = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+            backbone = AutoModel.from_pretrained(
+                model_name_or_path, *model_args, trust_remote_code=trust_remote_code, **hf_kwargs
+            )
     effective_is_causal = _resolve_text_backbone_is_causal(
         backbone,
         config,
@@ -681,12 +702,24 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
                 exc,
             )
             export_config = None
+    cross_encoder_exporter = None
+    if isinstance(model, CrossEncoderModel):
+        cross_encoder_exporter = model._get_consolidated_hf_metadata_exporter(
+            tokenizer=tokenizer, original_model_path=original_model_path
+        )
+        if cross_encoder_exporter is not None:
+            cross_encoder_exporter.validate(tokenizer=tokenizer, original_model_path=original_model_path)
     model.model.save_pretrained(save_directory)
     if deploy_config is not None:
         deploy_config.save_pretrained(save_directory)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(save_directory)
+    if cross_encoder_exporter is not None:
+        cross_encoder_exporter._save_sentence_transformer_assets(
+            hf_metadata_dir=save_directory, tokenizer=tokenizer, original_model_path=original_model_path
+        )
     if export_config is None:
         return
-    tokenizer.save_pretrained(save_directory)
     _save_generated_sentence_transformer_assets(model, export_config, original_model_path, save_directory, tokenizer)
 
 
@@ -754,7 +787,9 @@ class _StockHFMetadataExporter:
         del tokenizer, original_model_path
         self.model_part.get_hf_export_config()
 
-    def save(self, *, hf_metadata_dir: str, tokenizer, original_model_path: str | None) -> None:
+    def save(
+        self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None, v4_compatible: bool
+    ) -> None:
         """Write stock model metadata and optional processor assets."""
         from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
 
@@ -764,7 +799,7 @@ class _StockHFMetadataExporter:
             original_model_path,
             hf_metadata_dir,
             tokenizer,
-            v4_compatible=False,
+            v4_compatible=v4_compatible,
             model_config=deploy_config,
             save_custom_model_code=False,
         )
@@ -823,9 +858,10 @@ class BiEncoderModel(nn.Module):
         l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
-        output_embedding_quantization: Optional[str] = None,
-        is_causal: bool | None = None,
         trust_remote_code: bool = False,
+        *,
+        output_embedding_quantization: str | None = None,
+        is_causal: bool | None = None,
         **hf_kwargs: Any,
     ) -> "BiEncoderModel":
         """Build bi-encoder model from a pretrained backbone."""
@@ -891,13 +927,30 @@ class BiEncoderModel(nn.Module):
             )
         return encoder
 
-    def configure_sentence_transformer_prompts(self, query_prompt: str, document_prompt: str) -> None:
-        """Set the exact prompts used by the current retrieval pipeline."""
+    def configure_sentence_transformer_prompts(
+        self,
+        query_prompt: str,
+        document_prompt: str,
+        *,
+        tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None = None,
+    ) -> None:
+        """Configure export prompts and validate the runtime processor when available.
+
+        Args:
+            query_prompt: Exact prompt used for queries by the training pipeline.
+            document_prompt: Exact prompt used for documents by the training pipeline.
+            tokenizer: Runtime tokenizer or processor, supplied during recipe setup
+                to validate export prerequisites before training begins.
+        """
         export_config = self.sentence_transformer_export_config
         if export_config is None:
             return
         export_config.query_prompt = query_prompt
         export_config.document_prompt = document_prompt
+        if tokenizer is not None:
+            self._get_consolidated_hf_metadata_exporter(
+                tokenizer=tokenizer, original_model_path=getattr(self, "source_model_path", None)
+            )
 
     def disable_sentence_transformer_export(self) -> None:
         """Disable standard export when runtime behavior cannot be represented faithfully."""
@@ -1057,6 +1110,14 @@ class CrossEncoderModel(nn.Module):
 
         self.is_causal = is_causal
 
+    def _get_consolidated_hf_metadata_exporter(
+        self, *, tokenizer: object, original_model_path: str | None
+    ) -> _CrossEncoderMetadataExporter | None:
+        """Use the same CrossEncoder metadata contract for direct and consolidated saves."""
+        if tokenizer is None:
+            return None
+        return _CrossEncoderMetadataExporter(self)
+
     @property
     def effective_score_temperature(self) -> float:
         """Return the model-side temperature applied to score logits.
@@ -1073,15 +1134,29 @@ class CrossEncoderModel(nn.Module):
     def build(
         cls,
         model_name_or_path: str,
-        is_causal: bool | None = None,
         trust_remote_code: bool = False,
+        *,
+        model_args: tuple[Any, ...] = (),
+        is_causal: bool | None = None,
         **hf_kwargs: Any,
     ) -> "CrossEncoderModel":
-        """Build a cross-encoder while preserving saved or native attention by default."""
+        """Build a cross-encoder while preserving saved or native attention by default.
+
+        Args:
+            model_name_or_path: Path to a pretrained model or model identifier.
+            trust_remote_code: Whether to allow custom code from the model repository.
+            model_args: Positional arguments forwarded to the backbone model's constructor.
+            is_causal: Optional text-backbone attention policy.
+            **hf_kwargs: Keyword arguments forwarded to the backbone loader.
+
+        Returns:
+            Cross-encoder with a loaded scoring backbone.
+        """
         logger.info(f"Building CrossEncoderModel from {model_name_or_path}")
         backbone = build_encoder_backbone(
             model_name_or_path,
             task=cls._TASK,
+            model_args=model_args,
             is_causal=is_causal,
             trust_remote_code=trust_remote_code,
             **hf_kwargs,
@@ -1095,7 +1170,7 @@ class CrossEncoderModel(nn.Module):
         self,
         input_dict: Mapping[str, Any] | None = None,
         **kwargs: Any,
-    ) -> ModelOutput:
+    ) -> ModelOutput | tuple[torch.Tensor, ...]:
         """Score tokenized query-document pairs with the wrapped backbone.
 
         Args:

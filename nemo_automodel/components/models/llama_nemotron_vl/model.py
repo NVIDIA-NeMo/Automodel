@@ -45,6 +45,14 @@ class LlamaBidirectionalConfig(LlamaConfig):
         is_causal: bool = False,
         **kwargs: Any,
     ) -> None:
+        """Configure legacy retrieval pooling, temperature, and attention mode.
+
+        Args:
+            pooling: Strategy used to pool token embeddings.
+            temperature: Divisor for retrieval scores.
+            is_causal: Whether to use causal rather than bidirectional attention.
+            **kwargs: Additional Hugging Face Llama configuration fields.
+        """
         self.pooling = pooling
         self.temperature = temperature
         super().__init__(
@@ -101,6 +109,11 @@ class LlamaNemotronVLConfig(PretrainedConfig):
         img_context_token_id: int = 128258,  # tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
         **kwargs,
     ):
+        # Retain the legacy argument position for compatibility, but do not serialize it.
+        if bidirectional_attention is True:
+            logger.warning(
+                "Ignoring legacy bidirectional_attention; configure text attention with llm_config.is_causal."
+            )
         if vision_config is not None:
             if vision_config["model_type"] == "siglip_vision_model":
                 self.vision_config = SiglipVisionConfig(**vision_config)
@@ -135,7 +148,6 @@ class LlamaNemotronVLConfig(PretrainedConfig):
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
         self.pooling = pooling
-        self.bidirectional_attention = bidirectional_attention
         self.img_context_token_id = img_context_token_id
         self.max_input_tiles = max_input_tiles
         super().__init__(**kwargs)
@@ -145,7 +157,16 @@ class LlamaNemotronVLConfig(PretrainedConfig):
         decoder: bool | None = None,
         encoder: bool | None = None,
     ) -> PretrainedConfig:
-        """Return the language decoder config using the Transformers composite-config contract."""
+        """Resolve the language config through the Transformers composite contract.
+
+        Args:
+            decoder: Select the text-output configuration when true.
+            encoder: Select the text-input configuration when true.
+
+        Returns:
+            The language decoder config for decoder or unrestricted requests;
+            the inherited config resolution for encoder-only requests.
+        """
         if decoder or decoder == encoder:
             return self.llm_config
         return super().get_text_config(decoder=decoder, encoder=encoder)
@@ -316,8 +337,27 @@ class LlamaBidirectionalModel(LlamaModel):
         cache_position: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> BaseModelOutputWithPast:
+        """Encode tokens using the selected attention mode.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence], mutually exclusive with inputs_embeds.
+            attention_mask: Optional padding mask of shape [batch, key_sequence], including cached tokens.
+            position_ids: Optional integer tensor of shape [batch, sequence] or [1, sequence].
+            past_key_values: Optional cache of key/value tensors of shape [batch, kv_heads, cached_sequence, head_dim].
+            inputs_embeds: Optional tensor of shape [batch, sequence, hidden], mutually exclusive with input_ids.
+            cache_position: Optional integer tensor of shape [sequence].
+            use_cache: Whether to retain attention keys and values.
+            output_hidden_states: Whether to return each layer's hidden states.
+            **kwargs: Additional arguments forwarded to the stock causal decoder.
+
+        Returns:
+            Output with last_hidden_state of shape [batch, sequence, hidden], optional
+            hidden_states containing tensors of that shape, and optional past_key_values
+            storing keys/values of shape [batch, kv_heads, key_sequence, head_dim]. The
+            causal path can also return attentions of shape [batch, heads, sequence, key_sequence].
+        """
         if getattr(self.config, "is_causal", False):
             return super().forward(
                 input_ids=input_ids,
@@ -514,11 +554,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
                 f"Please use transformers <=4.53.x or >=4.56.0."
             )
 
-    def get_decoder(self) -> PreTrainedModel:
-        """Return the language model used as the retrieval text tower."""
-        return self.language_model
-
-    def _embed_batch(self, inputs: Dict[str, Any], pool_type: Optional[str] = None):
+    def _embed_batch(self, inputs: Dict[str, Any], pool_type: str | None = None):
         """
         Encodes the inputs into a tensor of embeddings.
         Args:
@@ -696,6 +732,10 @@ class LlamaNemotronVLModel(PreTrainedModel):
         vit_embeds = self.mlp1(vit_embeds)
 
         return vit_embeds
+
+    def get_decoder(self) -> PreTrainedModel:
+        """Return the language tower used as the retrieval text decoder."""
+        return self.language_model
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()

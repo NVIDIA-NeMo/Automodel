@@ -17,11 +17,13 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from transformers.image_utils import PILImageResampling
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.models.llama.modeling_llama import LlamaModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+from transformers.models.siglip.modeling_siglip import SiglipAttention
 from transformers.processing_utils import ProcessorMixin
 
+import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
+from nemo_automodel._transformers.retrieval import BiEncoderModel
 from nemo_automodel.components.models.llama_nemotron_vl.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalModel,
@@ -36,6 +38,10 @@ from nemo_automodel.components.models.llama_nemotron_vl.processor import (
 )
 
 IMG_CONTEXT_TOKEN_ID = 99
+
+
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.llama.modeling_llama import LlamaModel
 
 
 class FakeTokenizer:
@@ -136,8 +142,6 @@ def processor(monkeypatch):
 
 @pytest.fixture
 def tiny_model(monkeypatch, processor):
-    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
-
     monkeypatch.setattr(model_module.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
     config = LlamaNemotronVLConfig(
         vision_config=_tiny_vision_config(),
@@ -520,6 +524,167 @@ def test_fast_image_processor_preprocess_honors_image_kwargs(monkeypatch):
 
 
 @pytest.mark.parametrize("is_causal", [False, True])
+def test_llama_nemotron_text_backbone_honors_attention_policy(is_causal):
+    """The multimodal language tower supports both saved attention policies."""
+    config = LlamaBidirectionalConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        is_causal=is_causal,
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        model = LlamaBidirectionalModel(config).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    modified = input_ids.clone()
+    modified[0, -1] = (modified[0, -1] + 1) % config.vocab_size
+
+    with torch.no_grad():
+        original = model(input_ids=input_ids).last_hidden_state
+        changed = model(input_ids=modified).last_hidden_state
+
+    assert all(layer.self_attn.is_causal is is_causal for layer in model.layers)
+    if is_causal:
+        torch.testing.assert_close(original[0, 0], changed[0, 0])
+    else:
+        assert not torch.allclose(original[0, 0], changed[0, 0])
+
+
+@pytest.fixture
+def tiny_retrieval_vlm(monkeypatch, processor):
+    """Real CPU text/vision towers; only external processor loading is replaced."""
+    monkeypatch.setattr(model_module.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
+    config = LlamaNemotronVLConfig(
+        vision_config=_tiny_vision_config(),
+        llm_config={**_tiny_llm_config(), "vocab_size": 128},
+        img_context_token_id=IMG_CONTEXT_TOKEN_ID,
+    )
+    config._attn_implementation = "eager"
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        return LlamaNemotronVLModel(config).eval()
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_retrieval_attention_policy_is_scoped_to_llama_nemotron_text_tower(tiny_retrieval_vlm, is_causal):
+    """Retrieval causality must never change the VL model's vision tower."""
+    model = tiny_retrieval_vlm
+    vision_attentions = [module for module in model.vision_model.modules() if isinstance(module, SiglipAttention)]
+    assert len(vision_attentions) == 1
+    vision_attention = vision_attentions[0]
+    vision_attention.is_causal = not is_causal
+    vision_config = model.config.vision_config.to_dict()
+    pixels = torch.arange(48, dtype=torch.float32).reshape(1, 3, 4, 4) / 48
+    with torch.no_grad():
+        expected_vision = model.extract_feature(pixels)
+
+    encoder = BiEncoderModel(model, is_causal=is_causal)
+
+    assert encoder.is_causal is is_causal
+    assert model.config.llm_config.is_causal is is_causal
+    assert all(layer.self_attn.is_causal is is_causal for layer in model.language_model.layers)
+    assert vision_attention.is_causal is (not is_causal)
+    assert model.config.vision_config.to_dict() == vision_config
+    assert "is_causal" not in vars(model.config)
+    with torch.no_grad():
+        torch.testing.assert_close(model.extract_feature(pixels), expected_vision)
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_retrieval_vlm_round_trip_preserves_embeddings_and_text_policy(tmp_path, tiny_retrieval_vlm, is_causal):
+    """A local VL checkpoint restores multimodal outputs and accepts text-only policy overrides."""
+    encoder = BiEncoderModel(tiny_retrieval_vlm, pooling="cls", is_causal=is_causal).eval()
+    inputs = {
+        "input_ids": torch.tensor([[1, IMG_CONTEXT_TOKEN_ID, 2, 3]]),
+        "attention_mask": torch.ones(1, 4, dtype=torch.long),
+        "pixel_values": torch.arange(48, dtype=torch.float32).reshape(1, 3, 4, 4) / 48,
+    }
+    with torch.no_grad():
+        expected = encoder(inputs)
+        expected_vision = encoder.model.extract_feature(inputs["pixel_values"])
+    save_dir = tmp_path / "vlm"
+    encoder.save_pretrained(save_dir)
+    reloaded = BiEncoderModel.build(str(save_dir), pooling="cls", attn_implementation="eager").eval()
+
+    assert reloaded.is_causal is is_causal
+    assert reloaded.model.config.llm_config.is_causal is is_causal
+    assert "is_causal" not in vars(reloaded.model.config)
+    assert "is_causal" not in vars(reloaded.model.config.vision_config)
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(inputs), expected)
+        torch.testing.assert_close(reloaded.model.extract_feature(inputs["pixel_values"]), expected_vision)
+
+    override_policy = not is_causal
+    overridden = BiEncoderModel.build(
+        str(save_dir), pooling="cls", is_causal=override_policy, attn_implementation="eager"
+    ).eval()
+    assert overridden.is_causal is override_policy
+    changed_inputs = {**inputs, "input_ids": torch.tensor([[1, IMG_CONTEXT_TOKEN_ID, 2, 4]])}
+    with torch.no_grad():
+        original = overridden(inputs)
+        changed = overridden(changed_inputs)
+        torch.testing.assert_close(overridden.model.extract_feature(inputs["pixel_values"]), expected_vision)
+    if override_policy:
+        torch.testing.assert_close(original, changed)
+    else:
+        assert not torch.allclose(original, changed, atol=1e-6)
+
+
+def test_llama_nemotron_vl_config_builds_composed_subconfigs():
+    config = LlamaNemotronVLConfig(
+        vision_config=_tiny_vision_config(),
+        llm_config=_tiny_llm_config(),
+        q_max_length=13,
+        p_max_length=21,
+        pooling="avg",
+    )
+
+    assert config.model_type == "llama_nemotron_vl"
+    assert isinstance(config.vision_config, SiglipVisionConfig)
+    assert isinstance(config.llm_config, LlamaBidirectionalConfig)
+    assert config.llm_config.architectures == ["LlamaBidirectionalModel"]
+    assert config.q_max_length == 13
+    assert config.p_max_length == 21
+    assert config.pooling == "avg"
+    assert config.get_text_config(decoder=True) is config.llm_config
+    assert config.get_text_config() is config.llm_config
+    assert config.get_text_config(encoder=True) is config
+
+
+def test_llama_nemotron_vl_config_accepts_but_drops_legacy_attention_field():
+    """Legacy outer attention metadata loads without overriding the text policy."""
+    llm_config = _tiny_llm_config()
+    llm_config["is_causal"] = True
+    config = LlamaNemotronVLConfig(
+        vision_config=_tiny_vision_config(),
+        llm_config=llm_config,
+        bidirectional_attention=True,
+    )
+
+    assert config.llm_config.is_causal is True
+    assert "bidirectional_attention" not in config.to_dict()
+
+
+def test_llama_nemotron_vl_config_rejects_unsupported_vision_model():
+    vision_config = _tiny_vision_config()
+    vision_config["model_type"] = "unsupported_vision"
+
+    with pytest.raises(ValueError, match="Unsupported model_type"):
+        LlamaNemotronVLConfig(vision_config=vision_config, llm_config=_tiny_llm_config())
+
+
+def test_llama_nemotron_vl_config_rejects_unsupported_llm_architecture():
+    llm_config = _tiny_llm_config()
+    llm_config["architectures"] = ["UnsupportedArchitecture"]
+
+    with pytest.raises(ValueError, match="Unsupported architecture"):
+        LlamaNemotronVLConfig(vision_config=_tiny_vision_config(), llm_config=llm_config)
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
 def test_llama_nemotron_text_backbone_supports_both_attention_policies(is_causal):
     """Verify the text backbone honors causal and bidirectional policies."""
     config = LlamaBidirectionalConfig(
@@ -573,41 +738,6 @@ def test_llama_nemotron_causal_forward_preserves_cache_position(monkeypatch):
     assert captured.get("cache_position") is cache_position
 
 
-def test_llama_nemotron_vl_config_builds_composed_subconfigs():
-    config = LlamaNemotronVLConfig(
-        vision_config=_tiny_vision_config(),
-        llm_config=_tiny_llm_config(),
-        q_max_length=13,
-        p_max_length=21,
-        pooling="avg",
-    )
-
-    assert config.model_type == "llama_nemotron_vl"
-    assert isinstance(config.vision_config, SiglipVisionConfig)
-    assert isinstance(config.llm_config, LlamaBidirectionalConfig)
-    assert config.llm_config.architectures == ["LlamaBidirectionalModel"]
-    assert config.q_max_length == 13
-    assert config.p_max_length == 21
-    assert config.pooling == "avg"
-    assert config.get_text_config(decoder=True) is config.llm_config
-
-
 def test_llama_nemotron_vl_model_exposes_text_decoder(tiny_model):
     """The composite model must expose the retrieval text tower explicitly."""
     assert tiny_model.get_decoder() is tiny_model.language_model
-
-
-def test_llama_nemotron_vl_config_rejects_unsupported_vision_model():
-    vision_config = _tiny_vision_config()
-    vision_config["model_type"] = "unsupported_vision"
-
-    with pytest.raises(ValueError, match="Unsupported model_type"):
-        LlamaNemotronVLConfig(vision_config=vision_config, llm_config=_tiny_llm_config())
-
-
-def test_llama_nemotron_vl_config_rejects_unsupported_llm_architecture():
-    llm_config = _tiny_llm_config()
-    llm_config["architectures"] = ["UnsupportedArchitecture"]
-
-    with pytest.raises(ValueError, match="Unsupported architecture"):
-        LlamaNemotronVLConfig(vision_config=_tiny_vision_config(), llm_config=llm_config)

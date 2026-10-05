@@ -348,8 +348,8 @@ class ConfigNode:
             d (dict): A dictionary representing configuration options.
             raise_on_missing_attr (bool): if True, it will return `None` on a missing attr.
         """
-        # Finetune scripts can modify the config in place, so we need to keep a copy of the
-        # original config for checkpointing.
+        # Finetune scripts can modify the config in place, so keep the originally loaded
+        # values separate from the live, serializable attributes.
         self._raw_config = deepcopy(d)
         # Store original string values before resolution (for _fn and _target_ keys)
         self._original_strings: dict[str, str] = {}
@@ -623,22 +623,33 @@ class ConfigNode:
             # Dicts (shouldn't normally appear because we wrap into ConfigNode, but handle defensively)
             if isinstance(value, dict):
                 return {k: _convert(k, v) for k, v in value.items()}
-            # Prefer original YAML string for _target_ / *_fn when use_orig_values is set
+            # Prefer original YAML strings only while their resolved callable remains live.
+            # Programmatic target/callback overrides must serialize the replacement.
             orig_strings = getattr(self, "_original_strings", {})
-            if use_orig_values and key in orig_strings:
-                return orig_strings[key]
             # Convert targets/functions to dotted path strings
             is_target_like = key == "_target_" or (isinstance(key, str) and key.endswith("_fn")) or key == "collate_fn"
             try:
                 import inspect as _inspect
 
                 if is_target_like and (callable(value) or _inspect.ismethod(value) or _inspect.isclass(value)):
-                    return self._to_dotted_path(value)
+                    dotted_value = self._to_dotted_path(value)
+                    if use_orig_values and key in orig_strings:
+                        try:
+                            original_value = _resolve_target(orig_strings[key])
+                        except Exception:
+                            original_value = None
+                        if callable(original_value) and (
+                            value is original_value or dotted_value == self._to_dotted_path(original_value)
+                        ):
+                            return orig_strings[key]
+                    return dotted_value
                 # Even if the key isn't target-like, convert bare callables to dotted path to avoid <function ...> repr
                 if callable(value) or _inspect.ismethod(value) or _inspect.isclass(value):
                     return self._to_dotted_path(value)
             except Exception:
                 pass
+            if type(value).__module__ == "torch" and type(value).__name__ == "dtype":
+                return str(value).removeprefix("torch.")
             if use_orig_values and hasattr(value, "_orig_value"):
                 return getattr(value, "_orig_value")
             # Primitive – already typed via translate_value/_wrap
