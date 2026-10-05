@@ -31,7 +31,7 @@ from jinja2 import TemplateError
 from PIL import Image
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel, WordPiece
-from tokenizers.pre_tokenizers import BertPreTokenizer
+from tokenizers.pre_tokenizers import BertPreTokenizer, Split
 from transformers import (
     AutoModel,
     AutoProcessor,
@@ -736,6 +736,69 @@ def test_ministral3_chat_template_user_only_preserves_literal_control_tokens(pix
     )
 
     assert rendered == "[IMG] literal [\u200cIMG]"
+
+
+@pytest.mark.parametrize("use_prompt_template", [False, True])
+@pytest.mark.parametrize("prefix_suffix", ["", " ", "  "])
+def test_ministral3_old_template_reexport_matches_training(
+    tmp_path: Path, use_prompt_template: bool, prefix_suffix: str
+) -> None:
+    """Reloading an old template must not duplicate exported prompt separators."""
+    # Reproduce the old built-in embedding branch's unconditional separator.
+    old_template = (
+        "{%- set use_prompt_template = " + str(use_prompt_template).lower() + " -%}\n"
+        "{# nemo-mistral-retrieval-v1 #}"
+        "{{ messages[0]['content'] }}{{ ' ' }}{{ messages[1]['content'] }}"
+    )
+    tokens = ["<unk>", "<pad>", *sorted(set("query: passage: sample"))]
+    backend = Tokenizer(WordLevel({token: i for i, token in enumerate(tokens)}, unk_token="<unk>"))
+    backend.pre_tokenizer = Split("", behavior="isolated")
+    tokenizer = TokenizersBackend(
+        tokenizer_object=backend,
+        unk_token="<unk>",
+        pad_token="<pad>",
+        additional_special_tokens=["[IMG]", "[IMG_BREAK]", "[IMG_END]"],
+        model_max_length=64,
+    )
+    assert tokenizer("query: sample")["input_ids"] != tokenizer("query:  sample")["input_ids"]
+    original = PixtralProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=tokenizer,
+        patch_size=4,
+        chat_template=old_template,
+    )
+    original.save_pretrained(tmp_path / "old")
+    processor = Mistral3BiEncoderProcessor.from_pretrained(
+        tmp_path / "old",
+        use_prompt_template=use_prompt_template,
+        query_prefix="query:" + prefix_suffix,
+        passage_prefix="passage:" + prefix_suffix,
+    )
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.image_token_id = processor.image_token_id
+    encoder = BiEncoderModel(Mistral3BidirectionalModel(config), pooling="avg")
+    _configure_sentence_transformer_export(encoder, processor, tokenizer=processor)
+    encoder.save_pretrained(tmp_path / "export", tokenizer=processor)
+    exported = AutoProcessor.from_pretrained(tmp_path / "export", trust_remote_code=False)
+    prompts = json.loads((tmp_path / "export" / "config_sentence_transformers.json").read_text())["prompts"]
+    training_batches = {
+        "query": processor.process_queries(["sample"], padding=False),
+        "document": processor.process_documents({"images": [None], "texts": ["sample"]}, padding=False),
+    }
+    assert prompts == {"query": "query: ", "document": "passage: "}
+    for name, batch in training_batches.items():
+        rendered = exported.apply_chat_template(
+            [{"role": "system", "content": prompts[name]}, {"role": "user", "content": "sample"}],
+            tokenize=False,
+        )
+        assert rendered == prompts[name] + "sample"
+        inference = exported(text=[rendered], padding=False, return_tensors="pt")
+        torch.testing.assert_close(inference["input_ids"], batch["input_ids"])
+        torch.testing.assert_close(inference["attention_mask"], batch["attention_mask"])
+    restored = Mistral3BiEncoderProcessor.from_pretrained(
+        tmp_path / "export", use_prompt_template=use_prompt_template
+    )
+    assert restored.chat_template == processor.chat_template == exported.chat_template
 
 
 def test_ministral3_exported_chat_template_vllm_content_format(tmp_path):

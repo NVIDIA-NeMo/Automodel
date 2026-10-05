@@ -210,11 +210,11 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
     its tokenizer treats raw control markers as processor-owned, while its chat
     template marks externally supplied text for ordinary tokenization. Direct
     retrieval query/document helpers apply the same text marker because they do
-    not render the chat template. Newly constructed retrieval templates and training
-    helpers normalize trailing ASCII spaces in query/document prefixes and add one
-    separator before content. This changes inputs for configurations that previously
-    relied on repeated prefix separators. Existing stock processor exports retain
-    their saved template.
+    not render the chat template. Training helpers and the retrieval template
+    normalize trailing ASCII spaces in query/document prefixes and add one separator
+    before content. This class always installs its built-in retrieval template,
+    including when loading a checkpoint, so training and export share that policy.
+    Custom saved templates are not preserved by this training processor.
 
     Saving defaults to the stock Pixtral class for portable bi-encoder checkpoints;
     cross-encoder recipes preserve this class because their evaluation path requires
@@ -360,8 +360,8 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             **kwargs,
         )
         default_chat_template = _apply_mistral_retrieval_ownership_policy(self.tokenizer)
-        # Instruct templates must be converted, but saved retrieval templates own
-        # their formatting and must survive a load/save round trip unchanged.
+        # Validate saved reranker settings before installing the current template.
+        # Training helpers and exported inference must use the same prefix policy.
         if chat_template is not None and "{# nemo-mistral-retrieval-v1" in chat_template:
             saved_prompt_setting = chat_template.split("\n", 1)[0]
             if (
@@ -373,10 +373,8 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
                 and saved_prompt_setting != f"{{%- set use_prompt_template = {str(use_prompt_template).lower()} -%}}"
             ):
                 raise ValueError("use_prompt_template conflicts with the saved retrieval chat template")
-            self.chat_template = chat_template
-        else:
-            prompt_setting = "true" if use_prompt_template else "false"
-            self.chat_template = "{%- set use_prompt_template = " + prompt_setting + " -%}\n" + default_chat_template
+        prompt_setting = "true" if use_prompt_template else "false"
+        self.chat_template = "{%- set use_prompt_template = " + prompt_setting + " -%}\n" + default_chat_template
         self.tokenizer.chat_template = self.chat_template
         self.q_max_length = q_max_length if q_max_length is not None else q_max_len
         self.p_max_length = p_max_length if p_max_length is not None else p_max_len
