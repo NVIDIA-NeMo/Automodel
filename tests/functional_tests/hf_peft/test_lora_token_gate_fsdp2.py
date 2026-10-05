@@ -23,7 +23,6 @@ reference over the global batch, and a loss confined to gated-off tokens must
 leave every adapter gradient exactly zero.
 """
 
-import copy
 import os
 import socket
 
@@ -114,15 +113,17 @@ def _run_rank(rank: int, port: int, activation_checkpointing: bool, bf16: bool) 
     device = torch.device("cuda", rank)
     try:
         microbatches = _global_microbatches(device)
-        model = _build_model(device)
 
         # Single-process fp32 reference: sum of both microbatches' gated backward over the global batch.
-        reference = copy.deepcopy(model)
+        # Built from the same seed rather than deep-copied: the fused LoRA MLP forward is an instance
+        # closure over the original module, which ``copy.deepcopy`` would keep pointing at the source.
+        reference = _build_model(device)
         for input_ids, gate, upstream in microbatches:
             with lora_token_gate(reference, gate):
                 reference(input_ids=input_ids).logits.backward(upstream)
         reference_grads = _lora_grads(reference)
 
+        model = _build_model(device)
         dtype = torch.bfloat16 if bf16 else torch.float32
         device_mesh = init_device_mesh(
             "cuda", (1, _WORLD_SIZE, 1), mesh_dim_names=("dp_replicate", "dp_shard_cp", "tp")
