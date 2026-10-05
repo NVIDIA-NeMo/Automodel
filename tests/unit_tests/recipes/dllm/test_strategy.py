@@ -473,7 +473,7 @@ class TestUnoStrategy:
         assert (default.tv_weight, default.kl_weight) == (1.0, 0.0)  # released recipe: TV only
 
     def test_pre_step_replaces_every_response_token_within_the_microbatch_range(self, strategy):
-        """Official noise: rate 1 over the response, ids drawn from [0, max(input_ids) + 1) of the microbatch."""
+        """Uno noise: rate 1 over the response, ids drawn from [0, max(input_ids) + 1) of the microbatch."""
         generator = torch.Generator().manual_seed(0)
 
         def apply_corruption(input_ids, loss_mask, microbatch_idx=0):
@@ -568,8 +568,8 @@ class TestUnoStrategy:
         trained = {name for name, p in model.named_parameters() if p.grad is not None}
         assert trained == {"q_proj.lora_A.weight", "q_proj.lora_B.weight"}
 
-    # Official ``training/configs/uno_3epoch_curriculum.yaml``: 2x8 GPUs x batch 8 x 4096 tokens.
-    OFFICIAL_CURRICULUM = {
+    # Uno-Qwen3-8B curriculum: global batch 128 x 4096 tokens, 6 stages over 3 epochs.
+    UNO_QWEN3_8B_CURRICULUM = {
         "tokens_per_step": 524288,
         "stages": [
             {"block_size": 2, "tokens": 2457862144},
@@ -585,10 +585,10 @@ class TestUnoStrategy:
         ("step", "block_size"),
         [(0, 2), (4687, 2), (4688, 4), (9375, 6), (23437, 12), (23438, 16), (28124, 16), (40000, 16)],
     )
-    def test_official_curriculum_picks_block_size_from_the_optimizer_step(self, strategy, step, block_size):
-        """Stage boundaries match the official plan (alternating 4,688/4,687-step halves); steps past the
+    def test_curriculum_picks_block_size_from_the_optimizer_step(self, strategy, step, block_size):
+        """Stage boundaries land on the expected steps (alternating 4,688/4,687-step halves); steps past the
         last stage keep its block size."""
-        strategy.create_loss_fn({"block_curriculum": self.OFFICIAL_CURRICULUM})
+        strategy.create_loss_fn({"block_curriculum": self.UNO_QWEN3_8B_CURRICULUM})
         assert strategy.block_size == 2
         assert strategy._stage_end_steps == [4688, 9375, 14063, 18750, 23438, 28125]
         recipe = types.SimpleNamespace(step_scheduler=types.SimpleNamespace(step=step))
@@ -603,7 +603,7 @@ class TestUnoStrategy:
     @pytest.mark.parametrize(
         ("dllm_cfg", "match"),
         [
-            ({"block_length": 4, "block_curriculum": OFFICIAL_CURRICULUM}, "not both"),
+            ({"block_length": 4, "block_curriculum": UNO_QWEN3_8B_CURRICULUM}, "not both"),
             ({"block_curriculum": {"stages": [{"block_size": 2, "tokens": 8}]}}, "tokens_per_step"),
             ({"block_curriculum": {"tokens_per_step": 8, "stages": []}}, "non-empty"),
             (
@@ -644,19 +644,19 @@ class TestUnoStrategy:
             mask_token_id=151669,
         )
 
-    def test_setup_extra_accepts_the_official_batch_and_steps(self, strategy, caplog):
-        strategy.create_loss_fn({"block_curriculum": self.OFFICIAL_CURRICULUM})
+    def test_setup_extra_accepts_a_matching_batch_and_steps(self, strategy, caplog):
+        strategy.create_loss_fn({"block_curriculum": self.UNO_QWEN3_8B_CURRICULUM})
         strategy.setup_extra(self._curriculum_recipe(128, 4096, 28125))
         assert "differs from the block curriculum" not in caplog.text
 
     def test_setup_extra_rejects_tokens_per_step_that_mismatches_the_batch(self, strategy):
-        """As official ``train.py``: tokens_per_step must equal global_batch_size * seq_length."""
-        strategy.create_loss_fn({"block_curriculum": self.OFFICIAL_CURRICULUM})
+        """tokens_per_step must equal global_batch_size * seq_length."""
+        strategy.create_loss_fn({"block_curriculum": self.UNO_QWEN3_8B_CURRICULUM})
         with pytest.raises(ValueError, match="global_batch_size \\* dataset.seq_length = 262144"):
             strategy.setup_extra(self._curriculum_recipe(64, 4096, 28125))
 
     def test_setup_extra_warns_when_max_steps_differs_from_the_curriculum(self, strategy, caplog):
-        strategy.create_loss_fn({"block_curriculum": self.OFFICIAL_CURRICULUM})
+        strategy.create_loss_fn({"block_curriculum": self.UNO_QWEN3_8B_CURRICULUM})
         strategy.setup_extra(self._curriculum_recipe(128, 4096, 1000))
         assert "differs from the block curriculum's last stage end step 28125" in caplog.text
 

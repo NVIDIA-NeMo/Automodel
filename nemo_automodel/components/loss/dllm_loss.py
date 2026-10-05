@@ -1109,8 +1109,7 @@ class UnoDistillLoss(nn.Module):
         L = \\gamma \\cdot \\text{TV} + \\beta \\cdot \\text{KL}(p_\\text{student} \\| p_\\text{teacher})
 
     - ``TV`` — the blockwise total-variation objective of the paper (Sec. 3, after Leviathan et al.
-      2023, Cor. 3.6): the full L1 distance ``sum_v |p_student - p_teacher|`` per position, matching
-      the official ``token_normalized_total_variation``. Computed in position chunks wrapped in
+      2023, Cor. 3.6): the full L1 distance ``sum_v |p_student - p_teacher|`` per position. Computed in position chunks wrapped in
       :func:`torch.utils.checkpoint` so only one ``[chunk, vocab]`` pair of fp32 probabilities is
       live at a time.
     - ``KL`` — reverse KL, computed by :class:`KDLoss` with the arguments swapped (``KDLoss``

@@ -19,13 +19,13 @@
 # teacher; the loss is the total variation between the two. At inference the Psi-Spec sampler drafts a
 # block with the adapter on and verifies it losslessly with the adapter off.
 #
-# Hyperparameters follow the released Uno-Qwen3-8B recipe (ifm-ai/uno, training/):
+# Hyperparameters follow the paper's Uno-Qwen3-8B setup:
 #   LoRA r=128, alpha=2048 on all 7 projections; TV loss only; lr 1e-5 with 562 warmup steps, then constant;
 #   global batch 128 x 4096 tokens; block-size curriculum 2 -> 4 -> 6 -> 8 -> 12 -> 16 over 3 epochs
 #   (28,125 steps) of OpenThoughts3-1.2M.
 #
-# The resulting adapter (checkpoint model/ directory) is a standard PEFT adapter for the official
-# nano_vllm_uno engine: --gated-lora-path <checkpoint>/model --mask-token-id 151669.
+# The resulting adapter (checkpoint model/ directory) is a standard PEFT adapter, applied with the gate on
+# draft tokens only at inference.
 #
 # Usage (8 GPUs, single node):
 #   python -m torch.distributed.run --nproc-per-node=8 \
@@ -84,7 +84,7 @@ dllm:
   mask_token_id: 151669      # Uno <MASK> for Qwen3 (s-sahoo/uno-qwen3-8B config.json)
   tv_weight: 1.0
   kl_weight: 0.0
-  block_curriculum:          # official training/configs/uno_3epoch_curriculum.yaml
+  block_curriculum:          # 2 -> 16, block size grows every half epoch
     tokens_per_step: 524288  # global_batch_size * seq_length
     stages:
       - {block_size: 2, tokens: 2457862144}

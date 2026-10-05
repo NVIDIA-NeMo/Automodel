@@ -4,7 +4,7 @@
 # and off for the clean x_0 copy, whose logits are the frozen AR teacher for the total-variation loss.
 # A short 3-stage block-size curriculum (2 -> 4 -> 8) exercises the stage switches within 6 steps.
 # Data: uno_smoke_data.jsonl holds the first 32 rows of open-thoughts/OpenThoughts3-1.2M (Apache-2.0,
-# revision 61bcf9d4, the official Uno training set) in its ShareGPT format, truncated to 1500/2000 characters.
+# revision 61bcf9d4, the Uno training set) in its ShareGPT format, truncated to 1500/2000 characters.
 #
 # Launched by L2_DLLM_Uno_Smoke.sh.
 
@@ -34,7 +34,7 @@ peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: ["*_proj"]
   dim: 16
-  alpha: 256      # official Uno ratio alpha = 16 * r
+  alpha: 256      # Uno ratio alpha = 16 * r
   dropout: 0.0
 
 checkpoint:

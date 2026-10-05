@@ -258,11 +258,7 @@ class TestCorruptUniformRandom:
         assert replacements.unique().numel() > 1, "replacements collapsed to a single id (looks like a mask token)"
 
     def test_eps_one_corrupts_every_supervised_position(self, inputs):
-        """eps=1 gives Uno's full uniform noise: every response token is replaced, the prompt is untouched.
-
-        Matches ``forward_add_noise_packed(noise="uniform")`` in the Uno SDAR remote code, which fixes the
-        mask rate to 1 and draws replacements with ``torch.randint`` over the vocabulary.
-        """
+        """eps=1 gives Uno's full uniform noise: every response token is replaced, the prompt is untouched."""
         input_ids, loss_mask = inputs
         generator = torch.Generator().manual_seed(3)
         noisy, noise_mask, p_mask = corrupt_uniform_random(

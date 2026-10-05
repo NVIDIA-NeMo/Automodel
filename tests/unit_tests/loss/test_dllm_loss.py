@@ -652,7 +652,7 @@ class TestIDLMLossDTensor:
 class TestUnoDistillLoss:
     """Uno TV / reverse-KL loss over the ``[x_t | x_0]`` halves.
 
-    The reference is the official Uno training math (``training/losses.py``): the full L1 distance
+    The reference is the Uno objective written out directly: the full L1 distance
     ``sum |p_student - p_teacher|`` and ``F.kl_div(teacher_log_probs, student_log_probs,
     log_target=True, reduction="sum")``, both divided by the supervised-token count, with the clean
     half as the detached teacher and both halves compared at the same (unshifted) answer positions.
@@ -684,7 +684,7 @@ class TestUnoDistillLoss:
         return tv_weight * tv + kl_weight * kl, tv
 
     @pytest.mark.parametrize(("tv_weight", "kl_weight"), [(1.0, 0.0), (0.0, 1.0), (1.0, 0.5)])
-    def test_matches_official_reference_loss_and_gradient(self, tv_weight, kl_weight):
+    def test_matches_reference_loss_and_gradient(self, tv_weight, kl_weight):
         from nemo_automodel.components.loss.dllm_loss import UnoDistillLoss
 
         logits, answer_mask, valid_mask, L = self._inputs()

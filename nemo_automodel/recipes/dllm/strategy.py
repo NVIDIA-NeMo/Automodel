@@ -576,19 +576,17 @@ class UnoStrategy(IDLMStrategy):
     """Strategy for Uno diffusion-adapter training (Sahoo et al., 2026; arXiv:2609.04010).
 
     Trains a LoRA adapter on a frozen AR model so that, with the adapter on, the model drafts a block
-    of tokens in parallel that the adapter-off model verifies losslessly. Follows the official Uno
-    training code (``ifm-ai/uno`` ``training/``) on top of the I-DLM ``[x_t | x_0]`` layout and mask:
+    of tokens in parallel that the adapter-off model verifies losslessly. Built on the I-DLM ``[x_t | x_0]``
+    layout and mask:
 
     - Corruption: every supervised (response) token in ``x_t`` is replaced by a uniform random id in
-      ``[0, max(input_ids) + 1)`` over the microbatch, as in the official SDAR
-      ``forward_add_noise_packed(noise="uniform")`` (rate fixed to 1) — :func:`corrupt_uniform_random`
+      ``[0, max(input_ids) + 1)`` over the microbatch (noise rate 1) — :func:`corrupt_uniform_random`
       with ``eps=1``.
     - Forward: the LoRA adapter is gated on for the ``x_t`` half only
-      (:func:`~nemo_automodel.components._peft.lora.lora_token_gate`, the official
-      ``TokenwiseLoraRouter``), so the ``x_0`` half is the frozen AR teacher in the same forward.
+      (:func:`~nemo_automodel.components._peft.lora.lora_token_gate`), so the ``x_0`` half is the frozen AR teacher in the same forward.
     - Loss: :class:`UnoDistillLoss` (total variation, optional reverse KL) between the two halves.
-    - Block size: fixed ``dllm.block_length``, or the official increasing block-size curriculum
-      ``dllm.block_curriculum`` (``training/curriculum.py``): ``tokens_per_step`` plus ``stages`` of
+    - Block size: fixed ``dllm.block_length``, or an increasing block-size curriculum
+      ``dllm.block_curriculum``: ``tokens_per_step`` plus ``stages`` of
       ``{block_size, tokens}``; a stage ends at optimizer step ``cumulative_tokens // tokens_per_step``.
       The stage is a pure function of the optimizer step, so resume works at any step.
 
@@ -619,10 +617,9 @@ class UnoStrategy(IDLMStrategy):
         )
 
     def _parse_block_curriculum(self, curriculum) -> None:
-        """Validate the official curriculum format and record each stage's end step.
+        """Validate the curriculum and record each stage's end step.
 
-        Mirrors ``BlockCurriculumPlan.from_yaml``: block sizes strictly increase and every stage
-        spans at least one optimizer step.
+        Block sizes must strictly increase and every stage must span at least one optimizer step.
         """
         tokens_per_step = int(curriculum.get("tokens_per_step", 0))
         if tokens_per_step <= 0:
@@ -647,7 +644,7 @@ class UnoStrategy(IDLMStrategy):
         self._tokens_per_step = tokens_per_step
 
     def setup_extra(self, recipe) -> None:
-        """Run the I-DLM checks, then the official curriculum runtime checks (``train.py``).
+        """Run the I-DLM checks, then check the curriculum against the batch and step budget.
 
         ``tokens_per_step`` must equal ``step_scheduler.global_batch_size * dataset.seq_length`` or every
         stage boundary lands on the wrong step; a ``max_steps`` other than the last stage's end step
@@ -685,7 +682,7 @@ class UnoStrategy(IDLMStrategy):
             ``(num_noise_tokens, num_supervised_tokens)`` raw local counts.
         """
         if self._stage_end_steps:
-            # Steps past the last stage keep its block size, as the official trainer clamps to max_steps - 1.
+            # Steps past the last stage keep its block size.
             step = min(int(recipe.step_scheduler.step), self._stage_end_steps[-1] - 1)
             block_size = self._stage_block_sizes[bisect.bisect_right(self._stage_end_steps, step)]
             if block_size != self.block_size:
@@ -694,7 +691,7 @@ class UnoStrategy(IDLMStrategy):
         num_noise = 0
         num_supervised = 0
         for microbatch_idx, batch in enumerate(batches):
-            # The official noise draws replacements from [0, max(input_ids) + 1) over the whole microbatch.
+            # Replacement ids are drawn from [0, max(input_ids) + 1) over the whole microbatch.
             self._noise_high = int(batch["input_ids"].max()) + 1
             noisy_input_ids, noise_mask, p_mask = recipe._apply_corruption(
                 batch["input_ids"], batch["loss_mask"], microbatch_idx=microbatch_idx
@@ -712,8 +709,8 @@ class UnoStrategy(IDLMStrategy):
     ):
         """Replace every supervised token with a uniform random id in ``[0, max(microbatch) + 1)``.
 
-        ``mask_token_id``, ``eps``, ``block_size`` and ``half_life_ratio`` are unused: the official Uno noise
-        has rate 1 and no mask token.
+        ``mask_token_id``, ``eps``, ``block_size`` and ``half_life_ratio`` are unused: Uno noise has rate 1 and
+        no mask token.
 
         Args:
             input_ids: Clean token IDs, Tensor of shape [batch, sequence].
