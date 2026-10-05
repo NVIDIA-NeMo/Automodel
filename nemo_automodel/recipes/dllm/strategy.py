@@ -673,6 +673,17 @@ class UnoStrategy(IDLMStrategy):
             )
 
     def pre_step(self, recipe, batches) -> tuple[int, int]:
+        """Pick the curriculum block size for this step, then corrupt every microbatch.
+
+        Args:
+            recipe: The dLLM recipe (reads ``step_scheduler.step`` and ``_apply_corruption``).
+            batches: Microbatch dicts whose ``input_ids`` and ``loss_mask`` are Tensors of shape
+                [batch, sequence]; each gains ``_noisy_input_ids``, ``_noise_mask``, ``_p_mask`` and
+                ``_clean_input_ids`` of the same shape.
+
+        Returns:
+            ``(num_noise_tokens, num_supervised_tokens)`` raw local counts.
+        """
         if self._stage_end_steps:
             # Steps past the last stage keep its block size, as the official trainer clamps to max_steps - 1.
             step = min(int(recipe.step_scheduler.step), self._stage_end_steps[-1] - 1)
@@ -699,6 +710,19 @@ class UnoStrategy(IDLMStrategy):
     def apply_corruption(
         self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
     ):
+        """Replace every supervised token with a uniform random id in ``[0, max(microbatch) + 1)``.
+
+        ``mask_token_id``, ``eps``, ``block_size`` and ``half_life_ratio`` are unused: the official Uno noise
+        has rate 1 and no mask token.
+
+        Args:
+            input_ids: Clean token IDs, Tensor of shape [batch, sequence].
+            loss_mask: Supervised-position mask, Tensor of shape [batch, sequence].
+            generator: Optional seeded generator for the replacement draws.
+
+        Returns:
+            ``(noisy_input_ids, noise_mask, p_mask)``, each a Tensor of shape [batch, sequence].
+        """
         if self._noise_high is None:
             raise RuntimeError("UnoStrategy.apply_corruption must run inside pre_step, which sets the noise range.")
         return corrupt_uniform_random(
