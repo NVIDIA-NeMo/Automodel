@@ -147,7 +147,9 @@ def load_pipeline(cfg, dist_info):
         model_id,
         torch_dtype=torch_dtype,
         mesh_context=mesh_context,
-        components_to_load=["transformer"],
+        # Inference needs every component on device, but only the transformer
+        # supports the requested model/context parallelism.
+        components_to_parallelize=["transformer"],
         move_to_device=not cpu_offload,
     )
 
