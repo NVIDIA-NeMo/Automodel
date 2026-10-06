@@ -175,9 +175,7 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
                 ``[batch, sequence, hidden]``.
             labels: Rank-local target token IDs with shape ``[batch, sequence]``.
             lm_weight: LM-head weight with global shape ``[vocab, hidden]``.
-                It may be a regular tensor or an FSDP-sharded DTensor. With
-                ``impl="cce"``, its compute dtype follows ``hidden_states``;
-                master-weight storage and gradient dtype are preserved.
+                It may be a regular tensor or an FSDP-sharded DTensor.
             num_label_tokens: Global number of non-padding target tokens used
                 to normalize a sum-reduced loss.
             grad_reduce_group: Group that contributes independent loss shards
@@ -206,10 +204,6 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
             lm_weight,
             grad_reduce_group=grad_reduce_group,
         )
-        if self.impl == "cce":
-            # CCE requires matching operand dtypes. Keep the cast differentiable
-            # so gradients still reach the original (possibly FP32) FSDP shard.
-            lm_weight = lm_weight.to(dtype=hidden_states.dtype)
 
         # First compute loss with sum reduction to handle normalization ourselves
         softcap = None if self.logit_softcapping == 0 else self.logit_softcapping
