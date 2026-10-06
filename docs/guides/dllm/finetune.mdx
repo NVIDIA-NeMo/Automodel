@@ -216,7 +216,7 @@ The following table describes the key configuration fields for dLLM fine-tuning:
 |-------|-------------|
 | `dllm.mode` | Training strategy (`mdlm`, `scdd`, `hybrid`, `block_diffusion`, `dflash`, `idlm`, or `uno`) |
 | `dllm.mask_token_id` | Token ID used for masking (`126336` for LLaDA, `156895` for LLaDA2.1, `100` for Nemotron-Labs-Diffusion). Unused by `block_diffusion`. |
-| `dllm.eps` | Minimum corruption ratio to avoid zero-corruption samples |
+| `dllm.eps` | Minimum corruption ratio to avoid zero-corruption samples. |
 | `dllm.block_size` | Hybrid: when set, use blockwise corruption (otherwise uniform). Block-diffusion: response-block size for one-canvas-per-step selection (default `256`). |
 | `dllm.encoder_loss_weight` | Weight on the co-trained encoder AR loss. Block-diffusion only (default `1.0`). |
 | `dllm.self_conditioning_p` | Per-example probability of two-pass self-conditioning. Block-diffusion only (default `0.5`). |
