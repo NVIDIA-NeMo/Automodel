@@ -155,6 +155,9 @@ def prepare_lm_weight(
         and gradient contract. Chunked CE also honors the head's compute dtype;
         share this result across loss calls to retain only one converted copy.
     """
+    # Match setup's head/config lookup without changing the training wrapper.
+    if isinstance(model, nn.parallel.DistributedDataParallel):
+        model = model.module
     if isinstance(loss_fn, ChunkedCrossEntropy):
         return loss_fn.prepare_lm_weight(
             _get_lm_head_module(model),

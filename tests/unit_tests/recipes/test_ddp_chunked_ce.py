@@ -21,9 +21,12 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers import MistralConfig, MistralForCausalLM
+from transformers import GPTNeoXConfig, GPTNeoXForCausalLM, MistralConfig, MistralForCausalLM
 
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.utils import prepare_lm_weight
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _maybe_downgrade_loss_fn,
@@ -54,12 +57,29 @@ def _mistral():
     )
 
 
-def test_ddp_preserves_chunked_ce_capability(ddp_group):
-    model = _mistral()
+def _gpt_neox():
+    return GPTNeoXForCausalLM(
+        GPTNeoXConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            use_cache=False,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+    )
+
+
+@pytest.mark.parametrize("model_factory", [_mistral, _gpt_neox])
+def test_ddp_preserves_chunked_ce_capability(ddp_group, model_factory):
+    model = model_factory()
     loss = ChunkedCrossEntropy(4, compile=False)
     assert _maybe_downgrade_loss_fn(loss, model, False) is loss
     wrapped = DDP(model)
     assert _maybe_downgrade_loss_fn(loss, wrapped, False) is loss
+    assert prepare_lm_weight(loss, wrapped) is model.get_output_embeddings().weight
 
 
 class _UnsupportedModel(nn.Linear):
@@ -97,13 +117,17 @@ def test_ddp_preserves_chunked_ce_head_validation(ddp_group, invalid):
 
         model.config = Gemma2Config(final_logit_softcapping=30.0)
         message = "final_logit_softcapping"
+    wrapped = DDP(model)
+    loss = ChunkedCrossEntropy(compile=False)
     with pytest.raises(ValueError, match=message):
-        _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), DDP(model), False)
+        _maybe_downgrade_loss_fn(loss, wrapped, False)
+    with pytest.raises(ValueError, match=message):
+        prepare_lm_weight(loss, wrapped)
 
 
-def _check_ddp_chunked_ce_training(rank, world_size):
+def _check_ddp_chunked_ce_training(rank, world_size, model_factory):
     torch.manual_seed(17)
-    model = _mistral()
+    model = model_factory()
     reference = deepcopy(model)
     wrapped = DDP(model)
     loss = ChunkedCrossEntropy(4, compile=False)
@@ -140,24 +164,31 @@ def _check_ddp_chunked_ce_training(rank, world_size):
     try:
         # A second iteration also exercises DDP's reducer completion checks.
         for _ in range(2):
-            input_ids = torch.randint(32, (world_size, 8))
-            labels = torch.randint(32, (world_size, 8))
+            input_ids = torch.randint(32, (world_size, 2, 8))
+            labels = torch.randint(32, (world_size, 2, 8))
             # Unequal valid-token counts catch per-rank normalization mistakes.
             for batch_index in range(world_size):
-                labels[batch_index, : batch_index + 1] = -100
+                labels[batch_index, :, : batch_index + 1] = -100
             losses = []
-            TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
-                recipe,
-                0,
-                {"input_ids": input_ids[rank : rank + 1], "labels": labels[rank : rank + 1]},
-                loss_buffer=losses,
-                num_label_tokens=int(labels.ne(-100).sum()),
-                num_batches=1,
+            for microbatch in range(2):
+                TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
+                    recipe,
+                    microbatch,
+                    {
+                        "input_ids": input_ids[rank, microbatch : microbatch + 1],
+                        "labels": labels[rank, microbatch : microbatch + 1],
+                    },
+                    loss_buffer=losses,
+                    num_label_tokens=int(labels.ne(-100).sum()),
+                    num_batches=2,
+                )
+            ref_loss = nn.functional.cross_entropy(
+                reference(input_ids.flatten(0, 1)).logits.flatten(0, 1), labels.flatten()
             )
-            ref_loss = nn.functional.cross_entropy(reference(input_ids).logits.flatten(0, 1), labels.flatten())
             ref_loss.backward()
-            dist.all_reduce(losses[0])
-            torch.testing.assert_close(losses[0], ref_loss)
+            total_loss = torch.stack(losses).sum()
+            dist.all_reduce(total_loss)
+            torch.testing.assert_close(total_loss, ref_loss)
             for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
                 torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=1e-4, atol=2e-6)
             optimizer.step()
@@ -168,18 +199,19 @@ def _check_ddp_chunked_ce_training(rank, world_size):
             ref_optimizer.zero_grad()
     finally:
         handle.remove()
-    assert forwarded == [1, 1]
+    assert forwarded == [1, 1, 1, 1]
 
 
-def test_ddp_chunked_ce_trains_through_wrapper(ddp_group):
-    _check_ddp_chunked_ce_training(rank=0, world_size=1)
+@pytest.mark.parametrize("model_factory", [_mistral, _gpt_neox])
+def test_ddp_chunked_ce_trains_through_wrapper(ddp_group, model_factory):
+    _check_ddp_chunked_ce_training(rank=0, world_size=1, model_factory=model_factory)
 
 
 def _run_ddp_chunked_ce_worker(rank, init_method):
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
-        _check_ddp_chunked_ce_training(rank=rank, world_size=2)
+        _check_ddp_chunked_ce_training(rank=rank, world_size=2, model_factory=_mistral)
     finally:
         dist.destroy_process_group()
 
@@ -196,3 +228,15 @@ def test_ddp_chunked_ce_two_rank_parity(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_ddp_fused_loss_capability(ddp_group, supported):
+    model = _mistral() if supported else _UnsupportedModel(16, 32, bias=False)
+    loss = FusedLinearCrossEntropy(ignore_index=0)
+    result = _maybe_downgrade_loss_fn(loss, DDP(model), False)
+    if supported:
+        assert result is loss
+    else:
+        assert isinstance(result, MaskedCrossEntropy)
+        assert result.ignore_index == 0
