@@ -335,7 +335,7 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         UV_CONCURRENT_INSTALLS=8 \
         UV_CACHE_DIR=${UV_CACHE_DIR}/${MOK_ARCH} \
         MOK_ARCH=${MOK_ARCH} \
-        uv sync --extra $AUTOMODEL_INSTALL --extra msa --extra mok --all-groups $UV_SYNC_ARGS && \
+        uv sync --extra $AUTOMODEL_INSTALL --extra msa --extra mok --extra ffpa --all-groups $UV_SYNC_ARGS && \
     python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}

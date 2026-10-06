@@ -25,10 +25,12 @@ from torch.nn.parallel import DistributedDataParallel
 from nemo_automodel.components.checkpoint.addons import (
     ConsolidatedHFAddon,
     _extract_target_modules,
+    _get_automodel_peft_metadata,
     _group_barrier,
     _is_group_rank_0,
     _maybe_save_custom_model_code,
     _maybe_strip_quantization_config,
+    load_automodel_peft_config_dict,
 )
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
@@ -556,3 +558,16 @@ class TestParamWrapperLayoutHintPlumbing:
 
         assert seen["hint"] == "peft-0.18"
         assert model.state_dict_adapter._paramwrapper_layout_hint is None
+
+
+def test_load_automodel_peft_config_dict_round_trips_the_saved_metadata(tmp_path):
+    import json
+
+    from nemo_automodel.components._peft.lora import PeftConfig
+
+    peft = PeftConfig(target_modules=["*.qkv_proj"], dim=16, alpha=8, lora_dtype=torch.bfloat16)
+    (tmp_path / "automodel_peft_config.json").write_text(json.dumps(_get_automodel_peft_metadata(peft)))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 8}))
+    loaded = PeftConfig.from_dict(load_automodel_peft_config_dict(str(tmp_path)))
+    assert loaded.target_modules == ["*.qkv_proj"] and (loaded.dim, loaded.alpha) == (16, 8)
+    assert loaded.lora_dtype == "torch.bfloat16"

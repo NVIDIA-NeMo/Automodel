@@ -149,6 +149,13 @@ def test_config_dir_returns_none_without_config(tmp_path):
     assert not _has_custom_model(_transformer_dir(str(tmp_path / "empty_dir")))
 
 
+def test_has_custom_transformer_resolves_the_checkpoint_layout(tmp_path):
+    assert adp.has_custom_transformer(_diffusers_repo(tmp_path, [CUSTOM_ARCH]))
+    single = str(tmp_path / "single")
+    _write_config(single, [UNKNOWN_ARCH])
+    assert not adp.has_custom_transformer(single)
+
+
 def test_config_dir_only_considers_first_architecture(tmp_path):
     root = _diffusers_repo(tmp_path, [UNKNOWN_ARCH, CUSTOM_ARCH])
 

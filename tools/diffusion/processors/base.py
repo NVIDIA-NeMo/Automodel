@@ -155,6 +155,14 @@ class BaseModelProcessor(ABC):
         """
         pass
 
+    def target_resolution(self, width: int, height: int, bucket: Dict[str, Any]) -> tuple[int, int]:
+        """Return the ``(width, height)`` an image of this size is resized and center-cropped to.
+
+        The default is the resolution of ``bucket``, the calculator's best bucket for the image. Override for
+        models trained on a fixed resolution set.
+        """
+        return tuple(bucket["resolution"])
+
     def preprocess_image(self, image: Image.Image) -> torch.Tensor:
         """
         Convert PIL Image to normalized tensor.
