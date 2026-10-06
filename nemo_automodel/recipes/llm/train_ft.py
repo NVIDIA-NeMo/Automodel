@@ -1144,7 +1144,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         for val_name, val_dataloader in self.val_dataloaders.items():
                             val_log_data = self._run_validation_epoch(val_dataloader)
                             # Route through best_metric_key so checkpoint promotion can track a
-                            # custom evaluator metric (e.g. tool_call_eval's token_f1/f1_loss)
+                            # custom evaluator metric (e.g. tool_call_eval's tool_call/args_exact_match)
                             # instead of always using raw val_loss. Falls back to val_loss when
                             # best_metric_key isn't a key in this dataset's metrics, which also
                             # safely covers the domain_mixture WEIGHTED_AGGREGATE_NAME default
