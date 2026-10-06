@@ -81,7 +81,7 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
-    "transformers==5.15.1",
+    "transformers==5.19.0",
     # peft>=0.20 raises ImportError from get_peft_model() when an installed torchao is older than 0.16.0.
     "torchao>=0.16.0",
     "flashoptim>=0.1.3",
@@ -550,7 +550,7 @@ convention = "google"
 
 
 [tool.ruff.lint.isort]
-known-third-party = ["datasets", "transformers", "wandb"]
+known-third-party = ["datasets", "transformers==5.19.0", "wandb"]
 
 [tool.importlinter]
 root_package = "nemo_automodel"
@@ -669,7 +669,7 @@ allowed-unresolved-imports = [
     "transformer_engine",
     "transformer_engine.**",
     "transformer_engine_torch",
-    "transformers.tokenization_utils",
+    "transformers==5.19.0",
     "uccl",
     "uccl.**",
     "wandb",
