@@ -1738,6 +1738,17 @@ class TestPeftOuterPrefixIsNotLoadBearing:
 
     @staticmethod
     def _assert_same(direct: dict, through_boundary: dict, what: str) -> None:
+        """Assert both routes through the adapter produced the same state dict.
+
+        Args:
+            direct: Mapping from parameter name to Tensor of shape [...], with arbitrary
+                rank and axis order. The adapter's output for prefixed keys.
+            through_boundary: Mapping with exactly the keys of ``direct``. Each value must
+                match the tensor under the same key in shape, axis order, dtype, device,
+                and values. The adapter's output for stripped keys, with the prefix
+                restored.
+            what: Name of the adapter call under test, used in the failure message.
+        """
         assert set(direct) == set(through_boundary), (
             f"{what} reads the outer prefix; direct_only={sorted(set(direct) - set(through_boundary))} "
             f"boundary_only={sorted(set(through_boundary) - set(direct))}"
@@ -1746,9 +1757,27 @@ class TestPeftOuterPrefixIsNotLoadBearing:
             torch.testing.assert_close(through_boundary[key], value, rtol=0, atol=0)
 
     def _strip(self, state_dict: dict) -> dict:
+        """Drop the outer prefix from every key, as #3867 will before the adapter runs.
+
+        Args:
+            state_dict: Mapping from prefixed parameter name to Tensor of shape [...], with
+                arbitrary rank and axis order.
+
+        Returns:
+            The same tensor objects, not copies, under keys without ``base_model.model.``.
+        """
         return {key.removeprefix(self._PREFIX): value for key, value in state_dict.items()}
 
     def _restore(self, state_dict: dict) -> dict:
+        """Add the outer prefix back to every key, as #3867 will after the adapter runs.
+
+        Args:
+            state_dict: Mapping from unprefixed parameter name to Tensor of shape [...],
+                with arbitrary rank and axis order.
+
+        Returns:
+            The same tensor objects, not copies, under keys starting with ``base_model.model.``.
+        """
         return {f"{self._PREFIX}{key}": value for key, value in state_dict.items()}
 
     def test_to_hf_does_not_read_the_prefix(self, adapter):
