@@ -178,7 +178,7 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
-    # Inspect the model's head and config without bypassing DDP for training.
+    # Probe the wrapped model's signature, head, and config; training still calls DDP.
     if isinstance(probe_module, nn.parallel.DistributedDataParallel):
         probe_module = probe_module.module
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):

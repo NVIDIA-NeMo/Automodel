@@ -42,7 +42,7 @@ def ddp_group(tmp_path):
         dist.destroy_process_group()
 
 
-def _mistral():
+def _mistral(*, tied=False):
     return MistralForCausalLM(
         MistralConfig(
             vocab_size=32,
@@ -53,8 +53,13 @@ def _mistral():
             num_key_value_heads=2,
             use_cache=False,
             attention_dropout=0.0,
+            tie_word_embeddings=tied,
         )
     )
+
+
+def _tied_mistral():
+    return _mistral(tied=True)
 
 
 def _gpt_neox():
@@ -202,7 +207,7 @@ def _check_ddp_chunked_ce_training(rank, world_size, model_factory):
     assert forwarded == [1, 1, 1, 1]
 
 
-@pytest.mark.parametrize("model_factory", [_mistral, _gpt_neox])
+@pytest.mark.parametrize("model_factory", [_mistral, _tied_mistral, _gpt_neox])
 def test_ddp_chunked_ce_trains_through_wrapper(ddp_group, model_factory):
     _check_ddp_chunked_ce_training(rank=0, world_size=1, model_factory=model_factory)
 
@@ -211,7 +216,8 @@ def _run_ddp_chunked_ce_worker(rank, init_method):
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
-        _check_ddp_chunked_ce_training(rank=rank, world_size=2, model_factory=_mistral)
+        for model_factory in (_mistral, _tied_mistral):
+            _check_ddp_chunked_ce_training(rank=rank, world_size=2, model_factory=model_factory)
     finally:
         dist.destroy_process_group()
 

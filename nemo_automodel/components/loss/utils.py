@@ -147,7 +147,8 @@ def prepare_lm_weight(
 
     Args:
         loss_fn: Linear-projection loss that owns materialization semantics.
-        model: Model with an output head of global shape [vocab, hidden].
+        model: Model or DDP wrapper whose wrapped module owns the config and
+            output head of global shape [vocab, hidden].
         grad_reduce_group: Group contributing independent token losses.
 
     Returns:
