@@ -296,7 +296,9 @@ def _load_registered_custom_config(pretrained_model_name_or_path, attn_implement
         return None
 
     unused_kwargs.setdefault("attn_implementation", attn_implementation)
-    return config_cls.from_dict(config_dict, **unused_kwargs)
+    config = config_cls.from_dict(config_dict, **unused_kwargs)
+    config._commit_hash = config_dict.get("_commit_hash")
+    return config
 
 
 def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
@@ -404,7 +406,9 @@ def _load_config_with_layer_types_fix(pretrained_model_name_or_path, attn_implem
             f"Could not resolve config class for {pretrained_model_name_or_path} "
             f"(model_type={config_dict.get('model_type')!r})"
         )
-    return config_cls.from_dict(config_dict, attn_implementation=attn_implementation)
+    config = config_cls.from_dict(config_dict, attn_implementation=attn_implementation)
+    config._commit_hash = config_dict.get("_commit_hash")
+    return config
 
 
 def get_is_hf_model(config, force_hf):
@@ -444,8 +448,9 @@ def _download_model_weights(
                 for key in ("cache_dir", "revision", "token", "local_files_only", "force_download")
                 if key in kwargs
             }
-            if hf_config._commit_hash is not None:
-                download_kwargs["revision"] = hf_config._commit_hash
+            commit_hash = getattr(hf_config, "_commit_hash", None)
+            if commit_hash is not None:
+                download_kwargs["revision"] = commit_hash
             snapshot_download(pretrained_model_name_or_path, **download_kwargs)
 
 
@@ -1034,7 +1039,7 @@ def _init_model_bnb_streaming(
     # 2. Resolve to local directory & verify safetensors
     model_dir = _resolve_model_dir(
         pretrained_model_name_or_path,
-        revision=hf_config._commit_hash,
+        revision=getattr(hf_config, "_commit_hash", None),
         cache_dir=kwargs.get("cache_dir"),
         subfolder=kwargs.get("subfolder", ""),
     )
@@ -1220,9 +1225,10 @@ def __init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
-    if is_pretrained_init and hf_config._commit_hash is not None:
-        kwargs["revision"] = hf_config._commit_hash
-        kwargs["_commit_hash"] = hf_config._commit_hash
+    commit_hash = getattr(hf_config, "_commit_hash", None)
+    if is_pretrained_init and commit_hash is not None:
+        kwargs["revision"] = commit_hash
+        kwargs["_commit_hash"] = commit_hash
     # A plain-dict ``config`` override (e.g. from ``--model.config.num_hidden_layers``)
     # has already been folded into ``hf_config`` by ``get_hf_config`` above. Drop it from
     # kwargs so it is not also forwarded into the model constructor / HF from_pretrained

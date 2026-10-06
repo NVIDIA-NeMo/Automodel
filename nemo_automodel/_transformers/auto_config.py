@@ -74,9 +74,13 @@ class NeMoAutoConfig(AutoConfig):
         Returns:
             The config, or the config and unused kwargs when requested.
         """
-        return super().from_pretrained(
-            pretrained_model_name_or_path, **cls._pin_revision(pretrained_model_name_or_path, kwargs)
-        )
+        kwargs = cls._pin_revision(pretrained_model_name_or_path, kwargs)
+        result = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        config = result[0] if isinstance(result, tuple) else result
+        # Transformers 5.18 no longer stores this metadata. Automodel still
+        # needs it to bind later weight/tokenizer reads to this same snapshot.
+        config._commit_hash = kwargs.get("_commit_hash")
+        return result
 
     @classmethod
     def get_config_dict(
@@ -91,6 +95,7 @@ class NeMoAutoConfig(AutoConfig):
         Returns:
             The config dictionary and unused loading options.
         """
-        return PretrainedConfig.get_config_dict(
-            pretrained_model_name_or_path, **cls._pin_revision(pretrained_model_name_or_path, kwargs)
-        )
+        kwargs = cls._pin_revision(pretrained_model_name_or_path, kwargs)
+        config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+        config_dict["_commit_hash"] = kwargs.get("_commit_hash")
+        return config_dict, unused_kwargs

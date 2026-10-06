@@ -621,12 +621,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # during init.  Custom models and meta-device initialization do not load weights
         # here; they rely on apply_model_infrastructure to load the checkpoint later.
         weights_already_loaded = not is_custom_model and not is_meta_device and load_base_model
-        if load_base_model and pretrained_path and not os.path.isdir(pretrained_path) and _hf_config._commit_hash:
+        commit_hash = getattr(_hf_config, "_commit_hash", None)
+        if load_base_model and pretrained_path and not os.path.isdir(pretrained_path) and commit_hash:
             # Give the checkpointer the selected snapshot, not a repo id whose
             # cache may also contain an unrelated (or newer) weight index.
             pretrained_path = snapshot_download(
                 pretrained_path,
-                revision=_hf_config._commit_hash,
+                revision=commit_hash,
                 cache_dir=cache_dir,
                 local_files_only=True,
             )
@@ -777,9 +778,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             else:
                 raise
         # Keep config rereads, remote code, and weights on the same snapshot.
-        if hf_config._commit_hash is not None:
-            kwargs["revision"] = hf_config._commit_hash
-            kwargs["_commit_hash"] = hf_config._commit_hash
+        commit_hash = getattr(hf_config, "_commit_hash", None)
+        if commit_hash is not None:
+            kwargs["revision"] = commit_hash
+            kwargs["_commit_hash"] = commit_hash
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
         # Layer 2: reject loading a checkpoint with tie_word_embeddings flipped from the

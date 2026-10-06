@@ -214,6 +214,9 @@ class Glm5NextTextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        # HF 5.18 remaps this legacy name to indexed_attention. The local
+        # backbone owns its layer protocol and still uses the checkpoint name.
+        self.layer_types = list(layer_types)
 
     @property
     def num_local_experts(self) -> int:

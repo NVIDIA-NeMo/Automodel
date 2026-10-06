@@ -1873,12 +1873,12 @@ class TestBuildModelRetryDepth:
             assert mock_init.call_count == 2
 
     def test_checkpoint_loading_uses_config_snapshot_not_cached_main(self, hf_config_hub):
-        from transformers import GPT2Config
+        from nemo_automodel._transformers.auto_config import NeMoAutoConfig
 
         root, cache, ref, _ = hf_config_hub
         # main and an unrelated weight index point to A; this config belongs to B.
         (cache / "snapshots" / ("a" * 40) / "model.safetensors.index.json").write_text("{}")
-        config = GPT2Config(n_embd=64, _commit_hash="b" * 40)
+        config = NeMoAutoConfig.from_pretrained("test/config-race", cache_dir=str(root), revision="b" * 40)
         config.name_or_path = "test/config-race"
         build_kwargs, _ = self._make_build_kwargs()
         build_kwargs.update(is_hf_model=False, cache_dir=str(root), subfolder="nested")

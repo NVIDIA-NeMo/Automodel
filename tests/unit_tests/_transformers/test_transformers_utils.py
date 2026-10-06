@@ -355,6 +355,31 @@ class TestApplyCacheCompatibilityPatchesIntegration:
 
         assert ROPE_INIT_FUNCTIONS["default"] is original
 
+    @pytest.mark.parametrize("partial_rotary_factor", [1.0, 0.5])
+    def test_native_default_rope_matches_hf(
+        self, monkeypatch: pytest.MonkeyPatch, partial_rotary_factor: float
+    ) -> None:
+        """Native v5 initialization retains the reference frequencies and rotary width."""
+        from transformers import Qwen3_5TextConfig
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
+
+        config = Qwen3_5TextConfig(
+            hidden_size=32,
+            num_attention_heads=2,
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 500000.0,
+                "partial_rotary_factor": partial_rotary_factor,
+            },
+        )
+        expected, _ = Qwen3_5TextRotaryEmbedding.compute_default_rope_parameters(config)
+        monkeypatch.delitem(ROPE_INIT_FUNCTIONS, "default", raising=False)
+        apply_cache_compatibility_patches()
+        actual, scale = ROPE_INIT_FUNCTIONS["default"](config)
+        torch.testing.assert_close(actual, expected)
+        assert scale == 1.0
+
     def test_calls_bytes_to_unicode_patch(self):
         """apply_cache_compatibility_patches invokes _patch_bytes_to_unicode."""
         with patch("nemo_automodel._transformers.utils._patch_bytes_to_unicode") as mock_btu:

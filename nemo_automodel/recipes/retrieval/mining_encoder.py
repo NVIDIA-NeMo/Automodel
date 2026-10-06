@@ -123,8 +123,9 @@ class CheckpointMiningEncoderConfig:
         module_name, class_name = processor_target.rsplit(".", 1)
         processor_class = getattr(import_module(module_name), class_name)
         loading_options = {}
-        if model.config._commit_hash is not None:
-            loading_options["revision"] = model.config._commit_hash
+        commit_hash = getattr(model.config, "_commit_hash", None)
+        if commit_hash is not None:
+            loading_options["revision"] = commit_hash
         processor = processor_class.from_pretrained(
             model.config.name_or_path or model.source_model_path, **loading_options
         )

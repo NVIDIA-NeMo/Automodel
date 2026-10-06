@@ -545,8 +545,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
 
         vision_model = getattr(self.model, "visual")
         rotary = vision_model.rotary_pos_emb
-        dim = rotary.inv_freq.shape[0] * 2
-        fp32_safe_rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(dim)
+        fp32_safe_rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(rotary.config)
         fp32_safe_rotary.register_buffer(
             "inv_freq",
             rotary.inv_freq.detach().clone().to(torch.float32, copy=True),

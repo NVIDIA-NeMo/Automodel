@@ -550,7 +550,7 @@ convention = "google"
 
 
 [tool.ruff.lint.isort]
-known-third-party = ["datasets", "transformers==5.18.0", "wandb"]
+known-third-party = ["datasets", "transformers", "wandb"]
 
 [tool.importlinter]
 root_package = "nemo_automodel"
@@ -669,7 +669,7 @@ allowed-unresolved-imports = [
     "transformer_engine",
     "transformer_engine.**",
     "transformer_engine_torch",
-    "transformers==5.18.0",
+    "transformers.tokenization_utils",
     "uccl",
     "uccl.**",
     "wandb",

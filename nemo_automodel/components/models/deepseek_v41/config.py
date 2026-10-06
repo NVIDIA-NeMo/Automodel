@@ -421,6 +421,7 @@ class DeepseekV41Config(PretrainedConfig):
         self.text_config = text_config
         self.vision_config = vision_config
         self.image_token_id = image_token_id
+        self._commit_hash = kwargs.pop("_commit_hash", None)
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,
