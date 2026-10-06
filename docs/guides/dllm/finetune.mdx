@@ -318,7 +318,7 @@ You can then point the recipe configuration `dataset.path_or_dataset_id` to the 
 
 I-DLM ([Introspective Diffusion LM](https://arxiv.org/abs/2604.11035), Yu et al., 2026) converts a pretrained autoregressive LM into a diffusion LM by all-masked fine-tuning. Each step concatenates a fully masked copy `x_t` and the clean copy `x_0` into a length-`2L` sequence run under a block-diffusion attention mask, with a Dream-style next-token logit shift. Two cross-entropy terms, both over the response tokens, are combined: `CE_noisy` (decode `q`, the masked copy conditioned on the clean ground-truth prefix) and `CE_clean` (verify `p`, the clean copy under strict causal attention).
 
-See [`qwen3_8b_idlm.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_idlm.yaml) for the full working configuration. The following example shows the key I-DLM-specific sections.
+See [`qwen3_8b_idlm.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_idlm.yaml) for the full working configuration. The following example shows the key I-DLM-specific sections:
 
 ```yaml
 model:
