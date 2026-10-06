@@ -77,9 +77,6 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
     Returns:
         bool: True if the model supports logits_to_keep, False otherwise.
     """
-    # DDP forwards kwargs to its wrapped model but exposes a generic signature.
-    if isinstance(model, nn.parallel.DistributedDataParallel):
-        model = model.module
     sig = _get_forward_signature(model)
     return sig is not None and "logits_to_keep" in sig.parameters
 

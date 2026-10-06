@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from copy import deepcopy
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +24,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import MistralConfig, MistralForCausalLM
 
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _maybe_downgrade_loss_fn,
@@ -57,10 +57,8 @@ def _mistral():
 def test_ddp_preserves_chunked_ce_capability(ddp_group):
     model = _mistral()
     loss = ChunkedCrossEntropy(4, compile=False)
-    assert _supports_logits_to_keep(model)
     assert _maybe_downgrade_loss_fn(loss, model, False) is loss
     wrapped = DDP(model)
-    assert _supports_logits_to_keep(wrapped)
     assert _maybe_downgrade_loss_fn(loss, wrapped, False) is loss
 
 
@@ -83,7 +81,6 @@ def test_ddp_does_not_invent_logits_to_keep_support(ddp_group):
     # An arbitrary .module child is not a transparent wrapper contract.
     model.module = _mistral()
     for probe in (model, DDP(model)):
-        assert not _supports_logits_to_keep(probe)
         with pytest.raises(ValueError, match="supporting logits_to_keep"):
             _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), probe, False)
 
@@ -104,7 +101,7 @@ def test_ddp_preserves_chunked_ce_head_validation(ddp_group, invalid):
         _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), DDP(model), False)
 
 
-def test_ddp_chunked_ce_trains_through_wrapper(ddp_group):
+def _check_ddp_chunked_ce_training(rank, world_size):
     torch.manual_seed(17)
     model = _mistral()
     reference = deepcopy(model)
@@ -122,8 +119,8 @@ def test_ddp_chunked_ce_trains_through_wrapper(ddp_group):
         te_fp8=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
-        _get_dp_group_size=lambda **kw: 1,
-        _get_dp_group=lambda **kw: None,
+        _get_dp_group_size=lambda **kw: world_size,
+        _get_dp_group=lambda **kw: dist.group.WORLD,
     )
     forwarded = []
 
@@ -143,19 +140,23 @@ def test_ddp_chunked_ce_trains_through_wrapper(ddp_group):
     try:
         # A second iteration also exercises DDP's reducer completion checks.
         for _ in range(2):
-            input_ids = torch.randint(32, (1, 8))
-            labels = torch.randint(32, (1, 8))
+            input_ids = torch.randint(32, (world_size, 8))
+            labels = torch.randint(32, (world_size, 8))
+            # Unequal valid-token counts catch per-rank normalization mistakes.
+            for batch_index in range(world_size):
+                labels[batch_index, : batch_index + 1] = -100
             losses = []
             TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
                 recipe,
                 0,
-                {"input_ids": input_ids, "labels": labels},
+                {"input_ids": input_ids[rank : rank + 1], "labels": labels[rank : rank + 1]},
                 loss_buffer=losses,
-                num_label_tokens=8,
+                num_label_tokens=int(labels.ne(-100).sum()),
                 num_batches=1,
             )
             ref_loss = nn.functional.cross_entropy(reference(input_ids).logits.flatten(0, 1), labels.flatten())
             ref_loss.backward()
+            dist.all_reduce(losses[0])
             torch.testing.assert_close(losses[0], ref_loss)
             for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
                 torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=1e-4, atol=2e-6)
@@ -168,3 +169,30 @@ def test_ddp_chunked_ce_trains_through_wrapper(ddp_group):
     finally:
         handle.remove()
     assert forwarded == [1, 1]
+
+
+def test_ddp_chunked_ce_trains_through_wrapper(ddp_group):
+    _check_ddp_chunked_ce_training(rank=0, world_size=1)
+
+
+def _run_ddp_chunked_ce_worker(rank, init_method):
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        _check_ddp_chunked_ce_training(rank=rank, world_size=2)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=60,
+    reason="Two spawned CPU/Gloo workers import the training stack and verify real DDP gradient reductions.",
+)
+def test_ddp_chunked_ce_two_rank_parity(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_ddp_chunked_ce_worker,
+        args=((tmp_path / "two_rank_rendezvous").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
