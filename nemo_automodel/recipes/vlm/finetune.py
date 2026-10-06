@@ -1065,7 +1065,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         cu_seqlens=(
                             None
                             if mtp_per_depth_targets is not None or "packed_token_indices" in batch
-                            else batch.get("cu_seqlens")
+                            else batch.get("cu_seqlens_padded", batch.get("cu_seqlens"))
                         ),
                     )
 

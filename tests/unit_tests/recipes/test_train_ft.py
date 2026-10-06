@@ -3578,7 +3578,7 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
 @pytest.mark.parametrize(
     "packing_format,batch_size,filter_metadata",
     [(fmt, size, filtered) for fmt in ("neat", "neat_varlen") for size in (1, 2) for filtered in (False, True)]
-    + [("thd", 1, False)],
+    + [("thd", 1, False), ("thd_padded", 1, False)],
 )
 def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batch_size, filter_metadata):
     from nemo_automodel.components.datasets.utils import neat_packed_collater
@@ -3653,10 +3653,23 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             attention_mask=[1, 1, 1, 1, 0, 2, 2, 2],
         ),
     ][:batch_size]
+    if packing_format == "thd_padded":
+        # Two documents occupy [0, 4) and [4, 8); slot 3 is internal pad.
+        # Real cumulative lengths [0, 3, 7] are not physical token offsets.
+        samples[0] = dict(
+            input_ids=[1, 2, 3, 0, 5, 6, 7, 8],
+            labels=[2, 3, 4, -100, 6, 7, 8, 9],
+            position_ids=[0, 1, 2, 0, 0, 1, 2, 3],
+            attention_mask=[1, 1, 1, 0, 2, 2, 2, 2],
+        )
     batch = neat_packed_collater(
         samples,
         packing=PackingCapabilities("block_causal", requires_packed_sequence_metadata=packing_format == "neat_varlen"),
     )
+    if packing_format == "thd_padded":
+        batch.pop("_packed_seq_ids")
+        batch["cu_seqlens"] = torch.tensor([0, 3, 7], dtype=torch.int32)
+        batch["cu_seqlens_padded"] = torch.tensor([0, 4, 8], dtype=torch.int32)
     if packing_format == "thd":
         # Exercise the legacy physical-offset fallback without NEAT document IDs.
         batch.pop("_packed_seq_ids")
@@ -3674,6 +3687,12 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             [[-100, -100, -100, -100, -100, -100, -100, -100], [10, -100, -100, -100, -100, -100, -100, -100]]
         )[:batch_size],
     ]
+    if packing_format == "thd_padded":
+        targets = [
+            labels,
+            torch.tensor([[3, 4, -100, -100, 7, 8, 9, -100]]),
+            torch.tensor([[4, -100, -100, -100, 8, 9, -100, -100]]),
+        ]
     reference_logits = model.logits.detach().clone().requires_grad_()
     reference_losses = [
         torch.nn.functional.cross_entropy(logits.flatten(0, 1), target.flatten(), reduction="sum") / num_tokens

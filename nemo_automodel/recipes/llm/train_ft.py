@@ -1409,11 +1409,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
-                        # NEAT uses physical document IDs; cu_seqlens is the legacy THD fallback.
+                        # MTP shifts index physical token slots, including internal THD padding.
                         cu_seqlens=(
                             None
                             if mtp_per_depth_targets is not None or "packed_token_indices" in batch
-                            else batch.get("cu_seqlens")
+                            else batch.get("cu_seqlens_padded", batch.get("cu_seqlens"))
                         ),
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
