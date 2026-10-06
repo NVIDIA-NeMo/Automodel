@@ -110,9 +110,10 @@ def test_apply_bias_large_weighted_forward_and_gradients(dtype, strided, reuse_i
     expected_bias_grad = torch.stack(
         [segment.double().sum(0) for segment in (upstream.float() * probs.detach()).split(counts)]
     ).to(dtype)
-    expected_probs_grad = (upstream.float() * expanded_bias).sum(-1, keepdim=True)
+    expected_probs_grad = (upstream.double() * expanded_bias.double()).sum(-1, keepdim=True).float()
 
     first_bias_grad = None
+    first_probs_grad = None
     for _ in range(2):
         owned_value = value * 1.0 if reuse_input else value
         actual = _apply_bias(owned_value, bias, token_counts, probs, reuse_input=reuse_input)
@@ -125,9 +126,41 @@ def test_apply_bias_large_weighted_forward_and_gradients(dtype, strided, reuse_i
         torch.testing.assert_close(probs.grad, expected_probs_grad, rtol=2e-5, atol=2e-5)
         if first_bias_grad is None:
             first_bias_grad = bias.grad.clone()
+            first_probs_grad = probs.grad.clone()
         else:
             torch.testing.assert_close(bias.grad, first_bias_grad, rtol=0, atol=0)
+            torch.testing.assert_close(probs.grad, first_probs_grad, rtol=0, atol=0)
         value.grad = bias.grad = probs.grad = None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("strided", [False, True])
+def test_apply_bias_gptoss_probability_gradient(strided):
+    """The GPT-OSS feature width preserves the routing gradient against an FP64 oracle."""
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    counts = [0, 4095, 8194, 0]
+    n_tokens, hidden = sum(counts), 2880
+    torch.manual_seed(5678)
+    value = torch.randn(n_tokens, hidden, device=device, dtype=torch.bfloat16)
+    bias = torch.randn(len(counts), hidden, device=device, dtype=torch.bfloat16)
+    upstream = torch.randn_like(value)
+    if strided:
+        bias = bias.T.contiguous().T
+        upstream = upstream.T.contiguous().T
+    probs = torch.rand(n_tokens, 1, device=device, requires_grad=True)
+    token_counts = torch.tensor(counts, device=device, dtype=torch.long)
+    expected = torch.cat(
+        [(grad.double() * row.double()).sum(-1, keepdim=True) for grad, row in zip(upstream.split(counts), bias)]
+    ).float()
+    first_grad = None
+    for _ in range(2):
+        _apply_bias(value, bias, token_counts, probs).backward(upstream)
+        torch.testing.assert_close(probs.grad, expected, rtol=2e-5, atol=2e-5)
+        if first_grad is None:
+            first_grad = probs.grad.clone()
+        else:
+            torch.testing.assert_close(probs.grad, first_grad, rtol=0, atol=0)
+        probs.grad = None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
