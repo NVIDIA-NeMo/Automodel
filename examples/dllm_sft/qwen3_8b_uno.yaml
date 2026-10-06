@@ -81,7 +81,6 @@ distributed:
 
 dllm:
   mode: uno
-  mask_token_id: 151669      # Uno <MASK> for Qwen3 (s-sahoo/uno-qwen3-8B config.json)
   tv_weight: 1.0
   kl_weight: 0.0
   block_curriculum:          # 2 -> 16, block size grows every half epoch

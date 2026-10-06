@@ -646,10 +646,14 @@ class UnoStrategy(IDLMStrategy):
     def setup_extra(self, recipe) -> None:
         """Run the I-DLM checks, then check the curriculum against the batch and step budget.
 
-        ``tokens_per_step`` must equal ``step_scheduler.global_batch_size * dataset.seq_length`` or every
-        stage boundary lands on the wrong step; a ``max_steps`` other than the last stage's end step
-        truncates the curriculum or trains past it at the final block size.
+        Uno has no mask token, so a missing ``dllm.mask_token_id`` gets a harmless placeholder (as the
+        block-diffusion recipe does) to satisfy the shared checks. ``tokens_per_step`` must equal
+        ``step_scheduler.global_batch_size * dataset.seq_length`` or every stage boundary lands on the wrong
+        step; a ``max_steps`` other than the last stage's end step truncates the curriculum or trains past it
+        at the final block size.
         """
+        if recipe.mask_token_id is None:
+            recipe.mask_token_id = 0
         super().setup_extra(recipe)
         if not self._stage_end_steps:
             return

@@ -660,6 +660,14 @@ class TestUnoStrategy:
         strategy.setup_extra(self._curriculum_recipe(128, 4096, 1000))
         assert "differs from the block curriculum's last stage end step 28125" in caplog.text
 
+    def test_setup_extra_fills_a_placeholder_mask_token_id(self, strategy):
+        """Uno has no mask token: a missing dllm.mask_token_id becomes an unused placeholder."""
+        strategy.create_loss_fn({"block_length": 4})
+        recipe = self._curriculum_recipe(128, 4096, 28125)
+        recipe.mask_token_id = None
+        strategy.setup_extra(recipe)
+        assert recipe.mask_token_id == 0
+
 
 # ---------------------------------------------------------------------------
 # DFlashStrategy — anchor-block sampling (CPU, no model loading)
