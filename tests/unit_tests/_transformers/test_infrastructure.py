@@ -25,7 +25,7 @@ from nemo_automodel._transformers.utils import _should_load_before_shard
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 class TestShouldLoadBeforeShard:

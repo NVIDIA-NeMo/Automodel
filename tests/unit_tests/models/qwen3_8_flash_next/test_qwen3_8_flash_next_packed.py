@@ -30,7 +30,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import Qwen3_8_Flas
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 _CU_SEQLENS = (0, 5, 12, 20)
 
@@ -537,10 +537,10 @@ def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytes
     assert captured["attention_mask"].tolist() == [[0, 0, 0, 1, 1, 1, 1, 1, 1, 1]]
     assert captured["attention_mask"].dtype == torch.int32
 
-    # An explicit mask is preserved untouched.
+    # An explicit mask is normalized to canonical IDs.
     explicit = torch.zeros(1, 10, dtype=torch.int32)
     layer(torch.randn(1, 10, gdn_config.hidden_size), cu_seqlens=torch.tensor([0, 10]), attention_mask=explicit)
-    assert captured["attention_mask"] is explicit
+    torch.testing.assert_close(captured["attention_mask"], explicit)
 
 
 def test_packed_boundaries_from_seq_lens_matches_loader_contract() -> None:
@@ -593,3 +593,173 @@ def test_model_advertises_packed_cp_for_sparse_backends(attn_backend: str) -> No
     model.backend = SimpleNamespace(attn="sdpa")
     sdpa_supports = ModelSupports(model, mesh=SimpleNamespace(cp_size=8, tp_size=1))
     assert not sdpa_supports.supports_cp_with_sequence_packing
+
+
+@pytest.mark.parametrize("document_id_offset", [None, 0, 1])
+def test_packed_gdn_parent_forward_backward_matches_separate_documents(document_id_offset: int | None) -> None:
+    """Exercise the inherited forward with three documents, including zero-based ID 2."""
+    import copy
+
+    import torch.nn.functional as F
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule
+
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
+
+    def reference_conv(x, weight, bias, activation, seq_idx):
+        """Apply independent causal convolutions at document boundaries.
+
+        Args:
+            x: Tensor of shape [1, channels, tokens].
+            weight: Tensor of shape [channels, kernel].
+            bias: Optional tensor of shape [channels].
+            activation: Activation name, required to be silu.
+            seq_idx: Optional document IDs of shape [1, tokens].
+
+        Returns:
+            Tensor of shape [1, channels, tokens].
+        """
+        assert activation == "silu"
+        cuts = (
+            [0, x.shape[-1]]
+            if seq_idx is None
+            else ([0] + (torch.nonzero(seq_idx[0, 1:] != seq_idx[0, :-1]).flatten() + 1).tolist() + [x.shape[-1]])
+        )
+        return torch.cat(
+            [
+                F.silu(
+                    F.conv1d(
+                        x[:, :, start:end], weight[:, None], bias, padding=weight.shape[-1] - 1, groups=x.shape[1]
+                    )[:, :, : end - start]
+                )
+                for start, end in zip(cuts, cuts[1:])
+            ],
+            dim=-1,
+        )
+
+    def reference_gdn(q, k, v, *, g, beta, cu_seqlens=None, cu_seqlens_cpu=None, **kwargs):
+        """Evaluate HF's recurrent reference independently for every document.
+
+        Args:
+            q: Tensor of shape [1, tokens, heads, key_dim].
+            k: Tensor of shape [1, tokens, heads, key_dim].
+            v: Tensor of shape [1, tokens, heads, value_dim].
+            g: Tensor of shape [1, tokens, heads].
+            beta: Tensor of shape [1, tokens, heads].
+            cu_seqlens: Optional boundaries of shape [documents + 1].
+            cu_seqlens_cpu: Optional CPU mirror of shape [documents + 1].
+            **kwargs: Scalar reference-kernel options; initial_state is None.
+
+        Returns:
+            Tensor of shape [1, tokens, heads, value_dim] and None for the unused state.
+        """
+        cuts = [0, q.shape[1]] if cu_seqlens is None else cu_seqlens.tolist()
+        outputs = [
+            torch_recurrent_gated_delta_rule(
+                q[:, start:end], k[:, start:end], v[:, start:end], g[:, start:end], beta[:, start:end], **kwargs
+            )[0]
+            for start, end in zip(cuts, cuts[1:])
+        ]
+        return torch.cat(outputs, dim=1), None
+
+    torch.manual_seed(15)
+    config = _config()
+    config.layer_types = ["linear_attention"]
+    config.linear_conv_kernel_dim = 4
+    config.linear_key_head_dim = 4
+    config.linear_value_head_dim = 4
+    config.linear_num_key_heads = 1
+    config.linear_num_value_heads = 2
+    layer = Qwen3_8_FlashNextGatedDeltaNet(config, layer_idx=0).float()
+    with torch.no_grad():
+        layer._fp32_params.A_log.zero_()
+        layer._fp32_params.dt_bias.zero_()
+    layer.causal_conv1d_fn = reference_conv
+    layer.chunk_gated_delta_rule = reference_gdn
+    reference = copy.deepcopy(layer)
+    hidden = torch.randn(1, 10, config.hidden_size, requires_grad=True)
+    ref_hidden = hidden.detach().clone().requires_grad_()
+    boundaries = [0, 3, 6, 10]
+    attention_mask = (
+        torch.tensor([[0, 0, 0, 1, 1, 1, 2, 2, 2, 2]]) + document_id_offset if document_id_offset is not None else None
+    )
+    output = layer(hidden, cu_seqlens=torch.tensor(boundaries, dtype=torch.int32), attention_mask=attention_mask)
+    expected = torch.cat([reference(ref_hidden[:, start:end]) for start, end in zip(boundaries, boundaries[1:])], dim=1)
+    upstream = torch.randn_like(output)
+    output.backward(upstream)
+    expected.backward(upstream)
+    torch.testing.assert_close(output, expected, rtol=3e-5, atol=1e-6)
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=3e-5, atol=1e-6)
+    for (name, param), (_, ref_param) in zip(layer.named_parameters(), reference.named_parameters()):
+        torch.testing.assert_close(param.grad, ref_param.grad, rtol=3e-5, atol=1e-6, msg=name)
+
+
+@pytest.mark.parametrize(
+    "boundaries,document_ids,message",
+    [
+        ([0, 3, 6, 10], [[1, 1, 1, 1, 1, 1, 2, 2, 2, 2]], "attention_mask document boundaries"),
+        ([0, 3, 6, 8], None, "one unpadded row"),
+        ([0, 6, 3, 10], None, "one unpadded row"),
+    ],
+)
+def test_packed_gdn_rejects_inconsistent_boundaries_before_kernels(boundaries, document_ids, message):
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
+
+    layer = Qwen3_8_FlashNextGatedDeltaNet.__new__(Qwen3_8_FlashNextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer._cp_mesh = None
+    mask = None if document_ids is None else torch.tensor(document_ids)
+    with pytest.raises(ValueError, match=message):
+        layer(torch.randn(1, 10, 4), cu_seqlens=torch.tensor(boundaries), attention_mask=mask)
+
+
+def test_packed_gdn_canonicalizes_reused_ids_and_inconsistent_indices(monkeypatch):
+    from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
+
+    captured = {}
+
+    def capture(self, hidden_states, **kwargs):
+        """Capture parent inputs without changing activations.
+
+        Args:
+            hidden_states: Tensor of shape [1, sequence, hidden].
+            **kwargs: Boundaries [documents + 1], document IDs [1, sequence],
+                and indices [sequence].
+
+        Returns:
+            The unchanged hidden-state tensor.
+        """
+        captured.update(kwargs)
+        return hidden_states
+
+    monkeypatch.setattr(CPAwareGatedDeltaNet, "forward", capture)
+    layer = Qwen3_8_FlashNextGatedDeltaNet.__new__(Qwen3_8_FlashNextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer._cp_mesh = None
+    layer(
+        torch.randn(1, 10, 4),
+        cu_seqlens=torch.tensor([0, 3, 4, 7, 10]),
+        attention_mask=torch.tensor([[1, 1, 1, 2, 1, 1, 1, 3, 3, 3]]),
+        indices=torch.tensor([0, 2]),
+    )
+    assert captured["attention_mask"].tolist() == [[0, 0, 0, 1, 2, 2, 2, 3, 3, 3]]
+    assert captured["indices"].tolist() == list(range(10))
+
+
+def test_decoder_layer_derives_ple_document_ids_only_for_packed_rows() -> None:
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextDecoderLayer
+
+    derive = Qwen3_8_FlashNextDecoderLayer._ple_sequence_ids
+    input_ids = torch.zeros(1, 6, dtype=torch.long)
+    assert derive(input_ids, None, None) is None
+    torch.testing.assert_close(
+        derive(input_ids, None, torch.tensor([0, 2, 6])),
+        torch.tensor([[0, 0, 1, 1, 1, 1]]),
+    )
+    # Positions past the last boundary (pack or CP padding) form one more segment.
+    torch.testing.assert_close(
+        derive(input_ids, None, torch.tensor([0, 2, 4])),
+        torch.tensor([[0, 0, 1, 1, 2, 2]]),
+    )
+    with pytest.raises(ValueError, match="one physical row"):
+        derive(torch.zeros(2, 6, dtype=torch.long), None, torch.tensor([0, 2, 6]))

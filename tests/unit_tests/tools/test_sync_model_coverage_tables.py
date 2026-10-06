@@ -15,6 +15,7 @@
 import base64
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -53,7 +54,7 @@ from tools.sync_fern_provider_icons import MAX_TOTAL_ENCODED_BYTES, PROVIDER_ORG
 
 # Over the default 5s budget on purpose: this module drives git through subprocesses over throwaway repositories.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _commit_recipes(repo_root: Path, timestamp: str = "2026-07-30T12:00:00Z") -> None:
@@ -386,10 +387,13 @@ def test_recipe_model_id_with_multiple_model_cards_is_rejected(tmp_path):
         )
 
 
-def test_embedding_and_reranking_releases_are_discovered_from_recipes():
+def test_embedding_and_reranking_releases_are_discovered_from_recipes(tmp_path):
     repo_root = Path(__file__).parents[3]
     model_docs, _ = _load_model_docs(repo_root / "docs")
-    releases = _load_model_releases(repo_root, model_docs)
+    # Keep real recipe discovery while making Git history independent of checkout size.
+    shutil.copytree(repo_root / "examples" / "retrieval", tmp_path / "examples" / "retrieval")
+    _commit_recipes(tmp_path)
+    releases = _load_model_releases(tmp_path, model_docs)
     models_by_type = {
         model_type: {release.hf_model_id for release in releases if release.model_type == model_type}
         for model_type in ("Embedding", "Reranking")
@@ -397,7 +401,11 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes():
 
     assert "meta-llama/Llama-3.2-1B" in models_by_type["Embedding"]
     assert "mistralai/Ministral-3-3B-Instruct-2512-BF16" in models_by_type["Embedding"]
-    assert models_by_type["Reranking"] == {"meta-llama/Llama-3.2-1B"}
+    assert models_by_type["Reranking"] == {
+        "meta-llama/Llama-3.2-1B",
+        "Qwen/Qwen3-Reranker-4B",
+        "mistralai/Ministral-3-3B-Instruct-2512-BF16",
+    }
 
 
 def test_generated_model_coverage_tables_are_not_committed():

@@ -410,9 +410,12 @@ jobs:
           platforms: ${{ steps.platform.outputs.platforms }}
           # Opt-in build parallelism (Dockerfile defaults keep the serial/lower values). Any
           # consumer sharing this BuildKit cache must pass identical values to hit the same layers.
+          # Bake VLM media dependencies into CI images so tests do not install packages.
+          # Media remains opt-in for builds outside this workflow.
           # Keep comments out of the block below: build-push-action passes `#` lines through.
           build-args: |
             BASE_IMAGE=pytorch
+            UV_SYNC_ARGS=--locked --extra vlm-media
             FA3_MAX_JOBS=24
             UV_SYNC_MAX_JOBS=24
             BNB_BUILD_MAX_JOBS=8
@@ -514,7 +517,7 @@ jobs:
           # sets the stage floor. A 40-minute timeout leaves more than 2x headroom
           # over the measured merged runtime while bounding timeout retries.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data
+            test-folder: hf_transformer,hf_transformer_llm,data,models/gemma4
             timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
@@ -577,6 +580,7 @@ jobs:
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
+          full-moe-matrix: ${{ github.event_name == 'schedule' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           is_unit_test: "false"
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ matrix.test-data-path }}
@@ -589,6 +593,9 @@ jobs:
       max-parallel: 10
       matrix:
         include:
+          - test-name: L2_Attention
+            test-folder: attention
+            timeout: 20
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
             timeout: 20
@@ -607,10 +614,10 @@ jobs:
             is-optional: "true"
           # Merged with hf_transformer_llm + data, mirroring cicd-e2e-tests
           # (2.4 + 3.8 + 4.3 = 10.5 min median, under the 13.2 min L2_Context_Parallel
-          # floor). Leaves this matrix at 9 entries, one slot of headroom.
+          # floor). Together with attention, this uses the 10 available matrix slots.
           # Include models/minimax_m3_vl here; its runtime is not part of the 10.5 min median.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data,models/minimax_m3_vl
+            test-folder: hf_transformer,hf_transformer_llm,data,models/minimax_m3_vl,models/gemma4
             timeout: 40
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
@@ -656,6 +663,7 @@ jobs:
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
+          full-moe-matrix: ${{ github.event_name == 'schedule' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           is-optional: ${{ matrix.is-optional || 'false' }}
           is_unit_test: "false"
           PAT: ${{ steps.app-token.outputs.token }}

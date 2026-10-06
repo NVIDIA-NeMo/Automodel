@@ -150,6 +150,8 @@ RUN if [ "$INSTALL_TE" = "True" ] || \
 # Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
 # The pinned hybrid-ep revision includes DeepEP #699, which inherits PyTorch's C++ standard
 # instead of forcing C++17 (PyTorch's Rubin builds require C++20).
+# deepep.patch also backports https://github.com/deepseek-ai/DeepEP/pull/564 for NVSHMEM 3.6.5 compatibility.
+# Remove the configs.cuh/ibgda_device.cuh hunks when the pinned revision includes that fix.
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ENV HYBRID_EP_MULTINODE=1
@@ -310,6 +312,8 @@ COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} docker/common/update_pyproject_pytorc
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
+# Include both Blackwell targets supported by the pinned MoK source.
+ARG MOK_ARCH=ALL
 # `msa` is SM100-only so it stays out of `all`, but the image needs it: the MiniMax M3 MSA
 # recipe under examples/vlm_finetune/ is auto-discovered into release CI.
 ARG UV_SYNC_ARGS="--locked"
@@ -317,7 +321,8 @@ ARG UV_SYNC_ARGS="--locked"
 # behavior, upstream CI passes a higher value.
 ARG UV_SYNC_MAX_JOBS=8
 # Preserve locally built wheels for source-only CUDA packages such as flash-attn,
-# causal-conv1d and mamba-ssm across BuildKit builds.
+# causal-conv1d and mamba-ssm across BuildKit builds. Separate GPU targets so
+# switching MOK_ARCH cannot reuse a wheel compiled for the other architecture.
 # ray/jars/ray_dist.jar vendors a flagged jackson (GHSA-r7wm-3cxj-wff9) that upstream
 # has not bumped; Automodel uses Ray from Python only, so drop the Java worker jars.
 RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
@@ -328,7 +333,9 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         MAGI_ATTENTION_PREBUILD_FFA=0 \
         MAX_JOBS=${UV_SYNC_MAX_JOBS} \
         UV_CONCURRENT_INSTALLS=8 \
-        uv sync --extra $AUTOMODEL_INSTALL --extra msa --all-groups $UV_SYNC_ARGS && \
+        UV_CACHE_DIR=${UV_CACHE_DIR}/${MOK_ARCH} \
+        MOK_ARCH=${MOK_ARCH} \
+        uv sync --extra $AUTOMODEL_INSTALL --extra msa --extra mok --extra ffpa --all-groups $UV_SYNC_ARGS && \
     python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
@@ -350,8 +357,13 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
 
 # Fail the image build before publication if PyTorch headers cannot compile as
 # C++20, torch._grouped_mm is unavailable, or a bundled native extension has
-# unresolved PyTorch/CUDA symbols.
-RUN MAX_JOBS=2 python docker/common/verify_native_runtime.py
+# unresolved PyTorch/CUDA symbols. MoK links libcuda directly; use the toolkit's
+# stub only for this import check on builders without an NVIDIA driver.
+RUN mkdir -p /tmp/cuda-driver-stubs && \
+    ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-driver-stubs/libcuda.so.1 && \
+    LD_LIBRARY_PATH=/tmp/cuda-driver-stubs:${LD_LIBRARY_PATH} \
+        MAX_JOBS=2 python docker/common/verify_native_runtime.py && \
+    rm -rf /tmp/cuda-driver-stubs
 
 WORKDIR /opt/Automodel
 
