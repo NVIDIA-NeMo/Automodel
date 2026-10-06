@@ -1267,14 +1267,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Preserve physical NEAT document IDs before model-kwarg filtering. The
         # loss needs these even when the forward does not accept packing metadata.
         mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
-        # Preserve THD metadata before forward-kwarg filtering as well.
+        # Preserve packing metadata needed by the loss before model-kwarg filtering.
+        mtp_is_packed = "cu_seqlens" in batch or "cu_seqlens_padded" in batch or batch.get("qkv_format") == "thd"
         mtp_cu_seqlens = batch.get("cu_seqlens_padded")
-        mtp_needs_thd_boundaries = (
-            mtp_per_depth_targets is None
-            and mtp_seq_idx is None
-            and "packed_token_indices" not in batch
-            and ("cu_seqlens" in batch or "cu_seqlens_padded" in batch or batch.get("qkv_format") == "thd")
-        )
         labels = batch.pop("labels")
         dataset_ids = batch.pop("dataset_id", None)
         loss_weights = None
@@ -1399,7 +1394,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
-                    if mtp_needs_thd_boundaries and mtp_cu_seqlens is None:
+                    if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
+                        # CP targets or NEAT document IDs already define the boundaries.
+                        mtp_cu_seqlens = None
+                    elif mtp_is_packed and mtp_cu_seqlens is None:
                         raise ValueError(
                             "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
                             "including padding; cu_seqlens alone is insufficient."
@@ -1425,7 +1423,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
                         # MTP shifts index physical token slots, including internal THD padding.
-                        cu_seqlens=mtp_cu_seqlens if mtp_needs_thd_boundaries else None,
+                        cu_seqlens=mtp_cu_seqlens,
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )

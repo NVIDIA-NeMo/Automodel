@@ -3580,7 +3580,7 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
     [(fmt, size, filtered) for fmt in ("neat", "neat_varlen") for size in (1, 2) for filtered in (False, True)]
     + [
         (fmt, 1, filtered)
-        for fmt in ("thd", "thd_padded", "thd_missing_padded", "thd_none_padded")
+        for fmt in ("unpacked", "thd", "thd_padded", "thd_missing_padded", "thd_none_padded")
         for filtered in (False, True)
     ],
 )
@@ -3657,6 +3657,13 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             attention_mask=[1, 1, 1, 1, 0, 2, 2, 2],
         ),
     ][:batch_size]
+    if packing_format == "unpacked":
+        samples[0] = dict(
+            input_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+            labels=[2, 3, 4, 5, 6, 7, 8, -100],
+            position_ids=list(range(8)),
+            attention_mask=[1] * 8,
+        )
     if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded"):
         # Two documents occupy [0, 4) and [4, 8); slot 3 is internal pad.
         # Real cumulative lengths [0, 3, 7] are not physical token offsets.
@@ -3702,6 +3709,12 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             torch.tensor([[3, 4, -100, -100, 7, 8, 9, -100]]),
             torch.tensor([[4, -100, -100, -100, 8, 9, -100, -100]]),
         ]
+    if packing_format == "unpacked":
+        targets = [
+            labels,
+            torch.tensor([[3, 4, 5, 6, 7, 8, -100, -100]]),
+            torch.tensor([[4, 5, 6, 7, 8, -100, -100, -100]]),
+        ]
     reference_logits = model.logits.detach().clone().requires_grad_()
     reference_losses = [
         torch.nn.functional.cross_entropy(logits.flatten(0, 1), target.flatten(), reduction="sum") / num_tokens
@@ -3723,5 +3736,6 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
     )
     torch.testing.assert_close(losses[0], expected.detach())
     torch.testing.assert_close(model.logits.grad, reference_logits.grad)
-    # The last token of document A must receive no cross-document MTP gradient.
-    assert torch.count_nonzero(model.logits.grad[1:, 0, 2]) == 0
+    if packing_format != "unpacked":
+        # The last token of document A must receive no cross-document MTP gradient.
+        assert torch.count_nonzero(model.logits.grad[1:, 0, 2]) == 0
