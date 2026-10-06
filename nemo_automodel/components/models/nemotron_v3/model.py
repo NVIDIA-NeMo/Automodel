@@ -1040,7 +1040,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 assert mtp_per_depth_h is not None
                 # seq_idx tail sources, in order of preference:
                 #   1. kwargs["seq_idx"] (neat-path).
-                #   2. derived from kwargs["cu_seqlens"] (THD/TE path).
+                #   2. derived from kwargs["cu_seqlens_padded"] (physical THD offsets).
                 #   3. all-1 sentinel — loss-fn cross-boundary mask is a no-op.
                 if logits.dim() == 3:
                     _B, _S = logits.shape[:2]
@@ -1051,13 +1051,16 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
                 _seq_idx_tail = kwargs.get("seq_idx", None)
                 if not isinstance(_seq_idx_tail, torch.Tensor):
-                    _cu = kwargs.get("cu_seqlens", None)
+                    _cu = kwargs.get("cu_seqlens_padded")
+                    if _cu is None and (is_thd or kwargs.get("cu_seqlens") is not None):
+                        raise ValueError("Packed MTP requires cu_seqlens_padded for physical document boundaries")
                     if isinstance(_cu, torch.Tensor):
                         _cu1d = _cu.squeeze(0) if (_cu.dim() == 2 and _cu.shape[0] == 1) else _cu
                         if _cu1d.dim() == 1:
+                            _cu1d = _cu1d[_cu1d != -1000]
                             _positions = torch.arange(_S, device=_cu1d.device)
                             # ``right=True`` so a position equal to a boundary
-                            # (first token of sub-seq k, position == cu_seqlens[k])
+                            # (first token of sub-seq k, position == cu_seqlens_padded[k])
                             # maps to k, not k-1 — matches mtp.py and layers.py.
                             _seq_idx_1d = torch.searchsorted(_cu1d[1:].contiguous(), _positions, right=True).to(
                                 torch.int32

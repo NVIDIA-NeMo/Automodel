@@ -119,8 +119,18 @@ compile:
   enabled: false
 nvtx: false
 wandb:
-  enable: true
+  enable: false  # Set true to log training to W&B.
   project: nemotron-lightning-cp
   name: lightning-tulu3-packed-cp8-64k-gbs8-bf16-te-original-template
   mode: online
   dir: wandb
+
+# Release CI runs a short smoke test on one 8-GPU node.
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:30:00"
+  nodes: 1
+  nproc_per_node: 8
+  max_steps: 2
+  env_vars:
+    REQUIRE_FINITE_METRICS: "true"

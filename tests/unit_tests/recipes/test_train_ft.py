@@ -3772,3 +3772,92 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
     if packing_format != "unpacked":
         # The last token of document A must receive no cross-document MTP gradient.
         assert torch.count_nonzero(model.logits.grad[1:, 0, 2]) == 0
+
+
+@pytest.mark.parametrize("batched_cu", [False, True])
+@pytest.mark.parametrize("internal_padding", [False, True])
+@pytest.mark.parametrize("is_train", [False, True])
+def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is_train):
+    """Exercise the PP recipe fallback independently of a model's seq_idx tail."""
+
+    class Model(nn.Module):
+        mtp_outputs_are_logits = True
+
+        def __init__(self):
+            super().__init__()
+            self.logits = nn.Parameter(torch.randn(3, 1, 8, 16))
+
+    torch.manual_seed(4169)
+    model = Model()
+    model.train(is_train)
+    base_loss = MaskedCrossEntropy()
+    pp_loss = PipelineCausalLMLoss(base_loss, model, scaling_factor=0.3)
+
+    class Schedule:
+        _loss_fn = pp_loss
+
+        def step(self, input_ids, *, target, losses, **kwargs):
+            assert input_ids.shape == (1, 8)
+            loss = self._loss_fn(tuple(model.logits.unbind()), target)
+            losses.append(loss.detach())
+            loss.backward()
+
+        def eval(self, input_ids, *, target, losses, **kwargs):
+            assert input_ids.shape == (1, 8)
+            with torch.no_grad():
+                losses.append(self._loss_fn(tuple(model.logits.unbind()), target))
+
+    recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=None))
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=1)
+    recipe.pp_enabled = True
+    recipe.pp = SimpleNamespace(
+        pp_batch_size=1,
+        pp_microbatch_size=1,
+        update_seq_len=lambda seq_len: None,
+        info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=Schedule()),
+    )
+    recipe.tokenizer = None
+    recipe.te_fp8 = None
+    recipe.domain_mixture = None
+    recipe.model_parts = [model]
+    recipe.loss_fn = base_loss
+    labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, 9]])
+    if not internal_padding:
+        labels[0, 3] = 5
+    cu = torch.tensor([0, 3 if internal_padding else 4, 7 if internal_padding else 8], dtype=torch.int32)
+    physical = torch.tensor([0, 4, 8], dtype=torch.int32)
+    if batched_cu:
+        cu = torch.cat((cu, torch.tensor([-1000], dtype=torch.int32))).unsqueeze(0)
+        physical = torch.cat((physical, torch.tensor([-1000], dtype=torch.int32))).unsqueeze(0)
+    batch = dict(
+        input_ids=torch.ones_like(labels), labels=labels, qkv_format="thd", cu_seqlens=cu, cu_seqlens_padded=physical
+    )
+    reference_logits = model.logits.detach().clone().requires_grad_()
+    expected = torch.nn.functional.cross_entropy(reference_logits[0].flatten(0, 1), labels.flatten(), reduction="sum")
+    if is_train:
+        for depth in (1, 2):
+            target = torch.full_like(labels, -100)
+            for start, end in ((0, 4), (4, 8)):
+                target[:, start : end - depth] = labels[:, start + depth : end]
+            expected = expected + 0.15 * torch.nn.functional.cross_entropy(
+                reference_logits[depth].flatten(0, 1), target.flatten(), reduction="sum"
+            )
+        expected.backward()
+    losses = []
+    recipe._forward_backward_step(
+        0,
+        batch,
+        loss_buffer=losses,
+        num_label_tokens=int((labels != -100).sum()),
+        num_batches=1,
+        is_train=is_train,
+    )
+    torch.testing.assert_close(pp_loss.cu_seqlens, torch.tensor([0, 4, 8], dtype=torch.int32))
+    torch.testing.assert_close(losses[0], expected.detach())
+    if is_train:
+        torch.testing.assert_close(model.logits.grad, reference_logits.grad)
+    else:
+        assert model.logits.grad is None

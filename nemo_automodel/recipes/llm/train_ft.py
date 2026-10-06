@@ -1309,14 +1309,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
-                # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
+                # Hand physical THD boundaries to the PP loss to mask cross-sequence targets —
                 # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
                 # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
                 # one pack/microbatch per step; batch-major NEAT metadata instead travels with each
                 # microbatch and its model-provided seq_idx tail.
-                cu_seqlens = None if "packed_token_indices" in batch_filtered else batch_filtered.get("cu_seqlens")
+                cu_seqlens = (
+                    None if "packed_token_indices" in batch_filtered else batch_filtered.get("cu_seqlens_padded")
+                )
                 if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
                     cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
+                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 1:
+                    cu_seqlens = cu_seqlens[cu_seqlens != -1000]
                 pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
                 if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
                     pp_loss_fn.cu_seqlens = cu_seqlens
