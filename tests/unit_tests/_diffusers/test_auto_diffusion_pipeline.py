@@ -710,6 +710,9 @@ def test_generation_load_pipeline_places_all_components_but_parallelizes_only_tr
     )
     dist_info = object()
     with (
+        # generate.py imports the resolver from _hf_cache itself, so the module-level
+        # autouse patch on auto_diffusion_pipeline does not cover this call.
+        patch("nemo_automodel._diffusers._hf_cache.resolve_diffusion_model_dir", side_effect=lambda model_id: model_id),
         patch.object(gen, "_build_mesh_context", return_value=mesh_context) as build_mesh,
         patch.object(adp, "DIFFUSERS_AVAILABLE", True),
         patch.object(adp.DiffusionPipeline, "from_pretrained", return_value=pipe),
