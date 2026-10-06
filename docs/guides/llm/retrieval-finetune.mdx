@@ -17,6 +17,13 @@ Both recipes use retrieval examples where the first passage is positive and the 
 common workflow is to train a bi-encoder, use it to mine harder negatives, then train either a stronger bi-encoder or a
 cross-encoder reranker.
 
+<Tip>
+For an end-to-end text bi-encoder workflow starting from your document corpus, follow the
+[Nemotron embedding recipe](https://github.com/NVIDIA-NeMo/Nemotron/tree/main/docs/nemotron/embed).
+It covers synthetic data generation, data preparation with hard-negative mining, fine-tuning with NeMo AutoModel,
+evaluation, model export when required, and deployment.
+</Tip>
+
 ## Workflow Overview
 
 Most retrieval projects move through the same loop:
