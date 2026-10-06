@@ -1214,6 +1214,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batch: Input mapping with token IDs, labels, and physical NEAT
                 document IDs of shape [batch, sequence]. NEAT attention metadata
                 is batch-major; legacy THD inputs are flattened by the sharder.
+                THD MTP requires physical boundaries in cu_seqlens_padded of
+                shape [num_sequences + 1] or [1, num_sequences + 1].
             loss_buffer: List receiving the detached scalar loss.
             num_label_tokens: Global supervised-token count for loss normalization.
             num_batches: Number of microbatches in the accumulation window.
@@ -1265,6 +1267,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Preserve physical NEAT document IDs before model-kwarg filtering. The
         # loss needs these even when the forward does not accept packing metadata.
         mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
+        # Preserve THD metadata before forward-kwarg filtering as well.
+        mtp_cu_seqlens = batch.get("cu_seqlens_padded")
+        mtp_needs_thd_boundaries = (
+            mtp_per_depth_targets is None
+            and mtp_seq_idx is None
+            and "packed_token_indices" not in batch
+            and ("cu_seqlens" in batch or "cu_seqlens_padded" in batch or batch.get("qkv_format") == "thd")
+        )
         labels = batch.pop("labels")
         dataset_ids = batch.pop("dataset_id", None)
         loss_weights = None
@@ -1389,6 +1399,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    if mtp_needs_thd_boundaries and mtp_cu_seqlens is None:
+                        raise ValueError(
+                            "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
+                            "including padding; cu_seqlens alone is insufficient."
+                        )
                     mtp_cfg = self.cfg.mtp
                     if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
                         raise NotImplementedError(
@@ -1410,11 +1425,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
                         # MTP shifts index physical token slots, including internal THD padding.
-                        cu_seqlens=(
-                            None
-                            if mtp_per_depth_targets is not None or "packed_token_indices" in batch
-                            else batch.get("cu_seqlens_padded", batch.get("cu_seqlens"))
-                        ),
+                        cu_seqlens=mtp_cu_seqlens if mtp_needs_thd_boundaries else None,
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )

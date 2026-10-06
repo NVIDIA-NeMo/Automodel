@@ -3578,7 +3578,11 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
 @pytest.mark.parametrize(
     "packing_format,batch_size,filter_metadata",
     [(fmt, size, filtered) for fmt in ("neat", "neat_varlen") for size in (1, 2) for filtered in (False, True)]
-    + [("thd", 1, False), ("thd_padded", 1, False)],
+    + [
+        (fmt, 1, filtered)
+        for fmt in ("thd", "thd_padded", "thd_missing_padded", "thd_none_padded")
+        for filtered in (False, True)
+    ],
 )
 def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batch_size, filter_metadata):
     from nemo_automodel.components.datasets.utils import neat_packed_collater
@@ -3653,7 +3657,7 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             attention_mask=[1, 1, 1, 1, 0, 2, 2, 2],
         ),
     ][:batch_size]
-    if packing_format == "thd_padded":
+    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded"):
         # Two documents occupy [0, 4) and [4, 8); slot 3 is internal pad.
         # Real cumulative lengths [0, 3, 7] are not physical token offsets.
         samples[0] = dict(
@@ -3666,14 +3670,19 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
         samples,
         packing=PackingCapabilities("block_causal", requires_packed_sequence_metadata=packing_format == "neat_varlen"),
     )
-    if packing_format == "thd_padded":
+    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded"):
         batch.pop("_packed_seq_ids")
         batch["cu_seqlens"] = torch.tensor([0, 3, 7], dtype=torch.int32)
         batch["cu_seqlens_padded"] = torch.tensor([0, 4, 8], dtype=torch.int32)
     if packing_format == "thd":
-        # Exercise the legacy physical-offset fallback without NEAT document IDs.
+        # Even without internal padding, THD must provide explicit physical offsets.
         batch.pop("_packed_seq_ids")
         batch["cu_seqlens"] = torch.tensor([0, 3, 6, 8], dtype=torch.int32)
+        batch["cu_seqlens_padded"] = batch["cu_seqlens"].clone()
+    if packing_format == "thd_missing_padded":
+        batch.pop("cu_seqlens_padded")
+    elif packing_format == "thd_none_padded":
+        batch["cu_seqlens_padded"] = None
     labels = batch["labels"].clone()
     num_tokens = int((labels != -100).sum())
     # Explicit document-isolated targets are independent of the production
@@ -3687,7 +3696,7 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             [[-100, -100, -100, -100, -100, -100, -100, -100], [10, -100, -100, -100, -100, -100, -100, -100]]
         )[:batch_size],
     ]
-    if packing_format == "thd_padded":
+    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded"):
         targets = [
             labels,
             torch.tensor([[3, 4, -100, -100, 7, 8, 9, -100]]),
@@ -3701,6 +3710,14 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
     expected = reference_losses[0] + 0.15 * (reference_losses[1] + reference_losses[2])
     expected.backward()
     losses = []
+    if packing_format in ("thd_missing_padded", "thd_none_padded"):
+        with pytest.raises(ValueError, match="Packed MTP requires cu_seqlens_padded"):
+            recipe._forward_backward_step(
+                0, batch, loss_buffer=losses, num_label_tokens=num_tokens, num_batches=1, is_train=True
+            )
+        assert not losses
+        assert model.logits.grad is None
+        return
     recipe._forward_backward_step(
         0, batch, loss_buffer=losses, num_label_tokens=num_tokens, num_batches=1, is_train=True
     )
