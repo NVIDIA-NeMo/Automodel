@@ -72,7 +72,7 @@ if _HAVE_TRITON and _HAVE_TRITON_LANGUAGE:
         output_stride_0: tl.constexpr,
         output_stride_1: tl.constexpr,
         BLOCK: tl.constexpr,
-    ):
+    ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
         """Add weighted expert bias without expanded bias or FP32 activation buffers.
 
         Args:
@@ -114,7 +114,7 @@ if _HAVE_TRITON and _HAVE_TRITON_LANGUAGE:
         bias_stride_1: tl.constexpr,
         probs_stride_0: tl.constexpr,
         BLOCK: tl.constexpr,
-    ):
+    ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
         """Reduce each row's bias-weighted gradient without expanded bias buffers.
 
         Args:
