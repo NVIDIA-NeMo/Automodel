@@ -24,6 +24,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from nemo_automodel.components.models.common import BackendConfig, MoKBackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
@@ -97,6 +98,28 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
         The returned tensor aliases the input's local storage.
     """
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def _copy_local_init_weight(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy a canonical initialization into the local MOK parameter storage.
+
+    Args:
+        destination: Parameter of shape [experts, output_features, input_features].
+            A DTensor may shard experts over EP and feature axes over FSDP.
+            Its local storage is mutated in place without replacing the parameter.
+        source: Tensor of shape [local_experts, output_features, input_features],
+            already restricted to this EP rank's experts but containing the full
+            feature axes. It may be a noncontiguous transposed view and is not mutated.
+    """
+    local = _local_tensor(destination)
+    if isinstance(destination, DTensor):
+        _, offsets = compute_local_shape_and_global_offset(
+            destination.shape, destination.device_mesh, destination.placements
+        )
+        # The canonical draw already uses the local expert count. Apply only
+        # feature-axis offsets; applying the EP offset again drops local experts.
+        source = source.narrow(1, offsets[1], local.size(1)).narrow(2, offsets[2], local.size(2))
+    local.copy_(source)
 
 
 def _flatten_mok_tensor_dataclass(
@@ -703,10 +726,11 @@ class GroupedExpertsMoK(nn.Module):
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         """Initialize MoK-native weights from the canonical expert layout.
 
-        Draw random values in the same tensor shapes and order as
-        :class:`GroupedExperts` before transposing them into MoK's native
-        layouts.  Otherwise switching only the dispatcher changes a
-        random-initialized model even when every process uses the same seed.
+        Draw random values in the same tensor shapes and order as unsharded
+        :class:`GroupedExperts` for this EP rank's experts, then transpose into
+        MoK's native layouts and select the local FSDP feature slices. Keeping
+        full feature widths in the draw preserves the random stream and the
+        initialized values when FSDP splits the parameters.
 
         Args:
             buffer_device: Device on which initialization kernels execute.
@@ -714,7 +738,6 @@ class GroupedExpertsMoK(nn.Module):
         """
         with torch.device(buffer_device):
             routed_gate = _local_tensor(self.routed_gate_weights)
-            routed_up = _local_tensor(self.routed_up_weights)
             routed_down = _local_tensor(self.routed_down_weights)
             inter_dim = self.config.moe_inter_dim
 
@@ -723,15 +746,15 @@ class GroupedExpertsMoK(nn.Module):
             # contiguous tensors consumed by MoK.
             canonical_gate_up = routed_gate.new_empty((routed_gate.size(0), self.config.dim, 2 * inter_dim))
             canonical_gate_up.normal_(mean=0.0, std=init_std)
-            routed_gate.copy_(canonical_gate_up[..., :inter_dim].transpose(-1, -2))
-            routed_up.copy_(canonical_gate_up[..., inter_dim:].transpose(-1, -2))
+            _copy_local_init_weight(self.routed_gate_weights, canonical_gate_up[..., :inter_dim].transpose(-1, -2))
+            _copy_local_init_weight(self.routed_up_weights, canonical_gate_up[..., inter_dim:].transpose(-1, -2))
             del canonical_gate_up
 
             # GroupedExperts draws down projection weights immediately after
             # the combined tensor, in [expert, intermediate, hidden] order.
             canonical_down = routed_down.new_empty((routed_down.size(0), inter_dim, self.config.dim))
             canonical_down.normal_(mean=0.0, std=init_std)
-            routed_down.copy_(canonical_down.transpose(-1, -2))
+            _copy_local_init_weight(self.routed_down_weights, canonical_down.transpose(-1, -2))
         self.runtime._invalidate_mxfp8_cache()
 
     def _save_to_state_dict(
