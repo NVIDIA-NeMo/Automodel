@@ -344,7 +344,7 @@ The mask is built for `sdpa` or `eager` (dense additive) or `flex_attention` (sp
 
 [Uno](https://arxiv.org/abs/2609.04010) (Sahoo et al., 2026) adds diffusion weights to a frozen autoregressive LM as a LoRA adapter so that the model can draft a block of tokens in parallel and verify them losslessly with the same weights, without a separate draft model. Training uses the I-DLM `[x_t | x_0]` forward pass: every response token in `x_t` is replaced by a uniform random token, the adapter is applied to the `x_t` copy only, and the loss is the total variation between the adapter-on `x_t` and the frozen adapter-off `x_0` next-token distributions. The block size follows an increasing curriculum.
 
-See [`qwen3_8b_uno.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_uno.yaml) for the full configuration of the released Uno-Qwen3-8B recipe. The following example shows the key Uno-specific sections.
+See [`qwen3_8b_uno.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_uno.yaml) for the full configuration of the released Uno-Qwen3-8B recipe. The following example shows the key Uno-specific sections:
 
 ```yaml
 peft:
