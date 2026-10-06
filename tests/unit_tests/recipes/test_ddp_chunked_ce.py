@@ -236,13 +236,18 @@ def test_ddp_chunked_ce_two_rank_parity(tmp_path):
     )
 
 
-@pytest.mark.parametrize("supported", [False, True])
-def test_ddp_fused_loss_capability(ddp_group, supported):
-    model = _mistral() if supported else _UnsupportedModel(16, 32, bias=False)
+@pytest.mark.parametrize("model_factory", [_mistral, _gpt_neox])
+def test_ddp_fused_loss_capability(ddp_group, model_factory):
+    model = model_factory()
+    wrapped = DDP(model)
     loss = FusedLinearCrossEntropy(ignore_index=0)
-    result = _maybe_downgrade_loss_fn(loss, DDP(model), False)
-    if supported:
-        assert result is loss
-    else:
-        assert isinstance(result, MaskedCrossEntropy)
-        assert result.ignore_index == 0
+    assert _maybe_downgrade_loss_fn(loss, wrapped, False) is loss
+    assert prepare_lm_weight(loss, wrapped) is model.get_output_embeddings().weight
+
+
+def test_ddp_unsupported_fused_loss_falls_back(ddp_group):
+    wrapped = DDP(_UnsupportedModel(16, 32, bias=False))
+    loss = FusedLinearCrossEntropy(ignore_index=0)
+    result = _maybe_downgrade_loss_fn(loss, wrapped, False)
+    assert isinstance(result, MaskedCrossEntropy)
+    assert result.ignore_index == 0
