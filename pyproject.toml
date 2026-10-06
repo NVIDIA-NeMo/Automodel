@@ -197,10 +197,14 @@ mlflow = [
     # Avoids the mlflow vs mlflow-skinny mutual-exclusion conflict that breaks
     # environments using sagemaker-mlflow, kedro-mlflow, and managed ML platforms.
     "mlflow-skinny>=3.16.1",
+    # MLflow's default local SQLite store needs both the SQL backend and migrations.
+    # Match the bounds in full MLflow while keeping its server/UI stack optional.
+    "sqlalchemy>=1.4.0,<3",
+    "alembic!=1.10.0,<2",
 ]
 mlflow-full = [
     # Full mlflow stack: tracking server, UI, SQL backend, pyarrow, etc.
-    # Use when you need the MLflow UI or sql:// artifact stores.
+    # Use when you need the MLflow server or UI.
     "mlflow>=3.16.1",
 ]
 wandb = ["wandb>=0.30.0"]
