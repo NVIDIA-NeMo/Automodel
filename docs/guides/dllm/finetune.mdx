@@ -76,7 +76,6 @@ For the full set of installation methods, see the [Installation Guide](/get-star
 
 The following components drive dLLM fine-tuning:
 
-1. A recipe script ([`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/dllm/train_ft.py)) orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
 - A recipe script ([`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/dllm/train_ft.py)) orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
 - A YAML configuration file specifies the model, data, optimizer, dLLM-specific settings, and distributed training strategy.
 
@@ -215,7 +214,7 @@ The following table describes the key configuration fields for dLLM fine-tuning:
 | Field | Description |
 |-------|-------------|
 | `dllm.mode` | Training strategy (`mdlm`, `scdd`, `hybrid`, `block_diffusion`, `dflash`, `idlm`, or `uno`). |
-| `dllm.mask_token_id` | Token ID used for masking (`126336` for LLaDA, `156895` for LLaDA2.1, `100` for Nemotron-Labs-Diffusion). Unused by `block_diffusion`. |
+| `dllm.mask_token_id` | Token ID used for masking (`126336` for LLaDA, `156895` for LLaDA2.1, `100` for Nemotron-Labs-Diffusion). Unused by `block_diffusion` and `uno`. |
 | `dllm.eps` | Minimum corruption ratio to avoid zero-corruption samples. |
 | `dllm.block_size` | Hybrid: when set, use blockwise corruption (otherwise uniform). Block-diffusion: response-block size for one-canvas-per-step selection (default `256`). |
 | `dllm.encoder_loss_weight` | Weight on the co-trained encoder AR loss. Block-diffusion only (default `1.0`). |
@@ -355,7 +354,6 @@ peft:
 
 dllm:
   mode: uno
-  mask_token_id: 151669          # Uno <MASK> for Qwen3
   tv_weight: 1.0
   block_curriculum:
     tokens_per_step: 524288      # global_batch_size * seq_length
