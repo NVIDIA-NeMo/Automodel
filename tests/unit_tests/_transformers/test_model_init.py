@@ -1394,15 +1394,18 @@ class TestLayerTypesFix:
     def test_resolves_via_config_mapping_when_not_trust_remote_code(self, mock_get_dict, mock_mapping):
         cfg_dict = self._config_dict()
         cfg_dict.pop("auto_map")
+        cfg_dict["_commit_hash"] = "b" * 40
         mock_get_dict.return_value = (cfg_dict, {})
 
         fake_cls = MagicMock()
-        fake_cls.from_dict.return_value = "built"
+        built = PretrainedConfig()
+        fake_cls.from_dict.return_value = built
         mock_mapping.get.side_effect = lambda k: fake_cls if k == "step3p5" else None
 
         result = _load_config_with_layer_types_fix("some/model", "flash_attention_2", trust_remote_code=False)
 
-        assert result == "built"
+        assert result is built
+        assert result._commit_hash == "b" * 40
         passed_dict = fake_cls.from_dict.call_args[0][0]
         assert len(passed_dict["layer_types"]) == 45
         mock_mapping.get.assert_called_once_with("step3p5")
