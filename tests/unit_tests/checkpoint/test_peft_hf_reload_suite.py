@@ -181,6 +181,115 @@ def _build_minimax_m2():
     return MiniMaxM2ForCausalLM(config), MiniMaxM2StateDictAdapter(config, moe_config, _BACKEND)
 
 
+def _build_qwen2_5_omni():
+    """Dense multimodal sibling of qwen3_omni_moe: same ``thinker.`` namespacing, no experts."""
+    from transformers.models.qwen2_5_omni import (
+        Qwen2_5OmniBigVGANConfig,
+        Qwen2_5OmniConfig,
+        Qwen2_5OmniDiTConfig,
+        Qwen2_5OmniTalkerConfig,
+        Qwen2_5OmniTextConfig,
+        Qwen2_5OmniToken2WavConfig,
+    )
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+        Qwen2_5OmniThinkerForConditionalGeneration,
+    )
+
+    from nemo_automodel.components.models.qwen2_5_omni.state_dict_adapter import Qwen2_5OmniStateDictAdapter
+
+    thinker_config = dict(
+        text_config=dict(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            # Multimodal rope splits the head dim three ways and the sections have to
+            # sum to half of it; head_dim is 32/4 here.
+            rope_scaling={"rope_type": "default", "mrope_section": [2, 1, 1]},
+        ),
+        vision_config=dict(
+            depth=1,
+            hidden_size=32,
+            num_heads=4,
+            out_hidden_size=32,
+            intermediate_size=64,
+            patch_size=14,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        ),
+        audio_config=dict(
+            d_model=32,
+            encoder_layers=1,
+            encoder_attention_heads=4,
+            encoder_ffn_dim=64,
+            num_mel_bins=128,
+            output_dim=32,
+            max_source_positions=64,
+        ),
+    )
+    config = Qwen2_5OmniConfig(
+        thinker_config=thinker_config,
+        # The talker's nested text_config is not coerced from a dict the way the
+        # thinker's is, and a plain dict there fails when the full model builds its
+        # generation config. It is only here so the reload target exists.
+        talker_config=Qwen2_5OmniTalkerConfig(
+            # The talker carries its own sizes as well as a nested text_config, and its
+            # defaults are a 28-layer 3584-wide stack: 6.6B parameters if left alone.
+            vocab_size=64,
+            embedding_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+            text_config=Qwen2_5OmniTextConfig(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=64,
+            ),
+        ),
+        # Same coercion gap as the talker, and the defaults here are a 22-layer DiT and
+        # a 1536-channel vocoder, which is far too much to build for a naming test.
+        token2wav_config=Qwen2_5OmniToken2WavConfig(
+            dit_config=Qwen2_5OmniDiTConfig(
+                hidden_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                emb_dim=32,
+                head_dim=8,
+                num_embeds=64,
+                max_position_embeddings=64,
+                mel_dim=8,
+                enc_emb_dim=16,
+                enc_dim=16,
+                enc_attention_channels=8,
+                enc_se_channels=8,
+            ),
+            bigvgan_config=Qwen2_5OmniBigVGANConfig(mel_dim=8, upsample_initial_channel=32),
+        ),
+    )
+    config._attn_implementation = "sdpa"
+    thinker = Qwen2_5OmniThinkerForConditionalGeneration(config.thinker_config)
+    return thinker, Qwen2_5OmniStateDictAdapter(config, _BACKEND, dtype=torch.float32)
+
+
+def _build_qwen2_5_omni_reference():
+    """The reload target: the full model whose layout the exported names describe."""
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniForConditionalGeneration
+
+    _, adapter = _build_qwen2_5_omni()
+    return Qwen2_5OmniForConditionalGeneration(adapter.config)
+
+
 def _build_qwen3_omni_moe():
     """Multimodal: the adapter names tensors for the whole Omni model.
 
@@ -340,6 +449,13 @@ _FAMILIES = (
         _build_qwen3_omni_moe,
         {"target_modules": ["*.q_proj", "*.v_proj"]},
         build_reference=_build_qwen3_omni_moe_reference,
+        reference_path="thinker",
+    ),
+    _Family(
+        "qwen2_5_omni",
+        _build_qwen2_5_omni,
+        {"target_modules": ["*.q_proj", "*.v_proj"]},
+        build_reference=_build_qwen2_5_omni_reference,
         reference_path="thinker",
     ),
     # Same adapter, thinker-only base: the namespace the full layout requires is exactly
