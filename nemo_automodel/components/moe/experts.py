@@ -53,6 +53,55 @@ _BIAS_CHUNK_THRESHOLD = 12288
 _EXPERT_MLP_CHUNK_BYTES = 256 * 1024 * 1024
 
 
+if _HAVE_TRITON and _HAVE_TRITON_LANGUAGE:
+
+    @triton.jit
+    def _weighted_bias_add_kernel(
+        value_ptr,
+        bias_ptr,
+        expert_ids_ptr,
+        probs_ptr,
+        output_ptr,
+        numel,
+        hidden: tl.constexpr,
+        value_stride_0: tl.constexpr,
+        value_stride_1: tl.constexpr,
+        bias_stride_0: tl.constexpr,
+        bias_stride_1: tl.constexpr,
+        probs_stride_0: tl.constexpr,
+        output_stride_0: tl.constexpr,
+        output_stride_1: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Add weighted expert bias without expanded bias or FP32 activation buffers.
+
+        Args:
+            value_ptr: Tensor of shape [tokens, hidden] containing grouped expert outputs.
+            bias_ptr: Tensor of shape [experts, hidden] containing per-expert biases.
+            expert_ids_ptr: Contiguous integer tensor of shape [tokens] mapping each row to its expert.
+            probs_ptr: FP32 tensor of shape [tokens, 1] containing routing weights.
+            output_ptr: Tensor of shape [tokens, hidden], optionally aliasing ``value_ptr`` exactly.
+            numel: Number of output elements.
+            hidden: Feature count.
+            value_stride_0: Value row stride.
+            value_stride_1: Value feature stride.
+            bias_stride_0: Bias expert stride.
+            bias_stride_1: Bias feature stride.
+            probs_stride_0: Probability row stride.
+            output_stride_0: Output row stride.
+            output_stride_1: Output feature stride.
+            BLOCK: Number of elements processed by each program.
+        """
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < numel
+        rows, cols = offsets // hidden, offsets % hidden
+        experts = tl.load(expert_ids_ptr + rows, mask, other=0)
+        value = tl.load(value_ptr + rows * value_stride_0 + cols * value_stride_1, mask, other=0).to(tl.float32)
+        bias = tl.load(bias_ptr + experts * bias_stride_0 + cols * bias_stride_1, mask, other=0).to(tl.float32)
+        probs = tl.load(probs_ptr + rows * probs_stride_0, mask, other=0)
+        tl.store(output_ptr + rows * output_stride_0 + cols * output_stride_1, value + bias * probs, mask)
+
+
 def _allocate_triton_workspace(size: int, alignment: int, stream: int | None) -> torch.Tensor:
     """Allocate device workspace required by Triton tensor descriptors.
 
@@ -474,6 +523,33 @@ class _ChunkedBiasAdd(Function):
         compute_dtype = torch.promote_types(value.dtype, bias.dtype)
         if probs is not None:
             compute_dtype = torch.promote_types(compute_dtype, probs.dtype)
+        if (
+            _HAVE_TRITON
+            and _HAVE_TRITON_LANGUAGE
+            and value.is_cuda
+            and probs is not None
+            and probs.dtype == torch.float32
+            and compute_dtype == torch.float32
+            and value.numel() > 0
+        ):
+            # Keep the bounded-memory contract while avoiding one sequence of
+            # gather/cast/multiply/add/copy launches for every 4096 token rows.
+            _weighted_bias_add_kernel[(triton.cdiv(value.numel(), 1024),)](
+                value,
+                bias,
+                expert_ids,
+                probs,
+                output,
+                value.numel(),
+                value.shape[1],
+                *value.stride(),
+                *bias.stride(),
+                probs.stride(0),
+                *output.stride(),
+                BLOCK=1024,
+                enable_fp_fusion=False,
+            )
+            return output
         for start in range(0, value.shape[0], _BIAS_CHUNK_ROWS):
             end = min(start + _BIAS_CHUNK_ROWS, value.shape[0])
             bias_rows = bias.index_select(0, expert_ids[start:end]).to(compute_dtype)
