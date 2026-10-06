@@ -616,6 +616,8 @@ def test_make_cp_batch_for_te_multi_chunk(monkeypatch):
     assert result["qkv_format"] == "thd"
     assert result["input_ids"].shape[0] == 2
     assert result["padding_mask"].shape == result["input_ids"].shape
+    assert torch.equal(result["cu_seqlens_padded"], result["cu_seqlens"])
+    assert result["pad_between_seqs"] is False
 
 
 def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
@@ -641,15 +643,17 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
         "input_ids": torch.tensor([1, 2, 3, 4]),
         "labels": torch.tensor([10, 20, 30, 40]),
         "position_ids": torch.tensor([0, 1, 2, 3]),
-        "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        "cu_seqlens": torch.tensor([0, 3], dtype=torch.int32),
         "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
+        "pad_between_seqs": True,
     }
 
     result, local_indices = _cu._shard_thd_chunk_for_te(batch, cp_mesh, "thd", -1000, 0)
 
     assert "input_ids" in result
     assert "attention_mask" not in result
-    assert "cu_seqlens_padded" not in result
+    assert torch.equal(result["cu_seqlens_padded"], result["cu_seqlens"])
+    assert result["pad_between_seqs"] is False
     # the partition IS the local-token global index map (mock returns arange)
     assert torch.equal(local_indices, torch.arange(4))
 

@@ -931,6 +931,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 "qkv_format",
                 "cu_seqlens",
                 "cu_seqlens_padded",
+                "pad_between_seqs",
                 "max_seqlen",
                 "max_seqlen_q",
                 "max_seqlen_kv",

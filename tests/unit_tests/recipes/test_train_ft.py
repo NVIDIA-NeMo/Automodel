@@ -3582,6 +3582,12 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
         (fmt, 1, filtered)
         for fmt in ("unpacked", "thd", "thd_padded", "thd_missing_padded", "thd_none_padded")
         for filtered in (False, True)
+    ]
+    + [
+        (fmt, size, filtered)
+        for fmt in ("thd_native_tail", "thd_native_equal", "thd_native_padded")
+        for size in (1, 2)
+        for filtered in (False, True)
     ],
 )
 def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batch_size, filter_metadata):
@@ -3604,10 +3610,13 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             Returns:
                 Base logits and two MTP logits, each [batch, sequence, vocab].
             """
-            assert input_ids.shape == self.logits.shape[1:3]
-            return SimpleNamespace(
-                logits=self.logits[0], mtp_per_depth_logits=list(self.logits[1:]), mtp_loss_scaling_factor=0.3
-            )
+            if packing_format.startswith("thd_native"):
+                assert input_ids.shape == (batch_size * 8,)
+                logits = self.logits.reshape(3, batch_size * 8, 16)
+            else:
+                assert input_ids.shape == self.logits.shape[1:3]
+                logits = self.logits
+            return SimpleNamespace(logits=logits[0], mtp_per_depth_logits=list(logits[1:]), mtp_loss_scaling_factor=0.3)
 
     class MetadataModel(Model):
         def forward(self, input_ids: torch.Tensor, **kwargs: object) -> SimpleNamespace:
@@ -3625,11 +3634,16 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
 
     torch.manual_seed(3734)
     model = Model() if filter_metadata else MetadataModel()
+    if packing_format.startswith("thd_native"):
+        from nemo_automodel.components.models.common import BackendConfig
+
+        model.backend = BackendConfig(attn="te")
     cls = train_ft.TrainFinetuneRecipeForNextTokenPrediction if recipe_kind == "llm" else finetune.FinetuneRecipeForVLM
     recipe = object.__new__(cls)
     recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=None))
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=1)
     recipe.pp_enabled = False
     recipe.tokenizer = None
     recipe.te_fp8 = None
@@ -3664,7 +3678,7 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             position_ids=list(range(8)),
             attention_mask=[1] * 8,
         )
-    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded"):
+    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded", "thd_native_padded"):
         # Two documents occupy [0, 4) and [4, 8); slot 3 is internal pad.
         # Real cumulative lengths [0, 3, 7] are not physical token offsets.
         samples[0] = dict(
@@ -3677,7 +3691,7 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
         samples,
         packing=PackingCapabilities("block_causal", requires_packed_sequence_metadata=packing_format == "neat_varlen"),
     )
-    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded"):
+    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded", "thd_native_padded"):
         batch.pop("_packed_seq_ids")
         batch["cu_seqlens"] = torch.tensor([0, 3, 7], dtype=torch.int32)
         batch["cu_seqlens_padded"] = torch.tensor([0, 4, 8], dtype=torch.int32)
@@ -3690,6 +3704,23 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
         batch.pop("cu_seqlens_padded")
     elif packing_format == "thd_none_padded":
         batch["cu_seqlens_padded"] = None
+    if packing_format.startswith("thd_native"):
+        # Exercise the real TE preparation: physical boundaries must survive
+        # even when lengths coincide or trailing padding is absorbed.
+        batch = {
+            key: torch.tensor([sample[key] for sample in samples]) for key in ("input_ids", "labels", "position_ids")
+        }
+        if packing_format == "thd_native_tail":
+            real_lengths = [[3, 3, -1000], [4, 3, -1000]]
+            physical_lengths = [[3, 5, -1000], [5, 3, -1000]]
+        elif packing_format == "thd_native_equal":
+            real_lengths = physical_lengths = [[3, 3, 2], [5, 3, -1000]]
+        else:
+            real_lengths = [[3, 4, -1000], [4, 3, -1000]]
+            physical_lengths = [[4, 4, -1000], [5, 3, -1000]]
+        batch["seq_lens"] = torch.tensor(real_lengths[:batch_size])
+        batch["seq_lens_padded"] = torch.tensor(physical_lengths[:batch_size])
+        batch["qkv_format"] = "thd"
     labels = batch["labels"].clone()
     num_tokens = int((labels != -100).sum())
     # Explicit document-isolated targets are independent of the production
@@ -3703,11 +3734,13 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             [[-100, -100, -100, -100, -100, -100, -100, -100], [10, -100, -100, -100, -100, -100, -100, -100]]
         )[:batch_size],
     ]
-    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded"):
+    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded", "thd_native_padded"):
         targets = [
             labels,
-            torch.tensor([[3, 4, -100, -100, 7, 8, 9, -100]]),
-            torch.tensor([[4, -100, -100, -100, 8, 9, -100, -100]]),
+            torch.tensor([[3, 4, -100, -100, 7, 8, 9, -100], [9, 10, -100, -100, -100, 13, -100, -100]])[:batch_size],
+            torch.tensor([[4, -100, -100, -100, 8, 9, -100, -100], [10, -100, -100, -100, -100, -100, -100, -100]])[
+                :batch_size
+            ],
         ]
     if packing_format == "unpacked":
         targets = [
