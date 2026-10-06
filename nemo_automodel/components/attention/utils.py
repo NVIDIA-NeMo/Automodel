@@ -333,19 +333,15 @@ def preprocess_args_and_kwargs_for_attn(
                     "cu_seqlens_kv": kwargs["cu_seqlens_kv"],
                 }
             )
-            q_padded = kwargs.get("cu_seqlens_q_padded")
-            kv_padded = kwargs.get("cu_seqlens_kv_padded")
-            if q_padded is not None:
-                attn_kwargs["cu_seqlens_q_padded"] = q_padded
-            if kv_padded is not None:
-                attn_kwargs["cu_seqlens_kv_padded"] = kv_padded
-            if q_padded is not None or kv_padded is not None:
-                pad_between_seqs = kwargs.get("pad_between_seqs")
-                if pad_between_seqs is None:
-                    pad_between_seqs = (q_padded is not None and not torch.equal(q_padded, kwargs["cu_seqlens_q"])) or (
-                        kv_padded is not None and not torch.equal(kv_padded, kwargs["cu_seqlens_kv"])
-                    )
-                attn_kwargs["pad_between_seqs"] = pad_between_seqs
+            if "cu_seqlens_q_padded" in kwargs:
+                attn_kwargs.update(
+                    {
+                        "cu_seqlens_q_padded": kwargs["cu_seqlens_q_padded"],
+                        "pad_between_seqs": True,
+                    }
+                )
+            if "cu_seqlens_kv_padded" in kwargs:
+                attn_kwargs["cu_seqlens_kv_padded"] = kwargs["cu_seqlens_kv_padded"]
             if "max_seqlen_q" in kwargs:
                 attn_kwargs["max_seqlen_q"] = kwargs["max_seqlen_q"]
             if "max_seqlen_kv" in kwargs:

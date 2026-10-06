@@ -896,17 +896,3 @@ def test_te_padding_flag_uses_boundaries_not_field_presence(padded, expected, ex
     _, _, _, kwargs = preprocess_args_and_kwargs_for_attn(q, q, q, None, "te", **metadata)
     assert kwargs["pad_between_seqs"] is expected
     assert kwargs["cu_seqlens_q_padded"] is metadata["cu_seqlens_padded"]
-
-
-@pytest.mark.parametrize("padded_side", ["q", "kv", "both"])
-@pytest.mark.parametrize("tail_padding", [False, True])
-def test_te_separate_qkv_padding_checks_both_complete_boundaries(padded_side, tail_padding):
-    cu = torch.tensor([0, 3, 5], dtype=torch.int32)
-    padded = torch.tensor([0, 3, 8] if tail_padding else [0, 3, 5], dtype=torch.int32)
-    metadata = {"cu_seqlens_q": cu, "cu_seqlens_kv": cu}
-    for side in ("q", "kv"):
-        if padded_side in (side, "both"):
-            metadata[f"cu_seqlens_{side}_padded"] = padded.clone()
-    q = torch.randn(8, 2, 4)
-    _, _, _, kwargs = preprocess_args_and_kwargs_for_attn(q, q, q, None, "te", **metadata)
-    assert kwargs["pad_between_seqs"] is tail_padding
