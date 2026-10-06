@@ -268,7 +268,7 @@ The following table describes the key configuration fields for DFlash fine-tunin
 
 | Field | Description |
 |-------|-------------|
-| `dflash.target_model_id` | Hub ID of the frozen causal LM that conditions the draft |
+| `dflash.target_model_id` | Hub ID of the frozen causal LM that conditions the draft. |
 | `dflash.block_size` | Tokens per draft block. `0` reads from the draft model config. |
 | `dflash.loss_decay_gamma` | Decay γ for Equation 4. `0` uses paper defaults (7, 5, and 4 for block sizes 16, 10, and 8). |
 | `dflash.num_blocks_per_sample` | Number of anchor blocks processed per sequence per step (paper default: 512, Appendix A.1). |
