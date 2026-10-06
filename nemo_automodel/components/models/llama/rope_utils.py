@@ -66,8 +66,8 @@ def apply_rotary_pos_emb(
     """
     q_dtype, k_dtype = q.dtype, k.dtype
     q, k = q.float(), k.float()
-    cos = cos.float().unsqueeze(1)
-    sin = sin.float().unsqueeze(1)
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed.to(q_dtype), k_embed.to(k_dtype)
