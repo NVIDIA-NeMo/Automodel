@@ -446,7 +446,7 @@ def test_build_diffusion_mesh_context_uses_shared_fsdp_defaults():
     assert strategy_config.enable_fsdp2_prefetch is True
     assert strategy_config.mp_policy.param_dtype == torch.float16
     assert strategy_config.mp_policy.reduce_dtype == torch.float32
-    assert strategy_config.mp_policy.output_dtype == torch.float16
+    assert strategy_config.mp_policy.output_dtype is None
 
 
 def test_build_diffusion_mesh_context_keeps_lora_param_dtype_uncast():
@@ -461,7 +461,7 @@ def test_build_diffusion_mesh_context_keeps_lora_param_dtype_uncast():
 
     policy = build_mesh.call_args.kwargs["strategy_config"].mp_policy
     assert policy.param_dtype is None
-    assert policy.output_dtype == torch.bfloat16
+    assert policy.output_dtype is None
 
 
 def test_build_diffusion_mesh_context_parses_ddp_config():

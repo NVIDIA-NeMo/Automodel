@@ -197,10 +197,14 @@ mlflow = [
     # Avoids the mlflow vs mlflow-skinny mutual-exclusion conflict that breaks
     # environments using sagemaker-mlflow, kedro-mlflow, and managed ML platforms.
     "mlflow-skinny>=3.16.1",
+    # MLflow's default local SQLite store needs both the SQL backend and migrations.
+    # Match the bounds in full MLflow while keeping its server/UI stack optional.
+    "sqlalchemy>=1.4.0,<3",
+    "alembic!=1.10.0,<2",
 ]
 mlflow-full = [
     # Full mlflow stack: tracking server, UI, SQL backend, pyarrow, etc.
-    # Use when you need the MLflow UI or sql:// artifact stores.
+    # Use when you need the MLflow server or UI.
     "mlflow>=3.16.1",
 ]
 wandb = ["wandb>=0.30.0"]
@@ -288,10 +292,13 @@ no-build-isolation-package = [
     "transformer-engine-torch",
 ]
 constraint-dependencies = [
+    "accelerate>=1.15.0", # Security floor requested by AUT-2490
+    "click>=8.3.3", # Security floor requested by AUT-2490
     "anyio>=4.14.2", # Security floor requested by AUT-2465
     "aiohttp>=3.14.3", # Address aiohttp security fixes through CVE-2026-69244
-    "cryptography>=48.0.1", # Address CVE GHSA-537c-gmf6-5ccf
+    "cryptography>=50.0.0", # Security floor requested by AUT-2490
     "diffusers>=0.38.0",
+    "fsspec>=2026.6.0", # Security floor requested by AUT-2490
     "gitpython>=3.1.60",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "mako>=1.3.11",

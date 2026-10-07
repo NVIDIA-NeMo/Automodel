@@ -78,7 +78,7 @@ export TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 srun --export=ALL \
-     --container-image=/path/to/automodel.sqsh \
+     --container-image=/path/to/automodel26.10.image.sqsh \
      --container-mounts=/path/to/Automodel:/workspace/Automodel,/path/to/data:/data \
      --container-workdir=/workspace/Automodel \
      --no-container-mount-home bash -c '

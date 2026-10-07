@@ -1044,6 +1044,9 @@ class DeepseekV4Model(nn.Module):
         return h
 
     def update_moe_gate_bias(self) -> None:
+        """Update routing biases only when enabled by the model's MoE configuration."""
+        if not self.moe_config.train_gate or self.moe_config.gate_bias_update_factor <= 0:
+            return
         with torch.no_grad():
             for block in self.layers.values():
                 if isinstance(block.mlp, MoE):

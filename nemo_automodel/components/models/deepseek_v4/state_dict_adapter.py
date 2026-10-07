@@ -197,6 +197,11 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
 # Routed-expert pattern in HF V4 format
 _EXPERT_PATTERN = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w1|w2|w3)\.weight$")
 
+# Base weights use DeepSeek's serialized names, which Transformers converts on
+# load. PEFT attaches directly to the constructed HF model and needs its names.
+_PEFT_MODULES_TO_HF = {"wq_a": "q_a_proj", "wq_b": "q_b_proj", "wkv": "kv_proj", "wo_b": "o_b_proj"}
+_PEFT_MODULES_FROM_HF = {hf: native for native, hf in _PEFT_MODULES_TO_HF.items()}
+
 
 class _HashBiasScope(enum.Enum):
     """Key-format scope for :meth:`DeepSeekV4StateDictAdapter._drop_hash_layer_gate_bias`."""
@@ -275,6 +280,18 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
           3. Aggregate per-expert routed weights into stacked tensors.
           4. Rename keys using the HF -> internal mapping table.
           5. Re-prefix MTP keys: ``model.layers.{k}.*`` -> ``mtp.layers.{k}.*``.
+
+        Args:
+            hf_state_dict: Checkpoint tensor mapping. Linear weights have shape [out, in]; routed experts are
+                per-expert [out, in] (FP4 packs two input values per byte). LoRA A/B tensors have shapes
+                [rank, in] and [out, rank]. Other parameters retain their model-defined shapes and axis order.
+            device_mesh: Optional expert-parallel mesh used to select and shard the expert axis.
+            **kwargs: Additional checkpoint-loader options.
+
+        Returns:
+            Native tensor mapping. Expert weights become [experts, hidden, 2 * intermediate] (gate then up)
+            and [experts, intermediate, hidden]. LoRA tensors retain their shape, dtype, device and storage;
+            only their module names change. Legacy AutoModel-named adapters remain accepted.
         """
         N = self.config.num_hidden_layers
         num_mtp = int(getattr(self.config, "num_nextn_predict_layers", 0) or 0)
@@ -294,6 +311,9 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         native_mtp_re = re.compile(r"^mtp\.(\d+)\.")
         for key in list(hf_state_dict.keys()):
             val = hf_state_dict[key]
+            if ".lora_" in key:
+                backbone_hf[".".join(_PEFT_MODULES_FROM_HF.get(part, part) for part in key.split("."))] = val
+                continue
             native_m = native_mtp_re.match(key)
             if native_m is not None:
                 mtp_depth = int(native_m.group(1))
@@ -727,7 +747,39 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 return new_key
         return key
 
+    def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
+        """Name LoRA targets in the native Transformers DeepSeek V4 model.
+
+        Args:
+            name: Native module path or leaf name, including compressor/indexer projections.
+            v4_compatible: Export compatibility selection; both use the same attention module names.
+
+        Returns:
+            HF module path with the original outer namespace preserved.
+        """
+        return ".".join(_PEFT_MODULES_TO_HF.get(part, part) for part in name.split("."))
+
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Export one base-model or LoRA tensor to its receiving checkpoint layout.
+
+        Args:
+            fqn: Native parameter name, optionally under the PEFT ``base_model.model.`` prefix.
+            tensor: LoRA A/B tensor of shape [rank, in] / [out, rank], linear weight [out, in], grouped
+                gate/up weight [experts, hidden, 2 * intermediate], or down weight [experts, intermediate,
+                hidden]. Other parameters have arbitrary model-defined shapes. Expert DTensors shard the
+                expert axis; non-expert tensors retain their placement.
+            **kwargs: Existing export options, including exclusion regex and base-weight quantization.
+
+        Returns:
+            Named tensors. LoRA tensors alias the input without layout/dtype changes and use HF runtime names.
+            Base experts split to per-expert [out, in] tensors; other base weights retain the original DeepSeek
+            checkpoint names/layouts. Quantized experts pack the input axis and emit per-block scales.
+        """
+        if ".lora_" in fqn:
+            hf_key = self.map_peft_target_module_to_hf(fqn)
+            exclude_key_regex = kwargs.get("exclude_key_regex")
+            return [] if exclude_key_regex and re.match(exclude_key_regex, hf_key) else [(hf_key, tensor)]
+
         # MTP keys (``mtp.layers.{k}.*``) share the same per-block layout as
         # backbone layers, but current DSV4-Flash stores them under native
         # ``mtp.{k}.*`` keys.  Rewrite to an equivalent temporary
