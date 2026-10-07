@@ -17,8 +17,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import InitVar, dataclass, field
 
 import torch
 
@@ -85,13 +85,24 @@ class DomainMixtureConfig:
         if sum(domain.objective_weight for domain in self.domains) <= 0:
             raise ValueError("domain_mixture objective weights must have a positive sum")
 
-    def build(self) -> "DomainMixture":
-        """Build the immutable runtime domain-mixture objective."""
+    def build(self, *, blend: tuple[Sequence[str], Sequence[float]] | None = None) -> "DomainMixture":
+        """Build the immutable runtime domain-mixture objective.
+
+        Args:
+            blend: Parsed training corpus prefixes and explicit sampling weights,
+                in dataset ID order. When provided, construction validates the
+                declared domain bindings against this blend. Omit for standalone
+                objective calculations.
+
+        Returns:
+            The domain-mixture objective with validated bindings when supplied.
+        """
         sampling_total = sum(domain.sampling_weight for domain in self.domains)
         objective_total = sum(domain.objective_weight for domain in self.domains)
         sampling_weights = tuple(domain.sampling_weight / sampling_total for domain in self.domains)
         objective_weights = tuple(domain.objective_weight / objective_total for domain in self.domains)
         return DomainMixture(
+            blend=blend,
             names=tuple(domain.name for domain in self.domains),
             paths=tuple(domain.path.strip() if domain.path is not None else None for domain in self.domains),
             sampling_weights=sampling_weights,
@@ -120,9 +131,40 @@ class DomainMixture:
     #: Corpus prefixes in dataset_id order; None means the binding is undeclared.
     #: Keyword-only to preserve the positional constructor for standalone users.
     paths: tuple[str | None, ...] = field(default=(), kw_only=True)
+    #: Construction-only validation input; not retained as runtime state.
+    blend: InitVar[tuple[Sequence[str], Sequence[float]] | None] = field(default=None, kw_only=True)
     #: Per-device cache of ``loss_multipliers``. Excluded from eq/hash so the
     #: dataclass stays frozen-comparable; mutated in place, never rebound.
     _multiplier_cache: dict = field(default_factory=dict, compare=False, repr=False)
+
+    def __post_init__(self, blend: tuple[Sequence[str], Sequence[float]] | None) -> None:
+        if blend is None:
+            return
+        blend_paths, blend_weights = blend
+        if len(self.paths) != len(self.names) or any(path is None for path in self.paths):
+            raise ValueError(
+                "domain_mixture requires a path for every domain; set each domains[i].path to the "
+                "corresponding corpus prefix in dataset.paths (or dataset.paths.train). "
+                "Sampling weights alone cannot verify domain order when weights are equal."
+            )
+        if tuple(blend_paths) != self.paths:
+            raise ValueError(
+                "domain_mixture paths must match the corpus prefixes in dataset.paths in the same order; "
+                f"got dataset paths {tuple(blend_paths)} and domain bindings "
+                f"{tuple(zip(self.names, self.paths))}"
+            )
+        blend_total = sum(blend_weights)
+        if blend_total <= 0:
+            raise ValueError(f"dataset.paths blend weights must have a positive sum, got {blend_weights}")
+        normalized = tuple(weight / blend_total for weight in blend_weights)
+        if len(normalized) != len(self.sampling_weights) or any(
+            not math.isclose(actual, declared, rel_tol=1.0e-6, abs_tol=1.0e-8)
+            for actual, declared in zip(normalized, self.sampling_weights)
+        ):
+            raise ValueError(
+                "domain_mixture sampling weights must match the explicit weights in dataset.paths; "
+                f"got dataset weights {normalized} and domain_mixture weights {self.sampling_weights}"
+            )
 
     def _multiplier_tensor(self, device: torch.device) -> torch.Tensor:
         """Return the multiplier vector on ``device``, building it at most once.

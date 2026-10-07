@@ -28,7 +28,6 @@ except ImportError:
 import gc
 import inspect
 import logging
-import math
 import pathlib
 import time
 from contextlib import nullcontext
@@ -229,14 +228,14 @@ def _supports_loss_weights(loss_fn: nn.Module) -> bool:
     return any(parameter.name == "loss_weights" for parameter in parameters)
 
 
-def _validate_domain_sampling_weights(domain_mixture, dataloader_config: DataloaderConfig) -> None:
-    """Check explicit Megatron corpus bindings and weights against the objective."""
+def _get_domain_mixture_blend(dataloader_config: DataloaderConfig) -> tuple[list[str], list[float]]:
+    """Extract the explicit Megatron training blend for domain-mixture construction."""
     from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
 
     dataset_config = dataloader_config.dataset_config
     if not isinstance(dataset_config, MegatronPretrainingConfig):
         raise ValueError("domain_mixture currently requires a MegatronPretraining dataset")
-    paths = getattr(dataset_config, "paths", None)
+    paths = dataset_config.paths
     if isinstance(paths, dict):
         paths = paths.get("train")
     if not isinstance(paths, (list, tuple)):
@@ -247,30 +246,7 @@ def _validate_domain_sampling_weights(domain_mixture, dataloader_config: Dataloa
     blend_paths, blend_weights = get_blend_from_list(list(paths))
     if blend_weights is None:
         raise ValueError("domain_mixture requires explicit sampling weights in dataset.paths")
-    if len(domain_mixture.paths) != len(domain_mixture.names) or any(path is None for path in domain_mixture.paths):
-        raise ValueError(
-            "domain_mixture requires a path for every domain; set each domains[i].path to the "
-            "corresponding corpus prefix in dataset.paths (or dataset.paths.train). "
-            "Sampling weights alone cannot verify domain order when weights are equal."
-        )
-    if tuple(blend_paths) != domain_mixture.paths:
-        raise ValueError(
-            "domain_mixture paths must match the corpus prefixes in dataset.paths in the same order; "
-            f"got dataset paths {tuple(blend_paths)} and domain bindings "
-            f"{tuple(zip(domain_mixture.names, domain_mixture.paths))}"
-        )
-    blend_total = sum(blend_weights)
-    if blend_total <= 0:
-        raise ValueError(f"dataset.paths blend weights must have a positive sum, got {blend_weights}")
-    normalized = tuple(weight / blend_total for weight in blend_weights)
-    if len(normalized) != len(domain_mixture.sampling_weights) or any(
-        not math.isclose(actual, declared, rel_tol=1.0e-6, abs_tol=1.0e-8)
-        for actual, declared in zip(normalized, domain_mixture.sampling_weights)
-    ):
-        raise ValueError(
-            "domain_mixture sampling weights must match the explicit weights in dataset.paths; "
-            f"got dataset weights {normalized} and domain_mixture weights {domain_mixture.sampling_weights}"
-        )
+    return blend_paths, blend_weights
 
 
 def build_model(
@@ -640,8 +616,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Build loss_fn (will be set on pipeline_config if PP enabled)
         self.loss_fn = self.cfg.loss_fn.build()
         domain_mixture_config = self.cfg.domain_mixture
-        self.domain_mixture = domain_mixture_config.build() if domain_mixture_config is not None else None
-        if self.domain_mixture is not None:
+        self.domain_mixture = None
+        if domain_mixture_config is not None:
             if self.pp_enabled:
                 raise ValueError(
                     "domain_mixture does not currently support pipeline parallelism because the pipeline "
@@ -684,7 +660,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 raise ValueError(
                     f"domain_mixture requires a loss function with explicit reduction='sum'; got {reduction!r}"
                 )
-            _validate_domain_sampling_weights(self.domain_mixture, self.cfg.dataloader)
+            self.domain_mixture = domain_mixture_config.build(blend=_get_domain_mixture_blend(self.cfg.dataloader))
         if self.magi.hf_dispatch and isinstance(self.loss_fn, LinearCrossEntropy):  # pragma: no cover
             raise ValueError(
                 "The magi HF backend needs full logits and is incompatible with "

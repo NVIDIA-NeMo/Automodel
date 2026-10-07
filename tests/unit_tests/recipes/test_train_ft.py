@@ -48,9 +48,9 @@ from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callab
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_pp_collate_wrapper,
+    _get_domain_mixture_blend,
     _should_pack_validation,
     _supports_loss_weights,
-    _validate_domain_sampling_weights,
     build_model,
     compute_trust_remote_code_from_model,
 )
@@ -337,19 +337,19 @@ def test_domain_mixture_sampling_weights_match_megatron_blend():
     from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
     from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
 
-    mixture = DomainMixtureConfig(
+    mixture_config = DomainMixtureConfig(
         domains=(
             DomainWeightConfig(name="web", sampling_weight=0.75, objective_weight=0.5, path="/data/web"),
             DomainWeightConfig(name="code", sampling_weight=0.25, objective_weight=0.5, path="/data/code"),
         )
-    ).build()
+    )
     dataloader = DataloaderConfig(dataset_config=MegatronPretrainingConfig(paths=["3", "/data/web", "1", "/data/code"]))
 
-    _validate_domain_sampling_weights(mixture, dataloader)
+    mixture_config.build(blend=_get_domain_mixture_blend(dataloader))
 
     mismatched = DataloaderConfig(dataset_config=MegatronPretrainingConfig(paths=["1", "/data/web", "1", "/data/code"]))
     with pytest.raises(ValueError, match="sampling weights must match"):
-        _validate_domain_sampling_weights(mixture, mismatched)
+        mixture_config.build(blend=_get_domain_mixture_blend(mismatched))
 
 
 def test_validation_dataloaders_no_validation_keys():
@@ -3188,21 +3188,21 @@ def test_domain_mixture_order_validation_does_not_infer_names_from_paths():
     from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
     from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
 
-    mixture = DomainMixtureConfig(
+    mixture_config = DomainMixtureConfig(
         domains=(
             DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.5, path="/data/python/train"),
             DomainWeightConfig(
                 name="web", sampling_weight=0.5, objective_weight=0.5, path="/data/web/encoded_text_document"
             ),
         )
-    ).build()
+    )
     dataloader = DataloaderConfig(
         dataset_config=MegatronPretrainingConfig(
             paths=["1", "/data/python/train", "1", "/data/web/encoded_text_document"]
         )
     )
 
-    _validate_domain_sampling_weights(mixture, dataloader)
+    mixture_config.build(blend=_get_domain_mixture_blend(dataloader))
 
 
 @pytest.mark.parametrize("split_paths", [False, True])
@@ -3223,8 +3223,8 @@ def test_domain_mixture_rejects_swapped_corpora_with_equal_sampling_weights(spli
         paths = {"train": paths, "validation": ["/data/held_out"]}
     dataloader = DataloaderConfig(dataset_config=MegatronPretrainingConfig(paths=paths))
 
-    mixture = DomainMixtureConfig(domains=tuple(domains)).build()
-    _validate_domain_sampling_weights(mixture, dataloader)
+    blend = _get_domain_mixture_blend(dataloader)
+    mixture = DomainMixtureConfig(domains=tuple(domains)).build(blend=blend)
     if num_domains == 2:
         # Training's positional IDs and validation's names refer to the same objective.
         labels = torch.tensor([[1, 2], [3, 4]])
@@ -3234,9 +3234,8 @@ def test_domain_mixture_rejects_swapped_corpora_with_equal_sampling_weights(spli
         assert mixture.weighted_validation_loss({"web": 2.0, "code": 4.0}) == pytest.approx(3.5)
 
     domains[0], domains[1] = domains[1], domains[0]
-    swapped = DomainMixtureConfig(domains=tuple(domains)).build()
     with pytest.raises(ValueError, match="paths must match.*same order") as exc:
-        _validate_domain_sampling_weights(swapped, dataloader)
+        DomainMixtureConfig(domains=tuple(domains)).build(blend=blend)
     assert "('code', '/data/code')" in str(exc.value)
     assert "('/data/web', '/data/code'" in str(exc.value)
 
@@ -3245,22 +3244,22 @@ def test_domain_mixture_compares_exact_prefixes_after_trimming_whitespace():
     from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
     from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
 
-    mixture = DomainMixtureConfig(
+    mixture_config = DomainMixtureConfig(
         domains=(
             DomainWeightConfig(name="web", sampling_weight=1, objective_weight=1, path=" /data/web "),
             DomainWeightConfig(name="code", sampling_weight=1, objective_weight=3, path="/data/code"),
         )
-    ).build()
+    )
     dataloader = DataloaderConfig(
         dataset_config=MegatronPretrainingConfig(paths=["1", "/data/web", "1", " /data/code "])
     )
-    _validate_domain_sampling_weights(mixture, dataloader)
+    mixture_config.build(blend=_get_domain_mixture_blend(dataloader))
 
     mismatched = DataloaderConfig(
         dataset_config=MegatronPretrainingConfig(paths=["1", "/data/web-other", "1", "/data/code"])
     )
     with pytest.raises(ValueError, match="paths must match.*same order"):
-        _validate_domain_sampling_weights(mixture, mismatched)
+        mixture_config.build(blend=_get_domain_mixture_blend(mismatched))
 
 
 _DOMAIN_MIXTURE_EXAMPLE = Path(__file__).parents[3] / "examples/llm_pretrain/megatron_pretrain_gpt2_domain_mixture.yaml"
