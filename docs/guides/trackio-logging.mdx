@@ -53,7 +53,7 @@ Any other key in the `trackio` section is passed to `trackio.init()` unchanged. 
 | `private` | Make a newly created Space private. |
 | `server_url` | Log to a self-hosted Trackio server instead of a local store or Space. |
 | `bucket_id` | Hugging Face Bucket used to persist a Space's metrics. |
-| `auto_log_gpu` | Log GPU utilization and memory in the background. Defaults to on when an NVIDIA GPU is detected. |
+| `auto_log_gpu` | Log GPU utilization, memory, power and temperature in the background. Defaults to on when an NVIDIA GPU is detected (the `trackio` extra installs `nvidia-ml-py` for this). |
 
 ### Storage Location
 

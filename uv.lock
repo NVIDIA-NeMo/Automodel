@@ -4238,7 +4238,7 @@ all = [
     { name = "torchvision", version = "0.25.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "torchvision", version = "0.25.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
     { name = "torchvision", version = "0.25.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
-    { name = "trackio" },
+    { name = "trackio", extra = ["gpu"] },
     { name = "transformer-engine", extra = ["pytorch"] },
     { name = "wandb" },
 ]
@@ -4345,11 +4345,11 @@ tracking = [
     { name = "alembic" },
     { name = "mlflow-skinny" },
     { name = "sqlalchemy" },
-    { name = "trackio" },
+    { name = "trackio", extra = ["gpu"] },
     { name = "wandb" },
 ]
 trackio = [
-    { name = "trackio" },
+    { name = "trackio", extra = ["gpu"] },
 ]
 vlm = [
     { name = "backoff" },
@@ -4504,7 +4504,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform == 'darwin' and extra == 'diffusion'", index = "https://pypi.org/simple" },
     { name = "torchvision", marker = "sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "trackio", marker = "extra == 'trackio'", specifier = ">=0.40.0" },
+    { name = "trackio", extras = ["gpu"], marker = "extra == 'trackio'", specifier = ">=0.40.0" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = ">=2.19.0" },
     { name = "transformers", specifier = "==5.15.1" },
     { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.30.0" },
@@ -5222,6 +5222,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ac/32/361e688007812ecc97cf4268204899a5e0a53340a26e2ab3319056c110ef/nvidia_cutlass_dsl_libs_cu13-4.6.2-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:08527435cd555b29044eebf194c51ec973cf0524153e800af020e03d02fdefbd", size = 88036344, upload-time = "2026-08-05T14:32:51.177Z" },
     { url = "https://files.pythonhosted.org/packages/6c/e4/cce5858e72cae8b25addcfa4474d15ad158025e5c52e145b405430a7b4d1/nvidia_cutlass_dsl_libs_cu13-4.6.2-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:b5ec2766b88245ec9ea4d84555b1b9b4c948b9300363fead450a1a1515efbfdf", size = 86722935, upload-time = "2026-08-05T14:37:36.528Z" },
     { url = "https://files.pythonhosted.org/packages/76/ab/b7238f3facfbb070776ff1f8666ede0ad1bdcba22e54e5ac4c816d0fe176/nvidia_cutlass_dsl_libs_cu13-4.6.2-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:b56df8f0565e89025934540038e608298df150c399acccc806c772229b829ace", size = 88048693, upload-time = "2026-08-05T14:38:26.684Z" },
+]
+
+[[package]]
+name = "nvidia-ml-py"
+version = "13.615.71"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/fd/30/b25216758be3d3e2834825d8193609e2d71c770a8bd7984438c058c90268/nvidia_ml_py-13.615.71.tar.gz", hash = "sha256:bebe4e48f51b1dc75028c0815cb7bfa14a31a5bb80be70c9d980c6036953fc3d", size = 57485, upload-time = "2026-09-25T15:15:28.226Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/53/a1/1681dfa1c904d4e3e72e51b55a0ff012d50b766843ef832d584abe2113c6/nvidia_ml_py-13.615.71-py3-none-any.whl", hash = "sha256:959bf4adf6fe1308e4bd739e722236b0d1ec8392e2cefad33ff70c311380b9b6", size = 58132, upload-time = "2026-09-25T15:15:26.54Z" },
 ]
 
 [[package]]
@@ -8951,6 +8960,12 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8f/60/69c8baac61bab8be099d54bc227cc5db845f7f2deaa69a3105e45fbca8c5/trackio-0.40.0-py3-none-any.whl", hash = "sha256:d3815222da697432cd4232f254b5b2b60aaa1e5b87bfff8f41101807b3fe7bc1", size = 3087146, upload-time = "2026-09-30T22:15:30.049Z" },
+]
+
+[package.optional-dependencies]
+gpu = [
+    { name = "nvidia-ml-py" },
+    { name = "psutil" },
 ]
 
 [[package]]

@@ -208,7 +208,7 @@ mlflow-full = [
     "mlflow>=3.16.1",
 ]
 wandb = ["wandb>=0.30.0"]
-trackio = ["trackio>=0.40.0"]
+trackio = ["trackio[gpu]>=0.40.0"]  # [gpu] adds nvidia-ml-py for automatic GPU metrics
 tracking = [
     # Convenience meta-extra: installs the experiment-tracking backends.
     "nemo-automodel[mlflow]",
