@@ -158,7 +158,8 @@ def _run_case(
             expected = (torch.bfloat16,) + (hidden_dtype,) * mtp_depth + ((torch.int32,) if mtp_depth else ())
         else:
             expected = (hidden_dtype,) + (torch.bfloat16,) * mtp_depth
-        assert tuple(t.dtype for t in outputs) == expected
+        actual = tuple(t.dtype for t in outputs)
+        assert actual == expected, f"stage output dtypes {actual}, expected {expected}"
 
     part.register_forward_hook(check_output_dtypes)
     optimizer = torch.optim.SGD(part.parameters(), lr=0.01)

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -160,7 +161,10 @@ class NemotronV3MTPSublayer(NemotronV3Block):
             self.enorm.reset_parameters()
             self.hnorm.reset_parameters()
             with buffer_device:
-                nn.init.normal_(self.eh_proj.weight, mean=0.0, std=init_std)
+                # MTP exists only on the final PP stage. Initialize local
+                # storage without entering DTensor's world-wide RNG collective.
+                weight = self.eh_proj.weight
+                nn.init.normal_(weight.to_local() if isinstance(weight, DTensor) else weight, mean=0.0, std=init_std)
                 if self.eh_proj.bias is not None:
                     nn.init.zeros_(self.eh_proj.bias)
         if self.has_final_norm:

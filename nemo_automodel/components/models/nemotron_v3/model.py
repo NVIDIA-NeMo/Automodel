@@ -18,6 +18,7 @@ from typing import Any, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 from transformers import AutoConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -298,7 +299,14 @@ class NemotronV3Model(nn.Module):
         """
         with buffer_device:
             if getattr(self, "embed_tokens", None) is not None:
-                nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.config.initializer_range)
+                # Only the first PP stage owns embeddings; avoid DTensor RNG's
+                # lazy world-wide broadcast on this subset of ranks.
+                weight = self.embed_tokens.weight
+                nn.init.normal_(
+                    weight.to_local() if isinstance(weight, DTensor) else weight,
+                    mean=0.0,
+                    std=self.config.initializer_range,
+                )
             if getattr(self, "norm", None) is not None:
                 self.norm.reset_parameters()
 
@@ -1252,7 +1260,13 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         with buffer_device:
             self.model.initialize_weights(buffer_device=buffer_device)
             if self.lm_head is not None:
-                nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
+                # Only the final PP stage owns this parameter.
+                weight = self.lm_head.weight
+                nn.init.normal_(
+                    weight.to_local() if isinstance(weight, DTensor) else weight,
+                    mean=0.0,
+                    std=self.config.initializer_range,
+                )
             if self.mtp is not None:
                 for sublayer in self.mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
