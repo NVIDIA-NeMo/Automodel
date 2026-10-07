@@ -23,6 +23,7 @@ import sys
 import time
 import traceback
 from contextlib import suppress
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -129,8 +130,12 @@ def worker_main(directory: Path, *, warmup_moe: bool = False) -> None:
     from tests.functional_tests.parallelism.run_pp_dtype_parity import _run_case
     from tests.functional_tests.parallelism_multigpu.run_recipe import run_recipe_pair_in_process
 
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    # Bind NCCL eagerly so later mesh groups inherit the device and can use
+    # communicator splitting, instead of serial lazy startup inside PP steps.
+    dist.init_process_group("nccl", device_id=device, timeout=timedelta(seconds=60))
     info = initialize_distributed("nccl")
-    device = info.device
     if warmup_moe:
         from nemo_automodel.components.models.common import BackendConfig
         from nemo_automodel.components.moe.megatron.fused_a2a import reset_hybrid_ep_buffer
