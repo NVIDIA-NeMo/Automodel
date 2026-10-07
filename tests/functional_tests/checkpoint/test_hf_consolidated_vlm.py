@@ -430,7 +430,9 @@ def test_consolidated_vlm_checkpoint():
     expected_model_keys, expected_optim_keys = get_test_consolidated_vlm_checkpoint_expected_keys()
 
     script_path = Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "gemma3" / "gemma3_vl_4b_cord_v2.yaml")
+    cfg = parse_args_and_load_config(
+        script_path.parent / "hf_transformer_vlm" / "configs" / "gemma3_vl_4b_cord_v2.yaml"
+    )
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()

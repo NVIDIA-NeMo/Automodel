@@ -1,0 +1,70 @@
+---
+title: "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+description: "Use NeMo AutoModel to fine-tune Wan-AI/Wan2.1-T2V-14B-Diffusers for Diffusion workflows with checked-in text to video recipes and documented distributed settings."
+slug: model-coverage/diffusion/wan-ai/Wan2.1-T2V-14B-Diffusers
+---
+
+[Wan2.1-T2V-14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) has a checked-in NeMo AutoModel recipe for text to video.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and the
+[diffusion setup and data preparation guide](/recipes-e2e-examples/diffusion-fine-tuning).
+Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the recipe,
+then run from the repository root on eight GPUs:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/wan2_1_t2v_flow.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Prepared video cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml) |
+| LoRA Fine-Tuning | Prepared video cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_lora.yaml) |
+
+## Model Context
+
+Wan2.1-T2V-14B-Diffusers is used for text to video. Its model size is 14.29B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text to video |
+| Parameters | 14.29B checkpoint parameters |
+| Transformer Blocks | 40 |
+| Hidden Size | 5,120 |
+| Attention | 40 attention heads |
+| **Architecture** | `WanTransformer3DModel` |
+
+### Configuration
+
+The following settings describe the checked-in recipes and Quick Start.
+Both recipes use data parallel size 8 (DP8). Low-rank adaptation (LoRA) trains
+adapters with rank 64 and requires Transformer Engine for its configured optimizer.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | GPU model and memory are not specified in these recipes. |
+| Strategy | Fully Sharded Data Parallel v2 (FSDP2); `dp_size: 8`, `dp_replicate_size: 1`; tensor, context, and pipeline parallel sizes are 1. |
+| Nodes | The Quick Start launches on one node with eight GPUs. |
+| Features | Checkpoint saving and compilation enabled; activation checkpointing disabled. |
+| Advanced | Full fine-tuning: `float32` model storage and `bfloat16` compute. LoRA: `bfloat16` base weights and compute by default. Both recipes use `bfloat16` gradient reduction. |
+
+### More Recipes for This Model
+
+- [`wan2_1_t2v_flow_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_lora.yaml)
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Wan-AI/Wan2.1-T2V-14B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Diffusion fine-tuning guide](/recipes-e2e-examples/diffusion-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers/blob/38ec498cb3208fb688890f8cc7e94ede2cbd7f68/transformer/config.json)

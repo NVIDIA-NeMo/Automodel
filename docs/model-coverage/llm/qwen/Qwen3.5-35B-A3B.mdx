@@ -1,0 +1,87 @@
+---
+title: "Qwen/Qwen3.5-35B-A3B"
+description: "Fine-tune Qwen/Qwen3.5-35B-A3B on MedPix-VQA or benchmark text training with NeMo AutoModel recipes and documented distributed settings."
+slug: model-coverage/large-language-models/qwen/Qwen3.5-35B-A3B
+---
+
+[Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) has NeMo AutoModel recipes for vision-language fine-tuning and text training benchmarks.
+The Hugging Face configuration declares the `Qwen3_5MoeForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and complete [Recipe Setup](#recipe-setup). From the repository root, run the MedPix-VQA vision-language fine-tuning example on one node with 8 GPUs:
+
+```bash
+uv run automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b_neat_packing.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; PP2; EP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b_neat_packing.yaml) |
+| LoRA Training Benchmark | Synthetic data; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3.5_moe_lora.yaml) |
+| Training Benchmark | Synthetic data; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3.5_moe_te_deepep.yaml) |
+
+## Model Context
+
+Qwen3.5-35B-A3B combines a vision encoder with a mixture-of-experts text decoder. The decoder alternates three Gated DeltaNet layers with one full-attention layer. The published checkpoint contains 35.95B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Vision-language fine-tuning and text training benchmarks |
+| **Architecture** | `Qwen3_5MoeForConditionalGeneration` |
+| Parameters | 35.95B checkpoint parameters |
+| Decoder Layers | 40 |
+| Hidden Size | 2,048 |
+| Attention | Full attention: 16 query heads and 2 key-value heads; linear attention: 16 query/key heads and 32 value heads |
+| Context Length | 262,144 tokens (checkpoint configuration); Quick Start packs sequences to 2,048 tokens |
+| Vocabulary Size | 248,320 |
+| Experts | 256 routed experts; 8 routed experts and 1 shared expert active per token |
+
+### Configuration
+
+These settings describe the Quick Start recipe. PP and EP denote pipeline parallelism and expert parallelism, respectively.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs in the example launch; GPU model unspecified |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=2`, `cp_size=1`, `ep_size=4` |
+| Nodes | 1 |
+| Features | Sequence packing, frozen vision tower, DeepEP |
+| Advanced | `attn=sdpa`, `linear=torch`, `experts=torch_mm`, `dispatcher=deepep`; `attn_implementation=flash_attention_2` |
+
+### More Recipes for This Model
+
+- [`qwen3.5_moe_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3.5_moe_te_deepep.yaml)
+- [`qwen3.5_moe_te_deepep_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3.5_moe_te_deepep_lora.yaml)
+
+### Setup and Additional Examples
+
+The text benchmarks initialize fresh weights from the model configuration (`from_config`), use synthetic data, and disable checkpoint saving. They use FSDP2 with `ep_size=8`, activation checkpointing, Transformer Engine, and DeepEP. The LoRA variants add low-rank adaptation. After [Recipe Setup](#recipe-setup), run the LoRA benchmark from the repository root:
+
+```bash
+uv run automodel examples/llm_benchmark/qwen/qwen3.5_moe_lora.yaml --nproc-per-node 8
+```
+
+### Recipe Setup
+
+Select the `vlm`, `moe`, and `fa` extras when following the [installation instructions](/get-started/installation). These supply the VLM dependencies, DeepEP, Flash Linear Attention, Transformer Engine, and FlashAttention 2 used by these recipes. The base package and `all` extra omit DeepEP and FlashAttention 2. The Quick Start recipe requires Transformers 5.3.0 or newer.
+
+The Quick Start loads pretrained weights from `Qwen/Qwen3.5-35B-A3B` and the `train` and `validation` splits of `mmoukouba/MedPix-VQA` from Hugging Face. Ensure both repositories are accessible from the training environment.
+
+### Workflow Notes
+
+The Quick Start sets `checkpoint.enabled: false`, so it does not save fine-tuned weights. To retain training results, enable checkpoint saving and set `checkpoint.checkpoint_dir` to a writable location before launching.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3.5-35B-A3B`](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | Pretrained weights for vision-language fine-tuning; configuration for text benchmarks |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/59d61f3ce65a6d9863b86d2e96597125219dc754/config.json)

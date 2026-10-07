@@ -1,0 +1,56 @@
+---
+title: "mistralai/Devstral-2-123B-Instruct-2512"
+description: "Fine-tune mistralai/Devstral-2-123B-Instruct-2512 for text generation with NeMo AutoModel using the checked-in single-node tensor-parallel LoRA recipe."
+slug: model-coverage/vision-language-models/mistralai/Devstral-2-123B-Instruct-2512
+---
+
+[Devstral-2-123B-Instruct-2512](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) is a text-only, code-focused checkpoint from Mistral AI. NeMo AutoModel includes a LoRA fine-tuning recipe for the checkpoint.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+From the repository root, run the recipe's example topology: one node with eight H100 80 GB GPUs.
+
+```bash
+uv run automodel examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml \
+  --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; 1 node; TP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml) |
+
+## Model Context
+
+Devstral-2-123B-Instruct-2512 is used for text generation. Its model size is 125.03B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `Ministral3ForCausalLM` |
+| Strategy | FSDP2 with tensor parallelism 8 and LoRA |
+| Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
+| Parameters | 125.03B checkpoint parameters |
+| Decoder Layers | 88 |
+| Hidden Size | 12,288 |
+| Attention | 96 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
+The recipe loads the pretrained checkpoint's FP8 weights and dequantizes each shard to BF16 for LoRA fine-tuning.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512/blob/1613bf01adb5e1c6fdc196b46e6b173eae75eb4a/config.json)

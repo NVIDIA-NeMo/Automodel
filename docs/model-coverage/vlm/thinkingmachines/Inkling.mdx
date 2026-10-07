@@ -1,0 +1,77 @@
+---
+title: "thinkingmachines/Inkling"
+description: "Fine-tune thinkingmachines/Inkling vision-language checkpoints with NeMo AutoModel using checked-in multi-node recipes with expert and pipeline parallelism."
+slug: model-coverage/vision-language-models/thinkingmachines/Inkling
+---
+
+[Inkling](https://huggingface.co/thinkingmachines/Inkling) is a multimodal Mixture-of-Experts model family from Thinking Machines Lab. The models accept text, image, video, and audio inputs and generate text. NeMo AutoModel supports both the 975B Inkling checkpoint and the 276B [Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small) checkpoint.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and complete [Recipe Setup](#recipe-setup). From the repository root, fine-tune Inkling on MedPix-VQA using the recipe's topology of 32 nodes with 8 GPUs each. Run on every node with a unique `NODE_RANK` from 0 to 31 and a shared `MASTER_ADDR` pointing to node 0.
+
+```bash
+uv run --extra vlm torchrun --nnodes 32 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/inkling/inkling_medpix.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 32 nodes; PP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml) |
+| Vision-Language Fine-Tuning (Inkling-Small) | MedPix-VQA; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml) |
+
+## Model Context
+
+The Inkling family supports image-text-to-text and audio-text-to-text tasks. The decoder dimensions below describe the full Inkling checkpoint.
+
+| Property | Value |
+|---|---|
+| **Task** | Image-Text-to-Text and Audio-Text-to-Text |
+| **Architecture** | `InklingForConditionalGeneration` |
+| **Parameters** | Inkling: 975B total / 41B active; Inkling-Small: 276B total / 12B active |
+| **Precision** | BF16 |
+| **HF Org** | [thinkingmachines](https://huggingface.co/thinkingmachines) |
+| Decoder Layers | 66 |
+| Hidden Size | 6,144 |
+| Attention | 64 attention heads; 16 local and 8 global key-value heads |
+| Vocabulary Size | 201,024 |
+| Experts | 256 routed / 2 shared / 6 selected per token |
+
+### Architecture
+
+Inkling uses a 66-layer decoder with hybrid local and global attention. Inkling-Small uses the same model family with 42 decoder layers and hidden size 4096. Local attention uses a 512-token sliding window, and every sixth layer uses global attention. Full Inkling uses 16 key-value heads in local layers and 8 in global layers. Both variants use short convolutions with kernel size four.
+
+Each sparse feed-forward layer routes a token to 6 of 256 experts and also evaluates 2 shared experts. Image inputs use a hierarchical patch encoder, while audio uses discrete dMel tokens. NeMo AutoModel's native Inkling processor does not accept video inputs.
+
+NeMo AutoModel retains the checkpoint's fused expert layout and supports expert parallelism for both variants. The full Inkling recipe also uses pipeline parallelism.
+
+### Recipe Notes
+
+Both recipes require a multi-node launch. Adjust the data and parallel dimensions to the available cluster before running a recipe.
+
+Both recipes load pretrained weights and fine-tune the language model on MedPix-VQA while freezing the vision and audio towers. Both set `checkpoint.enabled: false`, so they do not save fine-tuned weights. Enable checkpoint saving and choose an output directory before training if you need to retain the result.
+
+The Inkling-Small EP64 recipe completed 100 training steps on 64 H100 GPUs with microbatch size 1, global batch size 64, and 512-token MedPix samples. It uses FSDP2, activation checkpointing, HybridEP dispatch, and no context or pipeline parallelism.
+
+### Recipe Setup
+
+Install the `vlm` extra for both recipes. Inkling-Small also requires HybridEP from the repository-pinned `deep_ep` package, provided by the `moe` extra. Build it for your GPUs with multinode support (`HYBRID_EP_MULTINODE=1`); the [repository Dockerfile](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile) documents the CUDA and RDMA build dependencies and GPU architecture settings. The standard `all` extra does not include `moe`.
+
+Make the repository, checkpoint cache, and MedPix-VQA dataset available on every node. Review the batch and parallelism settings in [Choose a Workflow](#choose-a-workflow) before changing the example topology. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Inkling BF16 | [`thinkingmachines/Inkling`](https://huggingface.co/thinkingmachines/Inkling) |
+| Inkling-Small | [`thinkingmachines/Inkling-Small`](https://huggingface.co/thinkingmachines/Inkling-Small) |
+
+## Related Resources
+
+- [thinkingmachines/Inkling](https://huggingface.co/thinkingmachines/Inkling)
+- [thinkingmachines/Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small)
+
+- [Checkpoint Configuration](https://huggingface.co/thinkingmachines/Inkling/blob/828496eeae4c243ff1a22f7f28ff83694f2f7bc9/config.json)

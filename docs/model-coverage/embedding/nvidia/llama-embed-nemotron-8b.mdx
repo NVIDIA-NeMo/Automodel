@@ -1,0 +1,116 @@
+---
+title: "nvidia/llama-embed-nemotron-8b"
+description: "Use nvidia/llama-embed-nemotron-8b with NeMo AutoModel for embedding training, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/embedding-models/nvidia/llama-embed-nemotron-8b
+---
+
+NeMo AutoModel provides a retrieval variant of [Meta's Llama](https://www.llama.com/) for embedding and dense retrieval tasks. It defaults to **bidirectional attention**, so each token can attend to both past and future tokens in the sequence, and can also preserve or explicitly select standard causal attention.
+
+For the cross-encoder variant, see [Llama (Bidirectional) for Reranking](/model-coverage/reranking-models/nvidia/llama-nemotron-rerank-1b-v2).
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/retrieval/bi_encoder/llama_embed_nemotron_8b_finetune.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Embedding Fine-Tuning | FEVER and synthetic classification data; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/bi_encoder/llama_embed_nemotron_8b_finetune.yaml) |
+| Embedding Fine-Tuning (Llama-3.1-8B) | Prepared Nemotron retrieval data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml) |
+
+## Model Context
+
+`nvidia/llama-embed-nemotron-8b` is an 8B-class embedding model derived from `meta-llama/Llama-3.1-8B` for dense retrieval.
+
+| Property | Value |
+| --- | --- |
+| Tasks | Embedding, Dense Retrieval |
+| **Architecture** | `LlamaBidirectionalModel` |
+| Parameters | 8B |
+| Hugging Face Organization | [NVIDIA](https://huggingface.co/nvidia) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads and 8 key-value heads |
+| Configured Position Limit | 131,072 tokens (`max_position_embeddings`) |
+| Documented Input Length | 32,768 tokens ([upstream model card](https://huggingface.co/nvidia/llama-embed-nemotron-8b/blob/aa3b43a495a9b280d1bdb716da37c54bb495d630/README.md)) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
+
+### Embedding Models
+
+The bidirectional bi-encoder path is used for embedding generation and dense retrieval.
+
+| **Architecture** | Task | Auto Class | Description |
+|---|---|---|---|
+| `LlamaBidirectionalModel` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Llama with configurable attention and mean pooling for dense embeddings |
+
+### Attention Mode
+
+Set `model.is_causal` in a bi-encoder recipe:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
+  is_causal: false
+```
+
+An explicit value takes precedence over the value saved in the checkpoint's text config. When neither exists, the
+bi-encoder defaults to `false`. The resolved value is persisted when the model is saved. Cross-encoders expose their own
+`is_causal` setting and otherwise preserve their saved or native attention mode. For Llama Nemotron VL, the bi-encoder
+setting changes only the language tower; vision attention remains unchanged. Changing the policy changes embeddings, so
+regenerate any stored corpus embeddings before using the updated model.
+
+### Pooling Strategies
+
+The bi-encoder supports multiple pooling strategies to aggregate token representations into a single embedding vector:
+
+| Strategy | Description |
+|---|---|
+| `avg` | Average of non-padding token hidden states (default) |
+| `cls` | First token hidden state |
+| `last` | Last non-padding token hidden state |
+| `weighted_avg` | Sum of non-padding token hidden states |
+
+### Prepare Data and Run the Reproduction Recipe
+
+The reproduction recipe starts from `meta-llama/Llama-3.1-8B` and uses locally prepared retrieval data. Obtain access to that checkpoint on Hugging Face and authenticate your environment. Ensure Transformer Engine is installed for the recipe's `FusedAdam` optimizer. From the repository root, prepare the data and then launch training:
+
+```bash
+uv run python examples/retrieval/bi_encoder/llama_embed_nemotron_8b/data_preparation.py \
+  --download-path ./embed_nemotron_dataset_v1
+
+uv run automodel \
+  examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml \
+  --nproc-per-node 8
+```
+
+### Recipe Setup
+
+The Quick Start recipe, [llama_embed_nemotron_8b_finetune.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/bi_encoder/llama_embed_nemotron_8b_finetune.yaml), fine-tunes the NVIDIA checkpoint for up to 100 steps. It loads the FEVER and SyntheticClassificationData subsets directly from Hugging Face and uses AdamW. The local data-preparation step above applies to the reproduction recipe.
+
+### Workflow Notes
+
+Dataset: [`nvidia/embed-nemotron-dataset-v1`](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1).
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Llama 3.1 8B | [`meta-llama/Llama-3.1-8B`](https://huggingface.co/meta-llama/Llama-3.1-8B) |
+| llama-embed-nemotron-8b | [`nvidia/llama-embed-nemotron-8b`](https://huggingface.co/nvidia/llama-embed-nemotron-8b) |
+
+## Related Resources
+
+NVIDIA trained and released the `Llama Nemotron Embedding 1B` model, which uses a bidirectional attention mechanism for multilingual and cross-lingual question-answer retrieval. The model supports long documents (up to 8,192 tokens) and dynamic embedding sizes using Matryoshka embeddings. For more details, see the model card on Hugging Face.
+
+- [NeMo AutoModel Repository](https://github.com/NVIDIA-NeMo/Automodel)
+- [nvidia/llama-nemotron-embed-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-1b-v2)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/llama-embed-nemotron-8b/blob/aa3b43a495a9b280d1bdb716da37c54bb495d630/config.json)

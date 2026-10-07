@@ -1,0 +1,66 @@
+---
+title: "deepseek-ai/DeepSeek-V3"
+description: "Benchmark deepseek-ai/DeepSeek-V3 with NeMo AutoModel using the checked-in recipe, launch command, architecture details, and checkpoint references."
+slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V3
+---
+
+[DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) is a mixture-of-experts (MoE) model with 671B total parameters and 37B activated per token. It features Multi-head Latent Attention (MLA), auxiliary-loss-free load balancing, and Multi-Token Prediction (MTP). This page covers its synthetic training benchmark in NeMo AutoModel.
+
+[Moonlight](https://huggingface.co/moonshotai/Moonlight-16B-A3B) by Moonshot AI also uses this architecture with 16B total parameters and 3B activated per token.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). Allocate 128 nodes with 8 GPUs each. Complete the [recipe setup](#recipe-setup), then run from the repository root on every node with `NODE_RANK` and `MASTER_ADDR` set.
+
+```bash
+uv run torchrun --nnodes 128 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Training Benchmark | Synthetic data; 128 nodes; pipeline parallelism: 4; expert parallelism: 64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml) |
+
+## Model Context
+
+The 671B parameter count describes the main model. The [upstream model card](https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/README.md) reports approximately 685B parameters including the MTP module.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (MoE) |
+| Architecture | `DeepseekV3ForCausalLM` |
+| Parameters | 671B main model; 37B active per token |
+| Hugging Face Organization | [deepseek-ai](https://huggingface.co/deepseek-ai) |
+| Decoder Layers | 61 |
+| Hidden Size | 7,168 |
+| Attention | 128 attention heads / 128 key-value heads |
+| Context Length | 163,840 tokens (checkpoint configuration) |
+| Vocabulary Size | 129,280 |
+| Experts | 256 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Setup
+
+The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml) initializes the model from its Hugging Face configuration and uses synthetic data. It does not load pretrained weights or require training-data paths. Its backends require Transformer Engine (`te`) and HybridEP (`hybridep`); ensure both are available in the environment on every node. See the [container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) and [installation instructions](/get-started/installation) for environment setup.
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the allocation. Set `NODE_RANK` to a unique rank from 0 to 127 on each node, and set `MASTER_ADDR` to the address of node rank 0 on every node.
+
+### Workflow Notes
+
+The recipe runs 12 iterations, including 2 warmup iterations, with a sequence length of 4,096 tokens. It enables balanced expert routing (`fake_balanced_gate: true`) and disables checkpoint saving. Interpret the benchmark timings in the context of these settings.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| DeepSeek-V3 | [`deepseek-ai/DeepSeek-V3`](https://huggingface.co/deepseek-ai/DeepSeek-V3) |
+| DeepSeek-V3-Base | [`deepseek-ai/DeepSeek-V3-Base`](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+- [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+- [Checkpoint Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/config.json)

@@ -1,0 +1,75 @@
+---
+title: "MiniMaxAI/MiniMax-M2.5"
+description: "Use NeMo AutoModel to fine-tune MiniMaxAI/MiniMax-M2.5 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/minimax/MiniMax-M2.5
+---
+
+[MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `MiniMaxM2ForCausalLM` architecture.
+
+## Quick Start
+
+Fine-tune on HellaSwag using 8 nodes with 8 GPUs each. Complete the [launch prerequisites](#prepare-to-launch), then run this command from the repository root on every node. Set `NODE_RANK` to a unique value from `0` to `7` and `MASTER_ADDR` to node 0's reachable address.
+
+```bash
+uv run torchrun --nnodes 8 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 8 nodes; pipeline parallelism 2; expert parallelism 32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) |
+| Training Benchmark | Synthetic data; 8 nodes; pipeline parallelism 2; expert parallelism 32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/minimax/minimax_m2.5_te_deepep.yaml) |
+
+## Model Context
+
+MiniMax-M2.5 is used for text generation. Its model size is 228.70B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `MiniMaxM2ForCausalLM` |
+| Parameters | 228.70B checkpoint parameters |
+| Decoder Layers | 62 |
+| Hidden Size | 3,072 |
+| Attention | 48 attention heads and 8 key-value heads |
+| Context Length | 196,608 tokens (checkpoint configuration) |
+| Vocabulary Size | 200,064 |
+| Experts | 256 routed experts; 8 selected per token |
+
+### Prepare to Launch
+
+Install [NeMo AutoModel](/get-started/installation) with Transformer Engine and HybridEP on every node. Use the same environment and repository revision on all nodes, and ensure each node can access `MiniMaxAI/MiniMax-M2.5` and `rowan/hellaswag` on Hugging Face. All nodes must be able to reach node 0 on port `29500` for the launch command.
+
+### Configuration
+
+These settings describe the full fine-tuning recipe. The GPU count is its documented validation setup.
+
+The [Quick Start recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) sets `checkpoint.enabled: false`, so it does not save trained weights as provided.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 64 H100 GPUs, 8 per node |
+| Strategy | Fully Sharded Data Parallelism 2 (FSDP2); `tp_size=1`, `pp_size=2`, `cp_size=1`, `ep_size=32` |
+| Nodes | 8 |
+| Features | Transformer Engine, HybridEP (`dispatcher=hybridep`) |
+| Advanced | `attn=te`, `linear=te`, `experts=torch_mm`, `dispatcher=hybridep` |
+
+### More Recipes for This Model
+
+- [`minimax_m25_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/minimax/minimax_m25_lora.yaml)
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`MiniMaxAI/MiniMax-M2.5`](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/MiniMaxAI/MiniMax-M2.5/blob/f710177d938eff80b684d42c5aa84b382612f21f/config.json)

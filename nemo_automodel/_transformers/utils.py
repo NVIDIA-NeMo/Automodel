@@ -226,7 +226,12 @@ def apply_cache_compatibility_patches():
     _patch_special_tokens_pattern()
 
     import transformers.cache_utils as cache_utils
+    import transformers.utils as transformers_utils
     import transformers.utils.import_utils as import_utils
+
+    # Older remote implementations import this name for the FlashAttention 2 APIs.
+    if not hasattr(transformers_utils, "is_flash_attn_available"):
+        transformers_utils.is_flash_attn_available = transformers_utils.is_flash_attn_2_available
 
     # Remote v4 checkpoints still import this predicate; v4 defined it as
     # is_torch_available(), so retain those semantics on v5.

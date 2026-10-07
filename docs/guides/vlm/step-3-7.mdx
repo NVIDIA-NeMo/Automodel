@@ -1,13 +1,13 @@
 ---
 title: "Fine-Tune Step-3.7-Flash"
-description: "End-to-end SFT and LoRA setup for Stepfun AI's Step-3.7-Flash 198B-A13B MoE vision-language model."
+description: "Configure image supervised fine-tuning and LoRA for Step-3.7-Flash with NeMo AutoModel."
 ---
 
 ## Introduction
 
-[stepfun-ai/Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash) is Stepfun AI's 198B-A13B Mixture-of-Experts vision-language model. It builds on the Step-3.5-Flash language architecture and adds native image and video understanding for agentic developer workflows.
+[stepfun-ai/Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash) is StepFun's mixture-of-experts (MoE) vision-language model. The [upstream model card](https://huggingface.co/stepfun-ai/Step-3.7-Flash/blob/5f6244077ac62e04eec3f320501ff8c2b293373a/README.md) describes 198B total parameters and approximately 11B active parameters per token. The model combines a Step-3.5-Flash-derived language backbone with native image understanding.
 
-Step-3.7-Flash is positioned for agentic use cases where image or video context is part of the task. Target workflows include frontend development from mockups, data-processing tasks, screenshot-based debugging, and tool-calling agents that need stable structured outputs.
+This guide covers image supervised fine-tuning (SFT) and low-rank adaptation (LoRA) with the checked-in MedPix recipes. Example image workflows include frontend development from mockups, data-processing tasks, and screenshot-based debugging.
 
 To set up your environment to run NeMo AutoModel, follow the [installation guide](/get-started/installation).
 
@@ -15,75 +15,122 @@ To set up your environment to run NeMo AutoModel, follow the [installation guide
 
 ### Architecture
 
-- **Model type:** 198B total / 13B active MoE vision-language model.
-- **Language module:** Step-3.5-Flash-derived backbone with 45 layers, 288 experts, 8 activated experts per token, and a 256k context length.
-- **Vision module:** 1.8B ViT with 47 layers and 728x728 image inputs.
-- **Precision targets:** BF16 and FP8 planned for Day 0; NVFP4 support is best effort.
-- **Hardware target:** trained on Hopper GPUs.
+The [checkpoint configuration](https://huggingface.co/stepfun-ai/Step-3.7-Flash/blob/5f6244077ac62e04eec3f320501ff8c2b293373a/config.json) defines the language and vision modules:
+
+- **Language module:** Step-3.5-Flash-derived backbone with 45 layers, 288 routed experts, 8 selected experts per token, and a 256k model context window.
+- **Vision module:** 1.8B-parameter vision transformer with 47 layers and a configured image size of 728 by 728 pixels.
+- **Recipe precision:** Both recipes select `torch_dtype: bfloat16` (BF16).
+- **Recipe sequence length:** Both recipes set the collator's `max_length` to 2,048 tokens.
 
 ### Agentic Positioning
 
-Step-3.7-Flash targets high-throughput, low-latency inference for real-time developer loops. It continues support for agent frameworks such as OpenClaw, HermesAgent, and KiloClaw, with emphasis on tool-call stability.
+The upstream model card describes tool-calling and developer workflows and lists agent platforms such as OpenClaw, Hermes Agent, and Kilo Code.
 
 ## Data
 
 ### Multimodal Supervised Fine-Tuning Data
 
-Use image/video instruction data that matches the target agent workflow. Good candidates include:
+Both recipes use `mmoukouba/MedPix-VQA`, which provides images, questions, and answers. To adapt the workflow, use image instruction data that matches the target task. Examples include:
 
-- frontend mockup-to-project examples,
-- screenshot-debugging conversations,
-- structured data-processing tasks with visual context,
-- image/video question-answer pairs for bounded task execution.
+- Frontend mockup-to-project examples.
+- Screenshot-debugging conversations.
+- Structured data-processing tasks with visual context.
+- Image question-answer pairs for bounded task execution.
 
 For a full walkthrough of how multimodal datasets are preprocessed and integrated into NeMo AutoModel, including chat-template conversion and collate functions, see the [Multi-Modal Dataset Guide](/datasets/multi-modal-dataset).
 
 ## Launch Training
 
-Use the checked-in [full SFT recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml) or [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml). Both use `stepfun-ai/Step-3.7-Flash` for the model and processor and configure pipeline and expert parallelism for this large VLM MoE.
+Use the checked-in [SFT recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml) or [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml). Both use `stepfun-ai/Step-3.7-Flash` for the model and processor, freeze the vision tower, and configure pipeline parallelism (PP) and expert parallelism (EP).
 
-NeMo AutoModel supports several ways to launch training: the AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on Slurm batch jobs, multi-node configuration, and environment variables, see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
+| Recipe | PP size | EP size | Nodes at 8 GPUs per node | Total GPUs | Expert dispatcher |
+| --- | --- | --- | --- | --- | --- |
+| SFT | 4 | 32 | 16 | 128 | `hybridep` |
+| LoRA | 8 | 8 | 8 | 64 | `deepep` |
 
-### Standalone Slurm Skeleton
+These are the checked-in recipe layouts. Both use fully sharded data parallelism (FSDP2) with tensor and context parallelism set to 1. Expert parallelism uses the data-parallel ranks within each pipeline stage.
 
-Before running, make sure your cluster environment is configured following the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
+### Prepare the Environment
+
+1. Configure Slurm and Pyxis as described in [Run on a Cluster](/job-launchers/slurm-cluster).
+2. Use a container with NeMo AutoModel, Transformer Engine, and the selected expert dispatcher. SFT requires HybridEP with multi-node support; LoRA selects DeepEP. The `moe` extra includes the pinned DeepEP source, which also contains HybridEP. For source builds, set `HYBRID_EP_MULTINODE=1` when building HybridEP and provide its RDMA communication dependencies. The [repository Dockerfile](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile) shows this setup and the NVSHMEM installation for DeepEP.
+3. Stage the repository checkout as `Automodel/`, the model and processor checkpoint files as `Step-3.7-Flash/`, and the Hugging Face cache as `hf_cache/` under a shared directory visible from every node. Use a checkout that matches the container's AutoModel version. The example mounts this directory at `/workspace`.
+4. Cache the MedPix dataset, including the `train` and `validation[:256]` splits, before enabling the offline settings below. Make the shared directory writable for checkpoint output.
+
+### Submit a Slurm Job
+
+Save the following script as `step3p7.sub`. Replace the account, partition, shared directory, and container image with your cluster settings, and choose an appropriate time limit. It launches the SFT recipe on 16 nodes with one `torchrun` launcher and eight workers per node. For LoRA, change `--nodes` to `8` and set `STEP3P7_RECIPE` to `examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml`.
 
 ```bash
-export TRANSFORMERS_OFFLINE=1
-export HF_HOME=/path/to/hf_cache
-export HF_DATASETS_OFFLINE=1
-export WANDB_API_KEY=your_wandb_key
+#!/bin/bash
+#SBATCH --account=your_account
+#SBATCH --partition=your_partition
+#SBATCH --time=02:00:00
+#SBATCH --nodes=16
+#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --output=step3p7-%j.out
+#SBATCH --error=step3p7-%j.err
 
-srun --output=output.out \
-     --error=output.err \
-     --container-image /path/to/automodel26.10.image.sqsh \
-     --no-container-mount-home bash -c "
-  CUDA_DEVICE_MAX_CONNECTIONS=1 automodel \
-  /path/to/step_3_7_flash_recipe.yaml \
-  --nproc-per-node=8 \
-  --model.pretrained_model_name_or_path=/path/to/Step-3.7-Flash \
-  --processor.pretrained_model_name_or_path=/path/to/Step-3.7-Flash "
+set -euo pipefail
+
+STEP3P7_SHARED=/path/to/shared/step3p7
+STEP3P7_IMAGE=/path/to/automodel26.10.image.sqsh
+export STEP3P7_RECIPE=examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml
+export HF_HOME=/workspace/hf_cache
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=${MASTER_PORT:-13742}
+
+srun --ntasks="$SLURM_NNODES" --ntasks-per-node=1 \
+     --container-image="$STEP3P7_IMAGE" \
+     --container-mounts="$STEP3P7_SHARED:/workspace" \
+     --container-workdir=/workspace/Automodel \
+     --no-container-mount-home \
+     --export=ALL \
+     bash -c '
+  set -euo pipefail
+  export CUDA_DEVICE_MAX_CONNECTIONS=1
+  exec torchrun \
+    --nnodes="$SLURM_NNODES" \
+    --nproc-per-node=8 \
+    --rdzv-id="$SLURM_JOB_ID" \
+    --rdzv-backend=c10d \
+    --rdzv-endpoint="$MASTER_ADDR:$MASTER_PORT" \
+    -m nemo_automodel.cli.app "$STEP3P7_RECIPE" \
+    --model.pretrained_model_name_or_path=/workspace/Step-3.7-Flash \
+    --processor.pretrained_model_name_or_path=/workspace/Step-3.7-Flash \
+    --checkpoint.checkpoint_dir="/workspace/checkpoints/step3p7-$SLURM_JOB_ID"
+'
 ```
 
-**Before you start**:
+Submit the job from a directory where Slurm can write the output logs:
 
-- Clone or mirror the model checkpoint locally before launching a multi-node run.
-- Ensure `HF_HOME` points to a shared cache visible from all nodes.
-- Cache the dataset locally if running with `HF_DATASETS_OFFLINE=1`.
-- Configure the `wandb` section in the recipe to record loss, throughput, and memory curves.
+```bash
+sbatch step3p7.sub
+```
+
+### Check the Outputs
+
+- **Logs:** Slurm writes `step3p7-<job_id>.out` and `step3p7-<job_id>.err` in the submission directory.
+- **SFT checkpoints:** Checkpointing is enabled in the SFT recipe. With the script's override, checkpoint subdirectories are written under `checkpoints/step3p7-<job_id>/` in the shared directory.
+- **LoRA checkpoints:** The LoRA recipe sets `checkpoint.enabled: false`. Set it to `true` in your recipe before submission to save adapters. The scheduler saves at the final training step when checkpointing is enabled; adjust `step_scheduler.ckpt_every_steps` to save intermediate checkpoints more frequently.
+- **Experiment tracking:** Both recipes disable Weights & Biases (W&B) by default. To record training curves, set `wandb.enable: true`, replace the recipe's W&B placeholders, choose a writable mounted path for `wandb.dir`, and export `WANDB_API_KEY` before submitting the job.
+- **Validation:** Both recipes configure validation data, but the VLM training loop skips validation when pipeline parallelism is enabled. These layouts produce training metrics without validation-loss curves.
 
 ## Training Results
 
-The SFT and LoRA training loss curves are shown below.
+The SFT and LoRA curves below are recorded training-loss results supplied with this guide.
 
 **SFT**
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/step3_7_sft.png" alt="Step-3.7-Flash SFT training loss curve" width="700" />
+  <img src="./step3_7_sft.png" alt="Step-3.7-Flash SFT training loss curve" width="700" />
 </p>
 
 **LoRA**
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/step3_7_lora.png" alt="Step-3.7-Flash LoRA training loss curve" width="700" />
+  <img src="./step3_7_lora.png" alt="Step-3.7-Flash LoRA training loss curve" width="700" />
 </p>

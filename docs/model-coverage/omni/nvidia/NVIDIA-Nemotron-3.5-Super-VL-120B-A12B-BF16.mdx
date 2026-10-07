@@ -1,0 +1,112 @@
+---
+title: "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
+description: "Use nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 with NeMo AutoModel for multimodal fine-tuning, with checkpoints, recipes, setup, and reference details."
+slug: model-coverage/omni/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+---
+
+[NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16)
+pairs a Nemotron Super NemotronH (hybrid Mamba-2 and Attention) Mixture-of-Experts (MoE) language
+backbone with a RADIO v2.5-H vision encoder. NeMo AutoModel maps its
+`NemotronH_Omni_Reasoning_V3` architecture to the same model wrapper as [Nemotron-3-Nano-Omni](/model-coverage/omni/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16).
+The BF16 checkpoint has no audio encoder, so audio inputs are not supported.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). This example uses one node with 8 GPUs. Run from the repository root. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Text Fine-Tuning | Tulu-3; 4 nodes; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml) |
+| Packed Text Fine-Tuning | Tulu-3; 4 nodes; CP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_cp8_100steps.yaml) |
+| LoRA Fine-Tuning | CORD-v2; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml) |
+
+## Model Context
+
+The recipes load pretrained weights. The CORD-v2 LoRA recipe saves adapter checkpoints; both 100-step Tulu-3 recipes set `checkpoint.enabled: false` and save no trained checkpoints.
+
+| Property | Value |
+| --- | --- |
+| Task | Multimodal (Text/Image) |
+| Architecture | `NemotronH_Omni_Reasoning_V3` |
+| Parameters | 121B total (MoE, 512 routed experts, 22 active per token; 124B with the MTP head) |
+| Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
+| Experts | 512 routed / 22 selected per token |
+| Vision Encoder | RADIO v2.5-H |
+
+EP denotes expert parallelism; CP denotes context parallelism. LoRA is low-rank adaptation.
+
+`NemotronH_Omni_Reasoning_V3` and `NemotronH_Nano_Omni_Reasoning_V3` use the
+`NemotronOmniForConditionalGeneration` wrapper and its state-dict adapter. The wrapper loads
+the vision implementation supplied by each checkpoint. It constructs `sound_encoder` and
+`sound_projection` only when `sound_config` is present; this checkpoint has audio disabled.
+
+### LoRA on CORD-v2
+
+`nemotron_3_5_super_vl_cord_v2_peft.yaml` fine-tunes the model on CORD-v2 receipt field extraction
+(the same task as the [NemotronOmni CORD-v2 guide](/recipes-e2e-examples/nemotron-omni)) with LoRA adapters
+instead of full supervised fine-tuning (SFT). Freezing the base weights removes their FP32 master
+weights and optimizer states. The documented LoRA example uses one node with 8 H100 GPUs
+(`cp_size: 1`, `ep_size: 8`); the full SFT example uses 4 nodes. These are example configurations.
+
+The following results are reported in the [Nemotron 3.5 Super VL fine-tuning guide](/recipes-e2e-examples/nemotron-3-5-super-vl).
+
+| Property | Value |
+| --- | --- |
+| Low-rank adaptation (LoRA) targets | 272 linear projections: Mamba `in_proj`/`out_proj`, attention `q/k/v/o_proj`, MoE `fc1/fc2_latent_proj` and shared experts (routed experts, vision tower, projector, `lm_head` frozen) |
+| Trainable parameters | 177M (0.15%), rank 64, alpha 128; Transformer Engine `FusedAdam` with FP32 master weights, learning rate 2e-4 |
+| Peak memory | 38.8 GiB/GPU |
+| Adapter checkpoint | 355 MB (`adapter_model.safetensors` + `adapter_config.json`) |
+| Training | 400 steps (global batch 8, 4 epochs of the 800 training receipts) in 13 min on one node; train loss 0.51 -> 0.01 |
+| Validation loss | 0.041 / 0.039 / 0.043 / 0.040 at steps 99 / 199 / 299 / 399 |
+| Field extraction (first 20 validation receipts, greedy, adapter merged into the base model) | step 199 (`LOWEST_VAL`): 8/20 exact match, mean similarity 0.954 (median 0.997), 20/20 structured outputs |
+
+### Launch the Multi-Node Text Example
+
+The Tulu-3 text example uses 4 nodes with 8 GPUs each. On every node, set `MASTER_ADDR` to
+node 0's reachable hostname or IP address and `NODE_RANK` to that node's unique rank (0 through 3).
+Run from the same repository checkout and environment on all four nodes:
+
+```bash
+: "${MASTER_ADDR:?Set MASTER_ADDR to the address of node 0}"
+: "${NODE_RANK:?Set NODE_RANK to the rank of this node (0 through 3)}"
+uv run torchrun --nnodes 4 --nproc-per-node 8 \
+    --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+    -m nemo_automodel.cli.app \
+    examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml
+```
+
+### Recipe Setup
+
+Use an environment with Transformer Engine, `mamba-ssm`, and `causal-conv1d` (the `cuda`
+extra), plus HybridEP for the recipes' `dispatcher: hybridep` backend. The `moe` extra
+includes `cuda` and selects the pinned `deep_ep` source, whose build includes HybridEP.
+Multi-node HybridEP requires building with `HYBRID_EP_MULTINODE=1` (default: `0`) and
+the RDMA dependencies. The NeMo AutoModel container enables this build and provides
+RDMA and NVSHMEM. See the
+[container setup](/get-started/installation) and the repository's
+[HybridEP build configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile).
+
+Ensure the model and processor checkpoint is accessible on every node. The LoRA recipe downloads
+`naver-clova-ix/cord-v2`; the text recipes use `allenai/tulu-3-sft-mixture`. Review the
+[LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml)
+for its data, backend, and checkpoint settings. It saves adapters under
+`vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft`.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16) | Post-trained; no audio encoder |
+| [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16) | Pretrained only; no audio encoder |
+
+## Related Resources
+
+- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)

@@ -1,0 +1,66 @@
+---
+title: "tiiuae/Falcon-H1-1.5B-Deep-Instruct"
+description: "Fine-tune tiiuae/Falcon-H1-1.5B-Deep-Instruct on SQuAD with NeMo AutoModel using the FSDP2 recipe and an eight-GPU example launch."
+slug: model-coverage/large-language-models/tiiuae/Falcon-H1-1.5B-Deep-Instruct
+---
+
+[Falcon-H1-1.5B-Deep-Instruct](https://huggingface.co/tiiuae/Falcon-H1-1.5B-Deep-Instruct) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `FalconH1ForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then launch full fine-tuning on SQuAD with eight GPUs on one node from the repository root:
+
+```bash
+automodel examples/llm_finetune/falcon/falcon_h1_1p5b_instruct_squad.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD; 8 GPUs; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_1p5b_instruct_squad.yaml) |
+
+## Model Context
+
+Falcon-H1-1.5B-Deep-Instruct combines Transformer attention with Mamba state space layers for text generation. It has approximately 1.55 billion checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `FalconH1ForCausalLM` |
+| Parameters | 1.55B checkpoint parameters |
+| Decoder Layers | 66 |
+| Hidden Size | 1,280 |
+| Attention | 6 attention heads and 2 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 65,537 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+These are example launch settings. The recipe does not specify a GPU model or memory requirement.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs (example launch) |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size=1`, `cp_size=1` |
+| Nodes | 1 |
+| Features | Unpacked sequences; sequence parallelism disabled |
+| Advanced | `torch_dtype: bf16` |
+
+### Workflow Notes
+
+The recipe loads pretrained weights and fine-tunes on `rajpurkar/squad` for 100 steps, with a global batch size of 64 and a local batch size of 8. It uses the validation split for evaluation.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`tiiuae/Falcon-H1-1.5B-Deep-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-1.5B-Deep-Instruct) | Instruction-tuned checkpoint for full fine-tuning |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/tiiuae/Falcon-H1-1.5B-Deep-Instruct/blob/b6648636ddc906688974282de6e7a243395f5423/config.json)

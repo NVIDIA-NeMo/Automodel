@@ -1,0 +1,130 @@
+---
+title: "tencent/HunyuanImage-3.0"
+description: "Fine-tune tencent/HunyuanImage-3.0, an 80B MoE text-to-image transformer, with LoRA and expert parallelism in NeMo AutoModel."
+slug: model-coverage/diffusion/tencent/HunyuanImage-3.0
+---
+
+[HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0) is Tencent's text-to-image model with a multimodal mixture-of-experts (MoE) decoder. NeMo AutoModel provides recipes for low-rank adaptation (LoRA), full fine-tuning, and image generation using its native transformer implementation.
+
+## Quick Start
+
+Run text-to-image LoRA fine-tuning on your cached images and captions with eight GPUs on one node. Complete the installation and data preparation below, including Transformer Engine, then set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the YAML. From the repository root, launch one rank per GPU:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | Cached images and captions; one node, eight GPUs, eight-way expert parallelism | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) |
+| Full Fine-Tuning | Cached images and captions; four nodes, eight GPUs each | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow.yaml) |
+| Text-to-Image Generation | Configured prompts; eight-GPU launch with eight-way expert parallelism | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_hunyuan_image3.yaml) |
+
+## Model Context
+
+HunyuanImage-3.0 combines prompt tokens and image tokens in one sequence. Its multimodal MoE decoder predicts the flow-matching velocity of image latents. The native implementation trains through AutoModel's custom-model path.
+
+| Property | Value |
+| --- | --- |
+| Task | Text-to-image generation |
+| Architecture | Multimodal MoE decoder with a flow-matching image head |
+| Parameters | 80B total, 13B active in the decoder |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | Grouped-query attention (GQA): 32 query heads, 8 key-value heads, head dimension 128 |
+| Experts | 64 routed experts per layer, top-8 routing, and one shared expert |
+| Configured Position Limit | 22,800 joint-sequence positions (`max_position_embeddings` in the native config) |
+| Vocabulary Size | 133,120 |
+| Positions | 2D rotary position embeddings (RoPE) over the joint text and image sequence |
+| Latents | 32 channels, 16x spatial compression with the release variational autoencoder (VAE) |
+| Hugging Face Organization | [tencent](https://huggingface.co/tencent) |
+
+### Model Class
+
+`HunyuanImage3ForCausalMM` (`nemo_automodel/components/models/hunyuan_image3/`) is registered for the checkpoint's `HunyuanImage3ForCausalMM` architecture and `hunyuan_image_3_moe` model type, so the transformer config loads without `trust_remote_code`. The decoder uses the shared `MoE` layer, which the MoE parallelizer shards with Fully Sharded Data Parallel version 2 (FSDP2) and expert parallelism. `HunyuanImage3StateDictAdapter` converts the released checkpoint's fused `[up; gate]` expert projections to grouped experts and renames `wte` and `ln_f`. The release's VAE and vision encoder are not part of the training model.
+
+The training path supports FSDP2, expert parallelism, LoRA, and full fine-tuning. It does not support tensor, pipeline, or context parallelism, image conditioning (image-to-image), or text generation training.
+
+### Install Dependencies
+
+From the repository root of a source checkout, install the training and diffusion media dependencies:
+
+```bash
+uv sync --locked --all-groups --extra all --extra diffusion-media
+```
+
+The `all` extra includes the CUDA and diffusion dependencies, including Transformer Engine for the recipes' `FusedAdam` optimizer. The `diffusion-media` extra supplies preprocessing dependencies such as OpenCV. Follow the [Installation Guide](/get-started/installation) for environment setup.
+
+### Prepare Data
+
+The preprocessing step needs the release's VAE and tokenizer wrapper, which are loaded from the checkpoint's remote code (`nemo_automodel/components/models/hunyuan_image3/release.py`, shared with generation). For every image it stores the VAE latent and the release's prompt token ids around the image span (the conditional prompt, the `<cfg>` unconditional prompt used for classifier-free guidance dropout, and the suffix). Images are snapped to the release's own resolution group (33 aspect ratios around 1024x1024) instead of the generic buckets:
+
+```bash
+uv run python -m tools.diffusion.preprocessing_multiprocess image \
+  --image_dir /data/images \
+  --output_dir /cache/hunyuan-image3 \
+  --processor hunyuan_image3 \
+  --model_name tencent/HunyuanImage-3.0 \
+  --resolution_preset 1024p
+```
+
+Captions follow the image processors' JSONL convention: place `<stem>_internvl.json` next to each image. For filenames containing `_sample`, use the prefix before the last `_sample` instead of the full stem. Each JSONL record identifies the image with `file_name` and stores its caption in `internvl` by default; `--caption_field usr` selects the `usr` field without changing the filename suffix. Replace `/data/images` and `/cache/hunyuan-image3` with your image and cache directories.
+
+### Cache Contract
+
+Each cache sample contains:
+
+- `latent`: `[32, height / 16, width / 16]` (fp32, scaled by the VAE scaling factor)
+- `prompt_input_ids`: token ids before the image span, ending in `<timestep>`
+- `uncond_prompt_input_ids`: the same with the prompt replaced by `<cfg>` tokens
+- `prompt_suffix_ids`: token ids after the image span (`<eoi>`)
+- `bucket_resolution`, `original_resolution`, `crop_offset`, `prompt`, `image_path`
+
+The `hunyuan_image3` flow-matching adapter assembles `prefix + <img> * (h * w) + suffix` per sample and right-pads the batch; `flow_matching.cfg_dropout_prob` swaps in the unconditional prefix.
+
+### Train the Model
+
+Set `data.dataloader.cache_dir` to the preprocessing output and `checkpoint.checkpoint_dir` to your checkpoint destination. The LoRA recipe specifies one node with eight GPUs and eight-way expert parallelism; launch it with the Quick Start command. These are example topology settings, not a measured GPU memory requirement.
+
+The full fine-tuning recipe specifies four nodes with eight GPUs each and eight-way expert parallelism. Its comments estimate about 1.1 TB of training state for all 80B parameters with FP32-precision master weights and Adam moments; this is not a measured peak-memory value.
+
+Use the same checkout, configuration, and accessible data and checkpoint paths on all four nodes. Set `NODE_RANK` to a different value from `0` through `3` on each node and `MASTER_ADDR` to the hostname or IP address of node `0`. Run this command on every node:
+
+```bash
+uv run torchrun --nnodes=4 --node-rank="$NODE_RANK" --nproc-per-node=8 \
+  --master-addr="$MASTER_ADDR" --master-port=29500 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/hunyuan_image3_t2i_flow.yaml
+```
+
+Both recipes keep the router in FP32 (`gate_precision: float32`), train with `flow_shift: 3.0` (the value the release samples with), and use Transformer Engine's `FusedAdam` with FP32-precision master weights (`master_weights: true` with 16-bit remainders) to preserve small updates to BF16 parameters. The LoRA recipe adapts the attention projections and the shared expert. Its saved model weights contain only the adapter (`adapter_model.safetensors` plus its config). `fsdp.ep_size: 1` is also supported; the experts are then sharded by FSDP2.
+
+### Generate Images
+
+`examples/diffusion/generate/generate.py` samples with the native transformer, sharded across the launched ranks as in training, and the release's VAE, prompt format and `flow_shift` from the checkpoint. Sampling follows the release pipeline: Euler steps on the shifted sigma schedule with classifier-free guidance over a `[prompt, <cfg>]` batch. Every rank samples the same prompts:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_hunyuan_image3.yaml
+```
+
+Set `inference.prompts` and `output.output_dir` in the generation YAML. To generate from a trained model, set `model.lora_weights` to the `model/` directory of a LoRA checkpoint step, or `model.checkpoint` to a full fine-tuning checkpoint step; both load through the training checkpointer. Leave both fields unset to use the base model. Requested sizes snap to the release resolution group.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [tencent/HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0) | Base model for text-to-image LoRA, full fine-tuning, and generation |
+
+## Related Resources
+
+- [Installation Guide](/get-started/installation)
+- [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning)
+- [Native Model Configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/models/hunyuan_image3/config.py)
+- [Native Transformer Implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/models/hunyuan_image3/model.py)
+- [HunyuanImage-3.0 Preprocessor](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/tools/diffusion/processors/hunyuan_image3.py)

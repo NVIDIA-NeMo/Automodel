@@ -45,7 +45,7 @@ rng:
   ranked: true
 
 # The published checkpoint shares its model_type with the Kimi K3 text backbone, so the
-# config class is named explicitly (see docs/model-coverage/llm/moonshotai/kimi-linear.mdx).
+# config class is named explicitly (see docs/model-coverage/llm/moonshotai/Kimi-Linear-48B-A3B-Instruct.mdx).
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:

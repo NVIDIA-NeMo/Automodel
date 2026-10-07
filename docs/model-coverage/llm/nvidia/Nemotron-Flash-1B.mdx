@@ -1,0 +1,64 @@
+---
+title: "nvidia/Nemotron-Flash-1B"
+description: "Fine-tune nvidia/Nemotron-Flash-1B with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/large-language-models/nvidia/Nemotron-Flash-1B
+---
+
+[NVIDIA Nemotron-Flash](https://huggingface.co/nvidia/Nemotron-Flash-1B) is a compact, fast language model designed for low-latency inference workloads.
+
+<Note>
+Both recipes set `trust_remote_code: true` under `model` and `model.config` to load the checkpoint's custom model and configuration code.
+
+</Note>
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+From the repository root, launch the example on eight GPUs on one node:
+
+```bash
+uv run --extra cuda --extra fa --extra fla automodel --nproc-per-node=8 examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml
+```
+
+The command selects the [required CUDA dependencies](#model-context).
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml) |
+| LoRA Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml) |
+
+## Model Context
+
+Nemotron-Flash-1B is a hybrid base model for text generation with approximately 1 billion parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `NemotronFlashForCausalLM` |
+| Parameters | 1B |
+| Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
+| Decoder Layers | 24 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 4 key-value heads |
+| Context Length | 36,000 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
+The checkpoint's custom model code requires a CUDA environment with Mamba, FlashAttention 2, and Flash Linear Attention. Use the `cuda` extra for `mamba-ssm` and `causal-conv1d`, `fa` for `flash-attn`, and `fla` for `flash-linear-attention`, as shown in the Quick Start.
+
+Both recipes load pretrained weights and fine-tune on `rajpurkar/squad` using Fully Sharded Data Parallelism version 2 (FSDP2), with tensor and context parallelism set to 1. Checkpoint saving is enabled in both recipes.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Nemotron-Flash 1B | [`nvidia/Nemotron-Flash-1B`](https://huggingface.co/nvidia/Nemotron-Flash-1B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/Nemotron-Flash-1B/blob/da87f707f678b5936e67fdcfe598f76ebcc5fdbc/config.json)

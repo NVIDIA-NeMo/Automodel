@@ -1,0 +1,55 @@
+---
+title: "llava-hf/llava-1.5-7b-hf"
+description: "Fine-tune llava-hf/llava-1.5-7b-hf with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/vision-language-models/llava-hf/llava-1.5-7b-hf
+---
+
+[LLaVA](https://llava-vl.github.io/) (Large Language and Vision Assistant) connects a vision encoder to a language model through a projection layer. This page covers the `llava-hf/llava-1.5-7b-hf` checkpoint and its low-rank adaptation (LoRA) fine-tuning example.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), including the VLM dependencies. From the repository root, run this example on one node with 8 GPUs. This is an example topology; validate training and memory use on your hardware.
+
+```bash
+uv run automodel examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | MedPix-VQA; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml) |
+
+## Model Context
+
+`llava-hf/llava-1.5-7b-hf` is an image-text-to-text checkpoint with approximately 7B parameters. The example recipe loads its pretrained weights in `bfloat16` for fine-tuning.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| Architecture | `LlavaForConditionalGeneration` |
+| Parameters | 7B |
+| Hugging Face Organization | [llava-hf](https://huggingface.co/llava-hf) |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 32,064 |
+| Checkpoint Dtype | `float16` |
+
+### Recipe Setup
+
+Install the `vlm` extra described in the [installation instructions](/get-started/installation). The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml) uses Fully Sharded Data Parallel 2 (FSDP2), rank-8 LoRA adapters, eager attention, and Adam. It freezes the vision tower and runs for 100 steps using the first 1,000 training examples and 100 validation examples from `mmoukouba/MedPix-VQA`. Checkpoint saving is enabled every 50 steps under `checkpoints/llava_1_5_7b_hf`.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| LLaVA 1.5 7B | [`llava-hf/llava-1.5-7b-hf`](https://huggingface.co/llava-hf/llava-1.5-7b-hf) |
+
+## Related Resources
+
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/llava-hf/llava-1.5-7b-hf/blob/b234b804b114d9e37bb655e11cbbb5f5e971b7a9/config.json)

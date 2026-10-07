@@ -60,6 +60,20 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[3]
 
 
+def test_deprecation_warnings_reference_existing_recipes():
+    """Keep the legacy configs explicitly referenced by runtime deprecation warnings."""
+    from nemo_automodel.components.models.deprecation import _DEPRECATED_CHECKPOINT_YAMLS, _DEPRECATED_MODEL_YAMLS
+
+    root = _repo_root()
+    missing = sorted(
+        path
+        for paths in (*_DEPRECATED_MODEL_YAMLS.values(), *_DEPRECATED_CHECKPOINT_YAMLS.values())
+        for path in paths
+        if not (root / path).is_file()
+    )
+    assert not missing, "Recipes referenced by deprecation.py must remain available:\n" + "\n".join(missing)
+
+
 def _iter_strings(node) -> Iterable[str]:
     """Yield every string value reachable from a nested YAML structure."""
     if isinstance(node, str):
@@ -234,11 +248,10 @@ def test_yaml_recipe_scan_finds_model_ids(recipe_model_ids: set[str]):
 # lowercase; list here only the deliberate deviations (rebrands, shared-family
 # pages, etc.).
 _HF_ORG_TO_DOC_SLUG = {
-    "CohereForAI": "cohere",
     "diffusers": "lightricks",  # LTX-2.3 conversion shares the Lightricks family page
-    "ibm-granite": "ibm",
     "meta-llama": "meta",
     "MiniMaxAI": "minimax",
+    "OrionStarAI": "orionstar",  # Existing provider URL uses the shortened organization name.
     "zai-org": "thudm",  # zai-org (née THUDM) publishes GLM-4+
 }
 

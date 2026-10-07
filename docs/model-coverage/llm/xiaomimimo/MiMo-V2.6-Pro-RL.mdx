@@ -1,0 +1,70 @@
+---
+title: "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+description: "Fine-tune XiaomiMiMo/MiMo-V2.6-Pro-RL with NeMo AutoModel using GB200 recipes for packed Tulu3 text and MedPix-VQA vision-language data."
+slug: model-coverage/large-language-models/xiaomimimo/MiMo-V2.6-Pro-RL
+---
+
+[MiMo-V2.6-Pro-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL) is Xiaomi's hybrid-attention Mixture-of-Experts (MoE) model. NeMo AutoModel provides recipes for packed Tulu3 text fine-tuning, MedPix-VQA fine-tuning, and low-rank adaptation (LoRA).
+
+## Quick Start
+
+After [installation](/get-started/installation) and [recipe setup](#recipe-setup), fine-tune on packed Tulu3 text. Allocate 32 nodes with 4 GB200 GPUs each. Run from the repository root on every node, setting `NODE_RANK` to its zero-based node index and `MASTER_ADDR` to the first node's address.
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True USE_MNNVL=1
+export NVTE_FUSED_ATTN=1 NVTE_FLASH_ATTN=0 NVTE_UNFUSED_ATTN=0
+uv run --extra all --group dev torchrun --nnodes 32 --nproc-per-node 4 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | Tulu3; 65,536-token packs; 32 GB200 nodes; EP64; PP2; CP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 32 GB200 nodes; EP64; PP2 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_medpix_nonpacked4k_ep64pp2_100steps.yaml) |
+| Vision-Language LoRA | MedPix-VQA; 8 GB200 nodes; EP16; PP2 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_medpix_nonpacked4k_lora_ep16pp2_100steps.yaml) |
+
+## Model Context
+
+MiMo-V2.6-Pro-RL combines a hybrid-attention language backbone with a vision encoder. The recipes cover text and vision-language fine-tuning.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation and Vision-Language Fine-Tuning |
+| Architecture | `MiMoV2ForCausalLM` |
+| Parameters | 1.02T total / 42B activated (publisher-reported) |
+| Decoder Layers | 70 |
+| Hidden Size | 6,144 |
+| Attention | 128 attention heads / 8 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 152,576 |
+| Experts | 384 routed / 8 selected per token |
+| Vision Encoder Dimensions | 28 layers; hidden size 1,280 |
+| Vision Encoder | MiMo vision transformer; frozen in both MedPix-VQA recipes. |
+| Recipe Hardware | GB200 nodes with 4 GPUs per node; 32 nodes for full fine-tuning and 8 nodes for LoRA. |
+
+All three recipes load pretrained weights and run for 100 steps. They set `checkpoint.enabled: false`, so they do not save trained weights or LoRA adapters.
+
+### Recipe Setup
+
+All three recipes use `FusedLinearCrossEntropy`, which requires `cut-cross-entropy` from the `dev` dependency group. The quick-start command selects the `all` extra and the `dev` group; the `all` extra alone does not include this loss dependency.
+
+The packed Tulu3 recipe requires Transformer Engine >= 2.19, cuDNN >= 9.26, and HybridEP with MNNVL. Keep each 64-GPU expert-parallel group within one NVLink domain. The quick-start command includes the environment variables required for a direct run; the YAML's `ci.env_vars` applies only to CI.
+
+The workflow table uses EP for expert parallelism, PP for pipeline parallelism, and CP for context parallelism. Follow the [launcher guide](/job-launchers/overview) to prepare the multi-node allocation. The LoRA recipe requires all 8 nodes in one NVLink domain.
+
+## Available Models
+
+| Model | Hugging Face ID |
+| --- | --- |
+| MiMo-V2.6-Pro-RL | [`XiaomiMiMo/MiMo-V2.6-Pro-RL`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL) |
+
+## Related Resources
+
+- [MiMo-V2-Flash](/model-coverage/large-language-models/xiaomimimo/MiMo-V2-Flash)
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+- [Launcher Guide](/job-launchers/overview)
+- [Checkpoint Configuration](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/73875d00b30a89ef8cc353a0b60b0e9f9561952d/config.json)
+- [Upstream Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/73875d00b30a89ef8cc353a0b60b0e9f9561952d/README.md)

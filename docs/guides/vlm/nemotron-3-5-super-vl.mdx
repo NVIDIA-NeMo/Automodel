@@ -3,14 +3,15 @@ title: "Nemotron 3.5 Super VL"
 description: "Fine-tune Nemotron 3.5 Super VL on CORD-v2 for receipt field extraction, then run inference and evaluation."
 position: 15
 ---
-**A step-by-step guide for fine-tuning Nemotron 3.5 Super VL (121B hybrid Mamba and Attention
-Mixture-of-Experts (MoE) VLM) to extract structured receipt data from scanned images using
-[NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). Full SFT on 4 nodes or LoRA on a single node,
-then inference and evaluation on the CORD-v2 validation split.**
+Fine-tune Nemotron 3.5 Super VL, a 121B hybrid Mamba and attention mixture-of-experts (MoE)
+vision-language model (VLM), to extract structured receipt data from scanned images using
+[NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). Use full supervised fine-tuning (SFT)
+on four nodes or low-rank adaptation (LoRA), a parameter-efficient fine-tuning (PEFT) method,
+on one node, then run inference and evaluation on the CORD-v2 validation split.
 
 ---
 
-## What is Nemotron 3.5 Super VL?
+## What Is Nemotron 3.5 Super VL?
 
 Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`,
 architecture `NemotronH_Omni_Reasoning_V3`) is the 121B member of the Nemotron 3.5 family.
@@ -48,7 +49,11 @@ The **model before task-specific fine-tuning** produces free-form descriptions. 
 | **Step 4** | Run inference and evaluation on the fine-tuned model |
 | **Step 5** | Results |
 
-## Hardware Requirements
+## Hardware Used for the Reported Runs
+
+The memory use, timings, training logs, checkpoint sizes, and evaluation scores below are
+historical results reported in the [original guide](https://github.com/NVIDIA-NeMo/Automodel/blob/c79ba55eb77527138337288220df04bc5939483c/docs/guides/vlm/nemotron-3-5-super-vl.mdx).
+Use them as reference values for the configurations described here.
 
 - **4 nodes x 8 H100 80 GB** (512 experts sharded with
   `ep_size=32`; `cp_size=4` so the 8-sample global batch is one sample per data-parallel rank)
@@ -63,22 +68,36 @@ The **model before task-specific fine-tuning** produces free-form descriptions. 
 
 ## Step 0 — Set Up the Environment
 
+Choose the container or source installation below.
+
 ```bash
 # Inside the NeMo AutoModel container (26.04+):
 cd /opt/Automodel
 uv pip install --python /opt/venv/bin/python ".[vlm-media]"
+```
 
-# Or from a source checkout:
+For a source installation on H100, first provision the CUDA and communication dependencies
+used by the [Dockerfile](https://github.com/NVIDIA-NeMo/Automodel/blob/c79ba55eb77527138337288220df04bc5939483c/docker/Dockerfile#L150-L183),
+including matching rdma-core headers and runtime libraries and NVSHMEM. Set `RDMA_CORE_HOME`
+to the rdma-core prefix. The pinned DeepEP source includes HybridEP; its multi-node
+NCCL/DOCA build path requires `HYBRID_EP_MULTINODE=1` at build time. The `moe` extra alone
+does not enable that build path.
+
+```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
-uv sync --locked --all-groups --all-extras
+HYBRID_EP_MULTINODE=1 TORCH_CUDA_ARCH_LIST=9.0 \
+    uv sync --locked --all-groups --extra moe --extra vlm --extra vlm-media
+source .venv/bin/activate
 ```
 
 <Note>
 Nemotron 3.5 Super VL requires `mamba_ssm` and `causal_conv1d` (the `cuda` extra, pre-built in the
-NeMo AutoModel container), Transformer Engine (`attn: te`, `linear: te`), and DeepEP for
-expert dispatch. The checkpoint is ~227 GB in bf16 (63 safetensors shards); download it into
-`$HF_HOME` before launching so that all 32 ranks read from the shared cache.
+NeMo AutoModel container), Transformer Engine (`attn: te`, `linear: te`), and HybridEP
+(`dispatcher: hybridep`) from the pinned DeepEP source for expert dispatch. The full SFT
+recipe needs a multi-node HybridEP build. The checkpoint is ~227 GB in bf16 (63 safetensors
+shards); set `HF_HOME` to a shared cache directory and download the checkpoint before launching
+so that all 32 ranks read from the same cache.
 
 </Note>
 
@@ -105,7 +124,7 @@ print(f"\nGround-truth keys: {list(gt.keys())}")
 ```
 
 Expected output:
-```
+```text
 Train      : 800 samples
 Validation : 100 samples
 Test       : 100 samples
@@ -118,7 +137,7 @@ Ground-truth keys: ['menu', 'sub_total', 'total']
 NeMo AutoModel converts structured JSON into an XML-like **token sequence** using
 the `json2token()` function. This is the format the model is trained to produce:
 
-```
+```text
 <s_total><s_total_price>45,500</s_total_price><s_changeprice>4,500</s_changeprice>
 <s_cashprice>50,000</s_cashprice></s_total><s_menu><s_price>16,500</s_price>
 <s_nm>REAL GANACHE</s_nm><s_cnt>1</s_cnt><sep/><s_price>13,000</s_price>
@@ -130,6 +149,9 @@ the `json2token()` function. This is the format the model is trained to produce:
 ## Step 2 — Training Configuration
 
 **Config file**: `examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml`
+
+The following excerpt highlights the training settings. Launch the complete recipe file,
+which also configures the processor, validation data, and distributed environment.
 
 ```yaml
 recipe: FinetuneRecipeForVLM
@@ -149,6 +171,7 @@ model:
   torch_dtype: torch.bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
+    dispatcher: hybridep
     attn: te
     linear: te
     rms_norm: torch_fp32
@@ -175,9 +198,10 @@ distributed:
     frozen_sharding: replicate   # frozen RADIO tower kept whole on every rank
 
 freeze_config:
-  freeze_vision_tower: true
-  freeze_audio_tower: true
-  freeze_language_model: false
+  freeze_modules:
+    - path: vision_model
+  unfreeze_modules:
+    - path: vision_projector
 
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
@@ -253,7 +277,8 @@ Without fp32 master weights and optimizer state for the frozen 121B parameters, 
 ### Collate Function
 
 Nemotron 3.5 Super VL uses InternVL-style image handling: each
-`<image>` token is expanded to 256 vision embeddings per tile during the forward pass.
+`<image>` placeholder is expanded by the processor into image tokens, which the model
+replaces with vision embeddings during the forward pass (256 per tile).
 The collate function extracts the images from the conversation, applies the chat template
 (which adds the `<think></think>` prefix for the assistant turn), runs the processor, and
 builds the training labels.
@@ -262,30 +287,72 @@ builds the training labels.
 
 ## Step 3 — Launch Fine-Tuning
 
-On a Slurm cluster (one task per GPU, 4 nodes):
+Within a Slurm allocation of four nodes with eight GPUs each, run one `torchrun` launcher
+per node. Use the same checkout path, Python environment, and shared checkpoint cache on
+every node. Run from the checkout root:
 
 ```bash
-srun --nodes=4 --ntasks-per-node=8 --gpus-per-node=8 \
-    python examples/vlm_finetune/finetune.py \
-    -c examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml
+export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
+export MASTER_PORT=29500
+
+srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --gpus-per-node=8 \
+    bash -c 'exec torchrun --nnodes=4 --nproc-per-node=8 \
+        --node-rank="$SLURM_NODEID" \
+        --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+        -m nemo_automodel.cli.app \
+        examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml'
 ```
 
-You can also launch the same recipe with the `automodel` launcher: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml --nproc-per-node 8 --nnodes 4`.
-W&B logging is opt-in: add `--wandb.enable=true --wandb.entity=<entity> --wandb.project=<project>` to either command.
+Without Slurm, run the following command on **each of the four nodes**. Set `MASTER_ADDR`
+to node 0's hostname or IP address reachable from every node, use the same available
+`MASTER_PORT` on all nodes, and set a distinct `NODE_RANK` of `0`, `1`, `2`, or `3`:
+
+```bash
+export MASTER_ADDR="node0.example.com"  # Replace with node 0's reachable address.
+export MASTER_PORT=29500
+export NODE_RANK=0  # Change to 1, 2, or 3 on the other nodes.
+
+torchrun --nnodes=4 --nproc-per-node=8 \
+    --node-rank="$NODE_RANK" \
+    --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+    -m nemo_automodel.cli.app \
+    examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2.yaml
+```
+
+Weights & Biases (W&B) logging is opt-in. For a source installation, install W&B and
+authenticate in the `.venv` environment activated in Step 0:
+
+```bash
+uv pip install "wandb>=0.30.0"
+wandb login
+```
+
+Then append `--wandb.enable=true`,
+`--wandb.entity=YOUR_ENTITY`, and `--wandb.project=YOUR_PROJECT` after the recipe path,
+substituting your entity and project. In the Slurm command, put these arguments inside
+the single-quoted `bash -c` script.
 
 ### LoRA PEFT
 
+Within a one-node Slurm allocation with eight GPUs:
+
 ```bash
-srun --nodes=1 --ntasks-per-node=8 --gpus-per-node=8 \
-    python examples/vlm_finetune/finetune.py \
-    -c examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml
+srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --gpus-per-node=8 \
+    torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+    -m nemo_automodel.cli.app \
+    examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml
 ```
 
-You can also launch it on any 8-GPU machine with the `automodel` launcher: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml --nproc-per-node 8`.
+On a single node with the hardware described above, you can also use the `automodel` launcher:
+
+```bash
+automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml \
+    --nproc-per-node 8
+```
 
 ### Training Log for LoRA PEFT
 
-```
+```text
 Trainable parameters: 177,012,736
 Trainable parameters percentage: 0.15%
 
@@ -304,12 +371,13 @@ Validation:
   step 399 | val_loss 0.0398
 ```
 
-400 steps take ~13 min on 8 H100 (including the four validation passes). Each checkpoint holds the adapter only (~355 MB), so
-`vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/` stays small even with a checkpoint per validation step.
+400 steps take ~13 min on 8 H100 (including the four validation passes). Each model export holds
+the adapter weights (~355 MB). The training checkpoints under
+`vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/` also include optimizer and resume state.
 
 ### Training Log for Full SFT
 
-```
+```text
 Trainable parameters: 120,668,687,360
 Trainable parameters percentage: 99.31%
 
@@ -333,7 +401,7 @@ in the last epoch — the 800-receipt training set is small enough for a 121B mo
 
 ### Checkpoints Saved
 
-```
+```text
 vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/
   epoch_0_step_99/             # sharded weights + optimizer state (~1.4 TB each) + model/consolidate.sh
   epoch_1_step_199/
@@ -368,7 +436,7 @@ checkpoint of this model is ~1.4 TB, so budget ~6 TB for the run. Intermediate c
 
 Load the consolidated HF export across all visible GPUs (`device_map="auto"`; the bf16 weights need
 ~227 GB, so use one node with 8x H100), greedy-decode CORD-v2 validation receipts with the training
-prompt (`<image>\nDescribe this image.`, `enable_thinking=False`) and score each prediction against
+prompt (`<image>Describe this image.`, `enable_thinking=False`) and score each prediction against
 `json2token(gt_parse, sort_json_key=True)`:
 
 - **exact match** — prediction identical to the ground-truth token sequence
@@ -400,7 +468,7 @@ model.eval()
 # Same single-turn prompt the collate function trained on; enable_thinking=False emits the empty
 # <think></think> assistant prefix.
 prompt = processor.tokenizer.apply_chat_template(
-    [{"role": "user", "content": "<image>\nDescribe this image."}],
+    [{"role": "user", "content": "<image>Describe this image."}],
     tokenize=False, add_generation_prompt=True, enable_thinking=False,
 )
 
@@ -438,7 +506,7 @@ scores the model before task-specific fine-tuning the same way.
 
 ### LoRA PEFT Inference
 
-LoRA checkpoints contain only `adapter_model.safetensors` + `adapter_config.json`, saved under the
+LoRA model exports contain `adapter_model.safetensors` and `adapter_config.json`, saved under the
 training wrapper's module names (`language_model.model.layers.N.mixer.in_proj`, ...), which match the
 HF module tree. Load the base checkpoint as above, fold the adapters into the base weights
 (`W += (B @ A) * alpha / r`), then run the same `predict` loop:
@@ -494,8 +562,10 @@ its free-form descriptions run to the token limit.
 | Full SFT, step 399 (`LATEST`, lr=5e-5, 400 steps) | 5/20 | 0.923 (median 0.989; 14/20 above 0.9) | 20/20 |
 | LoRA PEFT, step 199 (`LOWEST_VAL`, val loss 0.039) | 8/20 | 0.954 (median 0.997; 15/20 above 0.9) | 20/20 |
 
-The checkpoint with the lowest validation loss also decodes best, so evaluate `LOWEST_VAL` (run its
-`model/consolidate.sh` first; the final step is the only one exported inline).
+In the reported full SFT run, the checkpoint with the lowest validation loss also has the
+highest mean similarity, so evaluate `LOWEST_VAL`. For full SFT, run its `model/consolidate.sh`
+first if it has not been exported; the final step is the only one exported inline. For LoRA,
+load the adapter files as described in the LoRA PEFT inference example.
 
 The base model answers `Describe this image.` with prose ("This is a photograph of a receipt from a
 restaurant, likely a pizzeria ..."). After fine-tuning every prediction is a well-formed
@@ -503,6 +573,8 @@ restaurant, likely a pizzeria ..."). After fine-tuning every prediction is a wel
 dropped `<s_cnt>` or `<s_vatyn>`, a `<s_sub>` block where the label has none) or OCR digits.
 
 ### Sample Predictions (Fine-Tuned, Step 299, `LOWEST_VAL`)
+
+Similarity values are rounded to two decimal places, so `1.00` does not always mean an exact match.
 
 | Sample | Ground-truth menu items | Prediction vs. ground truth | Similarity |
 |--------|-------------------------|-----------------------------|------------|

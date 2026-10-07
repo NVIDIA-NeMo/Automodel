@@ -1,0 +1,82 @@
+---
+title: "CohereLabs/North-Micro-Vision-Instruct"
+description: "Fine-tune CohereLabs/North-Micro-Vision-Instruct for image-text tasks with NeMo AutoModel using the checked-in two-GPU LoRA recipe."
+slug: model-coverage/vision-language-models/coherelabs/North-Micro-Vision-Instruct
+---
+
+[North Micro Vision](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct) is Cohere Labs' 2.4B-parameter vision language model with native-resolution image support. NeMo AutoModel provides low-rank adaptation (LoRA) fine-tuning recipes through `NeMoAutoModelForImageTextToText`.
+
+## Quick Start
+
+Complete the [installation](/get-started/installation) and [model setup](#setup-and-additional-examples). From the repository root, run LoRA fine-tuning on RDR Items using two GPUs:
+
+```bash
+uv run --with transformers==5.16.0 automodel --nproc-per-node=2 examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | RDR Items; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml) |
+| LoRA Fine-Tuning | Shopify product catalogue; 1 node; full training split | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_full.yaml) |
+| LoRA Fine-Tuning | Shopify product catalogue; 1 node; 2,000 training samples | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_lora.yaml) |
+| Resume LoRA Fine-Tuning | Shopify product catalogue; 1 node; 2,000 samples; existing checkpoint | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_resume.yaml) |
+
+## Model Context
+
+North-Micro-Vision-Instruct is used for image-text-to-text (native resolution). Its model size is 2.4B total (2B language / 400M vision) parameters.
+
+| Property | Value |
+|---|---|
+| **Task** | Image-Text-to-Text (native resolution) |
+| **Architecture** | `CohereCompassForConditionalGeneration` |
+| **Parameters** | 2.4B total (2B language / 400M vision) |
+| **Layers** | 28 language (21 sliding + 7 full attention), 27 vision |
+| **Context Length** | 128K language backbone; multimodal prompts validated up to 8K tokens |
+| **HF Org** | [CohereLabs](https://huggingface.co/CohereLabs) |
+| Hidden Size | 2,048 language; 1,152 vision |
+| Attention | Language: 16 query heads and 8 key-value heads |
+| Vocabulary Size | 262,144 |
+| Configured Dtype | `bfloat16` |
+
+### Architecture
+
+- Hybrid attention interleaves three sliding-window layers (window 4,096) with one full-attention layer. The full-attention layers carry no positional embeddings; rotary position embeddings (RoPE) are applied on the sliding layers only.
+- Attention is grouped-query, 16 heads over 8 key-value heads, with parallel transformer blocks and LayerNorm. Embeddings are tied across a 262,144-token vocabulary.
+- DeepStack uses features from vision-encoder layers 8, 16, and 24 and injects them into early language-model layers.
+- The language model uses interleaved multimodal RoPE (mRoPE) with sections `[24, 20, 20]`. Native-resolution image processing makes visual token count depend on image dimensions.
+
+### Setup and Additional Examples
+
+<Warning>
+The [pinned upstream model card](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct/blob/fa548d9aa62c1220bfd21fc6cfc465f1bd2a1a40/README.md) requires Transformers 5.16.0, which includes `CohereCompass` support. This repository pins Transformers 5.15.1. The Quick Start uses [`uv run --with`](https://docs.astral.sh/uv/concepts/projects/run/#requesting-additional-dependencies) to select 5.16.0 for that invocation; use the same override when launching the other recipes.
+</Warning>
+
+Use a CUDA development image with a C compiler for the recipe's Triton LoRA kernels (`use_triton: true`). The RDR recipe loads pretrained weights from Hugging Face and saves checkpoints under `checkpoints_rdr/`, relative to the working directory.
+
+The RDR recipe is 18 optimizer steps and exists to prove the pipeline. A full epoch of the Shopify recipe is 2,415 steps, completes in about an hour on two RTX PRO 6000 GPUs, and takes validation loss from 0.90 to 0.43.
+
+The listed recipes explicitly select `default_collate_fn`. Leave `max_length` unset for dynamic padding because visual token counts vary with image dimensions. Setting `max_length` enables fixed-length padding and truncation; also setting `drop_overlong: true` filters samples estimated to exceed the cap before processing.
+
+### Recipe Setup
+
+Read [north_micro_vision_rdr.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml) for checkpoint access, data paths, and backend dependencies.
+
+### Workflow Notes
+
+Fine-tune CohereLabs/North-Micro-Vision-Instruct: [north_micro_vision_rdr.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml). 1 node, 2 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+Before using the resume recipe, run `north_micro_vision_shopify_lora.yaml` and set `checkpoint.restore_from` to a checkpoint it produced.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [North Micro Vision](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [North Micro Vision model card](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct)
+- [Shopify product-catalogue dataset](https://huggingface.co/datasets/Shopify/product-catalogue)
+- [Checkpoint Configuration](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct/blob/fa548d9aa62c1220bfd21fc6cfc465f1bd2a1a40/config.json)

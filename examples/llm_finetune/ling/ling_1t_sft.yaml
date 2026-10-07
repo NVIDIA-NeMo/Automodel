@@ -7,7 +7,7 @@
 # Adam state in fp32.
 # Minimum:    256x H100 80GB (32 nodes) -- 47 GB/rank, comfortable.
 # Lower bound: 128x H100 80GB (16 nodes) -- 94 GB/rank, will OOM without offload.
-# Use ling_1t_lora_pp.yaml (32 GPUs) if full SFT is not feasible.
+# Use ling_1t_lora_pp.yaml (64 GPUs) if full SFT is not feasible.
 # ------------------------------------------------------------------------------------------------
 #
 # Topology: PP=4, EP=64; FSDP shards the rest.

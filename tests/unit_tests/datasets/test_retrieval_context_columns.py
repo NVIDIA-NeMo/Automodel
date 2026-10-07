@@ -26,8 +26,8 @@ import pytest
 
 from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as mod
 from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import (
-    _flatten_context_columns,
     ContextAwareRetrievalDatasetConfig,
+    _flatten_context_columns,
 )
 
 # --------------------------------------------------------------------------------------

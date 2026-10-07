@@ -1,0 +1,61 @@
+---
+title: "inceptionai/jais-13b"
+description: "Fine-tune inceptionai/jais-13b with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/large-language-models/inceptionai/jais-13b
+---
+
+[Jais](https://huggingface.co/inceptionai/jais-13b) is an Arabic-English bilingual language model from Inception (formerly G42/Inception AI), trained on a large Arabic and English corpus.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and complete the [checkpoint access setup](#recipe-setup). From the repository root, run the example on one node with 8 GPUs. GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/inceptionai/jais_13b_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/inceptionai/jais_13b_squad_peft.yaml) |
+
+## Model Context
+
+jais-13b is used for text generation. Its model size is 13B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `JAISLMHeadModel` |
+| Parameters | 13B |
+| Hugging Face Organization | [inceptionai](https://huggingface.co/inceptionai) |
+| Decoder Layers | 40 |
+| Hidden Size | 5,120 |
+| Attention | 40 attention heads |
+| Context Length | 2,048 tokens (checkpoint configuration) |
+| Vocabulary Size | 84,992 |
+| Configured Dtype | `float32` |
+
+### Recipe Setup
+
+This checkpoint is gated. Request access on the [Hugging Face model page](https://huggingface.co/inceptionai/jais-13b), then set `HF_TOKEN` in your training environment to a token from an account with access.
+
+The [jais_13b_squad_peft.yaml recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/inceptionai/jais_13b_squad_peft.yaml) uses `rajpurkar/squad`, `bfloat16`, rank-8 low-rank adaptation (LoRA), Fully Sharded Data Parallel version 2 (FSDP2), and activation checkpointing. It runs for 100 steps with 512-token sequences and enables `trust_remote_code: true` to load the checkpoint's custom model code.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Jais 13B | [`inceptionai/jais-13b`](https://huggingface.co/inceptionai/jais-13b) |
+| Jais 13B Chat | [`inceptionai/jais-13b-chat`](https://huggingface.co/inceptionai/jais-13b-chat) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/inceptionai/jais-13b/blob/0d5eb87f91e6577dac17bc319eee940fb875b899/config.json)

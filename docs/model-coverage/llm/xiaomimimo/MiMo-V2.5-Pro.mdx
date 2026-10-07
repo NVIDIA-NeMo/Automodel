@@ -1,0 +1,83 @@
+---
+title: "XiaomiMiMo/MiMo-V2.5-Pro"
+description: "Fine-tune XiaomiMiMo/MiMo-V2.5-Pro with NeMo AutoModel using the checked-in HellaSwag recipe for its hybrid attention MoE architecture and FP8 checkpoint."
+slug: model-coverage/large-language-models/xiaomimimo/MiMo-V2.5-Pro
+---
+
+[MiMo-V2.5-Pro](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) is Xiaomi's hybrid attention mixture-of-experts (MoE) language model. It interleaves full and sliding-window attention layers, uses a `sigmoid_with_bias` router to select eight of 384 experts per token, and ships as an FP8 Hugging Face checkpoint.
+
+## Quick Start
+
+Complete [Recipe Setup](#recipe-setup), then run this HellaSwag fine-tuning sanity check from the repository root on every node of an 18-node allocation with eight GPUs per node. Set `NODE_RANK` to each node's rank (0 through 17) and `MASTER_ADDR` to rank 0's reachable hostname.
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+uv run --no-sync torchrun --nnodes 18 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 18 nodes; PP18; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml) |
+
+## Model Context
+
+MiMo-V2.5-Pro combines MoE blocks with hybrid attention for text generation. Its checkpoint contains approximately 1023.18 billion parameters.
+
+| Property | Value |
+|---|---|
+| **Task** | Text Generation (MoE, hybrid attention) |
+| **Architecture** | `MiMoV2ForCausalLM` (NeMo AutoModel alias: `MiMoV25ForCausalLM`) |
+| **Validated Hardware** | 18 nodes, 144 H100 80GB GPUs; PP18 / EP8 |
+| **Hugging Face Organization** | [XiaomiMiMo](https://huggingface.co/XiaomiMiMo) |
+| Parameters | 1023.18B checkpoint parameters |
+| Decoder Layers | 70 |
+| Hidden Size | 6,144 |
+| Attention | 128 attention heads / 8 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 152,576 |
+| Experts | 384 routed / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Architecture
+
+- The checkpoint declares `MiMoV2ForCausalLM`; the recipe selects the dedicated `mimo_v25` implementation with `architectures: [MiMoV25ForCausalLM]`.
+- Sliding-window attention uses the `MiMoV2Attention(is_swa=True)` path.
+- MoE blocks use `nemo_automodel.components.moe.layers.MoE` with `score_func="sigmoid_with_bias"` and `gate_precision=fp32`.
+- `MiMoV2StateDictAdapter` dequantizes the pretrained FP8 checkpoint and restores canonical QKV row order. Unquantized export preserves weight precision; FP8 export is unsupported.
+
+### Recipe Setup
+
+1. Clone the repository to get the implementation and example recipe:
+
+   ```bash
+   git clone https://github.com/NVIDIA-NeMo/Automodel.git
+   cd Automodel
+   ```
+
+2. Follow the [installation instructions](/get-started/installation) to prepare the environment in this checkout. The recipe requires DeepEP (`dispatcher: deepep`); the base package and the `all` extra omit it. For a source install, add `--extra moe` to the guide's `uv sync` command. Make the checkout and prepared environment available on every node. The Quick Start uses `--no-sync` to preserve that environment.
+
+3. Prepare an 18-node allocation with eight GPU workers per node using the [Slurm launcher guide](/job-launchers/slurm-cluster), then run the Quick Start command on every node. It sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for the workers, as specified by the recipe.
+
+### Workflow Notes
+
+The [HellaSwag recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml) loads pretrained weights and runs a 20-step training sanity check with validation every five steps and checkpoint writing disabled. It uses BF16 weights and AdamW state. The validated setup uses pipeline parallelism (PP) with size 18 and expert parallelism (EP) with size eight, keeping expert dispatch within each node. These settings describe the checked-in recipe, not a general hardware minimum. A single-node launch cannot run this configuration.
+
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) for training configuration details.
+
+## Available Models
+
+- **MiMo-V2.5-Pro**: Hybrid full and sliding-window attention with FP8 weights.
+
+| Model | HF ID |
+|---|---|
+| MiMo-V2.5-Pro | [`XiaomiMiMo/MiMo-V2.5-Pro`](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) |
+
+## Related Resources
+
+- [XiaomiMiMo/MiMo-V2.5-Pro](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro)
+
+- [Checkpoint Configuration](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro/blob/21d1ecfecd7bd70f31be25ca49d7edd21f003659/config.json)

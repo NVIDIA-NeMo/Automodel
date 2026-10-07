@@ -1,0 +1,65 @@
+---
+title: "black-forest-labs/FLUX.1-dev"
+description: "Fine-tune black-forest-labs/FLUX.1-dev with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/diffusion/black-forest-labs/FLUX.1-dev
+---
+
+[FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) is a 12B parameter text-to-image diffusion transformer from Black Forest Labs, trained with flow matching. It produces high-fidelity images and is designed for non-commercial research and development use.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Complete the [prerequisites](#prerequisites) for model access, data, and paths. Then, from the repository root, launch full fine-tuning on eight GPUs:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/flux_t2i_flow.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Prepared image-text cache; 8 GPUs (`fsdp.dp_size: 8`) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml) |
+| Pretraining | Prepared image-text cache; 8 GPUs (`fsdp.dp_size: 8`) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/flux_t2i_flow.yaml) |
+
+## Model Context
+
+FLUX.1-dev is used for text-to-image. Its model size is 12B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text-to-Image |
+| **Architecture** | DiT (Flow Matching) |
+| Parameters | 12B |
+| Hugging Face Organization | [black-forest-labs](https://huggingface.co/black-forest-labs) |
+| Transformer Blocks | 19 dual-stream / 38 single-stream |
+| Hidden Size | 3,072 |
+| Attention | 24 attention heads |
+
+### Prerequisites
+
+Before launching:
+
+1. Accept the access conditions on the [Hugging Face model page](https://huggingface.co/black-forest-labs/FLUX.1-dev) and authenticate your environment with an account that has access.
+2. Prepare the image-text cache by following [Dataset Preparation](/datasets/diffusion-dataset).
+3. In `examples/diffusion/finetune/flux_t2i_flow.yaml`, set `data.dataloader.cache_dir` to your prepared cache path and `checkpoint.checkpoint_dir` to your output directory, replacing the placeholder values.
+
+### Task
+
+- Text-to-Image (T2I)
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| FLUX.1-dev | [`black-forest-labs/FLUX.1-dev`](https://huggingface.co/black-forest-labs/FLUX.1-dev) |
+
+## Related Resources
+
+- [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning)
+- [Dataset Preparation](/datasets/diffusion-dataset)
+
+- [Upstream Architecture Configuration](https://github.com/black-forest-labs/flux/blob/802fb4713906133fcbd0d8dc5351620ca4773036/src/flux/util.py)

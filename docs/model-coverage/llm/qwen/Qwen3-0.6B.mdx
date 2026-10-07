@@ -1,0 +1,56 @@
+---
+title: "Qwen/Qwen3-0.6B"
+description: "Use Qwen/Qwen3-0.6B with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/large-language-models/qwen/Qwen3-0.6B
+---
+
+Qwen3-0.6B is a dense causal language model in Alibaba Cloud's [Qwen3](https://qwenlm.github.io/blog/qwen3/) family, with support for text generation, reasoning, and multilingual tasks.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+On a node with eight GPUs, run the HellaSwag example from the repository root:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml) |
+
+## Model Context
+
+Qwen3-0.6B is a text generation model with 0.6 billion parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `Qwen3ForCausalLM` |
+| Parameters | 0.6B |
+| Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 28 |
+| Hidden Size | 1,024 |
+| Attention | 16 attention heads / 8 key-value heads |
+| Context Length | 40,960 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
+
+The example loads pretrained `Qwen/Qwen3-0.6B` weights and fine-tunes on `rowan/hellaswag` using Fully Sharded Data Parallel (FSDP2).
+
+The recipe sets `checkpoint.enabled: false`, so the run does not save fine-tuned weights. Set `checkpoint.enabled: true` in the recipe before running if you need saved checkpoints.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Qwen3 0.6B | [`Qwen/Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-0.6B/blob/c1899de289a04d12100db370d81485cdf75e47ca/config.json)

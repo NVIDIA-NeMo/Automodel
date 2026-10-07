@@ -1,0 +1,58 @@
+---
+title: "EleutherAI/gpt-neox-20b"
+description: "Fine-tune EleutherAI/gpt-neox-20b with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/large-language-models/eleutherai/gpt-neox-20b
+---
+
+GPT-NeoX-20B is EleutherAI's pretrained autoregressive language model, trained on the Pile using the [GPT-NeoX library](https://github.com/EleutherAI/gpt-neox). Use the example below to fine-tune `EleutherAI/gpt-neox-20b` with low-rank adaptation (LoRA) on SQuAD.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml) |
+
+## Model Context
+
+gpt-neox-20b is used for text generation. Its model size is 20B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `GPTNeoXForCausalLM` |
+| Parameters | 20B |
+| Hugging Face Organization | [EleutherAI](https://huggingface.co/EleutherAI) |
+| Decoder Layers | 44 |
+| Hidden Size | 6,144 |
+| Attention | 64 attention heads |
+| Context Length | 2,048 tokens (checkpoint configuration) |
+| Vocabulary Size | 50,432 |
+| Checkpoint Dtype | `float16` |
+
+### Recipe Setup
+
+The [gpt_neox_20b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml) example uses SQuAD (`rajpurkar/squad`) with 512-token sequences and runs for 100 steps. It loads the model in `bfloat16` and uses LoRA with rank 8, fully sharded data parallelism (FSDP2), and activation checkpointing.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| GPT-NeoX 20B | [`EleutherAI/gpt-neox-20b`](https://huggingface.co/EleutherAI/gpt-neox-20b) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/EleutherAI/gpt-neox-20b/blob/c292233c833e336628618a88a648727eb3dff0a7/config.json)

@@ -1,0 +1,72 @@
+---
+title: "mistralai/Ministral-3-3B-Instruct-2512"
+description: "Fine-tune mistralai/Ministral-3-3B-Instruct-2512 with NeMo AutoModel using the checked-in recipe, launch command, architecture details, and checkpoint references."
+slug: model-coverage/vision-language-models/mistralai/Ministral-3-3B-Instruct-2512
+---
+
+[Ministral 3](https://mistral.ai/news/mistral-3/) is Mistral AI's small model family with vision capabilities. Ministral-3-3B-Instruct-2512 accepts text and image inputs and generates text.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and [recipe setup](#recipe-setup). This language-only LoRA example uses one node with 8 GPUs. Run from the repository root.
+
+```bash
+uv run automodel examples/llm_finetune/mistral/ministral3_3b_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Language-Only LoRA Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/ministral3_3b_squad_peft.yaml) |
+| Vision-Language Fine-Tuning (Ministral-3-3B-Reasoning-2512) | MedPix-VQA; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml) |
+
+## Model Context
+
+Ministral-3-3B-Instruct-2512 is used for image-text-to-text. The [upstream model card](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512/blob/b35d4dfe56c142746f54dbd64f579faab2744308/README.md) describes a 3.4B language model and a 0.4B vision encoder.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| **Architecture** | `Mistral3ForConditionalGeneration` |
+| Parameters | 3.4B language model; 0.4B vision encoder (upstream rounded counts) |
+| Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
+| Decoder Layers | 26 |
+| Hidden Size | 3,072 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
+### Setup and Additional Examples
+
+For vision-language fine-tuning, this example loads `mistralai/Ministral-3-3B-Reasoning-2512` and uses MedPix-VQA. Follow the [VLM dependency setup](/get-started/installation#vlm-dependencies), then run from the repository root on one node with 8 GPUs:
+
+```bash
+uv run automodel examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml --nproc-per-node 8
+```
+
+### Recipe Setup
+
+The [SQuAD recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/ministral3_3b_squad_peft.yaml) loads pretrained Instruct weights and the `rajpurkar/squad` dataset from Hugging Face. AutoModel dequantizes the FP8 checkpoint to `bfloat16` for LoRA training and freezes the vision tower and multimodal projector. The recipe enables checkpoint saving under `checkpoints/`.
+
+The MedPix recipe loads `mmoukouba/MedPix-VQA`, freezes the vision tower, and enables checkpoint saving under `vlm_checkpoints/`.
+
+### Workflow Notes
+
+Both recipes use Fully Sharded Data Parallel version 2 (FSDP2). The launch commands show example topologies; they do not establish a minimum GPU requirement. Changing the GPU count may also require adjusting batch sizes and parallelism settings.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Ministral-3 3B Instruct | [`mistralai/Ministral-3-3B-Instruct-2512`](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512) |
+| Ministral-3-3B-Reasoning-2512 | [`mistralai/Ministral-3-3B-Reasoning-2512`](https://huggingface.co/mistralai/Ministral-3-3B-Reasoning-2512) |
+
+## Related Resources
+
+- [Fine-Tune Gemma 3n (Related VLM Example)](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512/blob/b35d4dfe56c142746f54dbd64f579faab2744308/config.json)

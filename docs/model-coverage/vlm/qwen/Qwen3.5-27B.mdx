@@ -1,0 +1,70 @@
+---
+title: "Qwen/Qwen3.5-27B"
+description: "Use NeMo AutoModel to fine-tune Qwen/Qwen3.5-27B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/qwen/Qwen3.5-27B
+---
+
+[Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Qwen3_5ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and complete the [recipe setup](#recipe-setup). From the repository root on each of 2 nodes with 8 GPUs each, launch this MedPix-VQA fine-tuning example:
+
+```bash
+uv run torchrun --nnodes 2 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/qwen3_5/qwen3_5_27b_tp4pp4.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 2 nodes; TP4; PP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_27b_tp4pp4.yaml) |
+
+## Model Context
+
+Qwen3.5-27B combines a vision encoder with a hybrid language decoder for image-text-to-text tasks. The checkpoint contains 27.78B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `Qwen3_5ForConditionalGeneration` |
+| Parameters | 27.78B checkpoint parameters |
+| Decoder Layers | 64 |
+| Hidden Size | 5,120 |
+| Attention | 48 linear-attention layers with 16 query/key heads and 48 value heads; 16 full-attention layers with 24 query heads and 4 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | GPU model not specified in the recipe |
+| Strategy | `tp_size=4`; `pp_size=4`; `cp_size=1`; `ep_size=1` |
+| Nodes | 2 |
+| Features | Activation checkpointing (`activation_checkpointing=true`) |
+| Advanced | `attn=sdpa`; `linear=torch` |
+
+### Recipe Setup
+
+Install the VLM dependencies described in the [installation instructions](/get-started/installation). This example uses tensor parallelism (TP4) and pipeline parallelism (PP4) across 16 GPUs. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the two-node allocation.
+
+For the Quick Start command, set `NODE_RANK=0` on the first node and `NODE_RANK=1` on the second. Set `MASTER_ADDR` on both nodes to the first node's hostname or IP address, reachable from both nodes on port 29500.
+
+The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_27b_tp4pp4.yaml) loads pretrained `Qwen/Qwen3.5-27B` weights and the `train` split of `mmoukouba/MedPix-VQA` from Hugging Face. It freezes the vision tower and sets `max_steps: 30`.
+
+Checkpoint saving is disabled (`checkpoint.enabled: false`), so this example does not save fine-tuned weights. Configure checkpoint saving before running if you need to retain them.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3.5-27B`](https://huggingface.co/Qwen/Qwen3.5-27B) | Pretrained checkpoint used by the fine-tuning recipe |
+
+## Related Resources
+
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-27B/blob/fc05daec18b0a78c049392ed2e771dde82bdf654/config.json)

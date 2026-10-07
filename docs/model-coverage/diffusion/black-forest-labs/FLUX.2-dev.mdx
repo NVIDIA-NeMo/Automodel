@@ -1,0 +1,69 @@
+---
+title: "black-forest-labs/FLUX.2-dev"
+description: "Fine-tune black-forest-labs/FLUX.2-dev for text-to-image generation with NeMo AutoModel using checked-in full-parameter and LoRA flow-matching recipes."
+slug: model-coverage/diffusion/black-forest-labs/FLUX.2-dev
+---
+
+[FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) is Black Forest Labs' 32B rectified flow transformer for text-to-image generation and single- or multi-reference image editing.
+
+NeMo AutoModel includes full-parameter and Low-Rank Adaptation (LoRA) text-to-image fine-tuning recipes for this checkpoint.
+
+## Quick Start
+
+Complete the setup in Recipe Notes, then launch full fine-tuning from the repository root on eight GPUs:
+
+```bash
+uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/flux2_t2i_flow.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Prepared image-text cache; 8 data-parallel GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow.yaml) |
+| LoRA Fine-Tuning | Prepared image-text cache; 8 data-parallel GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow_lora.yaml) |
+
+## Model Context
+
+FLUX.2-dev is used for diffusion generation. Its model size is 32B parameters.
+
+| Property | Value |
+|---|---|
+| Task | Diffusion Generation |
+| Upstream Tasks | Text-to-image generation; single- and multi-reference image editing |
+| Model Type | Rectified flow transformer |
+| Parameters | 32B |
+| Architecture | `Flux2` |
+| Transformer Blocks | 8 double-stream / 48 single-stream |
+| Hidden Size | 6,144 |
+| Attention | 48 heads |
+| Feed-Forward Ratio | 3.0 |
+| Text Encoder | `Mistral-Small-3.2-24B-Instruct-2506` |
+| Text Feature Width | 15,360 |
+| Latent Channels | 128 input / 128 output |
+| Position Axes | 4 axes with 32 dimensions each |
+| Rotary Position Embedding Theta | 2,000 |
+| Guidance | Guidance-distilled with guidance embedding enabled |
+| Configured Dtype | `BF16` |
+
+### Recipe Notes
+
+Before running either recipe:
+
+1. Install the diffusion dependencies described in the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
+2. Obtain access to the gated [FLUX.2-dev checkpoint](https://huggingface.co/black-forest-labs/FLUX.2-dev) and authenticate your Hugging Face environment.
+3. Prepare the image-text cache using the guide's image preprocessing workflow with `--processor flux2`.
+4. In the chosen YAML, set `data.dataloader.cache_dir` to the prepared cache directory and `checkpoint.checkpoint_dir` to your checkpoint output directory, replacing the `PATH_TO_YOUR_DATA` and `PATH_TO_YOUR_CKPT_DIR` placeholders.
+
+Both recipes set `fsdp.dp_size: 8`, matching the eight-GPU launch above.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`black-forest-labs/FLUX.2-dev`](https://huggingface.co/black-forest-labs/FLUX.2-dev) | Checkpoint linked by the example recipe |
+
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)

@@ -57,6 +57,7 @@ from nemo_automodel.components.distributed.model_parallelizer import (
     compile_parallelized_model,
     parallelize_model,
 )
+from nemo_automodel.components.models.deprecation import warn_deprecated_checkpoint
 from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -678,6 +679,7 @@ class NeMoAutoDiffusionPipeline:
             ``NeMoAutoDiffusionPipeline`` holding the custom-model transformer.
         """
         logger.info("[INFO] Loading pipeline from pretrained: %s", pretrained_model_name_or_path)
+        warn_deprecated_checkpoint(pretrained_model_name_or_path)
 
         # Resolve to a local snapshot dir so a warm HF cache is not re-validated
         # (and potentially re-downloaded) over the network on every run.
@@ -963,6 +965,7 @@ class NeMoAutoDiffusionPipeline:
             The initialized diffusers pipeline with requested components replaced by their parallelized modules, or
             a ``NeMoAutoDiffusionPipeline`` holding the randomly initialized custom-model transformer.
         """
+        warn_deprecated_checkpoint(model_id)
         # Parse and validate pipeline spec
         spec = PipelineSpec.from_dict(pipeline_spec)
         transformer_dir = _transformer_dir(resolve_diffusion_model_dir(model_id), spec.subfolder)

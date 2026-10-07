@@ -1,0 +1,57 @@
+---
+title: "Qwen/Qwen3.6-27B"
+description: "Fine-tune Qwen/Qwen3.6-27B for vision-language tasks with NeMo AutoModel using language-model and LoRA recipes that keep the vision tower frozen."
+slug: model-coverage/vision-language-models/qwen/Qwen3.6-27B
+---
+
+Qwen3.6 is Alibaba Cloud's vision-language model generation following Qwen3.5. NeMo AutoModel provides fine-tuning and Low-Rank Adaptation (LoRA) recipes for the dense Qwen3.6-27B checkpoint and the related Qwen3.6-35B-A3B mixture-of-experts (MoE) checkpoint.
+
+## Quick Start
+
+Install NeMo AutoModel with the `vlm-media` extra using the [Installation Guide](/get-started/installation). From the repository root, launch MedPix-VQA fine-tuning with eight GPUs. See [Model Context](#model-context) for recipe settings and [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n) for a related example.
+
+```bash
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 8-GPU launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml) |
+| LoRA Fine-Tuning | MedPix-VQA | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_6_27b_lora.yaml) |
+| Vision-Language Fine-Tuning (Qwen3.6-35B-A3B) | MedPix-VQA; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml) |
+| LoRA Fine-Tuning (Qwen3.6-35B-A3B) | MedPix-VQA; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_lora.yaml) |
+
+## Model Context
+
+Qwen3.6-27B combines a dense language model with a vision encoder for image-text-to-text tasks. Its decoder alternates three Gated DeltaNet layers with one full-attention layer. The properties below describe Qwen3.6-27B; Qwen3.6-35B-A3B is a separate MoE checkpoint.
+
+| Property | Value |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Qwen3_5ForConditionalGeneration` |
+| **Parameters** | 27B dense language model (upstream model size) |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 64 |
+| Hidden Size | 5,120 |
+| Attention | Full attention: 24 query heads and 4 key-value heads; Gated DeltaNet: 16 query/key heads and 48 value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
+
+All four recipes load pretrained weights, use Fully Sharded Data Parallel (FSDP2), and keep the vision tower frozen. Both LoRA recipes set `checkpoint.enabled: false`, so they do not save trained adapters. Enable checkpoint saving to retain them.
+
+The Qwen3.6-35B-A3B recipes use eight-way expert parallelism (`ep_size: 8`) with DeepEP (`dispatcher: deepep`). Install the `moe` extra for DeepEP; it is not included in `all`.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3.6-27B`](https://huggingface.co/Qwen/Qwen3.6-27B) | Checkpoint linked by the example recipe |
+| [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | Checkpoint linked by the example recipe |
+
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/config.json)

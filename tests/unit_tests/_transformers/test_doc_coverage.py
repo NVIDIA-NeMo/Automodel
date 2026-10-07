@@ -33,30 +33,17 @@ import pathlib
 # ready-to-run architecture table, and ``test_recipe_doc_coverage.py`` (arches
 # resolved from example YAMLs).
 _DOC_ARCH_ALIASES = {
-    # HF ships the class as ``BaiChuanForCausalLM`` (CamelCase) — registry
-    # uses ``BaichuanForCausalLM``. Documented on the Baichuan page.
-    "BaichuanForCausalLM": "BaiChuanForCausalLM",
     # HF upstream renamed ``Gemma3nForConditionalGeneration`` between releases;
     # the "Gemma 3n" variant is covered on the Gemma 3 VL page.
     "Gemma3nForConditionalGeneration": "Gemma 3n",
-    # Checkpoint-facing alias of ``KimiK25VLForConditionalGeneration``, covered
-    # by the Kimi-VL page.
-    "KimiK25ForConditionalGeneration": "Kimi-K25-VL",
-    "KimiK25VLForConditionalGeneration": "Kimi-K25-VL",
+    # The Kimi-K2.5 card uses the checkpoint-facing architecture name;
+    # the registry also accepts the internal implementation class name.
+    "KimiK25VLForConditionalGeneration": "KimiK25ForConditionalGeneration",
     # Retrieval/bi-encoder variants of Llama, covered on the GritLM page.
     "LlamaBidirectionalForSequenceClassification": "GritLM",
     "LlamaBidirectionalModel": "GritLM",
     # Multimodal retrieval variant covered by the existing NVIDIA Llama Nemotron embedding page.
     "LlamaNemotronVLModel": "llama-nemotron-embed-1b-v2",
-    # HF ships ``LlavaOnevisionForConditionalGeneration`` (lowercase "n");
-    # registry uses ``LlavaOneVisionForConditionalGeneration`` (the NVIDIA
-    # re-impl for LLaVA-OneVision-1.5 with RICE ViT).
-    "LlavaOneVisionForConditionalGeneration": "LlavaOnevisionForConditionalGeneration",
-    # Registry also exposes the NVIDIA LLaVA-OneVision-1.5 re-impl under the
-    # class name ``LLaVAOneVision1_5_ForConditionalGeneration`` (all-caps
-    # "LLaVA" + explicit "1_5_" infix). The same model is documented on the
-    # lmms-lab/llava-onevision page under ``LlavaOneVisionForConditionalGeneration``.
-    "LLaVAOneVision1_5_ForConditionalGeneration": "LlavaOneVisionForConditionalGeneration",
     # Ministral3 text model; covered on the Ministral3 / Ministral3-VL pages
     # that list the VLM arch ``Mistral3ForConditionalGeneration``.
     "Ministral3ForCausalLM": "Mistral3ForConditionalGeneration",
@@ -65,16 +52,8 @@ _DOC_ARCH_ALIASES = {
     # Mistral4 text model is the backbone of Mistral-Small-4 VLM; documented
     # on the Mistral-Small-4 page via the recipe path ``mistral4``.
     "Mistral4ForCausalLM": "mistral4",
-    # OLMo2 page uses the vendor-branded spelling ``OLMo2`` (all caps "OLM");
-    # HF normalized the class name to ``Olmo2``.
-    "Olmo2ForCausalLM": "OLMo2ForCausalLM",
-    # HF upstream added an extra underscore between "5" and "VL"
-    # (``Qwen2_5_VLForConditionalGeneration``); the Qwen2.5-VL page still uses
-    # the pre-rename spelling.
-    "Qwen2_5_VLForConditionalGeneration": "Qwen2_5VLForConditionalGeneration",
-    # Qwen3-Omni and Qwen3-VL are documented with the VL-facing arch name; the
-    # registry wires their MoE backbones under these keys.
-    "Qwen3OmniMoeForConditionalGeneration": "Qwen3OmniForConditionalGeneration",
+    # Qwen3-VL is documented with the VL-facing arch name; the registry wires
+    # its MoE backbone under this key.
     "Qwen3VLMoeForConditionalGeneration": "Qwen3VLForConditionalGeneration",
     # Qwen3.5-MoE text and VL entry points share the unified Qwen3.5 page.
     "Qwen3_5MoeForCausalLM": "Qwen3.5-MoE",
@@ -129,15 +108,15 @@ def test_every_model_card_has_architecture_reference_table():
     invalid = []
     for path, content in documents:
         reasons = []
-        if "## Model Reference" not in content:
-            reasons.append("missing '## Model Reference'")
-        if "### Model Architecture" not in content:
-            reasons.append("missing '### Model Architecture'")
+        if "## Model Context" not in content:
+            reasons.append("missing '## Model Context'")
         else:
-            architecture_section = content.split("### Model Architecture", maxsplit=1)[1]
-            architecture_section = architecture_section.split("\n##", maxsplit=1)[0]
+            architecture_section = content.split("## Model Context", maxsplit=1)[1]
+            architecture_section = architecture_section.split("\n## ", maxsplit=1)[0]
             if "| Property | Value |" not in architecture_section:
                 reasons.append("missing architecture Property/Value table")
+        if "## Model Reference" in content or "### Model Architecture" in content:
+            reasons.append("uses legacy nested Model Reference headings")
         if "### Model Summary" in content:
             reasons.append("uses legacy '### Model Summary' heading")
         if "### Available Checkpoints" in content:
@@ -180,7 +159,7 @@ def test_every_registered_arch_has_model_coverage_doc():
             f"{details}\n\n"
             "Fix by either:\n"
             "  1. Adding a new .mdx file under docs/model-coverage/ (preferred for "
-            "new architectures — e.g., docs/model-coverage/vlm/google/gemma4.mdx), or\n"
+            "new architectures — e.g., docs/model-coverage/vlm/google/gemma-4-31B-it.mdx), or\n"
             "  2. Updating an existing .mdx file to mention the arch name, or\n"
             "  3. Adding an entry to _DOC_ARCH_ALIASES in this test file with a "
             "comment explaining the mismatch."

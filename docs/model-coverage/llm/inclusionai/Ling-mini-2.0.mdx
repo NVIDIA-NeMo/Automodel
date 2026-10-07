@@ -1,0 +1,62 @@
+---
+title: "inclusionAI/Ling-mini-2.0"
+description: "Fine-tune inclusionAI/Ling-mini-2.0 with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/large-language-models/inclusionai/Ling-mini-2.0
+---
+
+[Ling 2.0](https://huggingface.co/collections/inclusionAI/ling-20) is the mixture-of-experts (MoE) large language model family from inclusionAI (Ant Group), using the Hugging Face model type `bailing_moe` and architecture `BailingMoeV2ForCausalLM`. The family spans a 16B mini model through a 1T flagship while sharing the same architecture.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+From the repository root, run low-rank adaptation (LoRA) fine-tuning on four GPUs, matching the recipe's expert parallelism (EP) setting of `distributed.ep_size: 4`:
+
+```bash
+automodel examples/llm_finetune/ling/ling_mini_2_0_squad.yaml --nproc-per-node 4
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; EP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_mini_2_0_squad.yaml) |
+| LoRA Fine-Tuning | HellaSwag; EP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_mini_2_0_hellaswag.yaml) |
+| Full Fine-Tuning | HellaSwag; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_mini_2_0_sft.yaml) |
+
+## Model Context
+
+Ling-mini-2.0 is a MoE model for text generation with 16B total parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (MoE) |
+| **Architecture** | `BailingMoeV2ForCausalLM` |
+| Parameters | 16B total |
+| Hugging Face Organization | [inclusionAI](https://huggingface.co/inclusionAI) |
+| Decoder Layers | 20 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 4 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 157,184 |
+| Experts | 256 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+- `BailingMoeV2ForCausalLM` (Hugging Face `model_type: "bailing_moe"`)
+- Grouped-query attention (GQA); `use_qk_norm: true`
+- Rotary position embeddings (RoPE) applied to half of each attention head (`partial_rotary_factor=0.5`)
+- DeepSeek-V3-style routing: sigmoid scoring, per-expert bias, grouped top-k (`n_group=8`, `topk_group=4`)
+- 1 shared expert at `moe_intermediate_size`
+- One initial dense multilayer perceptron (MLP) layer (`first_k_dense_replace=1`)
+
+## Available Models
+
+| Model | Hugging Face ID |
+|---|---|
+| Ling-mini-2.0 | [`inclusionAI/Ling-mini-2.0`](https://huggingface.co/inclusionAI/Ling-mini-2.0) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/inclusionAI/Ling-mini-2.0/blob/a810f6416bc4e1e29c9d7f271dd2fa7e56e71eab/config.json)

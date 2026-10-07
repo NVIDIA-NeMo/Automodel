@@ -1,0 +1,79 @@
+---
+# pragma: allowlist nextline secret - public Hugging Face checkpoint ID
+title: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+description: "Fine-tune nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/large-language-models/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+---
+
+[NVIDIA-Nemotron-3-Super-120B-A12B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `NemotronHForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, fine-tune on HellaSwag using 4 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node as described in [Recipe Setup](#recipe-setup), then run:
+
+```bash
+uv run torchrun --nnodes 4 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 4 nodes; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml) |
+| LoRA Training Benchmark | Synthetic data; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_super_v3_lora.yaml) |
+
+## Model Context
+
+NVIDIA-Nemotron-3-Super-120B-A12B-BF16 is used for text generation. Its model size is 123.61B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `NemotronHForCausalLM` |
+| Parameters | 123.61B checkpoint parameters |
+| Decoder Layers | 88 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Experts | 512 routed / 1 shared / 22 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+The full fine-tuning recipe uses Fully Sharded Data Parallel version 2 (FSDP2) with expert parallelism (EP) and the following settings.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 32 GPUs with 80 GB each, as specified by the recipe |
+| Strategy | FSDP2; `tp_size=1`, `cp_size=1`, `ep_size=32` |
+| Nodes | 4 |
+| Features | Checkpoint saving enabled; SafeTensors under `checkpoints/` |
+
+The LoRA benchmark initializes a model with `from_config` and uses synthetic data. It does not load pretrained weights, and checkpoint saving is disabled, so the run produces no saved adapter.
+
+### More Recipes for This Model
+
+- [`nemotron_super_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_super_v3_te_deepep.yaml)
+- [`nemotron_super_v3_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag_peft.yaml)
+
+### Recipe Setup
+
+Set `NODE_RANK` to a unique value from `0` to `3` on each node. Set `MASTER_ADDR` to node 0's hostname or IP address, reachable from every node. Run the Quick Start command on every node from the repository root using the same environment.
+
+The fine-tuning recipe loads the Hugging Face checkpoint and the `rowan/hellaswag` dataset. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16) | Pretrained weights for fine-tuning; configuration for benchmarks |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16/blob/2dc98e2afe4face0e4ce40972a915c45368bd34a/config.json)

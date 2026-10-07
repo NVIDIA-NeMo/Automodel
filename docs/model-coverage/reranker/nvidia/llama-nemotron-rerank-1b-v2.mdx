@@ -1,0 +1,79 @@
+---
+title: "nvidia/llama-nemotron-rerank-1b-v2"
+description: "Fine-tune nvidia/llama-nemotron-rerank-1b-v2 with NeMo AutoModel using a checked-in recipe, with checkpoint and architecture details."
+slug: model-coverage/reranking-models/nvidia/llama-nemotron-rerank-1b-v2
+---
+
+NeMo AutoModel provides a retrieval variant of [Meta's Llama](https://www.llama.com/) that defaults to bidirectional attention for reranking. This lets the query and document interact across the full sequence before a classification head produces a relevance score. Set `model.is_causal: true` to use causal attention. When the option is omitted, a saved text-config value takes precedence over the bidirectional default.
+
+For the bi-encoder variant, see [Llama (Bidirectional) for Embedding](/model-coverage/embedding-models/nvidia/llama-embed-nemotron-8b).
+
+## Quick Start
+
+Follow the [source installation instructions](/get-started/installation). From the repository root, run this example on one node with 8 GPUs. GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/retrieval/cross_encoder/llama_nemotron_rerank_1b_v2_finetune.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Reranker Fine-Tuning | FEVER and synthetic classification data; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/cross_encoder/llama_nemotron_rerank_1b_v2_finetune.yaml) |
+| Reranker Fine-Tuning (Llama-3.2-1B) | FEVER and synthetic classification data; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml) |
+
+## Model Context
+
+llama-nemotron-rerank-1b-v2 is used for reranking. Its model size is 1B parameters.
+
+| Property | Value |
+| --- | --- |
+| Tasks | Reranking |
+| **Architecture** | `LlamaBidirectionalForSequenceClassification` |
+| Parameters | 1B |
+| Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
+| Decoder Layers | 16 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 8,192 tokens ([upstream model card](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2/blob/828765652b05bd439c9789d2a6d093db1caa1443/README.md)) |
+| Configured Maximum Positions | 131,072 (`max_position_embeddings`) |
+| Vocabulary Size | 128,256 |
+| Checkpoint Dtype | `bfloat16` |
+
+### Reranking Models
+
+The cross-encoder path is used for pairwise relevance scoring and reranking.
+
+| **Architecture** | Task | Wrapper Class | Description |
+|---|---|---|---|
+| `LlamaBidirectionalForSequenceClassification` | Reranking | `NeMoAutoModelCrossEncoder` | Bidirectional Llama with classification head for relevance scoring |
+
+### Configure the Fine-Tuning Recipe
+
+The [fine-tuning recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/cross_encoder/llama_nemotron_rerank_1b_v2_finetune.yaml) loads pretrained `nvidia/llama-nemotron-rerank-1b-v2` weights and uses fully sharded data parallelism (FSDP2), `torch.optim.AdamW`, and FEVER and synthetic classification data. It sets `dtype: float32`, limits query-document pairs to 512 tokens, and runs for up to 100 steps. Checkpoint saving is enabled under `checkpoints/llama_nemotron_rerank_1b_v2`.
+
+### Train a Reranker from Llama 3.2 1B
+
+For this base-model example, follow the [source installation instructions](/get-started/installation) with the `cuda` extra for the Transformer Engine optimizer and the `dev` dependency group for the selected Liger kernels.
+
+Request access to the gated [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) checkpoint and wait for approval. Set `HF_TOKEN` in the runtime environment to a Hugging Face token with read access to that checkpoint. From the repository root, run:
+
+```bash
+uv run automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-node 8
+```
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Llama 3.2 1B | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) |
+| llama-nemotron-rerank-1b-v2 | [`nvidia/llama-nemotron-rerank-1b-v2`](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2) |
+
+## Related Resources
+
+NVIDIA trained and released the `Llama Nemotron Reranking 1B` model, optimized to produce a relevance logit score indicating how well a document matches a given query. The model was fine-tuned with a bidirectional attention mechanism for multilingual and cross-lingual question-answer retrieval, with support for long documents (up to 8,192 tokens).
+
+- [nvidia/llama-nemotron-rerank-1b-v2](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2)
+- [NeMo AutoModel Repository](https://github.com/NVIDIA-NeMo/Automodel)
+- [Checkpoint Configuration](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2/blob/828765652b05bd439c9789d2a6d093db1caa1443/config.json)

@@ -1,38 +1,60 @@
 ---
-title: "gpt-oss-120b"
-description: "Fine-tune gpt-oss-120b for text generation with NeMo AutoModel using checked-in recipes and documented distributed settings."
+title: "openai/gpt-oss-120b"
+description: "Fine-tune openai/gpt-oss-120b for text generation with NeMo AutoModel using checked-in recipes and documented distributed settings."
 slug: model-coverage/large-language-models/openai/gpt-oss-120b
 ---
 
 [GPT-OSS 120B](https://huggingface.co/openai/gpt-oss-120b) has a checked-in NeMo AutoModel recipe for text generation.
 The Hugging Face configuration declares the `GptOssForCausalLM` architecture.
 
-## Fine-Tune GPT-OSS 120B
+## Quick Start
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Complete the prerequisites in Model Context, then run this command from the repository root on each of 8 nodes with 8 GPUs per node:
 
 ```bash
-automodel examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml --nproc-per-node 8
+uv run torchrun --nnodes 8 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml
 ```
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ## Choose a Workflow
 
-| Goal | Start Here |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Pretrained weights; HellaSwag; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml) |
+| Training Benchmark | Initialized from configuration; synthetic data; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml) |
+
+## Model Context
+
+gpt-oss-120b is used for text generation. It has 117B total parameters, with 5.1B active per token.
+
+| Property | Value |
 | --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml). |
-| Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml). |
+| Task | Text generation |
+| **Architecture** | `GptOssForCausalLM` |
+| Decoder Layers | 36 |
+| Hidden Size | 2,880 |
+| Attention | 64 attention heads and 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 201,088 |
+| Experts | 128 routed experts; 4 selected per token |
+| Parameters | 117B total; 5.1B active per token |
+
+Before launching, follow the [installation instructions](/get-started/installation) and use the same checkout and environment, including HybridEP, on every node. Set `NODE_RANK` to a unique value from `0` through `7`. Set `MASTER_ADDR` to the rank-0 node's hostname or IP address, reachable from every node on port `29500`.
+
+EP64 means expert parallelism across 64 ranks. The recipe defaults to `step_scheduler.local_batch_size=8` and `global_batch_size=512`, which are compatible with 64 data-parallel ranks.
+
+Full fine-tuning loads pretrained weights and enables checkpoint saving. The benchmark initializes weights from configuration, uses synthetic data with `fake_balanced_gate=true`, and disables checkpoint saving.
 
 ### Configuration
 
 | Setting | Configuration |
 | --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=64 |
+| Hardware | 8 GPUs per node in the Quick Start example |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=64` |
 | Nodes | 8 |
-| Features | Checkpointing (enabled=true), HybridEP (dispatcher=hybridep) |
-| Advanced | experts=torch_mm, dispatcher=hybridep |
+| Features | Checkpoint saving (`enabled=true`), HybridEP (`dispatcher=hybridep`) |
+| Advanced | `experts=torch_mm`, `dispatcher=hybridep` |
 
 ### More Recipes for This Model
 
@@ -40,19 +62,13 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 - [`gptoss_120b_te_deepep_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep_gb200.yaml)
 - [`gptoss_120b_te_mxfp8_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml)
 
-## Model Reference
+## Available Models
 
-### Model Architecture
-
-| Property | Value |
+| Checkpoint | Type |
 | --- | --- |
-| Task | Text generation |
-| Architecture | `GptOssForCausalLM` |
-
-### Available Models
-
-- [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b)
+| [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b) | Checkpoint documented on this page |
 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+- [Checkpoint Configuration](https://huggingface.co/openai/gpt-oss-120b/blob/b5c939de8f754692c1647ca79fbf85e8c1e70f8a/config.json)

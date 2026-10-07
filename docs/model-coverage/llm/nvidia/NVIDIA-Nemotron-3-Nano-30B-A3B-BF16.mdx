@@ -1,0 +1,83 @@
+---
+title: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+description: "Use NeMo AutoModel to fine-tune nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+---
+
+[NVIDIA-Nemotron-3-Nano-30B-A3B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `NemotronHForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run this eight-GPU context parallelism test from the repository root.
+Review [Model Context](#model-context) for its settings and checkpoint-saving behavior.
+
+```bash
+uv run automodel examples/llm_finetune/nemotron/nemotron_nano_v3_cp_test.yaml \
+  --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning Test | HellaSwag; 10 steps; CP2; EP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_cp_test.yaml) |
+| Training Benchmark | Synthetic data; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_nano_v3_te_deepep.yaml) |
+
+## Model Context
+
+NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 is used for text generation. Its model size is 31.58B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `NemotronHForCausalLM` |
+| Parameters | 31.58B checkpoint parameters |
+| Decoder Layers | 52 |
+| Hidden Size | 2,688 |
+| Attention | 32 attention heads and 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Experts | 128 routed experts and 1 shared expert; 6 routed experts selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+The Quick Start recipe loads pretrained weights and runs 10 fine-tuning steps on HellaSwag. It sets `checkpoint.enabled: false`, so it does not save fine-tuned weights.
+The settings below describe this test; the eight-GPU launch is an example topology, not a hardware minimum.
+
+The benchmark recipe initializes the model from configuration and uses synthetic data with `fake_balanced_gate: true`. It also disables checkpoint saving.
+
+Context parallelism (CP) and expert parallelism (EP) use the sizes shown below. Tensor parallelism (TP) and pipeline parallelism (PP) remain at size 1.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | GPU model not specified in the YAML |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size=1`, `pp_size=1`, `cp_size=2`, `ep_size=4` |
+| Nodes | Not specified in the YAML |
+| Features | Transformer Engine |
+| Advanced | `model.backend.attn: te` |
+
+### More Recipes for This Model
+
+- [`nemotron_nano_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_nano_v3_te_deepep.yaml)
+- [`customizer_nemotron_nano_full_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft.yaml)
+- [`customizer_nemotron_nano_full_sft_chat.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft_chat.yaml)
+- [`customizer_nemotron_nano_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/customizer_nemotron_nano_peft.yaml)
+- [`customizer_nemotron_nano_peft_packing.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/customizer_nemotron_nano_peft_packing.yaml)
+- [`nemotron_nano_v3_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml)
+- [`nemotron_nano_v3_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag_peft.yaml)
+- [`nemotron_nano_v3_hellaswag_peft_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag_peft_te.yaml)
+- [`nemotron_nano_v3_singlegpu_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_singlegpu_lora.yaml)
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/blob/bf77c3174f68ad409e1c2aa60daeb46e32d1c606/config.json)

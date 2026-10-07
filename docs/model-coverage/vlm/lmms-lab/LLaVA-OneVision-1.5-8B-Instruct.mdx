@@ -1,0 +1,66 @@
+---
+title: "lmms-lab/LLaVA-OneVision-1.5-8B-Instruct"
+description: "Use NeMo AutoModel to fine-tune lmms-lab/LLaVA-OneVision-1.5-8B-Instruct for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct
+---
+
+[LLaVA-OneVision-1.5-8B-Instruct](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `LLaVAOneVision1_5_ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and [recipe prerequisites](#workflow-notes). In your installed environment, run low-rank adaptation (LoRA) fine-tuning on `quintend/rdr-items` from the repository root. This example uses eight GPUs on one node:
+
+```bash
+automodel examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | RDR Items; 8-GPU example | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml) |
+
+## Model Context
+
+LLaVA-OneVision-1.5-8B-Instruct is used for image-text-to-text. Its model size is 8.53B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `LLaVAOneVision1_5_ForConditionalGeneration` |
+| Parameters | 8.53B checkpoint parameters |
+| Decoder Layers | 36 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs in the example launch; GPU model and memory unspecified |
+| Strategy | FSDP2; `tp_size=1`, `cp_size=1` |
+| Nodes | 1 in the example launch |
+| Features | Checkpoint saving (`enabled=true`), LoRA |
+| Attention Backend | FlashAttention 2 (`attn_implementation: flash_attention_2`) |
+
+### Workflow Notes
+
+The recipe selects FlashAttention 2, which requires the `fa` extra in addition to the VLM dependencies. For a source installation, add `--extra fa` to the installation guide's `uv sync` command. The `fa` extra is excluded from `all`.
+
+The recipe loads pretrained weights and trains on image descriptions from `quintend/rdr-items`. It saves checkpoints under `checkpoints/`. The eight-GPU launch is an example topology; the recipe does not specify a minimum GPU memory requirement.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`lmms-lab/LLaVA-OneVision-1.5-8B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct) | Pretrained checkpoint for LoRA fine-tuning |
+
+## Related Resources
+
+- [Gemma 3n fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct/blob/e137910552d616eb0f7305147ca054311a90c542/config.json)

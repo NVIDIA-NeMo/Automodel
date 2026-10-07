@@ -1,0 +1,64 @@
+---
+title: "tiiuae/Falcon-H1-0.5B-Instruct"
+description: "Use NeMo AutoModel to fine-tune tiiuae/Falcon-H1-0.5B-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/tiiuae/Falcon-H1-0.5B-Instruct
+---
+
+[Falcon-H1-0.5B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-0.5B-Instruct) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `FalconH1ForCausalLM` architecture.
+
+## Quick Start
+
+After [installing NeMo AutoModel](/get-started/installation), run full fine-tuning on SQuAD from the repository root. This example launches on one node with eight GPUs:
+
+```bash
+automodel examples/llm_finetune/falcon/falcon_h1_0p5b_instruct_squad.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD; 1 node, 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_0p5b_instruct_squad.yaml) |
+
+## Model Context
+
+Falcon-H1-0.5B-Instruct is used for text generation. Its model size is 521.4M checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `FalconH1ForCausalLM` |
+| Parameters | 521.4M checkpoint parameters |
+| Decoder Layers | 36 |
+| Hidden Size | 1,024 |
+| Attention | 8 attention heads / 2 key-value heads |
+| Context Length | 16,384 tokens (checkpoint configuration) |
+| Vocabulary Size | 32,784 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs (example launch); GPU model unspecified |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size=1`, `cp_size=1` |
+| Nodes | 1 |
+| Features | - |
+| Advanced | `bf16` |
+
+### Workflow Notes
+
+The recipe loads pretrained weights and fine-tunes on the SQuAD training split for 100 steps.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`tiiuae/Falcon-H1-0.5B-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-0.5B-Instruct) | Pretrained checkpoint for full fine-tuning |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/tiiuae/Falcon-H1-0.5B-Instruct/blob/8f2587ca06bff78d8fa1adfccbe8c24d5f86b368/config.json)

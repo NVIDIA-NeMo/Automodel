@@ -1,0 +1,69 @@
+---
+title: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+description: "Use Qwen/Qwen3-Omni-30B-A3B-Instruct with NeMo AutoModel for multimodal fine-tuning, with documented checkpoints, runnable recipes, setup, and model reference details."
+slug: model-coverage/omni/qwen/Qwen3-Omni-30B-A3B-Instruct
+---
+
+[Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) accepts text, images, audio, and video through a mixture-of-experts (MoE) Thinker-Talker architecture. NeMo AutoModel fine-tunes its Thinker stack for vision-language tasks and automatic speech recognition (ASR).
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Fine-tune the pretrained Thinker language model on MedPix-VQA with eight GPUs and eight-way expert parallelism (EP8). Review the [recipe prerequisites](#recipe-prerequisites), then run from the repository root:
+
+```bash
+uv run --extra all --extra moe --extra vlm-media automodel --nproc-per-node=8 examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml) |
+| Speech Recognition Fine-Tuning | AMI meeting corpus; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml) |
+| Speech Recognition Fine-Tuning | English ASR mixture; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/multi_en_sft.yaml) |
+
+## Model Context
+
+The upstream checkpoint includes both Thinker and Talker components; NeMo AutoModel loads the Thinker component. The parameter total below describes the full checkpoint, while the decoder dimensions describe the Thinker text stack (`thinker_config.text_config`).
+
+| Property | Value |
+| --- | --- |
+| Task | Vision-language fine-tuning and speech recognition |
+| **Architecture** | `Qwen3OmniMoeForConditionalGeneration` (checkpoint) |
+| Parameters | Approximately 35.26B in the full checkpoint (Hugging Face metadata) |
+| Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 48 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads and 4 key-value heads |
+| Context Length | 65,536 tokens (checkpoint configuration) |
+| Vocabulary Size | 152,064 |
+| Experts | 128 routed experts; 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Prerequisites
+
+All three recipes select Transformer Engine linear layers and DeepEP dispatch. The Quick Start includes the `all`, `moe`, and `vlm-media` installation extras: `moe` supplies DeepEP, and `vlm-media` supplies the `qwen_omni_utils` preprocessing dependency.
+
+The Quick Start loads pretrained weights and freezes the vision and audio towers. Its YAML sets `checkpoint.enabled: false`, so it does not save trained weights. Enable checkpoint saving to retain the fine-tuned model. The two ASR recipes train the audio tower and language model and enable checkpoint saving.
+
+For the English ASR mixture, accept the GigaSpeech and SPGISpeech dataset terms before launching. Follow the ASR guide below for dataset access and preparation.
+
+### Fine-Tuning
+
+See the [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) for the shared MedPix data workflow and the
+[Qwen3-Omni ASR Fine-Tuning Guide](/recipes-e2e-examples/qwen3-omni-asr).
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Qwen3-Omni 30B A3B Instruct | [`Qwen/Qwen3-Omni-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) |
+
+## Related Resources
+
+- [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/26291f793822fb6be9555850f06dfe95f2d7e695/config.json)
+- [Checkpoint Parameter Metadata](https://huggingface.co/api/models/Qwen/Qwen3-Omni-30B-A3B-Instruct/revision/26291f793822fb6be9555850f06dfe95f2d7e695)

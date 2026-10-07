@@ -1,0 +1,63 @@
+---
+title: "openbmb/MiniCPM5-1B"
+description: "Fine-tune openbmb/MiniCPM5-1B with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context, with setup guidance."
+slug: model-coverage/large-language-models/openbmb/MiniCPM5-1B
+---
+
+[MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B/blob/87179e5c1f455ef22e6223592d2d61351b525bfc/README.md) is a compact, dense language model from OpenBMB for text generation. Use the recipes below for full fine-tuning or low-rank adaptation (LoRA) on the Stanford Question Answering Dataset (SQuAD).
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+These commands use eight GPUs on one node. From the repository root, run either workflow:
+
+```bash
+# Full fine-tuning
+uv run automodel examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml --nproc-per-node 8
+
+# LoRA fine-tuning
+uv run automodel examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml) |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml) |
+
+## Model Context
+
+MiniCPM5-1B is a dense model for text generation with approximately 1.08 billion parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| Architecture | `LlamaForCausalLM` |
+| Parameters | 1,080,632,832 |
+| Hugging Face Organization | [openbmb](https://huggingface.co/openbmb) |
+| Decoder Layers | 24 |
+| Hidden Size | 1,536 |
+| Attention | 16 attention heads and 2 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 130,560 |
+| Configured Dtype | `bfloat16` |
+
+### Workflow Notes
+
+Both recipes load pretrained weights from `openbmb/MiniCPM5-1B` and fine-tune on SQuAD for 100 steps using fully sharded data parallelism (FSDP2).
+
+The LoRA recipe sets `checkpoint.enabled: false`, so it does not save trained adapters. Set `enabled: true` in its `checkpoint` block to retain the training output. The full fine-tuning recipe uses the default checkpoint saving configuration.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| MiniCPM5 1B | [`openbmb/MiniCPM5-1B`](https://huggingface.co/openbmb/MiniCPM5-1B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/openbmb/MiniCPM5-1B/blob/87179e5c1f455ef22e6223592d2d61351b525bfc/config.json)

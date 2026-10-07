@@ -1,0 +1,76 @@
+---
+title: "Qwen/Qwen3-32B"
+description: "Use NeMo AutoModel to fine-tune Qwen/Qwen3-32B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/qwen/Qwen3-32B
+---
+
+[Qwen3-32B](https://huggingface.co/Qwen/Qwen3-32B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Qwen3ForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and check the [recipe prerequisites](#model-context). From the repository root, run full fine-tuning on Tulu-3:
+
+```bash
+automodel examples/llm_finetune/qwen/qwen3_32b_tulu3.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Tulu-3; 1 node, 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_32b_tulu3.yaml) |
+| Full Fine-Tuning | Tulu-3; 1 node, 8 GPUs; context parallelism (`cp_size=2`) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_32b_tulu3_cp2.yaml) |
+
+## Model Context
+
+Qwen3-32B is used for text generation. Its model size is 32.76B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `Qwen3ForCausalLM` |
+| Parameters | 32.76B checkpoint parameters |
+| Decoder Layers | 64 |
+| Hidden Size | 5,120 |
+| Attention | 64 attention heads and 8 key-value heads |
+| Context Length | 40,960 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+The following settings describe the Quick Start recipe. Both Tulu-3 recipes load pretrained weights and run 100 training steps. They set `checkpoint.enabled: false`, so they do not save fine-tuned checkpoints.
+
+The recipes require `cut-cross-entropy` for `FusedLinearCrossEntropy`. This package is in the `dev` dependency group, outside the base install and standard `all` extra. For a source installation, use the installation guide's developer setup and activate the environment:
+
+```bash
+uv sync --locked --all-groups --extra all
+source .venv/bin/activate
+```
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | Example setup: 8 H100 or A100 GPUs with 80 GB each |
+| Strategy | Fully Sharded Data Parallel v2 (FSDP2); `tp_size=1`, `pp_size=1`, `cp_size=1` |
+| Nodes | 1 |
+| Features | Activation checkpointing (`activation_checkpointing=true`) |
+| Advanced | Sequence length: 2,048 tokens |
+
+### More Recipes for This Model
+
+- [`qwen3_32b_coderforge_cp16_128k_lowerLR.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/qwen3_32b/qwen3_32b_coderforge_cp16_128k_lowerLR.yaml)
+
+This long-context recipe documents 16 nodes and 128 GPUs. Prepare its local CoderForge training and validation files, and replace the placeholder checkpoint directory before running it.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3-32B`](https://huggingface.co/Qwen/Qwen3-32B) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-32B/blob/9216db5781bf21249d130ec9da846c4624c16137/config.json)

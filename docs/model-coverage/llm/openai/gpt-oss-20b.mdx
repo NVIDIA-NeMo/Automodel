@@ -1,0 +1,59 @@
+---
+title: "openai/gpt-oss-20b"
+description: "Use openai/gpt-oss-20b with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/large-language-models/openai/gpt-oss-20b
+---
+
+[GPT-OSS](https://huggingface.co/openai/gpt-oss-20b) is OpenAI's open-weight model family featuring QuickGELU activations and activation clamping for training stability.
+
+The documented workflows cover full-parameter fine-tuning, low-rank adaptation (LoRA), packed sequences, and a DGX Spark LoRA configuration.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+This example uses eight GPUs. From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; eight-way expert parallelism (EP8) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml) |
+| LoRA Fine-Tuning | HellaSwag; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_peft.yaml) |
+| Full Fine-Tuning (Packed Sequences) | HellaSwag; EP8; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml) |
+| LoRA Fine-Tuning | HellaSwag; DGX Spark | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_single_gpu_peft.yaml) |
+
+## Model Context
+
+gpt-oss-20b is used for text generation. Its model size is 21B total / 3.6B active parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `GptOssForCausalLM` |
+| Parameters | 21B total / 3.6B active |
+| Hugging Face Organization | [openai](https://huggingface.co/openai) |
+| Decoder Layers | 24 |
+| Hidden Size | 2,880 |
+| Attention | 64 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 201,088 |
+| Experts | 32 routed / 4 selected per token |
+
+The recipes load pretrained `openai/gpt-oss-20b` weights and train on HellaSwag. The packed-sequence recipe sets `checkpoint.enabled: false`, so it does not save the fine-tuned model.
+
+## Available Models
+
+| Model | Hugging Face ID |
+|---|---|
+| GPT-OSS 20B | [`openai/gpt-oss-20b`](https://huggingface.co/openai/gpt-oss-20b) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/openai/gpt-oss-20b/blob/6cee5e81ee83917806bbde320786a8fb61efebee/config.json)

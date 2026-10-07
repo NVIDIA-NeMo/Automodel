@@ -1,6 +1,6 @@
 ---
-title: "gpt2"
-description: "Pretrain gpt2 with NeMo AutoModel using a documented checkpoint, runnable recipe, setup guidance, model reference details, and links to the pretraining guide."
+title: "openai-community/gpt2"
+description: "Pretrain GPT-2 from its openai-community/gpt2 configuration with NeMo AutoModel using prepared Megatron data and the provided recipe."
 slug: model-coverage/large-language-models/openai-community/gpt2
 ---
 
@@ -8,32 +8,49 @@ slug: model-coverage/large-language-models/openai-community/gpt2
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Pretrain gpt2
+## Quick Start
 
-From the repository root, run:
+Follow the [installation instructions](/get-started/installation) and complete the [recipe setup](#recipe-setup). From the repository root, launch this example on one node with 8 GPUs.
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_pretrain/megatron_pretrain_gpt2.yaml
+uv run automodel examples/llm_pretrain/megatron_pretrain_gpt2.yaml --nproc-per-node 8
 ```
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Megatron pretraining smoke test - GPT-2 on FineWeb-Edu | Use [megatron_pretrain_gpt2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_gpt2.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Pretraining | Prepared Megatron data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_gpt2.yaml) |
 
-## Model Reference
+## Model Context
 
-### Model Architecture
+GPT-2 is a 124M-parameter text generation model. This recipe initializes it from the `openai-community/gpt2` configuration using `NeMoAutoModelForCausalLM.from_config`, without loading pretrained weights. Checkpoint saving is enabled, with `torch_save` output under `checkpoints/`.
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (pretraining baseline) |
-| Architecture | `GPT2LMHeadModel` |
+| **Architecture** | `GPT2LMHeadModel` |
 | Parameters | 124M |
 | Hugging Face Organization | [openai-community](https://huggingface.co/openai-community) |
+| Decoder Layers | 12 |
+| Hidden Size | 768 |
+| Attention | 12 attention heads |
+| Context Length | 1,024 tokens (checkpoint configuration) |
+| Vocabulary Size | 50,257 |
 
-### Available Models
+### Recipe Setup
+
+Before launching [megatron_pretrain_gpt2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_gpt2.yaml):
+
+1. Use an environment with Transformer Engine for the configured `FusedAdam` optimizer.
+2. Prepare Megatron-format data with the `openai-community/gpt2` tokenizer, following the [LLM Pretraining Guide](/recipes-e2e-examples/pretraining).
+3. In both `dataset` and `validation_dataset`, replace `paths` with your prepared data paths and set `index_mapping_dir` to a writable directory for index mappings.
+
+### Workflow Notes
+
+The launch example uses one node with 8 GPUs. The recipe uses fully sharded data parallelism (FSDP2), a global batch size of 512, and a local batch size of 32. Tensor and context parallel sizes are both 1.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -42,3 +59,5 @@ uv run automodel --nproc-per-node=8 examples/llm_pretrain/megatron_pretrain_gpt2
 ## Related Resources
 
 - [LLM Pretraining Guide](/recipes-e2e-examples/pretraining)
+
+- [Checkpoint Configuration](https://huggingface.co/openai-community/gpt2/blob/607a30d783dfa663caf39e06633721c8d4cfcd7e/config.json)

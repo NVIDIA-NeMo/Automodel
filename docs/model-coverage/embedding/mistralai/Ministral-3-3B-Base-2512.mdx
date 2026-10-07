@@ -1,0 +1,138 @@
+---
+title: "mistralai/Ministral-3-3B-Base-2512"
+description: "Fine-tune mistralai/Ministral-3-3B-Base-2512 text embeddings with NeMo AutoModel, with related BF16 instruct recipes for multimodal retrieval and reranking."
+slug: model-coverage/embedding-models/mistralai/Ministral-3-3B-Base-2512
+---
+
+For text-only retrieval, NeMo AutoModel loads [Mistral AI's Ministral 3](https://mistral.ai/news/mistral-3/) with the stock Hugging Face `Ministral3Model` and configurable text attention for embedding and dense retrieval tasks. It defaults to `is_causal: false`, so each token can attend to both past and future tokens without requiring a custom model implementation.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/retrieval/bi_encoder/ministral_3_3b_base_2512_finetune.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Embedding Fine-Tuning | FEVER and synthetic classification data; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/bi_encoder/ministral_3_3b_base_2512_finetune.yaml) |
+| Multimodal Embedding Fine-Tuning | Custom corpus-ID JSON; 8-GPU example; BF16 instruct checkpoint | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/mistral3_vl_embedding.yaml) |
+| Multimodal Reranker Fine-Tuning | Custom corpus-ID JSON; 8-GPU example; BF16 instruct checkpoint | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/cross_encoder/mistral3_vl_reranker.yaml) |
+
+## Model Context
+
+The text-only recipe uses Ministral-3-3B-Base-2512 for dense retrieval. The multimodal recipes use the BF16 instruct checkpoint with its Pixtral vision tower. The dimensions below describe the base checkpoint's text backbone.
+
+| Property | Value |
+| --- | --- |
+| Tasks | Embedding, Dense Retrieval, Reranking |
+| **Architecture** | `Ministral3Model` for text-only retrieval; `Mistral3BidirectionalModel` for vision-language retrieval; `Ministral3BidirectionalModel` (legacy) |
+| Parameters | 3B |
+| Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
+| Decoder Layers | 26 |
+| Hidden Size | 3,072 |
+| Attention | 32 attention heads and 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Checkpoint Dtype | `bfloat16` (the text-only recipe loads `float32`) |
+
+### Model Overview
+
+Text-only `ministral3` checkpoints load directly. For vision-language model (VLM) checkpoints such as `mistralai/Ministral-3-3B-Base-2512` and `mistralai/Ministral-3-3B-Instruct-2512`, the default retrieval path retains the vision tower. Set `model.extract_submodel: language_model` to train a text-only encoder instead. The Quick Start recipe already includes this setting. The custom `Ministral3BidirectionalModel` remains available through the legacy `ministral3_bidirec` model type for compatibility with existing checkpoints.
+
+For multimodal retrieval training, the registered `Mistral3BidirectionalModel` combines the Pixtral vision tower with a bidirectional Ministral3 language tower. `Mistral3VLBidirectionalForSequenceClassification` adds the corresponding reranking head.
+
+### Embedding Models
+
+The bi-encoder supports text-only and multimodal embedding generation and dense retrieval.
+
+| **Architecture** | Task | Auto Class | Description |
+|---|---|---|---|
+| `Ministral3Model` with `is_causal: false` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Preferred stock Hugging Face path with configurable attention |
+| `Ministral3BidirectionalModel` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Legacy compatibility path for text-only retrieval checkpoints |
+| `Mistral3BidirectionalModel` | Multimodal Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/_transformers/auto_model.py#L1289) | Pixtral vision tower with a bidirectional Ministral3 language tower |
+
+For multimodal cross-encoder scoring, `mistral3` checkpoints with a Ministral3 text tower use `Mistral3VLBidirectionalForSequenceClassification`. Text-only `ministral3` checkpoints continue to use Hugging Face `Ministral3ForSequenceClassification`. The legacy `ministral3_bidirec` type does not provide a cross-encoder scoring class.
+
+### Attention Mode
+
+Set `model.is_causal` to `true` or `false` in the bi-encoder recipe. An explicit value takes precedence over the
+saved text-config value; when neither exists, the model defaults to bidirectional attention. The resolved value is saved
+with the checkpoint. Changing the policy changes embeddings, so regenerate stored corpus embeddings before querying
+with the updated model.
+
+### Pooling Strategies
+
+The bi-encoder supports multiple pooling strategies to aggregate token representations into a single embedding vector:
+
+| Strategy | Description |
+|---|---|
+| `avg` | Average of non-padding token hidden states (default) |
+| `cls` | Hidden state at the first sequence position (zero if it is padding) |
+| `last` | Last non-padding token hidden state |
+| `weighted_avg` | Sum of non-padding token hidden states |
+
+### Recipe Setup
+
+The [text-only fine-tuning recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/bi_encoder/ministral_3_3b_base_2512_finetune.yaml) uses average pooling with L2 normalization and trains for up to 100 steps. Query and passage lengths are each limited to 512 tokens.
+
+### Train Multimodal Embeddings or Rerankers
+
+Both multimodal recipes load `mistralai/Ministral-3-3B-Instruct-2512-BF16`. They configure FlashAttention 2, Liger kernels, and Transformer Engine's `FusedAdam` optimizer, so those dependencies must be available in your training environment.
+
+1. Clone and install from source, following the [installation instructions](/get-started/installation):
+
+   ```bash
+   git clone https://github.com/NVIDIA-NeMo/Automodel.git
+   cd Automodel
+   uv sync --locked --all-groups --all-extras
+   ```
+
+2. Prepare your retrieval dataset using the [corpus-ID JSON format](/datasets/retrieval-dataset#corpus-id-based-json) to associate each query with positive and negative document IDs. Include the referenced corpus and its `merlin_metadata.json` file, with a corpus class that matches your document format. These recipes do not require a particular dataset.
+
+   In the recipe you select, replace `dataset.data_dir_list[0].path` with the path to your training JSON file. The example path `<DATASETS_PATH>/retrieval/train.json` is a placeholder, not a bundled dataset.
+
+   Both examples set `use_text_in_document: true`, so image documents include available companion text. Multimodal mining includes each document's available image and text content and uses the checkpoint's saved prompts, sequence limits, and image preprocessing. Text-only documents retain their text. Use the same document inputs when mining, training, and evaluating an embedding model.
+
+3. From the repository root, run the command for your selected workflow. These examples launch on 8 GPUs; adjust `--nproc-per-node` to the number of GPUs available and validate memory use on your hardware.
+
+   ```bash
+   # Multimodal embedding fine-tuning
+   uv run automodel examples/retrieval/bi_encoder/mistral3_vl_embedding.yaml --nproc-per-node 8
+   ```
+
+   ```bash
+   # Multimodal reranker fine-tuning
+   uv run automodel examples/retrieval/cross_encoder/mistral3_vl_reranker.yaml --nproc-per-node 8
+   ```
+
+### Configure Reranker Temperature and Tower Freezing
+
+The reranker's scoring projection and `model.temperature` scaling run in FP32, including under BF16 autocast. The recipe also computes cross entropy in FP32. Keep the top-level `temperature: 1.0` when using a non-unit model temperature; setup rejects two active temperature sources.
+
+To freeze model towers, use the top-level `freeze_config` section. Setting `freeze_vision_tower: true` and `freeze_language_model: true` within that section leaves the projector and, for reranking, the scoring head trainable:
+
+```yaml
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: true
+```
+
+## Available Models
+
+| Model | Hugging Face ID |
+|---|---|
+| Ministral-3 3B Base | [`mistralai/Ministral-3-3B-Base-2512`](https://huggingface.co/mistralai/Ministral-3-3B-Base-2512) |
+| Ministral-3 3B Instruct | [`mistralai/Ministral-3-3B-Instruct-2512`](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512) |
+| Ministral-3 3B Instruct BF16 | [`mistralai/Ministral-3-3B-Instruct-2512-BF16`](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-BF16) |
+
+## Related Resources
+
+- [NeMo AutoModel Repository](https://github.com/NVIDIA-NeMo/Automodel)
+- [Nemotron 3 Embed End-to-End Fine-Tuning Recipe (Text)](https://github.com/NVIDIA-NeMo/Nemotron/blob/main/docs/nemotron/embed/README.md)
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Ministral-3-3B-Base-2512/blob/6f9c4b12a95b139af68670a6713616b757923735/config.json)
