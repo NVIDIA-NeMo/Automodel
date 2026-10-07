@@ -2121,7 +2121,8 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
         batch = processor.process_queries_documents_crossencoder(features)
         model_inputs = {key: value for key, value in batch.items() if key != "labels"}
         with torch.no_grad():
-            expected = encoder.model(**model_inputs).logits
+            # The export intentionally omits the temperature applied during training.
+            expected = encoder.model(**model_inputs).logits * config.temperature
         if consolidated:
             from safetensors.torch import save_file
 
@@ -2155,12 +2156,15 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
 
         dense_weight = load_file(export_dir / "2_Dense/model.safetensors")["linear.weight"]
         torch.testing.assert_close(
-            dense_weight, encoder.model.score.weight.float() / config.temperature, rtol=0, atol=0
+            dense_weight, encoder.model.score.weight.float(), rtol=0, atol=0
         )
         saved_config = json.loads((export_dir / "config.json").read_text())
         assert saved_config["model_type"] == "mistral3"
         assert saved_config["text_config"]["model_type"] == "ministral3"
-        assert saved_config["score_temperature"] == config.temperature
+        for subconfig in (saved_config, saved_config["text_config"], saved_config["vision_config"]):
+            assert "temperature" not in subconfig
+            assert "score_temperature" not in subconfig
+        assert encoder.effective_score_temperature == 0.02
         assert saved_config["auto_map"] == {
             "AutoModelForSequenceClassification": "model.Mistral3ForSequenceClassification"
         }
@@ -2169,7 +2173,7 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
         restored = NeMoAutoModelCrossEncoder.from_pretrained(
             str(export_dir), attn_implementation="eager", use_liger_kernel=False, use_sdpa_patching=False,
         ).cpu().eval()
-        assert restored.effective_score_temperature == config.temperature
+        assert restored.effective_score_temperature == 1.0
         torch.testing.assert_close(restored(**model_inputs).logits, expected, rtol=1e-5, atol=1e-7)
         torch.save(
             {"inputs": model_inputs, "logits": expected, "state": encoder.model.state_dict()},
@@ -2383,9 +2387,9 @@ def test_mistral3_reranker_checkpointer_preserves_trained_head_dtype(tmp_path):
     assert head.dtype == torch.float32
     torch.testing.assert_close(head, expected_head, rtol=0, atol=0)
     dense = load_file(exported / "2_Dense/model.safetensors")["linear.weight"]
-    torch.testing.assert_close(dense, head / config.temperature, rtol=0, atol=0)
+    torch.testing.assert_close(dense, head, rtol=0, atol=0)
     restored = CrossEncoderModel.build(str(exported), attn_implementation="eager").eval()
-    assert restored.effective_score_temperature == config.temperature
+    assert restored.effective_score_temperature == 1.0
     torch.testing.assert_close(restored.model.score.weight, expected_head, rtol=0, atol=0)
 
 
@@ -2422,7 +2426,7 @@ def _reranker_sharded_export_worker(rank: int, init_file: str, output_dir: str) 
             tokenizer=processor,
         )
         dense = load_file(Path(output_dir) / "2_Dense/model.safetensors")["linear.weight"]
-        torch.testing.assert_close(dense, head / config.temperature, rtol=0, atol=0)
+        torch.testing.assert_close(dense, head, rtol=0, atol=0)
         torch.testing.assert_close(encoder.model.score.weight.full_tensor(), head, rtol=0, atol=0)
     finally:
         torch.distributed.destroy_process_group()

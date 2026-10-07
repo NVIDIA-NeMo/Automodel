@@ -69,7 +69,7 @@ class Mistral3ForSequenceClassification(Mistral3PreTrainedModel):
             **kwargs: Additional Mistral3Model inputs, following its forward tensor contract.
 
         Returns:
-            Classifier output with FP32 logits of shape [batch, num_labels].
+            Classifier output with raw, unscaled FP32 logits of shape [batch, num_labels].
         """
         if attention_mask is None:
             raise ValueError("attention_mask is required for sequence pooling.")
@@ -86,5 +86,5 @@ class Mistral3ForSequenceClassification(Mistral3PreTrainedModel):
         hidden = outputs.last_hidden_state
         pooled = hidden.masked_fill(~attention_mask[..., None].bool(), 0).sum(1) / attention_mask.sum(1)[:, None]
         with torch.autocast(device_type=pooled.device.type, enabled=False):
-            logits = nn.functional.linear(pooled.float(), self.score.weight.float()) / self.config.score_temperature
+            logits = nn.functional.linear(pooled.float(), self.score.weight.float())
         return SequenceClassifierOutputWithPast(logits=logits)

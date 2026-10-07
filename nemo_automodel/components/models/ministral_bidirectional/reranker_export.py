@@ -15,7 +15,6 @@
 """Portable checkpoint export for the Mistral3 pooled reranker."""
 
 import json
-import math
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -106,9 +105,6 @@ class Mistral3RerankerMetadataExporter:
         """Validate the export and collectively snapshot the small trained head before rank-zero I/O."""
         if self.model.config.pooling != "avg":
             raise ValueError("Portable Mistral3 reranker export requires mean pooling (pooling=avg).")
-        temperature = self.model.effective_score_temperature
-        if not math.isfinite(temperature) or temperature <= 0:
-            raise ValueError("Reranker score temperature must be finite and positive.")
         if not isinstance(tokenizer, PixtralProcessor) or not tokenizer.chat_template:
             raise ValueError("Mistral3 reranker export requires a Pixtral processor with a chat template.")
         if type(tokenizer) is PixtralProcessor:
@@ -122,7 +118,9 @@ class Mistral3RerankerMetadataExporter:
         weight = self.model.score.weight.detach()
         if isinstance(weight, DTensor):
             weight = weight.full_tensor()
-        self.dense_weight = (weight.to(device="cpu", dtype=torch.float32) / temperature).contiguous()
+        # Export raw scores; temperature belongs to the training configuration.
+        # copy=True keeps a CPU FP32 parameter from aliasing this snapshot.
+        self.dense_weight = weight.to(device="cpu", dtype=torch.float32, copy=True).contiguous()
 
     def save_model_assets(self, directory: str | Path) -> None:
         """Write stock configs and the small standalone Transformers scoring adapter."""
@@ -134,10 +132,11 @@ class Mistral3RerankerMetadataExporter:
         config.architectures = ["Mistral3ForSequenceClassification"]
         config.text_config.architectures = ["Ministral3ForSequenceClassification"]
         config.auto_map = {"AutoModelForSequenceClassification": "model.Mistral3ForSequenceClassification"}
-        config.score_temperature = self.model.effective_score_temperature
-        # Generation temperature must never substitute for the scoring divisor.
-        if hasattr(config, "temperature"):
-            del config.temperature
+        # Do not carry training or generation temperatures into the inference export.
+        for subconfig in (config, config.text_config, config.vision_config):
+            for name in ("temperature", "score_temperature"):
+                if hasattr(subconfig, name):
+                    delattr(subconfig, name)
         config.is_causal = config.text_config.is_causal
         config.save_pretrained(directory)
         shutil.copyfile(Path(__file__).with_name("reranker_model.py"), directory / "model.py")
