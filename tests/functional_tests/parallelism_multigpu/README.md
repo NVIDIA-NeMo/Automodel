@@ -21,6 +21,10 @@ residuals, activation checkpointing, MTP depth 0/1, and sequence lengths 16/24.
 The four-layer model has width 64 and vocabulary 64. PP4 exercises interior
 pipeline stages. BF16 projections and FP32 residuals coexist in the same run;
 the FP32 cases do not mean full-FP32 compute.
+Stage boundaries explicitly check FP32/BF16 residual and BF16 embedding
+dtypes. Final MTP states stay on the last stage and follow the unpartitioned
+model's dtype: CUDA autocast may promote their final Torch RMSNorm to FP32
+even with BF16 residuals.
 
 The tiny Llama recipe adds tensor parallelism and context parallelism, using
 TE attention when CP is enabled. Sequence parallelism is disabled: the PP2/TP2

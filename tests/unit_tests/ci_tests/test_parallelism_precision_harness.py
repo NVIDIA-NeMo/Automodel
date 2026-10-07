@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from tests.functional_tests.parallelism.compare_parallel_parity import main, read_metrics
+from tests.functional_tests.parallelism_multigpu.recipe_parity import compare_recipe_runs
 
 
 @pytest.mark.parametrize("metric", ["loss", "grad_norm"])
@@ -67,3 +68,20 @@ def test_ci_exposes_requested_gpus(tmp_path: Path, count: int | None) -> None:
     )
     expected = ",".join(str(i) for i in range(count or 2))
     assert result.stdout.strip() == f"VISIBLE={expected}"
+
+
+@pytest.mark.parametrize(
+    "validation",
+    [[{"step": 2, "val_loss": 3.0}], [], [{"step": 2, "val_loss": float("nan")}], [{"step": 1, "val_loss": 3.0}]],
+)
+def test_recipe_validation_schema(tmp_path: Path, validation: list[dict[str, float]]) -> None:
+    """Accept real recipe validation records and reject missing, corrupt or early output."""
+    (tmp_path / "training.jsonl").write_text(
+        "\n".join(json.dumps({"step": i, "loss": 3.0 - 0.1 * i, "grad_norm": 1.0}) for i in range(3))
+    )
+    (tmp_path / "validation.jsonl").write_text("\n".join(json.dumps(record) for record in validation))
+    if validation == [{"step": 2, "val_loss": 3.0}]:
+        compare_recipe_runs(baseline=tmp_path, parallel=tmp_path, loss_tol=0.05, grad_norm_rtol=0.05)
+    else:
+        with pytest.raises(AssertionError):
+            compare_recipe_runs(baseline=tmp_path, parallel=tmp_path, loss_tol=0.05, grad_norm_rtol=0.05)

@@ -120,6 +120,13 @@ def _run_case(
 ) -> None:
     reference = _model(device, fp32_residual=fp32_residual, mtp_depth=mtp_depth)
     candidate = deepcopy(reference)
+    # Terminal MTP states do not cross a PP boundary. CUDA autocast can
+    # promote their final RMSNorm to FP32 even for BF16 residuals; use the
+    # unpartitioned model as the dtype oracle for these backend-owned outputs.
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        probe = reference(torch.zeros((1, 16), device=device, dtype=torch.long))
+    final_dtypes = (probe.logits.dtype, *(state.dtype for state in (probe.mtp_per_depth_h or ())))
+    del probe
     batch_size = mesh["pp"].size()
     pp = AutoPipeline(
         world_mesh=mesh,
@@ -155,7 +162,7 @@ def _run_case(
         del module, inputs
         outputs = output if isinstance(output, tuple) else (output,)
         if pp.info.has_last_stage:
-            expected = (torch.bfloat16,) + (hidden_dtype,) * mtp_depth + ((torch.int32,) if mtp_depth else ())
+            expected = final_dtypes + ((torch.int32,) if mtp_depth else ())
         else:
             expected = (hidden_dtype,) + (torch.bfloat16,) * mtp_depth
         actual = tuple(t.dtype for t in outputs)

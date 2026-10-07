@@ -14,12 +14,12 @@
 
 """Bounded subprocesses and training/validation parity for tiny GPU recipes."""
 
+import json
+import math
 import os
 import subprocess
 import sys
 from pathlib import Path
-
-from tests.functional_tests.parallelism.compare_parallel_parity import read_metrics
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -76,10 +76,16 @@ def compare_recipe_runs(*, baseline: Path, parallel: Path, loss_tol: float, grad
         ],
         check=True,
     )
-    reference = read_metrics(str(baseline / "validation.jsonl"))
-    candidate = read_metrics(str(parallel / "validation.jsonl"))
-    assert set(reference) == set(candidate) == {2}, (reference, candidate)
-    assert abs(reference[2]["loss"] - candidate[2]["loss"]) <= loss_tol, (reference, candidate)
+    validation = []
+    for directory in (baseline, parallel):
+        records = [
+            json.loads(line) for line in (directory / "validation.jsonl").read_text().splitlines() if line.strip()
+        ]
+        assert len(records) == 1 and records[0]["step"] == 2, records
+        loss = float(records[0]["val_loss"])
+        assert math.isfinite(loss), f"{directory}: non-finite validation loss {loss}"
+        validation.append(loss)
+    assert abs(validation[0] - validation[1]) <= loss_tol, validation
 
 
 def run_recipe_pair(
