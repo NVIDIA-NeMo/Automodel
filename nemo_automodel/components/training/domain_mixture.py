@@ -38,13 +38,19 @@ class DomainWeightConfig:
         sampling_weight: Relative probability used to sample the domain.
         objective_weight: Relative contribution of the domain to the training
             and validation objectives.
+        path: Explicit Megatron corpus prefix for this domain. Required by the
+            training recipe to verify blend order; optional for standalone
+            objective calculations. Names are never inferred from this path.
     """
 
     name: str
     sampling_weight: float
     objective_weight: float
+    path: str | None = None
 
     def __post_init__(self) -> None:
+        if self.path is not None and (not isinstance(self.path, str) or not self.path.strip()):
+            raise ValueError(f"domain_mixture path must be a non-empty string for {self.name!r}, got {self.path!r}")
         if not self.name:
             raise ValueError("domain_mixture domain names must be non-empty")
         if self.name == WEIGHTED_AGGREGATE_NAME:
@@ -87,6 +93,7 @@ class DomainMixtureConfig:
         objective_weights = tuple(domain.objective_weight / objective_total for domain in self.domains)
         return DomainMixture(
             names=tuple(domain.name for domain in self.domains),
+            paths=tuple(domain.path.strip() if domain.path is not None else None for domain in self.domains),
             sampling_weights=sampling_weights,
             objective_weights=objective_weights,
             loss_multipliers=tuple(
@@ -110,6 +117,9 @@ class DomainMixture:
     sampling_weights: tuple[float, ...]
     objective_weights: tuple[float, ...]
     loss_multipliers: tuple[float, ...]
+    #: Corpus prefixes in dataset_id order; None means the binding is undeclared.
+    #: Keyword-only to preserve the positional constructor for standalone users.
+    paths: tuple[str | None, ...] = field(default=(), kw_only=True)
     #: Per-device cache of ``loss_multipliers``. Excluded from eq/hash so the
     #: dataclass stays frozen-comparable; mutated in place, never rebound.
     _multiplier_cache: dict = field(default_factory=dict, compare=False, repr=False)

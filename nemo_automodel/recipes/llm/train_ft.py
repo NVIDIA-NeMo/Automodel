@@ -230,7 +230,7 @@ def _supports_loss_weights(loss_fn: nn.Module) -> bool:
 
 
 def _validate_domain_sampling_weights(domain_mixture, dataloader_config: DataloaderConfig) -> None:
-    """Check explicit Megatron blend weights against the objective declaration."""
+    """Check explicit Megatron corpus bindings and weights against the objective."""
     from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
 
     dataset_config = dataloader_config.dataset_config
@@ -244,9 +244,21 @@ def _validate_domain_sampling_weights(domain_mixture, dataloader_config: Dataloa
 
     from nemo_automodel.components.datasets.llm.megatron.megatron_utils import get_blend_from_list
 
-    _, blend_weights = get_blend_from_list(list(paths))
+    blend_paths, blend_weights = get_blend_from_list(list(paths))
     if blend_weights is None:
         raise ValueError("domain_mixture requires explicit sampling weights in dataset.paths")
+    if len(domain_mixture.paths) != len(domain_mixture.names) or any(path is None for path in domain_mixture.paths):
+        raise ValueError(
+            "domain_mixture requires a path for every domain; set each domains[i].path to the "
+            "corresponding corpus prefix in dataset.paths (or dataset.paths.train). "
+            "Sampling weights alone cannot verify domain order when weights are equal."
+        )
+    if tuple(blend_paths) != domain_mixture.paths:
+        raise ValueError(
+            "domain_mixture paths must match the corpus prefixes in dataset.paths in the same order; "
+            f"got dataset paths {tuple(blend_paths)} and domain bindings "
+            f"{tuple(zip(domain_mixture.names, domain_mixture.paths))}"
+        )
     blend_total = sum(blend_weights)
     if blend_total <= 0:
         raise ValueError(f"dataset.paths blend weights must have a positive sum, got {blend_weights}")

@@ -77,3 +77,9 @@ def test_domain_mixture_combines_named_validation_losses():
 def test_domain_mixture_rejects_invalid_domain_sets(domains):
     with pytest.raises(ValueError):
         DomainMixtureConfig(domains=domains)
+
+
+@pytest.mark.parametrize("path", ["", "  ", 42, ["/data/web"]])
+def test_domain_mixture_rejects_invalid_corpus_path(path):
+    with pytest.raises(ValueError, match="path must be a non-empty string.*web"):
+        DomainWeightConfig(name="web", sampling_weight=1, objective_weight=1, path=path)
