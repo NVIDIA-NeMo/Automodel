@@ -132,13 +132,23 @@ def worker_main(directory: Path, *, warmup_moe: bool = False) -> None:
     info = initialize_distributed("nccl")
     device = info.device
     if warmup_moe:
+        from nemo_automodel.components.models.common import BackendConfig
         from nemo_automodel.components.moe.megatron.fused_a2a import reset_hybrid_ep_buffer
         from nemo_automodel.components.moe.megatron.token_dispatcher import _HybridEPManager
 
         # Compile communication kernels once without constructing a model or
         # exercising PP. Actual model initialization remains inside each case.
         ep_mesh = init_device_mesh("cuda", (info.world_size // 2, 2), mesh_dim_names=("replica", "ep"))
-        manager = _HybridEPManager(ep_mesh["ep"].get_group(), num_local_experts=2, num_experts=4, router_topk=2)
+        manager = _HybridEPManager(
+            ep_mesh["ep"].get_group(),
+            num_local_experts=2,
+            num_experts=4,
+            router_topk=2,
+            # Match both GroupedExpertsDeepEP and TEGroupedExperts defaults;
+            # different SM counts require different HybridEP JIT kernels.
+            permute_fusion=True,
+            moe_hybridep_num_sms=BackendConfig().dispatcher_num_sms,
+        )
         for tokens in (512, 32, 64):
             manager.initialize_runtime(num_tokens=tokens, hidden_dim=256, dtype=torch.bfloat16, device=device)
         del manager
