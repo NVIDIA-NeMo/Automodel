@@ -525,6 +525,52 @@ class TestUnoStrategy:
                 half_life_ratio=None,
             )
 
+    def test_sdpa_mask_uses_the_mixed_precision_param_dtype(self, strategy):
+        """Without autocast the additive mask is built in the FSDP2 param dtype, so it needs no input cast."""
+        vocab, seq_len = 32, 6
+        loss_fn = strategy.create_loss_fn({"block_length": 2})
+        seen = {}
+
+        class _TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(vocab, 8)
+                self.q_proj = torch.nn.Linear(8, 8)
+                self.head = torch.nn.Linear(8, vocab)
+                self.config = types.SimpleNamespace(_attn_implementation="sdpa")
+
+            def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
+                seen["mask_dtype"] = attention_mask.dtype
+                return types.SimpleNamespace(logits=self.head(self.q_proj(self.embed(input_ids))))
+
+        model = _TinyModel()
+        apply_lora_to_linear_modules(model, PeftConfig(target_modules=["q_proj"], dim=4, alpha=8, use_triton=False))
+        recipe = types.SimpleNamespace(
+            dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+            model_parts=[model],
+            distributed_config=types.SimpleNamespace(
+                defer_fsdp_grad_sync=True,
+                autocast_dtype=None,
+                mp_policy=types.SimpleNamespace(param_dtype=torch.bfloat16),
+            ),
+            te_fp8=None,
+            device_mesh=None,
+            dllm_loss_fn=loss_fn,
+            _dllm_loss_buffer=[],
+            _dllm_loss_components_buffer=[],
+            _get_dp_group_size=lambda include_cp=True: 1.0,
+        )
+        clean = torch.randint(0, vocab, (1, seq_len))
+        noise_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+        noise_mask[:, seq_len // 2 :] = True
+        batch = {"_clean_input_ids": clean, "_noisy_input_ids": clean.clone(), "_noise_mask": noise_mask}
+
+        strategy.forward_backward(
+            recipe, 0, batch, loss_buffer=[], num_diffusion_tokens=int(noise_mask.sum()), num_batches=1, is_train=False
+        )
+
+        assert seen["mask_dtype"] == torch.bfloat16
+
     def test_forward_backward_gates_lora_to_the_noisy_half(self, strategy):
         """x_t logits use the adapter, x_0 logits are the frozen base, and only LoRA weights train."""
         torch.manual_seed(0)

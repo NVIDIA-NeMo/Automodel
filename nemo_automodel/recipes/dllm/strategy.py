@@ -509,7 +509,10 @@ class IDLMStrategy(DLLMStrategy):
         if getattr(getattr(model, "config", None), "_attn_implementation", None) == "flex_attention":
             block_mask = create_idlm_block_mask(L, self.block_size, attn, device=device)
         else:
-            mask_dtype = autocast_dtype if autocast_dtype is not None else torch.float32
+            # Build the additive mask in the dtype attention runs in (autocast, else the FSDP2 mixed-precision
+            # param dtype): an fp32 mask is not cast for us when ``mp_policy.cast_forward_inputs`` is off.
+            mp_policy = getattr(recipe.distributed_config, "mp_policy", None)
+            mask_dtype = autocast_dtype or getattr(mp_policy, "param_dtype", None) or torch.float32
             block_mask = create_idlm_sdpa_mask(L, self.block_size, attn, device=device, dtype=mask_dtype)
 
         with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx, self._forward_context(model, noisy_input_ids):
