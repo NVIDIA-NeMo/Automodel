@@ -14,8 +14,10 @@
 
 """Run the production recipe with topology-independent random test weights."""
 
+import gc
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -59,24 +61,36 @@ def initialize_parity_weights(parts: list[torch.nn.Module]) -> dict[str, str]:
     return fingerprints
 
 
-def main() -> None:
-    """Retain production initialization, optimizer, training and validation paths."""
+def run_recipe_pair_in_process(config: Path, overrides: list[str], pp_size: int, output: Path) -> None:
+    """Run PP and its reference in the same workers with equal global batches.
+
+    The reference uses all ranks for data parallelism. Its local batch shrinks
+    by PP size so the global batch and accumulation count remain unchanged.
+    """
     from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+    from nemo_automodel.components.moe.megatron.fused_a2a import reset_hybrid_ep_buffer
     from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
-    cfg = parse_args_and_load_config("tests/functional_tests/parallelism_multigpu/llama.yaml")
-    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    recipe.setup()
-    # Setup must run first: it exercises the real stage-specific initializers
-    # whose DTensor RNG collectives previously hung on PP4 attention/MoE stages.
-    fingerprints = initialize_parity_weights(recipe.model_parts)
-    output = Path(cfg.checkpoint.checkpoint_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    (output / f"initial_weights.{torch.distributed.get_rank()}.json").write_text(
-        json.dumps(fingerprints, sort_keys=True)
-    )
-    recipe.run_train_validation_loop()
-
-
-if __name__ == "__main__":
-    main()
+    cfg = parse_args_and_load_config(argv=["--config", str(config), *overrides])
+    local_batch = int(cfg.step_scheduler.local_batch_size)
+    assert local_batch % pp_size == 0
+    for name, pp, batch in (("parallel", pp_size, local_batch), ("baseline", 1, local_batch // pp_size)):
+        current = deepcopy(cfg)
+        directory = output / name
+        current.set_by_dotted("checkpoint.checkpoint_dir", str(directory))
+        current.set_by_dotted("distributed.pp_size", pp)
+        current.set_by_dotted("step_scheduler.local_batch_size", batch)
+        recipe = TrainFinetuneRecipeForNextTokenPrediction(current)
+        recipe.setup()
+        # Retain production initialization before assigning the shared fixture.
+        fingerprints = initialize_parity_weights(recipe.model_parts)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"initial_weights.{torch.distributed.get_rank()}.json").write_text(
+            json.dumps(fingerprints, sort_keys=True)
+        )
+        recipe.run_train_validation_loop()
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        del recipe
+        reset_hybrid_ep_buffer()
+        gc.collect()

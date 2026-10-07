@@ -22,12 +22,12 @@ dataloader:
   shuffle: false
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
-  max_sentence_len: 128
-  mean_len: 127
+  max_sentence_len: 32
+  mean_len: 31
   num_sentences: 64
   seed: 42
   std_len: 0
-  vocab_size: 512
+  vocab_size: 128
 dist_env:
   backend: nccl
   timeout_minutes: 1
@@ -66,12 +66,12 @@ model:
     _target_: transformers.LlamaConfig
     architectures:
     - LlamaForCausalLM
-    vocab_size: 512
-    hidden_size: 128
-    intermediate_size: 256
+    vocab_size: 128
+    hidden_size: 64
+    intermediate_size: 128
     num_hidden_layers: 4
-    num_attention_heads: 8
-    num_key_value_heads: 4
+    num_attention_heads: 4
+    num_key_value_heads: 2
     head_dim: 16
     dtype: bfloat16
     use_cache: false
@@ -101,9 +101,9 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
-  max_sentence_len: 128
-  mean_len: 127
+  max_sentence_len: 32
+  mean_len: 31
   num_sentences: 8
   seed: 7
   std_len: 0
-  vocab_size: 512
+  vocab_size: 128

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bounded subprocesses and training/validation parity for tiny GPU recipes."""
+"""Training/validation parity using the shared GPU worker group."""
 
 import json
 import math
@@ -20,6 +20,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+from tests.functional_tests.parallelism_multigpu.gpu_workers import GPUWorkers
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -34,27 +36,6 @@ def gpu_count() -> int:
     if visible is not None:
         assert count == len(visible.split(",")), f"Requested GPUs {visible}, but only {count} are available"
     return count
-
-
-def run_distributed(ranks: int, args: list[str], log: Path) -> None:
-    """Run real NCCL workers with a hard timeout and retain their combined log."""
-    command = [
-        "timeout",
-        "--kill-after=10",
-        "180",
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        f"--nproc_per_node={ranks}",
-        *args,
-    ]
-    env = {**os.environ, "TRANSFORMERS_OFFLINE": "1", "HF_HUB_OFFLINE": "1", "OMP_NUM_THREADS": "1"}
-    # Import this checkout, including when pytest was invoked from another cwd.
-    env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
-    with log.open("w") as output:
-        result = subprocess.run(command, cwd=REPO, env=env, stdout=output, stderr=subprocess.STDOUT)
-    assert result.returncode == 0, f"{' '.join(command)}\n{log.read_text()}"
 
 
 def compare_recipe_runs(*, baseline: Path, parallel: Path, loss_tol: float, grad_norm_rtol: float) -> None:
@@ -90,7 +71,7 @@ def compare_recipe_runs(*, baseline: Path, parallel: Path, loss_tol: float, grad
 
 def run_recipe_pair(
     *,
-    ranks: int,
+    workers: GPUWorkers,
     pp_size: int,
     config: Path,
     overrides: list[str],
@@ -98,22 +79,11 @@ def run_recipe_pair(
     loss_tol: float,
     grad_norm_rtol: float,
 ) -> None:
-    """Compare PP against the same TP/CP/EP/DP topology with PP disabled."""
-    for name, pp in (("baseline", 1), ("parallel", pp_size)):
-        run_distributed(
-            ranks // pp_size * pp,
-            [
-                "tests/functional_tests/parallelism_multigpu/run_recipe.py",
-                "--config",
-                str(config),
-                *overrides,
-                "--distributed.pp_size",
-                str(pp),
-                "--checkpoint.checkpoint_dir",
-                str(output / name),
-            ],
-            output / f"{name}.log",
-        )
+    """Compare PP with a no-PP reference sharing global weights, data and batch size."""
+    workers.run(
+        {"kind": "recipe", "config": str(config), "overrides": overrides, "pp_size": pp_size, "output": str(output)},
+        output,
+    )
     initial_weights = []
     for name in ("baseline", "parallel"):
         weights = {}
@@ -125,7 +95,7 @@ def run_recipe_pair(
         initial_weights.append(weights)
     assert initial_weights[0] == initial_weights[1], "Baseline and PP must start from identical weights"
     # A successful numerical comparison must actually have used the static PP path.
-    log = (output / "parallel.log").read_text()
+    log = (output / "worker.log").read_text()
     assert "Precomputed pipeline stage shapes" in log
     assert "dynamic metadata inference" not in log
     compare_recipe_runs(

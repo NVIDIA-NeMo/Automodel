@@ -103,3 +103,15 @@ def test_initial_weights_do_not_depend_on_stage_or_visit_order() -> None:
     assert reference["2.weight"] != reference["3.weight"]
     for name, parameter in stage.named_parameters():
         torch.testing.assert_close(parameter, dict(model.named_parameters())[name], rtol=0, atol=0)
+
+
+def test_reusing_distributed_environment_returns_a_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reused worker must preserve the DistInfo.device contract for recipe setup."""
+    from nemo_automodel.components.distributed.init_utils import initialize_distributed
+
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    assert initialize_distributed("nccl").device == torch.device("cuda", 2)

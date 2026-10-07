@@ -18,16 +18,19 @@ from pathlib import Path
 
 import pytest
 
-from tests.functional_tests.parallelism_multigpu.recipe_parity import gpu_count, run_recipe_pair
+from tests.functional_tests.parallelism_multigpu.gpu_workers import GPUWorkers
+from tests.functional_tests.parallelism_multigpu.recipe_parity import run_recipe_pair
 
 
 @pytest.mark.parametrize("experts", ["torch_mm", "te"])
 @pytest.mark.parametrize("fp32_residual", [False, True], ids=["bf16", "fp32-residual"])
-def test_pp_ep_precision(experts: str, fp32_residual: bool, tmp_path: Path) -> None:
+def test_pp_ep_precision(
+    parallelism_gpu_workers: GPUWorkers, experts: str, fp32_residual: bool, tmp_path: Path
+) -> None:
     """Exercise PP2/EP2 or PP4/EP2, including validation and optimizer updates."""
-    count = gpu_count()
+    count = parallelism_gpu_workers.ranks
     run_recipe_pair(
-        ranks=count,
+        workers=parallelism_gpu_workers,
         pp_size=count // 2,
         config=Path(__file__).with_name("nemotron.yaml"),
         overrides=["--model.backend.experts", experts, "--model.config.residual_in_fp32", str(fp32_residual).lower()],
@@ -37,11 +40,11 @@ def test_pp_ep_precision(experts: str, fp32_residual: bool, tmp_path: Path) -> N
     )
 
 
-def test_pp_ep_fsdp_checkpointing(tmp_path: Path) -> None:
+def test_pp_ep_fsdp_checkpointing(parallelism_gpu_workers: GPUWorkers, tmp_path: Path) -> None:
     """Compose PP2 with EP2 and FSDP2/4, FP32 residuals and checkpoint recomputation."""
-    count = gpu_count()
+    count = parallelism_gpu_workers.ranks
     run_recipe_pair(
-        ranks=count,
+        workers=parallelism_gpu_workers,
         pp_size=2,
         config=Path(__file__).with_name("nemotron.yaml"),
         overrides=[
