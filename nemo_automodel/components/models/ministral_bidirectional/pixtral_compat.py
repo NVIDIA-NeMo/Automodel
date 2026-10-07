@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Temporary Pixtral forward backport for Transformers 5.17.0 and 5.18.0.
+"""Temporary Pixtral forward backport for Transformers 5.17.0, 5.18.0, and 5.19.0.
 
 Adapted from Hugging Face Transformers (Apache-2.0), with the image-boundary
 fix from https://github.com/huggingface/transformers/pull/49373

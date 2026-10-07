@@ -313,7 +313,7 @@ class Mistral3BidirectionalModel(Mistral3Model):
             config: Composite Mistral3 vision-language configuration.
         """
         super().__init__(config)
-        if transformers.__version__ in {"5.17.0", "5.18.0"}:
+        if transformers.__version__ in {"5.17.0", "5.18.0", "5.19.0"}:
             # Instance-local backport of HF #49373; remove with the next fixed pin.
             from .pixtral_compat import _pixtral_vision_forward
 

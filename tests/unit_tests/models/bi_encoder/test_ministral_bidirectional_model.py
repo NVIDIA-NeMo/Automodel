@@ -1397,7 +1397,7 @@ def test_mistral3_pixtral_backport_preserves_non_flash_outputs(attention):
         torch.testing.assert_close(actual_hidden, expected_hidden, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("version", ["5.15.1", "5.17.0", "5.18.0", "5.19.1"])
+@pytest.mark.parametrize("version", ["5.15.1", "5.17.0", "5.18.0", "5.19.0", "5.19.1"])
 def test_mistral3_pixtral_backport_does_not_patch_other_versions_or_instances(monkeypatch, version):
     """Other Transformers versions and independently constructed HF models stay native."""
     import transformers
@@ -1405,7 +1405,9 @@ def test_mistral3_pixtral_backport_does_not_patch_other_versions_or_instances(mo
 
     monkeypatch.setattr(transformers, "__version__", version)
     model = Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config())
-    assert (model.vision_tower.forward.__func__ is PixtralVisionModel.forward) == (version not in {"5.17.0", "5.18.0"})
+    assert (model.vision_tower.forward.__func__ is PixtralVisionModel.forward) == (
+        version not in {"5.17.0", "5.18.0", "5.19.0"}
+    )
     stock = PixtralVisionModel(model.config.vision_config)
     assert stock.forward.__func__ is PixtralVisionModel.forward
 
