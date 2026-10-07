@@ -57,6 +57,11 @@ model:
     num_nextn_predict_layers: 0
   trust_remote_code: false
   load_base_model: true
+  # Attention-only LoRA keeps the pretrained router state fixed. Retain the
+  # correction-bias buffer for base checkpoint loading, but disable its updates.
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: tilelang
@@ -70,11 +75,14 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
+  # The discrete indexer is frozen by the training policy. Do not create
+  # indexer adapters whose metadata would outlive their omitted checkpoint tensors.
   target_modules:
-    - "*wq_a"
-    - "*wq_b"
-    - "*wkv"
-    - "*wo_b"
+    - "*.self_attn.wq_a"
+    - "*.self_attn.wq_b"
+    - "*.self_attn.wkv"
+    - "*.self_attn.wo_b"
+    - "*.self_attn.compressor.wkv"
   dim: 8
   alpha: 32
   use_triton: True
@@ -131,7 +139,8 @@ optimizer:
 ci:
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: hemildesai
-  time: "01:00:00"
+  # Two CPU-offloaded HF loads take about 20 minutes; allow the resume check to finish too.
+  time: "01:30:00"
   nodes: 4
   checkpoint_robustness:
     step_scheduler.global_batch_size: 32
@@ -139,6 +148,10 @@ ci:
     tokenizer_name: deepseek-ai/DeepSeek-V4-Flash
     trust_remote_code: true
     hf_device_map_auto: true
+    # The HF reference uses one 8-GPU node. Reserve room for the 8 GiB expert
+    # concatenation and allow CPU overflow while loading the full bf16 model.
+    hf_device_map_max_memory_gib: 60
+    hf_device_map_cpu_max_memory_gib: 256
     # EP32 sparse routing is inside the shared relaxed envelope; the separate
     # vanilla-HF reload gate remains enabled so reference-load regressions still fail.
     parity_tolerance_profile: relaxed
