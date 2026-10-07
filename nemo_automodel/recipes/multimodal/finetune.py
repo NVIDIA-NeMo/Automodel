@@ -54,6 +54,7 @@ _HAS_WANDB, wandb = safe_import(
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
+from nemo_automodel.components.loggers.loggers import TrackioConfig  # noqa: E402
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
 from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend  # noqa: E402
@@ -421,6 +422,14 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             suppress_wandb_log_messages()
             run = self._build_wandb()
             logging.info("Running run at %s", run.url)
+
+        # -- trackio ------------------------------------------------------
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
+            trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
+            model_name = str(_resolve_bagel_artifact_path(self.cfg) or "bagel")
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_dict(), model_name=model_name)
+            logging.info("Trackio experiment tracking enabled")
 
         self._log_experiment_details()
         self._log_library_versions()
@@ -1009,6 +1018,9 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             return
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
         self.metric_logger_train.log(log_data)
         logging.info(
             "step {} | epoch {} | ce {:.4f} | mse {:.4f} | grad_norm {:.4f} | "

@@ -130,6 +130,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         if self._bench_flops_scope not in ("model", "text"):
             raise ValueError(f"benchmark.flops_scope must be 'model' or 'text', got {self._bench_flops_scope!r}")
         self._wandb_enabled = cfg.get("wandb", None) is not None
+        self._trackio_enabled = cfg.get("trackio", None) is not None
 
         # Infer max_steps from step_scheduler
         self._bench_steps = cfg.step_scheduler.max_steps
@@ -242,6 +243,16 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             self.timers.write_to_wandb(
                 names=["setup"],
                 writer=self.wandb_run,
+                iteration=0,
+                normalizer=1.0,
+                reset=False,
+                barrier=True,
+            )
+        # Collective over all ranks; only rank 0 has a Trackio run to write to.
+        if self._trackio_enabled:
+            self.timers.write_to_wandb(
+                names=["setup"],
+                writer=self.trackio_logger.run if self.trackio_logger is not None else None,
                 iteration=0,
                 normalizer=1.0,
                 reset=False,
@@ -434,11 +445,15 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 )
                 if self._wandb_enabled and self.wandb_run is not None:
                     self.wandb_run.log({"loss": reporting_loss}, step=i)
+                if self.trackio_logger is not None:
+                    self.trackio_logger.log_metrics({"loss": reporting_loss}, step=i)
 
             # Collect and log MoE load balance metrics (inherited from train_ft)
             self._collect_moe_load_balance()
             if self._wandb_enabled and self.wandb_run is not None:
                 self._log_moe_metrics(i, self.wandb_run.log)
+            if self.trackio_logger is not None:
+                self._log_moe_metrics(i, self.trackio_logger.log_metrics)
 
             # Calculate and log MFU
             self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
@@ -478,6 +493,15 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             self.timers.write_to_wandb(
                 names=timer_names,
                 writer=self.wandb_run,
+                iteration=iteration,
+                normalizer=1.0,
+                reset=False,
+                barrier=False,
+            )
+        if self._trackio_enabled:
+            self.timers.write_to_wandb(
+                names=timer_names,
+                writer=self.trackio_logger.run if self.trackio_logger is not None else None,
                 iteration=iteration,
                 normalizer=1.0,
                 reset=False,
@@ -593,6 +617,17 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     }
                 )
 
+            if self.trackio_logger is not None:
+                self.trackio_logger.log_metrics(
+                    {
+                        "summary/avg_iter_time_seconds": avg_iter_time,
+                        "summary/avg_mfu_percent": mfu,
+                        "summary/training_time_seconds": iter_time,
+                        "summary/tflops_per_gpu": self.tflops,
+                    },
+                    step=steps,
+                )
+
             # Save summary to JSON file if output path is provided
             if self._bench_json_output_path is not None:
                 summary_file = pathlib.Path(self._bench_json_output_path)
@@ -607,6 +642,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             import wandb
 
             wandb.finish()
+        if self.trackio_logger is not None:
+            self.trackio_logger.finish()
 
 
 def main(config_path=None):
