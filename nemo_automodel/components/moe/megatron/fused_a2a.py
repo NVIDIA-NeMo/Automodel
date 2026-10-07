@@ -618,7 +618,12 @@ def _warm_start_hybrid_ep_jit() -> bool:
     if os.path.isdir(_jit_shared_dir):
         for name in sorted(os.listdir(_jit_shared_dir)):
             if name.endswith(".so"):
-                shutil.copy2(os.path.join(_jit_shared_dir, name), os.path.join(_jit_proc_dir, name))
+                destination = os.path.join(_jit_proc_dir, name)
+                # A previous buffer may already have dlopened this kernel.
+                # Truncating its mapped ELF file can segfault the process.
+                if os.path.exists(destination):
+                    continue
+                shutil.copy2(os.path.join(_jit_shared_dir, name), destination)
                 loaded += 1
     logger.info("HybridEP JIT cache: warm-started %d kernel(s) from %s", loaded, _jit_shared_dir)
     atexit.register(store_hybrid_ep_jit_cache)
