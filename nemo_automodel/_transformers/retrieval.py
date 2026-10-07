@@ -18,7 +18,7 @@ import inspect
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from copy import copy
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 import torch.nn as nn
@@ -50,6 +50,10 @@ from nemo_automodel._transformers.sentence_transformer_export import (
 )
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.checkpoint.addons import _ConsolidatedHFMetadataExporter
+
 
 logger = logging.get_logger(__name__)
 
@@ -629,11 +633,14 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     model.model.save_pretrained(save_directory)
     if deploy_config is not None:
         deploy_config.save_pretrained(save_directory)
-    if tokenizer is not None:
+    if tokenizer is not None and cross_encoder_exporter is None:
         tokenizer.save_pretrained(save_directory)
     if cross_encoder_exporter is not None:
-        cross_encoder_exporter._save_sentence_transformer_assets(
-            hf_metadata_dir=save_directory, tokenizer=tokenizer, original_model_path=original_model_path
+        cross_encoder_exporter.save(
+            hf_metadata_dir=save_directory,
+            tokenizer=tokenizer,
+            original_model_path=original_model_path,
+            v4_compatible=False,
         )
     if export_config is None:
         return
@@ -689,7 +696,7 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")
-    encoder.state_dict_adapter = EncoderStateDictAdapter()
+    encoder.state_dict_adapter = EncoderStateDictAdapter(getattr(model, "state_dict_adapter", None))
     configure_encoder_metadata(model, model.config)
 
 
@@ -994,12 +1001,15 @@ class CrossEncoderModel(nn.Module):
 
     def _get_consolidated_hf_metadata_exporter(
         self, *, tokenizer: object, original_model_path: str | None
-    ) -> _CrossEncoderMetadataExporter | None:
+    ) -> "_ConsolidatedHFMetadataExporter | None":
         """Use the same CrossEncoder metadata contract for direct and consolidated saves."""
         # Generative backbones keep their language-model export contract. Classifier
         # metadata would load a different head instead of preserving their scoring rule.
         if tokenizer is None or self.model.can_generate():
             return None
+        get_exporter = getattr(self.model, "_get_consolidated_hf_metadata_exporter", None)
+        if callable(get_exporter):
+            return get_exporter(tokenizer=tokenizer, original_model_path=original_model_path)
         return _CrossEncoderMetadataExporter(self)
 
     @property
