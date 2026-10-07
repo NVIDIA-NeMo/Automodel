@@ -16,11 +16,56 @@
 
 from __future__ import annotations
 
+from typing import cast
+
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel
+from torch.distributed.tensor.placement_types import Replicate, Shard
+
 from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.tp_styles import (
+    VocabParallelEmbedding,
+)
+
+
+def _parallelize_muse_glimmer(
+    model,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """TP plan for the native MuseGlimmer dense VLM.
+
+    The vision tower stays replicated. The language backbone and vocabulary
+    matrices contain nearly all trainable parameters and are tensor-sharded.
+    MuseGlimmer has two KV heads, so the model strategy limits this complete
+    Q/K/V-sharding plan to TP1 or TP2.
+    """
+    if sequence_parallel:
+        import warnings
+
+        warnings.warn(
+            "sequence_parallel=True is not yet supported for MuseGlimmer and will be ignored.",
+            stacklevel=2,
+        )
+
+    plan: dict[str, ParallelStyle] = {
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.output_gate_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    return cast(dict[str, ParallelStyle], plan)
 
 
 class MuseGlimmerModelParallelizer(ModelParallelizer):
     """Apply standard dense parallelism and install the model-owned CP mesh."""
+
+    tp_plan = staticmethod(_parallelize_muse_glimmer)
 
     def _apply(self, model, device_mesh, **kwargs):
         tp_mesh = device_mesh["tp"] if "tp" in device_mesh.mesh_dim_names else None

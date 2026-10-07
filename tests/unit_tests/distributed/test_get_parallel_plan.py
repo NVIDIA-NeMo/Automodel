@@ -18,7 +18,7 @@ The function selects a tensor-parallel sharding plan via the following priority:
 1. A *custom* plan supplied by the caller (either a dictionary ‑or- an import
    path to a dict/function).
 2. If requested, the HuggingFace-derived plan via ``get_hf_tp_shard_plan``.
-3. A model-specific plan located in ``PARALLELIZE_FUNCTIONS``; on failure, try HF.
+3. A model-specific plan located in ``model sidecar``; on failure, try HF.
 4. Otherwise, return a default base plan (with SP adjustments when enabled).
 
 This test module covers every branch, including error conditions.
@@ -27,7 +27,6 @@ This test module covers every branch, including error conditions.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Dict
 
 import pytest
 from torch.distributed.tensor.parallel import ColwiseParallel
@@ -35,54 +34,26 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 # Function under test and collaborators
 import nemo_automodel.components.distributed.parallelizer as parallelizer
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-    _get_class_qualname,
-    get_decilm_nemotron_tp_plan,
-    get_llama_nemotron_super_tp_plan,
-)
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
+from nemo_automodel.components.models.llama.parallelization import get_llama_nemotron_super_tp_plan
+from nemo_automodel.components.models.nemotron_nas.parallelization import (
+    LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
+    get_decilm_nemotron_tp_plan,
+)
 
 
 class _DummyModel:
     """Minimal model stand-in."""
 
 
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    """Ensure external state is isolated between tests."""
-    # Backup original global dicts so we can restore them after each test
-    original_plans: Dict = parallelizer.PARALLELIZE_FUNCTIONS.copy()
-    original_model_cls = getattr(parallelizer, "model_cls", None)
-
-    yield
-
-    # Restore module-level globals that we tamper with
-    parallelizer.PARALLELIZE_FUNCTIONS.clear()
-    parallelizer.PARALLELIZE_FUNCTIONS.update(original_plans)
-
-    if original_model_cls is not None:
-        monkeypatch.setattr(parallelizer, "model_cls", original_model_cls, raising=False)
-    else:
-        # Ensure we do not leak the attr
-        monkeypatch.delattr(parallelizer, "model_cls", raising=False)
-
-
-def _set_global_model_cls(monkeypatch, cls):
-    """Make the *module-global* ``model_cls`` visible to the helper."""
-    monkeypatch.setattr(parallelizer, "model_cls", cls, raising=False)
-
-
 # 1. Custom plan provided directly as *dict*
 def test_custom_dict_plan(monkeypatch):
     plan = {"foo": "bar"}
-    _set_global_model_cls(monkeypatch, _DummyModel)  # irrelevant but required
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_shard_plan=plan)
     assert result is plan  # identity check
 
 
 def test_custom_moe_explicit_plan_is_validated_even_when_ep_is_one(monkeypatch):
-    _set_global_model_cls(monkeypatch, _DummyModel)
     monkeypatch.setattr(parallelizer, "_uses_custom_moe_modules", lambda model: True)
 
     with pytest.raises(ValueError, match="EP-owned"):
@@ -104,7 +75,6 @@ def test_custom_plan_imports_dict(monkeypatch):
         return plan  # Dict returned directly
 
     monkeypatch.setattr(parallelizer, "import_class_from_path", _fake_import_class_from_path, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), tp_shard_plan="some.module.PLAN")
     assert result is plan
@@ -120,7 +90,6 @@ def test_custom_plan_imports_function(monkeypatch):
         return _dummy_fn
 
     monkeypatch.setattr(parallelizer, "import_class_from_path", _fake_import, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), tp_shard_plan="some.module.func")
     assert result is plan
@@ -133,19 +102,19 @@ def test_custom_plan_invalid_path(monkeypatch):
         raise ImportError("boom")
 
     monkeypatch.setattr(parallelizer, "import_class_from_path", _fake_import, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     with pytest.raises(ValueError):
         _get_parallel_plan(_DummyModel(), tp_shard_plan="bad.path")
 
 
-# 3. Optimised plan in ``PARALLELIZE_FUNCTIONS``
+# 3. Optimised plan in ``model sidecar``
 def test_optimised_plan_success(monkeypatch):
     plan = {"opt": "plan"}
 
     # Register dummy entry
-    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = lambda m, sp: plan
-    _set_global_model_cls(monkeypatch, _DummyModel)
+    monkeypatch.setattr(
+        _DummyModel, "parallelizer", parallelizer.ModelParallelizer(tp_plan=lambda m, sp: plan), raising=False
+    )
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
     assert result is plan
@@ -158,9 +127,8 @@ def test_optimised_plan_fallback_to_hf(monkeypatch):
     def _broken_fn(model, seq):  # noqa: D401
         raise RuntimeError("fail")
 
-    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
+    monkeypatch.setattr(_DummyModel, "parallelizer", parallelizer.ModelParallelizer(tp_plan=_broken_fn), raising=False)
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: sentinel, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
     assert result is sentinel
@@ -171,7 +139,6 @@ def test_hf_fallback(monkeypatch):
     # When no optimised plan exists, the helper should prefer the HF-provided plan.
     hf_plan = {"model.embed_tokens": "embed", "lm_head": "head"}
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: hf_plan, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
     assert result is hf_plan
@@ -180,7 +147,6 @@ def test_hf_fallback(monkeypatch):
 def test_hf_fallback_sequence_parallel_assert(monkeypatch):
     """When sequence_parallel=True and no optimised plan, helper should return base plan with SP entries."""
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: {}, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=True)
     assert isinstance(result, dict)
@@ -194,13 +160,12 @@ def test_optimised_plan_and_hf_both_fail_raises_sp_false(monkeypatch):
     def _broken_fn(model, seq):
         raise RuntimeError("fail")
 
-    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
+    monkeypatch.setattr(_DummyModel, "parallelizer", parallelizer.ModelParallelizer(tp_plan=_broken_fn), raising=False)
 
     def _raise_hf(_model):
         raise RuntimeError("hf fail")
 
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     with pytest.raises(RuntimeError, match="hf fail"):
         _get_parallel_plan(_DummyModel(), sequence_parallel=False)
@@ -212,13 +177,12 @@ def test_optimised_plan_and_hf_both_fail_assert_sp_true(monkeypatch):
     def _broken_fn(model, seq):
         raise RuntimeError("fail")
 
-    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
+    monkeypatch.setattr(_DummyModel, "parallelizer", parallelizer.ModelParallelizer(tp_plan=_broken_fn), raising=False)
 
     def _raise_hf2(_model):
         raise RuntimeError("hf fail")
 
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf2, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     with pytest.raises(RuntimeError, match="hf fail"):
         _get_parallel_plan(_DummyModel(), sequence_parallel=True)
@@ -227,13 +191,12 @@ def test_optimised_plan_and_hf_both_fail_assert_sp_true(monkeypatch):
 def test_not_registered_and_hf_fail_base_plan(monkeypatch):
     """No optimised plan and HF raises → base plan (with/without SP)."""
     # Ensure dummy not in mapping
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_DummyModel), None)
+    monkeypatch.delattr(_DummyModel, "parallelizer", raising=False)
 
     def _raise_hf3(_model):
         raise RuntimeError("hf fail")
 
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf3, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     # SP=False
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
@@ -294,13 +257,12 @@ def test_default_plan_fallthrough_raises_for_remote_code_at_tp_size_gt_1(monkeyp
     ``transformers_modules.*``), so users get an actionable error instead of an opaque
     PyTorch assertion. See https://github.com/NVIDIA-NeMo/Automodel/issues/2243.
     """
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
+    monkeypatch.delattr(_RemoteCodeDummyModel, "parallelizer", raising=False)
 
     def _raise_hf(_model):
         raise RuntimeError("hf fail")
 
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
-    _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
 
     for sp in (False, True):
         with pytest.raises(ValueError) as excinfo:
@@ -309,7 +271,7 @@ def test_default_plan_fallthrough_raises_for_remote_code_at_tp_size_gt_1(monkeyp
         msg = str(excinfo.value)
         # The error must name the offending class and the three supported registration paths.
         assert _RemoteCodeDummyModel.__name__ in msg
-        assert "PARALLELIZE_FUNCTIONS" in msg
+        assert "model-owned `parallelizer`" in msg
         assert "_tp_plan" in msg
         assert "tp_shard_plan" in msg
 
@@ -322,13 +284,12 @@ def test_default_plan_fallthrough_known_hf_arch_warns_at_tp_size_gt_1(monkeypatc
     """
     import logging as _logging
 
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_DummyModel), None)
+    monkeypatch.delattr(_DummyModel, "parallelizer", raising=False)
 
     def _raise_hf(_model):
         raise RuntimeError("hf fail")
 
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     with caplog.at_level(_logging.WARNING, logger=parallelizer.logger.name):
         result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_size=2)
@@ -347,13 +308,12 @@ def test_default_plan_fallthrough_remote_code_folds_translator_diagnostic(monkey
     "`_tp_plan` defined but unusable". See
     https://github.com/NVIDIA-NeMo/Automodel/pull/2244 discussion.
     """
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
+    monkeypatch.delattr(_RemoteCodeDummyModel, "parallelizer", raising=False)
 
     def _raise_translator(_model):
         raise ValueError("Unknown parallel style: foo_bar")
 
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_translator, raising=True)
-    _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
 
     with pytest.raises(ValueError) as excinfo:
         _get_parallel_plan(_RemoteCodeDummyModel(), sequence_parallel=False, tp_size=2)
@@ -362,7 +322,7 @@ def test_default_plan_fallthrough_remote_code_folds_translator_diagnostic(monkey
     # Diagnostic from get_hf_tp_shard_plan must be folded into the user-facing error.
     assert "Unknown parallel style: foo_bar" in msg
     # And the registration guidance must still be there.
-    assert "PARALLELIZE_FUNCTIONS" in msg
+    assert "model-owned `parallelizer`" in msg
     assert "_tp_plan" in msg
     assert "tp_shard_plan" in msg
 
@@ -374,13 +334,12 @@ def test_default_plan_fallthrough_tp_size_1_still_returns_base_plan(monkeypatch)
     metadata never matters. This preserves backwards compatibility for callers that
     do not pass ``tp_size`` (default is 1), including for custom-code archs.
     """
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
+    monkeypatch.delattr(_RemoteCodeDummyModel, "parallelizer", raising=False)
 
     def _raise_hf(_model):
         raise RuntimeError("hf fail")
 
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
-    _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
 
     # Explicit tp_size=1 — should still return the base plan, even for remote-code archs.
     result = _get_parallel_plan(_RemoteCodeDummyModel(), sequence_parallel=False, tp_size=1)
@@ -395,9 +354,8 @@ def test_hf_native_plan_unaffected_at_tp_size_gt_1(monkeypatch):
     non-empty plan, that plan must be used regardless of ``tp_size``.
     """
     hf_plan = {"model.embed_tokens": "embed", "lm_head": "head"}
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
+    monkeypatch.delattr(_RemoteCodeDummyModel, "parallelizer", raising=False)
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda _m: hf_plan, raising=True)
-    _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
 
     result = _get_parallel_plan(_RemoteCodeDummyModel(), sequence_parallel=False, tp_size=4)
     assert result is hf_plan
@@ -410,7 +368,6 @@ def test_custom_plan_imports_non_dict_raises(monkeypatch):
         return ["not", "a", "dict"]
 
     monkeypatch.setattr(parallelizer, "import_class_from_path", _fake_import, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
 
     with pytest.raises(ValueError):
         _get_parallel_plan(_DummyModel(), tp_shard_plan="some.module.NOT_A_DICT")

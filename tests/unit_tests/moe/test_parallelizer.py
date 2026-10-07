@@ -1785,13 +1785,12 @@ def test_resolve_moe_tp_plan_rejects_sequence_parallel_fail_closed(monkeypatch):
 
 def test_resolve_moe_tp_plan_uses_registered_factory_without_dense_fallback(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
-    optimized_stub = types.ModuleType("nemo_automodel.components.distributed.optimized_tp_plans")
+    optimized_stub = types.ModuleType("nemo_automodel.components.distributed.model_parallelizer")
     factory = MagicMock(return_value={"lm_head": object()})
-    optimized_stub.PARALLELIZE_FUNCTIONS = {"registered.Model": factory}
-    optimized_stub._get_class_qualname = lambda cls: "registered.Model"
+    optimized_stub.get_model_parallelizer = lambda model: types.SimpleNamespace(tp_plan=factory)
     monkeypatch.setitem(
         sys.modules,
-        "nemo_automodel.components.distributed.optimized_tp_plans",
+        "nemo_automodel.components.distributed.model_parallelizer",
         optimized_stub,
     )
 
@@ -1809,16 +1808,15 @@ def test_resolve_moe_tp_plan_uses_registered_factory_without_dense_fallback(monk
 
 def test_resolve_moe_tp_plan_propagates_registered_factory_failure(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
-    optimized_stub = types.ModuleType("nemo_automodel.components.distributed.optimized_tp_plans")
+    optimized_stub = types.ModuleType("nemo_automodel.components.distributed.model_parallelizer")
 
     def broken_factory(model, sequence_parallel):
         raise RuntimeError("architecture-specific plan failed")
 
-    optimized_stub.PARALLELIZE_FUNCTIONS = {"BrokenMoe": broken_factory}
-    optimized_stub._get_class_qualname = lambda cls: "not.registered"
+    optimized_stub.get_model_parallelizer = lambda model: types.SimpleNamespace(tp_plan=broken_factory)
     monkeypatch.setitem(
         sys.modules,
-        "nemo_automodel.components.distributed.optimized_tp_plans",
+        "nemo_automodel.components.distributed.model_parallelizer",
         optimized_stub,
     )
 

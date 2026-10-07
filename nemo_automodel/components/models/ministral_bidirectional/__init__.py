@@ -14,20 +14,10 @@
 
 """Bidirectional Ministral3 model for embedding and retrieval tasks."""
 
-from nemo_automodel.components.models.ministral_bidirectional.model import (
-    Ministral3BidirectionalConfig,
-    Ministral3BidirectionalModel,
-    Mistral3BidirectionalConfig,
-    Mistral3BidirectionalModel,
-    Mistral3VLBidirectionalForSequenceClassification,
-)
-from nemo_automodel.shared.import_utils import safe_import_from
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
-_, Mistral3BiEncoderProcessor = safe_import_from(
-    "nemo_automodel.components.models.ministral_bidirectional.processor",
-    "Mistral3BiEncoderProcessor",
-    msg="Mistral3BiEncoderProcessor requires the vision dependencies from the diffusion extra.",
-)
+from nemo_automodel.shared.import_utils import safe_import_from
 
 __all__ = [
     "Ministral3BidirectionalModel",
@@ -37,3 +27,33 @@ __all__ = [
     "Mistral3VLBidirectionalForSequenceClassification",
     "Mistral3BiEncoderProcessor",
 ]
+
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.ministral_bidirectional.model import (
+        Ministral3BidirectionalConfig,
+        Ministral3BidirectionalModel,
+        Mistral3BidirectionalConfig,
+        Mistral3BidirectionalModel,
+        Mistral3VLBidirectionalForSequenceClassification,
+    )
+
+
+def __getattr__(name: str) -> Any:
+    """Load public model exports only when requested, keeping sidecars lightweight."""
+    if name == "Mistral3BiEncoderProcessor":
+        _, value = safe_import_from(
+            "nemo_automodel.components.models.ministral_bidirectional.processor",
+            name,
+            msg="Mistral3BiEncoderProcessor requires the vision dependencies from the diffusion extra.",
+        )
+        return value
+    if name in (
+        "Ministral3BidirectionalConfig",
+        "Ministral3BidirectionalModel",
+        "Mistral3BidirectionalConfig",
+        "Mistral3BidirectionalModel",
+        "Mistral3VLBidirectionalForSequenceClassification",
+    ):
+        return getattr(import_module("nemo_automodel.components.models.ministral_bidirectional.model"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

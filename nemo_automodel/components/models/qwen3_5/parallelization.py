@@ -19,6 +19,7 @@ import logging
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy
+from torch.distributed.tensor.parallel import ParallelStyle
 
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.multimodal_fsdp import (
@@ -33,8 +34,25 @@ from nemo_automodel.components.distributed.parallelizer_utils import fully_shard
 logger = logging.getLogger(__name__)
 
 
+def _parallelize_qwen3_5_vlm(
+    model,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelize Qwen3.5 VLM by reusing transformers' base_model_tp_plan.
+
+    Qwen3.5 has mixed attention: full self_attn (every 4th layer) + linear_attn
+    (GatedDeltaNet). The transformers-provided base_model_tp_plan covers only
+    self_attn + MLP — linear_attn is not TP-shardable with stock kernels.
+    """
+    from nemo_automodel.components.distributed.parallelizer import get_hf_tp_shard_plan
+
+    return get_hf_tp_shard_plan(model)
+
+
 class Qwen3_5ModelParallelizer(ModelParallelizer):
     """Keep mixed-dtype GatedDeltaNet parameters in dtype-uniform FSDP units."""
+
+    tp_plan = staticmethod(_parallelize_qwen3_5_vlm)
 
     _fp32_compute_module_names: tuple[str, ...] = ("_fp32_params",)
 
@@ -133,3 +151,8 @@ class Qwen3_5ModelParallelizer(ModelParallelizer):
 PARALLELIZER = Qwen3_5ModelParallelizer()
 
 __all__ = ["PARALLELIZER"]
+
+
+VLM_PARALLELIZER = type(PARALLELIZER)(
+    layer_group_paths={"language": ("model.language_model.layers",), "vision": ("model.visual.blocks",)}
+)

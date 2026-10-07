@@ -306,3 +306,6 @@ class Gemma4ModelParallelizer(ModelParallelizer):
 PARALLELIZER = Gemma4ModelParallelizer()
 
 __all__ = ["PARALLELIZER"]
+
+
+HF_PARALLELIZER = ModelParallelizer(layer_group_paths={"language": ("model.language_model.layers",)})

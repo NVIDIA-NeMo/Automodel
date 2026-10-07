@@ -29,9 +29,9 @@ from nemo_automodel._transformers.capabilities import (
     attach_capabilities_and_validate,
     validate_for_mesh,
 )
-from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
+from nemo_automodel.components.distributed import ModelParallelizer
 
-_PARALLELIZE_PATH = "nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS"
+_PARALLELIZE_PATH = "nemo_automodel.components.models.parallelization.MODEL_PARALLELIZERS"
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +245,7 @@ class TestModelSupportsTP:
     def test_tp_true_with_optimized_plan(self):
         model = _Bare()
         _attach(model)
-        with patch(_PARALLELIZE_PATH, {_get_class_qualname(_Bare): lambda model, sp: {}}):
+        with patch.object(_Bare, "parallelizer", ModelParallelizer(tp_plan=lambda model, sp: {}), create=True):
             assert model.supports.supports_tp is True
 
     def test_tp_true_with_hf_native_plan(self):

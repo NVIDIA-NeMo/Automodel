@@ -623,6 +623,11 @@ forbidden_modules = [
     "nemo_automodel._transformers",
 ]
 allow_indirect_imports = true
+ignore_imports = [
+    # This index contains lazy object references, never model implementations or policies.
+    "nemo_automodel.components.distributed.model_parallelizer -> nemo_automodel.components.models.parallelization",
+    "nemo_automodel.components.distributed.parallelizer -> nemo_automodel.components.models.parallelization",
+]
 
 # ty: type checking (https://github.com/astral-sh/ty)
 # Default: permissive. Strict checks are opt-in per-file via overrides below.

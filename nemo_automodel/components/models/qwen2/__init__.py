@@ -14,6 +14,18 @@
 
 """Custom Qwen2 model implementation for NeMo Automodel."""
 
-from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
 __all__ = ["Qwen2ForCausalLM"]
+
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
+
+
+def __getattr__(name: str) -> Any:
+    """Load public model exports only when requested, keeping sidecars lightweight."""
+    if name in ("Qwen2ForCausalLM",):
+        return getattr(import_module("nemo_automodel.components.models.qwen2.model"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

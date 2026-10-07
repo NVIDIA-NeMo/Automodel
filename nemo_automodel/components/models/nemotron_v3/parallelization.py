@@ -165,6 +165,6 @@ class NemotronHModelParallelizer(ModelParallelizer):
         )
 
 
-PARALLELIZER = NemotronHModelParallelizer()
+PARALLELIZER = NemotronHModelParallelizer(layer_group_paths={"language": ("backbone.layers", "model.layers")})
 
 __all__ = ["PARALLELIZER"]

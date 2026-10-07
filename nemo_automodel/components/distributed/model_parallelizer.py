@@ -36,8 +36,10 @@ _DEFAULT_PARALLELIZER = ModelParallelizer()
 
 
 def get_model_parallelizer(model: nn.Module) -> ModelParallelizer:
-    """Return the class-owned sidecar, or the shared default implementation."""
-    parallelizer = getattr(type(model), "parallelizer", None)
+    """Return the class-owned or lazily indexed sidecar, falling back to the shared default."""
+    from nemo_automodel.components.models.parallelization import resolve_model_parallelizer
+
+    parallelizer = resolve_model_parallelizer(type(model))
     if parallelizer is None:
         return _DEFAULT_PARALLELIZER
     if not callable(getattr(parallelizer, "parallelize", None)):

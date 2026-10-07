@@ -14,7 +14,7 @@
 
 """Unit tests for the mistral3_vlm package-level resolver hook.
 
-Importing the package installs a hook on
+Importing the native implementation installs a hook on
 ``_resolve_custom_model_cls_for_config`` (model_init.py) that claims FP8-native
 and dequantized Mistral3 VLM configs and dispatches to
 ``Mistral3FP8VLMForConditionalGeneration``.
@@ -23,7 +23,7 @@ and dequantized Mistral3 VLM configs and dispatches to
 from types import SimpleNamespace
 from unittest.mock import patch
 
-# Importing the package installs the hook (idempotent).
+# Importing the native implementation installs the hook (idempotent).
 import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
 from nemo_automodel._transformers import model_init as _mi
 from nemo_automodel.components.models.mistral3_vlm.model import (

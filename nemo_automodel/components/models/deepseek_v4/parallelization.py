@@ -27,6 +27,8 @@ class DeepseekV4ModelParallelizer(ModelParallelizer):
         return fully_shard_deepseek_v4(module, **kwargs)
 
 
-PARALLELIZER = DeepseekV4ModelParallelizer()
+PARALLELIZER = DeepseekV4ModelParallelizer(
+    layer_group_paths={"language": ("model.layers",), "vision": ("model.vision.blocks",)}
+)
 
 __all__ = ["PARALLELIZER"]

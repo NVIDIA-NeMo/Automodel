@@ -43,13 +43,11 @@ logger = logging.getLogger(__name__)
 
 
 def _has_optimized_tp_plan(model_cls: type) -> bool:
-    """Check if *model_cls* has an entry in ``PARALLELIZE_FUNCTIONS``."""
-    from nemo_automodel.components.distributed.optimized_tp_plans import (
-        PARALLELIZE_FUNCTIONS,
-        _get_class_qualname,
-    )
+    """Return whether the selected model sidecar supplies a TP plan."""
+    from nemo_automodel.components.models.parallelization import resolve_model_parallelizer
 
-    return _get_class_qualname(model_cls) in PARALLELIZE_FUNCTIONS
+    sidecar = resolve_model_parallelizer(model_cls)
+    return sidecar is not None and getattr(sidecar, "tp_plan", None) is not None
 
 
 def _is_moe(model_cls: type) -> bool:
@@ -440,7 +438,7 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
     if tp_size > 1 and not supports.supports_tp:
         errors.append(
             f"Tensor parallelism (tp_size={tp_size}) requested but {arch} "
-            f"has no TP plan (not in PARALLELIZE_FUNCTIONS and no `_tp_plan` attribute).\n"
+            f"has no TP plan (no model-sidecar plan and no `_tp_plan` attribute).\n"
             f"Please re-run with --distributed.tp_size=1 or\n"
             f"modify distributed YAML config section:\n"
             f"distributed:\n"

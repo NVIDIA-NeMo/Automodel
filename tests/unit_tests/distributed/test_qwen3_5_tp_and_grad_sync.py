@@ -20,14 +20,18 @@ import pytest
 import torch.nn as nn
 
 import nemo_automodel.components.distributed.parallelizer as parallelizer
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    PARALLELIZE_FUNCTIONS,
-    _parallelize_qwen3_5_vlm,
-)
 from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 from nemo_automodel.components.distributed.parallelizer import (
     translate_to_torch_parallel_style,
 )
+from nemo_automodel.components.models.parallelization import MODEL_PARALLELIZERS, resolve_model_parallelizer
+from nemo_automodel.components.models.qwen3_5.parallelization import _parallelize_qwen3_5_vlm
+
+
+def _sidecar_for_key(key):
+    module, _, name = key.rpartition(".")
+    cls = type(name or key, (), {"__module__": module or "transformers_modules.snapshot"})
+    return resolve_model_parallelizer(cls)
 
 
 class TestTranslateToTorchParallelStyleReplicatedWithGradAllreduce:
@@ -89,7 +93,7 @@ class TestGetHfTpShardPlanReplicatedStyles:
 
 
 class TestParallelizeQwen35VlmRegistered:
-    """_parallelize_qwen3_5_vlm is registered in PARALLELIZE_FUNCTIONS and
+    """_parallelize_qwen3_5_vlm is registered in MODEL_PARALLELIZERS and
     delegates to get_hf_tp_shard_plan so transformers' native base_model_tp_plan
     is reused."""
 
@@ -98,8 +102,8 @@ class TestParallelizeQwen35VlmRegistered:
         # transformers.models.qwen3_5 at test-collection time, which would
         # defeat other tests that stub that module before first import.
         key = "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration"
-        assert key in PARALLELIZE_FUNCTIONS
-        assert PARALLELIZE_FUNCTIONS[key] is _parallelize_qwen3_5_vlm
+        assert key in MODEL_PARALLELIZERS
+        assert _sidecar_for_key(key).tp_plan is _parallelize_qwen3_5_vlm
 
     def test_delegates_to_get_hf_tp_shard_plan(self, monkeypatch):
         sentinel_plan = {"probe": "value"}

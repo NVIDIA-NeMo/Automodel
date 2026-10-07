@@ -14,8 +14,28 @@
 
 """BAGEL mixed-modal LLM (Qwen2 + SigLIP-NaViT + MoT shell)."""
 
-from nemo_automodel.components.models.bagel.autoencoder import AutoEncoder, AutoEncoderParams, load_bagel_autoencoder
-from nemo_automodel.components.models.bagel.configuration import BagelConfig
-from nemo_automodel.components.models.bagel.model import BagelForUnifiedMultimodal
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
 __all__ = ["AutoEncoder", "AutoEncoderParams", "BagelConfig", "BagelForUnifiedMultimodal", "load_bagel_autoencoder"]
+
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.bagel.autoencoder import (
+        AutoEncoder,
+        AutoEncoderParams,
+        load_bagel_autoencoder,
+    )
+    from nemo_automodel.components.models.bagel.configuration import BagelConfig
+    from nemo_automodel.components.models.bagel.model import BagelForUnifiedMultimodal
+
+
+def __getattr__(name: str) -> Any:
+    """Load public model exports only when requested, keeping sidecars lightweight."""
+    if name in ("AutoEncoder", "AutoEncoderParams", "load_bagel_autoencoder"):
+        return getattr(import_module("nemo_automodel.components.models.bagel.autoencoder"), name)
+    if name in ("BagelConfig",):
+        return getattr(import_module("nemo_automodel.components.models.bagel.configuration"), name)
+    if name in ("BagelForUnifiedMultimodal",):
+        return getattr(import_module("nemo_automodel.components.models.bagel.model"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

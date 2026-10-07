@@ -296,3 +296,10 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
             return True
         method = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
         return method == "fp8"
+
+
+# Install the legacy config resolver only when the native implementation is loaded.
+# Importing the lightweight parallelization sidecar must not load model_init.
+from nemo_automodel.components.models.mistral3_vlm import _install_resolver_hook
+
+_install_resolver_hook()

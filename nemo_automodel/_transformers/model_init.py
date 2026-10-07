@@ -133,11 +133,11 @@ def _get_mixin_wrapped_class(model_class: type) -> type:
     Returns:
         A class that inherits from both HFCheckpointingMixin and model_class
     """
-    from nemo_automodel._transformers.model_parallelization import configure_parallelization_metadata
+    from nemo_automodel.components.models.parallelization import resolve_model_parallelizer
 
     # Custom models already inherit HFCheckpointingMixin
     if issubclass(model_class, HFCheckpointingMixin):
-        return configure_parallelization_metadata(model_class)
+        return model_class
 
     # Create wrapper class that looks identical to original
     wrapped_class = type(
@@ -148,7 +148,10 @@ def _get_mixin_wrapped_class(model_class: type) -> type:
             "__qualname__": model_class.__qualname__,
         },
     )
-    return configure_parallelization_metadata(wrapped_class)
+    parallelizer = resolve_model_parallelizer(model_class)
+    if parallelizer is not None:
+        wrapped_class.parallelizer = parallelizer
+    return wrapped_class
 
 
 @contextmanager

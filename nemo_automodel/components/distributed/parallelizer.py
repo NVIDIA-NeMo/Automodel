@@ -69,17 +69,8 @@ from nemo_automodel.components.distributed.multimodal_fsdp import (
     module_parameters,
     normalize_frozen_multimodal_sharding,
 )
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-    PARALLELIZE_FUNCTIONS,
-    VocabParallelEmbedding,
-    _get_class_qualname,
-    get_decilm_nemotron_tp_plan,
-    get_llama_nemotron_super_tp_plan,
-    is_nemotron_flash_config,
-    validate_optimized_tp_mesh,
-)
 from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce, translate_to_lora
+from nemo_automodel.components.distributed.tp_styles import VocabParallelEmbedding
 from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
@@ -178,9 +169,33 @@ def _get_input_output_embeddings(model: nn.Module) -> tuple[nn.Module | None, nn
 
 
 class ModelParallelizer:
-    """Single model-owned parallelization sidecar contract."""
+    """Model-owned policy executed through ``parallelize(model, mesh_context)``.
+
+    ``tp_plan`` supplies a fresh tensor-parallel plan for a model and its sequence-
+    parallel setting. ``layer_group_paths`` maps roles to alternative container
+    paths; the first existing path per role wins. Both are optional: the shared
+    implementation retains HF plan translation and structural layer discovery.
+    Sidecars hold policy only, never model instances or resolved layer objects.
+    """
 
     _customizes_moe_fsdp = False
+    tp_plan: Callable[[nn.Module, bool], dict[str, ParallelStyle]] | None = None
+    layer_group_paths: dict[str, tuple[str, ...]] | None = None
+
+    def __init__(
+        self,
+        *,
+        layer_group_paths: dict[str, tuple[str, ...]] | None = None,
+        tp_plan: Callable[[nn.Module, bool], dict[str, ParallelStyle]] | None = None,
+    ) -> None:
+        if layer_group_paths is not None:
+            self.layer_group_paths = layer_group_paths
+        if tp_plan is not None:
+            self.tp_plan = tp_plan
+
+    def _finalize_tp_plan(self, model: nn.Module, plan: dict[str, ParallelStyle]) -> dict[str, ParallelStyle]:
+        """Apply model-owned constraints to explicit and automatically selected plans."""
+        return plan
 
     def parallelize(
         self,
@@ -269,7 +284,7 @@ class ModelParallelizer:
 
     def _validate_tp_mesh(self, model: nn.Module, tp_mesh: DeviceMesh) -> None:
         """Validate the model's attention topology against its TP mesh."""
-        validate_tp_mesh(model, tp_mesh)
+        _validate_attention_heads(model, tp_mesh)
 
     def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
         """Return whether this model safely opts into whole-layer checkpointing."""
@@ -1020,11 +1035,16 @@ def _attention_config(model: nn.Module):
 
 
 def validate_tp_mesh(model: nn.Module, tp_mesh: DeviceMesh) -> None:
+    """Validate the selected sidecar's tensor-parallel topology."""
+    from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
+
+    get_model_parallelizer(model)._validate_tp_mesh(model, tp_mesh)
+
+
+def _validate_attention_heads(model: nn.Module, tp_mesh: DeviceMesh) -> None:
     """Validate that every sharded language attention shape divides the TP size."""
     tp_size = tp_mesh.size()
     if tp_size == 1:
-        return
-    if validate_optimized_tp_mesh(model, tp_size):
         return
 
     config = _attention_config(model)
@@ -1103,7 +1123,13 @@ def _discover_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
 def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
     """Extract transformer layers grouped by model role."""
     model_cls = type(model)
+    from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
+
+    # Explicit legacy metadata remains supported for external integrations.
     layer_group_specs = getattr(model, "parallel_layer_groups", None)
+    explicit_layer_groups = layer_group_specs is not None
+    if layer_group_specs is None:
+        layer_group_specs = getattr(get_model_parallelizer(model), "layer_group_paths", None)
 
     layer_groups: Dict[str, List[nn.Module]] = {}
     if layer_group_specs is not None:
@@ -1120,6 +1146,10 @@ def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
                     break
             if layers:
                 layer_groups[group_name] = layers
+        if not layer_groups and not explicit_layer_groups:
+            # Raw HF callers previously used structural discovery. Preserve that
+            # recovery when an installed Transformers layout has drifted.
+            layer_groups = _discover_layer_groups(model)
         if not layer_groups:
             logger.warning(
                 "Layer-group spec for %s resolved no modules: none of the expected FQNs %s exist in the "
@@ -1318,7 +1348,7 @@ def _get_parallel_plan(
 
     Priority order:
     1) If ``tp_shard_plan`` is provided as a dict or import path, use it.
-    2) If the model type exists in ``PARALLELIZE_FUNCTIONS``, use its optimised plan; on failure, fall back to HF plan.
+    2) Use the selected model sidecar's TP plan; on failure, fall back to the HF plan.
     3) Otherwise, prefer the model's HF-native ``_tp_plan`` (via ``get_hf_tp_shard_plan``).
     4) Otherwise, fall back to the default base plan.
 
@@ -1341,31 +1371,21 @@ def _get_parallel_plan(
     diagnostic so the user can tell whether to add a ``_tp_plan`` from
     scratch or fix the styles in the one they already have.
     """
+    from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
+    from nemo_automodel.components.models.parallelization import resolve_named_tp_plan
+
     model_parallel_plan = None
     model_cls = type(model)
+    sidecar = get_model_parallelizer(model)
 
     if isinstance(tp_shard_plan, dict):
         model_parallel_plan = tp_shard_plan
         col_w = max(55, max(map(len, tp_shard_plan.keys()), default=0))
         plan_lines = "\n".join(f"  {k:<{col_w}} {v}" for k, v in tp_shard_plan.items())
         logger.info(f"Using parallel plan (dictionary):\n{plan_lines}")
-    elif tp_shard_plan == LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME:
-        model_arch = None
-        if hasattr(model, "config") and hasattr(model.config, "architectures") and model.config.architectures:
-            try:
-                model_arch = model.config.architectures[0]
-            except Exception:
-                model_arch = None
-
-        if model_arch == "DeciLMForCausalLM" and getattr(model.config, "model_type", None) == "nemotron-nas":
-            model_parallel_plan = get_decilm_nemotron_tp_plan(sequence_parallel=sequence_parallel)
-            logger.info(
-                "Using DeciLM/Nemotron-NAS TP plan for named plan %s",
-                LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-            )
-        else:
-            model_parallel_plan = get_llama_nemotron_super_tp_plan(sequence_parallel=sequence_parallel)
-            logger.info(f"Using named parallel plan: {LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME}")
+    elif isinstance(tp_shard_plan, str) and (named_plan := resolve_named_tp_plan(tp_shard_plan)) is not None:
+        model_parallel_plan = named_plan(model, sequence_parallel)
+        logger.info("Using named parallel plan: %s", tp_shard_plan)
     elif tp_shard_plan is not None:
         try:
             plan_obj = import_class_from_path(tp_shard_plan)
@@ -1387,23 +1407,12 @@ def _get_parallel_plan(
                 f"Error: {e}"
             )
 
-    elif (func := PARALLELIZE_FUNCTIONS.get(_get_class_qualname(model_cls))) is not None:
+    elif sidecar.tp_plan is not None:
         try:
-            model_parallel_plan = func(model, sequence_parallel)
-            logger.info(f"Using optimized parallel plan for {model_cls.__name__}.")
+            model_parallel_plan = sidecar.tp_plan(model, sequence_parallel)
+            logger.info("Using model-owned parallel plan for %s.", model_cls.__name__)
         except Exception as e:
-            logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
-            model_parallel_plan = get_hf_tp_shard_plan(model)
-
-    # Fallback: match by bare class __name__ for trust_remote_code models whose
-    # qualified module path contains a snapshot hash and so cannot be stably
-    # registered via _get_class_qualname().
-    elif (func := PARALLELIZE_FUNCTIONS.get(model_cls.__name__)) is not None:
-        try:
-            model_parallel_plan = func(model, sequence_parallel)
-            logger.info(f"Using optimized parallel plan for {model_cls.__name__} (matched by class name).")
-        except Exception as e:
-            logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
+            logger.info("Model-owned parallel plan not available: %s. Falling back to the HF tp plan.", e)
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
     else:
@@ -1442,8 +1451,7 @@ def _get_parallel_plan(
                     "metadata, which trips an internal assert in "
                     "`torch.distributed.tensor._redistribute` on the first weight redistribute. "
                     "Register a working plan in one of the following ways:\n"
-                    f"  1. Add an entry for '{model_cls.__name__}' to "
-                    "`nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS`.\n"
+                    "  1. Supply a model-owned `parallelizer` with a `tp_plan` factory.\n"
                     "  2. Define a `_tp_plan` on the model class with styles nemo recognizes "
                     "(e.g. `colwise`, `rowwise`, `colwise_rep`, `rowwise_rep`).\n"
                     "  3. Pass `tp_shard_plan` (dict or import path) when constructing the parallelizer.\n"
@@ -1454,7 +1462,7 @@ def _get_parallel_plan(
                     "No usable tensor-parallel plan is registered for '%s'. Falling back to the "
                     "default base plan at tp_size=%d. If you hit an internal assert in "
                     "`torch.distributed.tensor._redistribute` on `shard_order is not None`, "
-                    "register a plan via `PARALLELIZE_FUNCTIONS`, `_tp_plan`, or `tp_shard_plan`.",
+                    "register a plan via a model sidecar, `_tp_plan`, or `tp_shard_plan`.",
                     model_cls.__name__,
                     tp_size,
                 )
@@ -1489,23 +1497,7 @@ def _get_parallel_plan(
             model_parallel_plan = base_model_tp_plan
             logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
 
-    # Nemotron-Flash's forward computes `logits / self.lm_head.weight.norm(p=2, dim=1)`.
-    # The logits and weight norm must therefore either both be plain tensors or both
-    # use the same vocab-sharded DTensor layout.  A replicated-output ColwiseParallel
-    # plan mixes a plain logits tensor with a sharded weight norm, so retain the
-    # historical fallback of dropping that plan.  A vocab-sharded output keeps both
-    # operands aligned and is required under FSDP+TP: leaving lm_head unplanned makes
-    # FSDP expose its weight as a DTensor while the input activation remains local.
-    if is_nemotron_flash_config(getattr(model, "config", None)):
-        for k in ("lm_head", "language_model.lm_head"):
-            style = model_parallel_plan.get(k)
-            output_layouts = getattr(style, "output_layouts", ())
-            if not isinstance(output_layouts, (tuple, list)):
-                output_layouts = (output_layouts,)
-            if any(isinstance(layout, Shard) for layout in output_layouts):
-                logger.info("Nemotron-Flash: retaining vocab-sharded %s TP plan.", k)
-            elif model_parallel_plan.pop(k, None) is not None:
-                logger.info("Nemotron-Flash: excluding replicated-output %s from TP plan.", k)
+    model_parallel_plan = sidecar._finalize_tp_plan(model, model_parallel_plan)
 
     # EP=1 uses this generic FSDP2 path rather than the dedicated MoE
     # parallelizer. Apply the same routed-expert ownership validation here so

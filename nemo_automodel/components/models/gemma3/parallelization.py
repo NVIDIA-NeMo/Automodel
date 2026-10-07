@@ -1,0 +1,101 @@
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Model-owned parallelization for gemma3."""
+
+from __future__ import annotations
+
+from typing import cast
+
+from torch import nn
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, SequenceParallel
+from torch.distributed.tensor.placement_types import Replicate, Shard
+
+from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
+from nemo_automodel.components.distributed.tp_styles import (
+    RotaryEmbedParallel,
+    VocabParallelEmbedding,
+)
+
+
+def _parallelize_gemma3(
+    model: nn.Module | None,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes a Gemma3ForCausalLM model across data and tensor parallel dimensions."""
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+
+    if isinstance(model, Gemma3ForConditionalGeneration):
+        model_prefix = "model.language_model"
+    else:
+        model_prefix = "model"
+
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+        f"{model_prefix}.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
+        f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
+        f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    base_model_sp_plan = {
+        f"{model_prefix}.embed_tokens": VocabParallelEmbedding(
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+            use_local_output=False,
+        ),
+        f"{model_prefix}.rotary_emb": RotaryEmbedParallel(use_local_output=True),
+        f"{model_prefix}.rotary_emb_local": RotaryEmbedParallel(use_local_output=True),
+        f"{model_prefix}.layers.*.input_layernorm": SequenceParallel(),
+        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+        f"{model_prefix}.layers.*.post_attention_layernorm": SequenceParallel(),
+        f"{model_prefix}.layers.*.pre_feedforward_layernorm": SequenceParallel(),
+        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+        f"{model_prefix}.layers.*.post_feedforward_layernorm": SequenceParallel(),
+        f"{model_prefix}.norm": SequenceParallel(),
+        "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    if sequence_parallel:
+        # Enable sequence parallelism only if TP size > 1
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
+PARALLELIZER = ModelParallelizer(tp_plan=_parallelize_gemma3)
+
+__all__ = ["PARALLELIZER"]
+
+
+VLM_PARALLELIZER = ModelParallelizer(
+    tp_plan=_parallelize_gemma3,
+    layer_group_paths={
+        "language": ("model.language_model.layers", "language_model.model.layers"),
+        "vision": (
+            "model.vision_tower.vision_model.encoder.layers",
+            "model.vision_tower.encoder.layers",
+            "vision_tower.vision_model.encoder.layers",
+        ),
+    },
+)
+
+LAYOUT_PARALLELIZER = ModelParallelizer(layer_group_paths=VLM_PARALLELIZER.layer_group_paths)

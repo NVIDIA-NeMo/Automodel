@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.models.step3p7.configuration_step3p7 import (
-    Step3p7Config,
-    Step3p7TextConfig,
-    StepRoboticsVisionEncoderConfig,
-)
-from nemo_automodel.components.models.step3p7.model import Step3p7ForConditionalGeneration
+
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
 __all__ = [
     "Step3p7Config",
@@ -25,3 +22,21 @@ __all__ = [
     "Step3p7TextConfig",
     "StepRoboticsVisionEncoderConfig",
 ]
+
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.step3p7.configuration_step3p7 import (
+        Step3p7Config,
+        Step3p7TextConfig,
+        StepRoboticsVisionEncoderConfig,
+    )
+    from nemo_automodel.components.models.step3p7.model import Step3p7ForConditionalGeneration
+
+
+def __getattr__(name: str) -> Any:
+    """Load public model exports only when requested, keeping sidecars lightweight."""
+    if name in ("Step3p7Config", "Step3p7TextConfig", "StepRoboticsVisionEncoderConfig"):
+        return getattr(import_module("nemo_automodel.components.models.step3p7.configuration_step3p7"), name)
+    if name in ("Step3p7ForConditionalGeneration",):
+        return getattr(import_module("nemo_automodel.components.models.step3p7.model"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

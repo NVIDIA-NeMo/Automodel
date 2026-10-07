@@ -255,7 +255,7 @@ def mock_distributed_env(monkeypatch):
     # Mock validate_tp_mesh
     validate_tp_mock = MagicMock()
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer.validate_tp_mesh", validate_tp_mock, raising=False
+        "nemo_automodel.components.distributed.parallelizer._validate_attention_heads", validate_tp_mock, raising=False
     )
 
     return {
@@ -1495,17 +1495,17 @@ class TestDeciLMNemotronNASValidation:
         tp_mesh = MagicMock()
         tp_mesh.size.return_value = 2
 
-        with patch("nemo_automodel.components.distributed.parallelizer.validate_optimized_tp_mesh") as mock_spec:
-            mock_spec.return_value = True
+        from nemo_automodel.components.models.nemotron_nas.parallelization import PARALLELIZER
 
-            # should not raise despite incompatible num_key_value_heads
+        type(model).parallelizer = PARALLELIZER
+        with patch(
+            "nemo_automodel.components.models.nemotron_nas.parallelization.validate_nemotron_nas_tp_mesh"
+        ) as mock_spec:
             parallelizer_mod.validate_tp_mesh(model, tp_mesh)
-
-            # specialized validator was called with (model, tp_size)
             mock_spec.assert_called_once_with(model, 2)
 
     def test_validate_tp_mesh_for_nemotron_nas_valid_config_passes(self):
-        from nemo_automodel.components.distributed.optimized_tp_plans import validate_nemotron_nas_tp_mesh
+        from nemo_automodel.components.models.nemotron_nas.parallelization import validate_nemotron_nas_tp_mesh
 
         # a valid config covering linear, grouped, and noop attention cases
         model = self._make_decilm_nas_model(

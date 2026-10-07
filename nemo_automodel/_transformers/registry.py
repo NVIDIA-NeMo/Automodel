@@ -31,8 +31,6 @@ logger = logging.getLogger(__name__)
 # Models are loaded lazily on first access rather than imported at startup.
 # Optional third element is a set of tags (e.g. {"retrieval"}) used by
 # downstream code to classify model archs without importing them.
-# "hf_parallelizer" opts the HF wrapper into the owning package's
-# parallelization.PARALLELIZER; it requires compatibility with the HF layout.
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
@@ -67,7 +65,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
         ),
         (
             "DeepseekV4ForCausalLM",
-            ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM", {"hf_parallelizer"}),
+            ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
         ),
         (
             "DeepseekV41ForCausalLM",
@@ -239,7 +237,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
         ),
         (
             "NemotronHForCausalLM",
-            ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM", {"hf_parallelizer"}),
+            ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),
         (
             "NemotronH_Nano_Omni_Reasoning_V3",
@@ -321,11 +319,11 @@ MODEL_ARCH_MAPPING = OrderedDict(
         ),
         (
             "Qwen3_5ForCausalLM",
-            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForCausalLM", {"hf_parallelizer"}),
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForCausalLM"),
         ),
         (
             "Qwen3_5ForConditionalGeneration",
-            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration", {"hf_parallelizer"}),
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration"),
         ),
         (
             "Qwen3OmniMoeForConditionalGeneration",
