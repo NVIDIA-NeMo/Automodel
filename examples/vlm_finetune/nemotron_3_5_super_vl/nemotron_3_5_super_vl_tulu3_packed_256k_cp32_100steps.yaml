@@ -18,7 +18,6 @@
 # world = TP1 * CP32 * PP1 * DP1 = 32 (4 nodes x 8 GPUs); EP32 = DP*CP.
 # GBS=8 and local batch=1 give 8 microbatches per optimizer step.
 #
-# The existing filename is retained for compatibility; this recipe now uses CP32.
 # Launch on four 8-GPU nodes and enable W&B with --wandb.enable=true.
 # Set PYTORCH_ALLOC_CONF=expandable_segments:True in the launch environment.
 
