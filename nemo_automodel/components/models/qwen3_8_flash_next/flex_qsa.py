@@ -57,6 +57,16 @@ def _compiled_flex():
     return torch.compile(flex_attention, dynamic=False)
 
 
+@functools.cache
+def _compiled_create_block_mask():
+    """Compile ``create_block_mask`` lazily.
+
+    Eager, it materializes every ``mask_mod`` intermediate over all (q, kv) pairs;
+    compiled, they fuse into the per-tile reduction.
+    """
+    return torch.compile(create_block_mask)
+
+
 def _routes_to_membership(
     selected_token_ids: torch.Tensor,
     kv_length: int,
@@ -129,6 +139,7 @@ def build_flex_qsa_mask(
     *,
     kv_length: int,
     device: torch.device,
+    use_compile: bool = True,
 ) -> FlexQSAMask:
     """Build the FlexAttention mask for a set of routed token IDs.
 
@@ -142,6 +153,8 @@ def build_flex_qsa_mask(
             coordinates; ``-1`` and out-of-range entries are padding.
         kv_length: Number of physical K/V rows.
         device: CUDA device the attention will run on.
+        use_compile: Build through the cached compiled ``create_block_mask``; ``False``
+            runs it eagerly.
 
     Returns:
         The block mask, the ``[B, S_q]`` has-routes marker, and the extents it was built for.
@@ -165,7 +178,8 @@ def build_flex_qsa_mask(
         offset = _membership_flat_offset(b, safe_q, safe_kv, query_length, kv_length)
         return in_range & membership_flat[offset]
 
-    block_mask = create_block_mask(
+    builder = _compiled_create_block_mask() if use_compile else create_block_mask
+    block_mask = builder(
         mask_mod,
         B=batch_size,
         H=None,
