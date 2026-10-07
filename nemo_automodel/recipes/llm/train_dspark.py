@@ -1140,7 +1140,9 @@ class TrainDSparkRecipe(BaseRecipe):
             if strategy == "fsdp2":
                 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
-                mp_policy = MixedPrecisionPolicy(param_dtype=self.compute_dtype, reduce_dtype=torch.float32)
+                mp_policy = MixedPrecisionPolicy(
+                    param_dtype=self.compute_dtype, reduce_dtype=torch.float32, cast_forward_inputs=False
+                )
                 # CP keeps the draft replicated across CP ranks. Otherwise use a
                 # named WORLD mesh so checkpoint adapters can resolve FSDP shards.
                 draft_mesh = self.dp_mesh

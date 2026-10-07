@@ -878,6 +878,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 document IDs of shape [batch, sequence]. NEAT attention metadata
                 is batch-major; legacy THD inputs are flattened by the sharder.
                 VLM media and position tensors retain the model's input layout.
+                THD MTP requires physical boundaries in cu_seqlens_padded of
+                shape [num_sequences + 1] or [1, num_sequences + 1], or
+                _packed_seq_ids [batch, sequence] supplied by the native model
+                sharder from physical seq_lens_padded [batch, num_sequences].
             loss_buffer: List receiving the detached scalar loss.
             num_label_tokens: Global supervised-token count for loss normalization.
             num_batches: Number of microbatches in the accumulation window.
@@ -964,6 +968,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Preserve physical NEAT document IDs before model-kwarg filtering. The
         # loss needs these even when the forward does not accept packing metadata.
         mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
+        # Preserve packing metadata needed by the loss before model-kwarg filtering.
+        mtp_is_packed = "cu_seqlens" in batch or "cu_seqlens_padded" in batch or batch.get("qkv_format") == "thd"
+        mtp_cu_seqlens = batch.get("cu_seqlens_padded")
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -1042,6 +1049,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
+                        # CP targets or NEAT document IDs already define the boundaries.
+                        mtp_cu_seqlens = None
+                    elif mtp_is_packed and mtp_cu_seqlens is None:
+                        raise ValueError(
+                            "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
+                            "including padding; cu_seqlens alone is insufficient."
+                        )
                     if _cp_active and mtp_per_depth_targets is None:
                         raise RuntimeError("MTP with context parallelism requires globally prepared per-depth targets")
                     mtp_cfg = self.cfg.mtp
@@ -1062,11 +1077,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         lm_weight=shared_lm_weight,
                         logits_dtype=out.logits.dtype,
                         grad_reduce_group=grad_reduce_group,
-                        cu_seqlens=(
-                            None
-                            if mtp_per_depth_targets is not None or "packed_token_indices" in batch
-                            else batch.get("cu_seqlens")
-                        ),
+                        cu_seqlens=mtp_cu_seqlens,
                     )
 
                 # Joint base + drafter co-training (Gemma4WithDrafter and

@@ -111,8 +111,6 @@ distributed:
     _target_: torch.distributed.fsdp.MixedPrecisionPolicy
     param_dtype: bfloat16
     reduce_dtype: float32
-    output_dtype: bfloat16
-    cast_forward_inputs: true
 
   pipeline:
     pp_schedule: interleaved1f1b

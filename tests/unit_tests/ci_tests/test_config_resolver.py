@@ -278,6 +278,23 @@ def test_end_to_end_robustness_ignores_max_steps_env(tmp_path, synthetic_recipe)
     assert resolved["checkpoint"]["checkpoint_dir"] == f"{tmp_path}/t1/robustness_checkpoint"
 
 
+@pytest.mark.parametrize("phase", ["release", "checkpoint_robustness"])
+def test_glm51_lora_saves_within_each_ci_run(tmp_path: Path, phase: str) -> None:
+    recipe = REPO_ROOT / "examples/llm_finetune/glm/glm_5.1_lora.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": "glm_5.1_lora"}
+    _run_resolver(["--base", str(recipe), "--phase", phase, "--output", str(out)], env=env)
+
+    resolved = yaml.load(out)
+    assert resolved["checkpoint"]["enabled"] is True
+    assert resolved["step_scheduler"]["ckpt_every_steps"] <= resolved["step_scheduler"]["max_steps"] == 2
+    assert resolved["step_scheduler"]["global_batch_size"] == 512
+    assert resolved["step_scheduler"]["local_batch_size"] == 8
+    assert resolved["model"]["moe_overrides"]["gate_bias_update_factor"] == 0.0
+    assert resolved["peft"]["use_triton"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["tokenizer_name"] == "zai-org/GLM-5.1"
+
+
 def test_end_to_end_customizer_chat_path_wins(tmp_path):
     """A recipe whose stem contains both 'customizer_' and 'chat' picks up the chat dataset paths."""
     recipe = tmp_path / "customizer_nano_chat.yaml"

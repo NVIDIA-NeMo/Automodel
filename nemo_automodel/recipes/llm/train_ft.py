@@ -85,7 +85,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
     _get_lm_head_module,
@@ -178,6 +178,9 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
+    # Probe the wrapped model's signature, head, and config; training still calls DDP.
+    if isinstance(probe_module, nn.parallel.DistributedDataParallel):
+        probe_module = probe_module.module
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
         if isinstance(loss_fn, ChunkedCrossEntropy):
             raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
@@ -1222,6 +1225,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batch: Input mapping with token IDs, labels, and physical NEAT
                 document IDs of shape [batch, sequence]. NEAT attention metadata
                 is batch-major; legacy THD inputs are flattened by the sharder.
+                THD MTP requires physical boundaries in cu_seqlens_padded of
+                shape [num_sequences + 1] or [1, num_sequences + 1], or
+                _packed_seq_ids [batch, sequence] supplied by the native model
+                sharder from physical seq_lens_padded [batch, num_sequences].
             loss_buffer: List receiving the detached scalar loss.
             num_label_tokens: Global supervised-token count for loss normalization.
             num_batches: Number of microbatches in the accumulation window.
@@ -1273,6 +1280,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Preserve physical NEAT document IDs before model-kwarg filtering. The
         # loss needs these even when the forward does not accept packing metadata.
         mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
+        # Preserve packing metadata needed by the loss before model-kwarg filtering.
+        mtp_is_packed = "cu_seqlens" in batch or "cu_seqlens_padded" in batch or batch.get("qkv_format") == "thd"
+        mtp_cu_seqlens = batch.get("cu_seqlens_padded")
         labels = batch.pop("labels")
         dataset_ids = batch.pop("dataset_id", None)
         loss_weights = None
@@ -1312,17 +1322,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
-                # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
+                # Hand physical THD boundaries to the PP loss to mask cross-sequence targets —
                 # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
                 # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
                 # one pack/microbatch per step; batch-major NEAT metadata instead travels with each
                 # microbatch and its model-provided seq_idx tail.
-                cu_seqlens = None if "packed_token_indices" in batch_filtered else batch_filtered.get("cu_seqlens")
+                cu_seqlens = (
+                    None if "packed_token_indices" in batch_filtered else batch_filtered.get("cu_seqlens_padded")
+                )
                 if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
                     cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
+                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 1:
+                    cu_seqlens = cu_seqlens[cu_seqlens != -1000]
                 pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
-                if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
+                if isinstance(pp_loss_fn, PipelineCausalLMLoss):
                     pp_loss_fn.cu_seqlens = cu_seqlens
+                    pp_loss_fn.is_packed = mtp_is_packed or mtp_seq_idx is not None
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
@@ -1397,6 +1412,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
+                        # CP targets or NEAT document IDs already define the boundaries.
+                        mtp_cu_seqlens = None
+                    elif mtp_is_packed and mtp_cu_seqlens is None:
+                        raise ValueError(
+                            "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
+                            "including padding; cu_seqlens alone is insufficient."
+                        )
                     mtp_cfg = self.cfg.mtp
                     if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
                         raise NotImplementedError(
@@ -1417,12 +1440,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
-                        # NEAT uses physical document IDs; cu_seqlens is the legacy THD fallback.
-                        cu_seqlens=(
-                            None
-                            if mtp_per_depth_targets is not None or "packed_token_indices" in batch
-                            else batch.get("cu_seqlens")
-                        ),
+                        # MTP shifts index physical token slots, including internal THD padding.
+                        cu_seqlens=mtp_cu_seqlens,
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )

@@ -615,6 +615,7 @@ class NeMoAutoDiffusionPipeline:
         move_to_device: bool = True,
         load_for_training: bool = False,
         components_to_load: Iterable[str] | None = None,
+        components_to_parallelize: Iterable[str] | None = None,
         peft_cfg=None,
         model_type=None,
         active_transformer: str | None = None,
@@ -647,6 +648,10 @@ class NeMoAutoDiffusionPipeline:
             move_to_device: Whether to move modules to device
             load_for_training: Whether to make parameters trainable
             components_to_load: Which components to process (default: all)
+            components_to_parallelize: Components to parallelize, independently of device placement.
+                Defaults to components_to_load. Inference can load all components onto the device
+                while parallelizing only the transformer. Custom-model checkpoints support only
+                None or ["transformer"]; other selectors, including [], are rejected.
             peft_cfg: PeftConfig instance or None. When provided, LoRA is injected
                 before _apply_parallelization() (FSDP2 wrapping). Base weights
                 are frozen after FSDP2; LoRA params are collected pre-FSDP2 and stored on pipe.
@@ -682,6 +687,10 @@ class NeMoAutoDiffusionPipeline:
         if _has_custom_model(transformer_dir):
             if components_to_load is not None and set(components_to_load) - {"transformer"}:
                 raise ValueError("Custom-model pipelines load only the `transformer` component.")
+            if components_to_parallelize is not None and set(components_to_parallelize) != {"transformer"}:
+                raise ValueError(
+                    'Custom-model pipelines support only components_to_parallelize=None or ["transformer"].'
+                )
             _validate_custom_model_options(
                 mesh_context,
                 active_transformer=active_transformer,
@@ -824,7 +833,8 @@ class NeMoAutoDiffusionPipeline:
         # FSDP2 LoRA: all params are trainable when fully_shard() runs so FSDP2
         # sets up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
         # DDP LoRA: base weights are frozen before wrapping so DDP only reduces LoRA gradients.
-        _apply_parallelization(pipe, mesh_context, components_to_load)
+        parallel_components = components_to_load if components_to_parallelize is None else components_to_parallelize
+        _apply_parallelization(pipe, mesh_context, parallel_components)
 
         # Freeze base weights after FSDP2 wrapping — mirrors the LLM pattern in
         # nemo_automodel/_transformers/infrastructure.py lines 513-518.
