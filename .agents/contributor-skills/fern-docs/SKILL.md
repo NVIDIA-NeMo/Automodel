@@ -97,7 +97,7 @@ Run the commands in this guide from the repository root. They use `make -C docs/
      slug: <short-url-segment>
    ```
 
-4. Run `make -C docs/fern docs-check` to validate dataset cards, regenerate model tables, restore archived pages, validate MDX syntax, and run `fern check`. Verify the URL in the `make -C docs/fern docs` preview. `latest.yml` mounts the frozen v0.5 tree and is not synchronized with nightly.
+4. Run `make -C docs/fern docs-check` to validate dataset cards and preview navigation, regenerate model tables, restore archived pages, validate MDX syntax, and run `fern check`. Verify the URL in the `make -C docs/fern docs` preview. `latest.yml` mounts the frozen v0.5 tree and is not synchronized with nightly.
 
 ### Update a Page
 
@@ -222,11 +222,12 @@ For cross-repo references (yaml configs, Python source), use absolute GitHub URL
 ## Validate
 
 ```bash
-make -C docs/fern docs-check          # Dataset cards, model tables, archived pages, MDX syntax, Fern config
+make -C docs/fern docs-check          # Dataset cards, preview navigation, model tables, archives, MDX, Fern config
 make -C docs/fern docs-dataset-cards  # Focused dataset-card tests and example coverage validation
+make -C docs/fern docs-preview-navigation  # Data navigation staging tests
 ```
 
-`docs-check` must pass before commit. It runs the dataset-card unit tests and validator, regenerates model-coverage tables, restores both archived page trees, validates MDX syntax, and runs `fern check`. Raw HTML in MDX must be valid JSX (for example, use `<img ... />`, not `<img ...>`).
+`docs-check` must pass before commit. It runs the dataset-card unit tests and validator, tests preview-navigation staging, regenerates model-coverage tables, restores both archived page trees, validates MDX syntax, and runs `fern check`. Raw HTML in MDX must be valid JSX (for example, use `<img ... />`, not `<img ...>`).
 
 Inspect link warnings against the version navigation and preview before treating them as broken routes. Version-agnostic links should preserve the current version; verify that the destination exists in that version's navigation.
 

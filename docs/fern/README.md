@@ -38,7 +38,7 @@ cd docs/fern && make docs-login
 # 3. Build the API library reference and start the local dev server
 make docs           # http://localhost:3002
 
-# 4. Validate dataset cards, MDX syntax, and Fern configuration before committing
+# 4. Validate dataset cards, preview navigation, MDX syntax, and Fern configuration
 make docs-check
 ```
 
@@ -99,8 +99,9 @@ Run these commands from this directory (`cd docs/fern` first), or use `make -C d
 ```bash
 make docs           # docs-stitch + `fern docs md generate` + `fern docs dev` → http://localhost:3002
 make docs-stitch    # restore frozen backward-version pages from the docs-archive branch
-make docs-check     # dataset cards, model tables, archived pages, MDX syntax, and `fern check`
+make docs-check     # dataset cards, preview navigation, model tables, archives, MDX, and `fern check`
 make docs-dataset-cards # validate Hub dataset cards and example coverage
+make docs-preview-navigation # test Data navigation staging
 make docs-model-tables  # regenerate model-coverage tables
 make docs-preview   # docs-stitch + shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)
 make docs-publish   # trigger the `Publish Fern Docs` workflow on origin/main

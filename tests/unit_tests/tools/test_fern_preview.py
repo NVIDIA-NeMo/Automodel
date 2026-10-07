@@ -14,6 +14,7 @@
 # limitations under the License.
 """Exercise the actual preview workflow's Data navigation staging step."""
 
+import json
 import os
 import subprocess
 import sys
@@ -52,8 +53,8 @@ class PreviewNavigationTests(unittest.TestCase):
         self.page.parent.mkdir(parents=True)
         self.page.write_text("A synthetic dataset card.")
 
-    def _stage(self, data: dict) -> subprocess.CompletedProcess[str]:
-        self.source.write_text(yaml.safe_dump({"navigation": [data]}))
+    def _stage(self, *sections: dict) -> subprocess.CompletedProcess[str]:
+        self.source.write_text(yaml.safe_dump({"navigation": list(sections)}))
         return subprocess.run(
             [sys.executable, "-I", "-c", SCRIPT],
             cwd=self.root,
@@ -82,7 +83,10 @@ class PreviewNavigationTests(unittest.TestCase):
                 page.write_text("Preview page.")
                 if "dataset-coverage" in item["path"]:
                     cards.add(item["path"])
-        self.assertEqual(len(cards), 36)  # 35 Hub datasets and the overview.
+        catalog = json.loads((ROOT / "docs/dataset-coverage/catalog.json").read_text())
+        expected = {"../../" + entry["card"].removeprefix("docs/") for entry in catalog}
+        expected.add("../../dataset-coverage/index.mdx")
+        self.assertEqual(cards, expected)
         result = self._stage(data)
         self.assertEqual(result.returncode, 0, result.stderr)
         actual = yaml.safe_load(self.target.read_text())
@@ -127,6 +131,45 @@ class PreviewNavigationTests(unittest.TestCase):
         entry = {"section": "Loop", "contents": []}
         entry["contents"].append(entry)
         self._reject(entry)
+
+    def test_rejects_hidden_pages_and_components(self) -> None:
+        for relative in (".private/page.mdx", "fern/components/page.mdx"):
+            with self.subTest(relative=relative):
+                page = self.docs / relative
+                page.parent.mkdir(parents=True, exist_ok=True)
+                page.write_text("Not preview content")
+                self._reject({"page": "Invalid", "path": "../../" + relative})
+
+    def test_requires_one_data_section_in_each_navigation(self) -> None:
+        data = {"section": "Data", "slug": "datasets", "contents": []}
+        for sections in ([], [data, data]):
+            with self.subTest(sections=sections):
+                result = self._stage(*sections)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(yaml.safe_load(self.target.read_text()), self.original)
+                trusted = {"navigation": sections}
+                self.target.write_text(yaml.safe_dump(trusted))
+                result = self._stage(data)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(yaml.safe_load(self.target.read_text()), trusted)
+                self.target.write_text(yaml.safe_dump(self.original))
+
+    def test_preserves_real_navigation_outside_data_section(self) -> None:
+        original = yaml.safe_load((ROOT / "docs/fern/versions/nightly.yml").read_text())
+        self.target.write_text(yaml.safe_dump(original))
+        replacement = {"section": "Data", "slug": "datasets", "contents": []}
+        result = self._stage(replacement)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = {
+            **original,
+            "navigation": [replacement if item.get("slug") == "datasets" else item for item in original["navigation"]],
+        }
+        self.assertEqual(yaml.safe_load(self.target.read_text()), expected)
+
+    def test_invalid_title_error_identifies_value(self) -> None:
+        result = self._stage({"section": "Data", "slug": "datasets", "contents": [{"page": "Text & audio"}]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Text & audio", result.stderr)
 
 
 if __name__ == "__main__":

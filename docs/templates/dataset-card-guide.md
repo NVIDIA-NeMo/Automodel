@@ -28,6 +28,18 @@ preparation scripts, and the upstream metadata revision. Keep preparation-only
 sources and mixture components tied to an actual example; a generic local-file
 loader is not itself a published dataset.
 
+When adding a dataset or updating its pinned revision, the secret scanner may
+flag the public Git hash as a `Hex High Entropy String`. Verify the reported
+value against the linked upstream revision, then add only that verified false
+positive to `.github/workflows/config/.secrets.baseline` with `is_secret: false`.
+Keep unrelated findings and scanner settings unchanged, stage the baseline, and
+rerun the secret check from the repository root:
+
+```bash
+uv run --no-project --with detect-secrets==1.5.0 detect-secrets-hook \
+  --baseline .github/workflows/config/.secrets.baseline docs/dataset-coverage/catalog.json
+```
+
 ## Content Contract
 
 Use exactly these H2 sections in order:
@@ -59,7 +71,10 @@ cards, detects unregistered Markdown and MDX cards, parses the
 synthetic JSON examples, and checks repository links and navigation entries. It
 detects uncovered Hub IDs in example YAMLs under `dataset_name`, `path_or_dataset`,
 `path_or_dataset_id`, `train_data_path`, and `schema_dataset`, as well as IDs in
-`hf://` strings.
+AutoModel retrieval URIs of the form `hf://ORGANIZATION/DATASET/SUBSET`.
+Recipe PRs that introduce a new Hub ID must add its card and catalog registration.
+Prefix relative local directories with `./` (for example, `./data/my_corpus`) so
+the checker can distinguish them from two-part Hub IDs such as `org/dataset`.
 It does not execute loaders or prove upstream factual claims. Review other YAML
 fields and indirect sources in loader defaults, mixtures, and preparation scripts
 against the catalog when changing those paths.

@@ -205,20 +205,20 @@ jobs:
                   raise ValueError("Data navigation is too large or contains recursive aliases")
               item = pending.pop()
               if not isinstance(item, dict) or set(item) - {"section", "page", "path", "slug", "contents"}:
-                  raise ValueError("Data navigation allows only sections and pages")
+                  raise ValueError(f"Data navigation allows only sections and pages: {item!r}")
               for key, value in item.items():
                   if key == "contents":
                       if not isinstance(value, list):
                           raise ValueError("Data navigation contents must be a list")
                       pending.extend(value)
                   elif not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9 /_.()+,-]+", value):
-                      raise ValueError("Data navigation values must be literal text or local paths")
+                      raise ValueError(f"Data navigation {key} must be literal text or a local path: {value!r}")
               if "path" in item:
                   page = (target.parent / item["path"]).resolve()
                   if not page.is_relative_to(docs) or page.suffix not in {".md", ".mdx"} or not page.is_file():
-                      raise ValueError("Data navigation must reference an existing staged Markdown page")
+                      raise ValueError(f"Data navigation must reference an existing staged Markdown page: {item['path']!r}")
                   if any(part.startswith(".") or part == "components" for part in page.relative_to(docs).parts):
-                      raise ValueError("Data navigation cannot reference hidden files or components")
+                      raise ValueError(f"Data navigation cannot reference hidden files or components: {item['path']!r}")
           matches = [i for i, item in enumerate(preview["navigation"]) if item.get("slug") == "datasets"]
           if len(matches) != 1:
               raise ValueError("Expected one Data section in trusted navigation")

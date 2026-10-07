@@ -72,7 +72,7 @@ jobs:
           version: 0.8.22
 
       - name: Validate dataset cards
-        run: uv run --no-project --with 'PyYAML==6.0.3' make -C docs/fern docs-dataset-cards
+        run: make -C docs/fern docs-dataset-cards
 
       - name: Test preview navigation staging
         run: make -C docs/fern docs-preview-navigation

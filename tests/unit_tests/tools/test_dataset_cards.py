@@ -187,7 +187,15 @@ class DatasetCardContractTests(unittest.TestCase):
         self.assertEqual(cards.hub_ids(value), {"org/direct", "org/retrieval", "org/chat"})
 
     def test_local_paths_are_not_hub_ids(self):
-        for path in ("./local", "../local", "/data/local", "data/train.jsonl", "${DATA}/train", "plain"):
+        for path in (
+            "./local",
+            "./data/my_corpus",
+            "../local",
+            "/data/local",
+            "data/train.jsonl",
+            "${DATA}/train",
+            "plain",
+        ):
             self.assertEqual(cards.hub_ids({"path_or_dataset_id": path}), set())
 
 
@@ -221,7 +229,9 @@ class DatasetCatalogTests(unittest.TestCase):
 
     def test_new_example_dataset_needs_card(self):
         self.write("examples/new.yml", "dataset:\n  dataset_name: new/dataset\n")
-        self.assertTrue(any("no card for Hub dataset new/dataset" in error for error in cards.validate(self.root)))
+        errors = cards.validate(self.root)
+        self.assertTrue(any("no card for Hub dataset new/dataset" in error for error in errors))
+        self.assertTrue(any("docs/templates/dataset-card-guide.md" in error for error in errors))
 
     def test_alias_matches_existing_card(self):
         self.write("docs/dataset-coverage/catalog.json", json.dumps([{**ENTRY, "aliases": ["legacy/toy"]}]))
@@ -262,6 +272,38 @@ class DatasetCatalogTests(unittest.TestCase):
             "path: ../../dataset-coverage/example/toy.mdx\nnavigation: [\n",
         )
         self.assertTrue(any("invalid nightly navigation YAML" in error for error in cards.validate(self.root)))
+
+    def test_malformed_catalog_entry_identifies_entry_and_field(self):
+        for key in ("id", "task", "card", "source", "revision", "recipes", "aliases", "evidence"):
+            for value in (None, 123, {}, [None]):
+                with self.subTest(key=key, value=value):
+                    self.write("docs/dataset-coverage/catalog.json", json.dumps([{**ENTRY, key: value}]))
+                    errors = cards.validate(self.root)
+                    self.assertTrue(any("catalog entry 1" in error and key in error for error in errors))
+        for entry in ("not an object", {key: value for key, value in ENTRY.items() if key != "recipes"}):
+            with self.subTest(entry=entry):
+                self.write("docs/dataset-coverage/catalog.json", json.dumps([entry]))
+                self.assertTrue(any("catalog entry 1" in error for error in cards.validate(self.root)))
+        self.write("docs/dataset-coverage/catalog.json", json.dumps([{**ENTRY, "recipes": "examples/toy.yaml"}]))
+        self.assertTrue(any("example/toy" in error and "recipes" in error for error in cards.validate(self.root)))
+
+    def test_duplicate_ids_and_aliases_are_rejected(self):
+        for entries in ([ENTRY, ENTRY], [{**ENTRY, "aliases": [ENTRY["id"]]}]):
+            with self.subTest(entries=entries):
+                self.write("docs/dataset-coverage/catalog.json", json.dumps(entries))
+                self.assertTrue(any("duplicate dataset ID or alias" in error for error in cards.validate(self.root)))
+
+    def test_card_path_must_preserve_hub_id(self):
+        self.write("docs/dataset-coverage/catalog.json", json.dumps([{**ENTRY, "card": "docs/toy.mdx"}]))
+        self.assertTrue(any("path must preserve the canonical Hub ID" in error for error in cards.validate(self.root)))
+
+    def test_missing_index_link_is_rejected(self):
+        self.write("docs/dataset-coverage/index.mdx", "No cards linked")
+        self.assertTrue(any("missing catalog index link" in error for error in cards.validate(self.root)))
+
+    def test_invalid_example_yaml_identifies_file(self):
+        self.write("examples/toy.yaml", "dataset: [\n")
+        self.assertTrue(any("examples/toy.yaml: invalid YAML" in error for error in cards.validate(self.root)))
 
 
 if __name__ == "__main__":

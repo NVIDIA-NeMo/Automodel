@@ -203,7 +203,30 @@ def validate(root: Path) -> list[str]:
     except yaml.YAMLError as exc:
         return [f"invalid nightly navigation YAML: {exc}"]
     index = (directory / "index.mdx").read_text()
-    for entry in entries:
+    for number, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            errors.append(f"catalog entry {number}: expected an object")
+            continue
+        label = f"catalog entry {number} ({entry.get('id', '<missing id>')!r})"
+        invalid = [
+            key
+            for key in ("id", "task", "card", "source", "revision")
+            if not isinstance(entry.get(key), str) or not entry[key].strip()
+        ]
+        invalid.extend(
+            key
+            for key in ("recipes", "aliases", "evidence")
+            if (key == "recipes" or key in entry)
+            and (
+                not isinstance(entry.get(key), list)
+                or any(not isinstance(item, str) or not item.strip() for item in entry[key])
+            )
+        )
+        if invalid:
+            errors.append(
+                f"{label}: invalid or missing fields: {', '.join(invalid)}; see docs/templates/dataset-card-guide.md"
+            )
+            continue
         dataset_id = entry["id"]
         if not HUB_ID.fullmatch(dataset_id):
             errors.append(f"invalid Hub dataset ID: {dataset_id}")
@@ -250,7 +273,10 @@ def validate(root: Path) -> list[str]:
             errors.append(f"{recipe.relative_to(root)}: invalid YAML: {exc}")
             continue
         for dataset_id in sorted(hub_ids(config) - known_ids):
-            errors.append(f"{recipe.relative_to(root)}: no card for Hub dataset {dataset_id}")
+            errors.append(
+                f"{recipe.relative_to(root)}: no card for Hub dataset {dataset_id}; "
+                "see docs/templates/dataset-card-guide.md (prefix local paths with ./)"
+            )
     return errors
 
 

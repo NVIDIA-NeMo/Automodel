@@ -412,7 +412,7 @@
     "recipes": [
       "examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml"
     ],
-    "source": "nemo_automodel/components/datasets/diffusion/loader.py",
+    "source": "nemo_automodel/components/datasets/diffusion/collate_fns.py",
     "evidence": [
       "examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml"
     ],
