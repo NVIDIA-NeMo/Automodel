@@ -784,7 +784,8 @@ class TestPrecomputeStageShapes:
         assert stage._user_meta.inputs[1].requires_grad is True
         assert stage._user_meta.outputs[0].requires_grad is True
 
-    def test_unsupported_pipeline_stage_api_uses_dynamic_metadata_inference(self):
+    @pytest.mark.parametrize("reset", [False, True])
+    def test_unsupported_pipeline_stage_api_uses_dynamic_metadata_inference(self, reset):
         """PipelineStage APIs without a static metadata hook retain the dynamic fallback."""
 
         class _Submod:
@@ -793,8 +794,12 @@ class TestPrecomputeStageShapes:
         stage = types.SimpleNamespace(is_first=True, submod=_Submod())
         config = self._make_config(hidden_size=64, vocab_size=128)
 
-        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+        if reset:
+            num_tokens = reset_pp_stage_shapes(types.SimpleNamespace(), [stage], config, microbatch_size=2, seq_len=16)
+        else:
+            num_tokens = _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
 
+        assert num_tokens == 32
         assert not hasattr(stage, "inputs_meta")
         assert not hasattr(stage, "_outputs_meta")
 
@@ -816,6 +821,43 @@ class TestPrecomputeStageShapes:
         assert len(out_call) == 1
         assert out_call[0].shape == (2, 16, 64)
         assert out_call[0].dtype == torch.bfloat16
+
+    @pytest.mark.parametrize("reset", [False, True])
+    def test_empty_stages_return_global_token_fallback(self, reset):
+        config = self._make_config()
+        if reset:
+            num_tokens = reset_pp_stage_shapes(types.SimpleNamespace(), [], config, 3, 17)
+        else:
+            num_tokens = _precompute_stage_shapes([], config, 3, 17)
+        assert num_tokens == 51
+
+    @pytest.mark.parametrize("reset", [False, True])
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_returns_maximum_local_stage_token_count(self, reset, reverse):
+        class LocalStageModel(torch.nn.Module):
+            def __init__(self, shape):
+                super().__init__()
+                self.shape = shape
+
+            def get_pipeline_stage_metas(self, **kwargs):
+                output = torch.empty(self.shape, device="meta", dtype=kwargs["dtype"])
+                return (output,), (output,)
+
+        # Include ordinary batch-major and hyper-connection layouts. The maximum
+        # (18) differs from the first/last value, their sum, and the global count.
+        shapes = [(2, 3, 64), (2, 9, 4, 64), (2, 5, 64)]
+        if reverse:
+            shapes.reverse()
+        stages = [
+            types.SimpleNamespace(is_first=False, submod=LocalStageModel(shape), _configure_outputs_meta=Mock())
+            for shape in shapes
+        ]
+        config = self._make_config()
+        if reset:
+            num_tokens = reset_pp_stage_shapes(types.SimpleNamespace(), stages, config, 2, 32)
+        else:
+            num_tokens = _precompute_stage_shapes(stages, config, 2, 32)
+        assert num_tokens == 18
 
     def test_middle_stage_shapes(self):
         """Middle stage input/output should be [mb, seq_len, hidden]."""
