@@ -3543,33 +3543,13 @@ class TestSkipInitWeightsOnLoadGate:
         model.config = SimpleNamespace(architectures=["TestModel"])
         return model
 
-    def test_from_config_initializes_even_with_checkpoint_load_optout(self) -> None:
-        """A load-only opt-out must not leave checkpoint-free parameters uninitialized."""
-        model = self._make_meta_model()
-        model._skip_init_weights_on_load = True
-        model.register_buffer("routing_bias", torch.empty(4, device="meta", dtype=torch.float32))
-
-        @torch.no_grad()
-        def initialize_weights(dtype: torch.dtype = torch.float32) -> None:
-            model.weight.fill_(0.25)
-            model.bias.fill_(0.5)
-            model.routing_bias.fill_(1.0)
-
-        model.initialize_weights = initialize_weights
-        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
-
-        torch.testing.assert_close(model(torch.ones(2, 4)), torch.full((2, 4), 1.5), rtol=0, atol=0)
-        torch.testing.assert_close(model.routing_bias, torch.ones(4), rtol=0, atol=0)
-        assert model.routing_bias.dtype == torch.float32
-        assert model._is_hf_initialized is False
-
     def test_skip_when_attr_true(self):
         """A model with _skip_init_weights_on_load=True takes the skip branch."""
         model = self._make_meta_model()
         model._skip_init_weights_on_load = True
         model.initialize_weights = MagicMock()
 
-        Checkpointer.initialize_model_weights(model, torch.device("cpu"), checkpoint_will_load=True)
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
         model.initialize_weights.assert_not_called()
         # And the _is_hf_initialized flag is left alone (not reset to False).

@@ -1440,11 +1440,7 @@ class Checkpointer:
 
     @staticmethod
     def initialize_model_weights(
-        model: torch.nn.Module,
-        device: torch.device,
-        peft_init_method: str | None = None,
-        *,
-        checkpoint_will_load: bool = False,
+        model: torch.nn.Module, device: torch.device, peft_init_method: str | None = None
     ) -> None:
         """
         Materialize meta-device parameters and initialize model weights.
@@ -1457,9 +1453,6 @@ class Checkpointer:
             model: Model whose weights should be initialized.
             device: Target device for materialized parameters.
             peft_init_method: Initialization method for PEFT adapters (e.g. "xavier").
-            checkpoint_will_load: Whether an upcoming checkpoint load will populate
-                base parameters. Only this path honors the model's load-only
-                initialization opt-out; checkpoint-free construction must initialize.
         """
         # Only materialize parameters that are actually on the meta device.
         # When the caller sets is_meta_device=True but the model was already
@@ -1529,7 +1522,7 @@ class Checkpointer:
         # (e.g. Devstral FP8 via its state_dict_adapter) can opt out of HF's
         # random init. Skipping also sidesteps stage-divergent DTensor
         # collectives inside `initialize_weights()` that would hang PP setups.
-        owns_weight_load = checkpoint_will_load and bool(getattr(model, "_skip_init_weights_on_load", False))
+        owns_weight_load = bool(getattr(model, "_skip_init_weights_on_load", False))
         skip_initialize_weights = (
             model_class
             in [

@@ -620,9 +620,7 @@ def apply_model_infrastructure(
             # Only meta-device models need their parameter shells materialized first.
             if is_meta_device:
                 lora_a_init = getattr(peft_config, "lora_A_init", None)
-                checkpointer.initialize_model_weights(
-                    model, device, peft_init_method=lora_a_init, checkpoint_will_load=need_checkpoint_load
-                )
+                checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
             checkpointer.load_base_model(
                 model,
                 device,
@@ -708,10 +706,8 @@ def apply_model_infrastructure(
     # This is needed for both from_pretrained (before checkpoint loading overwrites)
     # and from_config (where this is the only weight initialization).
     # Skipped when load_before_shard already handled materialization + init.
-    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and not weights_already_loaded
     need_materialize = (
         is_meta_device
-        and not weights_already_loaded
         and not load_before_shard
         and any(
             [
@@ -729,19 +725,18 @@ def apply_model_infrastructure(
         model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
         for mp in model_parts:
-            if autopipeline is not None and should_load_checkpoint:
+            if autopipeline is not None and load_base_model:
                 # PP stages own different modules, so HF random initialization can issue
                 # a different number of DTensor RNG collectives on each stage. Every
                 # parameter is about to be populated from the pretrained checkpoint.
                 mp._skip_init_weights_on_load = True
-            checkpointer.initialize_model_weights(
-                mp, init_device, peft_init_method=lora_a_init, checkpoint_will_load=should_load_checkpoint
-            )
+            checkpointer.initialize_model_weights(mp, init_device, peft_init_method=lora_a_init)
 
     # Load the checkpoint if pretrained weights are needed and weren't already loaded
     # (e.g., by HF's from_pretrained on a real device, which also handles BnB
     # quantization atomically).  Decoupled from the meta-device materialization
     # decision so that changes to the meta-device policy cannot silently skip loading.
+    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and not weights_already_loaded
     if should_load_checkpoint:
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
