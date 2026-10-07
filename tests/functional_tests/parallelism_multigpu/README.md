@@ -37,7 +37,8 @@ TE attention when CP is enabled. Sequence parallelism is disabled: the PP2/TP2
 control with SP enabled hangs in NCCL RECV with full-sequence receive metadata
 on the tested PyTorch 2.13 image. This is a separate coverage gap; enabling SP
 in `llama.yaml` retains a small reproduction.
-The recipes use 32-token sequences and vocabulary 128. Llama has width 64;
+The recipes use 32-token sequences and vocabulary 128. Llama has two layers,
+width 64 and global batch two, the smallest batch for its PP2 schedule;
 the Nemotron MoE recipe retains width 512 and latent width 256 to exercise the
 latent projection, with four experts, expert intermediate width 128 and top-2
 routing to exercise HybridEP with both Torch and Transformer Engine experts.

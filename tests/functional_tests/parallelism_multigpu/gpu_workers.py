@@ -144,7 +144,7 @@ def worker_main(directory: Path, *, warmup_moe: bool = False) -> None:
             num_local_experts=2,
             num_experts=4,
             router_topk=2,
-            # Match both GroupedExpertsDeepEP and TEGroupedExperts defaults;
+            # Match both GroupedExpertsDeepEP and GroupedExpertsTE defaults;
             # different SM counts require different HybridEP JIT kernels.
             permute_fusion=True,
             moe_hybridep_num_sms=BackendConfig().dispatcher_num_sms,
