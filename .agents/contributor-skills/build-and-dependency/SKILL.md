@@ -117,6 +117,24 @@ Always use `uv`. Do not introduce `pip install` commands in scripts or docs.
 | Add an optional dependency | `uv add --optional --extra <group> <package>` |
 | Regenerate the lockfile | `uv lock` |
 
+### Transformers upgrades
+
+When changing the Transformers pin, inspect existing compatibility backports and
+their version gates. Verify fixes in the actual released upstream code; a newer
+version number or a mocked version-string test is not evidence of a fix.
+
+For the Pixtral image-boundary backport in
+`nemo_automodel/components/models/ministral_bidirectional/pixtral_compat.py`, check
+[HF #49373](https://github.com/huggingface/transformers/pull/49373). Run
+`tests/functional_tests/retrieval/test_mistral3_vl_flash_attention.py` with the
+candidate dependency and both FlashAttention 2 and 3 available. All four
+embedding/reranking cases must run, including output, gradient, and image-isolation
+checks; skipped cases do not validate the upgrade. This test belongs to scheduled
+`L2_Retrieval`, so ordinary PR CI does not guarantee it ran. Record the release
+evidence and test results in the upgrade PR. Remove the backport and its binding
+when the release contains the fix; otherwise validate and extend its version gate.
+Keep the functional regression test after removing the backport.
+
 ## Environment Variables
 
 ```bash

@@ -1397,6 +1397,10 @@ def test_mistral3_pixtral_backport_preserves_non_flash_outputs(attention):
         torch.testing.assert_close(actual_hidden, expected_hidden, atol=0, rtol=0)
 
 
+# 5.19.1 is an unverified future-version example, not a known-fixed release.
+# This test substitutes version strings only; it does not validate those releases.
+# Before changing the Transformers pin, verify HF #49373 in the released code and
+# run test_mistral3_vl_flash_attention.py with the actual candidate dependency.
 @pytest.mark.parametrize("version", ["5.15.1", "5.17.0", "5.18.0", "5.19.0", "5.19.1"])
 def test_mistral3_pixtral_backport_does_not_patch_other_versions_or_instances(monkeypatch, version):
     """Other Transformers versions and independently constructed HF models stay native."""

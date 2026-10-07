@@ -18,7 +18,11 @@
 Adapted from Hugging Face Transformers (Apache-2.0), with the image-boundary
 fix from https://github.com/huggingface/transformers/pull/49373
 (ff704ffd47d800e31b31f2f81a5a2952fb0fbf71). Remove this module and its binding
-when AutoModel pins a release containing that fix.
+when AutoModel pins a release verified to contain that fix; no future release
+number is assumed fixed. On a pin change, inspect the released upstream code
+and run tests/functional_tests/retrieval/test_mistral3_vl_flash_attention.py
+with the actual dependency and both FA2 and FA3 available. If the release is
+still affected, validate the backport before extending its version gate.
 """
 
 import torch

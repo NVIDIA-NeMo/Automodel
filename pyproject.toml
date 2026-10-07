@@ -81,6 +81,8 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
+    # Before upgrading, recheck the Pixtral HF #49373 backport and run its FA2/FA3 tests.
+    # See "Transformers upgrades" in .agents/contributor-skills/build-and-dependency/SKILL.md.
     "transformers==5.18.0",
     # peft>=0.20 raises ImportError from get_peft_model() when an installed torchao is older than 0.16.0.
     "torchao>=0.16.0",
