@@ -38,9 +38,6 @@ from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
 )
 from nemo_automodel.components.distributed.fsdp_patches import (
-    patch_fsdp_post_forward_mesh_cache as _patch_fsdp_post_forward_mesh_cache,
-)
-from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
 from nemo_automodel.components.distributed.multimodal_fsdp import (
@@ -796,7 +793,7 @@ def apply_fsdp(
     ep_shard_mesh: DeviceMesh | None = None,
     mp_policy: MixedPrecisionPolicy | None = None,
     offload_policy: OffloadPolicy | None = None,
-    reshard_after_forward: bool | int = False,
+    reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
@@ -806,8 +803,6 @@ def apply_fsdp(
     fsdp2_forward_prefetch_depth: int = 1,
 ) -> None:
     """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
-    if isinstance(reshard_after_forward, int) and not isinstance(reshard_after_forward, bool):
-        _patch_fsdp_post_forward_mesh_cache()
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
     # MoE normally keeps fully frozen skipped towers with an always-run root,
     # but trainable multimodal towers still get standalone FSDP units. Install
@@ -986,7 +981,7 @@ def apply_fsdp(
 
     # Prefetch only the sequential backbone parents. Nested expert/gate FSDP
     # units retain their own lifecycles; MTP heads may execute conditionally.
-    if enable_fsdp2_prefetch and reshard_after_forward is not False:
+    if enable_fsdp2_prefetch and reshard_after_forward:
         for i, block in enumerate(prefetch_blocks):
             forward_targets = (
                 prefetch_blocks[i + 1 : i + 1 + fsdp2_forward_prefetch_depth]
@@ -1203,7 +1198,7 @@ def parallelize_model(
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
-    reshard_after_forward: bool | int = False,
+    reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,

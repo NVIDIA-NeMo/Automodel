@@ -16,13 +16,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any
-from weakref import WeakValueDictionary
-
-if TYPE_CHECKING:
-    from torch.distributed.device_mesh import DeviceMesh
-    from torch.distributed.fsdp._fully_shard._fsdp_common import FSDPMeshInfo
+from collections.abc import Iterable
+from typing import Any
 
 
 def _widest_float_dtype(dtypes: Iterable[Any]) -> Any:
@@ -188,61 +183,3 @@ __all__ = [
     "patch_fsdp_uniform_reduce_dtype",
     "patch_fsdp_unused_param_reduction",
 ]
-
-
-class _PostForwardMeshInfoCache:
-    """Reuse partial-reshard mesh metadata within one physical source mesh."""
-
-    def __init__(
-        self,
-        original: Callable[[bool | int, FSDPMeshInfo], FSDPMeshInfo | None],
-    ) -> None:
-        self._original = original
-        # Keep the source mesh while the weak value lives, and include identity:
-        # DeviceMesh equality does not distinguish live process groups.
-        self._cache: WeakValueDictionary[tuple[int, DeviceMesh, int], FSDPMeshInfo] = WeakValueDictionary()
-
-    def __call__(self, reshard_after_forward: bool | int, mesh_info: FSDPMeshInfo) -> FSDPMeshInfo | None:
-        size = mesh_info.shard_mesh_size
-        if (
-            isinstance(reshard_after_forward, bool)
-            or not isinstance(reshard_after_forward, int)
-            or not 1 < reshard_after_forward < size
-            or size % reshard_after_forward
-        ):
-            # Preserve upstream bool, size-one/full-size normalization and every
-            # invalid-input error, including a direct unsupported None argument.
-            return self._original(reshard_after_forward, mesh_info)
-        key = (reshard_after_forward, mesh_info.mesh, id(mesh_info.mesh))
-        result = self._cache.get(key)
-        if result is None:
-            result = self._original(reshard_after_forward, mesh_info)
-            if result is not None:
-                self._cache[key] = result
-        return result
-
-
-def patch_fsdp_post_forward_mesh_cache() -> None:
-    """Deduplicate NCCL groups for integer resharding on affected PyTorch builds.
-
-    PyTorch 2.13.0a0+8145d630e8.nv26.06 constructs a fresh DeviceMesh for
-    every FSDP unit when 1 < reshard_after_forward < shard_world_size.
-    Duplicate NCCL/NVLS allocations can exhaust device memory outside the
-    PyTorch allocator. See https://github.com/pytorch/pytorch/issues/187155.
-
-    This compatibility patch follows the weak-value cache proposed in open PR
-    https://github.com/pytorch/pytorch/pull/187161, with source-mesh identity
-    added to avoid sharing across distinct process groups with equal layouts.
-    It changes neither collective membership nor bool/no-reshard behavior.
-    Both imported aliases are updated; installation is process-local and
-    idempotent. It does not modify installed PyTorch files.
-    """
-    try:
-        import torch.distributed.fsdp._fully_shard._fsdp_init as fsdp_init
-        import torch.distributed.fsdp._fully_shard._fully_shard as fully_shard_module
-    except ImportError:
-        return
-    original = fsdp_init._get_post_forward_mesh_info
-    cached = original if isinstance(original, _PostForwardMeshInfoCache) else _PostForwardMeshInfoCache(original)
-    fsdp_init._get_post_forward_mesh_info = cached
-    fully_shard_module._get_post_forward_mesh_info = cached

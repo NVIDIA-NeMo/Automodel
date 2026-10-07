@@ -3754,8 +3754,7 @@ def test_apply_cp_mixed_full_and_linear_attention(monkeypatch):
 
 
 @pytest.mark.parametrize("expert_shards", [False, True])
-@pytest.mark.parametrize("reshard", [True, 1, 4])
-def test_moe_prefetch_targets_only_ordered_backbone_parents(monkeypatch, expert_shards, reshard):
+def test_moe_prefetch_targets_only_ordered_backbone_parents(monkeypatch, expert_shards):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
     shard = MagicMock()
@@ -3774,7 +3773,7 @@ def test_moe_prefetch_targets_only_ordered_backbone_parents(monkeypatch, expert_
         ep_enabled=True,
         ep_shard_enabled=expert_shards,
         ep_shard_mesh=object(),
-        reshard_after_forward=reshard,
+        reshard_after_forward=True,
         enable_fsdp2_prefetch=True,
         fsdp2_forward_prefetch_depth=1,
         fsdp2_backward_prefetch_depth=2,
