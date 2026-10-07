@@ -218,8 +218,9 @@ If your contribution involves documentation changes, please refer to the [Fern d
 
 Training examples that introduce a Hugging Face dataset must include its dataset
 card and catalog registration. Follow the [dataset-card guide](docs/templates/dataset-card-guide.md)
-and run `make -C docs/fern docs-dataset-cards`; the Fern CI workflow checks example
-coverage on every PR. Write relative local dataset directories with a `./` prefix
+and run `make -C docs/fern docs-dataset-cards`; Fern CI checks Hub IDs referenced
+directly in example YAML. Check indirect sources in loaders and preparation
+scripts by hand as described in the guide. Write relative local dataset directories with a `./` prefix
 so they can be distinguished from Hub IDs.
 
 ## Signing Your Work

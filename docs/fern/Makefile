@@ -112,7 +112,7 @@ docs-check: docs-dataset-cards docs-preview-navigation docs-model-tables docs-st
 	fern check
 
 # Keep this docs-only dependency separate from the training environment.
-# Match the PyYAML pin used by the Fern CI workflow.
+# Use the same pinned environment across these local helper targets.
 docs-model-tables:
 	uv run --no-project --with 'PyYAML==6.0.3' python3 "$(REPO_ROOT)/tests/ci_tests/utils/sync_model_coverage_tables.py"
 

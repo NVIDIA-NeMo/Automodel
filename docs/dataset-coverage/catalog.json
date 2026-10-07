@@ -338,7 +338,7 @@
     ],
     "source": "nemo_automodel/components/datasets/llm/nanogpt_dataset.py",
     "evidence": [
-      "examples/llm_pretrain/nanogpt_pretrain.yaml"
+      "docs/guides/llm/nanogpt-pretraining.mdx"
     ],
     "revision": "9bb295ddab0e05d785b879661af7260fed5140fc"
   },

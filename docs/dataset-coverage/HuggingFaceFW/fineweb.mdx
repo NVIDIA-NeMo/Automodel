@@ -56,7 +56,9 @@ Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-se
 
 **Adapter:** [`NanogptDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/nanogpt_dataset.py).
 
-The example expects modded-nanoGPT shards at `modded-nanogpt/data/fineweb_10BT_max_500M/fineweb_train_*.bin`. Prepare compatible shards first, or update `dataset.file_pattern`. The model vocabulary and special-token IDs must match the tokenizer used for preprocessing. `NanogptDataset` does not accept raw Hub Parquet files or Megatron `.bin/.idx` pairs.
+The example expects modded-nanoGPT shards at `modded-nanogpt/data/fineweb_10BT_max_500M/fineweb_train_*.bin`. Alternatively, follow [the nanoGPT preparation guide](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/docs/guides/llm/nanogpt-pretraining.mdx) to run [the bundled preprocessor](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/tools/nanogpt_data_processor.py). Its `--max-tokens 500M` example writes `tools/fineweb_max_tokens_500M/dataset.bin`; set `dataset.file_pattern` to that file when using this preparation path.
+
+The model vocabulary and special-token IDs must match the tokenizer used for preprocessing. `NanogptDataset` does not accept raw Hub Parquet files or Megatron `.bin/.idx` pairs.
 
 The example reads local files matching `fineweb_train_*.bin`. It does not select a Hub split at runtime or configure validation data.
 
@@ -65,4 +67,5 @@ The example reads local files matching `fineweb_train_*.bin`. It does not select
 - [Hub dataset and source files](https://huggingface.co/datasets/HuggingFaceFW/fineweb)
 - [Upstream card at revision `9bb295dd`](https://huggingface.co/datasets/HuggingFaceFW/fineweb/blob/9bb295ddab0e05d785b879661af7260fed5140fc/README.md)
 - [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/nanogpt_dataset.py)
+- [Preparation reference](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/docs/guides/llm/nanogpt-pretraining.mdx)
 - [Dataset catalog](/dataset-coverage/overview)
