@@ -304,12 +304,17 @@ def preprocess_args_and_kwargs_for_attn(
                     "cu_seqlens_kv": kwargs["cu_seqlens"],
                 }
             )
-            if "cu_seqlens_padded" in kwargs:
+            if kwargs.get("cu_seqlens_padded") is not None:
+                pad_between_seqs = kwargs.get("pad_between_seqs")
+                if pad_between_seqs is None:
+                    # Direct callers may not have run THD batch/model preparation.
+                    # Include the final offset so tail-only padding is detected.
+                    pad_between_seqs = not torch.equal(kwargs["cu_seqlens_padded"], kwargs["cu_seqlens"])
                 attn_kwargs.update(
                     {
                         "cu_seqlens_q_padded": kwargs["cu_seqlens_padded"],
                         "cu_seqlens_kv_padded": kwargs["cu_seqlens_padded"],
-                        "pad_between_seqs": True,
+                        "pad_between_seqs": pad_between_seqs,
                     }
                 )
             if "max_seqlen" in kwargs:
