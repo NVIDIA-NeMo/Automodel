@@ -150,12 +150,30 @@ def test_packed_dual_chunk_swap_matches_document_order(cp_size: int) -> None:
     cu_global = cu_local * cp_size
 
     def to_sequential(value: torch.Tensor) -> torch.Tensor:
-        """Map [global_tokens, local_hidden] rank blocks to document token order."""
+        """Map rank blocks to document token order.
+
+        Args:
+            value: Tensor of shape [global_tokens, local_hidden] in rank-major
+                DualChunkSwap order, with each rank's two chunks per document.
+
+        Returns:
+            Tensor of shape [global_tokens, local_hidden] in document-major
+            sequential order across all CP ranks.
+        """
         value = _deinterleave_packed_seqs(value, cu_local, cp_size)
         return _undo_attention_load_balancing(value, cp_size, cu_global)
 
     def to_rank_major(value: torch.Tensor) -> torch.Tensor:
-        """Map [global_tokens, local_hidden] document tokens back to rank blocks."""
+        """Map document tokens back to rank blocks.
+
+        Args:
+            value: Tensor of shape [global_tokens, local_hidden] in document-major
+                sequential order across all CP ranks.
+
+        Returns:
+            Tensor of shape [global_tokens, local_hidden] in rank-major
+            DualChunkSwap order, with each rank's two chunks per document.
+        """
         value = _redo_attention_load_balancing(value, cp_size, cu_global)
         return _reinterleave_packed_seqs(value, cu_local, cp_size)
 

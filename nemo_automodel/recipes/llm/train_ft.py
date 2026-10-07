@@ -85,7 +85,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
     _get_lm_head_module,
@@ -1215,7 +1215,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 document IDs of shape [batch, sequence]. NEAT attention metadata
                 is batch-major; legacy THD inputs are flattened by the sharder.
                 THD MTP requires physical boundaries in cu_seqlens_padded of
-                shape [num_sequences + 1] or [1, num_sequences + 1].
+                shape [num_sequences + 1] or [1, num_sequences + 1], or
+                _packed_seq_ids [batch, sequence] supplied by the native model
+                sharder from physical seq_lens_padded [batch, num_sequences].
             loss_buffer: List receiving the detached scalar loss.
             num_label_tokens: Global supervised-token count for loss normalization.
             num_batches: Number of microbatches in the accumulation window.
@@ -1322,8 +1324,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 1:
                     cu_seqlens = cu_seqlens[cu_seqlens != -1000]
                 pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
-                if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
+                if isinstance(pp_loss_fn, PipelineCausalLMLoss):
                     pp_loss_fn.cu_seqlens = cu_seqlens
+                    pp_loss_fn.is_packed = mtp_is_packed or mtp_seq_idx is not None
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:

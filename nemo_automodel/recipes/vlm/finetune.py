@@ -879,7 +879,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 is batch-major; legacy THD inputs are flattened by the sharder.
                 VLM media and position tensors retain the model's input layout.
                 THD MTP requires physical boundaries in cu_seqlens_padded of
-                shape [num_sequences + 1] or [1, num_sequences + 1].
+                shape [num_sequences + 1] or [1, num_sequences + 1], or
+                _packed_seq_ids [batch, sequence] supplied by the native model
+                sharder from physical seq_lens_padded [batch, num_sequences].
             loss_buffer: List receiving the detached scalar loss.
             num_label_tokens: Global supervised-token count for loss normalization.
             num_batches: Number of microbatches in the accumulation window.

@@ -372,3 +372,51 @@ def test_2d_labels_and_3d_hidden_states_unchanged():
 
     for d, h in enumerate(captured_hidden):
         assert h.shape == (B, S, H), f"depth {d}: BSHD path should be unchanged, got {tuple(h.shape)}"
+
+
+@pytest.mark.parametrize("fallback", [None, [0, 4, 8], [[0, 4, 8], [0, 3, 8]]])
+def test_pipeline_mtp_tail_owns_each_microbatch_layout(fallback):
+    """A microbatch tail overrides absent, stale, or multi-layout fallback metadata."""
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    torch.manual_seed(4169)
+    model = torch.nn.Module()
+    model.mtp_outputs_are_logits = True
+    loss_fn = PipelineCausalLMLoss(MaskedCrossEntropy(), model, scaling_factor=0.3)
+    loss_fn.is_packed = True
+    loss_fn.cu_seqlens = None if fallback is None else torch.tensor(fallback, dtype=torch.int32)
+    for boundary in (4, 2):
+        labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, 9]])
+        seq_idx = torch.tensor([[7] * boundary + [9] * (8 - boundary)], dtype=torch.int32)
+        logits = torch.randn(3, 1, 8, 16, requires_grad=True)
+        actual = loss_fn((*logits.unbind(), seq_idx), labels)
+        expected = torch.nn.functional.cross_entropy(logits[0].flatten(0, 1), labels.flatten(), reduction="sum")
+        for depth in (1, 2):
+            target = torch.full_like(labels, -100)
+            for start, end in ((0, boundary), (boundary, 8)):
+                if end - start > depth:
+                    target[:, start : end - depth] = labels[:, start + depth : end]
+            expected = expected + 0.15 * torch.nn.functional.cross_entropy(
+                logits[depth].flatten(0, 1), target.flatten(), reduction="sum"
+            )
+        (actual_grad,) = torch.autograd.grad(actual, logits, retain_graph=True)
+        (expected_grad,) = torch.autograd.grad(expected, logits)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.parametrize("boundaries", [[], [0], [[0, 4, 8], [0, 3, 8]]])
+def test_pipeline_mtp_rejects_unusable_shared_boundaries(boundaries):
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    model = torch.nn.Module()
+    model.mtp_outputs_are_logits = True
+    loss_fn = PipelineCausalLMLoss(MaskedCrossEntropy(), model, scaling_factor=0.3)
+    loss_fn.is_packed = True
+    loss_fn.cu_seqlens = torch.tensor(boundaries, dtype=torch.int32)
+    logits = torch.randn(2, 1, 8, 16, requires_grad=True)
+    with pytest.raises(ValueError, match="Packed MTP requires"):
+        loss_fn(tuple(logits.unbind()), torch.ones(1, 8, dtype=torch.long))
+    assert logits.grad is None

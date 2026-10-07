@@ -791,7 +791,13 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             **kwargs: Additional arguments forwarded to the base model
                 (e.g. ``qkv_format``, ``cu_seqlens``, ``cu_seqlens_padded``,
                 ``max_seqlen``, ``seq_idx``, ``cp_rank``, ``cp_size``,
-                ``_packed_seq_ids``).
+                ``_packed_seq_ids``). For THD, ``cu_seqlens_padded`` is an
+                integer tensor [documents + 1] or [1, documents + 1] of global
+                physical token offsets, including document padding, with optional
+                trailing -1000 sentinels. It differs from ``cu_seqlens``, which
+                accumulates real attention lengths, and from rank-local token
+                IDs. ``seq_idx`` and ``_packed_seq_ids`` contain per-token
+                document IDs [batch, sequence] in the local input layout.
 
         Returns:
             Off-PP: :class:`NemotronHCausalLMOutputWithPast` with ``logits``,
@@ -802,6 +808,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
               * mid stages: ``(hidden_states, *mtp_embed_inputs)`` arity ``1 + D``.
               * last stage: ``(logits, *mtp_per_depth_h, seq_idx)`` arity
                 ``1 + D + 1`` when MTP is enabled, else ``logits`` alone.
+                The int32 ``seq_idx`` tensor [batch, sequence] identifies
+                documents in that microbatch's physical token layout; its loss
+                must consume the same microbatch. Hidden states and MTP
+                embeddings have shape [batch, sequence, hidden], and logits
+                have shape [batch, sequence, vocab].
         """
         is_pp_stage = self._is_pipeline_parallel_stage()
         is_first_stage = getattr(self.model, "embed_tokens", None) is not None
