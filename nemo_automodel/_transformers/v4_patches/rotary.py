@@ -77,7 +77,7 @@ def _compute_flash_inv_freq(cfg, device, dim):
 
 def should_fix_rotary_embeddings(model_parts):
     """Return True when the legacy rotary workaround should run."""
-    from nemo_automodel.components.models.nemotron_flash.parallelization import is_nemotron_flash_config
+    from nemo_automodel.components.models.nemotron_flash import is_nemotron_flash_config
 
     for mp in model_parts:
         if isinstance(mp, nn.Module):

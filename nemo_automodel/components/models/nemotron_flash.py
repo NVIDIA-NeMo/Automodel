@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 
-from torch import nn
 from torch.distributed.tensor.parallel import ParallelStyle
 from torch.distributed.tensor.placement_types import Shard
 
@@ -52,13 +51,6 @@ def adjust_flash_tp_plan(plan: dict[str, ParallelStyle]) -> dict[str, ParallelSt
     return plan
 
 
-class NemotronFlashParallelizer(LlamaParallelizer):
-    """Preserve the remote-code model's normalized vocabulary projection."""
-
-    def _finalize_tp_plan(self, model: nn.Module, plan: dict[str, ParallelStyle]) -> dict[str, ParallelStyle]:
-        return adjust_flash_tp_plan(plan) if is_nemotron_flash_config(getattr(model, "config", None)) else plan
-
-
-PARALLELIZER = NemotronFlashParallelizer()
+PARALLELIZER = LlamaParallelizer()
 
 __all__ = ["PARALLELIZER"]

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-owned parallelization for mistral3_vlm."""
+"""Model-owned parallelization for nemotron_labs_diffusion."""
 
 from __future__ import annotations
 
@@ -22,23 +22,11 @@ from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.models.common.tp_plan import gated_decoder_tp_plan
 
 
-def _parallelize_mistral3_vlm(model, sequence_parallel: bool = False) -> dict[str, ParallelStyle]:
-    """Shard the language backbone; keep vision replicated and sequence parallelism disabled."""
-    return gated_decoder_tp_plan(prefix="model.language_model")
+def _parallelize_nemotron_labs_diffusion(model, sequence_parallel: bool = False) -> dict[str, ParallelStyle]:
+    """Nemotron-Labs-Diffusion uses a gated encoder and a diffusion output head."""
+    return gated_decoder_tp_plan(sequence_parallel, prefix="encoder", head="diffusion_head")
 
 
-PARALLELIZER = ModelParallelizer(
-    tp_plan=_parallelize_mistral3_vlm,
-    layer_group_paths={
-        "language": ("model.language_model.layers",),
-        "vision": (
-            "model.vision_tower.encoder.layers",
-            "model.vision_tower.vision_model.encoder.layers",
-            "model.vision_tower.transformer.layers",
-        ),
-    },
-)
+PARALLELIZER = ModelParallelizer(tp_plan=_parallelize_nemotron_labs_diffusion)
 
 __all__ = ["PARALLELIZER"]
-
-LAYOUT_PARALLELIZER = ModelParallelizer(layer_group_paths=PARALLELIZER.layer_group_paths)

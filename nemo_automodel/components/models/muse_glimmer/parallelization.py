@@ -16,50 +16,21 @@
 
 from __future__ import annotations
 
-from typing import cast
-
-from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.distributed.tp_styles import (
-    VocabParallelEmbedding,
-)
+from nemo_automodel.components.models.common.tp_plan import gated_decoder_tp_plan
 
 
-def _parallelize_muse_glimmer(
-    model,
-    sequence_parallel: bool = False,
-) -> dict[str, ParallelStyle]:
-    """TP plan for the native MuseGlimmer dense VLM.
-
-    The vision tower stays replicated. The language backbone and vocabulary
-    matrices contain nearly all trainable parameters and are tensor-sharded.
-    MuseGlimmer has two KV heads, so the model strategy limits this complete
-    Q/K/V-sharding plan to TP1 or TP2.
-    """
+def _parallelize_muse_glimmer(model, sequence_parallel: bool = False) -> dict[str, ParallelStyle]:
+    """Shard the language backbone including its attention output gate; vision stays replicated."""
     if sequence_parallel:
         import warnings
 
-        warnings.warn(
-            "sequence_parallel=True is not yet supported for MuseGlimmer and will be ignored.",
-            stacklevel=2,
-        )
-
-    plan: dict[str, ParallelStyle] = {
-        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.output_gate_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-        "model.layers.*.mlp.up_proj": ColwiseParallel(),
-        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-        "model.layers.*.mlp.down_proj": RowwiseParallel(),
-        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-    }
-
-    return cast(dict[str, ParallelStyle], plan)
+        warnings.warn("sequence_parallel=True is not yet supported for MuseGlimmer and will be ignored.", stacklevel=2)
+    plan = gated_decoder_tp_plan()
+    plan["model.layers.*.self_attn.output_gate_proj"] = ColwiseParallel()
+    return plan
 
 
 class MuseGlimmerModelParallelizer(ModelParallelizer):

@@ -16,16 +16,12 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 from torch import nn
-from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, SequenceParallel
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, SequenceParallel
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.distributed.tp_styles import (
-    VocabParallelEmbedding,
-)
+from nemo_automodel.components.models.common.tp_plan import gated_decoder_tp_plan
 
 
 def validate_nemotron_nas_tp_mesh(model, tp_size: int) -> None:
@@ -48,46 +44,16 @@ def validate_nemotron_nas_tp_mesh(model, tp_size: int) -> None:
             raise ValueError(f"layer {index}: attention must define grouped heads, a linear replacement, or no_op")
 
 
-def get_decilm_nemotron_tp_plan(
-    sequence_parallel: bool = False,
-) -> dict[str, ParallelStyle]:
-    """Return a TP plan for remote-code DeciLM Nemotron-NAS checkpoints.
-
-    DeciLM/Nemotron-NAS is close to Llama structurally, but its remote-code forward
-    path performs model-level rotary embedding setup and per-layer block-config
-    dispatch. In practice, the generic base-style plan is a safer match than the
-    Llama-optimized named plan for this architecture.
-    """
-    base_model_tp_plan: dict[str, ParallelStyle] = {
-        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-        "model.layers.*.mlp.up_proj": ColwiseParallel(),
-        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-        "model.layers.*.mlp.down_proj": RowwiseParallel(),
-        "lm_head": ColwiseParallel(output_layouts=Replicate()),
-    }
-
-    base_model_sp_plan = {
-        "model.embed_tokens": VocabParallelEmbedding(
-            input_layouts=Replicate(),
-            output_layouts=Shard(1),
-            use_local_output=False,
-        ),
-        "model.norm": SequenceParallel(),
-        "model.layers.*.input_layernorm": SequenceParallel(),
-        "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-        "model.layers.*.post_attention_layernorm": SequenceParallel(),
-        "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-        "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
-    }
-
+def get_decilm_nemotron_tp_plan(sequence_parallel: bool = False) -> dict[str, ParallelStyle]:
+    """NAS remote-code rotary setup needs plain SP norms and replicated logits."""
+    plan = gated_decoder_tp_plan(sequence_parallel)
+    plan["lm_head"] = ColwiseParallel(
+        input_layouts=Shard(1) if sequence_parallel else Replicate(), output_layouts=Replicate()
+    )
     if sequence_parallel:
-        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
-
-    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+        for name in ("input_layernorm", "post_attention_layernorm"):
+            plan[f"model.layers.*.{name}"] = SequenceParallel()
+    return plan
 
 
 def _parallelize_decilm_nemotron(
