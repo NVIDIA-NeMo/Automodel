@@ -624,7 +624,7 @@ jobs:
         with:
           test-folder: parallelism_multigpu,moe_multigpu
           gpu-count: ${{ matrix.gpu-count }}
-          timeout: 15
+          timeout: 5
           max-attempts: 1
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
@@ -646,7 +646,7 @@ jobs:
             test-folder: parallelism_multigpu
             runner: nemo-ci-gcp-gpu-x4
             gpu-count: 4
-            timeout: 10
+            timeout: 5
             max-attempts: 1
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
