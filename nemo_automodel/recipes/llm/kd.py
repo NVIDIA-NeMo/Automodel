@@ -643,19 +643,18 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         }
         if separate_teacher_logits is not None:
             batch["teacher_logits"] = separate_teacher_logits
-        labels = batch.pop("labels")
         # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
-        # Separate-mesh teacher logits ride the batch through CP sharding.
+        # Labels and separate-mesh teacher logits ride the batch through CP sharding.
         cp_sharder = ContextParallelSharder(
             self.model_parts[0],
             self.device_mesh,
             batch,
-            loss_mask=labels,
             invoke_pre_embed=False,
             extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
         )
         train_ctx, batch = cp_sharder.shard(batch)
         separate_teacher_logits = batch.pop("teacher_logits", None)
+        labels = batch.pop("labels")
 
         model = self.model_parts[0]
         sync_ctx = (
