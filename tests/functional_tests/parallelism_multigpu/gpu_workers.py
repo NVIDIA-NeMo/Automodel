@@ -40,6 +40,9 @@ class GPUWorkers:
         self.log = directory / "workers.log"
         self.output = self.log.open("wb")
         env = {**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "OMP_NUM_THREADS": "1"}
+        # Persistent topology groups can exhaust H100 multicast resources.
+        # These tiny tensors do not benefit from NVLink SHARP collectives.
+        env.setdefault("NCCL_NVLS_ENABLE", "0")
         env.setdefault("NEMO_HYBRIDEP_JIT_CACHE", str(directory / "hybridep_kernels"))
         env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
         self.process = subprocess.Popen(
