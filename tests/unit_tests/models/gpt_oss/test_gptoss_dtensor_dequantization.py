@@ -85,6 +85,35 @@ def _dequantize_worker(rank: int, rendezvous: str) -> None:
                         )
                     assert actual.placements == tuple(Shard(0) if name == "ep" else Shard(2) for name in mesh_dim_names)
                     torch.testing.assert_close(actual.full_tensor(), expected.to(dtype), rtol=0, atol=0)
+
+            # Exercise the real metadata producer from model-style expert/FSDP placements.
+            # GPT-OSS checkpoint metadata uses 90 groups of 32 decoded input features.
+            model_placements = [Shard(0) if name == "ep" else Shard(1) for name in mesh_dim_names]
+            model_weight = distribute_tensor(torch.zeros(4, 2880, 8), mesh, model_placements)
+            checkpoint_tensors = dict(
+                adapter.convert_single_tensor_to_hf(
+                    "model.layers.0.mlp.experts.gate_and_up_projs", model_weight, quantization=True
+                )
+            )
+            produced_blocks = checkpoint_tensors["model.layers.0.mlp.experts.gate_up_proj_blocks"]
+            produced_scales = checkpoint_tensors["model.layers.0.mlp.experts.gate_up_proj_scales"]
+            assert produced_blocks.placements == produced_scales.placements == tuple(placements)
+            packed = torch.full((4, 8, 90, 16), 0x12, dtype=torch.uint8)
+            exponents = torch.arange(-2, 2, dtype=torch.int32).view(4, 1, 1)
+            packed_scales = (exponents + 127).expand(4, 8, 90).to(torch.uint8)
+            produced_blocks.copy_(distribute_tensor(packed, mesh, produced_blocks.placements))
+            produced_scales.copy_(distribute_tensor(packed_scales, mesh, produced_scales.placements))
+            with (
+                patch("torch.cuda.is_available", return_value=False),
+                patch("torch.distributed.tensor.empty", side_effect=poisoned_empty),
+            ):
+                actual = adapter._convert_moe_packed_tensors(
+                    produced_blocks, produced_scales, dtype=torch.bfloat16, rows_per_chunk=127
+                )
+            # Byte 0x12 decodes to [1, 0.5]; distinct expert scales expose row misalignment.
+            known_values = torch.tensor([1.0, 0.5] * 1440, dtype=torch.bfloat16).view(1, 2880, 1).expand(4, 2880, 8)
+            assert actual.placements == tuple(Shard(0) if name == "ep" else Shard(2) for name in mesh_dim_names)
+            torch.testing.assert_close(actual.full_tensor(), torch.ldexp(known_values, exponents), rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
