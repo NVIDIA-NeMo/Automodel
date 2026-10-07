@@ -156,7 +156,9 @@ What you can expect:
 
 ## Feature Roadmap
 
-✅ _Available now ([v0.5.0](https://pypi.org/project/nemo-automodel/0.5.0/) / [26.06 container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.06.00))_ | 🔜 _Planned for 26.08_
+✅ _Implemented on `main`_ | 🔜 _Planned_
+
+For released features, see the [release notes](https://github.com/NVIDIA-NeMo/Automodel/releases). Docker examples target the [26.10 container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.10.00).
 
 High-throughput scalable training
 - ✅ **PyTorch DTensor-native SPMD training** Same training script can scale from 1 GPU to large multi-node jobs by changing the device mesh/config.
@@ -194,7 +196,7 @@ Model Coverage and 🤗 Ecosystem compatibility
 Agentic Development and UX
 - ✅ **Agent-friendly skills** - Curated [`skills/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/skills) for common dev tasks (recipe runs, model onboarding, CI).
 
-Planned for 26.08
+Planned
 - 🔜 **Unified Engine API and recipes** - Introduce a common engine and consolidate the LLM and VLM recipe paths.
 - 🔜 **Composable component configuration** - Complete the typed config and `.build()` refactor across data and remaining components.
 - 🔜 **Packed long-context training with CP** - Combine THD sequence packing with context parallelism, including DeepSeek V4 coverage.

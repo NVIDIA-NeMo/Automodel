@@ -65,6 +65,10 @@ model:
     _target_: nemo_automodel.components.models.deepseek_v32.config.DeepseekV32Config.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
     name_or_path: deepseek-ai/DeepSeek-V3.2
+  # Adapter checkpoints omit router buffers; keep the pretrained correction bias fixed.
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig

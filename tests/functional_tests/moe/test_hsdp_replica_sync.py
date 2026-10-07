@@ -122,7 +122,8 @@ def _replica_sync_worker(rank: int, port: int) -> None:
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         # Distinct inputs make the test sensitive to a missing replica all-reduce.
         generator = torch.Generator().manual_seed(9000 + rank)
-        hidden_states = torch.randn(4, _HIDDEN_SIZE, generator=generator)
+        # Match BF16 compute explicitly; the default FSDP policy preserves input dtypes.
+        hidden_states = torch.randn(4, _HIDDEN_SIZE, generator=generator).to(torch.bfloat16)
         loss = model(hidden_states).square().mean()
         loss.backward()
         optimizer.step()

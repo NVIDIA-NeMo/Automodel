@@ -52,13 +52,6 @@ Mandatory workflow — never skip or reorder:
      expressions/shell, secret and OIDC exposure, concurrency/timeouts,
      `uv`-only commands, and optional-dependency gates. Never inspect or
      validate `uv.lock`, even when a dependency declaration changes.
-     For Transformers pin changes, inspect existing compatibility backports and
-     their version gates. Require evidence from the candidate release before
-     accepting removal or bypass of a backport; do not assume a future or patch
-     release contains an upstream fix. If a backport remains necessary, require
-     validation on that release before extending its gate. Check that the affected
-     regression tests actually ran with the candidate dependency and required
-     backends; mocked version strings or skipped tests are not compatibility evidence.
    - Documentation, examples, or Fern changes: verify claims against current
      code, runnable commands and config keys, links, `uv` usage, and Fern
      navigation, slugs, redirects, and version aliases when applicable.

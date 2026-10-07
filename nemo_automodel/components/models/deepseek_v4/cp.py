@@ -437,13 +437,39 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     ``pad_multiple``) and invoked by the CP dispatch. HybridEP can
     first max-reduce packed lengths so every rank contributes a uniform token count.
     Each CP rank then keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers
-    K/V across CP ranks during forward. Returns ``(nullcontext, batch)``.
+    K/V across CP ranks during forward.
 
     ``pad_multiple`` is the required *per-CP-rank* shard multiple (from
     ``dsv4_cp_local_seq_multiple``); the global sequence is padded so it is divisible
     by ``cp_size`` and each local shard is divisible by ``pad_multiple`` (>= 2).
-    At CP size one, the native THD route only marks packed input as THD and leaves
-    its tensors and packing metadata unchanged.
+    At CP size one, the native THD route keeps the original tensors and packing
+    metadata and exposes physical document IDs to the generic loss contract.
+
+    Args:
+        cp_mesh: Context-parallel mesh; size one selects native preparation.
+        tp_mesh: Tensor-parallel mesh passed to the shared sharder.
+        batch: Mutable mapping with input_ids [batch, global_sequence] or
+            inputs_embeds [batch, global_sequence, hidden], labels and position_ids
+            [batch, global_sequence], and optional attention_mask [batch,
+            global_sequence] or [batch, 1, global_sequence, global_sequence].
+            Native packed seq_lens and seq_lens_padded are integer tensors
+            [batch, documents] of real and physical lengths; -1000 pads unused
+            document entries. Existing _packed_seq_ids [batch, global_sequence]
+            take precedence. At CP1, physical lengths produce row-local IDs
+            starting at one, with zero for trailing pack padding.
+        loss_mask: Optional tensor [batch, global_sequence], used as labels if
+            absent, otherwise kept as a separate sharded loss mask.
+        padding_token_id: Token value used for added input padding.
+        pad_multiple: Required per-rank sequence-length multiple.
+        sync_packed_length: Whether to synchronize packed lengths before sharding.
+
+    Returns:
+        Context-manager factory, the mutated batch mapping, and a ShardLayout
+        (None at CP1). CP1 preserves batch rows and adds _packed_seq_ids [batch,
+        global_sequence] only when physical lengths exist and IDs are absent.
+        For CP > 1, token tensors use [batch, local_sequence, ...] with a
+        contiguous sequence shard; packed_seq_ids and padding_mask use [batch,
+        local_sequence]. Length metadata remains global to each batch row.
     """
     import contextlib
 
@@ -458,6 +484,13 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     if cp_size <= 1:
         if packed:
             batch["qkv_format"] = "thd"
+            if batch.get("_packed_seq_ids") is None and batch.get("seq_lens_padded") is not None:
+                primary_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
+                primary = batch[primary_key]
+                sequence = primary.shape[-2] if primary_key == "inputs_embeds" else primary.shape[-1]
+                batch["_packed_seq_ids"] = build_packed_seq_ids(
+                    batch["seq_lens_padded"], seq_len=sequence, device=primary.device
+                )
         if "labels" not in batch and loss_mask is not None:
             batch["labels"] = loss_mask
         elif loss_mask is not None:

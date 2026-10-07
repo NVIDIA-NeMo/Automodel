@@ -878,3 +878,21 @@ class TestFA4Backend:
         upstream = torch.randn_like(output)
         output.backward(upstream)
         torch.testing.assert_close(q.grad, 2 * upstream)
+
+
+@pytest.mark.parametrize("padded,expected", [([0, 3, 5], False), ([0, 4, 8], True), ([0, 3, 8], True)])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_te_padding_flag_uses_boundaries_not_field_presence(padded, expected, explicit, monkeypatch):
+    cu = torch.tensor([0, 3, 5], dtype=torch.int32)
+    metadata = {"cu_seqlens": cu, "cu_seqlens_padded": torch.tensor(padded, dtype=torch.int32)}
+    if explicit:
+        metadata["pad_between_seqs"] = expected
+
+        def unexpected_comparison(*args, **kwargs):
+            raise AssertionError("The upstream padding decision must not be recomputed in each layer")
+
+        monkeypatch.setattr(torch, "equal", unexpected_comparison)
+    q = torch.randn(8, 2, 4)
+    _, _, _, kwargs = preprocess_args_and_kwargs_for_attn(q, q, q, None, "te", **metadata)
+    assert kwargs["pad_between_seqs"] is expected
+    assert kwargs["cu_seqlens_q_padded"] is metadata["cu_seqlens_padded"]

@@ -1583,7 +1583,8 @@ def test_forward_backward_step_pp_uses_eval_for_validation(monkeypatch):
 def test_forward_backward_step_pp_does_not_treat_neat_metadata_as_thd(monkeypatch):
     """Batch-major NEAT boundaries must not become the PP loss's flat THD fallback."""
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
-    pp_info.schedule._loss_fn = SimpleNamespace(cu_seqlens=torch.tensor([99]))
+    pp_info.schedule._loss_fn = PipelineCausalLMLoss(MaskedCrossEntropy(), nn.Module())
+    pp_info.schedule._loss_fn.cu_seqlens = torch.tensor([99])
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
     batch = {
         "input_ids": torch.tensor([[1, 2, 3]]),
@@ -3578,7 +3579,24 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
 @pytest.mark.parametrize(
     "packing_format,batch_size,filter_metadata",
     [(fmt, size, filtered) for fmt in ("neat", "neat_varlen") for size in (1, 2) for filtered in (False, True)]
-    + [("thd", 1, False)],
+    + [
+        (fmt, 1, filtered)
+        for fmt in ("unpacked", "thd", "thd_padded", "thd_missing_padded", "thd_none_padded")
+        for filtered in (False, True)
+    ]
+    + [
+        (fmt, size, filtered)
+        for fmt in ("thd_native_tail", "thd_native_equal", "thd_native_padded")
+        for size in (1, 2)
+        for filtered in (False, True)
+    ]
+    + [
+        (fmt, size, filtered)
+        for fmt in ("thd_dsv4_equal", "thd_dsv4_padded")
+        for size in (1, 2)
+        for filtered in (False, True)
+    ]
+    + [(fmt, 1, True) for fmt in ("thd_dsv4_missing", "thd_dsv4_none")],
 )
 def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batch_size, filter_metadata):
     from nemo_automodel.components.datasets.utils import neat_packed_collater
@@ -3595,37 +3613,69 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             """Return differentiable base and two-depth MTP logits.
 
             Args:
-                input_ids: Packed tokens of shape [batch, sequence].
+                input_ids: Tensor of shape [batch, sequence], or [tokens] for
+                    native TE THD, where tokens = batch * sequence. Model-owned
+                    DSV4 THD keeps separate batch rows.
 
             Returns:
-                Base logits and two MTP logits, each [batch, sequence, vocab].
+                Namespace containing logits of shape [batch, sequence, vocab]
+                or [tokens, vocab], two mtp_per_depth_logits tensors with the
+                same layout, and the scalar MTP loss coefficient.
             """
-            assert input_ids.shape == self.logits.shape[1:3]
-            return SimpleNamespace(
-                logits=self.logits[0], mtp_per_depth_logits=list(self.logits[1:]), mtp_loss_scaling_factor=0.3
-            )
+            if packing_format.startswith("thd_native"):
+                assert input_ids.shape == (batch_size * 8,)
+                logits = self.logits.reshape(3, batch_size * 8, 16)
+            else:
+                assert input_ids.shape == self.logits.shape[1:3]
+                logits = self.logits
+            return SimpleNamespace(logits=logits[0], mtp_per_depth_logits=list(logits[1:]), mtp_loss_scaling_factor=0.3)
 
     class MetadataModel(Model):
         def forward(self, input_ids: torch.Tensor, **kwargs: object) -> SimpleNamespace:
             """Accept collator metadata as a production packing-aware model would.
 
             Args:
-                input_ids: Packed tokens of shape [batch, sequence].
-                **kwargs: Collator metadata including document IDs [batch, sequence]
-                    and a block-causal attention mask [batch, 1, sequence, sequence].
+                input_ids: Tensor of shape [batch, sequence], or [tokens] for
+                    native TE THD, where tokens = batch * sequence.
+                **kwargs: Collator metadata including document IDs [batch, sequence],
+                    a block-causal attention mask [batch, 1, sequence, sequence],
+                    real/physical lengths [batch, documents], and cumulative
+                    boundaries [documents + 1] for flattened THD.
 
             Returns:
-                Base logits and two MTP logits, each [batch, sequence, vocab].
+                Namespace containing base and two-depth MTP logits, each
+                [batch, sequence, vocab] or [tokens, vocab], and a scalar
+                MTP loss coefficient.
             """
             return super().forward(input_ids)
 
     torch.manual_seed(3734)
     model = Model() if filter_metadata else MetadataModel()
+    if packing_format.startswith("thd_native"):
+        from nemo_automodel.components.models.common import BackendConfig
+
+        model.backend = BackendConfig(attn="te")
+    if packing_format.startswith("thd_dsv4"):
+        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
+
+        model.supports_thd = True
+        model.config = SimpleNamespace(compress_ratios=[1])
+        model.backend = BackendConfig(attn="sdpa", dispatcher="torch")
+        model.prepare_model_inputs_for_cp = types.MethodType(DeepseekV4ForCausalLM.prepare_model_inputs_for_cp, model)
     cls = train_ft.TrainFinetuneRecipeForNextTokenPrediction if recipe_kind == "llm" else finetune.FinetuneRecipeForVLM
     recipe = object.__new__(cls)
     recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=None))
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = None
+    if packing_format.startswith("thd_dsv4"):
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 1
+        recipe.device_mesh = MagicMock()
+        recipe.device_mesh.mesh_dim_names = ("cp",)
+        recipe.device_mesh.__getitem__.return_value = cp_mesh
+        recipe.cp_vision_frame_sharding = finetune.CpVisionFrameShardingConfig()
+    recipe.mesh_context = SimpleNamespace(cp_size=1)
     recipe.pp_enabled = False
     recipe.tokenizer = None
     recipe.te_fp8 = None
@@ -3653,14 +3703,76 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             attention_mask=[1, 1, 1, 1, 0, 2, 2, 2],
         ),
     ][:batch_size]
+    if packing_format == "unpacked":
+        samples[0] = dict(
+            input_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+            labels=[2, 3, 4, 5, 6, 7, 8, -100],
+            position_ids=list(range(8)),
+            attention_mask=[1] * 8,
+        )
+    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded", "thd_native_padded"):
+        # Two documents occupy [0, 4) and [4, 8); slot 3 is internal pad.
+        # Real cumulative lengths [0, 3, 7] are not physical token offsets.
+        samples[0] = dict(
+            input_ids=[1, 2, 3, 0, 5, 6, 7, 8],
+            labels=[2, 3, 4, -100, 6, 7, 8, 9],
+            position_ids=[0, 1, 2, 0, 0, 1, 2, 3],
+            attention_mask=[1, 1, 1, 0, 2, 2, 2, 2],
+        )
     batch = neat_packed_collater(
         samples,
         packing=PackingCapabilities("block_causal", requires_packed_sequence_metadata=packing_format == "neat_varlen"),
     )
+    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded", "thd_native_padded"):
+        batch.pop("_packed_seq_ids")
+        batch["cu_seqlens"] = torch.tensor([0, 3, 7], dtype=torch.int32)
+        batch["cu_seqlens_padded"] = torch.tensor([0, 4, 8], dtype=torch.int32)
     if packing_format == "thd":
-        # Exercise the legacy physical-offset fallback without NEAT document IDs.
+        # Even without internal padding, THD must provide explicit physical offsets.
         batch.pop("_packed_seq_ids")
         batch["cu_seqlens"] = torch.tensor([0, 3, 6, 8], dtype=torch.int32)
+        batch["cu_seqlens_padded"] = batch["cu_seqlens"].clone()
+    if packing_format == "thd_missing_padded":
+        batch.pop("cu_seqlens_padded")
+    elif packing_format == "thd_none_padded":
+        batch["cu_seqlens_padded"] = None
+    if packing_format.startswith("thd_native"):
+        # Exercise the real TE preparation: physical boundaries must survive
+        # even when lengths coincide or trailing padding is absorbed.
+        batch = {
+            key: torch.tensor([sample[key] for sample in samples]) for key in ("input_ids", "labels", "position_ids")
+        }
+        if packing_format == "thd_native_tail":
+            real_lengths = [[3, 3, -1000], [4, 3, -1000]]
+            physical_lengths = [[3, 5, -1000], [5, 3, -1000]]
+        elif packing_format == "thd_native_equal":
+            real_lengths = physical_lengths = [[3, 3, 2], [5, 3, -1000]]
+        else:
+            real_lengths = [[3, 4, -1000], [4, 3, -1000]]
+            physical_lengths = [[4, 4, -1000], [5, 3, -1000]]
+        batch["seq_lens"] = torch.tensor(real_lengths[:batch_size])
+        batch["seq_lens_padded"] = torch.tensor(physical_lengths[:batch_size])
+        batch["qkv_format"] = "thd"
+    if packing_format.startswith("thd_dsv4"):
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 3, 0, 5, 6, 0, 0], [7, 8, 9, 10, 0, 11, 12, 13]])[:batch_size],
+            "labels": torch.tensor([[2, 3, 4, -100, 6, 7, -100, -100], [8, 9, 10, -100, -100, 12, 13, -100]])[
+                :batch_size
+            ],
+            "position_ids": torch.tensor([[0, 1, 2, 0, 0, 1, 0, 0], [0, 1, 2, 3, 0, 0, 1, 2]])[:batch_size],
+            "seq_lens": torch.tensor([[3, 2], [4, 3]])[:batch_size],
+            "seq_lens_padded": torch.tensor([[4, 4], [5, 3]])[:batch_size],
+            "qkv_format": "thd",
+        }
+        if packing_format == "thd_dsv4_equal":
+            batch["input_ids"] = torch.arange(1, 17).reshape(2, 8)[:batch_size] % 15
+            batch["labels"] = (batch["input_ids"] + 1) % 16
+            batch["position_ids"] = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3], [0, 1, 2, 3, 4, 0, 1, 2]])[:batch_size]
+            batch["seq_lens"] = batch["seq_lens_padded"].clone()
+        elif packing_format == "thd_dsv4_missing":
+            batch.pop("seq_lens_padded")
+        elif packing_format == "thd_dsv4_none":
+            batch["seq_lens_padded"] = None
     labels = batch["labels"].clone()
     num_tokens = int((labels != -100).sum())
     # Explicit document-isolated targets are independent of the production
@@ -3674,6 +3786,28 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
             [[-100, -100, -100, -100, -100, -100, -100, -100], [10, -100, -100, -100, -100, -100, -100, -100]]
         )[:batch_size],
     ]
+    if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded", "thd_native_padded"):
+        targets = [
+            labels,
+            torch.tensor([[3, 4, -100, -100, 7, 8, 9, -100], [9, 10, -100, -100, -100, 13, -100, -100]])[:batch_size],
+            torch.tensor([[4, -100, -100, -100, 8, 9, -100, -100], [10, -100, -100, -100, -100, -100, -100, -100]])[
+                :batch_size
+            ],
+        ]
+    if packing_format == "unpacked":
+        targets = [
+            labels,
+            torch.tensor([[3, 4, 5, 6, 7, 8, -100, -100]]),
+            torch.tensor([[4, 5, 6, 7, 8, -100, -100, -100]]),
+        ]
+    if packing_format.startswith("thd_dsv4"):
+        targets = [labels]
+        for depth in (1, 2):
+            target = torch.full_like(labels, -100)
+            for row, spans in enumerate([((0, 4), (4, 8)), ((0, 5), (5, 8))][:batch_size]):
+                for start, end in spans:
+                    target[row, start : end - depth] = labels[row, start + depth : end]
+            targets.append(target)
     reference_logits = model.logits.detach().clone().requires_grad_()
     reference_losses = [
         torch.nn.functional.cross_entropy(logits.flatten(0, 1), target.flatten(), reduction="sum") / num_tokens
@@ -3682,10 +3816,160 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
     expected = reference_losses[0] + 0.15 * (reference_losses[1] + reference_losses[2])
     expected.backward()
     losses = []
+    if packing_format in ("thd_missing_padded", "thd_none_padded", "thd_dsv4_missing", "thd_dsv4_none"):
+        with pytest.raises(ValueError, match="Packed MTP requires cu_seqlens_padded"):
+            recipe._forward_backward_step(
+                0, batch, loss_buffer=losses, num_label_tokens=num_tokens, num_batches=1, is_train=True
+            )
+        assert not losses
+        assert model.logits.grad is None
+        return
     recipe._forward_backward_step(
         0, batch, loss_buffer=losses, num_label_tokens=num_tokens, num_batches=1, is_train=True
     )
     torch.testing.assert_close(losses[0], expected.detach())
     torch.testing.assert_close(model.logits.grad, reference_logits.grad)
-    # The last token of document A must receive no cross-document MTP gradient.
-    assert torch.count_nonzero(model.logits.grad[1:, 0, 2]) == 0
+    if packing_format != "unpacked":
+        # The last token of document A must receive no cross-document MTP gradient.
+        boundary_token = 3 if packing_format.startswith("thd_dsv4") else 2
+        assert torch.count_nonzero(model.logits.grad[1:, 0, boundary_token]) == 0
+
+
+@pytest.mark.parametrize("batched_cu", [False, True])
+@pytest.mark.parametrize("internal_padding", [False, True])
+@pytest.mark.parametrize("is_train", [False, True])
+@pytest.mark.parametrize("physical_metadata", ["present", "missing", "none"])
+@pytest.mark.parametrize("mtp_enabled", [False, True])
+def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is_train, physical_metadata, mtp_enabled):
+    """Exercise the PP recipe fallback independently of a model's seq_idx tail."""
+
+    class Model(nn.Module):
+        mtp_outputs_are_logits = True
+
+        def __init__(self):
+            super().__init__()
+            self.logits = nn.Parameter(torch.randn(3, 1, 8, 16))
+
+    torch.manual_seed(4169)
+    model = Model()
+    model.train(is_train)
+    base_loss = MaskedCrossEntropy()
+    pp_loss = PipelineCausalLMLoss(base_loss, model, scaling_factor=0.3)
+
+    class Schedule:
+        _loss_fn = pp_loss
+
+        def step(
+            self, input_ids: torch.Tensor, *, target: torch.Tensor, losses: list[torch.Tensor], **kwargs: object
+        ) -> None:
+            """Append the scalar loss and backpropagate.
+
+            Args:
+                input_ids: Token IDs of shape [1, 8].
+                target: Label IDs of shape [1, 8].
+                losses: Mutable list of scalar loss tensors.
+                **kwargs: Packing metadata, including integer boundary tensors
+                    [documents + 1] or [1, documents + 1], with -1000 sentinels.
+
+            Returns:
+                None; appends a detached scalar loss to losses.
+            """
+            assert input_ids.shape == (1, 8)
+            loss = self._loss_fn(tuple(model.logits.unbind()) if mtp_enabled else model.logits[0], target)
+            losses.append(loss.detach())
+            loss.backward()
+
+        def eval(
+            self, input_ids: torch.Tensor, *, target: torch.Tensor, losses: list[torch.Tensor], **kwargs: object
+        ) -> None:
+            """Append the scalar evaluation loss.
+
+            Args:
+                input_ids: Token IDs of shape [1, 8].
+                target: Label IDs of shape [1, 8].
+                losses: Mutable list of scalar loss tensors.
+                **kwargs: Packing metadata, including integer boundary tensors
+                    [documents + 1] or [1, documents + 1], with -1000 sentinels.
+
+            Returns:
+                None; appends a scalar loss without constructing a backward graph.
+            """
+            assert input_ids.shape == (1, 8)
+            with torch.no_grad():
+                losses.append(self._loss_fn(tuple(model.logits.unbind()) if mtp_enabled else model.logits[0], target))
+
+    recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=None))
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=1)
+    recipe.pp_enabled = True
+    recipe.pp = SimpleNamespace(
+        pp_batch_size=1,
+        pp_microbatch_size=1,
+        update_seq_len=lambda seq_len: None,
+        info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=Schedule()),
+    )
+    recipe.tokenizer = None
+    recipe.te_fp8 = None
+    recipe.domain_mixture = None
+    recipe.model_parts = [model]
+    recipe.loss_fn = base_loss
+    labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, 9]])
+    if not internal_padding:
+        labels[0, 3] = 5
+    cu = torch.tensor([0, 3 if internal_padding else 4, 7 if internal_padding else 8], dtype=torch.int32)
+    physical = torch.tensor([0, 4, 8], dtype=torch.int32)
+    if batched_cu:
+        cu = torch.cat((cu, torch.tensor([-1000], dtype=torch.int32))).unsqueeze(0)
+        physical = torch.cat((physical, torch.tensor([-1000], dtype=torch.int32))).unsqueeze(0)
+    batch = dict(
+        input_ids=torch.ones_like(labels), labels=labels, qkv_format="thd", cu_seqlens=cu, cu_seqlens_padded=physical
+    )
+    if physical_metadata == "missing":
+        batch.pop("cu_seqlens_padded")
+    elif physical_metadata == "none":
+        batch["cu_seqlens_padded"] = None
+    reference_logits = model.logits.detach().clone().requires_grad_()
+    expected = torch.nn.functional.cross_entropy(reference_logits[0].flatten(0, 1), labels.flatten(), reduction="sum")
+    if is_train and mtp_enabled:
+        for depth in (1, 2):
+            target = torch.full_like(labels, -100)
+            for start, end in ((0, 4), (4, 8)):
+                target[:, start : end - depth] = labels[:, start + depth : end]
+            expected = expected + 0.15 * torch.nn.functional.cross_entropy(
+                reference_logits[depth].flatten(0, 1), target.flatten(), reduction="sum"
+            )
+    if is_train:
+        expected.backward()
+    losses = []
+    if is_train and mtp_enabled and physical_metadata != "present":
+        with pytest.raises(ValueError, match="Packed MTP requires"):
+            recipe._forward_backward_step(
+                0,
+                batch,
+                loss_buffer=losses,
+                num_label_tokens=int((labels != -100).sum()),
+                num_batches=1,
+                is_train=is_train,
+            )
+        assert not losses
+        assert model.logits.grad is None
+        return
+    recipe._forward_backward_step(
+        0,
+        batch,
+        loss_buffer=losses,
+        num_label_tokens=int((labels != -100).sum()),
+        num_batches=1,
+        is_train=is_train,
+    )
+    if physical_metadata == "present":
+        torch.testing.assert_close(pp_loss.cu_seqlens, torch.tensor([0, 4, 8], dtype=torch.int32))
+    else:
+        assert pp_loss.cu_seqlens is None
+    torch.testing.assert_close(losses[0], expected.detach())
+    if is_train:
+        torch.testing.assert_close(model.logits.grad, reference_logits.grad)
+    else:
+        assert model.logits.grad is None
