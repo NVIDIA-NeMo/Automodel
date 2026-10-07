@@ -28,8 +28,9 @@ preparation scripts, and the upstream metadata revision. Keep preparation-only
 sources and mixture components tied to an actual example; a generic local-file
 loader is not itself a published dataset.
 
-Pin AutoModel recipe and adapter links to the repository revision used to verify
-the card. When refreshing a card for a recipe change, inspect the recipe and its
+Pin AutoModel recipe and adapter links to the full commit SHA used to verify
+the card; the validator rejects branch and tag references in those links.
+When refreshing a card for a recipe change, inspect the recipe and its
 loader at the new revision, update the card's split, limit, and preparation claims,
 and update its AutoModel links together. The offline validator checks current
 path existence and registration; it does not compare the contents at historical
@@ -91,7 +92,7 @@ to provision the pinned `PyYAML==6.0.3` dependency. It validates all registered
 cards, detects unregistered Markdown and MDX cards, parses the
 synthetic JSON examples, and checks repository links and navigation entries. It
 detects uncovered Hub IDs in example YAMLs under `dataset_name`, `path_or_dataset`,
-`path_or_dataset_id`, `train_data_path`, and `schema_dataset`, as well as IDs in
+`path_or_dataset_id`, `train_data_path`, `val_data_path`, and `schema_dataset`, as well as IDs in
 AutoModel retrieval URIs of the form `hf://ORGANIZATION/DATASET/SUBSET`.
 Recipe PRs that introduce a new Hub ID must add its card and catalog registration.
 Prefix relative local directories with `./` (for example, `./data/my_corpus`) so

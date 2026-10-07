@@ -73,12 +73,12 @@ This is a synthetic example.
 
 ## Use with NeMo AutoModel
 
-[View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/toy.yaml)
+[View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/REPO_REVISION/examples/toy.yaml)
 
 ## Related Resources
 
 [Pinned source](https://huggingface.co/datasets/example/toy/blob/REVISION/README.md)
-""".replace("REVISION", ENTRY["revision"])
+""".replace("REPO_REVISION", "b" * 40).replace("REVISION", ENTRY["revision"])
 
 
 class DatasetCardContractTests(unittest.TestCase):
@@ -166,6 +166,11 @@ class DatasetCardContractTests(unittest.TestCase):
     def test_unpinned_source(self):
         self.assert_invalid(CARD.replace(ENTRY["revision"], "main"), "revision-pinned")
 
+    def test_repository_links_require_commit_pins(self):
+        for ref in ("main", "v0.5.0", "b" * 39):
+            with self.subTest(ref=ref):
+                self.assert_invalid(CARD.replace("b" * 40, ref), "40-character commit SHA")
+
     def test_extra_section(self):
         self.assert_invalid(CARD + "\n## Extra\nMore.\n", "H2 sections")
 
@@ -181,10 +186,10 @@ class DatasetCardContractTests(unittest.TestCase):
     def test_hub_ids_from_nested_recipes(self):
         value = {
             "dataset": {"dataset_name": "org/direct", "data_dir_list": [{"path": "hf://org/retrieval/subset"}]},
-            "recipe_args": {"train_data_path": "org/chat"},
+            "recipe_args": {"train_data_path": "org/chat", "val_data_path": "org/evaluation"},
             "model": {"pretrained_model_name_or_path": "org/model"},
         }
-        self.assertEqual(cards.hub_ids(value), {"org/direct", "org/retrieval", "org/chat"})
+        self.assertEqual(cards.hub_ids(value), {"org/direct", "org/retrieval", "org/chat", "org/evaluation"})
 
     def test_local_paths_are_not_hub_ids(self):
         for path in (

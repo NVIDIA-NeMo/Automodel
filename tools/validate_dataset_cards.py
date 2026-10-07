@@ -30,9 +30,17 @@ import yaml
 
 LOGGER = logging.getLogger(__name__)
 SECTIONS = ("Task", "Example Record", "Schema and Splits", "Use with NeMo AutoModel", "Related Resources")
-DATASET_KEYS = {"dataset_name", "path_or_dataset", "path_or_dataset_id", "train_data_path", "schema_dataset"}
+DATASET_KEYS = {
+    "dataset_name",
+    "path_or_dataset",
+    "path_or_dataset_id",
+    "train_data_path",
+    "val_data_path",
+    "schema_dataset",
+}
 HUB_ID = re.compile(r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*\Z")
 REPO_LINK = re.compile(r"https://github\.com/NVIDIA-NeMo/Automodel/blob/[^/]+/([^\s)#]+)")
+REPO_REF = re.compile(r"https://github\.com/NVIDIA-NeMo/Automodel/blob/([^/]+)/[^\s)#]+")
 
 
 class _RequiredCatalogEntry(TypedDict):
@@ -162,6 +170,8 @@ def card_errors(text: str, entry: _CatalogEntry) -> list[str]:
     revision = entry["revision"]
     if not re.fullmatch(r"[0-9a-f]{40}", revision) or f"{hub_url}/blob/{revision}/README.md" not in text:
         errors.append("missing revision-pinned upstream card")
+    if any(not re.fullmatch(r"[0-9a-fA-F]{40}", ref) for ref in REPO_REF.findall(text)):
+        errors.append("AutoModel repository links must use a 40-character commit SHA")
     linked_recipes = {p for p in REPO_LINK.findall(areas["Use with NeMo AutoModel"]) if p.endswith((".yaml", ".yml"))}
     if not entry["recipes"] or linked_recipes != set(entry["recipes"]):
         errors.append("recipe links must match the catalog recipes")
