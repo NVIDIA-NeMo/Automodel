@@ -18,12 +18,15 @@ import json
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
+import torch
 
 from tests.functional_tests.parallelism.compare_parallel_parity import main, read_metrics
 from tests.functional_tests.parallelism_multigpu.recipe_parity import compare_recipe_runs
+from tests.functional_tests.parallelism_multigpu.run_recipe import initialize_parity_weights
 
 
 @pytest.mark.parametrize("metric", ["loss", "grad_norm"])
@@ -85,3 +88,18 @@ def test_recipe_validation_schema(tmp_path: Path, validation: list[dict[str, flo
     else:
         with pytest.raises(AssertionError):
             compare_recipe_runs(baseline=tmp_path, parallel=tmp_path, loss_tol=0.05, grad_norm_rtol=0.05)
+
+
+def test_initial_weights_do_not_depend_on_stage_or_visit_order() -> None:
+    """PP stages omit different parameters; global RNG order is not a valid oracle."""
+    model = torch.nn.ModuleDict({str(i): torch.nn.Linear(8, 8, dtype=torch.bfloat16) for i in range(4)})
+    stage = deepcopy(model)
+    del stage["0"]
+    del stage["1"]
+    stage = torch.nn.ModuleDict(reversed(list(stage.items())))
+    reference = initialize_parity_weights([model])
+    actual = initialize_parity_weights([stage])
+    assert actual == {name: reference[name] for name in actual}
+    assert reference["2.weight"] != reference["3.weight"]
+    for name, parameter in stage.named_parameters():
+        torch.testing.assert_close(parameter, dict(model.named_parameters())[name], rtol=0, atol=0)

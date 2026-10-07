@@ -103,7 +103,7 @@ def run_recipe_pair(
         run_distributed(
             ranks // pp_size * pp,
             [
-                "examples/llm_finetune/finetune.py",
+                "tests/functional_tests/parallelism_multigpu/run_recipe.py",
                 "--config",
                 str(config),
                 *overrides,
@@ -114,6 +114,16 @@ def run_recipe_pair(
             ],
             output / f"{name}.log",
         )
+    initial_weights = []
+    for name in ("baseline", "parallel"):
+        weights = {}
+        for path in (output / name).glob("initial_weights.*.json"):
+            for parameter, fingerprint in json.loads(path.read_text()).items():
+                assert parameter not in weights or weights[parameter] == fingerprint, parameter
+                weights[parameter] = fingerprint
+        assert weights, f"No initial parameter fingerprints in {name}"
+        initial_weights.append(weights)
+    assert initial_weights[0] == initial_weights[1], "Baseline and PP must start from identical weights"
     # A successful numerical comparison must actually have used the static PP path.
     log = (output / "parallel.log").read_text()
     assert "Precomputed pipeline stage shapes" in log

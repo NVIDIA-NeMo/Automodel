@@ -34,7 +34,12 @@ in `llama.yaml` retains a small reproduction.
 The Nemotron MoE recipe uses width 512, latent width 256, eight experts and top-2
 routing to exercise HybridEP with both Torch and Transformer Engine experts.
 Both compare three optimizer steps and final validation against a run with PP
-disabled and the same remaining topology. Every loss and gradient norm must be
+disabled and the same remaining topology. After normal recipe setup, the test
+entrypoint assigns random weights seeded by parameter name and checks matching
+fingerprints across both runs. A global RNG seed alone cannot ensure matching
+initial weights when stages initialize different parameter subsets. Production
+setup still runs so stage-specific initialization hangs remain detectable.
+Every loss and gradient norm must be
 finite, every expected step must be present, and gradients must be nonzero.
 Loss tolerance is 0.05 for Llama and 0.10 for MoE; gradient-norm relative
 tolerance is 0.05. These account for BF16 reduction and GEMM ordering; the
