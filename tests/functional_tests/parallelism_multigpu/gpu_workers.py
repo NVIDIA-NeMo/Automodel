@@ -14,6 +14,7 @@
 
 """One persistent torchrun group per GPU job, with bounded individual cases."""
 
+import argparse
 import json
 import os
 import signal
@@ -32,7 +33,7 @@ CASE_TIMEOUT = 30.0
 class GPUWorkers:
     """Share imports and CUDA/NCCL startup across the functional precision matrix."""
 
-    def __init__(self, directory: Path, ranks: int) -> None:
+    def __init__(self, directory: Path, ranks: int, *, warmup_moe: bool = False) -> None:
         self.directory = directory
         self.ranks = ranks
         self.index = 0
@@ -49,6 +50,7 @@ class GPUWorkers:
                 f"--nproc_per_node={ranks}",
                 str(Path(__file__).resolve()),
                 str(directory),
+                *(["--warmup-moe"] if warmup_moe else []),
             ],
             cwd=REPO,
             env=env,
@@ -63,6 +65,7 @@ class GPUWorkers:
             self.close()
             raise
         self.startup_seconds = time.monotonic() - started
+        (directory / "startup.json").write_text(json.dumps({"seconds": self.startup_seconds}))
         print(f"Shared GPU worker startup: {self.startup_seconds:.2f}s", flush=True)
 
     def _wait_for(self, path: Path, timeout: float) -> None:
@@ -114,7 +117,7 @@ class GPUWorkers:
         self.output.close()
 
 
-def worker_main(directory: Path) -> None:
+def worker_main(directory: Path, *, warmup_moe: bool = False) -> None:
     """Import GPU dependencies once, then execute requests on every rank."""
     import torch
     import torch.distributed as dist
@@ -127,6 +130,18 @@ def worker_main(directory: Path) -> None:
 
     info = initialize_distributed("nccl")
     device = info.device
+    if warmup_moe:
+        from nemo_automodel.components.moe.megatron.fused_a2a import reset_hybrid_ep_buffer
+        from nemo_automodel.components.moe.megatron.token_dispatcher import _HybridEPManager
+
+        # Compile communication kernels once without constructing a model or
+        # exercising PP. Actual model initialization remains inside each case.
+        ep_mesh = init_device_mesh("cuda", (info.world_size // 2, 2), mesh_dim_names=("replica", "ep"))
+        manager = _HybridEPManager(ep_mesh["ep"].get_group(), num_local_experts=2, num_experts=4, router_topk=2)
+        for tokens in (512, 32, 64):
+            manager.initialize_runtime(num_tokens=tokens, hidden_dim=256, dtype=torch.bfloat16, device=device)
+        del manager
+        reset_hybrid_ep_buffer()
     dist.barrier()
     if info.rank == 0:
         (directory / "ready.json").write_text("{}")
@@ -182,7 +197,12 @@ def worker_main(directory: Path) -> None:
         if any(errors):
             raise RuntimeError("Distributed functional case failed")
         index += 1
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    worker_main(Path(sys.argv[1]))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("directory", type=Path)
+    parser.add_argument("--warmup-moe", action="store_true")
+    args = parser.parse_args()
+    worker_main(args.directory, warmup_moe=args.warmup_moe)

@@ -186,12 +186,15 @@ def pytest_addoption(parser: pytest.Parser):
 
 
 @pytest.fixture(scope="session")
-def parallelism_gpu_workers(tmp_path_factory: pytest.TempPathFactory) -> Iterator["GPUWorkers"]:
+def parallelism_gpu_workers(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Iterator["GPUWorkers"]:
     """Pay Python/CUDA/NCCL startup once for both multi-GPU precision folders."""
     from tests.functional_tests.parallelism_multigpu.gpu_workers import GPUWorkers
     from tests.functional_tests.parallelism_multigpu.recipe_parity import gpu_count
 
-    workers = GPUWorkers(tmp_path_factory.mktemp("gpu_workers"), gpu_count())
+    warmup_moe = any("moe_multigpu" in item.path.parts for item in request.session.items)
+    workers = GPUWorkers(tmp_path_factory.mktemp("gpu_workers"), gpu_count(), warmup_moe=warmup_moe)
     try:
         yield workers
     finally:

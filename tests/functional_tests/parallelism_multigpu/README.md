@@ -2,7 +2,10 @@
 
 These suites use random weights and synthetic tokens. They need no model or
 dataset downloads. One persistent worker group shares Python, CUDA and NCCL
-startup across both folders in a GPU job. Startup is bounded at two minutes;
+startup across both folders in a GPU job. MoE jobs also compile HybridEP
+dispatch/combine kernels in this shared startup, using synthetic tensors and
+no model. Each case still runs production model initialization, training and
+validation. Startup is bounded at two minutes;
 each individual case has a 30-second deadline and records its own timing.
 Timeouts terminate the complete worker process group.
 
