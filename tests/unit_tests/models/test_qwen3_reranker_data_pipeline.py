@@ -69,8 +69,8 @@ def test_real_jsonl_preserves_missing_context_through_batched_loading(tmp_path, 
 
 
 @pytest.mark.runtime_budget(
-    20,
-    reason="A real spawned DataLoader worker imports PyTorch and Transformers before exercising shared epoch state.",
+    60,
+    reason="Cold PyTorch/Transformers imports in a spawned worker can exceed 30s on shared CI runners.",
 )
 def test_persistent_worker_observes_epoch_changes_in_actual_prompts(tokenizer):
     features = [
@@ -85,7 +85,7 @@ def test_persistent_worker_observes_epoch_changes_in_actual_prompts(tokenizer):
         num_workers=1,
         persistent_workers=True,
         multiprocessing_context="spawn",
-        timeout=30,
+        timeout=60,
     )
     try:
         (epoch0,) = list(loader)
@@ -99,5 +99,11 @@ def test_persistent_worker_observes_epoch_changes_in_actual_prompts(tokenizer):
         kept1 = (epoch1["input_ids"] == trace_id).any(dim=-1)
         assert not torch.equal(kept0, kept1)
     finally:
-        # DataLoader owns the persistent worker and shuts it down on destruction.
-        del loader
+        # A failed iteration's traceback retains the iterator, so deleting the
+        # loader cannot reliably stop its persistent worker. DataLoader has no
+        # public close method; explicitly shut down and reap even a stuck worker.
+        if loader._iterator is not None:
+            loader._iterator._shutdown_workers()
+            for worker in loader._iterator._workers:
+                worker.join(timeout=5)
+                assert not worker.is_alive()
