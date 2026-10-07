@@ -120,20 +120,6 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
         self.num_mtp_modules = num_mtp_modules
         super().__init__(pad_token_id=pad_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs)
 
-    def model_flops(self, *, gbs: int = 1, seq_len: int | None = None) -> float:
-        """Return useful text-only training FLOPs, excluding MTP and recomputation.
-
-        Args:
-            gbs: Number of individual sequences in the global optimizer step.
-            seq_len: Tokens per sequence; defaults to max_position_embeddings.
-
-        Returns:
-            Useful model FLOPs across all devices for one optimizer step.
-        """
-        from nemo_automodel.components.models.minimax_m3_vl.flops import model_flops
-
-        return model_flops(self, gbs=gbs, seq_len=seq_len)
-
     def to_dict(self):
         return _json_safe_value(super().to_dict())
 

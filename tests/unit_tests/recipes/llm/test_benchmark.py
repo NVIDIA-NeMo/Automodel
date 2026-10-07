@@ -21,9 +21,7 @@ import pytest
 import torch
 from transformers import LlamaConfig, PretrainedConfig
 
-from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.utils.flops_utils import llama2_flops
-from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
 
@@ -142,8 +140,6 @@ def mock_recipe(mock_config, monkeypatch):
         recipe.dataloader = MagicMock()
         recipe.val_dataloader = None
         recipe.pp_enabled = False
-        recipe.activation_checkpointing = True
-        recipe._get_cp_group_size = MagicMock(return_value=1)
         recipe.tflops = 1000.0
         # Set benchmark-specific attributes
         recipe._bench_steps = 30
@@ -377,83 +373,6 @@ class TestBenchmarkingRecipeSetup:
             expected_tflops = expected_flops / (10**12)
             assert mock_recipe.tflops == expected_tflops
             mock_flops_formula.assert_called_once()
-
-    @pytest.mark.parametrize(
-        "activation_checkpointing,pp_enabled,cp_size,providers,expected_prepare",
-        [
-            ("selective", False, 1, True, True),
-            ("SeLeCtIvE", False, 1, True, True),
-            ("selective", False, 1, False, False),
-            ("selective", True, 1, True, False),
-            ("selective", False, 2, True, False),
-            ("full", False, 1, True, False),
-            (True, False, 1, True, False),
-            (False, False, 1, True, False),
-        ],
-    )
-    def test_selective_runtime_preparation_uses_resolved_microbatch_after_setup(
-        self,
-        mock_recipe: BenchmarkingRecipeForNextTokenPrediction,
-        activation_checkpointing: bool | str,
-        pp_enabled: bool,
-        cp_size: int,
-        providers: bool,
-        expected_prepare: bool,
-    ) -> None:
-        """Prepare fixed CP1 capacity from real recipe runtime keys after sharding."""
-        mock_recipe.cfg = RecipeConfig(
-            ConfigNode({"step_scheduler": {"global_batch_size": 24, "local_batch_size": 3, "max_steps": 2}})
-        )
-        # The typed scheduler deliberately excludes this runtime-only YAML key.
-        with pytest.raises(AttributeError):
-            _ = mock_recipe.cfg.step_scheduler.local_batch_size
-        assert mock_recipe.cfg.get("step_scheduler.local_batch_size") == 3
-        mock_recipe.activation_checkpointing = activation_checkpointing
-        mock_recipe.pp_enabled = pp_enabled
-        mock_recipe._get_cp_group_size.return_value = cp_size
-        events: list[str] = []
-        initializer = MagicMock()
-
-        def prepare(*, num_tokens: int, device: torch.device) -> None:
-            assert events == ["parent_setup", "collect"]
-            assert num_tokens == 3 * 2048
-            assert device == torch.device("cpu")
-            events.append("prepare")
-
-        initializer.prepare.side_effect = prepare
-
-        def collect(model_parts: list[torch.nn.Module]) -> list[MagicMock]:
-            assert events == ["parent_setup"]
-            assert model_parts is mock_recipe.model_parts
-            events.append("collect")
-            return [initializer] if providers else []
-
-        with (
-            patch(
-                "nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.setup",
-                side_effect=lambda: events.append("parent_setup"),
-            ),
-            patch(
-                "nemo_automodel.recipes.llm.benchmark.collect_pipeline_runtime_initializers",
-                side_effect=collect,
-                create=True,
-            ),
-            patch(
-                "nemo_automodel.recipes.llm.benchmark.get_flops_formula_for_hf_config",
-                return_value=lambda config, gbs, seq_len: 1e15,
-            ),
-            patch.object(mock_recipe, "_mtp_tflops", return_value=0.0),
-        ):
-            mock_recipe.setup()
-        if expected_prepare:
-            assert events == ["parent_setup", "collect", "prepare"]
-            initializer.prepare.assert_called_once()
-        elif activation_checkpointing == "selective" and not pp_enabled and cp_size == 1:
-            assert events == ["parent_setup", "collect"]
-            initializer.prepare.assert_not_called()
-        else:
-            assert events == ["parent_setup"]
-            initializer.prepare.assert_not_called()
 
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")

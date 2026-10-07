@@ -13,21 +13,7 @@
 # limitations under the License.
 
 import warnings
-from typing import Any, Callable, Protocol, runtime_checkable
-
-
-@runtime_checkable
-class ModelFlopsConfig(Protocol):
-    """Configuration that owns its architecture's useful training FLOPs."""
-
-    def model_flops(self, *, gbs: int = 1, seq_len: int | None = None) -> float:
-        """Count global-step FLOPs for gbs unpadded sequences of seq_len tokens."""
-        ...
-
-
-def _config_model_flops(config: ModelFlopsConfig, gbs: int = 1, seq_len: int | None = None) -> float:
-    """Adapt a config-owned FLOPs method to the existing calculator signature."""
-    return config.model_flops(gbs=gbs, seq_len=seq_len)
+from typing import Any, Callable
 
 
 def calculate_mfu(
@@ -1997,9 +1983,6 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         composite config. Pass its text config explicitly when only text-backbone
         FLOPs are intended.
     """
-    if isinstance(config, ModelFlopsConfig):
-        return _config_model_flops
-
     # Get config class name
     config_class_name = config.__class__.__name__
 
@@ -2070,6 +2053,11 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         "BloomConfig": transformer_flops,
         "FalconConfig": transformer_flops,
     }
+
+    if config_class_name == "MiniMaxM3VLTextConfig":
+        from nemo_automodel.components.models.minimax_m3_vl.flops import model_flops
+
+        class_name_to_formula[config_class_name] = model_flops
 
     # Try exact match first
     formula = class_name_to_formula.get(config_class_name)

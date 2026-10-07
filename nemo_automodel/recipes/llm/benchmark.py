@@ -19,9 +19,7 @@ import pathlib
 import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.activation_checkpointing import is_selective_activation_checkpointing
 from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
-from nemo_automodel.components.distributed.pipelining.runtime import collect_pipeline_runtime_initializers
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
@@ -171,20 +169,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         with self.timers("setup", log_level=1):
             # Call parent setup
             super().setup()
-
-            # Selective checkpointing must not record HybridEP's one-time
-            # runtime initialization. Fixed CP1 benchmark shapes give its
-            # local token capacity; PP already prepares its own runtime.
-            if (
-                not self.pp_enabled
-                and self._get_cp_group_size() == 1
-                and is_selective_activation_checkpointing(self.activation_checkpointing)
-            ):
-                for initializer in collect_pipeline_runtime_initializers(self.model_parts):
-                    initializer.prepare(
-                        num_tokens=self._bench_seq_len * self.cfg.get("step_scheduler.local_batch_size"),
-                        device=self.dist_env.device,
-                    )
 
         # Store wandb run object if initialized by parent
         import wandb

@@ -17,6 +17,7 @@
 import pytest
 
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
+from nemo_automodel.components.models.minimax_m3_vl.flops import model_flops
 from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config, transformer_flops
 
 
@@ -85,6 +86,7 @@ def _oracle(length: int, *, sparse: bool = True) -> int:
 def test_counter_matches_independent_parameter_and_selected_key_oracle(length: int, sparse: bool) -> None:
     config = _config(sparse=sparse)
     formula = get_flops_formula_for_hf_config(config)
+    assert formula is model_flops
     assert formula(config, gbs=3, seq_len=length) == 3 * _oracle(length, sparse=sparse)
 
 
@@ -109,44 +111,44 @@ def test_sequence_default_and_composite_scope() -> None:
 @pytest.mark.parametrize("gbs,length", [(0, 12), (1, 0), (1, -1)])
 def test_invalid_batch_or_sequence_is_rejected(gbs: int, length: int) -> None:
     with pytest.raises(ValueError, match="positive seq_len and gbs"):
-        _config().model_flops(gbs=gbs, seq_len=length)
+        model_flops(_config(), gbs=gbs, seq_len=length)
 
 
 def test_mtp_and_nonlocal_sparse_budget_are_explicitly_unsupported() -> None:
     with pytest.raises(ValueError, match="num_mtp_modules=0"):
-        _config(mtp=1).model_flops()
+        model_flops(_config(mtp=1))
     with pytest.raises(ValueError, match="local block"):
-        _config(local_blocks=0).model_flops()
+        model_flops(_config(local_blocks=0))
 
 
 def test_short_layer_patterns_and_unsupported_output_gate_are_rejected() -> None:
     config = _config()
     config.moe_layer_freq = [0]
     with pytest.raises(ValueError, match="moe_layer_freq"):
-        config.model_flops()
+        model_flops(config)
     config = _config()
     config.sparse_attention_config["sparse_attention_freq"] = [0]
     with pytest.raises(ValueError, match="sparse_attention_freq"):
-        config.model_flops()
+        model_flops(config)
     config = _config()
     config.attention_output_gate = True
     with pytest.raises(ValueError, match="attention_output_gate"):
-        config.model_flops()
+        model_flops(config)
 
 
 def test_forced_initial_blocks_must_leave_room_for_partial_local_block() -> None:
     config = _config()
     config.sparse_attention_config["sparse_init_block"] = 2
     with pytest.raises(ValueError, match="leave room"):
-        config.model_flops()
+        model_flops(config)
 
 
 def test_shared_expert_count_scales_only_shared_projection_work() -> None:
     config = _config()
-    original = config.model_flops(seq_len=12)
+    original = model_flops(config, seq_len=12)
     config.n_shared_experts = 2
     # Three additional hidden8/intermediate7 matrices, forward + backward.
-    assert config.model_flops(seq_len=12) - original == 3 * 8 * 7 * 12 * 6
+    assert model_flops(config, seq_len=12) - original == 3 * 8 * 7 * 12 * 6
 
 
 @pytest.mark.parametrize("local_blocks,initial_blocks", [(3, 0), (2, 1)])
@@ -154,7 +156,7 @@ def test_forced_blocks_cannot_overfill_topk_budget(local_blocks: int, initial_bl
     config = _config(local_blocks=local_blocks)
     config.sparse_attention_config["sparse_init_block"] = initial_blocks
     with pytest.raises(ValueError, match="fit the top-k budget"):
-        config.model_flops()
+        model_flops(config)
 
 
 @pytest.mark.parametrize("local_blocks,initial_blocks", [(2, 0), (1, 1)])
@@ -163,4 +165,4 @@ def test_valid_forced_block_mix_preserves_selected_key_count(local_blocks: int, 
     config.sparse_attention_config["sparse_init_block"] = initial_blocks
     # The actual old full block may differ, but every selected old block has two
     # keys and the forced current block has the same causal partial length.
-    assert config.model_flops(seq_len=13) == _oracle(13)
+    assert model_flops(config, seq_len=13) == _oracle(13)
