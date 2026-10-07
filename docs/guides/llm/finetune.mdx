@@ -221,6 +221,12 @@ peft:
 
 Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead. See [Switch Between SFT and PEFT](#switch-between-sft-and-peft).
 
+For MoE models with adaptive router correction biases, freeze those updates as
+well as the base parameters. This preserves routing when reloading the saved
+adapters; see
+[Router Correction Biases in MoE Models](/development/checkpointing#router-correction-biases-in-moe-models)
+for the recipe settings.
+
 #### QLoRA for Quantized Low-Rank Adaptation
 
 If GPU memory is a constraint, [QLoRA](https://arxiv.org/abs/2305.14314) combines LoRA with 4-bit NormalFloat (NF4) quantization to reduce memory usage by up to 75% compared to full-parameter SFT in 16-bit precision, while maintaining comparable quality to standard LoRA.
@@ -1009,7 +1015,7 @@ distributed:
 ```
 
 <Info>
-When `cp_size > 1`, fused RoPE is automatically disabled. Some models also require the Transformer Engine (TE) attention backend for CP with packed sequences. The framework will raise an error with instructions if this applies.
+When `cp_size > 1`, fused RoPE is automatically disabled. Some models also require the Transformer Engine (TE) attention backend for CP with packed sequences. The framework raises an error with instructions if this applies.
 
 </Info>
 
