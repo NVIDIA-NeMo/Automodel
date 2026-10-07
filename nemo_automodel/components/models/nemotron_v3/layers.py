@@ -818,7 +818,11 @@ class NemotronV3Block(nn.Module):
 
             # Override gate weight with normal (not trunc_normal) for backward compat
             if hasattr(self.mixer.gate, "weight"):
-                nn.init.normal_(self.mixer.gate.weight, mean=0.0, std=init_std)
+                # Match MoE.init_weights: initialize the local shard. A DTensor
+                # random op lazily broadcasts RNG state across the default group,
+                # which hangs when other PP stages contain no MoE blocks.
+                weight = self.mixer.gate.weight
+                nn.init.normal_(weight.to_local() if isinstance(weight, DTensor) else weight, mean=0.0, std=init_std)
             if hasattr(self.mixer.gate, "bias") and self.mixer.gate.bias is not None:
                 nn.init.zeros_(self.mixer.gate.bias)
 

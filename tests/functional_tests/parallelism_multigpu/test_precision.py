@@ -42,7 +42,7 @@ def test_pp_tp_cp_recipe(tmp_path: Path) -> None:
         ranks=count,
         pp_size=2,
         config=Path(__file__).with_name("llama.yaml"),
-        overrides=["--distributed.cp_size", str(count // 4)],
+        overrides=["--distributed.cp_size", str(count // 4), "--model.backend.attn", "te" if count == 8 else "sdpa"],
         output=tmp_path,
         loss_tol=0.05,
         grad_norm_rtol=0.05,

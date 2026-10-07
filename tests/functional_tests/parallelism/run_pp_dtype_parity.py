@@ -134,6 +134,7 @@ def _run_case(
         pp_seq_len=16,
         patch_inner_model=False,
         patch_causal_lm_model=False,
+        defer_fsdp_grad_sync=False,
     ).build(candidate, loss_fn=_loss, parallelize_fn=partial(_shard, activation_checkpointing=checkpointing))
     part = pp.parts[0]
     hidden_dtype = torch.float32 if fp32_residual else torch.bfloat16
@@ -172,7 +173,7 @@ def _run_case(
         ) % 64
         labels = (tokens + 1) % 64
         optimizer.zero_grad(set_to_none=True)
-        ref_optimizer.zero_grad(set_to_none=True)
+        reference_grads = [torch.zeros_like(param) for param in reference.parameters()]
         pp.update_seq_len(seq_len)
         losses = []
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -182,23 +183,23 @@ def _run_case(
                 pp.info.schedule.step(target=labels, losses=losses)
             reference_loss = torch.zeros((), device=device)
             for sample, target in zip(tokens.split(1), labels.split(1)):
+                ref_optimizer.zero_grad(set_to_none=True)
                 ref_output = reference(sample)
                 ref_logits = (ref_output.logits, *(ref_output.mtp_per_depth_h or ()))
                 loss = _loss(ref_logits, target)
                 loss.backward()
+                # Match the configured per-microbatch FP32 reduction followed
+                # by BF16 gradient accumulation, without using FSDP in the oracle.
+                for param, accumulated in zip(reference.parameters(), reference_grads):
+                    assert param.grad is not None
+                    reduced_grad = param.grad.float()
+                    dist.all_reduce(reduced_grad, group=mesh["dp"].get_group())
+                    accumulated.add_((reduced_grad / mesh["dp"].size()).to(param.dtype))
                 reference_loss += loss.detach()
         if pp.info.has_last_stage:
             torch.testing.assert_close(torch.stack(losses).sum(), reference_loss, rtol=1e-6, atol=1e-5)
-        # FSDP averages across DP replicas; construct the same global-batch
-        # reference independently from their unpartitioned models.
-        for param in reference.parameters():
-            assert param.grad is not None
-            # FSDP's reduce_dtype is FP32 even though the stored parameters and
-            # gradients are BF16. Reducing the reference in BF16 introduces
-            # extra intermediate rounding when there are more than two ranks.
-            reduced_grad = param.grad.float()
-            dist.all_reduce(reduced_grad, group=mesh["dp"].get_group())
-            param.grad.copy_(reduced_grad / mesh["dp"].size())
+        for param, accumulated in zip(reference.parameters(), reference_grads):
+            param.grad = accumulated
         checked = 0
         for name, param in part.named_parameters():
             name = name.replace("_checkpoint_wrapped_module.", "")

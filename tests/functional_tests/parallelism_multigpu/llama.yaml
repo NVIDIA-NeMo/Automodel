@@ -42,7 +42,9 @@ distributed:
     pp_schedule: 1f1b
     scale_grads_in_schedule: false
   pp_size: 2
-  sequence_parallel: true
+  # The PP boundary here carries replicated activations. Sequence-sharded PP
+  # boundaries need separate DTensor metadata support (see README).
+  sequence_parallel: false
   strategy: fsdp2
   tp_size: 2
 loss_fn:

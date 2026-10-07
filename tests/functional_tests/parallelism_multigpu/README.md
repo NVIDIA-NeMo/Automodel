@@ -22,7 +22,11 @@ The four-layer model has width 64 and vocabulary 64. PP4 exercises interior
 pipeline stages. BF16 projections and FP32 residuals coexist in the same run;
 the FP32 cases do not mean full-FP32 compute.
 
-The tiny Llama recipe adds tensor/sequence parallelism and context parallelism.
+The tiny Llama recipe adds tensor parallelism and context parallelism, using
+TE attention when CP is enabled. Sequence parallelism is disabled: the PP2/TP2
+control with SP enabled hangs in NCCL RECV with full-sequence receive metadata
+on the tested PyTorch 2.13 image. This is a separate coverage gap; enabling SP
+in `llama.yaml` retains a small reproduction.
 The Nemotron MoE recipe uses width 512, latent width 256, eight experts and top-2
 routing to exercise HybridEP with both Torch and Transformer Engine experts.
 Both compare three optimizer steps and final validation against a run with PP
