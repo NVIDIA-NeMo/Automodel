@@ -208,9 +208,11 @@ mlflow-full = [
     "mlflow>=3.16.1",
 ]
 wandb = ["wandb>=0.30.0"]
+trackio = ["trackio>=0.40.0"]
 tracking = [
-    # Convenience meta-extra: installs both experiment-tracking backends.
+    # Convenience meta-extra: installs the experiment-tracking backends.
     "nemo-automodel[mlflow]",
+    "nemo-automodel[trackio]",
     "nemo-automodel[wandb]",
 ]
 # Official MSA (Linux + SM100); the model-private patch supplies the CuTe DSL 4.6.2 fmax fix.
