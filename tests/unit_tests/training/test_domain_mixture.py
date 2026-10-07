@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.training.domain_mixture import (
+    DomainMixture,
     DomainMixtureConfig,
     DomainWeightConfig,
 )
@@ -83,3 +84,19 @@ def test_domain_mixture_rejects_invalid_domain_sets(domains):
 def test_domain_mixture_rejects_invalid_corpus_path(path):
     with pytest.raises(ValueError, match="path must be a non-empty string.*web"):
         DomainWeightConfig(name="web", sampling_weight=1, objective_weight=1, path=path)
+
+
+@pytest.mark.parametrize("provide_cache", [False, True])
+def test_domain_mixture_preserves_standalone_positional_constructor(provide_cache):
+    args = (("web", "code"), (0.5, 0.5), (0.25, 0.75), (0.5, 1.5))
+    cache = {}
+    mixture = DomainMixture(*args, cache) if provide_cache else DomainMixture(*args)
+
+    weights = mixture.loss_weights(torch.tensor([0, 1]), torch.tensor([[1, 2], [3, 4]]))
+
+    torch.testing.assert_close(weights, torch.tensor([[0.5, 0.5], [1.5, 1.5]]))
+    assert mixture.weighted_validation_loss({"web": 2.0, "code": 4.0}) == pytest.approx(3.5)
+    assert mixture.paths == ()
+    if provide_cache:
+        # The fifth positional argument must still receive the runtime cache.
+        torch.testing.assert_close(cache[torch.device("cpu")], torch.tensor([0.5, 1.5]))
