@@ -2083,7 +2083,7 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
     reason="isolated Transformers startup and two export round trips took 15.6s on CI; allow runner variance",
 )
 def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Both export paths include standalone code and preserve default CrossEncoder text/image scores."""
+    """Trained heads export through both save paths into stock ST modules and portable Transformers."""
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     # Share interpreter/import startup, but build and verify each export independently.
     export_dirs = [tmp_path / "direct", tmp_path / "consolidated"]
@@ -2104,14 +2104,20 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
         config.num_labels = 1
         config.temperature = 0.02
         encoder = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config)).eval()
+        # A real update makes stale copies of the source Dense head observable.
+        optimizer = torch.optim.SGD(encoder.parameters(), lr=0.01)
+        encoder(input_ids=torch.tensor([[1, 2, 3, 4]]), attention_mask=torch.ones(1, 4)).logits.sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
         features = [
-            {"question": "What is shown?", "doc_text": "literal", "doc_image": ""},
+            {"question": "What is [IMG] shown?", "doc_text": "literal", "doc_image": ""},
             {
-                "question": "What is shown?",
+                "question": "What is [IMG] shown?",
                 "doc_text": "Image doc",
                 "doc_image": Image.new("RGB", (16, 16), (255, 0, 0)),
             },
         ]
+        features.append({"question": "What is [IMG] shown?", "doc_text": "", "doc_image": Image.new("RGB", (16, 16), "blue")})
         batch = processor.process_queries_documents_crossencoder(features)
         model_inputs = {key: value for key, value in batch.items() if key != "labels"}
         with torch.no_grad():
@@ -2127,7 +2133,11 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
                 original_model_path=None,
                 tokenizer=processor,
             )
-            save_file(encoder.model.state_dict(), export_dir / "model.safetensors", metadata={"format": "pt"})
+            save_file(
+                encoder.state_dict_adapter.to_hf(encoder.state_dict()),
+                export_dir / "model.safetensors",
+                metadata={"format": "pt"},
+            )
         else:
             encoder.save_pretrained(str(export_dir), tokenizer=processor)
         metadata = json.loads((export_dir / "config_sentence_transformers.json").read_text())
@@ -2140,7 +2150,27 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
         assert tokenizer_config["model_max_length"] == 64
         assert "max_length" not in tokenizer_config
         assert (export_dir / "model.py").is_file()
-        assert (export_dir / "processor.py").is_file()
+        assert not (export_dir / "processor.py").exists()
+        from safetensors.torch import load_file
+
+        dense_weight = load_file(export_dir / "2_Dense/model.safetensors")["linear.weight"]
+        torch.testing.assert_close(
+            dense_weight, encoder.model.score.weight.float() / config.temperature, rtol=0, atol=0
+        )
+        saved_config = json.loads((export_dir / "config.json").read_text())
+        assert saved_config["model_type"] == "mistral3"
+        assert saved_config["text_config"]["model_type"] == "ministral3"
+        assert saved_config["score_temperature"] == config.temperature
+        assert saved_config["auto_map"] == {
+            "AutoModelForSequenceClassification": "model.Mistral3ForSequenceClassification"
+        }
+        from nemo_automodel import NeMoAutoModelCrossEncoder
+
+        restored = NeMoAutoModelCrossEncoder.from_pretrained(
+            str(export_dir), attn_implementation="eager", use_liger_kernel=False, use_sdpa_patching=False,
+        ).cpu().eval()
+        assert restored.effective_score_temperature == config.temperature
+        torch.testing.assert_close(restored(**model_inputs).logits, expected, rtol=1e-5, atol=1e-7)
         torch.save(
             {"inputs": model_inputs, "logits": expected, "state": encoder.model.state_dict()},
             export_dir.with_suffix(".pt"),
@@ -2156,11 +2186,16 @@ directories = sys.argv[1:]
 for directory in directories:
     expected = torch.load(directory + ".pt", weights_only=True)
     model = AutoModelForSequenceClassification.from_pretrained(directory, trust_remote_code=True, attn_implementation="eager").eval()
-    processor = AutoProcessor.from_pretrained(directory, trust_remote_code=True)
-    batch = processor.process_queries_documents_crossencoder([
-        {"question": "What is shown?", "doc_text": "literal", "doc_image": ""},
-        {"question": "What is shown?", "doc_text": "Image doc", "doc_image": Image.new("RGB", (16, 16), (255, 0, 0))},
-    ])
+    processor = AutoProcessor.from_pretrained(directory, trust_remote_code=False)
+    batch = processor.apply_chat_template([
+        [{"role": "query", "content": [{"type": "text", "text": "What is [IMG] shown?"}]},
+         {"role": "document", "content": [{"type": "text", "text": "literal"}]}],
+        [{"role": "query", "content": [{"type": "text", "text": "What is [IMG] shown?"}]},
+         {"role": "document", "content": [{"type": "text", "text": "Image doc"},
+           {"type": "image", "image": Image.new("RGB", (16, 16), (255, 0, 0))}]}],
+        [{"role": "query", "content": [{"type": "text", "text": "What is [IMG] shown?"}]},
+         {"role": "document", "content": [{"type": "image", "image": Image.new("RGB", (16, 16), "blue")}]}],
+    ], tokenize=True, return_dict=True, return_tensors="pt", padding=True)
     inputs = {key: value for key, value in batch.items() if key != "labels"}
     assert set(inputs) == set(expected["inputs"])
     for key, value in inputs.items():
@@ -2188,13 +2223,14 @@ assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") fo
     from sentence_transformers import CrossEncoder
 
     pairs = [
-        ("What is shown?", "literal"),
-        ("What is shown?", {"text": "Image doc", "image": Image.new("RGB", (16, 16), (255, 0, 0))}),
+        ("What is [IMG] shown?", "literal"),
+        ("What is [IMG] shown?", {"text": "Image doc", "image": Image.new("RGB", (16, 16), (255, 0, 0))}),
     ]
+    pairs.append(("What is [IMG] shown?", {"image": Image.new("RGB", (16, 16), "blue")}))
     for export_dir in export_dirs:
         expected = torch.load(export_dir.with_suffix(".pt"), weights_only=True)
         cross_encoder = CrossEncoder(
-            str(export_dir), trust_remote_code=True, device="cpu", model_kwargs={"attn_implementation": "eager"}
+            str(export_dir), trust_remote_code=False, device="cpu", model_kwargs={"attn_implementation": "eager"}
         )
         assert isinstance(cross_encoder.activation_fn, torch.nn.Identity)
         assert cross_encoder[0].processing_kwargs == {}
@@ -2303,3 +2339,155 @@ def test_mistral3_reranker_uses_tokenizer_limit_for_default_inference(
     restored.tokenizer.model_max_length = 96
     overridden = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt")
     assert overridden["input_ids"].shape[1] == 96
+
+
+def test_mistral3_reranker_checkpointer_preserves_trained_head_dtype(tmp_path):
+    """Consolidation uses this step's head, not source Dense weights or source BF16 rounding."""
+    from safetensors.torch import load_file, save_file
+
+    from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
+
+    pixtral_processor = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+    )
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.num_labels = 1
+    config.temperature = 0.05
+    encoder = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config)).eval()
+    source = tmp_path / "source"
+    source.mkdir()
+    source_state = {k: v.to(torch.bfloat16) for k, v in encoder.state_dict_adapter.to_hf(encoder.state_dict()).items()}
+    save_file(source_state, source / "model.safetensors")
+    (source / "2_Dense").mkdir()
+    save_file({"linear.weight": torch.zeros_like(encoder.model.score.weight)}, source / "2_Dense/model.safetensors")
+    with torch.no_grad():
+        encoder.model.score.weight.add_(0.012345)
+    expected_head = encoder.model.score.weight.detach().clone()
+    checkpointer = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_repo_id=str(source),
+        save_consolidated=True,
+        is_peft=False,
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+    try:
+        checkpointer.save_model(encoder, str(tmp_path / "step"), tokenizer=pixtral_processor)
+    finally:
+        checkpointer.close()
+    exported = tmp_path / "step/model/consolidated"
+    index = json.loads((exported / "model.safetensors.index.json").read_text())
+    head = load_file(exported / index["weight_map"]["language_model.score.weight"])["language_model.score.weight"]
+    assert head.dtype == torch.float32
+    torch.testing.assert_close(head, expected_head, rtol=0, atol=0)
+    dense = load_file(exported / "2_Dense/model.safetensors")["linear.weight"]
+    torch.testing.assert_close(dense, head / config.temperature, rtol=0, atol=0)
+    restored = CrossEncoderModel.build(str(exported), attn_implementation="eager").eval()
+    assert restored.effective_score_temperature == config.temperature
+    torch.testing.assert_close(restored.model.score.weight, expected_head, rtol=0, atol=0)
+
+
+def _reranker_sharded_export_worker(rank: int, init_file: str, output_dir: str) -> None:
+    """Both ranks gather a sharded score head, while only rank zero writes metadata."""
+    from datetime import timedelta
+
+    from safetensors.torch import load_file
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo", rank=rank, world_size=2, init_method=f"file://{init_file}", timeout=timedelta(seconds=30)
+    )
+    try:
+        config = _tiny_mistral3_bidirectional_vlm_config()
+        config.num_labels = 1
+        config.temperature = 0.05
+        encoder = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config))
+        head = torch.arange(config.text_config.hidden_size, dtype=torch.float32).reshape(1, -1) / 17
+        mesh = init_device_mesh("cpu", (2,))
+        encoder.model.score.weight = nn.Parameter(distribute_tensor(head, mesh, [Shard(1)]))
+        processor = Mistral3BiEncoderProcessor(
+            image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+            tokenizer=FakePixtralTokenizer(),
+            patch_size=4,
+        )
+        ConsolidatedHFAddon().pre_save(
+            model_state=SimpleNamespace(model=[encoder]),
+            hf_metadata_dir=output_dir,
+            fqn_to_file_index_mapping={},
+            original_model_path=None,
+            tokenizer=processor,
+        )
+        dense = load_file(Path(output_dir) / "2_Dense/model.safetensors")["linear.weight"]
+        torch.testing.assert_close(dense, head / config.temperature, rtol=0, atol=0)
+        torch.testing.assert_close(encoder.model.score.weight.full_tensor(), head, rtol=0, atol=0)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(30, reason="two spawned workers import Transformers and initialize a real Gloo group")
+def test_mistral3_reranker_sharded_head_export(tmp_path):
+    """A real two-rank DTensor export neither hangs nor writes only rank zero's local head shard."""
+    torch.multiprocessing.spawn(
+        _reranker_sharded_export_worker,
+        args=(str(tmp_path / "init"), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected"),
+    [
+        ({}, 1.0),
+        ({"temperature": 0.02}, 0.02),
+        ({"score_temperature": 0.05}, 0.05),
+        ({"temperature": 0.9, "score_temperature": 0.05}, 0.05),
+    ],
+)
+def test_mistral3_reranker_score_temperature_config(settings, expected):
+    """New scoring metadata takes precedence over generation temperature, while legacy configs still load."""
+    config = Mistral3BidirectionalConfig(**settings)
+    assert config.temperature == expected
+
+
+def test_mistral3_reranker_export_adapter_roundtrip():
+    """Wrapper and backbone conversions preserve every tensor and expose one unscaled scoring head."""
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.num_labels = 1
+    encoder = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config))
+    native = encoder.state_dict()
+    adapter = encoder.state_dict_adapter
+    exported = adapter.to_hf(native)
+    assert "score.weight" not in exported
+    assert "language_model.score.weight" in exported
+    assert len(exported) == len(native)
+    restored = adapter.from_hf(exported)
+    assert restored.keys() == native.keys()
+    for key in native:
+        assert restored[key] is native[key]
+    assert dict(adapter.convert_single_tensor_to_hf("model.score.weight", native["model.score.weight"])) == {
+        "language_model.score.weight": native["model.score.weight"]
+    }
+    assert adapter.forced_hf_dtype_mapping(exported) == {"language_model.score.weight": "F32"}
+    legacy = dict(exported)
+    legacy["score.weight"] = legacy.pop("language_model.score.weight")
+    assert adapter.from_hf(legacy)["model.score.weight"] is native["model.score.weight"]
+
+
+def test_mistral3_reranker_export_rejects_non_mean_pooling(tmp_path):
+    """Fail before writing a module chain whose pooling does not match the trained scorer."""
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.pooling = "cls"
+    encoder = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config))
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+    )
+    with pytest.raises(ValueError, match="requires mean pooling"):
+        encoder.save_pretrained(str(tmp_path), tokenizer=processor)
+    assert not list(tmp_path.iterdir())
