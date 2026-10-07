@@ -680,35 +680,67 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         seq_len: int,
         dtype: torch.dtype,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Return analytical (inputs_meta, outputs_meta) for a PP stage.
+        """Return analytical metadata for this stage's model-owned dtypes.
 
-        Inter-stage tensors are plain ``[B, S, H]`` (no HC stream). With MTP
-        enabled, every transfer carries ``1 + D`` tensors so the variadic
-        forward signature is exercised on every microbatch.
+        Args:
+            is_first: Whether this stage receives token IDs.
+            microbatch_size: Number of sequences per microbatch.
+            seq_len: Number of tokens per sequence.
+            dtype: Embedding and projection compute dtype.
+
+        Returns:
+            Input and output metadata tuples. Token IDs have shape
+            ``[batch, sequence]`` and dtype int64. Hidden states have shape
+            ``[batch, sequence, hidden]`` and preserve FP32 residuals when
+            configured. MTP carries have the same shape, but remain in the
+            embedding dtype until the final stage computes the MTP states.
+            Logits have shape ``[batch, sequence, vocab]``. The final MTP
+            stage also emits int32 document IDs of shape ``[batch, sequence]``.
         """
+        from torch.distributed.fsdp import FSDPModule
+
         hidden_shape = (microbatch_size, seq_len, self.config.hidden_size)
         mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+        hidden_dtype = torch.float32 if self.config.residual_in_fp32 else dtype
+        # Explicit FSDP output casts still take precedence over the model's
+        # residual dtype. The default policy now preserves module outputs.
+        last_layer = next(reversed(self.model.layers.values()), None)
+        if isinstance(last_layer, FSDPModule):
+            hidden_dtype = last_layer._get_fsdp_state()._mp_policy.output_dtype or hidden_dtype
+        output_dtype = self._get_fsdp_state()._mp_policy.output_dtype if isinstance(self, FSDPModule) else None
+        hidden_dtype = output_dtype or hidden_dtype
+        carry_dtype = output_dtype or dtype
 
         def meta(shape: tuple[int, ...], d: torch.dtype = dtype) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=d)
 
-        def append_mtp(primary: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        def append_mtp(primary: torch.Tensor, mtp_dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+            """Append MTP tensors of shape [batch, sequence, hidden] to primary.
+
+            Args:
+                primary: Hidden states [batch, sequence, hidden] or logits
+                    [batch, sequence, vocab].
+                mtp_dtype: Dtype of the appended MTP tensors.
+
+            Returns:
+                Primary followed by one [batch, sequence, hidden] tensor per depth.
+            """
             if mtp_depth == 0:
                 return (primary,)
-            return (primary, *(meta(hidden_shape) for _ in range(mtp_depth)))
+            return (primary, *(meta(hidden_shape, d=mtp_dtype) for _ in range(mtp_depth)))
 
         if is_first:
             inputs_meta: tuple[torch.Tensor, ...] = (
                 torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),
             )
         else:
-            inputs_meta = append_mtp(meta(hidden_shape))
+            inputs_meta = append_mtp(meta(hidden_shape, d=hidden_dtype), carry_dtype)
 
         if self.lm_head is not None:
-            primary_out = meta((microbatch_size, seq_len, self.config.vocab_size))
+            primary_out = meta((microbatch_size, seq_len, self.config.vocab_size), d=output_dtype or dtype)
         else:
-            primary_out = meta(hidden_shape)
-        outputs_meta = append_mtp(primary_out)
+            primary_out = meta(hidden_shape, d=hidden_dtype)
+        outputs_meta = append_mtp(primary_out, hidden_dtype if self.lm_head is not None else carry_dtype)
         # Last stage appends an int32 [B, S] seq_idx so the loss fn can mask
         # MTP label rolls across sub-seq boundaries — bonded to its microbatch
         # via the PP output-tuple contract (schedule-agnostic).
