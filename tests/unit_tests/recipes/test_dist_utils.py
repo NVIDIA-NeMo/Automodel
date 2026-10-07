@@ -19,6 +19,7 @@ Typed validation tests live in ``tests/unit_tests/distributed/test_mesh.py``.
 
 import pytest
 import torch
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.config import (
@@ -84,6 +85,45 @@ class TestParsing:
     def test_default_strategy_is_fsdp2(self):
         result = parse_distributed_section({})
         assert isinstance(result["strategy_config"], FSDP2Config)
+
+    @pytest.mark.parametrize("path", ["strategy", "strategy_target", "moe_target"])
+    @pytest.mark.parametrize("cast_forward_inputs", [None, False, True])
+    @pytest.mark.parametrize("output_dtype", ["omitted", None, "bfloat16", "float32"])
+    def test_mp_policy_cast_defaults_and_overrides(self, path, cast_forward_inputs, output_dtype):
+        policy_kwargs = {"param_dtype": "bfloat16", "reduce_dtype": "float32"}
+        if output_dtype != "omitted":
+            policy_kwargs["output_dtype"] = output_dtype
+        if path != "strategy":
+            policy_kwargs["_target_"] = MixedPrecisionPolicy
+        if cast_forward_inputs is not None:
+            policy_kwargs["cast_forward_inputs"] = cast_forward_inputs
+        cfg = (
+            {"ep_size": 2, "moe": {"mp_policy": policy_kwargs}}
+            if path == "moe_target"
+            else {"mp_policy": policy_kwargs}
+        )
+        result = parse_distributed_section(cfg)
+        config = result["moe_parallel_config" if path == "moe_target" else "strategy_config"]
+        assert config.mp_policy.cast_forward_inputs is (False if cast_forward_inputs is None else cast_forward_inputs)
+        assert config.mp_policy.param_dtype is torch.bfloat16
+        assert config.mp_policy.reduce_dtype is torch.float32
+        expected_output_dtype = {"omitted": None, None: None, "bfloat16": torch.bfloat16, "float32": torch.float32}
+        assert config.mp_policy.output_dtype is expected_output_dtype[output_dtype]
+
+    @pytest.mark.parametrize("moe", [False, True])
+    def test_mp_policy_custom_factory_and_object_are_preserved(self, moe):
+        policy = MixedPrecisionPolicy(param_dtype=torch.float16, output_dtype=torch.float32, cast_forward_inputs=True)
+
+        def factory(param_dtype: torch.dtype) -> MixedPrecisionPolicy:
+            assert param_dtype is torch.float16
+            return policy
+
+        for value in (policy, {"_target_": factory, "param_dtype": "float16"}):
+            cfg = {"ep_size": 2, "moe": {"mp_policy": value}} if moe else {"mp_policy": value}
+            result = parse_distributed_section(cfg)
+            assert result["moe_parallel_config" if moe else "strategy_config"].mp_policy is policy
+            assert policy.cast_forward_inputs is True
+            assert policy.output_dtype is torch.float32
 
     @pytest.mark.parametrize("strategy", ["megatron_fsdp", "megatron-fsdp", "mfsdp"])
     def test_megatron_fsdp_names(self, strategy):
@@ -252,9 +292,10 @@ class TestPipeline:
         assert result["pp_enabled"] is False
         assert "pipeline parallelism is disabled" in caplog.text
 
-    def test_pipeline_dtype_defaults_to_mp_policy_output_dtype(self):
-        """Unset pipeline.dtype is derived from the FSDP mp_policy output dtype (bf16 default)."""
+    def test_pipeline_dtype_defaults_to_param_dtype_when_output_is_preserved(self):
+        """Without an output cast, ordinary BF16 computation still uses BF16 pipeline buffers."""
         result = parse_distributed_section({"pp_size": 2, "pipeline": {}})
+        assert result["strategy_config"].mp_policy.output_dtype is None
         assert result["pipeline_config"].dtype == torch.bfloat16
 
     def test_pipeline_dtype_explicit_match_kept(self, caplog):
