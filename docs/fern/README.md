@@ -192,7 +192,7 @@ When the next GA cuts (e.g. `v0.6`):
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `fern-docs-ci.yml` | `push: pull-request/[0-9]+` (FW-CI mirror) | Dataset-card validation, MDX syntax validation, and `fern check` on PRs |
+| `fern-docs-ci.yml` | `push: pull-request/[0-9]+` (FW-CI mirror) | Dataset-card validation, preview-navigation tests, MDX syntax validation, and `fern check` on PRs |
 | `fern-docs-preview.yml` | `push: pull-request/[0-9]+` (approved mirror) | Stage docs with trusted tooling, publish a preview and update the comment |
 | `publish-fern-docs.yml` | push to `main` (`docs/**`), `docs/v*` tag, or manual | Publish to docs.nvidia.com/nemo/automodel |
 

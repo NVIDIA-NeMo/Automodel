@@ -27,7 +27,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/fern-docs-preview.yml").read_text())
 STAGE = next(
-    step["run"] for step in WORKFLOW["jobs"]["preview"]["steps"] if step["name"] == "Stage validated Data navigation"
+    step["run"]
+    for step in WORKFLOW["jobs"]["preview"]["steps"]
+    if step.get("name") == "Stage validated Data navigation"
 )
 SCRIPT = STAGE.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
 

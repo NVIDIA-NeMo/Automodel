@@ -253,7 +253,7 @@ Approved upstream PR mirrors that change docs or preview inputs receive an autom
 
 | Workflow | Trigger | Behavior |
 |---|---|---|
-| `fern-docs-ci.yml` | Push to `pull-request/[0-9]+` | Restore archives, validate dataset cards and MDX syntax, run `fern check` |
+| `fern-docs-ci.yml` | Push to `pull-request/[0-9]+` | Restore archives, validate dataset cards, test preview navigation, validate MDX syntax, run `fern check` |
 | `fern-docs-preview.yml` | Push to an approved `pull-request/[0-9]+` mirror with docs or preview changes | Restore archives, stage PR pages with trusted configuration and tooling from `main`, publish the preview, and update its comment |
 | `publish-fern-docs.yml` | Push to `main` affecting docs inputs, `docs/v*` tag, or manual dispatch | Restore archives and publish to `docs.nvidia.com/nemo/automodel` |
 
