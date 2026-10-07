@@ -193,8 +193,12 @@ def _run_case(
         # reference independently from their unpartitioned models.
         for param in reference.parameters():
             assert param.grad is not None
-            dist.all_reduce(param.grad, group=mesh["dp"].get_group())
-            param.grad.div_(mesh["dp"].size())
+            # FSDP's reduce_dtype is FP32 even though the stored parameters and
+            # gradients are BF16. Reducing the reference in BF16 introduces
+            # extra intermediate rounding when there are more than two ranks.
+            reduced_grad = param.grad.float()
+            dist.all_reduce(reduced_grad, group=mesh["dp"].get_group())
+            param.grad.copy_(reduced_grad / mesh["dp"].size())
         checked = 0
         for name, param in part.named_parameters():
             name = name.replace("_checkpoint_wrapped_module.", "")
