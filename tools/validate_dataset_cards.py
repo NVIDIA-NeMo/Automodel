@@ -288,7 +288,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:
         errors = validate(args.repo_root)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError) as exc:
         errors = [f"invalid dataset catalog: {exc}"]
     if errors:
         for error in errors:

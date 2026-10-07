@@ -202,6 +202,8 @@ Approved upstream PR mirrors that change docs or preview inputs get a preview UR
 
 Preview configuration, components, tooling, and navigation outside the Data section come from `main`; PR page content overlays that trusted tree. The preview imports the PR's Data navigation after validating its fields and local page paths, so new dataset cards appear under **Data → Dataset Catalog**. Newer main-only pages remain available, while explicit PR page deletions are applied relative to the merge base. Deleting a page still referenced by trusted navigation outside Data can fail the build until that navigation is updated on `main`. Archived v0.4/v0.5 pages come from `docs-archive`.
 
+Data navigation uses a restricted subset of Fern fields and ASCII text; titles containing `&` or `:` are rejected. Follow the [Data preview navigation rules](../templates/dataset-card-guide.md#data-preview-navigation) and run `make docs-preview-navigation` before committing navigation changes.
+
 The preview workflow pins Fern 5.139.0, sets `FERN_NO_VERSION_REDIRECTION=true`, and verifies the exact expected preview host before commenting. It does not execute PR package scripts or make authenticated page-link requests.
 
 ## Commits

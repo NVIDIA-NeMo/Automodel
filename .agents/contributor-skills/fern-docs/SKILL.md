@@ -259,6 +259,8 @@ Approved upstream PR mirrors that change docs or preview inputs receive an autom
 
 The preview and production publication steps use the `DOCS_FERN_TOKEN` organization secret. The preview validates and imports the PR's Data navigation, including dataset cards. Navigation outside Data comes from `main`, so PR-only changes to other sections may not appear in the automatic preview. Use the local preview to inspect those navigation changes.
 
+Data navigation accepts a restricted subset of Fern fields and ASCII text; titles containing `&` or `:` fail validation. Follow the [Data preview navigation rules](../../../docs/templates/dataset-card-guide.md#data-preview-navigation) and run `make -C docs/fern docs-preview-navigation` when editing this section.
+
 ## Cut a New Version Train
 
 When NeMo AutoModel ships the next GA (for example, `v0.6`), run release commands from the repository root:
