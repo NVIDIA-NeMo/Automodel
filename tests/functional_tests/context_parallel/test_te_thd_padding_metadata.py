@@ -14,6 +14,8 @@
 
 """CUDA coverage of physical THD metadata and TE padding dispatch."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -85,3 +87,61 @@ def test_te_physical_boundaries_forward_backward(real_lengths: tuple[int, int], 
     for actual, expected in zip(inputs, reference_inputs):
         torch.testing.assert_close(actual.grad.double(), expected.grad, atol=2e-2, rtol=2e-2)
         assert torch.count_nonzero(actual.grad[~valid]) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("stage", ["full", "first", "middle", "last"])
+@pytest.mark.parametrize("supplied_flag", [False, True])
+def test_te_stage_resolves_padding_once_per_microbatch(stage: str, supplied_flag: bool) -> None:
+    """Share each pack's padding flag across real backbone and MTP attention."""
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+    from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_mtp import MockNemotronV3Config
+
+    pytest.importorskip("transformer_engine.pytorch")
+    config = MockNemotronV3Config(
+        hidden_size=128,
+        head_dim=32,
+        layers_block_type=["attention", "attention"],
+        num_nextn_predict_layers=1,
+        mtp_hybrid_override_pattern="*",
+    )
+    backend = BackendConfig(
+        linear="torch", attn="te", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
+    )
+    model = NemotronHForCausalLM(config, backend=backend).to(device="cuda", dtype=torch.bfloat16).train()
+    if stage in ("first", "middle"):
+        model.lm_head = None
+        model.model.norm = None
+        model.mtp = None
+    if stage in ("middle", "last"):
+        model.model.embed_tokens = None
+        inputs = (
+            torch.randn(1, 128, 128, device="cuda", dtype=torch.bfloat16),
+            torch.randn(1, 128, 128, device="cuda", dtype=torch.bfloat16),
+        )
+    else:
+        inputs = (torch.randint(1, 64, (1, 128), device="cuda"),)
+    positions = torch.arange(128, device="cuda").view(1, 128) % 64
+    physical = torch.tensor([[0, 64, 128, -1000]], device="cuda", dtype=torch.int32)
+    # Reuse a stage with alternating layouts to catch flags cached across packs.
+    for padded in (True, False, True):
+        real = torch.tensor([[0, 63, 126, -1000]], device="cuda", dtype=torch.int32) if padded else physical.clone()
+        metadata = dict(qkv_format="thd", cu_seqlens=real, cu_seqlens_padded=physical, max_seqlen=64)
+        if supplied_flag:
+            metadata["pad_between_seqs"] = padded
+        with (
+            patch("torch.equal", wraps=torch.equal) as equality,
+            patch(
+                "nemo_automodel.components.models.nemotron_v3.layers.preprocess_args_and_kwargs_for_attn",
+                wraps=preprocess_args_and_kwargs_for_attn,
+            ) as preparation,
+        ):
+            model(*inputs, position_ids=positions, **metadata)
+        # Both backbone layers and, on the final/full model, the MTP attention
+        # must receive the resolved boolean, avoiding the direct-call fallback.
+        assert preparation.call_count == (3 if stage in ("full", "last") else 2)
+        assert [call.kwargs.get("pad_between_seqs") for call in preparation.call_args_list] == [
+            padded
+        ] * preparation.call_count
+        assert equality.call_count == (0 if supplied_flag else 1)

@@ -169,7 +169,7 @@ def _all_to_all_hp2cp(
 
 def _reorder_chunks(
     input_: torch.Tensor,
-    order: list[int],
+    order: list[int] | torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reorder equal-sized chunks of a tensor according to *order*.
@@ -177,7 +177,9 @@ def _reorder_chunks(
     Args:
         input_: Tensor of shape [batch, sequence, hidden] (BSHD), or
             [tokens, hidden] (packed THD) when ``cu_seqlens`` is provided.
-        order: Permutation of equal-sized chunk indices.
+        order: Permutation of equal-sized chunk indices. For packed THD,
+            also accepts an integer tensor [num_chunks] on the input device
+            to avoid uploading a Python list on each call. BSHD uses a list.
         cu_seqlens: Integer tensor of shape [sequences + 1] containing the
             global padded THD boundaries, starting at zero and ending at
             ``tokens``. Each sequence length must be positive and divisible
@@ -196,7 +198,7 @@ def _reorder_chunks(
         starts = cu_seqlens[sequence_ids]
         chunk_sizes = (cu_seqlens[sequence_ids + 1] - starts) // num_chunks
         offsets = positions - starts
-        chunk_order = torch.tensor(order, device=input_.device)
+        chunk_order = torch.as_tensor(order, device=input_.device)
         source_positions = starts + chunk_order[offsets // chunk_sizes] * chunk_sizes + offsets % chunk_sizes
         # This is a permutation: each input row receives exactly one gradient
         # row. A single gather avoids a full-sized slice gradient per document.
@@ -300,9 +302,25 @@ def _undo_attention_load_balancing(
     cp_size: int,
     cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Reorder from DualChunkSwap to sequential for SSM processing."""
+    """Reorder from DualChunkSwap to sequential for SSM processing.
+
+    Args:
+        input_: Tensor [batch, sequence, hidden], or packed [tokens, hidden].
+        cp_size: Context-parallel world size.
+        cu_seqlens: Optional integer tensor [sequences + 1] of global padded
+            THD boundaries on CPU or the input device. Each document length
+            must be positive and divisible by ``2 * cp_size``.
+
+    Returns:
+        Tensor with the input shape, dtype, and device, in sequential order
+        within each document. Does not mutate or alias the input.
+    """
     num_chunks = 2 * cp_size
-    order = [2 * i for i in range(cp_size)] + [num_chunks - 1 - 2 * i for i in range(cp_size)]
+    if cu_seqlens is not None:
+        chunks = torch.arange(num_chunks, device=input_.device)
+        order = torch.where(chunks < cp_size, 2 * chunks, 2 * (num_chunks - chunks) - 1)
+    else:
+        order = [2 * i for i in range(cp_size)] + [num_chunks - 1 - 2 * i for i in range(cp_size)]
     return _reorder_chunks(input_, order, cu_seqlens)
 
 
@@ -314,11 +332,26 @@ def _redo_attention_load_balancing(
     """Reorder from sequential back to DualChunkSwap for attention.
 
     Inverse of :func:`_undo_attention_load_balancing`.
+
+    Args:
+        input_: Tensor [batch, sequence, hidden], or packed [tokens, hidden].
+        cp_size: Context-parallel world size.
+        cu_seqlens: Optional integer tensor [sequences + 1] of global padded
+            THD boundaries on CPU or the input device. Each document length
+            must be positive and divisible by ``2 * cp_size``.
+
+    Returns:
+        Tensor with the input shape, dtype, and device, in DualChunkSwap order
+        within each document. Does not mutate or alias the input.
     """
     num_chunks = 2 * cp_size
-    order = [None] * num_chunks
-    order[::2] = range(cp_size)
-    order[1::2] = reversed(range(cp_size, num_chunks))
+    if cu_seqlens is not None:
+        chunks = torch.arange(num_chunks, device=input_.device)
+        order = torch.where(chunks % 2 == 0, chunks // 2, num_chunks - 1 - chunks // 2)
+    else:
+        order = [None] * num_chunks
+        order[::2] = range(cp_size)
+        order[1::2] = reversed(range(cp_size, num_chunks))
     return _reorder_chunks(input_, order, cu_seqlens)
 
 

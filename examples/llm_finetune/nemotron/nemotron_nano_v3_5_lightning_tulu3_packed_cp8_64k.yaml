@@ -19,12 +19,12 @@
 # Document spans are padded to 2 * CP = 16 tokens for dual-chunk context parallelism.
 # The first 800 native packs provide 100 optimizer steps; weight checkpointing is disabled.
 #
-# Run from the repository root (with W&B authenticated):
+# Run from the repository root:
 #   OMP_NUM_THREADS=2 automodel \
 #     examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_tulu3_packed_cp8_64k.yaml \
 #     --nproc-per-node 8
+# W&B is disabled by default. After authenticating, add --wandb.enable true.
 # W&B uses your default entity; optionally add --wandb.entity <your_entity>.
-# Offline/local validation: add --wandb.enable false.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 step_scheduler:

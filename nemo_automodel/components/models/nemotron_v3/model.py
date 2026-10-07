@@ -877,6 +877,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             attention_mask = None
             causal_mask_mapping = None
 
+        # Non-first PP stages skip squeeze_input_for_thd. Resolve this once
+        # per microbatch here so backbone and MTP attention reuse the same flag.
+        if squeeze_for_thd and kwargs.get("cu_seqlens_padded") is not None and kwargs.get("pad_between_seqs") is None:
+            kwargs["pad_between_seqs"] = not torch.equal(kwargs["cu_seqlens_padded"], kwargs["cu_seqlens"])
+
         # MoE needs a padding_mask; derive from attention_mask when missing.
         if padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
             padding_mask = attention_mask.bool().logical_not()

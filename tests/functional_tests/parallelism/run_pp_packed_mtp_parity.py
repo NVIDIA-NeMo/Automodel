@@ -14,9 +14,9 @@
 
 """Packed Nemotron MTP: native PP2 against an unpartitioned reference.
 
-Run on two GPUs:
-    torchrun --standalone --nproc-per-node=2 run_pp_packed_mtp_parity.py
-    torchrun --standalone --nproc-per-node=2 run_pp_packed_mtp_parity.py --backend te
+Run from the repository root on two GPUs:
+    PYTHONPATH=. torchrun --standalone --nproc-per-node=2 tests/functional_tests/parallelism/run_pp_packed_mtp_parity.py
+    PYTHONPATH=. torchrun --standalone --nproc-per-node=2 tests/functional_tests/parallelism/run_pp_packed_mtp_parity.py --backend te
 
 SDPA uses FP32; TE uses BF16. Two microbatches have different physical document
 boundaries, internal padding, and rectangular boundary arrays with -1000 padding.

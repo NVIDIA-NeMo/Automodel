@@ -22,6 +22,7 @@ from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.distributed.context_parallel.mamba import (
     _deinterleave_packed_seqs,
+    _redo_attention_load_balancing,
     _reinterleave_packed_seqs,
     _undo_attention_load_balancing,
 )
@@ -129,3 +130,43 @@ def test_cuda_packed_checkpoint_gradient_parity(cp_size: int, chunk_lengths: lis
         output.backward(upstream)
         torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
         torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("redo", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_cuda_chunk_reorder_avoids_host_synchronization(cp_size: int, redo: bool, dtype: torch.dtype) -> None:
+    """GPU-resident metadata must not introduce pageable host-to-device copies."""
+    lengths = [1, 9, 2, 3]
+    balanced = [
+        (doc, chunk, token)
+        for doc, length in enumerate(lengths)
+        for rank in range(cp_size)
+        for chunk in (rank, 2 * cp_size - rank - 1)
+        for token in range(length)
+    ]
+    sequential = [
+        (doc, chunk, token)
+        for doc, length in enumerate(lengths)
+        for chunk in range(2 * cp_size)
+        for token in range(length)
+    ]
+    source, target = (sequential, balanced) if redo else (balanced, sequential)
+    lookup = {row: index for index, row in enumerate(source)}
+    order = torch.tensor([lookup[row] for row in target], device="cuda")
+    boundaries = torch.tensor([0, *itertools.accumulate(n * 2 * cp_size for n in lengths)], device="cuda")
+    value = torch.randn(len(source), 7, dtype=dtype, device="cuda", requires_grad=True)
+    reference = value.detach().clone().requires_grad_()
+    upstream = torch.randn_like(value)
+    expected = reference.index_select(0, order)
+    expected.backward(upstream)
+    operation = _redo_attention_load_balancing if redo else _undo_attention_load_balancing
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        actual = operation(value, cp_size, boundaries)
+        actual.backward(upstream)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(value.grad, reference.grad, rtol=0, atol=0)
