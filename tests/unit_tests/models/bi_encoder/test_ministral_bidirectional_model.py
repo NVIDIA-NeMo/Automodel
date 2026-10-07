@@ -795,9 +795,7 @@ def test_ministral3_old_template_reexport_matches_training(
         inference = exported(text=[rendered], padding=False, return_tensors="pt")
         torch.testing.assert_close(inference["input_ids"], batch["input_ids"])
         torch.testing.assert_close(inference["attention_mask"], batch["attention_mask"])
-    restored = Mistral3BiEncoderProcessor.from_pretrained(
-        tmp_path / "export", use_prompt_template=use_prompt_template
-    )
+    restored = Mistral3BiEncoderProcessor.from_pretrained(tmp_path / "export", use_prompt_template=use_prompt_template)
     assert restored.chat_template == processor.chat_template == exported.chat_template
 
 
@@ -1373,6 +1371,41 @@ def test_mistral3_vlm_causal_export_scopes_attention_policy_to_text_tower():
     assert "is_causal" not in serialized_config
     assert serialized_config["text_config"]["is_causal"] is True
     assert serialized_config["vision_config"].get("is_causal", False) is False
+
+
+@pytest.mark.parametrize("attention", ["eager", "sdpa"])
+def test_mistral3_pixtral_backport_preserves_non_flash_outputs(attention):
+    """The scoped backport preserves stock vision outputs and captured hidden states."""
+    from transformers import PixtralVisionModel
+
+    torch.manual_seed(42)
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config._attn_implementation = attention
+    model = Mistral3BidirectionalModel(config).eval()
+    stock = PixtralVisionModel(config.vision_config).eval()
+    stock.load_state_dict(model.vision_tower.state_dict())
+    pixels = torch.randn(2, 3, 16, 16)
+    sizes = torch.tensor([[16, 8], [8, 16]])
+    with torch.no_grad():
+        actual = model.vision_tower(pixels, image_sizes=sizes, output_hidden_states=True)
+        expected = stock(pixels, image_sizes=sizes, output_hidden_states=True)
+    torch.testing.assert_close(actual.last_hidden_state, expected.last_hidden_state, atol=0, rtol=0)
+    assert len(actual.hidden_states) == len(expected.hidden_states)
+    for actual_hidden, expected_hidden in zip(actual.hidden_states, expected.hidden_states):
+        torch.testing.assert_close(actual_hidden, expected_hidden, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("version", ["5.15.1", "5.17.0", "5.18.0", "5.19.1"])
+def test_mistral3_pixtral_backport_does_not_patch_other_versions_or_instances(monkeypatch, version):
+    """Other Transformers versions and independently constructed HF models stay native."""
+    import transformers
+    from transformers import PixtralVisionModel
+
+    monkeypatch.setattr(transformers, "__version__", version)
+    model = Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config())
+    assert (model.vision_tower.forward.__func__ is PixtralVisionModel.forward) == (version not in {"5.17.0", "5.18.0"})
+    stock = PixtralVisionModel(model.config.vision_config)
+    assert stock.forward.__func__ is PixtralVisionModel.forward
 
 
 @pytest.mark.parametrize("is_causal", [False, True])
@@ -2117,7 +2150,9 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
                 "doc_image": Image.new("RGB", (16, 16), (255, 0, 0)),
             },
         ]
-        features.append({"question": "What is [IMG] shown?", "doc_text": "", "doc_image": Image.new("RGB", (16, 16), "blue")})
+        features.append(
+            {"question": "What is [IMG] shown?", "doc_text": "", "doc_image": Image.new("RGB", (16, 16), "blue")}
+        )
         batch = processor.process_queries_documents_crossencoder(features)
         model_inputs = {key: value for key, value in batch.items() if key != "labels"}
         with torch.no_grad():
@@ -2158,9 +2193,7 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
         from safetensors.torch import load_file
 
         dense_weight = load_file(export_dir / "2_Dense/model.safetensors")["linear.weight"]
-        torch.testing.assert_close(
-            dense_weight, encoder.model.score.weight.float(), rtol=0, atol=0
-        )
+        torch.testing.assert_close(dense_weight, encoder.model.score.weight.float(), rtol=0, atol=0)
         saved_config = json.loads((export_dir / "config.json").read_text())
         assert saved_config["model_type"] == "mistral3"
         assert saved_config["text_config"]["model_type"] == "ministral3"
@@ -2521,6 +2554,7 @@ def test_mistral3_reranker_resume_head_layouts(tmp_path, storage_format, is_init
     """Strict checkpoint readers accept old heads without relaxing missing-key checks."""
     from safetensors.torch import save_file
     from torch.distributed.checkpoint.api import CheckpointException
+
     from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 
     config = _tiny_mistral3_bidirectional_vlm_config()
@@ -2553,8 +2587,11 @@ def test_mistral3_reranker_resume_head_layouts(tmp_path, storage_format, is_init
         torch.distributed.checkpoint.save(state, checkpoint_id=str(checkpoint))
     restored = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config)).eval()
     checkpointer = CheckpointingConfig(
-        enabled=True, checkpoint_dir=str(tmp_path), model_save_format=storage_format,
-        save_consolidated=False, is_peft=False,
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format=storage_format,
+        save_consolidated=False,
+        is_peft=False,
     ).build(dp_rank=0, tp_rank=0, pp_rank=0)
     resumed_optimizer = torch.optim.SGD(restored.parameters(), lr=0.001, momentum=0.9)
     try:
