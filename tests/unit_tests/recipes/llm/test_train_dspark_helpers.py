@@ -677,7 +677,7 @@ def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
         return "target-model"
 
     monkeypatch.setattr(
-        tb.DeepseekV4Config, "from_pretrained", staticmethod(lambda *a, **k: SimpleNamespace(num_hidden_layers=43))
+        tb.NeMoAutoConfig, "from_pretrained", staticmethod(lambda *a, **k: SimpleNamespace(num_hidden_layers=43))
     )
     monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
     monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")

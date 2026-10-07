@@ -34,11 +34,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
-from transformers import AutoConfig, PretrainedConfig
 
+from nemo_automodel import NeMoAutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 
 logger = logging.getLogger(__name__)
@@ -205,12 +204,12 @@ def build_deepseek_v4_target(
             "with the expert-parallel / FSDP distributed path."
         )
     # Build the device_mesh + moe_mesh from the recipe's `distributed` block
-    # (strategy, ep_size, moe, ...). DeepseekV4Config.from_pretrained is used
-    # because the custom V4 model_type is not registered with stock AutoConfig.
+    # (strategy, ep_size, moe, ...). NeMoAutoConfig resolves the registered local
+    # config and retains the selected snapshot for the later weight load.
     distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
     # Pass name_or_path explicitly (as the V4 finetune recipe does) so from_config
     # resolves the base checkpoint to load and dequantize from.
-    target_config = DeepseekV4Config.from_pretrained(target_path, name_or_path=target_path, num_nextn_predict_layers=0)
+    target_config = NeMoAutoConfig.from_pretrained(target_path, name_or_path=target_path, num_nextn_predict_layers=0)
     # Diagnostic / CI knob: a full 43-layer V4-Flash target dequantizes to
     # ~63 GiB of experts per rank at ep_size=8 and does NOT fit on a single
     # 8x80GB node. Shrinking the layer count loads only the first N layers, so the
@@ -296,10 +295,12 @@ def build_glm_5_2_target(
             "GLM-5.2 DSpark target requires CUDA: the target is loaded "
             "with the expert-parallel / FSDP distributed path."
         )
-    target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+    target_config = NeMoAutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
     # The published config's head_dim=192 clobbers qk_rope_head_dim on load via the
     # HF attribute_map, breaking checkpoint shape validation (see the helper).
-    raw_config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
+    raw_config_dict, _ = NeMoAutoConfig.get_config_dict(
+        target_path, trust_remote_code=trust_remote_code, revision=target_config._commit_hash
+    )
     repair_glm_5_2_qk_rope_head_dim(target_config, raw_config_dict)
     n_reduced = resolve_reduced_target_layers(
         target_config.num_hidden_layers,
@@ -386,7 +387,7 @@ def build_kimi_k3_target(
             "Kimi K3 DSpark target requires CUDA: the target is loaded with the "
             "expert-parallel / FSDP distributed path."
         )
-    target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+    target_config = NeMoAutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
     text_config = getattr(target_config, "text_config", target_config)
     n_reduced = resolve_reduced_target_layers(
         text_config.num_hidden_layers,
@@ -411,6 +412,7 @@ def build_kimi_k3_target(
         }
     text_config.architectures = ["KimiK3ForCausalLM"]
     text_config.name_or_path = target_path
+    text_config._commit_hash = target_config._commit_hash
     distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
     target_model = NeMoAutoModelForCausalLM.from_config(
         config=text_config,

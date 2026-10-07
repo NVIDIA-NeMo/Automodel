@@ -24,7 +24,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import (
-    AutoConfig,
     AutoModel,
     AutoModelForSequenceClassification,
     FineGrainedFP8Config,
@@ -36,6 +35,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import ModelOutput, logging
 
+from nemo_automodel._transformers.auto_config import NeMoAutoConfig
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.sentence_transformer_export import (
     SentenceTransformerExportConfig,
@@ -471,11 +471,14 @@ def build_encoder_backbone(
     """
     config = loaded_config
     if config is None:
-        config = AutoConfig.from_pretrained(
+        config = NeMoAutoConfig.from_pretrained(
             model_name_or_path,
             trust_remote_code=trust_remote_code,
             **hf_kwargs,
         )
+    commit_hash = getattr(config, "_commit_hash", None)
+    if commit_hash is not None:
+        hf_kwargs["revision"] = commit_hash
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
@@ -513,6 +516,7 @@ def build_encoder_backbone(
             default=False if task == "embedding" else None,
         )
         _set_text_backbone_is_causal(backbone, effective_is_causal)
+        backbone.config._commit_hash = commit_hash
         return backbone
 
     backbone_model_class = _get_supported_backbone_class(model_type, task, config)
@@ -546,6 +550,7 @@ def build_encoder_backbone(
         default=False if task == "embedding" else None,
     )
     _set_text_backbone_is_causal(backbone, effective_is_causal)
+    backbone.config._commit_hash = commit_hash
     return backbone
 
 
@@ -768,17 +773,16 @@ class BiEncoderModel(nn.Module):
             raise ValueError("task must be specified when calling build()")
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
-        config = AutoConfig.from_pretrained(
+        config = NeMoAutoConfig.from_pretrained(
             model_name_or_path,
             trust_remote_code=trust_remote_code,
             **hf_kwargs,
         )
         is_causal = _resolve_is_causal(config, is_causal)
-        metadata_kwargs = dict(hf_kwargs)
         commit_hash = getattr(config, "_commit_hash", None)
         if commit_hash is not None:
-            metadata_kwargs["revision"] = commit_hash
-        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, metadata_kwargs)
+            hf_kwargs["revision"] = commit_hash
+        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, hf_kwargs)
         pooling, l2_normalize = _resolve_bi_encoder_options(
             config,
             saved_options,
