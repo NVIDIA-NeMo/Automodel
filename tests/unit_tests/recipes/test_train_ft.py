@@ -3342,6 +3342,7 @@ def test_recipe_profiles_model_and_loss_without_full_logits(tied):
     reference = LlamaForCausalLM(config)
     reference.load_state_dict(model.state_dict())
     recipe = SimpleNamespace(
+        _autocast_context=nullcontext,
         model_parts=[model],
         loss_fn=ChunkedCrossEntropy(8, compile=False),
         dist_env=SimpleNamespace(device=torch.device("cpu")),
@@ -3450,6 +3451,7 @@ def test_qwen35_hidden_state_request_in_recipe(monkeypatch, loss_kind):
     )
     reference = deepcopy(model)
     recipe = SimpleNamespace(
+        _autocast_context=nullcontext,
         model_parts=[model],
         loss_fn=ChunkedCrossEntropy(2, compile=False)
         if loss_kind == "chunked"
@@ -3543,6 +3545,7 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
     assert _maybe_downgrade_loss_fn(loss_fn, model, False) is loss_fn
 
     recipe = SimpleNamespace(
+        _autocast_context=nullcontext,
         model_parts=[model],
         loss_fn=loss_fn,
         dist_env=SimpleNamespace(device=torch.device("cpu")),
@@ -3973,3 +3976,88 @@ def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is
         torch.testing.assert_close(model.logits.grad, reference_logits.grad)
     else:
         assert model.logits.grad is None
+
+
+@pytest.mark.parametrize("pp_enabled", [False, True])
+@pytest.mark.parametrize("is_train", [False, True])
+@pytest.mark.parametrize("autocast_dtype", [None, torch.bfloat16])
+def test_configured_autocast_preserves_fp32_residuals(pp_enabled, is_train, autocast_dtype):
+    """Both recipe paths honor compute precision while retaining FP32 residuals."""
+    from copy import deepcopy
+
+    class ResidualModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(16, 8)
+            self.projection = nn.Linear(8, 8)
+            self.head = nn.Linear(8, 16)
+            self.supports = SimpleNamespace(mtp_enabled=False)
+            self.observed_dtypes = None
+
+        def forward(self, input_ids):
+            """Map int64 IDs [B, S] to logits [B, S, 16] through FP32 residuals."""
+            hidden = self.embedding(input_ids)
+            projected = self.projection(hidden)
+            residual = hidden + projected
+            logits = self.head(residual)
+            self.observed_dtypes = (projected.dtype, residual.dtype, logits.dtype)
+            return SimpleNamespace(logits=logits)
+
+    torch.manual_seed(17)
+    model = ResidualModel()
+    reference = deepcopy(model)
+    tokens = torch.tensor([[1, 2, 3, 4]])
+    labels = torch.tensor([[2, 3, 4, 5]])
+
+    class Schedule:
+        def step(self, input_ids, *, target, losses):
+            """Run real CE/backward on int64 IDs and labels [1, 4]."""
+            loss = torch.nn.functional.cross_entropy(model(input_ids).logits.float().flatten(0, 1), target.flatten())
+            losses.append(loss.detach())
+            loss.backward()
+
+        def eval(self, input_ids, *, target, losses):
+            """Append real forward CE for int64 IDs and labels [1, 4]."""
+            with torch.no_grad():
+                losses.append(
+                    torch.nn.functional.cross_entropy(model(input_ids).logits.float().flatten(0, 1), target.flatten())
+                )
+
+    recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.device_mesh = None
+    recipe.pp_enabled = pp_enabled
+    recipe.pp = SimpleNamespace(
+        pp_batch_size=1,
+        pp_microbatch_size=1,
+        update_seq_len=lambda seq_len: None,
+        info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=Schedule()),
+    )
+    recipe.tokenizer = None
+    recipe.te_fp8 = None
+    recipe.domain_mixture = None
+    recipe.model_parts = [model]
+    recipe.loss_fn = MaskedCrossEntropy()
+    recipe.distributed_config = SimpleNamespace(autocast_dtype=autocast_dtype, defer_fsdp_grad_sync=True)
+    recipe._get_cp_group_size = lambda: 1
+    recipe._get_dp_group_size = lambda **kwargs: 1
+    losses = []
+    recipe._forward_backward_step(
+        0,
+        {"input_ids": tokens, "labels": labels},
+        loss_buffer=losses,
+        num_label_tokens=4,
+        num_batches=1,
+        is_train=is_train,
+    )
+    compute_dtype = autocast_dtype or torch.float32
+    assert model.observed_dtypes == (compute_dtype, torch.float32, compute_dtype)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast_dtype is not None):
+        expected = torch.nn.functional.cross_entropy(reference(tokens).logits.float().flatten(0, 1), labels.flatten())
+    torch.testing.assert_close(losses[0], expected)
+    if is_train:
+        expected.backward()
+        for actual, ref in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, ref.grad)
+    else:
+        assert all(parameter.grad is None for parameter in model.parameters())

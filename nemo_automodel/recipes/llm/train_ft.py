@@ -1296,7 +1296,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
-            with train_ctx(), fp8_ctx:
+            with train_ctx(), self._autocast_context(), fp8_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -1360,7 +1360,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx, fp8_ctx:
+            with train_ctx(), sync_ctx, self._autocast_context(), fp8_ctx:
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
