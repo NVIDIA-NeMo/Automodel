@@ -581,11 +581,55 @@ jobs:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
           full-moe-matrix: ${{ github.event_name == 'schedule' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
-          is_unit_test: "false"
+          is-unit-test: "false"
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ matrix.test-data-path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
+
+  cicd-e2e-tests-multigpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - test-name: L2_Distributed_4GPU
+            runner: nemo-ci-aws-gpu-x4
+            gpu-count: 4
+          - test-name: L2_Distributed_8GPU
+            runner: nemo-ci-aws-gpu-x8
+            gpu-count: 8
+    needs: [pre-flight, cicd-unit-tests]
+    runs-on: ${{ matrix.runner }}
+    name: multigpu_${{ matrix.test-name }}
+    # These are member pools; preserve the ephemeral-runner boundary for external PRs.
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+      && needs.pre-flight.outputs.is_member == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+      - name: main
+        uses: ./.github/actions/test-template
+        with:
+          test-folder: parallelism_multigpu,moe_multigpu
+          gpu-count: ${{ matrix.gpu-count }}
+          timeout: 15
+          max-attempts: 1
+          PAT: ${{ steps.app-token.outputs.token }}
+          test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
+          runner: ${{ matrix.runner }}
 
   cicd-e2e-tests-gb200:
     strategy:
@@ -596,6 +640,14 @@ jobs:
           - test-name: L2_Attention
             test-folder: attention
             timeout: 20
+          # The plain GCP pool has no IMEX lease; run PP/FSDP/TP here and
+          # exercise NVLink-dependent HybridEP kernels on the AWS pools above.
+          - test-name: L2_Distributed_4GPU
+            test-folder: parallelism_multigpu
+            runner: nemo-ci-gcp-gpu-x4
+            gpu-count: 4
+            timeout: 10
+            max-attempts: 1
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
             timeout: 20
@@ -665,7 +717,9 @@ jobs:
           timeout: ${{ matrix.timeout }}
           full-moe-matrix: ${{ github.event_name == 'schedule' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           is-optional: ${{ matrix.is-optional || 'false' }}
-          is_unit_test: "false"
+          gpu-count: ${{ matrix.gpu-count || 2 }}
+          max-attempts: ${{ matrix.max-attempts || 3 }}
+          is-unit-test: "false"
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry-gb200 }}/automodel:${{ github.sha }}
@@ -676,6 +730,7 @@ jobs:
       - pre-flight
       - cicd-unit-tests
       - cicd-e2e-tests
+      - cicd-e2e-tests-multigpu
       - cicd-e2e-tests-gb200
     if: |
       (
@@ -702,8 +757,10 @@ jobs:
         run: |
           if [[ "$IS_MEMBER" == "true" && "$DISABLE_GB200_TESTS" != "true" ]]; then
             FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
-          else
+          elif [[ "$IS_MEMBER" == "true" ]]; then
             FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | startswith("gb200_") | not))] | length') || echo 0
+          else
+            FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | test("^(gb200_|multigpu_)") | not))] | length') || echo 0
           fi
 
           if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then

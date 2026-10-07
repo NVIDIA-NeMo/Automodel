@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Check Nemotron PP dtypes, losses, gradients and updates on two or four GPUs.
+"""Check Nemotron PP dtypes, losses, gradients and updates on two to eight GPUs.
 
-Four GPUs compose PP2 with FSDP2. All models use four tiny attention/MLP blocks;
+Compose PP2 or PP4 with FSDP over the remaining ranks. All models use four tiny attention/MLP blocks;
 no pretrained weights, dataset downloads or Mamba kernels are needed.
 """
 
@@ -120,6 +120,7 @@ def _run_case(
 ) -> None:
     reference = _model(device, fp32_residual=fp32_residual, mtp_depth=mtp_depth)
     candidate = deepcopy(reference)
+    batch_size = mesh["pp"].size()
     pp = AutoPipeline(
         world_mesh=mesh,
         moe_mesh=None,
@@ -127,7 +128,7 @@ def _run_case(
         dp_axis_names=("dp",),
         pp_schedule="1f1b",
         pp_microbatch_size=1,
-        pp_batch_size=2,
+        pp_batch_size=batch_size,
         device=device,
         dtype=torch.bfloat16,
         pp_seq_len=16,
@@ -135,11 +136,40 @@ def _run_case(
         patch_causal_lm_model=False,
     ).build(candidate, loss_fn=_loss, parallelize_fn=partial(_shard, activation_checkpointing=checkpointing))
     part = pp.parts[0]
+    hidden_dtype = torch.float32 if fp32_residual else torch.bfloat16
+
+    def check_output_dtypes(
+        module: torch.nn.Module, inputs: tuple[torch.Tensor, ...], output: torch.Tensor | tuple[torch.Tensor, ...]
+    ) -> None:
+        """Check actual wire dtypes, including each tensor of a mixed MTP payload.
+
+        Args:
+            module: Pipeline stage whose forward just completed.
+            inputs: Int64 token IDs [batch, sequence] or hidden states and
+                optional MTP embeddings [batch, sequence, hidden].
+            output: Hidden states [batch, sequence, hidden] or final-stage
+                logits [batch, sequence, vocab], followed for MTP by carries
+                [batch, sequence, hidden] and final int32 IDs [batch, sequence].
+        """
+        del module, inputs
+        outputs = output if isinstance(output, tuple) else (output,)
+        if pp.info.has_last_stage:
+            expected = (torch.bfloat16,) + (hidden_dtype,) * mtp_depth + ((torch.int32,) if mtp_depth else ())
+        else:
+            expected = (hidden_dtype,) + (torch.bfloat16,) * mtp_depth
+        assert tuple(t.dtype for t in outputs) == expected
+
+    part.register_forward_hook(check_output_dtypes)
     optimizer = torch.optim.SGD(part.parameters(), lr=0.01)
     ref_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
     ref_params = dict(reference.named_parameters())
     for seq_len in (16, 24):
-        tokens = (torch.arange(2 * seq_len, device=device).reshape(2, seq_len) + 3) % 64
+        # Distinct DP batches make a missing/incorrect gradient reduction observable.
+        tokens = (
+            torch.arange(batch_size * seq_len, device=device).reshape(batch_size, seq_len)
+            + 3
+            + 7 * mesh["dp"].get_local_rank()
+        ) % 64
         labels = (tokens + 1) % 64
         optimizer.zero_grad(set_to_none=True)
         ref_optimizer.zero_grad(set_to_none=True)
@@ -159,6 +189,12 @@ def _run_case(
                 reference_loss += loss.detach()
         if pp.info.has_last_stage:
             torch.testing.assert_close(torch.stack(losses).sum(), reference_loss, rtol=1e-6, atol=1e-5)
+        # FSDP averages across DP replicas; construct the same global-batch
+        # reference independently from their unpartitioned models.
+        for param in reference.parameters():
+            assert param.grad is not None
+            dist.all_reduce(param.grad, group=mesh["dp"].get_group())
+            param.grad.div_(mesh["dp"].size())
         checked = 0
         for name, param in part.named_parameters():
             name = name.replace("_checkpoint_wrapped_module.", "")
@@ -174,7 +210,7 @@ def _run_case(
             name = name.replace("_checkpoint_wrapped_module.", "")
             torch.testing.assert_close(_full(param), _full(ref_params[name]), rtol=0.02, atol=0.002, msg=name)
         print(
-            f"PASS rank={dist.get_rank()} pp=2 dp={mesh['dp'].size()} fp32_residual={fp32_residual} "
+            f"PASS rank={dist.get_rank()} pp={mesh['pp'].size()} dp={mesh['dp'].size()} fp32_residual={fp32_residual} "
             f"checkpointing={checkpointing} mtp_depth={mtp_depth} seq_len={seq_len} parameters={checked} "
             f"loss={reference_loss.item():.8f}",
             flush=True,
@@ -186,14 +222,15 @@ def main() -> None:
     """Run the smallest real PP/FSDP precision regression matrix."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--fp32-residual-only", action="store_true")
+    parser.add_argument("--pp-size", type=int, choices=(2, 4), default=2)
     args = parser.parse_args()
     dist.init_process_group("nccl", timeout=timedelta(seconds=90))
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     world = dist.get_world_size()
-    if world not in (2, 4):
-        raise ValueError("Run with two GPUs (PP2) or four GPUs (PP2 x FSDP2)")
-    mesh = init_device_mesh("cuda", (2, world // 2), mesh_dim_names=("pp", "dp"))
+    if world not in (2, 4, 8) or world % args.pp_size:
+        raise ValueError("Run with two, four or eight GPUs, divisible by --pp-size")
+    mesh = init_device_mesh("cuda", (args.pp_size, world // args.pp_size), mesh_dim_names=("pp", "dp"))
     for fp32_residual in (True,) if args.fp32_residual_only else (False, True):
         for checkpointing in (False, True):
             for mtp_depth in (0, 1):
