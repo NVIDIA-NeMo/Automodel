@@ -122,7 +122,8 @@ def test_selected_keys_match_transformers_indexer(indexer):
     cos = torch.cat([angles.cos(), angles.cos()], dim=-1)  # HF rotate_half convention: [B, S, ROPE_DIM]
     sin = torch.cat([angles.sin(), angles.sin()], dim=-1)
     position_ids = torch.arange(SEQ).expand(BATCH, -1)
-    expected = hf_indexer(x, q_resid, (cos, sin), attention_mask=None, position_ids=position_ids)
+    # Transformers 5.18 requires an explicit indexer mask, broadcastable to [B, S, T].
+    expected = hf_indexer(x, q_resid, (cos, sin), attention_mask=causal[None], position_ids=position_ids)
 
     actual = indexer(x, q_resid, freqs_cis, attention_mask=causal[None, None])
     torch.testing.assert_close(_late_sets(actual), _late_sets(expected.long()))
