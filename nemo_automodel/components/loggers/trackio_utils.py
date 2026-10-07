@@ -28,6 +28,33 @@ logger = logging.getLogger(__name__)
 RESERVED_KEYS = frozenset({"project", "run", "timestamp", "step", "time", "metrics"})
 
 
+def to_json_config(value: Any) -> Any:
+    """Convert a recipe config to plain JSON values for ``trackio.init(config=...)``.
+
+    Resolved ``_target_`` entries hold classes and functions, which Trackio's own serializer cannot handle
+    (it calls ``obj.to_dict()`` on anything that has one, which fails for a class). Mappings and sequences are
+    converted recursively, classes and functions become their dotted import path and any other object its string
+    form.
+
+    Args:
+        value: A config value: mapping, sequence, scalar or arbitrary object.
+
+    Returns:
+        The value built from dicts, lists, strings, numbers, booleans and ``None`` only.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): to_json_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [to_json_config(v) for v in value]
+    if isinstance(value, type) or callable(value):
+        module, name = getattr(value, "__module__", None), getattr(value, "__qualname__", None)
+        if module and name:
+            return f"{module}.{name}"
+    return str(value)
+
+
 class TrackioLogger:
     """Log training metrics to a Trackio run.
 

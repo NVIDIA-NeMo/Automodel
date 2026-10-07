@@ -115,6 +115,21 @@ class TestTrackioConfig:
         assert isinstance(logger, TrackioLogger) and logger.run == "run"
         assert captured == {"project": "p", "name": "run-1", "group": "g", "resume": "allow", "config": {"lr": 1e-3}}
 
+    def test_build_passes_a_json_safe_run_config(self, monkeypatch):
+        """Resolved ``_target_`` classes would break Trackio's serializer; they are logged by import path."""
+        import json
+
+        captured = {}
+        _fake_trackio(monkeypatch, captured)
+
+        TrackioConfig().build(run_config={"peft": {"_target_": TrackioConfig, "dim": 16}, "tags": ("a", "b")})
+
+        assert captured["config"] == {
+            "peft": {"_target_": "nemo_automodel.components.loggers.loggers.TrackioConfig", "dim": 16},
+            "tags": ["a", "b"],
+        }
+        json.dumps(captured["config"])
+
     def test_build_derives_the_run_name_from_the_model(self, monkeypatch):
         captured = {}
         _fake_trackio(monkeypatch, captured)
