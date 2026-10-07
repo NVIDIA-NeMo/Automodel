@@ -25,6 +25,7 @@ from torch.distributed.tensor import DTensor
 from transformers import PixtralProcessor
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.shared.tokenizer_serialization import restore_source_tokenizer_serialization_state
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -34,6 +35,11 @@ if TYPE_CHECKING:
 
 class Mistral3RerankerStateDictAdapter(StateDictAdapter):
     """Preserve backbone weights and expose the head at the native vLLM classifier path."""
+
+    @property
+    def checkpoint_key_aliases(self) -> dict[str, str]:
+        """Map the current head name to the name used by older training checkpoints."""
+        return {"language_model.score.weight": "score.weight"}
 
     def to_hf(self, state_dict: dict[str, torch.Tensor], **kwargs: Any) -> dict[str, torch.Tensor]:
         """Rename the native scoring head without changing tensor values.
@@ -60,7 +66,11 @@ class Mistral3RerankerStateDictAdapter(StateDictAdapter):
         Returns:
             Native names mapped to the same tensors, preserving device, dtype and distributed placements.
         """
-        return {"score.weight" if k == "language_model.score.weight" else k: v for k, v in hf_state_dict.items()}
+        return {
+            "score.weight" if k == "language_model.score.weight" else k: v
+            for k, v in hf_state_dict.items()
+            if k != "score.weight" or "language_model.score.weight" not in hf_state_dict
+        }
 
     def forced_hf_dtype_mapping(self, state_dict: dict[str, torch.Tensor]) -> dict[str, str]:
         """Keep the trained head's dtype so its exported Dense copy describes the same weights.
@@ -94,7 +104,11 @@ class Mistral3RerankerStateDictAdapter(StateDictAdapter):
 
 
 class Mistral3RerankerMetadataExporter:
-    """Snapshot the trained head on every rank, then write portable metadata on the writer rank."""
+    """Snapshot the trained head on every rank, then write portable metadata on the writer rank.
+
+    Serialized head values are preserved, but consumers may cast them to the backbone dtype at load time.
+    Stock Sentence Transformers Dense scoring therefore need not be bitwise identical to FP32 projection.
+    """
 
     def __init__(self, model: "Mistral3VLBidirectionalForSequenceClassification") -> None:
         self.model = model
@@ -150,6 +164,7 @@ class Mistral3RerankerMetadataExporter:
         directory = Path(hf_metadata_dir)
         self.save_model_assets(directory)
         self.processor.save_pretrained(directory)
+        restore_source_tokenizer_serialization_state(original_model_path, str(directory), self.processor.tokenizer)
         forward = {"method": "forward", "method_output_name": "last_hidden_state"}
         configs = {
             "modules.json": [

@@ -2095,7 +2095,7 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
             tokenizer=tokenizer,
             patch_size=4,
             padding=True,
-            rerank_max_length=32,
+            rerank_max_length=40,
             use_prompt_template=True,
             export_as_stock_processor=False,
         )
@@ -2150,6 +2150,9 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
         tokenizer_config = json.loads((export_dir / "tokenizer_config.json").read_text())
         assert tokenizer_config["model_max_length"] == 64
         assert "max_length" not in tokenizer_config
+        serialized_tokenizer = json.loads((export_dir / "tokenizer.json").read_text())
+        assert serialized_tokenizer["truncation"] is None
+        assert serialized_tokenizer["padding"] is None
         assert (export_dir / "model.py").is_file()
         assert not (export_dir / "processor.py").exists()
         from safetensors.torch import load_file
@@ -2168,11 +2171,7 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
         assert saved_config["auto_map"] == {
             "AutoModelForSequenceClassification": "model.Mistral3ForSequenceClassification"
         }
-        from nemo_automodel import NeMoAutoModelCrossEncoder
-
-        restored = NeMoAutoModelCrossEncoder.from_pretrained(
-            str(export_dir), attn_implementation="eager", use_liger_kernel=False, use_sdpa_patching=False,
-        ).cpu().eval()
+        restored = CrossEncoderModel.build(str(export_dir), attn_implementation="eager").eval()
         assert restored.effective_score_temperature == 1.0
         torch.testing.assert_close(restored(**model_inputs).logits, expected, rtol=1e-5, atol=1e-7)
         torch.save(
@@ -2191,6 +2190,9 @@ for directory in directories:
     expected = torch.load(directory + ".pt", weights_only=True)
     model = AutoModelForSequenceClassification.from_pretrained(directory, trust_remote_code=True, attn_implementation="eager").eval()
     processor = AutoProcessor.from_pretrained(directory, trust_remote_code=False)
+    long_messages = [{"role": "query", "content": "What?"}, {"role": "document", "content": "literal " * 45}]
+    long_inputs = processor.apply_chat_template(long_messages, tokenize=True, return_dict=True, return_tensors="pt")
+    assert 40 < long_inputs["attention_mask"].sum().item() <= 64
     batch = processor.apply_chat_template([
         [{"role": "query", "content": [{"type": "text", "text": "What is [IMG] shown?"}]},
          {"role": "document", "content": [{"type": "text", "text": "literal"}]}],
@@ -2209,6 +2211,12 @@ for directory in directories:
         torch.testing.assert_close(value, expected["state"][key], rtol=0, atol=0)
     with torch.no_grad():
         torch.testing.assert_close(model(**inputs).logits, expected["logits"], rtol=1e-6, atol=1e-6)
+        tuple_output = model(**inputs, return_dict=False)
+        assert isinstance(tuple_output, tuple)
+        torch.testing.assert_close(tuple_output[0], expected["logits"], rtol=1e-6, atol=1e-6)
+        model.config.return_dict = False
+        assert isinstance(model(**inputs), tuple)
+        assert hasattr(model(**inputs, return_dict=True), "logits")
 assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") for name in sys.modules)
 """
     result = subprocess.run(
@@ -2238,6 +2246,8 @@ assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") fo
         )
         assert isinstance(cross_encoder.activation_fn, torch.nn.Identity)
         assert cross_encoder[0].processing_kwargs == {}
+        long_inputs = cross_encoder[0].preprocess([("What?", "literal " * 45)])
+        assert 40 < long_inputs["attention_mask"].sum().item() <= 64
         standard_inputs = cross_encoder[0].preprocess(pairs)
         for key, value in expected["inputs"].items():
             torch.testing.assert_close(standard_inputs[key], value, rtol=0, atol=0)
@@ -2495,3 +2505,96 @@ def test_mistral3_reranker_export_rejects_non_mean_pooling(tmp_path):
     with pytest.raises(ValueError, match="requires mean pooling"):
         encoder.save_pretrained(str(tmp_path), tokenizer=processor)
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("storage_format", "is_init_step", "head_layout"),
+    [
+        (storage_format, is_init_step, head_layout)
+        for storage_format, is_init_step in [("safetensors", False), ("safetensors", True), ("torch_save", False)]
+        for head_layout in ("legacy", "current", "both", "missing")
+        # Base initialization permits missing task heads; resume must remain strict.
+        if not (is_init_step and head_layout == "missing")
+    ],
+)
+def test_mistral3_reranker_resume_head_layouts(tmp_path, storage_format, is_init_step, head_layout):
+    """Strict checkpoint readers accept old heads without relaxing missing-key checks."""
+    from safetensors.torch import save_file
+    from torch.distributed.checkpoint.api import CheckpointException
+    from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
+
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.num_labels = 1
+    original = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config)).eval()
+    inputs = {
+        "input_ids": torch.tensor([[10, 10, 10, 10, 1, 2]]),
+        "attention_mask": torch.ones(1, 6),
+        "pixel_values": torch.randn(1, 3, 8, 8),
+        "image_sizes": torch.tensor([[8, 8]]),
+    }
+    optimizer = torch.optim.SGD(original.parameters(), lr=0.001, momentum=0.9)
+    original(**inputs).logits.sum().backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    state = original.state_dict_adapter.to_hf(original.state_dict())
+    expected_head = original.model.score.weight.detach().clone()
+    if head_layout == "legacy":
+        state["score.weight"] = state.pop("language_model.score.weight")
+    elif head_layout == "both":
+        # A current key must win over a stale legacy copy.
+        state["score.weight"] = torch.zeros_like(expected_head)
+    elif head_layout == "missing":
+        state.pop("language_model.score.weight")
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    if storage_format == "safetensors":
+        save_file(state, checkpoint / "model.safetensors")
+    else:
+        torch.distributed.checkpoint.save(state, checkpoint_id=str(checkpoint))
+    restored = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config)).eval()
+    checkpointer = CheckpointingConfig(
+        enabled=True, checkpoint_dir=str(tmp_path), model_save_format=storage_format,
+        save_consolidated=False, is_peft=False,
+    ).build(dp_rank=0, tp_rank=0, pp_rank=0)
+    resumed_optimizer = torch.optim.SGD(restored.parameters(), lr=0.001, momentum=0.9)
+    try:
+        if head_layout == "missing":
+            with pytest.raises(CheckpointException, match="Missing key"):
+                checkpointer.load_model(restored, str(checkpoint), is_init_step=is_init_step)
+            return
+        checkpointer.load_model(restored, str(checkpoint), is_init_step=is_init_step)
+        if not is_init_step:
+            checkpointer.save_optimizer(optimizer, original, str(tmp_path / "step"))
+            checkpointer.load_optimizer(resumed_optimizer, restored, str(tmp_path / "step"))
+    finally:
+        checkpointer.close()
+    for key, value in original.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
+    torch.testing.assert_close(restored(**inputs).logits, original(**inputs).logits, rtol=0, atol=0)
+    if not is_init_step:
+        # The next update must match uninterrupted training, including restored momentum.
+        for model, opt in ((original, optimizer), (restored, resumed_optimizer)):
+            model(**inputs).logits.sum().backward()
+            opt.step()
+        for key, value in original.state_dict().items():
+            torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_mistral3_reranker_finetune_from_head_layouts(tmp_path, legacy):
+    """Native fine-tuning initialization accepts both legacy and current HF heads."""
+    from safetensors.torch import load_file, save_file
+
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.num_labels = 1
+    original = Mistral3VLBidirectionalForSequenceClassification(config).eval()
+    original.save_pretrained(tmp_path)
+    if legacy:
+        state = load_file(tmp_path / "model.safetensors")
+        state["score.weight"] = state.pop("language_model.score.weight")
+        save_file(state, tmp_path / "model.safetensors", metadata={"format": "pt"})
+    restored = CrossEncoderModel.build(str(tmp_path), attn_implementation="eager").eval()
+    torch.testing.assert_close(restored.model.score.weight, original.score.weight, rtol=0, atol=0)
+    loss = restored(input_ids=torch.tensor([[1, 2, 3]]), attention_mask=torch.ones(1, 3)).logits.sum()
+    loss.backward()
+    assert torch.isfinite(restored.model.score.weight.grad).all()

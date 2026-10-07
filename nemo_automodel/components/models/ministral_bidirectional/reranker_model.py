@@ -22,6 +22,7 @@ from torch import nn
 from transformers import Mistral3Config, Mistral3Model
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.models.mistral3.modeling_mistral3 import Mistral3PreTrainedModel
+from transformers.utils import can_return_tuple
 
 
 class Mistral3ForSequenceClassification(Mistral3PreTrainedModel):
@@ -49,6 +50,7 @@ class Mistral3ForSequenceClassification(Mistral3PreTrainedModel):
         key_mapping.setdefault(r"^language_model\.score\.weight$", "score.weight")
         return super().from_pretrained(pretrained_model_name_or_path, *model_args, key_mapping=key_mapping, **kwargs)
 
+    @can_return_tuple
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -73,7 +75,6 @@ class Mistral3ForSequenceClassification(Mistral3PreTrainedModel):
         """
         if attention_mask is None:
             raise ValueError("attention_mask is required for sequence pooling.")
-        kwargs.pop("return_dict", None)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

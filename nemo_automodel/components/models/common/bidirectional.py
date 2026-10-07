@@ -80,6 +80,11 @@ class EncoderStateDictAdapter(StateDictAdapter):
             hf_state_dict = self.backbone_adapter.from_hf(hf_state_dict, device_mesh=device_mesh, **kwargs)
         return {self._add_model_prefix(key): value for key, value in hf_state_dict.items()}
 
+    @property
+    def checkpoint_key_aliases(self) -> dict[str, str]:
+        """Forward backbone aliases, which are already expressed in exported HF names."""
+        return self.backbone_adapter.checkpoint_key_aliases if self.backbone_adapter is not None else {}
+
     def forced_hf_dtype_mapping(self, state_dict: dict[str, torch.Tensor]) -> dict[str, str]:
         """Preserve backbone export dtype requirements through the encoder wrapper.
 
