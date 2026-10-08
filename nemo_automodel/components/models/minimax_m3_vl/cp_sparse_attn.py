@@ -78,6 +78,43 @@ def _get_compiled_flash_attention() -> Callable[..., torch.Tensor]:
     return _COMPILED_FLASH_ATTENTION
 
 
+def _block_sel_flat_offset(
+    batch_idx: torch.Tensor,
+    index_head: torch.Tensor,
+    query_idx: torch.Tensor,
+    kv_block: torch.Tensor,
+    num_index_heads: int,
+    query_length: int,
+    num_blocks: int,
+) -> torch.Tensor:
+    """Flat offset into a ``[B, num_index_heads, query_length, num_blocks]`` block-selection table, in int64.
+
+    FlexAttention inlines ``mask_mod`` into its Triton template and emits the inlined
+    index arithmetic in int32. A 4-D gather such as ``block_sel[b, h, q, kb]`` is
+    lowered to ``((b * H + h) * S + q) * NB + kb``, which wraps once the table has more
+    than ``2**31`` elements: with four index heads and 128-token blocks that is a single
+    sequence of 262,144 tokens. Just past the limit the wrapped address still lands in
+    mapped memory, so tail queries silently read a wrong selection before the failure
+    escalates to an illegal memory access. Widening the operands here keeps the
+    generated address arithmetic in int64 (same fix as the Qwen3.8 flex QSA mask).
+
+    Args:
+        batch_idx: Scalar batch coordinate of the table (after any head grouping).
+        index_head: Scalar index-head coordinate.
+        query_idx: Scalar local query coordinate, already clamped in range.
+        kv_block: Scalar key block coordinate (``kv_idx // block_size``), already clamped.
+        num_index_heads: Size of the table's index-head axis.
+        query_length: Size of the table's query axis.
+        num_blocks: Size of the table's key-block axis.
+
+    Returns:
+        int64 offset of ``[batch_idx, index_head, query_idx, kv_block]`` in the flattened table.
+    """
+    flat_head = batch_idx.to(torch.int64) * num_index_heads + index_head.to(torch.int64)
+    flat_query = flat_head * query_length + query_idx.to(torch.int64)
+    return flat_query * num_blocks + kv_block.to(torch.int64)
+
+
 class _AllGatherConcatFn(Function):
     """All-gather + concat with an autograd-safe backward.
 
@@ -587,6 +624,12 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         # optional pad-key and per-document (block-diagonal) terms when supplied. The
         # ``is not None`` checks are resolved at trace time, so the compiled mask only
         # includes the active terms.
+        # Looked up through a flat int64 offset rather than ``block_sel[b, h, q, kb]``:
+        # the inlined int32 index arithmetic wraps for long sequences. See
+        # _block_sel_flat_offset.
+        sel_heads, sel_queries, sel_blocks = block_sel.shape[1], block_sel.shape[2], block_sel.shape[3]
+        block_sel_flat = block_sel.reshape(-1)
+
         def cp_sparse_mask(b, h, q_idx, kv_idx):
             # Mask construction visits the padded tile boundary too. Clamp metadata
             # reads before masking so ragged lengths never index beyond their tensors.
@@ -598,7 +641,10 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
                 b = b // self.num_kv_heads
             else:
                 h_idx = h // rep
-            keep = (kv_idx <= q_positions[q_idx]) & block_sel[b, h_idx, q_idx, kv_idx // block_size]
+            sel_offset = _block_sel_flat_offset(
+                b, h_idx, q_idx, kv_idx // block_size, sel_heads, sel_queries, sel_blocks
+            )
+            keep = (kv_idx <= q_positions[q_idx]) & block_sel_flat[sel_offset]
             if key_valid is not None:
                 keep = keep & key_valid[b, kv_idx]
             if doc_global is not None:
