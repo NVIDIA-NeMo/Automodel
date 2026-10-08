@@ -32,6 +32,12 @@ Each combination is a separate pytest case. The four-layer model has width 64
 and vocabulary 64. PP4 exercises interior
 pipeline stages. BF16 projections and FP32 residuals coexist in the same run;
 the FP32 cases do not mean full-FP32 compute.
+These cases explicitly set `residual_in_fp32=True`; the released Nano, Super,
+and Ultra BF16 configurations set it to `False`. The block saves the residual
+before casting the normalization input to the norm weight's dtype. This keeps
+the compute branch in BF16 while retaining accumulated FP32 residual updates
+when requested. A two-block CPU regression also checks both flag values with
+autocast enabled and disabled, small residual updates, and residual gradients.
 Stage boundaries explicitly check FP32/BF16 residual and BF16 embedding
 dtypes. Final MTP states stay on the last stage and follow the unpartitioned
 model's dtype: CUDA autocast may promote their final Torch RMSNorm to FP32

@@ -736,7 +736,10 @@ class NemotronV3Block(nn.Module):
         """Forward pass through the block.
 
         Args:
-            hidden_states: Input tensor of shape (batch, seq_len, hidden_size)
+            hidden_states: Tensor of shape [batch, sequence, hidden] or packed
+                [tokens, hidden]. The residual retains its input dtype unless
+                ``residual_in_fp32`` promotes it to FP32; the compute branch
+                uses the norm weight dtype.
             attention_mask: Mask tensor - type depends on layer:
                 - For attention: 4D causal mask [batch, 1, seq_len, seq_len]
                 - For mamba: 2D padding mask [batch, seq_len]
@@ -747,13 +750,13 @@ class NemotronV3Block(nn.Module):
                 only (e.g. cu_seqlens, cp_size, cp_rank for Context Parallelism).
 
         Returns:
-            Output tensor of shape (batch, seq_len, hidden_size)
+            Tensor with the same shape as ``hidden_states``, after residual addition.
         """
         # Save residual
         residual = hidden_states
 
-        # Pre-norm
-        hidden_states = self.norm(hidden_states)
+        # Match the HF compute dtype without rounding the saved residual.
+        hidden_states = self.norm(hidden_states.to(dtype=self.norm.weight.dtype))
 
         # Optional fp32 residuals for numerical stability
         if self.residual_in_fp32:
