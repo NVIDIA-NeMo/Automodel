@@ -74,6 +74,11 @@ HybridEP provides both token dispatch and expert-output combine. Router
 correction biases remain fixed during fine-tuning through
 `gate_bias_update_factor: 0`.
 
+Set `model.backend.rope: triton` to run the rotary embedding of the attention,
+key/value and indexer projections through a fused Triton kernel (one launch for
+the forward and one for the backward); the default `torch` keeps the eager
+complex rotation, which stays the numerical reference.
+
 FSDP mixed precision must use `param_dtype: bfloat16`, `reduce_dtype: float32`,
 `output_dtype: null`, and `cast_forward_inputs: false`. Set
 `lm_head_precision: float32`. These settings preserve FP32 mHC coefficients
