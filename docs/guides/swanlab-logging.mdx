@@ -1,0 +1,77 @@
+---
+title: "SwanLab Logging in NeMo AutoModel"
+description: ""
+position: 5
+---
+## Introduction
+
+[SwanLab](https://swanlab.cn) is an experiment tracker with a W&B-compatible API. NeMo AutoModel can log every run to SwanLab in addition to Weights & Biases, which is also useful where the W&B servers are not reachable.
+
+SwanLab logging mirrors the W&B logger instead of adding a second set of logging calls to every recipe: when it is enabled, each `wandb.init`, `wandb.log`, `wandb.config.update`, and `finish` a recipe makes is forwarded to SwanLab. SwanLab therefore records the same items as W&B: the project, run name, tags, group, notes, the full run config, and every logged metric at the same step.
+
+## Prerequisites
+
+Install the `swanlab` extra (it pulls in `wandb` as well):
+
+```bash
+uv pip install "nemo-automodel[swanlab]"
+```
+
+Provide your SwanLab API key through the `SWANLAB_API_KEY` environment variable (or run `swanlab login` once). The key is never part of the YAML.
+
+## Configuration
+
+Add a `swanlab` sub-block to the recipe's `wandb` section:
+
+```yaml
+wandb:
+  project: my-project
+  name: qwen3_0p6b_hellaswag
+  swanlab:
+    mode: online
+```
+
+The run keeps logging to W&B as before and is also logged to SwanLab under the same project and run name.
+
+### Configuration Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mode` | str | `online` | `online` uploads to SwanLab, `offline` writes the run locally for a later `swanlab sync`, `local` keeps it local only, `disabled` turns SwanLab off. |
+| `workspace` | str | null | SwanLab workspace (user or organization). If null, uses the account's default workspace. |
+| `log_dir` | str | null | Local directory for SwanLab run files. If null, uses the SDK default. |
+| `upload_to_wandb` | bool | `true` | Keep uploading to W&B. Set to `false` where W&B is not reachable: W&B then runs in offline mode and only SwanLab receives the run. |
+
+### SwanLab Only
+
+Where W&B is not reachable, keep the `wandb` block (it drives the logging calls) and stop the W&B upload:
+
+```yaml
+wandb:
+  project: my-project
+  swanlab:
+    mode: online
+    upload_to_wandb: false
+```
+
+### Offline Clusters
+
+On a cluster without internet access, write the run locally and upload it later from a machine that can reach SwanLab:
+
+```yaml
+wandb:
+  project: my-project
+  swanlab:
+    mode: offline
+    upload_to_wandb: false
+    log_dir: /path/to/swanlog
+```
+
+```bash
+swanlab sync /path/to/swanlog/run-<id>
+```
+
+## Notes
+
+- String values that W&B logs (for example the per-step `timestamp`) appear in SwanLab as text.
+- When a recipe logs the same key twice at one step (for example a training and a validation record at the same step), W&B keeps the last value and SwanLab keeps the first.

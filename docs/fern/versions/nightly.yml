@@ -1048,6 +1048,9 @@ navigation:
       - page: "MLflow Logging"
         path: ../../guides/mlflow-logging.mdx
         slug: mlflow-logging
+      - page: "SwanLab Logging"
+        path: ../../guides/swanlab-logging.mdx
+        slug: swanlab-logging
       - page: "Breaking Changes"
         path: ../../breaking-changes.mdx
         slug: breaking-changes
