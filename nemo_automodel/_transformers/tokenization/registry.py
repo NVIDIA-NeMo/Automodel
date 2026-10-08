@@ -118,6 +118,8 @@ def _register_default_tokenizers():
         "kimi_k3",
         "nemo_automodel.components.models.kimi_k3.tokenization:TikTokenTokenizer",
     )
+    # Beam's chat template needs tool-call arguments as dicts; datasets store them as JSON strings.
+    TokenizerRegistry.register("beam", "nemo_automodel.components.models.beam.tokenization:BeamTokenizer")
 
 
 # Register defaults on module load
