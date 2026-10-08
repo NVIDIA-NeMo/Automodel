@@ -81,6 +81,15 @@ class SwanLabConfig:
             workspace=self.workspace,
             log_dir=self.log_dir,
         )
+        # The mirror forwards string values (e.g. the per-step ``timestamp``) to
+        # ``swanlab.log`` unchanged, but SwanLab only accepts numbers as scalars and
+        # rejects them. Log them as text so SwanLab keeps every item W&B records.
+        log_scalars = swanlab.log
+
+        def log_strings_as_text(data, step=None):
+            return log_scalars({k: swanlab.Text(v) if isinstance(v, str) else v for k, v in data.items()}, step=step)
+
+        swanlab.log = log_strings_as_text
         _SWANLAB_MIRROR_INSTALLED = True
 
 
