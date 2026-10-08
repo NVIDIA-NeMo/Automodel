@@ -54,6 +54,7 @@ _HAS_WANDB, wandb = safe_import(
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
+from nemo_automodel.components.loggers.loggers import mirror_wandb_to_swanlab  # noqa: E402
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
 from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend  # noqa: E402
@@ -989,7 +990,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             "Settings",
             msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]",
         )
-        kwargs = self.cfg.wandb.to_dict()
+        kwargs = mirror_wandb_to_swanlab(self.cfg.wandb.to_dict())
         if kwargs.get("name", "") == "":
             # default name: model basename.
             mp = _resolve_bagel_artifact_path(self.cfg) or "bagel"
