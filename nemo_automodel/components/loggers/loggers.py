@@ -22,13 +22,17 @@ there is no free builder function — ``config.build(...)`` is the entry point.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import Any
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
-_SWANLAB_MIRROR_INSTALLED = False
+logger = logging.getLogger(__name__)
+
+# The SwanLabConfig whose mirror is installed in this process (it cannot be undone).
+_SWANLAB_MIRROR_INSTALLED: "SwanLabConfig | None" = None
 
 
 def _builtin_scalar(value: Any) -> Any:
@@ -76,8 +80,8 @@ class SwanLabConfig:
     ``wandb.log`` / ``wandb.config.update`` / ``finish`` a recipe makes is
     forwarded to SwanLab. SwanLab therefore records the items W&B records: the
     run name, project, tags, group, notes, the full run config, and every logged
-    metric at the same step (when a key is logged twice at one step, W&B keeps
-    the last value and SwanLab the first).
+    number, string, and image at the same step. See the SwanLab logging guide
+    for the differences (e.g. W&B tables and histograms are not mirrored).
 
     The SwanLab API key is read by the SDK from ``SWANLAB_API_KEY`` (or a prior
     ``swanlab login``); it is never part of the YAML.
@@ -100,11 +104,19 @@ class SwanLabConfig:
     def mirror_wandb(self) -> None:
         """Patch ``wandb`` so the next ``wandb.init`` and all its logging also go to SwanLab.
 
-        Must run before ``wandb.init``. Idempotent within a process: patching
-        twice would forward every call to SwanLab twice.
+        Must run before ``wandb.init``. The patch is process-wide and cannot be
+        undone, so it is installed once: patching twice would forward every call to
+        SwanLab twice, and a later call with different settings is ignored with a
+        warning.
         """
         global _SWANLAB_MIRROR_INSTALLED
-        if _SWANLAB_MIRROR_INSTALLED:
+        if _SWANLAB_MIRROR_INSTALLED is not None:
+            if _SWANLAB_MIRROR_INSTALLED != self:
+                logger.warning(
+                    "The SwanLab mirror is already installed with %s; ignoring the new settings %s.",
+                    _SWANLAB_MIRROR_INSTALLED,
+                    self,
+                )
             return
         _, swanlab = safe_import(
             "swanlab",
@@ -117,7 +129,7 @@ class SwanLabConfig:
             log_dir=self.log_dir,
         )
         _patch_mirror_values(swanlab)
-        _SWANLAB_MIRROR_INSTALLED = True
+        _SWANLAB_MIRROR_INSTALLED = self
 
 
 @dataclass
@@ -167,8 +179,11 @@ class WandbConfig:
         if "extra" in kwargs:  # caller passed an explicit extra mapping
             extra = {**extra, **(kwargs["extra"] or {})}
             extra.pop("extra", None)
-        if isinstance(direct.get("swanlab"), Mapping):
-            direct["swanlab"] = SwanLabConfig(**direct["swanlab"])
+        swanlab = direct.get("swanlab")
+        if isinstance(swanlab, Mapping):
+            direct["swanlab"] = SwanLabConfig(**swanlab)
+        elif swanlab is not None and not isinstance(swanlab, SwanLabConfig):
+            raise TypeError(f"wandb.swanlab must be a mapping of SwanLab options, got {swanlab!r}")
         return cls(**direct, extra=extra)
 
     def build(self, run_config: Mapping[str, Any] | None = None, model_name: str | None = None) -> Any:

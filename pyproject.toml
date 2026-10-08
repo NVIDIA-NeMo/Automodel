@@ -209,11 +209,11 @@ mlflow-full = [
 ]
 wandb = ["wandb>=0.30.0"]
 # SwanLab mirrors the W&B run, so it needs the wandb extra as well.
-swanlab = ["nemo-automodel[wandb]", "swanlab>=0.10.0"]
+# Upper bound: the mirror relies on how swanlab 0.10's ``sync_wandb`` forwards values.
+swanlab = ["nemo-automodel[wandb]", "swanlab>=0.10.0,<0.11"]
 tracking = [
-    # Convenience meta-extra: installs the experiment-tracking backends.
+    # Convenience meta-extra: installs both experiment-tracking backends.
     "nemo-automodel[mlflow]",
-    "nemo-automodel[swanlab]",
     "nemo-automodel[wandb]",
 ]
 # Official MSA (Linux + SM100); the model-private patch supplies the CuTe DSL 4.6.2 fmax fix.

@@ -14,6 +14,7 @@
 
 """Tests for mirroring the W&B logger to SwanLab (``wandb.swanlab:``)."""
 
+import logging
 import sys
 import types
 
@@ -42,7 +43,7 @@ def fake_swanlab(monkeypatch):
     wandb_run_module = types.ModuleType("wandb.sdk.wandb_run")
     wandb_run_module.Run = Run
     monkeypatch.setitem(sys.modules, "wandb.sdk.wandb_run", wandb_run_module)
-    monkeypatch.setattr(loggers, "_SWANLAB_MIRROR_INSTALLED", False)
+    monkeypatch.setattr(loggers, "_SWANLAB_MIRROR_INSTALLED", None)
     return calls
 
 
@@ -85,7 +86,7 @@ def test_mirror_wandb_forwards_options_and_patches_once(fake_swanlab, cfg, expec
 
 def test_mirror_wandb_raises_when_swanlab_absent(monkeypatch):
     monkeypatch.setitem(sys.modules, "swanlab", None)
-    monkeypatch.setattr(loggers, "_SWANLAB_MIRROR_INSTALLED", False)
+    monkeypatch.setattr(loggers, "_SWANLAB_MIRROR_INSTALLED", None)
     with pytest.raises(UnavailableError, match="swanlab is not installed"):
         SwanLabConfig().mirror_wandb()
 
@@ -142,3 +143,24 @@ def test_init_wandb_run_without_swanlab_does_not_mirror(fake_swanlab, fake_wandb
     init_wandb_run({"project": "p"}, {}, default_name="d")
     assert fake_swanlab == []
     assert fake_wandb["project"] == "p"
+
+
+def test_mirror_warns_when_reinstalled_with_different_settings(fake_swanlab, caplog):
+    SwanLabConfig(mode="offline").mirror_wandb()
+    with caplog.at_level(logging.WARNING):
+        SwanLabConfig(mode="online").mirror_wandb()
+    assert "ignoring the new settings" in caplog.text
+    assert [c for c in fake_swanlab if isinstance(c, dict)] == [
+        {"mode": "offline", "wandb_run": True, "workspace": None, "log_dir": None}
+    ]
+
+
+@pytest.mark.parametrize("value", [True, "online"])
+def test_wandb_config_rejects_non_mapping_swanlab(value):
+    with pytest.raises(TypeError, match="wandb.swanlab must be a mapping"):
+        WandbConfig.from_kwargs(project="p", swanlab=value)
+
+
+def test_wandb_config_accepts_swanlab_config_instance():
+    cfg = SwanLabConfig(mode="local")
+    assert WandbConfig.from_kwargs(swanlab=cfg).swanlab is cfg

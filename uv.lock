@@ -4108,7 +4108,6 @@ all = [
     { name = "sentencepiece" },
     { name = "soundfile" },
     { name = "sqlalchemy" },
-    { name = "swanlab" },
     { name = "tile-kernels" },
     { name = "tilelang" },
     { name = "timm" },
@@ -4225,7 +4224,6 @@ tracking = [
     { name = "alembic" },
     { name = "mlflow-skinny" },
     { name = "sqlalchemy" },
-    { name = "swanlab" },
     { name = "wandb" },
 ]
 vlm = [
@@ -4343,7 +4341,6 @@ requires-dist = [
     { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'moe'" },
     { name = "nemo-automodel", extras = ["mlflow"], marker = "extra == 'tracking'" },
     { name = "nemo-automodel", extras = ["s3"], marker = "extra == 'all'" },
-    { name = "nemo-automodel", extras = ["swanlab"], marker = "extra == 'tracking'" },
     { name = "nemo-automodel", extras = ["tracking"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm-media"], marker = "extra == 'media'" },
@@ -4370,7 +4367,7 @@ requires-dist = [
     { name = "sentencepiece", marker = "extra == 'extra'" },
     { name = "soundfile", marker = "extra == 'vlm'" },
     { name = "sqlalchemy", marker = "extra == 'mlflow'", specifier = ">=1.4.0,<3" },
-    { name = "swanlab", marker = "extra == 'swanlab'", specifier = ">=0.10.0" },
+    { name = "swanlab", marker = "extra == 'swanlab'", specifier = ">=0.10.0,<0.11" },
     { name = "tiktoken" },
     { name = "tile-kernels", marker = "extra == 'cuda'", specifier = "==1.0.0" },
     { name = "tilelang", marker = "extra == 'cuda'", specifier = ">=0.1.11" },
