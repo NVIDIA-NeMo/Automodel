@@ -12,7 +12,7 @@ remains available for ``ministral3_bidirec`` checkpoints.
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,10 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3PreTrainedModel,
 )
 from transformers.utils import logging
+
+if TYPE_CHECKING:
+    from .reranker_export import Mistral3RerankerMetadataExporter
+
 
 logger = logging.get_logger(__name__)
 
@@ -187,7 +191,16 @@ class Mistral3BidirectionalConfig(Mistral3Config):
             else:
                 self.text_config.pooling = value
 
-    def __init__(self, pooling: str = "avg", temperature: float = 1.0, **kwargs) -> None:
+    def __init__(
+        self,
+        pooling: str = "avg",
+        temperature: float | None = None,
+        score_temperature: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Released rerankers separate scoring from generation temperature; legacy checkpoints use temperature.
+        temperature = score_temperature if score_temperature is not None else temperature
+        temperature = 1.0 if temperature is None else temperature
         if temperature <= 0:
             raise ValueError("temperature must be > 0")
         super().__init__(**kwargs)
@@ -560,6 +573,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
         """
         key_mapping = dict(kwargs.pop("key_mapping", None) or {})
         key_mapping.setdefault(r"^language_model\.model\.", "language_model.")
+        key_mapping.setdefault(r"^language_model\.score\.weight$", "score.weight")
         return super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
@@ -580,6 +594,27 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
         self.model = Mistral3BidirectionalModel(config)
         self.score = _Float32ScoringHead(config.text_config.hidden_size, self.num_labels, bias=False)
         self.post_init()
+        from .reranker_export import Mistral3RerankerStateDictAdapter
+
+        self.state_dict_adapter = Mistral3RerankerStateDictAdapter()
+
+    def _get_consolidated_hf_metadata_exporter(
+        self, *, tokenizer: object, original_model_path: str | None
+    ) -> "Mistral3RerankerMetadataExporter":
+        """Select the portable reranker export for direct and distributed checkpoint saves."""
+        from .reranker_export import Mistral3RerankerMetadataExporter
+
+        return Mistral3RerankerMetadataExporter(self)
+
+    def save_pretrained(self, save_directory: str | os.PathLike, **kwargs: Any) -> None:
+        """Save trained weights using the shared Transformers/vLLM reranker head name."""
+        state_dict = kwargs.pop("state_dict", None)
+        if state_dict is None:
+            state_dict = self.state_dict()
+        super().save_pretrained(save_directory, state_dict=self.state_dict_adapter.to_hf(state_dict), **kwargs)
+        from .reranker_export import Mistral3RerankerMetadataExporter
+
+        Mistral3RerankerMetadataExporter(self).save_model_assets(save_directory)
 
     def _nemo_apply_liger_kernel(self, liger_kernel_transformers) -> None:
         """Apply compatible Liger kernels to the nested Mistral text tower."""
@@ -744,7 +779,6 @@ def _register_with_hf_auto_classes() -> None:
 
 
 _register_with_hf_auto_classes()
-Mistral3VLBidirectionalForSequenceClassification.register_for_auto_class("AutoModelForSequenceClassification")
 
 __all__ = [
     "Ministral3BidirectionalModel",

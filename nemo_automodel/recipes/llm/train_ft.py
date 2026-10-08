@@ -1444,6 +1444,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )
+                # Autograd retains tensors needed by the losses. Release the
+                # output container and auxiliary aliases before backward so
+                # unused full-vocabulary logits do not overlap its allocations.
+                del out, mtp_per_depth_h, mtp_per_depth_logits
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
