@@ -151,6 +151,9 @@ def test_automodel_random_initialization(tmp_path: Path, vlm: bool, mtp: bool) -
                     parameter.fill_(float("nan"))
 
     with (
+        # Build on CPU even on GPU hosts: the model formats ``cuda:{current_device()}`` only
+        # when CUDA is available, while from_config uses current_device() as the device.
+        patch.object(torch.cuda, "is_available", return_value=False),
         patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")),
         patch.object(
             checkpointing, "to_empty_parameters_only", side_effect=materialize_and_poison_text
@@ -219,6 +222,9 @@ def test_checkpoint_overwrites_random_initialization(tmp_path: Path) -> None:
         load(checkpointer, model, device, root_dir, model_name, load_base_model)
 
     with (
+        # Build on CPU even on GPU hosts: the model formats ``cuda:{current_device()}`` only
+        # when CUDA is available, while from_config uses current_device() as the device.
+        patch.object(torch.cuda, "is_available", return_value=False),
         patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")),
         patch.object(Checkpointer, "initialize_model_weights", side_effect=record_initialize),
         patch.object(Checkpointer, "load_base_model", autospec=True, side_effect=record_load),
