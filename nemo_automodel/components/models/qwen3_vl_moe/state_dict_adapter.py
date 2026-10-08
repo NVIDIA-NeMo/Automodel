@@ -121,7 +121,9 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
                         assert local_tensor.shape[1] % ep_shard_size == 0
                         chunk = local_tensor.shape[1] // ep_shard_size
                         local_tensor = local_tensor[:, ep_shard_rank * chunk : (ep_shard_rank + 1) * chunk, :]
-                    state_dict[native_key] = state_dict_utils.create_dtensor_from_local(local_tensor, device_mesh, rank)
+                    state_dict[native_key] = state_dict_utils.create_dtensor_from_local(
+                        local_tensor, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
+                    )
                 continue
 
             if key.endswith("_scale_inv"):

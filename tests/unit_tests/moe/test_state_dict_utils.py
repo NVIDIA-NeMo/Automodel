@@ -23,6 +23,7 @@ from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
     get_expert_slice_for_rank,
+    get_sharded_expert_range,
     is_dtensor,
     should_load_expert_for_rank,
     split_experts_weights_dtensor_aware,
@@ -361,3 +362,22 @@ class TestShouldLoadExpertForRank:
 
         assert should_load_expert_for_rank(2, Mock(), 8)  # Start is inclusive
         assert not should_load_expert_for_rank(4, Mock(), 8)  # End is exclusive
+
+
+@pytest.mark.parametrize("n_experts,world_size", [(10, 4), (60, 8), (64, 24), (3, 2), (1, 2), (0, 2), (8, 4)])
+def test_sharded_expert_ranges_match_torch_chunk(n_experts: int, world_size: int) -> None:
+    chunks = torch.arange(n_experts).chunk(world_size)
+    offset = 0
+    for rank in range(world_size):
+        expected = chunks[rank] if rank < len(chunks) else torch.empty(0, dtype=torch.int64)
+        start, end = get_sharded_expert_range(n_experts, world_size=world_size, rank=rank)
+        assert (start, end) == (offset, offset + expected.numel())
+        torch.testing.assert_close(torch.arange(start, end), expected)
+        offset = end
+    assert offset == n_experts
+
+
+@pytest.mark.parametrize("n_experts,world_size,rank", [(-1, 2, 0), (3, 0, 0), (3, 2, -1), (3, 2, 2)])
+def test_sharded_expert_range_rejects_invalid_partition(n_experts: int, world_size: int, rank: int) -> None:
+    with pytest.raises(ValueError, match="Invalid expert partition"):
+        get_sharded_expert_range(n_experts, world_size=world_size, rank=rank)

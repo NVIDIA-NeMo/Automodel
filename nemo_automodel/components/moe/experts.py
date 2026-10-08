@@ -37,7 +37,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 )
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
-from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
+from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local, get_sharded_expert_range
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAVE_TRITON, triton = safe_import("triton")
@@ -727,6 +727,9 @@ class GroupedExperts(nn.Module):
     """
     Sparse MoE implementation using all-gather/reduce-scatter primitives.
 
+    Expert ownership follows DTensor Shard(0), including uneven and empty
+    trailing shards. Router indices continue to use global expert IDs.
+
     Supports two compute backends:
     - Per-expert loop with gather/scatter (default)
     - torch._grouped_mm with argsort-based permutation (backend.experts="torch_mm";
@@ -891,10 +894,6 @@ class GroupedExperts(nn.Module):
             ep_size = 1
             ep_rank = 0
 
-        assert self.n_routed_experts % ep_size == 0, (
-            f"Number of experts must be divisible by ep_size (ep_size={ep_size})"
-        )
-
         # Cast expert weights to the activation dtype so that fp32-stored
         # parameters (e.g. under fp32 master weights) still work with kernels
         # torch._grouped_mm requires matching dtypes with
@@ -933,11 +932,29 @@ class GroupedExperts(nn.Module):
                 x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
             )
 
-        n_local_experts = self.n_routed_experts // ep_size
-        experts_start_idx = ep_rank * n_local_experts
-        experts_end_idx = experts_start_idx + n_local_experts
+        experts_start_idx, experts_end_idx = get_sharded_expert_range(
+            self.n_routed_experts, world_size=ep_size, rank=ep_rank
+        )
+        n_local_experts = experts_end_idx - experts_start_idx
 
-        if self.use_torch_mm:
+        if n_local_experts == 0 or x.shape[0] == 0:
+            shape = (
+                (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
+            )
+            y = torch.zeros(shape, dtype=torch.float32, device=x.device)
+            # Empty slices attach zero gradients without reading full weights.
+            # Their slice backward also avoids broadcast-stride DTensor gradients
+            # that can trigger an unmatched redistribution on empty ranks.
+            y = (
+                y
+                + x[..., :0].sum()
+                + weights[..., :0].sum()
+                + gate_and_up_projs[..., :0].sum()
+                + down_projs[..., :0].sum()
+            )
+            if self.expert_bias:
+                y = y + gate_up_proj_bias[..., :0].sum() + down_proj_bias[..., :0].sum()
+        elif self.use_torch_mm:
             y = self._forward_grouped_mm(
                 x,
                 token_mask,
@@ -1406,6 +1423,10 @@ class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
 
+    Uneven ownership follows DTensor Shard(0). Dispatch uses fixed-width
+    expert slots per rank; unused trailing slots have no weights or tokens.
+    Kernel-specific communication capacity restrictions still apply.
+
     Uses torch._grouped_mm for the canonical ``experts="torch_mm"`` backend.
     ``experts="gmm"`` remains a deprecated compatibility alias.
 
@@ -1495,9 +1516,14 @@ class GroupedExpertsDeepEP(nn.Module):
         self.ep_rank = ep_mesh.get_local_rank()
         ep_group = ep_mesh.get_group()
 
+        first, last = get_sharded_expert_range(self.config.n_routed_experts, world_size=self.ep_size, rank=self.ep_rank)
+        self.num_local_experts = last - first
+        slots_per_rank = (self.config.n_routed_experts + self.ep_size - 1) // self.ep_size
+        # Communication kernels use fixed-width rank slots. Trailing slots have
+        # no parameters and are never routed to; the router keeps its real size.
         config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
-            num_moe_experts=self.config.n_routed_experts,
+            num_moe_experts=slots_per_rank * self.ep_size,
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
@@ -1515,7 +1541,7 @@ class GroupedExpertsDeepEP(nn.Module):
 
         self.n_routed_experts = self.config.n_routed_experts
 
-        num_local_experts = self.config.n_routed_experts // self.ep_size
+        num_local_experts = slots_per_rank
 
         local_expert_indices_offset = self.ep_rank * num_local_experts
         local_expert_indices = [local_expert_indices_offset + i for i in range(num_local_experts)]
@@ -1564,6 +1590,9 @@ class GroupedExpertsDeepEP(nn.Module):
             token_probs=weights,
             token_indices=indices,
         )
+        # Discard only zero-count communication slots beyond the real local
+        # expert interval. No activation rows or expert weights are padded.
+        tokens_per_expert = tokens_per_expert[: self.num_local_experts]
         permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, self.config.dtype)
         permuted_probs = permuted_probs.unsqueeze(-1)
         return permuted_local_hidden_states, tokens_per_expert, permuted_probs
@@ -1607,10 +1636,6 @@ class GroupedExpertsDeepEP(nn.Module):
         """
         assert not isinstance(x, DTensor)
 
-        assert self.n_routed_experts % self.ep_size == 0, (
-            f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
-        )
-
         permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
             x, token_mask, weights, indices
         )
@@ -1631,7 +1656,7 @@ class GroupedExpertsDeepEP(nn.Module):
         # construction, so the count_nonzero device-to-host read (one per microbatch, and
         # again per activation-checkpoint recompute) can be skipped.
         router_weight_already_applied = False
-        if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
+        if self.num_local_experts > 0 and (self.static_routing or torch.count_nonzero(tokens_per_expert) > 0):
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             gate_up_output_bytes = (
                 permuted_local_hidden_states.shape[0]
@@ -1691,9 +1716,16 @@ class GroupedExpertsDeepEP(nn.Module):
                     use_mxfp8=self.use_mxfp8,
                 )
         else:
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1_ = self.expert_activation(output1, activation_probs)
-            output2 = torch.matmul(output1_, down_projs[0])
+            output2 = permuted_local_hidden_states * 0.0
+            output2 = (
+                output2 + gate_and_up_projs[..., :0].sum() + down_projs[..., :0].sum() + permuted_probs[..., :0].sum()
+            )
+            if self.expert_bias:
+                output2 = (
+                    output2
+                    + self.gate_up_proj_bias.to_local()[..., :0].sum()
+                    + self.down_proj_bias.to_local()[..., :0].sum()
+                )
 
         if self.config.apply_router_weight_after_down and not router_weight_already_applied:
             # HybridEP/DeepEP combine expects the expert activation dtype. Keep

@@ -858,6 +858,7 @@ class TestGroupedExpertsDeepEP:
         dispatcher.token_unpermutation.side_effect = lambda output: output
         experts.token_dispatcher = dispatcher
         experts.n_routed_experts = experts.config.n_routed_experts
+        experts.num_local_experts = experts.config.n_routed_experts
         experts.ep_size = 1
 
         # Production installs DTensor parameters before this forward. These tests
@@ -1255,6 +1256,7 @@ class TestGroupedExpertsDeepEP:
         else:
             experts = GroupedExpertsDeepEP(config)
             experts.n_routed_experts = 1
+            experts.num_local_experts = 1
             experts.ep_size = 1
         for parameter in experts.parameters():
             torch.nn.init.normal_(parameter, std=0.1)

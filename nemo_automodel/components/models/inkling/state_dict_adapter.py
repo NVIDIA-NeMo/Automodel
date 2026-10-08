@@ -217,7 +217,9 @@ class InklingStateDictAdapter(StateDictAdapter):
                 value = value[start_expert:end_expert]
             value = value.transpose(-1, -2).contiguous().to(self.dtype)
             if is_expert and device_mesh is not None:
-                value = state_dict_utils.create_dtensor_from_local(value, device_mesh, rank)
+                value = state_dict_utils.create_dtensor_from_local(
+                    value, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
+                )
             return value
 
         for key, value in hf_state_dict.items():
