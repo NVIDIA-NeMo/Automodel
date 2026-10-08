@@ -45,6 +45,7 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
 
 # Replace bundled Nsight Systems binaries built with a vulnerable Go toolchain.
 # Match the pinned devtools release used by NVIDIA-NeMo/RL#4343.
+# Remove entire EFA metrics plugins bundled with a vulnerable Go toolchain after installation.
 RUN rm -rf /usr/local/cuda*/NsightSystems-cli-* /opt/nvidia/nsight-systems* && \
     (apt-get remove --purge -y --allow-change-held-packages 'nsight-systems*' || true) && \
     NSYS_VERSION="2026.5.1.161-265138896106v0" && \
@@ -55,6 +56,8 @@ RUN rm -rf /usr/local/cuda*/NsightSystems-cli-* /opt/nvidia/nsight-systems* && \
         > /etc/apt/sources.list.d/nvidia-devtools.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends "nsight-systems-cli-${NSYS_RELEASE}=${NSYS_VERSION}" && \
+    rm -rf "/opt/nvidia/nsight-systems-cli/${NSYS_RELEASE}/target-linux-x64/plugins/efa_metrics" \
+        "/opt/nvidia/nsight-systems-cli/${NSYS_RELEASE}/target-linux-sbsa-armv8/plugins/efa_metrics" && \
     rm -f /etc/apt/sources.list.d/nvidia-devtools.list /usr/share/keyrings/nvidia-devtools.asc && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
@@ -335,7 +338,7 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         UV_CONCURRENT_INSTALLS=8 \
         UV_CACHE_DIR=${UV_CACHE_DIR}/${MOK_ARCH} \
         MOK_ARCH=${MOK_ARCH} \
-        uv sync --extra $AUTOMODEL_INSTALL --extra msa --extra mok --all-groups $UV_SYNC_ARGS && \
+        uv sync --extra $AUTOMODEL_INSTALL --extra msa --extra mok --extra ffpa --all-groups $UV_SYNC_ARGS && \
     python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}

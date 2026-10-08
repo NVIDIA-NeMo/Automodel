@@ -798,6 +798,8 @@ def make_cp_batch_for_te(
         "labels": torch.stack([chunk["labels"] for chunk in chunks]),
         "position_ids": torch.stack([chunk["position_ids"] for chunk in chunks]),
         "cu_seqlens": torch.stack([chunk["cu_seqlens"] for chunk in chunks]),
+        "cu_seqlens_padded": torch.stack([chunk["cu_seqlens_padded"] for chunk in chunks]),
+        "pad_between_seqs": False,
         "max_seqlen": torch.stack([chunk["max_seqlen"] for chunk in chunks]),
         "qkv_format": qkv_format,
         "padding_mask": torch.stack([chunk["padding_mask"] for chunk in chunks]),
@@ -850,7 +852,6 @@ def _shard_thd_chunk_for_te(
     # below replaces every transformed field with its authoritative local value.
     output_batch = batch.copy()
     output_batch.pop("attention_mask", None)
-    output_batch.pop("cu_seqlens_padded", None)
 
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
     output_batch.update(
@@ -858,7 +859,11 @@ def _shard_thd_chunk_for_te(
             "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
             "labels": batch["labels"].to(torch.int64).contiguous(),
             "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
+            # CP attention already includes each document's trailing pad slots.
+            # Retain the same physical boundaries without enabling padding dispatch.
             "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
+            "cu_seqlens_padded": cu_seqlens_padded.to(torch.int32).contiguous(),
+            "pad_between_seqs": False,
             "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
             "qkv_format": qkv_format,
             "cp_size": cp_size,

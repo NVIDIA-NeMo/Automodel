@@ -15,13 +15,12 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git && cd Automodel
 uv sync --locked --all-groups --extra all
 ```
 
-Or use the NeMo-AutoModel container from NVIDIA NGC (pick a published tag from
-[the NGC catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) —
-e.g. `26.04`):
+Or use the NeMo-AutoModel 26.10 container from
+[NVIDIA NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.10.00):
 
 ```bash
-docker pull nvcr.io/nvidia/nemo-automodel:26.04
-docker run --gpus all -it nvcr.io/nvidia/nemo-automodel:26.04
+docker pull nvcr.io/nvidia/nemo-automodel:26.10.00
+docker run --gpus all -it nvcr.io/nvidia/nemo-automodel:26.10.00
 ```
 
 ## Installation Options
@@ -33,7 +32,7 @@ The container ships with all dependencies pre-installed at `/opt/Automodel`
 
 ```bash
 docker run --gpus all --network=host -it --rm --shm-size=32g \
-    nvcr.io/nvidia/nemo-automodel:26.04 /bin/bash
+    nvcr.io/nvidia/nemo-automodel:26.10.00 /bin/bash
 ```
 
 #### Mounting your local checkout into the container
@@ -44,7 +43,7 @@ override the installed source:
 ```bash
 docker run --gpus all --network=host -it --rm --shm-size=32g \
     -v <local-Automodel-path>:/opt/Automodel \
-    nvcr.io/nvidia/nemo-automodel:26.04 /bin/bash
+    nvcr.io/nvidia/nemo-automodel:26.10.00 /bin/bash
 ```
 
 Inside the container, patch `pyproject.toml` / `uv.lock` for the PyTorch base

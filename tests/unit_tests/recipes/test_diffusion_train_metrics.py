@@ -291,7 +291,7 @@ def test_diffusion_recipe_raises_when_hunyuan_flash_varlen_mask_optimization_fai
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), diffusion_train.MeshContext())),
     )
 
     from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
@@ -312,7 +312,7 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), diffusion_train.MeshContext())),
     )
 
     from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
@@ -336,7 +336,7 @@ def test_diffusion_recipe_reseeds_rng_by_dp_rank_when_cp_enabled(monkeypatch):
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), diffusion_train.MeshContext())),
     )
     init_all_rng = MagicMock()
     monkeypatch.setattr(diffusion_train, "init_all_rng", init_all_rng)
@@ -363,7 +363,7 @@ def test_diffusion_recipe_does_not_reseed_rng_without_cp(monkeypatch):
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), diffusion_train.MeshContext())),
     )
     init_all_rng = MagicMock()
     monkeypatch.setattr(diffusion_train, "init_all_rng", init_all_rng)
@@ -390,7 +390,7 @@ def test_diffusion_recipe_broadcasts_tp_replicas_before_optimizer_setup(monkeypa
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=transformer), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=transformer), diffusion_train.MeshContext())),
     )
     broadcast = MagicMock()
     monkeypatch.setattr(diffusion_train, "broadcast_tp_replicas", broadcast)
@@ -446,7 +446,7 @@ def test_build_diffusion_mesh_context_uses_shared_fsdp_defaults():
     assert strategy_config.enable_fsdp2_prefetch is True
     assert strategy_config.mp_policy.param_dtype == torch.float16
     assert strategy_config.mp_policy.reduce_dtype == torch.float32
-    assert strategy_config.mp_policy.output_dtype == torch.float16
+    assert strategy_config.mp_policy.output_dtype is None
 
 
 def test_build_diffusion_mesh_context_keeps_lora_param_dtype_uncast():
@@ -461,7 +461,7 @@ def test_build_diffusion_mesh_context_keeps_lora_param_dtype_uncast():
 
     policy = build_mesh.call_args.kwargs["strategy_config"].mp_policy
     assert policy.param_dtype is None
-    assert policy.output_dtype == torch.bfloat16
+    assert policy.output_dtype is None
 
 
 def test_build_diffusion_mesh_context_parses_ddp_config():
@@ -531,7 +531,7 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     monkeypatch.setattr(diffusion_train.MeshContext, "build", build_mesh)
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
-    built_pipe, device_mesh = build_diffusion_pipeline(
+    built_pipe, built_mesh_context = build_diffusion_pipeline(
         model_id="dummy-model",
         finetune_mode=True,
         device=torch.device("cpu"),
@@ -554,6 +554,8 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
         transformer_engine_fp8_safe_only=True,
         fuse_qkv_projections=True,
         compact_fused_qkv_projections=True,
+        backend={"attn": "sdpa"},
+        config_overrides={"num_hidden_layers": 2},
     )
 
     strategy_config = build_mesh.call_args.kwargs["strategy_config"]
@@ -575,8 +577,12 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     # set_attention_backend before sharding (required for context parallelism).
     assert calls["attention_backend"] == "flash"
     assert calls["mesh_context"] is mesh_context
+    assert calls["backend"] == {"attn": "sdpa"}
+    assert calls["config_overrides"] == {"num_hidden_layers": 2}
     assert built_pipe is pipe
-    assert device_mesh == "mesh"
+    # The full MeshContext is returned so the recipe can read both device_mesh and moe_mesh.
+    assert built_mesh_context is mesh_context
+    assert built_mesh_context.device_mesh == "mesh"
 
 
 def test_build_diffusion_pipeline_raises_when_lora_params_missing(monkeypatch):
@@ -720,7 +726,8 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
     monkeypatch.setattr(diffusion_train, "synchronize_tp_replica_gradients", MagicMock())
-    monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train, "scale_grads_and_clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train, "get_expert_tp_replication_factor", MagicMock(return_value=1))
     sync_ctx_mock = MagicMock(wraps=diffusion_train.get_sync_ctx)
     monkeypatch.setattr(diffusion_train, "get_sync_ctx", sync_ctx_mock)
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
@@ -748,6 +755,10 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.lr_scheduler = [SimpleNamespace(step=MagicMock())]
     recipe.model = model
     recipe.device_mesh = object()
+    recipe.moe_mesh = None
+    recipe._get_cp_group_size = MagicMock(return_value=1)
+    recipe._get_dp_group_size = MagicMock(return_value=1)
+    recipe.pp_enabled = False
     recipe.device = torch.device("cpu")
     recipe.compute_dtype = torch.float32
     recipe.check_loss = True
@@ -788,11 +799,15 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
         call(model, False, defer_fsdp_grad_sync=True),
         call(model, True, defer_fsdp_grad_sync=True),
     ]
-    diffusion_train.clip_grad_norm.assert_called_once_with(
+    diffusion_train.scale_grads_and_clip_grad_norm.assert_called_once_with(
         0.5,
         [model],
         device_mesh=recipe.device_mesh,
+        moe_mesh=None,
+        ep_axis_name=None,
         foreach=False,
+        dp_group_size=1,
+        expert_tp_replication_factor=1,
     )
     recipe.optimizer[0].zero_grad.assert_called_once_with(set_to_none=True)
     recipe.optimizer[0].step.assert_called_once()
@@ -861,7 +876,7 @@ def _patch_setup_dataloaders(monkeypatch, *, validation_batches=1, with_validati
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), diffusion_train.MeshContext())),
     )
 
     validation_config = None
@@ -1045,7 +1060,8 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
     monkeypatch.setattr(diffusion_train, "synchronize_tp_replica_gradients", MagicMock())
-    monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train, "scale_grads_and_clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train, "get_expert_tp_replication_factor", MagicMock(return_value=1))
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
     wandb_log = MagicMock()
     monkeypatch.setattr(diffusion_train.wandb, "run", MagicMock(), raising=False)
@@ -1066,6 +1082,11 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     recipe.optimizer = [SimpleNamespace(zero_grad=MagicMock(), step=MagicMock(), param_groups=[{"lr": 0.01}])]
     recipe.lr_scheduler = None
     recipe.model = nn.Linear(1, 1)
+    recipe.device_mesh = None
+    recipe.moe_mesh = None
+    recipe._get_cp_group_size = MagicMock(return_value=1)
+    recipe._get_dp_group_size = MagicMock(return_value=1)
+    recipe.pp_enabled = False
     recipe.device = torch.device("cpu")
     recipe.compute_dtype = torch.float32
     recipe.check_loss = False

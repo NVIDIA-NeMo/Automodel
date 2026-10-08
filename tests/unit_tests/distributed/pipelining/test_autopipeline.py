@@ -1140,6 +1140,7 @@ class TestAutoPipelineUpdateSeqLen:
 
         def record_reset(*args, **kwargs):
             events.append(("reset", args[4]))
+            return ap.pp_microbatch_size * args[4]
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.pipelining.autopipeline.reset_pp_stage_shapes",

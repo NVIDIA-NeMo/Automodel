@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 # Models are loaded lazily on first access rather than imported at startup.
 # Optional third element is a set of tags (e.g. {"retrieval"}) used by
 # downstream code to classify model archs without importing them.
+# "hf_parallelizer" opts the HF wrapper into the owning package's
+# parallelization.PARALLELIZER; it requires compatibility with the HF layout.
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
@@ -65,7 +67,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
         ),
         (
             "DeepseekV4ForCausalLM",
-            ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
+            ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM", {"hf_parallelizer"}),
         ),
         (
             "DeepseekV41ForCausalLM",
@@ -201,6 +203,22 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "Mistral3BidirectionalModel",
+            (
+                "nemo_automodel.components.models.ministral_bidirectional.model",
+                "Mistral3BidirectionalModel",
+                {"retrieval"},
+            ),
+        ),
+        (
+            "Mistral3VLBidirectionalForSequenceClassification",
+            (
+                "nemo_automodel.components.models.ministral_bidirectional.model",
+                "Mistral3VLBidirectionalForSequenceClassification",
+                {"retrieval"},
+            ),
+        ),
+        (
             "Mistral4ForCausalLM",
             ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
         ),
@@ -216,8 +234,12 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "Qwen3RerankerForCausalReranking",
+            ("nemo_automodel.components.models.qwen3_reranker.model", "Qwen3RerankerForCausalReranking"),
+        ),
+        (
             "NemotronHForCausalLM",
-            ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
+            ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM", {"hf_parallelizer"}),
         ),
         (
             "NemotronH_Nano_Omni_Reasoning_V3",
@@ -255,6 +277,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "HyMT2ForCausalLM",
             ("nemo_automodel.components.models.hy_mt2.model", "HyMT2ForCausalLM"),
+        ),
+        (
+            "HunyuanImage3ForCausalMM",
+            ("nemo_automodel.components.models.hunyuan_image3.model", "HunyuanImage3ForCausalMM"),
         ),
         (
             "Qwen2ForCausalLM",
@@ -295,11 +321,11 @@ MODEL_ARCH_MAPPING = OrderedDict(
         ),
         (
             "Qwen3_5ForCausalLM",
-            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForCausalLM"),
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForCausalLM", {"hf_parallelizer"}),
         ),
         (
             "Qwen3_5ForConditionalGeneration",
-            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration"),
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration", {"hf_parallelizer"}),
         ),
         (
             "Qwen3OmniMoeForConditionalGeneration",
@@ -367,6 +393,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
     "glm5_next": ("nemo_automodel.components.models.glm5_next.config", "Glm5NextConfig"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
+    "hunyuan_image_3_moe": ("nemo_automodel.components.models.hunyuan_image3.config", "HunyuanImage3Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
@@ -383,6 +410,10 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "ministral3_bidirec": (
         "nemo_automodel.components.models.ministral_bidirectional.model",
         "Ministral3BidirectionalConfig",
+    ),
+    "mistral3_bidirec": (
+        "nemo_automodel.components.models.ministral_bidirectional.model",
+        "Mistral3BidirectionalConfig",
     ),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
     "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),

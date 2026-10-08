@@ -72,6 +72,7 @@ if TYPE_CHECKING:
 
     from nemo_automodel.components.quantization.fp8 import FP8Config
     from nemo_automodel.components.utils.compile_utils import CompileConfig
+    from nemo_automodel.components.utils.model_utils import FreezeConfig
 
 #  Re-exports from sibling modules (backward compatibility)
 # Backward-compat shim for trust_remote_code models (e.g. DeciLM)
@@ -1087,6 +1088,34 @@ class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextTo
     pass
 
 
+class NeMoAutoModelForDiffusion(_BaseNeMoAutoModelClass):
+    """Auto class for diffusion transformers that have a custom Automodel implementation.
+
+    ``transformers`` has no diffusion auto class, and diffusion checkpoints without a custom implementation are
+    loaded through diffusers (``nemo_automodel._diffusers``). This class therefore only resolves architectures
+    registered in ``ModelRegistry``; everything else (``distributed_setup`` with FSDP2 / expert parallelism,
+    PEFT, sharded checkpoint loading) works as for ``NeMoAutoModelForCausalLM``.
+
+    Examples:
+    --------
+    >>> transformer = NeMoAutoModelForDiffusion.from_config(
+    ...     "/ckpts/my-moe-dit/transformer", distributed_setup=setup, load_base_model=True)
+    """
+
+    _NO_CUSTOM_MODEL = (
+        "NeMoAutoModelForDiffusion only builds architectures with a custom Automodel implementation "
+        "(see ModelRegistry); load other diffusion transformers through diffusers."
+    )
+
+    @classmethod
+    def _from_pretrained_parent_class(cls, *args, **kwargs):
+        raise ValueError(cls._NO_CUSTOM_MODEL)
+
+    @classmethod
+    def _from_config_parent_class(cls, *args, **kwargs):
+        raise ValueError(cls._NO_CUSTOM_MODEL)
+
+
 class _NeMoAutoModelForRetrievalBase:
     """Private shared base for encoder auto-models.
 
@@ -1100,6 +1129,7 @@ class _NeMoAutoModelForRetrievalBase:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
+        *model_args: Any,
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
@@ -1109,6 +1139,7 @@ class _NeMoAutoModelForRetrievalBase:
         device_mesh: Optional["DeviceMesh"] = None,
         compile_config: Optional["CompileConfig"] = None,
         peft_config: dict | None = None,
+        freeze_config: "FreezeConfig | dict[str, bool] | None" = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
@@ -1119,6 +1150,7 @@ class _NeMoAutoModelForRetrievalBase:
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            *model_args: Positional arguments forwarded to the backbone model's constructor.
             attn_implementation: Attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
                 Defaults to ``DEFAULT_ATTN_IMPLEMENTATION``
@@ -1132,6 +1164,8 @@ class _NeMoAutoModelForRetrievalBase:
                 in a topology-only ``DistributedSetup`` internally.
             compile_config: Configuration for torch.compile.
             peft_config: PEFT/LoRA configuration dictionary.
+            freeze_config: Parameter-freezing policy applied after pretrained
+                weights are loaded and before distributed sharding.
             **kwargs: Additional arguments passed to the encoder's ``build()`` method.
                 ``dtype`` selects model storage dtype and takes precedence over
                 ``torch_dtype`` when not ``None``; accepts ``auto``.
@@ -1160,6 +1194,7 @@ class _NeMoAutoModelForRetrievalBase:
         def _retry(**override):
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
+                *model_args,
                 attn_implementation=attn_implementation,
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
@@ -1169,6 +1204,7 @@ class _NeMoAutoModelForRetrievalBase:
                 device_mesh=device_mesh,
                 compile_config=compile_config,
                 peft_config=peft_config,
+                freeze_config=freeze_config,
                 **kwargs,
             )
 
@@ -1176,6 +1212,8 @@ class _NeMoAutoModelForRetrievalBase:
         build_kwargs.pop("tp_size", None)
         build_kwargs.pop("cp_size", None)
         build_kwargs.pop("has_packed_sequence", None)
+        if model_args:
+            build_kwargs["model_args"] = model_args
 
         setup = _resolve_distributed_setup(
             distributed_setup=distributed_setup,
@@ -1242,6 +1280,7 @@ class _NeMoAutoModelForRetrievalBase:
             compile_config=compile_config,
             load_base_model=False,  # encoder_cls.build already loads weights
             cache_dir=build_kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE),
+            freeze_config=freeze_config,
         )
 
         return model
@@ -1332,7 +1371,8 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        *args: Any,
+        *model_args: Any,
+        attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         is_causal: bool | None = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
@@ -1340,7 +1380,8 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
-            *args: Positional arguments forwarded to the shared retrieval loader.
+            *model_args: Positional arguments forwarded to the backbone model's constructor.
+            attn_implementation: Attention implementation forwarded to the shared loader.
             is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
                 preserves the scoring backbone's native attention mode.
             **kwargs: Forwarded to the shared retrieval loader.
@@ -1350,7 +1391,8 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
         """
         return super().from_pretrained(
             pretrained_model_name_or_path,
-            *args,
+            *model_args,
+            attn_implementation=attn_implementation,
             is_causal=is_causal,
             **kwargs,
         )

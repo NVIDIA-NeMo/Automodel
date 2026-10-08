@@ -45,15 +45,32 @@ def test_llm_benchmark_configs_define_required_benchmark_fields():
     assert not violations, "Benchmark configs are missing required fields:\n" + "\n".join(violations)
 
 
-def test_super35_vl_benchmark_waits_for_public_checkpoint():
-    config = Path("examples/llm_benchmark/nemotron/super35_vl_text_8k_ep16_fused_adam.yaml")
+def test_nemotron_super_v3_hybridep_benchmark_uses_shared_ci_inputs():
+    config = Path("examples/llm_benchmark/nemotron/nemotron_super_v3_te_hybridep_8k_ep16_gb200.yaml")
     recipe = YAML(typ="safe").load(config)
 
+    assert recipe["model"]["config"]["_target_"] == "nemo_automodel.NeMoAutoConfig.from_pretrained"
     assert recipe["model"]["config"]["pretrained_model_name_or_path"] == (
-        "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
+        # Public Hugging Face model ID; the entropy detector misclassifies it as a credential.
+        "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"  # pragma: allowlist secret
     )
-    assert recipe["ci"]["known_issue_id"] == "AMINT-383"
-    assert generate_job(config, {}, "performance", "llm_benchmark", ".") == []
+    assert recipe["step_scheduler"]["local_batch_size"] == 2
+    assert "known_issue_id" not in recipe["ci"]
+    assert "freeze_config" not in recipe
+    assert "multimodal" not in recipe["distributed"]
+    assert "flops_scope" not in recipe["benchmark"]
+
+    jobs = generate_job(config, {}, "performance", "llm_benchmark", ".")
+
+    assert len(jobs) == 1
+    job_name, job = jobs[0]
+    assert job_name == ""
+    assert job["extends"] == ".llm_benchmark_test"
+    assert job["stage"] == "performance"
+    assert job["variables"]["TEST_NODE_COUNT"] == 4
+    assert job["variables"]["CONFIG_NPROC_PER_NODE"] == 4
+    assert job["variables"]["RESERVED_CLUSTER_TAG"] == "/gb200/"
+    assert "CUDA_VISIBLE_DEVICES" not in job["variables"]
 
 
 def test_qwen35_moe_lora_benchmark_disables_mtp():
@@ -398,6 +415,20 @@ def test_generate_qwen3_moe_lora_uses_all_isolated_checkpoint_phases():
         "source_load_cosine_threshold",
     ):
         assert key not in robustness
+
+
+def test_generate_glm51_lora_includes_native_checkpoint_validation():
+    config = Path("examples/llm_finetune/glm/glm_5.1_lora.yaml")
+    job = dict(generate_job(config, {}, "release", "llm_finetune", "."))[""]
+    variables = job["variables"]
+
+    assert job.get("allow_failure") is None
+    assert variables["HAS_ROBUSTNESS"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload resume"
+    assert variables["TEST_NODE_COUNT"] == 16
+    assert variables["TIME"] == "00:35:00"
+    assert variables["REQUIRE_FINITE_METRICS"] == "true"
 
 
 def test_generate_nemotron_resume_cohort_preserves_known_issue_gating():

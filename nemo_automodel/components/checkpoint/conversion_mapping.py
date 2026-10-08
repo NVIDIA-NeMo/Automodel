@@ -205,9 +205,9 @@ def get_combined_key_mapping(
         model_type: The model type string from config.model_type
         model_key_mapping: Optional key mapping from the model's
                           `_checkpoint_conversion_mapping` attribute
-        model: Optional model instance whose nested submodels may supply additional
-            scoped renames. Omit for models whose state-dict adapter or tensor
-            converters own checkpoint conversion.
+        model: Optional model instance used to resolve class-specific root renames
+            and scoped submodel renames. Omit for models whose state-dict adapter
+            or tensor converters own checkpoint conversion.
 
     Returns:
         Regex mapping, a callable that also applies nested-model renames in order,
@@ -230,6 +230,15 @@ def get_combined_key_mapping(
     # Try to get conversion mapping from transformers and extract simple renamings
     if _TRANSFORMERS_AVAILABLE:
         conversions = get_checkpoint_conversion_mapping(model_type)
+        if model is not None:
+            # HF registers some root rules by class rather than model_type.
+            # FSDP adds a subclass, so retain the first registered base class's
+            # rules instead of relying on the wrapper's generated class name.
+            for model_class in type(model).__mro__:
+                class_conversions = get_checkpoint_conversion_mapping(model_class.__name__)
+                if class_conversions is not None:
+                    conversions = class_conversions
+                    break
         if conversions:
             for conv in conversions:
                 # Only extract simple WeightRenaming, not WeightConverter
