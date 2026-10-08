@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed configs for remote loggers (WandB, MLflow, Comet).
+"""Typed configs for remote loggers (WandB, MLflow, Comet, SwanLab).
 
 Each logger config is a plain dataclass exposing its YAML-configurable fields
 plus a ``build(...)`` method that initialises and returns the logger / run
@@ -27,6 +27,80 @@ from dataclasses import dataclass, field, fields
 from typing import Any
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+
+_SWANLAB_MIRROR_INSTALLED = False
+
+
+@dataclass
+class SwanLabConfig:
+    """Also log the W&B run to SwanLab (maps to the YAML ``wandb.swanlab:`` block).
+
+    SwanLab is an additional experiment tracker next to W&B; it is also useful
+    where Weights & Biases is not reachable. Instead of a parallel set of
+    logging calls in every recipe, it patches
+    ``wandb`` through ``swanlab.sync_wandb`` so every ``wandb.init`` /
+    ``wandb.log`` / ``wandb.config.update`` / ``finish`` a recipe makes is
+    forwarded to SwanLab. SwanLab therefore records exactly the items W&B
+    records: the run name, project, tags, group, notes, the full run config, and
+    every logged metric at the same step.
+
+    The SwanLab API key is read by the SDK from ``SWANLAB_API_KEY`` (or a prior
+    ``swanlab login``); it is never part of the YAML.
+
+    Attributes:
+        mode: SwanLab mode: ``online``, ``local``, ``offline``, or ``disabled``.
+        workspace: SwanLab workspace (user or organization). ``None`` uses the
+            account's default workspace.
+        log_dir: Local directory for SwanLab run files. ``None`` uses the SDK default.
+        upload_to_wandb: Keep uploading to W&B as usual (default). Set it to
+            ``False`` where W&B is not reachable: W&B then runs in offline mode
+            and only SwanLab receives the run.
+    """
+
+    mode: str = "online"
+    workspace: str | None = None
+    log_dir: str | None = None
+    upload_to_wandb: bool = True
+
+    def mirror_wandb(self) -> None:
+        """Patch ``wandb`` so the next ``wandb.init`` and all its logging also go to SwanLab.
+
+        Must run before ``wandb.init``. Idempotent within a process: patching
+        twice would forward every call to SwanLab twice.
+        """
+        global _SWANLAB_MIRROR_INSTALLED
+        if _SWANLAB_MIRROR_INSTALLED:
+            return
+        _, swanlab = safe_import(
+            "swanlab",
+            msg="swanlab is not installed. To enable SwanLab experiment tracking, run: uv add nemo-automodel[swanlab]",
+        )
+        swanlab.sync_wandb(
+            mode=self.mode,
+            wandb_run=self.upload_to_wandb,
+            workspace=self.workspace,
+            log_dir=self.log_dir,
+        )
+        _SWANLAB_MIRROR_INSTALLED = True
+
+
+def mirror_wandb_to_swanlab(wandb_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Pop the ``swanlab`` sub-block from raw ``wandb.init`` kwargs and enable the mirror.
+
+    For recipes that pass the ``wandb:`` block to ``wandb.init`` as a plain dict
+    rather than through :class:`WandbConfig`.
+
+    Args:
+        wandb_kwargs: The ``wandb:`` block as a dict. Not modified.
+
+    Returns:
+        The kwargs without the ``swanlab`` key, ready for ``wandb.init``.
+    """
+    kwargs = dict(wandb_kwargs)
+    swanlab_cfg = kwargs.pop("swanlab", None)
+    if swanlab_cfg is not None:
+        SwanLabConfig(**swanlab_cfg).mirror_wandb()
+    return kwargs
 
 
 @dataclass
@@ -47,6 +121,8 @@ class WandbConfig:
         group: Group name for related runs.
         tags: List of string tags attached to the run.
         notes: Free-text notes shown in the WandB UI.
+        swanlab: Optional :class:`SwanLabConfig` that mirrors this run to
+            SwanLab (the ``wandb.swanlab:`` sub-block).
         extra: Any additional ``wandb.init()`` kwargs (``mode``, ``dir``,
             ...) carried through unfiltered.
     """
@@ -57,6 +133,7 @@ class WandbConfig:
     group: str | None = None
     tags: list[str] = field(default_factory=list)
     notes: str | None = None
+    swanlab: SwanLabConfig | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -73,6 +150,8 @@ class WandbConfig:
         if "extra" in kwargs:  # caller passed an explicit extra mapping
             extra = {**extra, **(kwargs["extra"] or {})}
             extra.pop("extra", None)
+        if isinstance(direct.get("swanlab"), Mapping):
+            direct["swanlab"] = SwanLabConfig(**direct["swanlab"])
         return cls(**direct, extra=extra)
 
     def build(self, run_config: Mapping[str, Any] | None = None, model_name: str | None = None) -> Any:
@@ -96,9 +175,12 @@ class WandbConfig:
             msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]",
         )
 
+        if self.swanlab is not None:
+            self.swanlab.mirror_wandb()
+
         named = {}
         for config_field in fields(self):
-            if config_field.name == "extra":
+            if config_field.name in ("extra", "swanlab"):
                 continue
             value = getattr(self, config_field.name)
             if value is not None:
@@ -290,4 +372,4 @@ class CometConfig:
         )
 
 
-__all__ = ["CometConfig", "MLflowConfig", "WandbConfig"]
+__all__ = ["CometConfig", "MLflowConfig", "SwanLabConfig", "WandbConfig", "mirror_wandb_to_swanlab"]

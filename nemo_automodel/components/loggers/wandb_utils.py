@@ -42,7 +42,9 @@ def init_wandb_run(wandb_cfg: dict, full_config: dict, default_name: str = ""):
             "  uv add nemo-automodel[tracking]"
         ) from e
 
-    kwargs = dict(wandb_cfg)
+    from nemo_automodel.components.loggers.loggers import mirror_wandb_to_swanlab
+
+    kwargs = mirror_wandb_to_swanlab(wandb_cfg)
     if not kwargs.get("name"):
         kwargs["name"] = default_name
     return wandb.init(**kwargs, config=full_config, settings=Settings(silent=True))
