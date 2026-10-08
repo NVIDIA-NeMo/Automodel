@@ -34,6 +34,14 @@ def fake_swanlab(monkeypatch):
     module.log = lambda data, step=None: calls.append(("log", data, step))
     module.Text = lambda value: ("text", value)
     monkeypatch.setitem(sys.modules, "swanlab", module)
+
+    class Run:
+        def log(self, data=None, step=None):
+            calls.append(("wandb_log", data, step))
+
+    wandb_run_module = types.ModuleType("wandb.sdk.wandb_run")
+    wandb_run_module.Run = Run
+    monkeypatch.setitem(sys.modules, "wandb.sdk.wandb_run", wandb_run_module)
     monkeypatch.setattr(loggers, "_SWANLAB_MIRROR_INSTALLED", False)
     return calls
 
@@ -46,6 +54,17 @@ def fake_wandb(monkeypatch):
     module.Settings = lambda **kw: None
     monkeypatch.setitem(sys.modules, "wandb", module)
     return captured
+
+
+def test_builtin_scalar_unwraps_zero_dim_values():
+    import numpy as np
+    import torch
+
+    assert type(loggers._builtin_scalar(np.float32(1.5))) is float
+    assert loggers._builtin_scalar(torch.tensor(2.0)) == 2.0
+    vector = torch.ones(2)
+    assert loggers._builtin_scalar(vector) is vector
+    assert loggers._builtin_scalar("text") == "text"
 
 
 def test_mirror_wandb_defaults_keep_wandb_uploading(fake_swanlab):
@@ -113,3 +132,16 @@ def test_mirror_logs_string_values_as_text(fake_swanlab):
     SwanLabConfig().mirror_wandb()
     swanlab.log({"loss": 1.5, "timestamp": "2026-10-08T00:00:00Z"}, step=3)
     assert fake_swanlab[-1] == ("log", {"loss": 1.5, "timestamp": ("text", "2026-10-08T00:00:00Z")}, 3)
+
+
+def test_mirror_converts_tensor_scalars_before_wandb_log(fake_swanlab):
+    import numpy as np
+    import torch
+
+    run_cls = sys.modules["wandb.sdk.wandb_run"].Run
+    SwanLabConfig().mirror_wandb()
+    run_cls().log({"grad_norm": torch.tensor(3.0), "mfu": np.float32(0.5)}, step=7)
+    run_cls().log(data={"loss": np.float64(1.0)}, step=8)
+    assert fake_swanlab[-2] == ("wandb_log", {"grad_norm": 3.0, "mfu": 0.5}, 7)
+    assert fake_swanlab[-1] == ("wandb_log", {"loss": 1.0}, 8)
+    assert type(fake_swanlab[-2][1]["grad_norm"]) is float
