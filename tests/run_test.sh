@@ -74,4 +74,16 @@ coverage run \
     -m "not pleasefixme" --tb=short -rfE \
     $SHARD_ARGS \
     $ADDITIONAL_ARGS
+# The pinned release predates the Pixtral regression. Collect real backport
+# coverage once on CPU, plus real FA2/FA3 parity in the retrieval GPU job.
+if [[ "$UNIT_TEST" == "true" && "$CPU" == "true" ]]; then
+    bash tests/ci_tests/scripts/test_pixtral_compat.sh cpu
+elif [[ "$UNIT_TEST" == "false" ]]; then
+    for TEST_FOLDER in "${TEST_FOLDERS[@]}"; do
+        if [[ "$TEST_FOLDER" == "retrieval" ]]; then
+            bash tests/ci_tests/scripts/test_pixtral_compat.sh gpu
+            break
+        fi
+    done
+fi
 coverage combine -q

@@ -1373,47 +1373,6 @@ def test_mistral3_vlm_causal_export_scopes_attention_policy_to_text_tower():
     assert serialized_config["vision_config"].get("is_causal", False) is False
 
 
-@pytest.mark.parametrize("attention", ["eager", "sdpa"])
-def test_mistral3_pixtral_backport_preserves_non_flash_outputs(attention):
-    """The scoped backport preserves stock vision outputs and captured hidden states."""
-    from transformers import PixtralVisionModel
-
-    torch.manual_seed(42)
-    config = _tiny_mistral3_bidirectional_vlm_config()
-    config._attn_implementation = attention
-    model = Mistral3BidirectionalModel(config).eval()
-    stock = PixtralVisionModel(config.vision_config).eval()
-    stock.load_state_dict(model.vision_tower.state_dict())
-    pixels = torch.randn(2, 3, 16, 16)
-    sizes = torch.tensor([[16, 8], [8, 16]])
-    with torch.no_grad():
-        actual = model.vision_tower(pixels, image_sizes=sizes, output_hidden_states=True)
-        expected = stock(pixels, image_sizes=sizes, output_hidden_states=True)
-    torch.testing.assert_close(actual.last_hidden_state, expected.last_hidden_state, atol=0, rtol=0)
-    assert len(actual.hidden_states) == len(expected.hidden_states)
-    for actual_hidden, expected_hidden in zip(actual.hidden_states, expected.hidden_states):
-        torch.testing.assert_close(actual_hidden, expected_hidden, atol=0, rtol=0)
-
-
-# 5.19.1 is an unverified future-version example, not a known-fixed release.
-# This test substitutes version strings only; it does not validate those releases.
-# Before changing the Transformers pin, verify HF #49373 in the released code and
-# run test_mistral3_vl_flash_attention.py with the actual candidate dependency.
-@pytest.mark.parametrize("version", ["5.15.1", "5.17.0", "5.18.0", "5.19.0", "5.19.1"])
-def test_mistral3_pixtral_backport_does_not_patch_other_versions_or_instances(monkeypatch, version):
-    """Other Transformers versions and independently constructed HF models stay native."""
-    import transformers
-    from transformers import PixtralVisionModel
-
-    monkeypatch.setattr(transformers, "__version__", version)
-    model = Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config())
-    assert (model.vision_tower.forward.__func__ is PixtralVisionModel.forward) == (
-        version not in {"5.17.0", "5.18.0", "5.19.0"}
-    )
-    stock = PixtralVisionModel(model.config.vision_config)
-    assert stock.forward.__func__ is PixtralVisionModel.forward
-
-
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp_path, is_causal):
     config = _tiny_mistral3_bidirectional_vlm_config()

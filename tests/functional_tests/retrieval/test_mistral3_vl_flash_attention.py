@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real FlashAttention kernels must preserve multimodal retrieval outputs and gradients."""
+"""Real FlashAttention kernels must preserve retrieval and ordinary Mistral VLM behavior."""
 
 import copy
 from types import MethodType
 
 import pytest
 import torch
-from transformers import PixtralVisionModel
+from transformers import Mistral3Config, PixtralVisionModel
 from transformers.utils import is_flash_attn_2_available, is_flash_attn_3_available
 
+from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Mistral3BidirectionalConfig,
@@ -32,8 +33,8 @@ from nemo_automodel.components.models.ministral_bidirectional.model import (
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real CUDA FlashAttention kernels")
 @pytest.mark.parametrize("attention", ["flash_attention_2", "flash_attention_3"])
-@pytest.mark.parametrize("reranker", [False, True])
-def test_mistral3_vl_flash_attention_outputs_and_gradients(attention, reranker):
+@pytest.mark.parametrize("model_kind", ["embedding", "reranker", "vlm"])
+def test_mistral3_vl_flash_attention_outputs_and_gradients(attention, model_kind):
     """Mixed-size images preserve embeddings/scores, gradients, and image isolation."""
     if attention == "flash_attention_2" and not is_flash_attn_2_available():
         pytest.skip("FlashAttention 2 is an optional GPU dependency")
@@ -43,7 +44,8 @@ def test_mistral3_vl_flash_attention_outputs_and_gradients(attention, reranker):
         pytest.skip("native FlashAttention 3 requires its optional package and a Hopper GPU")
 
     torch.manual_seed(42)
-    config = Mistral3BidirectionalConfig(
+    config_cls = Mistral3Config if model_kind == "vlm" else Mistral3BidirectionalConfig
+    config = config_cls(
         text_config={
             "model_type": "ministral3",
             "vocab_size": 32,
@@ -75,7 +77,13 @@ def test_mistral3_vl_flash_attention_outputs_and_gradients(attention, reranker):
         temperature=1.0,
     )
     config._attn_implementation = attention
-    if reranker:
+    if model_kind == "vlm":
+        config.architectures = ["Mistral3ForConditionalGeneration"]
+        model_cls = _resolve_custom_model_cls_for_config(config)
+        assert model_cls is not None
+        model = model_cls(config)
+        backbone = model.model
+    elif model_kind == "reranker":
         model = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config))
         backbone = model.model.model
     else:
@@ -83,7 +91,7 @@ def test_mistral3_vl_flash_attention_outputs_and_gradients(attention, reranker):
         backbone = model.model
     model = model.to(device="cuda", dtype=torch.bfloat16).train()
     reference = copy.deepcopy(model)
-    reference_backbone = reference.model.model if reranker else reference.model
+    reference_backbone = reference.model.model if model_kind == "reranker" else reference.model
     reference_backbone.set_attn_implementation("sdpa")
     # Keep the oracle on the original upstream non-FlashAttention implementation.
     reference_backbone.vision_tower.forward = MethodType(PixtralVisionModel.forward, reference_backbone.vision_tower)
@@ -93,10 +101,14 @@ def test_mistral3_vl_flash_attention_outputs_and_gradients(attention, reranker):
         "pixel_values": torch.randn(2, 3, 28, 28, device="cuda", dtype=torch.bfloat16),
         "image_sizes": torch.tensor([[28, 28], [14, 28]], device="cuda"),
     }
-    actual = model(inputs)
-    expected = reference(inputs)
-    if reranker:
+    actual = model(**inputs).logits if model_kind == "vlm" else model(inputs)
+    expected = reference(**inputs).logits if model_kind == "vlm" else reference(inputs)
+    if model_kind == "reranker":
         actual, expected = actual.logits, expected.logits
+    elif model_kind == "vlm":
+        # Padded query logits have no semantic meaning and differ across kernels.
+        valid_tokens = inputs["attention_mask"].bool()
+        actual, expected = actual[valid_tokens], expected[valid_tokens]
     torch.testing.assert_close(actual.float(), expected.float(), atol=0.002, rtol=0.02)
     upstream_gradient = torch.randn_like(expected)
     actual.backward(upstream_gradient)
@@ -116,9 +128,9 @@ def test_mistral3_vl_flash_attention_outputs_and_gradients(attention, reranker):
 
     model.eval()
     with torch.no_grad():
-        original = model(inputs)
+        original = model(**inputs).logits if model_kind == "vlm" else model(inputs)
         inputs["pixel_values"][1].normal_()
-        changed = model(inputs)
-    if reranker:
+        changed = model(**inputs).logits if model_kind == "vlm" else model(inputs)
+    if model_kind == "reranker":
         original, changed = original.logits, changed.logits
     torch.testing.assert_close(original[0], changed[0], atol=0, rtol=0)

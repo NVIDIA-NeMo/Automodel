@@ -81,6 +81,10 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
+    # Before upgrading, recheck HF #49373 and nemo_automodel/components/models/pixtral/compat.py.
+    # Run tests/ci_tests/scripts/test_pixtral_compat.sh cpu <version> and gpu <version>:
+    # retrieval and ordinary Mistral VLMs need output/gradient parity and image isolation (FA2/FA3).
+    # Remove the backport and affected-release CI checks only after the upstream fix passes those tests.
     "transformers==5.15.1",
     # peft>=0.20 raises ImportError from get_peft_model() when an installed torchao is older than 0.16.0.
     "torchao>=0.16.0",

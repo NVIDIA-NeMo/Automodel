@@ -12,12 +12,10 @@ remains available for ``ministral3_bidirec`` checkpoints.
 
 import os
 from dataclasses import dataclass
-from types import MethodType
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
-import transformers
 from torch.distributed.fsdp import FSDPModule
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PretrainedConfig
 from transformers import initialization as init
@@ -33,6 +31,8 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3PreTrainedModel,
 )
 from transformers.utils import logging
+
+from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forward_backport
 
 if TYPE_CHECKING:
     from .reranker_export import Mistral3RerankerMetadataExporter
@@ -326,11 +326,7 @@ class Mistral3BidirectionalModel(Mistral3Model):
             config: Composite Mistral3 vision-language configuration.
         """
         super().__init__(config)
-        if transformers.__version__ in {"5.17.0", "5.18.0", "5.19.0"}:
-            # Instance-local backport of HF #49373; remove with the next fixed pin.
-            from .pixtral_compat import _pixtral_vision_forward
-
-            self.vision_tower.forward = MethodType(_pixtral_vision_forward, self.vision_tower)
+        apply_pixtral_forward_backport(self.vision_tower)
         # AutoModel already resolves our registered text config to the retrieval tower.
         # Only callers supplying a stock text config object need a replacement.
         if not isinstance(self.language_model, Ministral3BidirectionalModel):

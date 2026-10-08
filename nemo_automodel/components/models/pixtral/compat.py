@@ -21,13 +21,30 @@ fix from https://github.com/huggingface/transformers/pull/49373
 when AutoModel pins a release containing that fix.
 """
 
+from types import MethodType
+
 import torch
+import transformers
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 from transformers.models.pixtral.modeling_pixtral import PixtralVisionModel, generate_block_attention_mask
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 from transformers.utils.generic import is_flash_attention_requested, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
+
+
+def apply_pixtral_forward_backport(vision_tower: PixtralVisionModel) -> None:
+    """Apply HF #49373 to one vision tower on the affected Transformers releases.
+
+    Remove this compatibility hook and its callers when the pinned release
+    contains the upstream fix and passes the Pixtral regression tests.
+
+    Args:
+        vision_tower: The owning model's Pixtral tower. Its forward method is
+            replaced in place; independently constructed HF towers are unchanged.
+    """
+    if transformers.__version__ in {"5.17.0", "5.18.0", "5.19.0"}:
+        vision_tower.forward = MethodType(_pixtral_vision_forward, vision_tower)
 
 
 @merge_with_config_defaults
