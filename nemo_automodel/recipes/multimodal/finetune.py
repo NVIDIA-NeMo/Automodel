@@ -45,7 +45,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+from nemo_automodel.shared.import_utils import safe_import
 
 _HAS_WANDB, wandb = safe_import(
     "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
@@ -54,9 +54,8 @@ _HAS_WANDB, wandb = safe_import(
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
-from nemo_automodel.components.loggers.loggers import mirror_wandb_to_swanlab  # noqa: E402
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages  # noqa: E402
 from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend  # noqa: E402
 from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa: E402
     build_bagel_from_hf_backbones,
@@ -985,22 +984,11 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     # ------------------------------------------------------------------
     def _build_wandb(self):
         assert self.cfg.get("wandb", None) is not None
-        _, _Settings = safe_import_from(
-            "wandb",
-            "Settings",
-            msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]",
+        # default name: model basename.
+        mp = _resolve_bagel_artifact_path(self.cfg) or "bagel"
+        return init_wandb_run(
+            self.cfg.wandb.to_dict(), self.cfg.to_dict(), default_name="_".join(str(mp).split("/")[-2:])
         )
-        kwargs = mirror_wandb_to_swanlab(self.cfg.wandb.to_dict())
-        if kwargs.get("name", "") == "":
-            # default name: model basename.
-            mp = _resolve_bagel_artifact_path(self.cfg) or "bagel"
-            kwargs["name"] = "_".join(str(mp).split("/")[-2:])
-        run = wandb.init(
-            **kwargs,
-            config=self.cfg.to_dict(),
-            settings=_Settings(silent=True),
-        )
-        return run
 
     def log_train_metrics(self, log_data) -> None:
         if not self.dist_env.is_main:

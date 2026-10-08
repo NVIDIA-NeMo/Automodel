@@ -33,11 +33,36 @@ _SWANLAB_MIRROR_INSTALLED = False
 
 def _builtin_scalar(value: Any) -> Any:
     """Return a 0-d numpy / torch value as the equivalent Python scalar; anything else unchanged."""
-    if isinstance(value, (bool, int, float, str)):
-        return value
     if getattr(value, "ndim", None) == 0 and hasattr(value, "item"):
         return value.item()
     return value
+
+
+def _patch_mirror_values(swanlab: Any) -> None:
+    """Make ``swanlab.sync_wandb`` forward every value W&B logs.
+
+    The mirror (swanlab 0.10) forwards only Python ``int``/``float``/``bool``/``str``
+    values and SwanLab rejects strings as scalars, so a 0-d numpy or torch value
+    (e.g. ``grad_norm``) is dropped and a string (e.g. the per-step ``timestamp``)
+    fails to log. Unwrap 0-d values in ``Run.log`` before the mirror filters them
+    (the same hook ``sync_wandb`` patches; W&B stores the same number either way)
+    and log strings to SwanLab as text.
+    """
+    _, run_cls = safe_import_from("wandb.sdk.wandb_run", "Run")
+    log_mirrored = run_cls.log
+
+    def log_builtin_scalars(run, data=None, *args, **kwargs):
+        if isinstance(data, Mapping):
+            data = {k: _builtin_scalar(v) for k, v in data.items()}
+        return log_mirrored(run, data, *args, **kwargs)
+
+    run_cls.log = log_builtin_scalars
+    log_scalars = swanlab.log
+
+    def log_strings_as_text(data, step=None):
+        return log_scalars({k: swanlab.Text(v) if isinstance(v, str) else v for k, v in data.items()}, step=step)
+
+    swanlab.log = log_strings_as_text
 
 
 @dataclass
@@ -49,9 +74,10 @@ class SwanLabConfig:
     logging calls in every recipe, it patches
     ``wandb`` through ``swanlab.sync_wandb`` so every ``wandb.init`` /
     ``wandb.log`` / ``wandb.config.update`` / ``finish`` a recipe makes is
-    forwarded to SwanLab. SwanLab therefore records exactly the items W&B
-    records: the run name, project, tags, group, notes, the full run config, and
-    every logged metric at the same step.
+    forwarded to SwanLab. SwanLab therefore records the items W&B records: the
+    run name, project, tags, group, notes, the full run config, and every logged
+    metric at the same step (when a key is logged twice at one step, W&B keeps
+    the last value and SwanLab the first).
 
     The SwanLab API key is read by the SDK from ``SWANLAB_API_KEY`` (or a prior
     ``swanlab login``); it is never part of the YAML.
@@ -90,50 +116,8 @@ class SwanLabConfig:
             workspace=self.workspace,
             log_dir=self.log_dir,
         )
-        # The mirror only forwards Python ``int``/``float``/``bool``/``str`` values,
-        # so a 0-d numpy or torch value (e.g. a ``grad_norm`` tensor) that W&B logs
-        # fine would be dropped from SwanLab. Convert those before the mirror sees
-        # them; W&B receives the same number either way.
-        _, run_cls = safe_import_from("wandb.sdk.wandb_run", "Run")
-        log_mirrored = run_cls.log
-
-        def log_builtin_scalars(run, *args, **kwargs):
-            if args and isinstance(args[0], Mapping):
-                args = ({k: _builtin_scalar(v) for k, v in args[0].items()},) + args[1:]
-            elif isinstance(kwargs.get("data"), Mapping):
-                kwargs["data"] = {k: _builtin_scalar(v) for k, v in kwargs["data"].items()}
-            return log_mirrored(run, *args, **kwargs)
-
-        run_cls.log = log_builtin_scalars
-        # The mirror forwards string values (e.g. the per-step ``timestamp``) to
-        # ``swanlab.log`` unchanged, but SwanLab only accepts numbers as scalars and
-        # rejects them. Log them as text so SwanLab keeps every item W&B records.
-        log_scalars = swanlab.log
-
-        def log_strings_as_text(data, step=None):
-            return log_scalars({k: swanlab.Text(v) if isinstance(v, str) else v for k, v in data.items()}, step=step)
-
-        swanlab.log = log_strings_as_text
+        _patch_mirror_values(swanlab)
         _SWANLAB_MIRROR_INSTALLED = True
-
-
-def mirror_wandb_to_swanlab(wandb_kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Pop the ``swanlab`` sub-block from raw ``wandb.init`` kwargs and enable the mirror.
-
-    For recipes that pass the ``wandb:`` block to ``wandb.init`` as a plain dict
-    rather than through :class:`WandbConfig`.
-
-    Args:
-        wandb_kwargs: The ``wandb:`` block as a dict. Not modified.
-
-    Returns:
-        The kwargs without the ``swanlab`` key, ready for ``wandb.init``.
-    """
-    kwargs = dict(wandb_kwargs)
-    swanlab_cfg = kwargs.pop("swanlab", None)
-    if swanlab_cfg is not None:
-        SwanLabConfig(**swanlab_cfg).mirror_wandb()
-    return kwargs
 
 
 @dataclass
@@ -405,4 +389,4 @@ class CometConfig:
         )
 
 
-__all__ = ["CometConfig", "MLflowConfig", "SwanLabConfig", "WandbConfig", "mirror_wandb_to_swanlab"]
+__all__ = ["CometConfig", "MLflowConfig", "SwanLabConfig", "WandbConfig"]

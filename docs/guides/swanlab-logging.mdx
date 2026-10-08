@@ -7,7 +7,7 @@ position: 5
 
 [SwanLab](https://swanlab.cn) is an experiment tracker with a W&B-compatible API. NeMo AutoModel can log every run to SwanLab in addition to Weights & Biases, which is also useful where the W&B servers are not reachable.
 
-SwanLab logging mirrors the W&B logger instead of adding a second set of logging calls to every recipe: when it is enabled, each `wandb.init`, `wandb.log`, `wandb.config.update`, and `finish` a recipe makes is forwarded to SwanLab. SwanLab therefore records the same items as W&B: the project, run name, tags, group, notes, the full run config, and every logged metric at the same step.
+SwanLab logging mirrors the W&B logger instead of adding a second set of logging calls to every recipe: when it is enabled, each `wandb.init`, `wandb.log`, `wandb.config.update`, and `finish` a recipe makes is forwarded to SwanLab. SwanLab therefore records the same items as W&B: the project, run name, tags, group, notes, the full run config, and every logged metric at the same step (see [Notes](#notes) for one difference).
 
 ## Prerequisites
 
