@@ -793,6 +793,7 @@ def test_remote_code_cache_serialization_uses_model_process_group(tmp_path):
     first_rank.assert_called_once_with(group=process_group)
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestGetHfConfigNestedKwargs:
     """get_hf_config should filter nested dict kwargs from AutoConfig.from_pretrained."""
 
@@ -837,6 +838,7 @@ class TestGetHfConfigNestedKwargs:
         assert "config" not in call_kwargs
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestGetHfConfigCustomRegistry:
     """get_hf_config should prefer Automodel's config registry over Transformers AutoConfig."""
 
@@ -923,6 +925,7 @@ class TestResolveCustomConfigRegistry:
         assert reg.resolve_custom_config_cls("bert") is FakeConfig
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestDictConfigOverrideKeepsCustomPath:
     """NVBugs 6259955 Defect 2: --model.config.* overrides must not flip dispatch off the
     custom model path, and the dict ``config`` must not reach the model constructor."""
@@ -1436,6 +1439,7 @@ class TestLayerTypesFix:
             _load_config_with_layer_types_fix("some/model", "sdpa", trust_remote_code=False)
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestGetHfConfigLayerTypesRetry:
     """get_hf_config should retry via the layer_types fix helper when AutoConfig raises."""
 
@@ -1620,7 +1624,7 @@ def test_direct_config_and_weights_keep_one_revision(hf_config_hub, monkeypatch)
     from nemo_automodel._transformers import model_init
 
     root, cache, ref, requests = hf_config_hub
-    revision = model_init.resolve_revision("test/config-race", cache_dir=str(root))
+    revision = model_init.AutoConfig.resolve_revision("test/config-race", cache_dir=str(root))
     config = get_hf_config("test/config-race", "eager", cache_dir=str(root), revision=revision)
     assert config.n_embd == 64
     # Another caller advances or rewrites main after this model chose its config.
@@ -1668,7 +1672,7 @@ def test_model_owned_metadata_reads_keep_explicit_revision(hf_config_hub, monkey
     from nemo_automodel._transformers import model_init
 
     root, _, ref, _ = hf_config_hub
-    revision = model_init.resolve_revision("test/config-race", cache_dir=root)
+    revision = model_init.AutoConfig.resolve_revision("test/config-race", cache_dir=root)
     config = get_hf_config("test/config-race", "eager", cache_dir=root, revision=revision)
     ref.write_text("a" * 40)
 

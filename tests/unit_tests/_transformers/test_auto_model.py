@@ -203,6 +203,7 @@ class TestResolveMeshContext:
         assert context.strategy_config.multimodal.frozen_sharding == "replicate"
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestFromPretrainedDeviceMesh:
     def test_from_pretrained_accepts_device_mesh_as_topology_shortcut(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
@@ -1144,6 +1145,7 @@ class TestNeedSetupCacheClassesMapping:
 # =============================================================================
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestModelMappingKeyErrorFallback:
     """Test cases for _model_mapping KeyError fallback in _init_model."""
 

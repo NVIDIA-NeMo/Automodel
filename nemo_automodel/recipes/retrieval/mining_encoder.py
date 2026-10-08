@@ -26,8 +26,9 @@ from typing import Any, Literal, Protocol
 import numpy as np
 import torch
 from PIL import Image
-from transformers.utils.hub import cached_file, resolve_revision
+from transformers.utils.hub import cached_file
 
+from nemo_automodel._transformers.auto_config import NeMoAutoConfig
 from nemo_automodel.shared.import_utils import safe_import
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,7 @@ class CheckpointMiningEncoderConfig:
 
         from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
 
-        revision = resolve_revision(model_name_or_path)
+        revision = NeMoAutoConfig.resolve_revision(model_name_or_path)
         model_kwargs = {"use_liger_kernel": False, "use_sdpa_patching": True, "revision": revision}
         if trust_remote_code:
             model_kwargs["trust_remote_code"] = True

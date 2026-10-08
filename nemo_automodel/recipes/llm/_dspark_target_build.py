@@ -34,7 +34,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
-from transformers.utils.hub import resolve_revision
 
 from nemo_automodel import NeMoAutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
@@ -210,7 +209,7 @@ def build_deepseek_v4_target(
     distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
     # Pass name_or_path explicitly (as the V4 finetune recipe does) so from_config
     # resolves the base checkpoint to load and dequantize from.
-    revision = resolve_revision(target_path)
+    revision = NeMoAutoConfig.resolve_revision(target_path)
     target_config = NeMoAutoConfig.from_pretrained(
         target_path, revision=revision, name_or_path=target_path, num_nextn_predict_layers=0
     )
@@ -300,7 +299,7 @@ def build_glm_5_2_target(
             "GLM-5.2 DSpark target requires CUDA: the target is loaded "
             "with the expert-parallel / FSDP distributed path."
         )
-    revision = resolve_revision(target_path)
+    revision = NeMoAutoConfig.resolve_revision(target_path)
     target_config = NeMoAutoConfig.from_pretrained(target_path, revision=revision, trust_remote_code=trust_remote_code)
     # The published config's head_dim=192 clobbers qk_rope_head_dim on load via the
     # HF attribute_map, breaking checkpoint shape validation (see the helper).
@@ -394,7 +393,7 @@ def build_kimi_k3_target(
             "Kimi K3 DSpark target requires CUDA: the target is loaded with the "
             "expert-parallel / FSDP distributed path."
         )
-    revision = resolve_revision(target_path)
+    revision = NeMoAutoConfig.resolve_revision(target_path)
     target_config = NeMoAutoConfig.from_pretrained(target_path, revision=revision, trust_remote_code=trust_remote_code)
     text_config = getattr(target_config, "text_config", target_config)
     n_reduced = resolve_reduced_target_layers(

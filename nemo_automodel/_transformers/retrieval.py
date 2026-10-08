@@ -35,8 +35,8 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import ModelOutput, logging
-from transformers.utils.hub import resolve_revision
 
+from nemo_automodel._transformers.auto_config import NeMoAutoConfig
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.sentence_transformer_export import (
     SentenceTransformerExportConfig,
@@ -474,12 +474,14 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    hf_kwargs["revision"] = resolve_revision(
+    hf_kwargs["revision"] = NeMoAutoConfig.resolve_revision(
         model_name_or_path,
         hf_kwargs.get("revision"),
         cache_dir=hf_kwargs.get("cache_dir"),
-        token=hf_kwargs.get("token"),
+        token=hf_kwargs.get("token", hf_kwargs.get("use_auth_token")),
         local_files_only=hf_kwargs.get("local_files_only", False),
+        subfolder=hf_kwargs.get("subfolder", ""),
+        force_download=hf_kwargs.get("force_download", False),
     )
     config = loaded_config
     if config is None:
@@ -783,12 +785,14 @@ class BiEncoderModel(nn.Module):
             raise ValueError("task must be specified when calling build()")
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
-        hf_kwargs["revision"] = resolve_revision(
+        hf_kwargs["revision"] = NeMoAutoConfig.resolve_revision(
             model_name_or_path,
             hf_kwargs.get("revision"),
             cache_dir=hf_kwargs.get("cache_dir"),
-            token=hf_kwargs.get("token"),
+            token=hf_kwargs.get("token", hf_kwargs.get("use_auth_token")),
             local_files_only=hf_kwargs.get("local_files_only", False),
+            subfolder=hf_kwargs.get("subfolder", ""),
+            force_download=hf_kwargs.get("force_download", False),
         )
         config = AutoConfig.from_pretrained(
             model_name_or_path,

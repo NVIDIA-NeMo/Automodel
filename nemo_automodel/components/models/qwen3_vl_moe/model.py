@@ -133,6 +133,25 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
         cache_position=None,
         **kwargs,
     ):
+        """Fuse packed vision patches into padded text sequences.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence].
+            attention_mask: Padding mask of shape [batch, sequence], or per-layer masks.
+            position_ids: Rotary coordinates of shape [3, batch, sequence].
+            past_key_values: Hugging Face decoder cache, unused by the native text backend.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            pixel_values: Image patches of shape [image_patches, patch_features], where
+                patch_features flattens channels, temporal depth, height, and width.
+            pixel_values_videos: Video patches of shape [video_patches, patch_features].
+            image_grid_thw: Integer tensor of shape [images, 3] with temporal/height/width grids.
+            video_grid_thw: Integer tensor of shape [videos, 3] with temporal/height/width grids.
+            cache_position: Optional positions of shape [sequence].
+            **kwargs: Backend options, including mm_token_type_ids of shape [batch, sequence].
+
+        Returns:
+            Model output with last_hidden_state of shape [batch, sequence, hidden].
+        """
         embed_tokens = self.get_input_embeddings()
         if inputs_embeds is None:
             if embed_tokens is not None:
@@ -192,7 +211,10 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
             elif has_images:
                 image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True)
                 image_embeds = image_outputs.pooler_output
-                deepstack_image_embeds = image_outputs.deepstack_features
+                deepstack_image_embeds = [
+                    level if torch.is_tensor(level) else torch.cat(level, dim=0)
+                    for level in image_outputs.deepstack_features
+                ]
                 image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
                 image_mask, _ = self.get_placeholder_mask(
                     input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -202,7 +224,10 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
             else:  # has_videos only
                 video_outputs = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
                 video_embeds = video_outputs.pooler_output
-                deepstack_video_embeds = video_outputs.deepstack_features
+                deepstack_video_embeds = [
+                    level if torch.is_tensor(level) else torch.cat(level, dim=0)
+                    for level in video_outputs.deepstack_features
+                ]
                 video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
                 _, video_mask = self.get_placeholder_mask(
                     input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds

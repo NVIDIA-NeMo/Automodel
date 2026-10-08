@@ -52,7 +52,6 @@ from transformers import (  # noqa: E402
 from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
-from transformers.utils.hub import resolve_revision
 
 from nemo_automodel.components.distributed.config import (  # noqa: E402
     DDPConfig,
@@ -773,12 +772,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
         loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
 
-        kwargs["revision"] = resolve_revision(
+        kwargs["revision"] = AutoConfig.resolve_revision(
             pretrained_model_name_or_path,
             kwargs.get("revision"),
             cache_dir=kwargs.get("cache_dir"),
-            token=kwargs.get("token"),
+            token=kwargs.get("token", kwargs.get("use_auth_token")),
             local_files_only=kwargs.get("local_files_only", False),
+            subfolder=kwargs.get("subfolder", ""),
+            force_download=kwargs.get("force_download", False),
         )
         try:
             hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
@@ -894,12 +895,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             "trust_remote_code", resolve_trust_remote_code(name_or_path) if name_or_path else False
         )
         if isinstance(config, str) or kwargs.get("load_base_model", False):
-            kwargs["revision"] = resolve_revision(
+            kwargs["revision"] = AutoConfig.resolve_revision(
                 name_or_path,
                 kwargs.get("revision"),
                 cache_dir=kwargs.get("cache_dir"),
-                token=kwargs.get("token"),
+                token=kwargs.get("token", kwargs.get("use_auth_token")),
                 local_files_only=kwargs.get("local_files_only", False),
+                subfolder=kwargs.get("subfolder", ""),
+                force_download=kwargs.get("force_download", False),
             )
         if isinstance(config, str):
             try:

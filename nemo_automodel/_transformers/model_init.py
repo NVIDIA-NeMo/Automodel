@@ -38,7 +38,6 @@ try:
 except ImportError:
     StrictDataclassClassValidationError = ValueError
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils.hub import resolve_revision
 
 # For models that still accesses config.pad_token_id after v5 removes it in PretrainedConfig
 if not hasattr(PretrainedConfig, "pad_token_id"):
@@ -305,12 +304,14 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     Get the HF config for the model.
     """
     kwargs = kwargs.copy()
-    kwargs["revision"] = resolve_revision(
+    kwargs["revision"] = AutoConfig.resolve_revision(
         pretrained_model_name_or_path,
         kwargs.get("revision"),
         cache_dir=kwargs.get("cache_dir"),
-        token=kwargs.get("token"),
+        token=kwargs.get("token", kwargs.get("use_auth_token")),
         local_files_only=kwargs.get("local_files_only", False),
+        subfolder=kwargs.get("subfolder", ""),
+        force_download=kwargs.get("force_download", False),
     )
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
@@ -1217,12 +1218,14 @@ def __init_model(
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
     if is_pretrained_init:
-        kwargs["revision"] = resolve_revision(
+        kwargs["revision"] = AutoConfig.resolve_revision(
             pretrained_model_name_or_path_or_config,
             kwargs.get("revision"),
             cache_dir=kwargs.get("cache_dir"),
-            token=kwargs.get("token"),
+            token=kwargs.get("token", kwargs.get("use_auth_token")),
             local_files_only=kwargs.get("local_files_only", False),
+            subfolder=kwargs.get("subfolder", ""),
+            force_download=kwargs.get("force_download", False),
         )
     hf_config = (
         get_hf_config(pretrained_model_name_or_path_or_config, attn_implementation, **kwargs)

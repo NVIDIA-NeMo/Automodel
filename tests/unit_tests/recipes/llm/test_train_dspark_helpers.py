@@ -622,6 +622,7 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
         captured.update(kwargs)
         return "target-model"
 
+    monkeypatch.setattr(tb.NeMoAutoConfig, "resolve_revision", lambda *args, **kwargs: None)
     monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
     monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
 
@@ -679,6 +680,7 @@ def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
     monkeypatch.setattr(
         tb.NeMoAutoConfig, "from_pretrained", staticmethod(lambda *a, **k: SimpleNamespace(num_hidden_layers=43))
     )
+    monkeypatch.setattr(tb.NeMoAutoConfig, "resolve_revision", lambda *args, **kwargs: None)
     monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
     monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
 
