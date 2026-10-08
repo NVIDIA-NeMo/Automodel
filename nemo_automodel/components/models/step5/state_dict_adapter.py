@@ -15,11 +15,13 @@
 """Step-5 FP8 loading, interleaved QKV mapping and native expert conversion."""
 
 import re
+from collections.abc import Iterator
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import dequantize_from_fp8
 from nemo_automodel.components.models.step3p5.state_dict_adapter import Step3p5StateDictAdapter
@@ -52,6 +54,112 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
 
     def __init__(self, config: Step5Config, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype) -> None:
         super().__init__(config, moe_config, backend, dtype)
+
+    def iter_checkpoint_load_parts(
+        self,
+        model_state_dict: dict[str, torch.Tensor],
+        device_mesh: DeviceMesh | None = None,
+    ) -> Iterator[CheckpointLoadPart]:
+        """Load FP8 expert projections in bounded parts into final BF16 storage.
+
+        Args:
+            model_state_dict: Final native storage: fused gate/up tensors
+                [experts, hidden, 2 * intermediate], down tensors
+                [experts, intermediate, hidden], and other native model tensors.
+                DTensors shard experts over ep and input dimensions over ep_shard.
+            device_mesh: Optional expert mesh used for native/HF conversion.
+
+        Yields:
+            Checkpoint load parts with FP8 projection tensors [experts, out, in]
+            and FP32 block scales [experts, ceil(out / 128), ceil(in / 128)].
+            Finish callbacks write decoded local experts into final model storage.
+        """
+        for name, destination in model_state_dict.items():
+            if name.endswith(".moe.experts.gate_and_up_projs"):
+                gate, up = destination.chunk(2, dim=-1)
+                prefix = name.removesuffix("experts.gate_and_up_projs")
+                views = {
+                    prefix + "gate_proj.weight": gate.transpose(1, 2),
+                    prefix + "up_proj.weight": up.transpose(1, 2),
+                }
+            elif name.endswith(".moe.experts.down_projs"):
+                prefix = name.removesuffix("experts.down_projs")
+                views = {prefix + "down_proj.weight": destination.transpose(1, 2)}
+            else:
+                tensors = dict(self.convert_single_tensor_to_hf(name, destination))
+
+                def finish_plain(
+                    tensors: dict[str, torch.Tensor] = tensors,
+                    name: str = name,
+                    destination: torch.Tensor = destination,
+                ) -> None:
+                    """Install one converted non-expert checkpoint part.
+
+                    Args:
+                        tensors: Source-named tensors in the layouts documented by from_hf.
+                        name: Native destination key.
+                        destination: Final native tensor matching the converted tensor's
+                            global shape and DTensor placements; mutated in place.
+                    """
+                    converted = self.from_hf(dict(tensors), device_mesh=device_mesh)
+                    with torch.no_grad():
+                        destination.copy_(converted[name])
+
+                yield CheckpointLoadPart(tensors, frozenset((name,)), frozenset(tensors), finish_plain)
+                continue
+
+            tensors = {}
+            decode_parts = []
+            for source_name, view in views.items():
+                local_view = view.to_local() if isinstance(view, DTensor) else view
+                packed = torch.empty_like(view, dtype=torch.float8_e4m3fn, memory_format=torch.contiguous_format)
+                local_packed = packed.to_local() if isinstance(packed, DTensor) else packed
+                scale_shape = (*view.shape[:-2], (view.shape[-2] + 127) // 128, (view.shape[-1] + 127) // 128)
+                local_scale_shape = (
+                    *local_view.shape[:-2],
+                    (local_view.shape[-2] + 127) // 128,
+                    (local_view.shape[-1] + 127) // 128,
+                )
+                local_scales = torch.empty(local_scale_shape, dtype=torch.float32, device=local_view.device)
+                if isinstance(view, DTensor):
+                    for axis, placement in enumerate(view.placements):
+                        if isinstance(placement, Shard) and placement.dim in (1, 2):
+                            size = view.shape[placement.dim]
+                            if size % (128 * view.device_mesh.size(axis)):
+                                raise ValueError("FP8 expert load requires block-aligned inner-axis sharding")
+                    scales = DTensor.from_local(
+                        local_scales,
+                        view.device_mesh,
+                        view.placements,
+                        shape=torch.Size(scale_shape),
+                        stride=torch.empty(scale_shape, device="meta").stride(),
+                    )
+                else:
+                    scales = local_scales
+                tensors[source_name] = packed
+                tensors[source_name + "_scale_inv"] = scales
+                decode_parts.append((source_name, local_packed, local_scales, local_view))
+
+            def finish_experts(
+                parts: tuple[tuple[str, torch.Tensor, torch.Tensor, torch.Tensor], ...] = tuple(decode_parts),
+            ) -> None:
+                """Decode local projections directly into final weight views.
+
+                Args:
+                    parts: Source name, FP8 weights [local_experts, out, in],
+                        FP32 block scales [local_experts, ceil(out / 128), ceil(in / 128)],
+                        and destination view [local_experts, out, in] for each projection.
+                        Destination views alias final model parameters and are mutated.
+                """
+                with torch.no_grad():
+                    for source_name, packed, scales, target in parts:
+                        for expert in range(target.shape[0]):
+                            decoded = dequantize_from_fp8(
+                                packed[expert], scales[expert], dtype=target.dtype, name=source_name
+                            )
+                            target[expert].copy_(decoded)
+
+            yield CheckpointLoadPart(tensors, frozenset((name,)), frozenset(tensors), finish_experts)
 
     def from_hf(
         self,
@@ -108,7 +216,9 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
                             stride=reference.stride(),
                         )
                     elif device_mesh is not None:
-                        tensor = create_dtensor_from_local(decoded, device_mesh)
+                        tensor = create_dtensor_from_local(
+                            decoded, device_mesh, n_experts=self.moe_config.n_routed_experts
+                        )
                     else:
                         tensor = decoded
                 else:
@@ -161,6 +271,17 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
             groups = self.config.num_attention_groups
             heads = self.config.num_attention_heads // groups
             dim, hidden = self.config.head_dim, self.config.hidden_size
+            if isinstance(tensor, DTensor) and any(
+                isinstance(placement, Shard) and placement.dim == 0 and groups % tensor.device_mesh.size(mesh_dim) != 0
+                for mesh_dim, placement in enumerate(tensor.placements)
+            ):
+                # QKV head groups may cross an FSDP shard boundary. Export the
+                # small attention projection with replicated group ownership.
+                tensor = tensor.redistribute(
+                    placements=tuple(
+                        Replicate() if isinstance(p, Shard) and p.dim == 0 else p for p in tensor.placements
+                    )
+                )
             grouped = tensor.reshape(groups, heads + 2, dim, hidden)
             prefix = fqn.removesuffix("qkv_proj.weight")
             result = [

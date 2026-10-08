@@ -140,7 +140,21 @@ def test_cast_preserves_original_precision():
     assert torch.equal(bias, torch.full_like(bias, 34.03125))
 
 
-def test_checkpoint_roundtrip_and_loaded_model():
+def test_fp32_storage_under_bf16_default_dtype() -> None:
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        model = make_model(dtype="bfloat16")
+    finally:
+        torch.set_default_dtype(previous)
+    for name, parameter in model.named_parameters():
+        if any(keyword in name for keyword in model._keep_in_fp32_modules_strict):
+            assert parameter.dtype == torch.float32, name
+    assert model.model.embed_tokens.weight.dtype == torch.bfloat16
+
+
+def test_adapter_roundtrip_and_directly_loaded_model():
+    """Component conversion check; native distributed loading uses the recipe CLI."""
     model = make_model()
     adapter = model.state_dict_adapter
     native = model.state_dict()

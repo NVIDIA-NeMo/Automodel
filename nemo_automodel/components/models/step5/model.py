@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -171,6 +172,9 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         )
         self.state_dict_adapter = Step5StateDictAdapter(text, moe_config, self.backend, dtype)
         self.init_weights()
+        # Establish FP32 norm storage even under Transformers' BF16 default dtype,
+        # before distributed checkpoint loading can round source FP32 weights.
+        cast_model_to_dtype(self, dtype)
 
     @classmethod
     def from_config(
@@ -206,7 +210,10 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
     ) -> None:
         """Initialize after meta allocation and apply precision-aware casting."""
         self.init_weights(buffer_device)
-        cast_model_to_dtype(self, dtype)
+        # Construction establishes storage dtypes before FSDP captures parameters.
+        # Recasting sharded parameters here replaces FSDP's cached storage.
+        if not any(isinstance(parameter, DTensor) for parameter in self.parameters()):
+            cast_model_to_dtype(self, dtype)
 
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the language embedding module."""
@@ -329,7 +336,8 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
         nn.init.normal_(self.vit_large_projector.weight, std=0.02)
         if self.vit_large_projector.bias is not None:
             nn.init.zeros_(self.vit_large_projector.bias)
-        cast_model_to_dtype(self, dtype)
+        if not any(isinstance(parameter, DTensor) for parameter in self.parameters()):
+            cast_model_to_dtype(self, dtype)
 
     def _encode_images(self, pixels: torch.Tensor, *, compute_dtype: torch.dtype) -> torch.Tensor:
         """Encode overview or crop images.
