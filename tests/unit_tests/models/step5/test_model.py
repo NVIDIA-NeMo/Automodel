@@ -334,3 +334,38 @@ def test_checkpoint_parts_without_quantization_do_not_request_scales():
     part.checkpoint_tensors["model.layers.3.moe.down_proj.weight"].fill_(0.375)
     part.finish()
     torch.testing.assert_close(destination, torch.full_like(destination, 0.375))
+
+
+@pytest.mark.parametrize(
+    "weight_name",
+    [
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.qkv_proj.weight",
+        "model.layers.3.moe.experts.down_projs",
+    ],
+)
+def test_checkpoint_parts_preserve_backend_extra_state(weight_name: str) -> None:
+    """Component load-plan check; distributed loading is validated through the native CLI."""
+    model = make_model()
+    adapter = model.state_dict_adapter
+    expected = model.state_dict()[weight_name].clone()
+    source = adapter.to_hf({weight_name: expected})
+    extra_state = torch.tensor([3, 1, 4], dtype=torch.uint8)
+    native = {
+        "model.layers.0.self_attn.qkv_proj._extra_state": extra_state.clone(),
+        weight_name: torch.zeros_like(expected),
+        "lm_head._extra_state": extra_state.clone(),
+    }
+    completed = set()
+    for part in adapter.iter_checkpoint_load_parts(native):
+        assert part.checkpoint_tensors
+        assert set(part.checkpoint_tensors) <= source.keys()
+        assert not completed.intersection(part.model_keys)
+        completed.update(part.model_keys)
+        for name, target in part.checkpoint_tensors.items():
+            target.copy_(source[name])
+        part.finish()
+    assert completed == native.keys()
+    torch.testing.assert_close(native[weight_name], expected, rtol=0, atol=0)
+    for name in ("model.layers.0.self_attn.qkv_proj._extra_state", "lm_head._extra_state"):
+        torch.testing.assert_close(native[name], extra_state, rtol=0, atol=0)

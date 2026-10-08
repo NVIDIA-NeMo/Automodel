@@ -89,8 +89,15 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
             [experts, ceil(out / 128), ceil(in / 128)]; finish callbacks decode local
             experts into final storage. Excluded or unquantized projections use
             BF16 views aliasing final parameter storage, without temporary copies.
+            Backend _extra_state entries retain their initialized runtime values;
+            they are accounted for by the first weight part without checkpoint I/O.
         """
+        extra_state_keys = frozenset(name for name in model_state_dict if name.endswith("_extra_state"))
         for name, destination in model_state_dict.items():
+            if name.endswith("_extra_state"):
+                continue
+            model_keys = frozenset((name,)) | extra_state_keys
+            extra_state_keys = frozenset()
             if name.endswith(".moe.experts.gate_and_up_projs"):
                 gate, up = destination.chunk(2, dim=-1)
                 prefix = name.removesuffix("experts.gate_and_up_projs")
@@ -123,7 +130,7 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
                     with torch.no_grad():
                         destination.copy_(converted[name])
 
-                yield CheckpointLoadPart(tensors, frozenset((name,)), frozenset(tensors), finish_plain)
+                yield CheckpointLoadPart(tensors, model_keys, frozenset(tensors), finish_plain)
                 continue
 
             tensors = {}
@@ -190,7 +197,7 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
                             )
                             target[expert].copy_(decoded)
 
-            yield CheckpointLoadPart(tensors, frozenset((name,)), frozenset(temporary_keys), finish_experts)
+            yield CheckpointLoadPart(tensors, model_keys, frozenset(temporary_keys), finish_experts)
 
     def from_hf(
         self,
