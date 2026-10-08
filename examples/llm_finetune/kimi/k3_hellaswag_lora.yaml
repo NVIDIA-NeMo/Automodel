@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Full-parameter, 93-layer Kimi K3 text SFT run on 256 GPUs:
-#   64 nodes x 4 GPUs, EP32 x PP8, DP32, 100 steps, lr=1e-5.
-# PP stages own the complete attention-residual blocks:
-#   [0,12), [12,24), [24,36), [36,48), [48,60), [60,72), [72,84), [84,93).
+# Ordinary LoRA SFT for the 93-layer Kimi K3 text model on 128 GPUs:
+#   32 GB200 nodes x 4 GPUs, PP4, DP32, EP32, 100 steps.
+# LoRA targets all supported linear modules. Dense modules use rank 32; routed
+# experts use rank 2 because moe_rank_scaling divides the rank by the 16 active
+# experts per token. HybridEP and torch_mm are the validated K3 expert path.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
+  gc_every_steps: 10
   global_batch_size: 256
   local_batch_size: 8
   ckpt_every_steps: 100
@@ -48,7 +50,7 @@ model:
   use_sdpa_patching: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: eager
+    attn: te
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
@@ -58,21 +60,33 @@ model:
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["*"]
+  dim: 32
+  alpha: 32
+  dropout: 0.0
+  use_memory_efficient_lora: false
+  use_triton: false
+  moe_rank_scaling: true
+
 checkpoint:
-  enabled: false
-  checkpoint_dir: checkpoints/kimi_k3_hellaswag
+  enabled: true
+  checkpoint_dir: checkpoints/kimi_k3_hellaswag_lora
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: final
   dequantize_base_checkpoint: true
+  max_recent_checkpoints: 1
 
 distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 8
+  pp_size: 4
   ep_size: 32
   sequence_parallel: false
-  activation_checkpointing: true
+  activation_checkpointing: selective
+  defer_fsdp_grad_sync: true
   pipeline:
     pp_schedule: 1f1b
     pp_microbatch_size: 1
@@ -80,6 +94,7 @@ distributed:
     patch_inner_model: false
     patch_causal_lm_model: false
   moe:
+    ignore_router_for_ac: true
     reshard_after_forward: true
     wrap_outer_model: false
 
@@ -104,6 +119,8 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
+  num_workers: 0
+  drop_last: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -120,10 +137,11 @@ validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   batch_size: 8
+  num_workers: 0
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-5
+  lr: 1.0e-4
   weight_decay: 0.0
   betas: [0.9, 0.95]
   eps: 1.0e-8
@@ -131,17 +149,14 @@ optimizer:
 wandb:
   enable: false
   project: kimi-k3-sft
-  name: kimi_k3_hellaswag_ep32_pp8
+  name: kimi_k3_hellaswag_lora_ep32_pp4
   dir: wandb
 
 clip_grad_norm:
   max_norm: 1.0
 
-prewarm:
-  comm_groups: true
-
 ci:
   recipe_owner: huiyingl
-  nodes: 64
+  nodes: 32
   cluster_tag: gb200
-  time: "01:30:00"
+  time: "01:00:00"
