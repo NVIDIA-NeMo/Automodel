@@ -100,6 +100,10 @@ def _hc_case(dtype: torch.dtype):
     return run
 
 
+@pytest.mark.runtime_budget(
+    30,
+    reason="compiles the three mHC cores and the fp32 RMSNorm core with torch.compile for one dtype (about 10 s on CI)",
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_compiled_cores_match_eager_and_reach_modules_built_earlier(restore_cores, dtype: torch.dtype) -> None:
     run = _hc_case(dtype)
