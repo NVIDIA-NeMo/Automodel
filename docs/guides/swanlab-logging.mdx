@@ -73,5 +73,8 @@ swanlab sync /path/to/swanlog/run-<id>
 
 ## Notes
 
-- String values that W&B logs (for example the per-step `timestamp`) appear in SwanLab as text.
+- Numbers, strings, and images are mirrored. String values (for example the per-step `timestamp`) appear in SwanLab as text. Other W&B types such as `wandb.Table` and histograms are not mirrored.
 - When a recipe logs the same key twice at one step (for example a training and a validation record at the same step), W&B keeps the last value and SwanLab keeps the first.
+- A resumed W&B run (`id` / `resume` in the `wandb` block) starts a new SwanLab run.
+- With `upload_to_wandb: false`, W&B always runs in `offline` mode, even if the `wandb` block sets another `mode`.
+- The mirror is installed once per process; a second recipe in the same process keeps the first run's SwanLab settings.
