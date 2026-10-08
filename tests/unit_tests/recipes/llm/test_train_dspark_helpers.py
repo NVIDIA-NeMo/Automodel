@@ -25,12 +25,9 @@ Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
   honoring an explicit ``_target_`` (e.g. TE FusedAdam with
   ``master_weights``/``exp_avg_dtype``/...) instead of always hardcoding plain
   ``torch.optim.AdamW``.
-- ``_resolve_warmup_steps``: the ratio-derived warmup length is floored for
-  short / small-dataset runs, unless the caller opts out with ``warmup_ratio<=0``.
-- ``_resolve_wandb_kwargs`` / ``_init_dspark_wandb``: the examples'
-  documentation-only ``enable`` flag is stripped before forwarding to
-  ``wandb.init`` and gates whether to log at all; ``_init_dspark_wandb`` also
-  gates on rank (``is_main``) and block presence.
+- ``resolve_warmup_steps`` at the DSpark floor: the ratio-derived warmup length
+  is floored for short / small-dataset runs, unless the caller opts out with
+  ``warmup_ratio<=0``.
 - ``_DSparkMetricWindow``: the log window packs into one all-reduce and unpacks
   back to the logged metrics, dividing the acceptance diagnostics once so they
   stay the exact global ratio across DP ranks.
@@ -53,7 +50,6 @@ from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest, write_shard, write_target_weights
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics
-from nemo_automodel.recipes.llm import train_dspark
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_backend,
     gather_full_weight_module,
@@ -62,6 +58,7 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     unsupported_parallel_axes,
     validate_dspark_parallelism_axes,
 )
+from nemo_automodel.recipes.llm._spec_train_utils import resolve_warmup_steps
 from nemo_automodel.recipes.llm.train_dspark import (
     _DSPARK_WINDOW_SCALARS,
     TrainDSparkRecipe,
@@ -70,10 +67,7 @@ from nemo_automodel.recipes.llm.train_dspark import (
     _build_dspark_optimizer,
     _DSparkMetricWindow,
     _extract_mm_kwargs,
-    _init_dspark_wandb,
     _resolve_dspark_optimizer_spec,
-    _resolve_wandb_kwargs,
-    _resolve_warmup_steps,
     _validate_cached_dspark_manifest,
 )
 
@@ -188,7 +182,7 @@ def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog)
             self.config = config
             built.append((config, kwargs))
 
-    monkeypatch.setattr(train_dspark, "Checkpointer", FakeCheckpointer)
+    monkeypatch.setattr("nemo_automodel.components.checkpoint.checkpointing.Checkpointer", FakeCheckpointer)
     obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
     obj.cfg = SimpleNamespace(
         get=lambda key, default=None: (
@@ -398,8 +392,12 @@ def test_build_optimizer_only_covers_trainable_params():
 
 
 # ---------------------------------------------------------------------------
-# _resolve_warmup_steps
+# resolve_warmup_steps at the DSpark floor
 # ---------------------------------------------------------------------------
+
+
+def _resolve_warmup_steps(warmup_ratio, total_optim_steps, min_warmup_steps=TrainDSparkRecipe.min_warmup_steps):
+    return resolve_warmup_steps(warmup_ratio, total_optim_steps, min_warmup_steps)
 
 
 def test_warmup_steps_floors_short_runs():
@@ -426,89 +424,6 @@ def test_warmup_steps_negative_ratio_treated_as_opt_out():
 def test_warmup_steps_custom_floor():
     assert _resolve_warmup_steps(0.01, 100, min_warmup_steps=5) == 5
     assert _resolve_warmup_steps(0.5, 100, min_warmup_steps=5) == 50
-
-
-# ---------------------------------------------------------------------------
-# _resolve_wandb_kwargs
-# ---------------------------------------------------------------------------
-
-
-def test_wandb_kwargs_disabled_when_enable_false():
-    assert _resolve_wandb_kwargs({"enable": False, "project": "p"}) is None
-
-
-def test_wandb_kwargs_enabled_strips_enable_key():
-    kwargs = _resolve_wandb_kwargs({"enable": True, "project": "p", "group": "g"})
-    assert kwargs == {"project": "p", "group": "g"}
-
-
-def test_wandb_kwargs_defaults_enabled_when_flag_absent():
-    kwargs = _resolve_wandb_kwargs({"project": "p"})
-    assert kwargs == {"project": "p"}
-
-
-# ---------------------------------------------------------------------------
-# _init_dspark_wandb
-# ---------------------------------------------------------------------------
-
-
-def _patch_wandb_run(monkeypatch, run=object()):
-    """Patch the module-level wandb hooks ``_init_dspark_wandb`` calls, returning a spy call log."""
-    import nemo_automodel.recipes.llm.train_dspark as train_dspark_module
-
-    calls = {}
-
-    def _fake_init_wandb_run(wandb_kwargs, cfg_dict, default_name):
-        calls["wandb_kwargs"] = wandb_kwargs
-        calls["cfg_dict"] = cfg_dict
-        calls["default_name"] = default_name
-        return run
-
-    def _fake_suppress():
-        calls["suppressed"] = True
-
-    monkeypatch.setattr(train_dspark_module, "init_wandb_run", _fake_init_wandb_run)
-    monkeypatch.setattr(train_dspark_module, "suppress_wandb_log_messages", _fake_suppress)
-    return calls
-
-
-def test_init_wandb_skipped_on_non_main_rank(monkeypatch):
-    calls = _patch_wandb_run(monkeypatch)
-    result = _init_dspark_wandb(is_main=False, wandb_cfg=_opt_cfg(project="p"), cfg_dict={}, default_name="run")
-    assert result is None
-    assert calls == {}
-
-
-def test_init_wandb_skipped_when_block_absent(monkeypatch):
-    calls = _patch_wandb_run(monkeypatch)
-    result = _init_dspark_wandb(is_main=True, wandb_cfg=None, cfg_dict={}, default_name="run")
-    assert result is None
-    assert calls == {}
-
-
-def test_init_wandb_skipped_when_disabled(monkeypatch):
-    calls = _patch_wandb_run(monkeypatch)
-    result = _init_dspark_wandb(
-        is_main=True, wandb_cfg=_opt_cfg(enable=False, project="p"), cfg_dict={}, default_name="run"
-    )
-    assert result is None
-    assert calls == {}
-
-
-def test_init_wandb_runs_on_main_when_enabled(monkeypatch):
-    sentinel_run = object()
-    calls = _patch_wandb_run(monkeypatch, run=sentinel_run)
-    result = _init_dspark_wandb(
-        is_main=True,
-        wandb_cfg=_opt_cfg(project="p", group="g"),
-        cfg_dict={"lr": 1e-4},
-        default_name="dspark_run",
-    )
-    assert result is sentinel_run
-    assert calls["suppressed"] is True
-    assert calls["wandb_kwargs"] == {"project": "p", "group": "g"}
-    assert calls["cfg_dict"] == {"lr": 1e-4}
-    assert calls["default_name"] == "dspark_run"
 
 
 # ---------------------------------------------------------------------------
@@ -1138,12 +1053,12 @@ def test_metric_window_unpack_rejects_mismatched_length():
 
 
 def _dspark_resume_self(mask_token_id=7):
-    return SimpleNamespace(
-        runtime=SimpleNamespace(global_step=0),
-        _resume_epoch=0,
-        mask_token_id=mask_token_id,
-        checkpoint_config=SimpleNamespace(allow_legacy_pickle_restore=False),
-    )
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.runtime = SimpleNamespace(global_step=0)
+    obj._resume_epoch = 0
+    obj.mask_token_id = mask_token_id
+    obj.checkpoint_config = SimpleNamespace(allow_legacy_pickle_restore=False)
+    return obj
 
 
 def _write_dspark_meta(tmp_path, **fields):

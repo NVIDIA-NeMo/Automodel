@@ -340,19 +340,3 @@ def test_check_captured_raises_on_layer_count_mismatch():
     target = HFEagle3TargetModel(_tiny_target(), aux_layer_ids=[1, 2, 3])
     with pytest.raises(RuntimeError, match="Expected 3 captured aux layers"):
         target._check_captured({1: torch.zeros(1)})
-
-
-# --------------------------------------------------------------------------- #
-# _submesh_or_none: None mesh, present axis, and a missing axis (KeyError -> None)
-# --------------------------------------------------------------------------- #
-def test_submesh_or_none_handles_none_present_and_missing(monkeypatch):
-    assert train_eagle3._submesh_or_none(None, "cp") is None
-
-    monkeypatch.setattr(train_eagle3, "get_flat_mesh", lambda mesh, name: ("submesh", name))
-    assert train_eagle3._submesh_or_none(object(), "dp") == ("submesh", "dp")
-
-    def _raise(mesh, name):
-        raise KeyError(name)
-
-    monkeypatch.setattr(train_eagle3, "get_flat_mesh", _raise)
-    assert train_eagle3._submesh_or_none(object(), "cp") is None

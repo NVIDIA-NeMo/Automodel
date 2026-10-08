@@ -145,7 +145,7 @@ def test_context_parallel_is_rejected_before_the_generic_cp_gates(monkeypatch):
     cp_mesh = SimpleNamespace(size=lambda: 2)
     dist_setup = SimpleNamespace(mesh_context=SimpleNamespace(device_mesh=object()))
     monkeypatch.setattr(train_dflash, "create_distributed_setup_from_config", lambda cfg, world_size: dist_setup)
-    monkeypatch.setattr(train_dflash, "_submesh_or_none", lambda mesh, name: cp_mesh if name == "cp" else object())
+    monkeypatch.setattr(train_dflash, "submesh_or_none", lambda mesh, name: cp_mesh if name == "cp" else object())
 
     def _must_not_load(*args, **kwargs):
         raise AssertionError("the target must not be loaded before the CP gate rejects the config")

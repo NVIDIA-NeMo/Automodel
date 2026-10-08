@@ -27,11 +27,20 @@ import math
 import pytest
 import torch
 
+from nemo_automodel.recipes.llm import _spec_train_utils
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    all_reduce_mean,
+    all_reduce_sum,
     apply_draft_activation_checkpointing,
+    check_resumed_mask_token_id,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    packing_kwargs,
+    resolve_wandb_kwargs,
+    resolve_warmup_steps,
     should_sync_grads,
+    submesh_or_none,
+    validate_packing_gates,
 )
 
 # ---------------------------------------------------------------------------
@@ -203,3 +212,102 @@ def test_draft_activation_checkpointing_warns_when_draft_has_no_layers():
     # Must not raise -- a draft with an unexpected shape should be a loud warning,
     # not a crash, since fp8/compile before it already succeeded.
     apply_draft_activation_checkpointing(draft, True)
+
+
+# ---------------------------------------------------------------------------
+# all_reduce_sum / all_reduce_mean
+# ---------------------------------------------------------------------------
+
+
+def test_all_reduce_helpers_pass_through_without_process_group():
+    t = torch.tensor(3.0)
+    assert all_reduce_sum(t) is t
+    assert all_reduce_mean(t).item() == 3.0
+
+
+def test_all_reduce_helpers_reduce_across_ranks(monkeypatch):
+    monkeypatch.setattr(_spec_train_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(_spec_train_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(_spec_train_utils.dist, "get_world_size", lambda: 4)
+    monkeypatch.setattr(_spec_train_utils.dist, "all_reduce", lambda value, op=None: value.mul_(4.0))
+
+    assert all_reduce_sum(torch.tensor(2.0)).item() == 8.0
+    assert all_reduce_mean(torch.tensor(2.0)).item() == 2.0
+
+
+# ---------------------------------------------------------------------------
+# submesh_or_none
+# ---------------------------------------------------------------------------
+
+
+def test_submesh_or_none_handles_none_present_and_missing(monkeypatch):
+    assert submesh_or_none(None, "dp") is None
+
+    monkeypatch.setattr(_spec_train_utils, "get_flat_mesh", lambda mesh, name: ("submesh", name))
+    assert submesh_or_none(object(), "dp") == ("submesh", "dp")
+
+    def _raise(mesh, name):
+        raise KeyError(name)
+
+    monkeypatch.setattr(_spec_train_utils, "get_flat_mesh", _raise)
+    assert submesh_or_none(object(), "cp") is None
+
+
+# ---------------------------------------------------------------------------
+# packing_kwargs / validate_packing_gates
+# ---------------------------------------------------------------------------
+
+
+def test_packing_kwargs_empty_when_unpacked_and_forwarded_when_packed():
+    assert packing_kwargs({"input_ids": torch.zeros(1, 4)}) == {}
+    packed = {
+        "input_ids": torch.zeros(1, 4),
+        "position_ids": torch.zeros(1, 4),
+        "seq_lens": torch.tensor([[4]]),
+        "doc_remaining": torch.zeros(1, 4),
+    }
+    assert set(packing_kwargs(packed)) == {"position_ids", "seq_lens", "doc_remaining"}
+
+
+def test_validate_packing_gates_fail_fast():
+    validate_packing_gates(method="DFlash", cp_size=1, target_attn_impl="sdpa", micro_batch_size=4)
+    validate_packing_gates(method="DFlash", cp_size=1, target_attn_impl="flash_attention_2", micro_batch_size=1)
+    with pytest.raises(NotImplementedError, match="in DSpark"):
+        validate_packing_gates(method="DSpark", cp_size=2, target_attn_impl="sdpa", micro_batch_size=1)
+    with pytest.raises(ValueError, match="micro_batch_size=1"):
+        validate_packing_gates(method="EAGLE-1/2", cp_size=1, target_attn_impl="flash_attention_2", micro_batch_size=2)
+
+
+# ---------------------------------------------------------------------------
+# resolve_warmup_steps / check_resumed_mask_token_id
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_warmup_steps_default_floor_is_one():
+    assert resolve_warmup_steps(0.05, 100) == 5
+    assert resolve_warmup_steps(0.001, 100) == 1
+    assert resolve_warmup_steps(0.0, 100) == 1
+
+
+def test_check_resumed_mask_token_id():
+    check_resumed_mask_token_id({}, 5, "ckpt")
+    check_resumed_mask_token_id({"mask_token_id": 5}, 5, "ckpt")
+    with pytest.raises(ValueError, match="mask_token_id mismatch"):
+        check_resumed_mask_token_id({"mask_token_id": 4}, 5, "ckpt")
+
+
+# ---------------------------------------------------------------------------
+# resolve_wandb_kwargs
+# ---------------------------------------------------------------------------
+
+
+def test_wandb_kwargs_disabled_when_enable_false():
+    assert resolve_wandb_kwargs({"enable": False, "project": "p"}) is None
+
+
+def test_wandb_kwargs_enabled_strips_enable_key():
+    assert resolve_wandb_kwargs({"enable": True, "project": "p", "group": "g"}) == {"project": "p", "group": "g"}
+
+
+def test_wandb_kwargs_defaults_enabled_when_flag_absent():
+    assert resolve_wandb_kwargs({"project": "p"}) == {"project": "p"}

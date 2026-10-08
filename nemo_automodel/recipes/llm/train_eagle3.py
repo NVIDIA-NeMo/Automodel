@@ -19,14 +19,12 @@ from __future__ import annotations
 import copy
 import logging
 import os
-import pathlib
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
-from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoConfig
 
@@ -34,13 +32,8 @@ from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
-    CheckpointingConfig,
     load_hf_safetensors_state_dict,
-    load_torch_ckpt,
-    save_config,
-    save_losses,
 )
-from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import (
     build_eagle3_dataloader,
@@ -52,10 +45,8 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
 )
 from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.speculative.decode_eval import DecodeEvalRunner, resolve_decode_eval_config
@@ -70,13 +61,15 @@ from nemo_automodel.components.speculative.regen_loop import RegenRunner, resolv
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
+from nemo_automodel.recipes.llm._spec_recipe_base import SpecDecodeRecipeBase
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    all_reduce_mean,
+    all_reduce_sum,
     apply_draft_compile,
     apply_draft_fp8,
-    make_warmup_cosine_schedule,
-    optim_steps_per_epoch,
+    packing_kwargs,
     should_sync_grads,
+    submesh_or_none,
 )
 from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
 
@@ -161,19 +154,6 @@ def _build_kimi_k3_target_backend(recipe_cfg) -> BackendConfig:
     )
 
 
-def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(value, op=dist.ReduceOp.SUM)
-        value = value / dist.get_world_size()
-    return value
-
-
-def _all_reduce_sum(value: torch.Tensor) -> torch.Tensor:
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(value, op=dist.ReduceOp.SUM)
-    return value
-
-
 def _window_tau_sim(step_prefix_hits: torch.Tensor | None, step_valid: torch.Tensor | None) -> float | None:
     """Simulated accept length over a metrics window, reduced across ranks.
 
@@ -186,26 +166,11 @@ def _window_tau_sim(step_prefix_hits: torch.Tensor | None, step_valid: torch.Ten
     """
     if step_prefix_hits is None or step_valid is None:
         return None
-    hits = _all_reduce_sum(step_prefix_hits.clone())
-    valid = _all_reduce_sum(step_valid.clone())
+    hits = all_reduce_sum(step_prefix_hits.clone())
+    valid = all_reduce_sum(step_valid.clone())
     if valid.sum().item() <= 0:
         return None
     return simulated_accept_length(hits, valid).item()
-
-
-def _submesh_or_none(device_mesh, name: str):
-    """Return the named 1D submesh (e.g. "cp"/"dp") or None if absent.
-
-    Uses ``get_flat_mesh`` so ``_flatten()``-created axes ("dp") resolve on
-    PyTorch 2.9-2.11, where a plain ``device_mesh[name]`` is deprecated or the
-    name is missing from ``mesh_dim_names``.
-    """
-    if device_mesh is None:
-        return None
-    try:
-        return get_flat_mesh(device_mesh, name)
-    except KeyError:
-        return None
 
 
 def _validate_cp_gates(
@@ -523,8 +488,11 @@ def _apply_draft_peft_and_fp8(draft_model, cfg, parallel_drafting: bool, freeze_
     return peft_config
 
 
-class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
+class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
     """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
+
+    # Existing EAGLE checkpoints key the RNG file on the global rank.
+    rng_checkpoint_on_dp_ranks = False
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -768,67 +736,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # optimizer captures them and TP replica gradients are averaged.
         broadcast_tp_replicas([self.trainer_module], self.device_mesh)
 
-        opt_cfg = self.cfg.optimizer
-        self.peak_lr = float(opt_cfg.lr)
-        self.optimizer = torch.optim.AdamW(
-            [p for p in self.trainer_module.parameters() if p.requires_grad],
-            lr=self.peak_lr,
-            betas=tuple(opt_cfg.get("betas", (0.9, 0.95))),
-            weight_decay=opt_cfg.get("weight_decay", 0.0),
-        )
-        self.grad_accumulation_steps = recipe_cfg.get("grad_accumulation_steps", 1)
-        self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
+        self._setup_training_state(recipe_cfg)
         self.target_prefetch_depth = self._resolve_prefetch_depth(recipe_cfg)
-        self.num_epochs = recipe_cfg.num_epochs
-        self.log_every_steps = recipe_cfg.get("log_every_steps", 10)
-        # Checkpoint cadence. The two knobs are independent:
-        #   * ``ckpt_every_steps``            -- save every N optimizer steps (None/<=0 = off).
-        #   * ``save_checkpoint_every_epoch`` -- save at each epoch boundary (off by default).
-        # The fully-trained model is always saved once the run completes; these
-        # only add intermediate checkpoints (and stack when both are set). With
-        # both off, the end-of-run checkpoint is the only one written.
-        # NOTE: field names mirror StepScheduler (components/training/step_scheduler.py),
-        # which the SFT recipe uses for the same cadence; EAGLE hand-rolls its own
-        # loop, so a future refactor could adopt StepScheduler here too.
-        self.ckpt_every_steps = recipe_cfg.get("ckpt_every_steps", None)
-        self.save_checkpoint_every_epoch = recipe_cfg.get("save_checkpoint_every_epoch", False)
-        self.output_dir = pathlib.Path(recipe_cfg.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Warmup + cosine LR schedule. EAGLE-3 from-scratch training with a
-        # flat LR diverges after the first epoch (loss climbs back up); a
-        # cosine schedule keeps the optimizer step size small enough once
-        # AdamW's second-moment estimates have settled.
-        try:
-            num_batches_per_epoch = len(self.train_dataloader)
-        except TypeError:
-            num_batches_per_epoch = 0
-        # Use ceil division so a trailing partial accumulation window (i.e. when
-        # ``num_batches_per_epoch`` is not a multiple of ``grad_accumulation_steps``)
-        # is counted as a real optimizer step. The training loop flushes that
-        # leftover window at the end of each epoch, so the LR scheduler must
-        # cover those steps too -- otherwise ``progress`` saturates and the
-        # final epoch trains at ``min_lr_ratio`` instead of the intended decay.
-        total_optim_steps = max(
-            1,
-            self.num_epochs * optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps),
-        )
-        warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
-        min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
-        warmup_steps = max(1, int(warmup_ratio * total_optim_steps))
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, make_warmup_cosine_schedule(warmup_steps, total_optim_steps, min_lr_ratio)
-        )
-        self.total_optim_steps = total_optim_steps
-        self.warmup_steps = warmup_steps
-        self.min_lr_ratio = min_lr_ratio
         # Baseline segment length; the on-policy regen swap warns if a regenerated
         # cycle differs from it, since the fixed LR horizon assumes an unchanged
         # per-pass step count (see ``_maybe_swap_regen_dataloader``).
-        self._orig_batches_per_epoch = num_batches_per_epoch
-
-        self.runtime = SimpleNamespace(global_step=0)
-        self._resume_epoch = 0
+        self._orig_batches_per_epoch = self.num_batches_per_epoch
 
         self.rng = StatefulRNG(
             seed=int(recipe_cfg.get("shuffle_seed", 42)),
@@ -838,14 +751,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
         # Optional Weights & Biases logging (rank 0 only).
-        self.wandb_run = None
-        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
-            suppress_wandb_log_messages()
-            self.wandb_run = init_wandb_run(
-                self.cfg.wandb.to_dict(),
-                self.cfg.to_dict(),
-                default_name="eagle3_" + str(target_path).rstrip("/").split("/")[-1],
-            )
+        self._init_wandb_run("eagle3_" + str(target_path).rstrip("/").split("/")[-1])
 
         # Optional periodic real-acceptance-length eval (rank 0 only): snapshot
         # the current draft on a cadence and measure accept_length inside an
@@ -1164,8 +1070,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             # (its FSDP2 parallelize plan), the wrapper gathers the resulting
             # vocab-sharded logits, and the flattened "dp" axis already excludes
             # the "tp" axis so the draft and sampler replicate across TP ranks.
-            self.cp_mesh = _submesh_or_none(self.device_mesh, "cp")
-            self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
+            self.cp_mesh = submesh_or_none(self.device_mesh, "cp")
+            self.dp_mesh = submesh_or_none(self.device_mesh, "dp")
             target_kwargs.update(
                 distributed_setup=self.dist_setup,
             )
@@ -1475,13 +1381,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             return self.trainer_module(**self._maybe_shard_cp(target_batch.to_trainer_inputs()))
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         # Sequence-packing metadata (present only when packed_sequence_size > 0).
-        packing_kwargs = {}
-        if "seq_lens" in batch:
-            packing_kwargs = {
-                "position_ids": batch["position_ids"],
-                "seq_lens": batch["seq_lens"],
-                "doc_remaining": batch["doc_remaining"],
-            }
+        packed = packing_kwargs(batch)
         if self.target_wrapper is None:
             # Offline cache: the supervision is already in the batch.
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -1494,7 +1394,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                         "aux_hidden_states": batch["aux_hidden_states"],
                         "target_probs": batch["target_probs"],
                         "position_mask": batch["position_mask"],
-                        **packing_kwargs,
+                        **packed,
                     }
                 )
             )
@@ -1502,7 +1402,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             loss_mask=batch["loss_mask"],
-            **packing_kwargs,
+            **packed,
         )
         return self.trainer_module(**self._maybe_shard_cp(target_batch.to_trainer_inputs()))
 
@@ -1555,298 +1455,31 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 _, pending_handle = queue.popleft()
                 pending_handle.result()
 
-    def _build_checkpointer(self, target_path: str) -> None:
-        """Build the checkpointer using the same plumbing as the standard recipes."""
-        ckpt_cfg = self.cfg.get("checkpoint", None)
-        default_dir = str(self.output_dir / "checkpoints")
-        # EAGLE recipes construct the draft model directly and bypass
-        # `apply_model_infrastructure`, which is where `_pre_shard_hf_state_dict_keys`
-        # would normally be attached. Capture the pre-shard keys here so the
-        # consolidated-safetensors path in `_maybe_build_consolidated_index`
-        # has something to diff against instead of `None`.
-        draft_state_dict_keys = list(self.draft_model.state_dict().keys())
-        # LoRA drafts save/load adapter-only checkpoints (PeftAddon); the
-        # consolidated full-draft export does not apply to them (merge the
-        # adapters into the base draft for serving instead).
-        is_peft = getattr(self, "peft_config", None) is not None
-        ckpt_kwargs = dict(
-            enabled=True,
-            checkpoint_dir=default_dir,
-            model_save_format="safetensors",
-            model_repo_id=str(target_path),
-            model_cache_dir=hf_constants.HF_HUB_CACHE,
-            save_consolidated=not is_peft,
-            is_peft=is_peft,
-            model_state_dict_keys=draft_state_dict_keys,
-        )
-        if ckpt_cfg is not None:
-            user_cfg = ckpt_cfg.to_dict() if hasattr(ckpt_cfg, "to_dict") else dict(ckpt_cfg)
-            user_cfg.pop("restore_from", None)
-            ckpt_kwargs.update(user_cfg)
-        if ckpt_kwargs.get("model_state_dict_keys") is None:
-            ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
+    def _on_draft_saved(self, draft_model, path: str, *, is_final_checkpoint: bool, is_rank_0: bool) -> None:
+        """Export the merged LoRA draft once, at the final checkpoint.
 
-        self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
-        # Under CP, several global ranks share one dp index (and identical draft
-        # weights), so shard checkpoints by dp position, not global rank. With
-        # cp_size==1 dp_mesh.get_local_rank() == global rank -> unchanged / resume
-        # compatible with pre-CP checkpoints.
-        dp_mesh = getattr(self, "dp_mesh", None)
-        dp_rank = dp_mesh.get_local_rank() if dp_mesh is not None else (dist.get_rank() if dist.is_initialized() else 0)
-        self.checkpointer = self.checkpoint_config.build(
-            dp_rank=dp_rank,
-            tp_rank=0,
-            pp_rank=0,
-            moe_mesh=None,
-        )
-        self._log_checkpoint_retention_policy(self.checkpoint_config)
-
-    def _module(self):
-        return (
-            self.trainer_module.module
-            if isinstance(self.trainer_module, DistributedDataParallel)
-            else self.trainer_module
-        )
-
-    def save_checkpoint(
-        self,
-        epoch: int,
-        step: int,
-        train_loss: float | None = None,
-        val_loss: dict[str, float] | None = None,
-        best_metric_key: str = "default",
-        is_final_checkpoint: bool = False,
-    ) -> None:
-        """Persist draft model, optimizer, scheduler, RNG, and EAGLE-3 meta.
-
-        Overrides ``BaseRecipe.save_checkpoint`` because EAGLE recipes hold multiple
-        ``nn.Module`` attributes (frozen target, target wrapper, trainer module wrapping
-        the draft) — only ``draft_model`` should be persisted as the main model. The
-        EAGLE-3 vocab mapping tensors ride along through ``_save_extra_state``.
-
-        ``is_final_checkpoint`` is computed by the caller (this hand-rolled loop
-        has no ``step_scheduler`` for the checkpointer to infer it from);
-        ``save_consolidated: final`` exports HF safetensors only when it is True.
+        LoRA runs checkpoint adapters only; without this the run would end with
+        nothing serve/bench or a later ``draft_weights_path`` warm start can
+        consume. Mirrors full-FT's ``save_consolidated: final``.
         """
-        checkpointer = getattr(self, "checkpointer", None)
-        if checkpointer is None or not checkpointer.config.enabled:
-            return
-        self.checkpointer.async_wait()
-        self.checkpointer.lifecycle.complete_pending()
-
-        ckpt_root = self.checkpoint_config.checkpoint_dir
-        path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
-        is_dist_initialized = dist.is_initialized()
-        is_rank_0 = (not is_dist_initialized) or dist.get_rank() == 0
-        best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
-        best_val_metric = val_loss.get(best_metric_name) if val_loss else None
-
-        self.checkpointer.lifecycle.reserve(path)
-
-        if is_rank_0:
-            loss_dict: dict[str, float] = {}
-            if train_loss is not None:
-                loss_dict["train_loss"] = float(train_loss)
-            if val_loss:
-                for k, v in val_loss.items():
-                    loss_dict[k] = float(v)
-            if loss_dict:
-                save_losses(loss_dict, path)
-        if is_dist_initialized:
-            dist.barrier()
-
-        draft_model = self._module().draft_model
-        self.checkpointer.save_model(
-            draft_model,
-            path,
-            peft_config=getattr(self, "peft_config", None),
-            tokenizer=self.tokenizer,
-            is_final_checkpoint=is_final_checkpoint,
-        )
-        # LoRA runs checkpoint adapters only; without this the run would end
-        # with nothing serve/bench or a later draft_weights_path warm start can
-        # consume. Mirror full-FT's `save_consolidated: final` by exporting the
-        # merged draft once, at the final checkpoint.
         if is_rank_0 and is_final_checkpoint and getattr(self, "peft_config", None) is not None:
             merged_dir = _export_merged_lora_draft(draft_model, path)
             logger.info("LoRA final checkpoint: merged consolidated draft exported to %s", merged_dir)
-        self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
-        self.checkpointer.save_on_global_ranks(self.rng, "rng", path)
-
-        # Rank-0 writes followed by collectives, so they go through the same guard:
-        # a failure here must abort every rank rather than only this one.
-        def write_recipe_metadata() -> None:
-            self._save_extra_state(path, epoch=epoch)
-            try:
-                save_config(self.cfg.raw_config, path)
-            except (AttributeError, OSError) as e:
-                logger.warning("Failed to save config snapshot: %s", e)
-
-        self.checkpointer.lifecycle.run_coordinator_step(
-            write_recipe_metadata,
-            description=f"write recipe metadata to {path}",
-        )
-        if is_dist_initialized:
-            dist.barrier()
-
-        if getattr(self.checkpointer.config, "is_async", False):
-            self.checkpointer.lifecycle.defer_publication(
-                path,
-                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
-                metric_key=best_metric_name,
-            )
-        else:
-            self.checkpointer.lifecycle.publish(
-                path,
-                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
-                metric_key=best_metric_name,
-            )
-
-    def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
-        """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
-        ckpt_cfg = getattr(self, "checkpoint_config", None)
-        if self.dist_env.is_main and ckpt_cfg is not None and ckpt_cfg.enabled:
-            logger.info("Saved %s checkpoint to %s/epoch_%d_step_%d", kind, ckpt_cfg.checkpoint_dir, epoch, step)
-
-    def _maybe_save_step_checkpoint(self, epoch: int) -> bool:
-        """Save a checkpoint mid-epoch when ``ckpt_every_steps`` is configured.
-
-        Called after every optimizer step. Saves whenever ``ckpt_every_steps`` is
-        a positive integer and the current ``global_step`` is a multiple of it.
-        Returns True if a checkpoint was written. The checkpoint directory is
-        named ``epoch_{epoch}_step_{global_step}`` so it never collides with the
-        end-of-epoch checkpoint (which uses ``epoch + 1``).
-        """
-        every = getattr(self, "ckpt_every_steps", None)
-        if every is None or every <= 0 or self.runtime.global_step % every != 0:
-            return False
-        total_optim_steps = getattr(self, "total_optim_steps", None)
-        is_final_checkpoint = total_optim_steps is not None and self.runtime.global_step >= total_optim_steps
-        self.save_checkpoint(
-            epoch=epoch,
-            step=self.runtime.global_step,
-            train_loss=None,
-            val_loss=None,
-            best_metric_key="val_loss",
-            is_final_checkpoint=is_final_checkpoint,
-        )
-        self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
-        return True
-
-    def _maybe_save_final_checkpoint(self, completed_epochs: int) -> bool:
-        """Always save the fully-trained model at the end of a completed run,
-        unless a periodic checkpoint already captured the final step.
-
-        The end-of-run state is otherwise easy to lose: with no cadence nothing is
-        saved at all, and with a pure step cadence the final step is skipped
-        whenever the total step count is not a multiple of ``ckpt_every_steps``.
-        This is a no-op only when a step or epoch checkpoint already landed on the
-        final step, so it never duplicates or collides with one.
-        """
-        gs = self.runtime.global_step
-        if gs <= 0:
-            return False
-        every = getattr(self, "ckpt_every_steps", None)
-        saved_by_step = bool(every and every > 0 and gs % every == 0)
-        saved_by_epoch = bool(getattr(self, "save_checkpoint_every_epoch", False))
-        if saved_by_step or saved_by_epoch:
-            return False
-        self.save_checkpoint(
-            epoch=completed_epochs,
-            step=gs,
-            train_loss=None,
-            val_loss=None,
-            best_metric_key="val_loss",
-            is_final_checkpoint=True,
-        )
-        self._log_saved_checkpoint("final", completed_epochs, gs)
-        return True
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist EAGLE-3 meta: global_step, epoch, and vocab mapping tensors."""
-        torch.save(
-            {
-                "global_step": self.runtime.global_step,
-                "epoch": int(epoch),
-                "selected_token_ids": self._module().selected_token_ids.cpu(),
-                "selected_token_mask": self._module().selected_token_mask.cpu(),
-            },
-            os.path.join(path, "eagle_meta.pt"),
+        self._save_meta(
+            path,
+            "eagle_meta.pt",
+            epoch,
+            selected_token_ids=self._module().selected_token_ids.cpu(),
+            selected_token_mask=self._module().selected_token_mask.cpu(),
         )
-
-    def load_checkpoint(self, restore_from: str | None = None) -> None:
-        """Resolve and restore a checkpoint produced by ``save_checkpoint``.
-
-        Restores the draft model, optimizer, LR scheduler, RNG, ``global_step``, and the
-        EAGLE-3 vocab mapping tensors. Target model weights are NOT restored — they are
-        re-loaded from the HF hub on each run because the target is frozen.
-        """
-        checkpointer = getattr(self, "checkpointer", None)
-        if checkpointer is None or not checkpointer.config.enabled:
-            return
-        is_rank_0 = (not dist.is_initialized()) or dist.get_rank() == 0
-        ckpt_root = self.checkpoint_config.checkpoint_dir
-
-        if restore_from:
-            ckpt_dir = resolve_restore_from_to_checkpoint_dir(ckpt_root, restore_from)
-            if ckpt_dir is None:
-                if is_rank_0:
-                    logger.warning("restore_from='LATEST' but no checkpoint found in %s", ckpt_root)
-                return
-            if not os.path.isdir(ckpt_dir):
-                raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
-        else:
-            auto = find_latest_checkpoint(ckpt_root)
-            if auto is None:
-                return
-            ckpt_dir = str(auto)
-
-        ok, reason = _is_checkpoint_model_config_compatible(self.cfg, ckpt_dir)
-        if not ok:
-            if not restore_from:
-                if is_rank_0:
-                    logger.warning(
-                        "Auto-detected checkpoint at %s is incompatible with current model configuration: %s. "
-                        "Skipping restore.",
-                        ckpt_dir,
-                        reason,
-                    )
-                return
-            if is_rank_0:
-                logger.warning(
-                    "Checkpoint at %s may be incompatible with current model configuration: %s. "
-                    "Proceeding with restore anyway.",
-                    ckpt_dir,
-                    reason,
-                )
-
-        if is_rank_0:
-            logger.info("Resuming from checkpoint: %s", ckpt_dir)
-
-        draft_model = self._module().draft_model
-        self.checkpointer.load_model(draft_model, os.path.join(ckpt_dir, "model"))
-        self.checkpointer.load_optimizer(self.optimizer, draft_model, ckpt_dir, self.lr_scheduler)
-        try:
-            self.checkpointer.load_on_global_ranks(self.rng, "rng", ckpt_dir)
-        except FileNotFoundError:
-            logger.warning("RNG state not found in %s; continuing without restoring RNG.", ckpt_dir)
-
-        self._load_extra_state(ckpt_dir)
 
     def _load_extra_state(self, ckpt_dir: str) -> None:
         """Restore EAGLE-3 meta: global_step, epoch, and vocab mapping tensors."""
-        meta_path = os.path.join(ckpt_dir, "eagle_meta.pt")
-        if not os.path.exists(meta_path):
-            legacy = os.path.join(ckpt_dir, "eagle3_meta.pt")
-            meta_path = legacy if os.path.exists(legacy) else meta_path
-        if os.path.exists(meta_path):
-            meta = load_torch_ckpt(
-                meta_path,
-                map_location="cpu",
-                weights_only=not self.checkpoint_config.allow_legacy_pickle_restore,
-            )
-            self.runtime.global_step = int(meta.get("global_step", 0))
-            self._resume_epoch = int(meta.get("epoch", 0))
+        meta = self._load_meta(ckpt_dir, "eagle_meta.pt", legacy_filename="eagle3_meta.pt")
+        if meta is not None:
             # Align the cadence-driven runners to the restored step so resume does
             # not immediately fire a redundant launch for an already-covered region.
             for runner_attr in ("regen_runner", "decode_eval_runner"):
@@ -1892,9 +1525,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                         total_step_valid = torch.zeros_like(total_step_prefix)
                     total_step_prefix += step_prefix_hits.float()
                     total_step_valid += metrics.step_valid.float()
-        total_loss = _all_reduce_mean(total_loss)
-        total_acc = _all_reduce_mean(total_acc)
-        total_batches = _all_reduce_mean(total_batches)
+        total_loss = all_reduce_mean(total_loss)
+        total_acc = all_reduce_mean(total_acc)
+        total_batches = all_reduce_mean(total_batches)
         tau_sim = _window_tau_sim(total_step_prefix, total_step_valid)
         self.trainer_module.train()
         return (
@@ -1902,12 +1535,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             total_acc / total_batches.clamp_min(1.0),
             tau_sim,
         )
-
-    def _wandb_log(self, data: dict, step: int) -> None:
-        """Log a metrics dict to W&B when a run is active (rank 0)."""
-        run = getattr(self, "wandb_run", None)
-        if run is not None:
-            run.log(data, step=step)
 
     def run_train_validation_loop(self):
         """Run the minimal EAGLE-3 train loop."""
@@ -2086,8 +1713,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                         self._maybe_save_step_checkpoint(epoch)
 
                         if self.runtime.global_step % self.log_every_steps == 0:
-                            mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
-                            mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
+                            mean_loss = all_reduce_mean(running_loss / max(running_steps, 1))
+                            mean_acc = all_reduce_mean(running_acc / max(running_steps, 1))
                             tau_sim = _window_tau_sim(running_step_prefix, running_step_valid)
                             current_lr = self.lr_scheduler.get_last_lr()[0]
                             if self.dist_env.is_main:
@@ -2187,8 +1814,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self._maybe_save_step_checkpoint(epoch)
 
                 if running_steps > 0:
-                    mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
-                    mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
+                    mean_loss = all_reduce_mean(running_loss / max(running_steps, 1))
+                    mean_acc = all_reduce_mean(running_acc / max(running_steps, 1))
                     tau_sim = _window_tau_sim(running_step_prefix, running_step_valid)
                     current_lr = self.lr_scheduler.get_last_lr()[0]
                     if self.dist_env.is_main:
