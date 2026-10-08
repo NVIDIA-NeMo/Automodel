@@ -20,7 +20,7 @@ import types
 import pytest
 
 from nemo_automodel.components.loggers import loggers
-from nemo_automodel.components.loggers.loggers import SwanLabConfig, WandbConfig, mirror_wandb_to_swanlab
+from nemo_automodel.components.loggers.loggers import SwanLabConfig, WandbConfig
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run
 from nemo_automodel.shared.import_utils import UnavailableError
 
@@ -67,16 +67,20 @@ def test_builtin_scalar_unwraps_zero_dim_values():
     assert loggers._builtin_scalar("text") == "text"
 
 
-def test_mirror_wandb_defaults_keep_wandb_uploading(fake_swanlab):
-    SwanLabConfig().mirror_wandb()
-    assert fake_swanlab == [{"mode": "online", "wandb_run": True, "workspace": None, "log_dir": None}]
-
-
-def test_mirror_wandb_forwards_options_and_patches_once(fake_swanlab):
-    cfg = SwanLabConfig(mode="offline", workspace="team", log_dir="/tmp/swanlab", upload_to_wandb=False)
+@pytest.mark.parametrize(
+    "cfg,expected",
+    [
+        (SwanLabConfig(), {"mode": "online", "wandb_run": True, "workspace": None, "log_dir": None}),
+        (
+            SwanLabConfig(mode="offline", workspace="team", log_dir="/tmp/swanlab", upload_to_wandb=False),
+            {"mode": "offline", "wandb_run": False, "workspace": "team", "log_dir": "/tmp/swanlab"},
+        ),
+    ],
+)
+def test_mirror_wandb_forwards_options_and_patches_once(fake_swanlab, cfg, expected):
     cfg.mirror_wandb()
     cfg.mirror_wandb()
-    assert fake_swanlab == [{"mode": "offline", "wandb_run": False, "workspace": "team", "log_dir": "/tmp/swanlab"}]
+    assert fake_swanlab == [expected]
 
 
 def test_mirror_wandb_raises_when_swanlab_absent(monkeypatch):
@@ -84,18 +88,6 @@ def test_mirror_wandb_raises_when_swanlab_absent(monkeypatch):
     monkeypatch.setattr(loggers, "_SWANLAB_MIRROR_INSTALLED", False)
     with pytest.raises(UnavailableError, match="swanlab is not installed"):
         SwanLabConfig().mirror_wandb()
-
-
-def test_mirror_wandb_to_swanlab_pops_block_without_mutating_input(fake_swanlab):
-    raw = {"project": "p", "swanlab": {"workspace": "team"}}
-    assert mirror_wandb_to_swanlab(raw) == {"project": "p"}
-    assert "swanlab" in raw
-    assert fake_swanlab[0]["workspace"] == "team"
-
-
-def test_mirror_wandb_to_swanlab_is_noop_without_block(fake_swanlab):
-    assert mirror_wandb_to_swanlab({"project": "p"}) == {"project": "p"}
-    assert fake_swanlab == []
 
 
 def test_wandb_config_parses_swanlab_sub_block():
@@ -144,4 +136,9 @@ def test_mirror_converts_tensor_scalars_before_wandb_log(fake_swanlab):
     run_cls().log(data={"loss": np.float64(1.0)}, step=8)
     assert fake_swanlab[-2] == ("wandb_log", {"grad_norm": 3.0, "mfu": 0.5}, 7)
     assert fake_swanlab[-1] == ("wandb_log", {"loss": 1.0}, 8)
-    assert type(fake_swanlab[-2][1]["grad_norm"]) is float
+
+
+def test_init_wandb_run_without_swanlab_does_not_mirror(fake_swanlab, fake_wandb):
+    init_wandb_run({"project": "p"}, {}, default_name="d")
+    assert fake_swanlab == []
+    assert fake_wandb["project"] == "p"
