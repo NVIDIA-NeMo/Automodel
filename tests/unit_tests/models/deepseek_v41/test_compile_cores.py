@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compiled mHC and RMSNorm cores: opt-in (`hc_impl`, `compile_norm`), once per process, allclose to eager."""
+"""Compiled mHC and RMSNorm cores: opt-in (`compile_hc`, `compile_norm`), once per process, allclose to eager."""
 
 from dataclasses import replace
 
@@ -22,7 +22,7 @@ from torch._dynamo.utils import counters as dynamo_counters
 
 import nemo_automodel.components.models.deepseek_v41.layers as v41_layers
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41HyperConnection, DeepseekV41RMSNorm
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from tests.unit_tests.models.deepseek_v41.test_attention import _arithmetic_config
@@ -41,14 +41,13 @@ def restore_cores():
 
 
 def _compile_backend() -> BackendConfig:
-    return replace(_backend(), compile_norm=True)
+    return replace(_backend(), compile_norm=True, compile_hc=True)
 
 
-def test_hc_impl_defaults_to_torch_and_rejects_other_values() -> None:
-    assert DeepseekV41TextConfig().hc_impl == "torch"
-    assert DeepseekV41Config().text_config.hc_impl == "torch"
-    with pytest.raises(ValueError, match="hc_impl must be 'torch' or 'compile'"):
-        _arithmetic_config(hc_impl="triton")
+def test_compile_hc_is_a_backend_knob_that_defaults_off() -> None:
+    assert BackendConfig().compile_hc is False
+    assert _backend().compile_hc is False
+    assert not hasattr(DeepseekV41TextConfig(), "hc_impl")  # moved out of the model config
 
 
 def test_default_model_leaves_the_cores_eager(restore_cores) -> None:
@@ -60,7 +59,6 @@ def test_default_model_leaves_the_cores_eager(restore_cores) -> None:
 
 def test_model_hooks_compile_the_cores_once(restore_cores) -> None:
     config = _tiny_config()
-    config.text_config.hc_impl = "compile"
     with torch.device("meta"):
         DeepseekV41ForCausalLM(config, backend=_compile_backend())
     assert v41_layers._HC_COMPILED and v41_layers._NORM_COMPILED

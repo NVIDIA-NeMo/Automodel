@@ -239,7 +239,7 @@ class DeepseekV41Model(nn.Module):
         config = config.text_config
         self.config = config
         self.moe_config = moe_config
-        if config.hc_impl == "compile":
+        if backend.compile_hc:
             compile_hc_cores()
         if backend.compile_norm and backend.rms_norm != "te":
             compile_norm_core()

@@ -34,7 +34,7 @@ from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Text
 # The mHC coefficient projection, the stream collapse/expand and the fp32 RMSNorm each run several full fp32 passes
 # in eager mode, and ``expand`` materialises a ``[batch, sequence, streams, streams, hidden]`` fp32 temporary before
 # its stream sum. The arithmetic lives in the plain functions below so ``torch.compile`` can fuse each into one or
-# two kernels: ``DeepseekV41TextConfig.hc_impl = "compile"`` wraps the three mHC cores, ``BackendConfig.compile_norm``
+# two kernels: ``BackendConfig.compile_hc`` wraps the three mHC cores, ``BackendConfig.compile_norm``
 # the RMSNorm core (same lazy once-per-process pattern as Kimi K3's ``compile_norm``). The modules call the
 # module-level dispatchers, so instances built before the hook ran still pick up the compiled core. Compiled
 # numerics are allclose to eager, not bitwise-identical. The mHC cores are compiled for static shapes only: with
@@ -107,7 +107,7 @@ def compile_norm_core() -> None:
 
 
 def compile_hc_cores() -> None:
-    """Wrap the mHC projection, collapse and expand cores with ``torch.compile`` (``hc_impl="compile"``).
+    """Wrap the mHC projection, collapse and expand cores with ``torch.compile`` (``BackendConfig.compile_hc``).
 
     Runs once per process, static shapes (``dynamic=False``: the fusion of ``expand`` needs concrete shapes; a new
     sequence length compiles the three cores again). The Sinkhorn normalisation keeps its own backend (TileKernels or
