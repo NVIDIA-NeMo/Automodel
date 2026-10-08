@@ -69,11 +69,3 @@ def hf_config_hub(tmp_path, monkeypatch):
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
     monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", False)
     return tmp_path, cache, ref, requests
-
-
-@pytest.fixture
-def mock_hub_revision(monkeypatch):
-    """Keep tests with mocked config/weight loaders independent of Hub access."""
-    from nemo_automodel import NeMoAutoConfig
-
-    monkeypatch.setattr(NeMoAutoConfig, "resolve_revision", lambda source, revision=None, **kwargs: revision)
