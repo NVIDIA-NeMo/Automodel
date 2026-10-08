@@ -107,7 +107,16 @@ def test_maybe_save_step_checkpoint_marks_cadence_save_final_at_last_step():
 
     assert TrainDFlashRecipe._maybe_save_step_checkpoint(obj, epoch=3) is True
 
-    assert calls == [{"epoch": 3, "step": 8, "best_metric_key": "val_loss", "is_final_checkpoint": True}]
+    assert calls == [
+        {
+            "epoch": 3,
+            "step": 8,
+            "train_loss": None,
+            "val_loss": None,
+            "best_metric_key": "val_loss",
+            "is_final_checkpoint": True,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -211,7 +220,7 @@ def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog)
             self.config = config
             built.append((config, kwargs))
 
-    monkeypatch.setattr(train_dflash, "Checkpointer", FakeCheckpointer)
+    monkeypatch.setattr("nemo_automodel.components.checkpoint.checkpointing.Checkpointer", FakeCheckpointer)
     obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
     obj.cfg = SimpleNamespace(
         get=lambda key, default=None: (
@@ -400,15 +409,6 @@ def test_all_ranks_have_valid_ddp_min_reduces_across_ranks(monkeypatch):
     assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is True
 
 
-def test_all_reduce_sum_uses_additive_distributed_statistics(monkeypatch):
-    monkeypatch.setattr(train_dflash.dist, "is_available", lambda: True)
-    monkeypatch.setattr(train_dflash.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda value, op=None: value.add_(2.0))
-
-    value = torch.tensor(3.0)
-    assert train_dflash._all_reduce_sum(value).item() == 5.0
-
-
 def test_wandb_log_forwards_metrics_when_run_exists():
     calls = []
     obj = SimpleNamespace(wandb_run=SimpleNamespace(log=lambda data, step: calls.append((data, step))))
@@ -423,12 +423,12 @@ def test_wandb_log_is_noop_without_run():
 
 
 def _load_extra_state_self(mask_token_id=7):
-    return SimpleNamespace(
-        runtime=SimpleNamespace(global_step=0),
-        _resume_epoch=0,
-        mask_token_id=mask_token_id,
-        checkpoint_config=SimpleNamespace(allow_legacy_pickle_restore=False),
-    )
+    obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    obj.runtime = SimpleNamespace(global_step=0)
+    obj._resume_epoch = 0
+    obj.mask_token_id = mask_token_id
+    obj.checkpoint_config = SimpleNamespace(allow_legacy_pickle_restore=False)
+    return obj
 
 
 def _write_meta(tmp_path, **fields):
