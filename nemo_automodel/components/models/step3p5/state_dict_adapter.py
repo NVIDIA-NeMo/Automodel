@@ -42,7 +42,6 @@ from typing import Any, Optional
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import Placement
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
@@ -50,7 +49,6 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
-    get_sharded_expert_range,
     get_submesh,
     is_dtensor,
 )
@@ -80,12 +78,10 @@ def _swap_shard_placements_1_2(placements: tuple) -> tuple:
 
 def _create_dtensor_from_local_or_reference(
     local_tensor: torch.Tensor,
-    reference_dtensor: torch.Tensor | None,
-    device_mesh: DeviceMesh | None = None,
+    reference_dtensor: Optional["torch.Tensor"],
+    device_mesh: Optional["DeviceMesh"] = None,
     rank: int | None = None,
-    placements_override: tuple[Placement, ...] | None = None,
-    *,
-    n_experts: int | None = None,
+    placements_override: tuple | None = None,
 ) -> torch.Tensor:
     """Create a DTensor from a local tensor.
 
@@ -94,35 +90,25 @@ def _create_dtensor_from_local_or_reference(
     using device_mesh if reference is not a DTensor.
 
     Args:
-        local_tensor: Local transformed weights [local_experts, in, out],
-            possibly strided after transposing inner axes.
-        reference_dtensor: Optional grouped source DTensor [experts, out, in]
-            whose expert extent, mesh and placements must be preserved.
+        local_tensor: Local portion of the tensor after transformation
+        reference_dtensor: Optional DTensor to copy mesh/placements from
         device_mesh: Device mesh for EP (used if reference is not DTensor)
         rank: Current rank for device placement
         placements_override: If provided, use these placements instead of the
             reference DTensor's placements. Useful after transposing the local
             tensor, where shard dimensions need to be swapped.
-        n_experts: Global expert count for uneven shards without a reference.
 
     Returns:
-        Native weights [experts, in, out] as a DTensor when a mesh is available,
-        otherwise the local tensor. Local storage is shared.
+        DTensor if mesh is available, otherwise local_tensor
     """
     from torch.distributed._tensor import DTensor
 
     if reference_dtensor is not None and is_dtensor(reference_dtensor):
         placements = placements_override if placements_override is not None else reference_dtensor.placements
-        from torch.distributed.tensor._utils import compute_global_tensor_info
-
-        shape, stride = compute_global_tensor_info(local_tensor, reference_dtensor.device_mesh, placements)
-        shape[0] = reference_dtensor.shape[0]
-        return DTensor.from_local(
-            local_tensor, reference_dtensor.device_mesh, placements, shape=torch.Size(shape), stride=tuple(stride)
-        )
+        return DTensor.from_local(local_tensor, reference_dtensor.device_mesh, placements)
     elif device_mesh is not None:
         # Create DTensor using the provided mesh
-        return create_dtensor_from_local(local_tensor, device_mesh, rank, n_experts=n_experts)
+        return create_dtensor_from_local(local_tensor, device_mesh, rank)
     else:
         # No mesh available, return regular tensor
         return local_tensor
@@ -186,19 +172,9 @@ class Step3p5StateDictAdapter(StateDictAdapter):
     ) -> dict[str, Any]:
         """Convert HF checkpoint to native format.
 
-        Args:
-            hf_state_dict: Mapping whose grouped gate/up tensors have shape
-                [experts, intermediate, hidden] and down tensors have shape
-                [experts, hidden, intermediate]. Other tensors retain their layout.
-                DTensors already contain the rank-local expert and inner-axis shards.
-            device_mesh: Optional mesh with ep sharding the expert axis and
-                ep_shard sharding the native input axis.
-            **kwargs: Checkpoint options.
-
-        Returns:
-            Mapping with fused gate/up [experts, hidden, 2 * intermediate] and
-            down [experts, intermediate, hidden]. When a mesh is provided,
-            DTensors retain global expert counts and rank-local ownership.
+        Handles Step3p5's grouped MoELinear format:
+        - [n_exp, inter, dim] gate_proj/up_proj -> [n_exp, dim, 2*inter] gate_and_up_projs
+        - [n_exp, dim, inter] down_proj -> [n_exp, inter, dim] down_projs
         """
         # Detect prefix
         for key in hf_state_dict.keys():
@@ -250,15 +226,6 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                 # and we should not slice it again.
                 if device_mesh is not None and not is_dtensor(value):
                     value = value[start_expert:end_expert]
-                    if "ep_shard" in device_mesh.mesh_dim_names:
-                        shard_mesh = get_submesh(device_mesh, ("ep_shard",))
-                        if value.shape[2] % shard_mesh.size():
-                            raise ValueError("Expert input dimensions must be divisible by ep_shard size")
-                        first, last = get_sharded_expert_range(
-                            value.shape[2], world_size=shard_mesh.size(), rank=shard_mesh.get_local_rank()
-                        )
-                        # Slice before merging/transposing to avoid a full inner-axis temporary.
-                        value = value[:, :, first:last]
 
                 if proj in ("gate_proj", "up_proj"):
                     # Collect gate_proj and up_proj to merge
@@ -296,12 +263,7 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                             else None
                         )
                         state_dict[native_key] = _create_dtensor_from_local_or_reference(
-                            merged,
-                            reference_dtensor,
-                            device_mesh,
-                            rank,
-                            placements_override=swapped,
-                            n_experts=n_experts,
+                            merged, reference_dtensor, device_mesh, rank, placements_override=swapped
                         )
 
                         # Clean up
@@ -324,7 +286,7 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                         else None
                     )
                     state_dict[native_key] = _create_dtensor_from_local_or_reference(
-                        down_t, reference_dtensor, device_mesh, rank, placements_override=swapped, n_experts=n_experts
+                        down_t, reference_dtensor, device_mesh, rank, placements_override=swapped
                     )
 
             elif router_m:
@@ -384,19 +346,13 @@ class Step3p5StateDictAdapter(StateDictAdapter):
     ) -> list[tuple[str, torch.Tensor]] | None:
         """Convert native format expert tensors to HF Step3p5 format.
 
-        Args:
-            fqn: Native state-dict key.
-            tensor: Tensor with fused gate/up shape [experts, hidden, 2 * intermediate],
-                down shape [experts, intermediate, hidden], or router bias [experts].
-                DTensors may shard experts over ep and the input axis over ep_shard.
+        Native: gate_and_up_projs [n_exp, dim, 2*inter] -> HF: gate_proj, up_proj [n_exp, inter, dim]
+        Native: down_projs [n_exp, inter, dim] -> HF: down_proj [n_exp, dim, inter]
 
-        Returns:
-            Named HF tensors: gate/up [experts, intermediate, hidden], down
-            [experts, hidden, intermediate], or router bias [experts]; None for
-            unrelated keys. DTensors preserve global expert counts and swap
-            inner-axis placements to match the transposed layout. Outputs may
-            share input storage.
+        Preserves DTensor structure when input is a DTensor.
         """
+        from torch.distributed._tensor import DTensor
+
         inter_dim = self.moe_config.moe_inter_dim
         prefix = self._hf_prefix
 
@@ -411,6 +367,7 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             # Check if input is DTensor to preserve structure
             tensor_is_dtensor = is_dtensor(tensor)
             if tensor_is_dtensor:
+                device_mesh = tensor.device_mesh
                 placements = tensor.placements
                 local_tensor = tensor.to_local()
             else:
@@ -428,8 +385,8 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
             if tensor_is_dtensor:
                 swapped = _swap_shard_placements_1_2(placements)
-                gate_weight = _create_dtensor_from_local_or_reference(gate_weight, tensor, placements_override=swapped)
-                up_weight = _create_dtensor_from_local_or_reference(up_weight, tensor, placements_override=swapped)
+                gate_weight = DTensor.from_local(gate_weight, device_mesh, swapped)
+                up_weight = DTensor.from_local(up_weight, device_mesh, swapped)
 
             return [
                 (f"{prefix}layers.{layer_num}.moe.gate_proj.weight", gate_weight),
@@ -447,6 +404,7 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             # Check if input is DTensor to preserve structure
             tensor_is_dtensor = is_dtensor(tensor)
             if tensor_is_dtensor:
+                device_mesh = tensor.device_mesh
                 placements = tensor.placements
                 local_tensor = tensor.to_local()
             else:
@@ -459,7 +417,7 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             # Swap Shard(1)↔Shard(2) because we transposed dims 1 and 2.
             if tensor_is_dtensor:
                 swapped = _swap_shard_placements_1_2(placements)
-                down_weight = _create_dtensor_from_local_or_reference(down_weight, tensor, placements_override=swapped)
+                down_weight = DTensor.from_local(down_weight, device_mesh, swapped)
 
             return [
                 (f"{prefix}layers.{layer_num}.moe.down_proj.weight", down_weight),

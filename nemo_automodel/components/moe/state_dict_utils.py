@@ -55,25 +55,6 @@ def _get_expert_mesh_dim_index(dtensor: DTensor) -> int | None:
     )
 
 
-def get_sharded_expert_range(n_experts: int, *, world_size: int, rank: int) -> tuple[int, int]:
-    """Return the expert interval assigned by PyTorch Shard(0).
-
-    Args:
-        n_experts: Global number of experts, including zero for an empty tensor.
-        world_size: Number of ranks in the expert-sharding mesh.
-        rank: Mesh-local rank.
-
-    Returns:
-        Inclusive start and exclusive end, following torch.chunk with empty
-        trailing shards. No expert IDs are added or reassigned.
-    """
-    if n_experts < 0 or world_size < 1 or not 0 <= rank < world_size:
-        raise ValueError(f"Invalid expert partition: {n_experts=}, {world_size=}, {rank=}")
-    width = (n_experts + world_size - 1) // world_size
-    start = min(rank * width, n_experts)
-    return start, min(start + width, n_experts)
-
-
 def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> tuple[torch.Tensor, int, int]:
     """
     Get the slice of experts present on the current rank for a DTensor.
@@ -112,7 +93,20 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
         current_rank = expert_mesh.get_local_rank()
         world_size = expert_mesh.size()
 
-        start_expert, end_expert = get_sharded_expert_range(n_experts, world_size=world_size, rank=current_rank)
+        # Calculate expert range for this rank
+        experts_per_rank = n_experts // world_size
+        remainder = n_experts % world_size
+
+        if current_rank < remainder:
+            # First `remainder` ranks get one extra expert
+            experts_on_rank = experts_per_rank + 1
+            start_expert = current_rank * experts_on_rank
+        else:
+            # Remaining ranks get standard number of experts
+            experts_on_rank = experts_per_rank
+            start_expert = remainder * (experts_per_rank + 1) + (current_rank - remainder) * experts_per_rank
+
+        end_expert = start_expert + experts_on_rank
         return local_tensor, start_expert, end_expert
     elif isinstance(placement, Replicate):
         # Tensor is replicated - all ranks have full data
@@ -238,26 +232,18 @@ def validate_dtensor_expert_sharding(tensor: torch.Tensor, expected_experts: int
 
 
 def create_dtensor_from_local(
-    local_tensor: torch.Tensor,
-    device_mesh: DeviceMesh | None,
-    rank: int | None = None,
-    *,
-    n_experts: int | None = None,
+    local_tensor: torch.Tensor, device_mesh: Optional["DeviceMesh"], rank: int | None = None
 ) -> torch.Tensor:
     """
     Create a DTensor from a local tensor for expert parallelism.
 
     Args:
-        local_tensor: Rank-local grouped weights [local_experts, ...], with
-            expert axis first. Inner axes may additionally be sharded by ep_shard.
+        local_tensor: Local portion of the tensor on this rank
         device_mesh: Device mesh for DTensor creation
-        rank: Current rank (for device placement).
-        n_experts: Explicit global expert count. Required for uneven expert
-            shards; omitted callers retain the equal-shard inference.
+        rank: Current rank (for device placement)
 
     Returns:
-        DTensor with global shape [n_experts, ...] when specified, sharing
-        local storage; otherwise equal-shard shape inference or local_tensor.
+        DTensor if device_mesh is provided and DTensor is available, otherwise local_tensor
     """
     if device_mesh is None:
         return local_tensor
@@ -295,19 +281,7 @@ def create_dtensor_from_local(
         else:
             raise ValueError(f"Unexpected mesh dimension name: {dim_name}")
 
-    target_mesh = get_submesh(device_mesh, tuple(dim_names_for_placements))
-    if n_experts is not None:
-        # Preserve stride inference for transposed inner axes without copying
-        # weights. Only the outer expert extent differs for uneven shards.
-        from torch.distributed.tensor._utils import compute_global_tensor_info
-
-        shape, stride = compute_global_tensor_info(local_tensor, target_mesh, placements)
-        shape[0] = n_experts
-        dtensor = DTensor.from_local(
-            local_tensor, target_mesh, placements, shape=torch.Size(shape), stride=tuple(stride)
-        )
-    else:
-        dtensor = DTensor.from_local(local_tensor, target_mesh, placements)
+    dtensor = DTensor.from_local(local_tensor, get_submesh(device_mesh, tuple(dim_names_for_placements)), placements)
     return dtensor
 
 
@@ -329,7 +303,17 @@ def get_expert_range_for_rank_from_mesh(device_mesh: Optional["DeviceMesh"], n_e
     world_size = ep_mesh.size()
     rank = ep_mesh.get_local_rank()
 
-    return get_sharded_expert_range(n_experts, world_size=world_size, rank=rank)
+    experts_per_rank = n_experts // world_size
+    remainder = n_experts % world_size
+
+    if rank < remainder:
+        experts_per_rank += 1
+        start_expert = rank * experts_per_rank
+    else:
+        start_expert = rank * experts_per_rank + remainder
+
+    end_expert = start_expert + experts_per_rank
+    return start_expert, end_expert
 
 
 def should_load_expert_for_rank(expert_id: int, device_mesh: Optional["DeviceMesh"], n_experts: int) -> bool:

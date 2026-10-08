@@ -254,9 +254,7 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
                             stride=reference.stride(),
                         )
                     elif device_mesh is not None:
-                        tensor = create_dtensor_from_local(
-                            decoded, device_mesh, n_experts=self.moe_config.n_routed_experts
-                        )
+                        tensor = create_dtensor_from_local(decoded, device_mesh)
                     else:
                         tensor = decoded
                 else:
