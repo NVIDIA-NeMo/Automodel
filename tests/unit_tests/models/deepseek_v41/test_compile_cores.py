@@ -18,6 +18,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch._dynamo
 from torch._dynamo.utils import counters as dynamo_counters
 
 import nemo_automodel.components.models.deepseek_v41.layers as v41_layers
@@ -111,8 +112,10 @@ def test_compiled_cores_match_eager_and_reach_modules_built_earlier(restore_core
     v41_layers.compile_norm_core()
     assert v41_layers._HC_COMPILED and v41_layers._NORM_COMPILED
     frames_before = dynamo_counters["frames"]["ok"]
+    breaks_before = sum(dynamo_counters["graph_break"].values())
     compiled_out, compiled_grads = run()
     assert dynamo_counters["frames"]["ok"] > frames_before  # the compiled path ran, not a silent eager fallback
+    assert sum(dynamo_counters["graph_break"].values()) == breaks_before  # whole cores, no graph breaks
     # fp32: fusion only reorders summations; bf16 streams may differ by one ulp (the default bf16 tolerance)
     tolerance = dict(rtol=1e-5, atol=1e-6) if dtype == torch.float32 else {}
     for actual, expected in zip(compiled_out, eager_out):
@@ -130,3 +133,30 @@ def test_hooks_are_idempotent(restore_cores) -> None:
     norm = v41_layers._rms_norm
     v41_layers.compile_norm_core()
     assert v41_layers._rms_norm is norm
+
+
+@pytest.mark.runtime_budget(
+    30,
+    reason="compiles the mHC projection core once, then exercises the eager fallback past a lowered recompile limit",
+)
+def test_hc_cores_run_eager_past_the_recompile_limit(restore_cores) -> None:
+    """Many distinct sequence lengths must degrade to eager for a core, not raise FailOnRecompileLimitHit."""
+    torch._dynamo.reset()
+    limit_name = "recompile_limit" if hasattr(torch._dynamo.config, "recompile_limit") else "cache_size_limit"
+    torch.manual_seed(44)
+    module = DeepseekV41HyperConnection(_arithmetic_config(hc_eps=1e-6), sinkhorn_backend="torch")
+    with torch.no_grad():
+        module.fn.normal_(std=0.1)
+        module.base.normal_(std=0.3)
+    inputs = [torch.randn(2, seq, 4, 16) for seq in (3, 5)]
+    eager = [module(x) for x in inputs]
+    v41_layers.compile_hc_cores()
+    with torch._dynamo.config.patch(**{limit_name: 1}):
+        first = module(inputs[0])  # compiles the projection core for this shape
+        frames_after_first = dynamo_counters["frames"]["ok"]
+        second = module(inputs[1])  # second shape: over the limit -> eager, no exception
+    assert dynamo_counters["frames"]["ok"] == frames_after_first
+    for actual, expected in zip((first, second), eager):
+        torch.testing.assert_close(actual.pre, expected.pre, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(actual.post, expected.post, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(actual.comb, expected.comb, rtol=1e-5, atol=1e-6)

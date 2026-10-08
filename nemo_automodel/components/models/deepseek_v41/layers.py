@@ -110,15 +110,17 @@ def compile_hc_cores() -> None:
     """Wrap the mHC projection, collapse and expand cores with ``torch.compile`` (``BackendConfig.compile_hc``).
 
     Runs once per process, static shapes (``dynamic=False``: the fusion of ``expand`` needs concrete shapes; a new
-    sequence length compiles the three cores again). The Sinkhorn normalisation keeps its own backend (TileKernels or
-    torch): compiling the 20-iteration torch loop is slower than the fused TileKernels kernel.
+    sequence length compiles the three cores again). No ``fullgraph``: past dynamo's recompile limit (many distinct
+    sequence lengths) a core runs eager instead of raising ``FailOnRecompileLimitHit``; the unit tests assert the
+    cores compile without graph breaks. The Sinkhorn normalisation keeps its own backend (TileKernels or torch):
+    compiling the 20-iteration torch loop is slower than the fused TileKernels kernel.
     """
     global _hc_project, _hc_collapse, _hc_expand, _HC_COMPILED
     if _HC_COMPILED:
         return
-    _hc_project = torch.compile(_hc_project_core, fullgraph=True, dynamic=False)
-    _hc_collapse = torch.compile(_hc_collapse_core, fullgraph=True, dynamic=False)
-    _hc_expand = torch.compile(_hc_expand_core, fullgraph=True, dynamic=False)
+    _hc_project = torch.compile(_hc_project_core, dynamic=False)
+    _hc_collapse = torch.compile(_hc_collapse_core, dynamic=False)
+    _hc_expand = torch.compile(_hc_expand_core, dynamic=False)
     _HC_COMPILED = True
 
 
