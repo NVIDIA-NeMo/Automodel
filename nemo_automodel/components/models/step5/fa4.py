@@ -204,8 +204,26 @@ def _selected_block_lists(
     query_start: int,
     fwd_k: int,
     bwd_k: int,
+    fwd_q: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create route-derived forward/reverse FA4 lists with bounded scratch space."""
+    """Create route-derived forward/reverse FA4 lists with bounded scratch space.
+
+    Args:
+        selection: Sorted region IDs [batch, groups, queries, slots] and
+            token-region IDs [batch, keys] with monotonic key-region order.
+        regions: Number of global regions.
+        query_start: Global token offset of the local query shard.
+        fwd_k: Key tokens represented by each forward metadata block.
+        bwd_k: Key tokens represented by each backward metadata block.
+        fwd_q: Query tokens per forward metadata block, either 128 or 256.
+
+    Returns:
+        Forward counts [batch * groups, 1, ceil(queries / fwd_q)] and
+        indices [batch * groups, 1, ceil(queries / fwd_q), ceil(keys / fwd_k)],
+        followed by backward counts [batch * groups, 1, ceil(keys / bwd_k)]
+        and indices [batch * groups, 1, ceil(keys / bwd_k), ceil(queries / 128)].
+        All four tensors contain int32 values on the selection device.
+    """
     ids, token_regions = selection.region_ids, selection.token_regions
     batch, groups, queries, _ = ids.shape
     rows = (queries + 127) // 128
@@ -218,8 +236,11 @@ def _selected_block_lists(
         fg, bg = _region_tiles(ids[:, :, start:stop], token_regions, regions, fwd_k, bwd_k)
         forward[:, :, start // 128 : (stop + 127) // 128] = fg
         backward[:, :, start // 128 : (stop + 127) // 128] = bg
-    last_query = query_start + torch.arange(1, rows + 1, device=ids.device) * 128
-    for grid, width in ((forward, fwd_k), (backward, bwd_k)):
+    if fwd_q == 256:
+        forward = F.pad(forward, (0, 0, 0, rows % 2))
+        forward = forward.unflatten(-2, (-1, 2)).any(-2)
+    for grid, width, query_tile in ((forward, fwd_k, fwd_q), (backward, bwd_k, 128)):
+        last_query = query_start + torch.arange(1, grid.shape[-2] + 1, device=ids.device) * query_tile
         grid &= torch.arange(grid.shape[-1], device=ids.device) * width < last_query[:, None]
     fc, fi = _compact_selected_tiles(forward)
     bc, bi = _compact_selected_tiles(backward.transpose(-1, -2))
@@ -239,7 +260,7 @@ def fa4_attention(
     window: int | None,
     selection: RegionSelection | None,
 ) -> torch.Tensor:
-    """Run FA4 forward/backward with compact CSA metadata on SM90.
+    """Run FA4 forward/backward with compact CSA metadata on SM90 or SM100.
 
     Args:
         query: BF16 CUDA tensor [batch, local_queries, query_heads, head_dim].
@@ -256,11 +277,18 @@ def fa4_attention(
     Returns:
         BF16 tensor [batch, local_queries, query_heads, head_dim].
         FA4 owns first-order autograd. No dense token membership tensor is built.
+        SM100 keeps Q/K at 192 dimensions and calls the native (192, 128)
+        kernel twice for the two V-channel slices; only the 64-channel V tail
+        is padded to 128. This repeats QK work but avoids 256-dimensional Q/K.
     """
     if not query.is_cuda or any(x.dtype != torch.bfloat16 for x in (query, key, value)):
         raise ValueError("Step5 FA4 requires CUDA BF16 Q/K/V")
-    if torch.cuda.get_device_capability(query.device) != (9, 0):
-        raise RuntimeError("Step5 FA4 block geometry is currently validated on SM90")
+    capability = torch.cuda.get_device_capability(query.device)
+    if capability not in ((9, 0), (10, 0)):
+        raise RuntimeError("Step5 FA4 supports SM90 and SM100")
+    split_values = capability == (10, 0)
+    if split_values and query.shape[-1] != 192:
+        raise ValueError("Step5 SM100 FA4 requires head_dim=192")
     if query.shape[-1] not in (192, 256):
         raise ValueError("Step5 FA4 supports head_dim=192 or 256")
     if torch.are_deterministic_algorithms_enabled():
@@ -283,16 +311,17 @@ def fa4_attention(
     batch = query.shape[0]
     attention, block_lists, mask_mod = _load_fa4(window, bitmap, slots, groups)
     # Requires FA4 #2888 (3c2c6b3): native 192-dimensional GQA backward.
-    fwd_k, bwd_k = (112, 96) if dim == 192 else (80, 64)
+    fwd_k, bwd_k = (128, 256) if split_values else ((112, 96) if dim == 192 else (80, 64))
+    fwd_q = 256 if split_values and queries > 128 else 128
     if selection is None:
         fc, fi = _block_lists(
-            queries, keys, query_start, window, block_q=128, block_k=fwd_k, reverse=False, device=query.device
+            queries, keys, query_start, window, block_q=fwd_q, block_k=fwd_k, reverse=False, device=query.device
         )
         bc, bi = _block_lists(
             queries, keys, query_start, window, block_q=128, block_k=bwd_k, reverse=True, device=query.device
         )
     else:
-        fc, fi, bc, bi = _selected_block_lists(selection, regions, query_start, fwd_k, bwd_k)
+        fc, fi, bc, bi = _selected_block_lists(selection, regions, query_start, fwd_k, bwd_k, fwd_q)
         # Grouping providers into the batch avoids a 16x metadata replication.
         # For the usual batch=1 these input transforms are strided views.
         query = query.unflatten(2, (groups, heads_per_group)).permute(0, 2, 1, 3, 4).flatten(0, 1)
@@ -300,27 +329,38 @@ def fa4_attention(
         value = value.unflatten(2, (groups, value.shape[2] // groups)).permute(0, 2, 1, 3, 4).flatten(0, 1)
     # This FA4 revision requires tensor full-block lists even when every tile
     # uses the custom predicate. Zero counts make the aliased indices unused.
-    forward = block_lists(fc, fi, torch.zeros_like(fc), fi, block_size=(128, fwd_k))
+    forward = block_lists(fc, fi, torch.zeros_like(fc), fi, block_size=(fwd_q, fwd_k))
     backward = block_lists(bc, bi, torch.zeros_like(bc), bi, block_size=(128, bwd_k))
-    output, _ = attention(
-        query,
-        key,
-        value,
-        softmax_scale=dim**-0.5,
-        pack_gqa=False,
-        mask_mod=mask_mod,
-        aux_tensors=[
-            positions,
-            key_positions,
-            documents[:, query_start : query_start + queries],
-            documents,
-            key_padding,
-            membership,
-            token_regions,
-        ],
-        block_sparse_tensors=forward,
-        block_sparse_tensors_bwd=backward,
-    )
+    # SM100 provides native (192, 128) kernels. V-channel splitting preserves
+    # the 192-dimensional Q/K scale and avoids padding Q/K to 256. Autograd
+    # sums both contributions to dQ/dK. The second call repeats QK work.
+    values = value.split(128, dim=-1) if split_values else (value,)
+    outputs = []
+    for part in values:
+        value_width = part.shape[-1]
+        if split_values and value_width < 128:
+            part = F.pad(part, (0, 128 - value_width))
+        output, _ = attention(
+            query,
+            key,
+            part,
+            softmax_scale=dim**-0.5,
+            pack_gqa=False,
+            mask_mod=mask_mod,
+            aux_tensors=[
+                positions,
+                key_positions,
+                documents[:, query_start : query_start + queries],
+                documents,
+                key_padding,
+                membership,
+                token_regions,
+            ],
+            block_sparse_tensors=forward,
+            block_sparse_tensors_bwd=backward,
+        )
+        outputs.append(output[..., :value_width])
+    output = torch.cat(outputs, dim=-1) if split_values else outputs[0]
     if selection is not None:
         output = output.unflatten(0, (batch, groups)).permute(0, 2, 1, 3, 4).flatten(2, 3)
     return output

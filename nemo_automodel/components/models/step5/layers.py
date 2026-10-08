@@ -158,7 +158,11 @@ class Step5Attention(nn.Module):
                 # Align FA4's online-softmax tiles across CP sizes. Otherwise BF16
                 # rounding can change the downstream discrete CSA/MoE routes.
                 # Padding is local: transport still exchanges exactly window - 1.
-                tile_width = 112 if self.head_dim == 192 else 80
+                tile_width = (
+                    128
+                    if hidden.is_cuda and torch.cuda.get_device_capability(hidden.device) == (10, 0)
+                    else (112 if self.head_dim == 192 else 80)
+                )
                 left_padding = first_key % tile_width if self.backend.attn == "fa4" else 0
                 exchanged = gather_halo(local_kv, self.cp_group, self.window - 1, left_padding=left_padding)
                 key_positions = F.pad(global_positions[:, first_key : query_start + sequence], (left_padding, 0))
