@@ -326,6 +326,9 @@ ARG UV_SYNC_MAX_JOBS=8
 # Preserve locally built wheels for source-only CUDA packages such as flash-attn,
 # causal-conv1d and mamba-ssm across BuildKit builds. Separate GPU targets so
 # switching MOK_ARCH cannot reuse a wheel compiled for the other architecture.
+# Ray's runtime-env agent prepends thirdparty_files to sys.path, bypassing our
+# aiohttp CVE constraint. Remove the entire vendored HTTP dependency bundle so
+# the agent uses the coherent, patched dependency set installed by uv sync.
 # ray/jars/ray_dist.jar vendors a flagged jackson (GHSA-r7wm-3cxj-wff9) that upstream
 # has not bumped; Automodel uses Ray from Python only, so drop the Java worker jars.
 RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
@@ -341,6 +344,7 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         uv sync --extra $AUTOMODEL_INSTALL --extra msa --extra mok --extra ffpa --all-groups $UV_SYNC_ARGS && \
     python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
+    rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/_private/runtime_env/agent/thirdparty_files && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
@@ -357,6 +361,9 @@ RUN git config --system --add safe.directory /opt/Automodel
 RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi
+
+# Verify in a fresh process: pre-importing aiohttp would hide Ray's sys.path override.
+RUN python docker/common/verify_ray_aiohttp.py
 
 # Fail the image build before publication if PyTorch headers cannot compile as
 # C++20, torch._grouped_mm is unavailable, or a bundled native extension has
