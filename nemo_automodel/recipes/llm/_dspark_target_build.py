@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+from transformers.utils.hub import resolve_revision
 
 from nemo_automodel import NeMoAutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
@@ -205,11 +206,14 @@ def build_deepseek_v4_target(
         )
     # Build the device_mesh + moe_mesh from the recipe's `distributed` block
     # (strategy, ep_size, moe, ...). NeMoAutoConfig resolves the registered local
-    # config and retains the selected snapshot for the later weight load.
+    # config; pass the resolved revision to both config and weight loading.
     distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
     # Pass name_or_path explicitly (as the V4 finetune recipe does) so from_config
     # resolves the base checkpoint to load and dequantize from.
-    target_config = NeMoAutoConfig.from_pretrained(target_path, name_or_path=target_path, num_nextn_predict_layers=0)
+    revision = resolve_revision(target_path)
+    target_config = NeMoAutoConfig.from_pretrained(
+        target_path, revision=revision, name_or_path=target_path, num_nextn_predict_layers=0
+    )
     # Diagnostic / CI knob: a full 43-layer V4-Flash target dequantizes to
     # ~63 GiB of experts per rank at ep_size=8 and does NOT fit on a single
     # 8x80GB node. Shrinking the layer count loads only the first N layers, so the
@@ -232,6 +236,7 @@ def build_deepseek_v4_target(
         backend=backend,
         distributed_setup=distributed_setup,
         load_base_model=True,
+        revision=revision,
         torch_dtype=compute_dtype,
         trust_remote_code=trust_remote_code,
     )
@@ -295,11 +300,12 @@ def build_glm_5_2_target(
             "GLM-5.2 DSpark target requires CUDA: the target is loaded "
             "with the expert-parallel / FSDP distributed path."
         )
-    target_config = NeMoAutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+    revision = resolve_revision(target_path)
+    target_config = NeMoAutoConfig.from_pretrained(target_path, revision=revision, trust_remote_code=trust_remote_code)
     # The published config's head_dim=192 clobbers qk_rope_head_dim on load via the
     # HF attribute_map, breaking checkpoint shape validation (see the helper).
     raw_config_dict, _ = NeMoAutoConfig.get_config_dict(
-        target_path, trust_remote_code=trust_remote_code, revision=target_config._commit_hash
+        target_path, trust_remote_code=trust_remote_code, revision=revision
     )
     repair_glm_5_2_qk_rope_head_dim(target_config, raw_config_dict)
     n_reduced = resolve_reduced_target_layers(
@@ -321,6 +327,7 @@ def build_glm_5_2_target(
         backend=backend,
         distributed_setup=distributed_setup,
         load_base_model=True,
+        revision=revision,
         torch_dtype=compute_dtype,
         trust_remote_code=trust_remote_code,
     )
@@ -387,7 +394,8 @@ def build_kimi_k3_target(
             "Kimi K3 DSpark target requires CUDA: the target is loaded with the "
             "expert-parallel / FSDP distributed path."
         )
-    target_config = NeMoAutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+    revision = resolve_revision(target_path)
+    target_config = NeMoAutoConfig.from_pretrained(target_path, revision=revision, trust_remote_code=trust_remote_code)
     text_config = getattr(target_config, "text_config", target_config)
     n_reduced = resolve_reduced_target_layers(
         text_config.num_hidden_layers,
@@ -412,13 +420,13 @@ def build_kimi_k3_target(
         }
     text_config.architectures = ["KimiK3ForCausalLM"]
     text_config.name_or_path = target_path
-    text_config._commit_hash = target_config._commit_hash
     distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
     target_model = NeMoAutoModelForCausalLM.from_config(
         config=text_config,
         backend=build_kimi_k3_backend(recipe_cfg),
         distributed_setup=distributed_setup,
         load_base_model=True,
+        revision=revision,
         torch_dtype=compute_dtype,
         trust_remote_code=trust_remote_code,
     )

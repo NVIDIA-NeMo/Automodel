@@ -37,8 +37,8 @@ from torch.nn.attention import SDPBackend
 from nemo_automodel.shared.torch_patches import apply_torch_patches
 
 apply_torch_patches()
+from huggingface_hub import ResolvedRevision, snapshot_download
 from huggingface_hub import constants as hf_constants  # noqa: E402
-from huggingface_hub import snapshot_download
 from transformers import (  # noqa: E402
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -52,6 +52,7 @@ from transformers import (  # noqa: E402
 from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
+from transformers.utils.hub import resolve_revision
 
 from nemo_automodel.components.distributed.config import (  # noqa: E402
     DDPConfig,
@@ -204,7 +205,6 @@ def _patch_remote_code_compat():
 
 _AUTO_CONFIG_HUB_KWARG_KEYS = (
     "revision",
-    "_commit_hash",
     "force_download",
     "subfolder",
     "token",
@@ -621,13 +621,18 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # during init.  Custom models and meta-device initialization do not load weights
         # here; they rely on apply_model_infrastructure to load the checkpoint later.
         weights_already_loaded = not is_custom_model and not is_meta_device and load_base_model
-        commit_hash = getattr(_hf_config, "_commit_hash", None)
-        if load_base_model and pretrained_path and not os.path.isdir(pretrained_path) and commit_hash:
+        revision = kwargs.get("revision")
+        if (
+            load_base_model
+            and pretrained_path
+            and not os.path.isdir(pretrained_path)
+            and isinstance(revision, ResolvedRevision)
+        ):
             # Give the checkpointer the selected snapshot, not a repo id whose
             # cache may also contain an unrelated (or newer) weight index.
             pretrained_path = snapshot_download(
                 pretrained_path,
-                revision=commit_hash,
+                revision=revision,
                 cache_dir=cache_dir,
                 local_files_only=True,
             )
@@ -768,6 +773,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
         loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
 
+        kwargs["revision"] = resolve_revision(
+            pretrained_model_name_or_path,
+            kwargs.get("revision"),
+            cache_dir=kwargs.get("cache_dir"),
+            token=kwargs.get("token"),
+            local_files_only=kwargs.get("local_files_only", False),
+        )
         try:
             hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
         except Exception as e:
@@ -777,11 +789,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
             else:
                 raise
-        # Keep config rereads, remote code, and weights on the same snapshot.
-        commit_hash = getattr(hf_config, "_commit_hash", None)
-        if commit_hash is not None:
-            kwargs["revision"] = commit_hash
-            kwargs["_commit_hash"] = commit_hash
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
         # Layer 2: reject loading a checkpoint with tie_word_embeddings flipped from the
@@ -849,6 +856,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Deprecated alias for ``dtype``. Defaults to ``auto``, which selects ``torch.bfloat16``.
             **kwargs: Additional arguments documented in ``from_pretrained``.
                 ``dtype`` takes precedence over ``torch_dtype`` when not ``None``.
+                When loading weights for a separately loaded config, pass the same
+                resolved ``revision`` used to load that config.
         """
         _reject_separate_distributed_kwargs(kwargs)
         if (dtype := kwargs.pop("dtype", None)) is not None:
@@ -884,6 +893,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         kwargs["trust_remote_code"] = kwargs.get(
             "trust_remote_code", resolve_trust_remote_code(name_or_path) if name_or_path else False
         )
+        if isinstance(config, str) or kwargs.get("load_base_model", False):
+            kwargs["revision"] = resolve_revision(
+                name_or_path,
+                kwargs.get("revision"),
+                cache_dir=kwargs.get("cache_dir"),
+                token=kwargs.get("token"),
+                local_files_only=kwargs.get("local_files_only", False),
+            )
         if isinstance(config, str):
             try:
                 config = get_hf_config(config, attn_implementation, **kwargs)

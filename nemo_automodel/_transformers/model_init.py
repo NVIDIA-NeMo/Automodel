@@ -38,6 +38,7 @@ try:
 except ImportError:
     StrictDataclassClassValidationError = ValueError
 from transformers.modeling_utils import PreTrainedModel
+from transformers.utils.hub import resolve_revision
 
 # For models that still accesses config.pad_token_id after v5 removes it in PretrainedConfig
 if not hasattr(PretrainedConfig, "pad_token_id"):
@@ -296,9 +297,7 @@ def _load_registered_custom_config(pretrained_model_name_or_path, attn_implement
         return None
 
     unused_kwargs.setdefault("attn_implementation", attn_implementation)
-    config = config_cls.from_dict(config_dict, **unused_kwargs)
-    config._commit_hash = config_dict.get("_commit_hash")
-    return config
+    return config_cls.from_dict(config_dict, **unused_kwargs)
 
 
 def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
@@ -306,6 +305,13 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     Get the HF config for the model.
     """
     kwargs = kwargs.copy()
+    kwargs["revision"] = resolve_revision(
+        pretrained_model_name_or_path,
+        kwargs.get("revision"),
+        cache_dir=kwargs.get("cache_dir"),
+        token=kwargs.get("token"),
+        local_files_only=kwargs.get("local_files_only", False),
+    )
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
     # A plain-dict ``config`` (e.g. from CLI ``--model.config.num_hidden_layers 16``,
@@ -395,8 +401,6 @@ def _load_config_with_layer_types_fix(pretrained_model_name_or_path, attn_implem
             for key in ("revision", "code_revision", "cache_dir", "token", "local_files_only", "force_download")
             if key in kwargs
         }
-        if config_dict.get("_commit_hash") is not None:
-            code_kwargs["revision"] = config_dict["_commit_hash"]
         config_cls = get_class_from_dynamic_module(auto_map["AutoConfig"], pretrained_model_name_or_path, **code_kwargs)
     if config_cls is None:
         model_type = config_dict.get("model_type")
@@ -406,9 +410,7 @@ def _load_config_with_layer_types_fix(pretrained_model_name_or_path, attn_implem
             f"Could not resolve config class for {pretrained_model_name_or_path} "
             f"(model_type={config_dict.get('model_type')!r})"
         )
-    config = config_cls.from_dict(config_dict, attn_implementation=attn_implementation)
-    config._commit_hash = config_dict.get("_commit_hash")
-    return config
+    return config_cls.from_dict(config_dict, attn_implementation=attn_implementation)
 
 
 def get_is_hf_model(config, force_hf):
@@ -448,9 +450,6 @@ def _download_model_weights(
                 for key in ("cache_dir", "revision", "token", "local_files_only", "force_download")
                 if key in kwargs
             }
-            commit_hash = getattr(hf_config, "_commit_hash", None)
-            if commit_hash is not None:
-                download_kwargs["revision"] = commit_hash
             snapshot_download(pretrained_model_name_or_path, **download_kwargs)
 
 
@@ -1039,7 +1038,7 @@ def _init_model_bnb_streaming(
     # 2. Resolve to local directory & verify safetensors
     model_dir = _resolve_model_dir(
         pretrained_model_name_or_path,
-        revision=getattr(hf_config, "_commit_hash", None),
+        revision=kwargs.get("revision"),
         cache_dir=kwargs.get("cache_dir"),
         subfolder=kwargs.get("subfolder", ""),
     )
@@ -1217,6 +1216,14 @@ def __init_model(
     process_group = kwargs.pop("_process_group", None)
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
+    if is_pretrained_init:
+        kwargs["revision"] = resolve_revision(
+            pretrained_model_name_or_path_or_config,
+            kwargs.get("revision"),
+            cache_dir=kwargs.get("cache_dir"),
+            token=kwargs.get("token"),
+            local_files_only=kwargs.get("local_files_only", False),
+        )
     hf_config = (
         get_hf_config(pretrained_model_name_or_path_or_config, attn_implementation, **kwargs)
         if is_pretrained_init
@@ -1225,10 +1232,6 @@ def __init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
-    commit_hash = getattr(hf_config, "_commit_hash", None)
-    if is_pretrained_init and commit_hash is not None:
-        kwargs["revision"] = commit_hash
-        kwargs["_commit_hash"] = commit_hash
     # A plain-dict ``config`` override (e.g. from ``--model.config.num_hidden_layers``)
     # has already been folded into ``hf_config`` by ``get_hf_config`` above. Drop it from
     # kwargs so it is not also forwarded into the model constructor / HF from_pretrained
@@ -1317,6 +1320,7 @@ def __init_model(
                     requested_dtype=(torch_dtype if torch_dtype != "auto" else None),
                 )
         else:
+            kwargs.pop("revision", None)
             model = cls._from_config_parent_class(
                 hf_config,
                 *model_args,
@@ -1357,11 +1361,14 @@ def __init_model(
             # them: the generation-config restore below has to read from the same
             # subfolder/revision the weights came from.
             loading_kwargs = {key: kwargs[key] for key in HUB_LOADING_KWARGS if key in kwargs}
-            for key in (*HUB_LOADING_KWARGS, "_commit_hash", "code_revision", "use_auth_token"):
-                kwargs.pop(key, None)
+            init_param_names = _get_init_param_names(model_cls)
+            for key in (*HUB_LOADING_KWARGS, "code_revision", "use_auth_token"):
+                # A model-owned tokenizer or adapter can explicitly request the
+                # resolved revision; **kwargs alone does not opt a model in.
+                if key != "revision" or key not in init_param_names:
+                    kwargs.pop(key, None)
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
-            init_param_names = _get_init_param_names(model_cls)
             config_overrides = dict_config_overrides | _consume_config_overrides(
                 hf_config, kwargs, init_param_names=init_param_names
             )
@@ -1447,6 +1454,7 @@ def __init_model(
                 requested_dtype=(torch_dtype if torch_dtype != "auto" else None),
             )
     else:
+        kwargs.pop("revision", None)
         model = cls._from_config_parent_class(
             hf_config,
             *model_args,

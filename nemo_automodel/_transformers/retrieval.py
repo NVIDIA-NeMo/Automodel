@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import (
+    AutoConfig,
     AutoModel,
     AutoModelForSequenceClassification,
     FineGrainedFP8Config,
@@ -34,8 +35,8 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import ModelOutput, logging
+from transformers.utils.hub import resolve_revision
 
-from nemo_automodel._transformers.auto_config import NeMoAutoConfig
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.sentence_transformer_export import (
     SentenceTransformerExportConfig,
@@ -473,16 +474,20 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
+    hf_kwargs["revision"] = resolve_revision(
+        model_name_or_path,
+        hf_kwargs.get("revision"),
+        cache_dir=hf_kwargs.get("cache_dir"),
+        token=hf_kwargs.get("token"),
+        local_files_only=hf_kwargs.get("local_files_only", False),
+    )
     config = loaded_config
     if config is None:
-        config = NeMoAutoConfig.from_pretrained(
+        config = AutoConfig.from_pretrained(
             model_name_or_path,
             trust_remote_code=trust_remote_code,
             **hf_kwargs,
         )
-    commit_hash = getattr(config, "_commit_hash", None)
-    if commit_hash is not None:
-        hf_kwargs["revision"] = commit_hash
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
@@ -520,7 +525,6 @@ def build_encoder_backbone(
             default=False if task == "embedding" else None,
         )
         _set_text_backbone_is_causal(backbone, effective_is_causal)
-        backbone.config._commit_hash = commit_hash
         return backbone
 
     backbone_model_class = _get_supported_backbone_class(model_type, task, config)
@@ -554,7 +558,6 @@ def build_encoder_backbone(
         default=False if task == "embedding" else None,
     )
     _set_text_backbone_is_causal(backbone, effective_is_causal)
-    backbone.config._commit_hash = commit_hash
     return backbone
 
 
@@ -780,15 +783,19 @@ class BiEncoderModel(nn.Module):
             raise ValueError("task must be specified when calling build()")
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
-        config = NeMoAutoConfig.from_pretrained(
+        hf_kwargs["revision"] = resolve_revision(
+            model_name_or_path,
+            hf_kwargs.get("revision"),
+            cache_dir=hf_kwargs.get("cache_dir"),
+            token=hf_kwargs.get("token"),
+            local_files_only=hf_kwargs.get("local_files_only", False),
+        )
+        config = AutoConfig.from_pretrained(
             model_name_or_path,
             trust_remote_code=trust_remote_code,
             **hf_kwargs,
         )
         is_causal = _resolve_is_causal(config, is_causal)
-        commit_hash = getattr(config, "_commit_hash", None)
-        if commit_hash is not None:
-            hf_kwargs["revision"] = commit_hash
         saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, hf_kwargs)
         pooling, l2_normalize = _resolve_bi_encoder_options(
             config,
@@ -821,7 +828,6 @@ class BiEncoderModel(nn.Module):
             )
         encoder.source_model_path = _resolve_cached_source_model_path(
             model_name_or_path,
-            backbone.config,
             hf_kwargs,
         )
         encoder.source_repository_path = _resolve_cached_source_repository_path(
@@ -831,7 +837,7 @@ class BiEncoderModel(nn.Module):
         )
         if encoder.sentence_transformer_export_config is not None:
             encoder.source_repository_path = (
-                _cache_hub_source_legal_assets(model_name_or_path, config, hf_kwargs) or encoder.source_repository_path
+                _cache_hub_source_legal_assets(model_name_or_path, hf_kwargs) or encoder.source_repository_path
             )
         return encoder
 

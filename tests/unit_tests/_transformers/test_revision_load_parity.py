@@ -58,7 +58,7 @@ def test_target_builder_keeps_selected_checkpoint(hf_config_hub, monkeypatch, bu
     def load_target(config, **kwargs):
         ref.write_text(A)
         build_kwargs, _ = _TestBuildModelRetryDepth()._make_build_kwargs()
-        build_kwargs.update(is_hf_model=False, cache_dir=str(root))
+        build_kwargs.update(is_hf_model=False, cache_dir=str(root), revision=kwargs["revision"])
         with (
             patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, model)),
             patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
@@ -84,7 +84,6 @@ def test_target_builder_keeps_selected_checkpoint(hf_config_hub, monkeypatch, bu
         trust_remote_code=False,
     )
     assert selected_sources == [cache / "snapshots" / B]
-    assert config._commit_hash == B
     assert loaded is model
     assert ref.read_text() == A
 
@@ -143,7 +142,6 @@ def test_retrieval_keeps_config_weights_and_prompts_on_one_snapshot(hf_config_hu
     assert encoder.sentence_transformer_export_config.query_prompt == f"query from {B}"
     weights = encoder.model.get_input_embeddings().weight
     torch.testing.assert_close(weights, torch.full_like(weights, 0.75), rtol=0, atol=0)
-    assert encoder.config._commit_hash == B
     assert Path(encoder.source_model_path) == cache / "snapshots" / B
     assert ref.read_text() == A
     # Upstream may probe for adapter metadata even with local_files_only=True.

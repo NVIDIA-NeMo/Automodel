@@ -958,7 +958,7 @@ def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
     parent_model = SimpleNamespace(language_model=language_model)
     auto_config_from_pretrained = MagicMock(return_value=config)
     auto_model_from_pretrained = MagicMock(return_value=parent_model)
-    monkeypatch.setattr(retrieval.NeMoAutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
     monkeypatch.setattr(retrieval.AutoModel, "from_pretrained", auto_model_from_pretrained)
 
     backbone = retrieval.build_encoder_backbone(
@@ -1021,13 +1021,12 @@ def test_embedding_fallback_forwards_hf_kwargs_and_disables_causal_attention(mon
 
     config = MagicMock()
     config.model_type = "mistral"
-    config._commit_hash = None
     config.get_text_config.return_value = config
     backbone = MagicMock()
     backbone.config = config
     auto_config_from_pretrained = MagicMock(return_value=config)
     auto_model_from_pretrained = MagicMock(return_value=backbone)
-    monkeypatch.setattr(retrieval.NeMoAutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
     monkeypatch.setattr(retrieval.AutoModel, "from_pretrained", auto_model_from_pretrained)
 
     result = retrieval.build_encoder_backbone(
@@ -1280,7 +1279,7 @@ def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monke
     backbone.forward = MagicMock()
     auto_config_from_pretrained = MagicMock(return_value=config)
     build_encoder_backbone = MagicMock(return_value=backbone)
-    monkeypatch.setattr(retrieval.NeMoAutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
     monkeypatch.setattr(retrieval, "build_encoder_backbone", build_encoder_backbone)
     monkeypatch.setattr(retrieval, "_load_sentence_transformer_wrapper_options", MagicMock(return_value=None))
     monkeypatch.setattr(retrieval, "_resolve_cached_source_model_path", MagicMock(return_value=None))
@@ -1321,7 +1320,7 @@ def test_build_encoder_backbone_preserves_positional_loaded_config(monkeypatch):
     backbone.config = config
     auto_config_from_pretrained = MagicMock(return_value=config)
     auto_model_from_pretrained = MagicMock(return_value=backbone)
-    monkeypatch.setattr(retrieval.NeMoAutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
     monkeypatch.setattr(retrieval.AutoModel, "from_pretrained", auto_model_from_pretrained)
 
     result = retrieval.build_encoder_backbone("org/model", "embedding", False, None, None, None, None, config)
@@ -1329,7 +1328,7 @@ def test_build_encoder_backbone_preserves_positional_loaded_config(monkeypatch):
     assert result is backbone
     auto_config_from_pretrained.assert_not_called()
     assert result.config.is_causal is False
-    auto_model_from_pretrained.assert_called_once_with("org/model", trust_remote_code=False)
+    auto_model_from_pretrained.assert_called_once_with("org/model", trust_remote_code=False, revision=None)
 
 
 def test_bi_encoder_build_preserves_positional_trust_remote_code(monkeypatch):
@@ -1342,14 +1341,14 @@ def test_bi_encoder_build_preserves_positional_trust_remote_code(monkeypatch):
     backbone.forward = MagicMock()
     auto_config_from_pretrained = MagicMock(return_value=config)
     build_encoder_backbone = MagicMock(return_value=backbone)
-    monkeypatch.setattr(retrieval.NeMoAutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
     monkeypatch.setattr(retrieval, "build_encoder_backbone", build_encoder_backbone)
     monkeypatch.setattr(retrieval, "_load_sentence_transformer_wrapper_options", MagicMock(return_value=None))
     monkeypatch.setattr(retrieval, "_resolve_cached_source_model_path", MagicMock(return_value=None))
 
     retrieval.BiEncoderModel.build("org/model", None, None, None, False, True, True)
 
-    auto_config_from_pretrained.assert_called_once_with("org/model", trust_remote_code=True)
+    auto_config_from_pretrained.assert_called_once_with("org/model", trust_remote_code=True, revision=None)
     assert build_encoder_backbone.call_args.kwargs["trust_remote_code"] is True
     assert build_encoder_backbone.call_args.kwargs["is_causal"] is False
 

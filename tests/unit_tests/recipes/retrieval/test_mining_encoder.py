@@ -26,14 +26,14 @@ import pytest
 import torch
 from PIL import Image
 
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.models.ministral_bidirectional.processor import load_image
+from nemo_automodel.recipes.retrieval.mine_hard_negatives import MineHardNegativesRecipe
 from nemo_automodel.recipes.retrieval.mining_encoder import (
     CheckpointMiningEncoder,
     CheckpointMiningEncoderConfig,
     SentenceTransformerMiningEncoder,
 )
-from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.models.ministral_bidirectional.processor import load_image
-from nemo_automodel.recipes.retrieval.mine_hard_negatives import MineHardNegativesRecipe
 
 
 class _PixelProcessor:
@@ -104,7 +104,7 @@ def test_typed_config_owns_processor_construction(monkeypatch):
 
     model = _PixelModel()
     model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
-    model.config = SimpleNamespace(name_or_path="", _commit_hash=None)
+    model.config = SimpleNamespace(name_or_path="")
     _use_native_checkpoint(monkeypatch, model)
     monkeypatch.setattr(
         "nemo_automodel.recipes.retrieval.mining_encoder.import_module",
@@ -114,19 +114,20 @@ def test_typed_config_owns_processor_construction(monkeypatch):
     encoder = config.build(model_name_or_path="/resolved-snapshot", device=torch.device("cpu"))
 
     assert encoder.processor is processor
-    from_pretrained.assert_called_once_with("/resolved-snapshot")
+    from_pretrained.assert_called_once_with("/resolved-snapshot", revision=None)
 
 
 def test_checkpoint_processor_uses_pinned_revision(monkeypatch):
     load = MagicMock(return_value=_PixelProcessor())
     model = _PixelModel()
     model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
-    model.config = SimpleNamespace(name_or_path="org/model", _commit_hash="pinned-sha")
+    model.config = SimpleNamespace(name_or_path="org/model")
     _use_native_checkpoint(monkeypatch, model)
     monkeypatch.setattr(
         "nemo_automodel.recipes.retrieval.mining_encoder.import_module",
         lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=load)),
     )
+    monkeypatch.setattr("nemo_automodel.recipes.retrieval.mining_encoder.resolve_revision", lambda _: "pinned-sha")
     model.source_model_path = "/snapshot"
     CheckpointMiningEncoderConfig().build(model_name_or_path="/snapshot", device=torch.device("cpu"))
     load.assert_called_once_with("org/model", revision="pinned-sha")
@@ -161,7 +162,7 @@ def test_sentence_transformer_checkpoint_is_selected_without_loading_automodel(t
 def test_checkpoint_without_sentence_transformer_modules_uses_automodel(tmp_path, monkeypatch):
     model = _PixelModel()
     model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
-    model.config = SimpleNamespace(name_or_path=str(tmp_path), _commit_hash=None)
+    model.config = SimpleNamespace(name_or_path=str(tmp_path))
     model.to = MagicMock(return_value=model)
     model.eval = MagicMock()
     load_model = MagicMock(return_value=model)
@@ -175,8 +176,8 @@ def test_checkpoint_without_sentence_transformer_modules_uses_automodel(tmp_path
     encoder = CheckpointMiningEncoderConfig().build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
 
     assert isinstance(encoder, CheckpointMiningEncoder)
-    load_model.assert_called_once_with(str(tmp_path), use_liger_kernel=False, use_sdpa_patching=True)
-    load_processor.assert_called_once_with(str(tmp_path))
+    load_model.assert_called_once_with(str(tmp_path), use_liger_kernel=False, use_sdpa_patching=True, revision=None)
+    load_processor.assert_called_once_with(str(tmp_path), revision=None)
 
 
 def test_cross_encoder_checkpoint_is_not_loaded_as_embedding_model(tmp_path, monkeypatch):

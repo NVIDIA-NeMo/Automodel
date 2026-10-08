@@ -26,7 +26,7 @@ from typing import Any, Literal, Protocol
 import numpy as np
 import torch
 from PIL import Image
-from transformers.utils.hub import cached_file
+from transformers.utils.hub import cached_file, resolve_revision
 
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -108,7 +108,8 @@ class CheckpointMiningEncoderConfig:
 
         from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
 
-        model_kwargs = {"use_liger_kernel": False, "use_sdpa_patching": True}
+        revision = resolve_revision(model_name_or_path)
+        model_kwargs = {"use_liger_kernel": False, "use_sdpa_patching": True, "revision": revision}
         if trust_remote_code:
             model_kwargs["trust_remote_code"] = True
         if attn_implementation is not None:
@@ -122,12 +123,8 @@ class CheckpointMiningEncoderConfig:
             raise ValueError("This checkpoint's backbone does not declare a supported retrieval processor.")
         module_name, class_name = processor_target.rsplit(".", 1)
         processor_class = getattr(import_module(module_name), class_name)
-        loading_options = {}
-        commit_hash = getattr(model.config, "_commit_hash", None)
-        if commit_hash is not None:
-            loading_options["revision"] = commit_hash
         processor = processor_class.from_pretrained(
-            model.config.name_or_path or model.source_model_path, **loading_options
+            model.config.name_or_path or model.source_model_path, revision=revision
         )
         logger.info("Resolved checkpoint retrieval processor: %s", processor)
         return CheckpointMiningEncoder(model=model, processor=processor, device=device)

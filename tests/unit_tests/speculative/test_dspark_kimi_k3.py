@@ -194,7 +194,6 @@ def test_target_builder_requires_cuda():
 def test_target_builder_uses_text_config_and_distributed_loader(monkeypatch):
     target_config = KimiK3Config(text_config=_target_config())
     # NeMoAutoConfig restores the resolved Hub revision on the loaded config.
-    target_config._commit_hash = "a" * 40
     distributed_setup = object()
     target_model = object()
     captured = {}
@@ -229,7 +228,6 @@ def test_target_builder_uses_text_config_and_distributed_loader(monkeypatch):
     assert config.linear_attn_config == {"kda_layers": [1, 2, 3], "full_attn_layers": []}
     assert config.architectures == ["KimiK3ForCausalLM"]
     assert config.name_or_path == "moonshotai/Kimi-K3"
-    assert config._commit_hash == target_config._commit_hash
     assert model is target_model
     assert setup is distributed_setup
     assert captured["config"] is config

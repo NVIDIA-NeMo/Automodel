@@ -421,7 +421,6 @@ class DeepseekV41Config(PretrainedConfig):
         self.text_config = text_config
         self.vision_config = vision_config
         self.image_token_id = image_token_id
-        self._commit_hash = kwargs.pop("_commit_hash", None)
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,
@@ -432,8 +431,11 @@ class DeepseekV41Config(PretrainedConfig):
             **kwargs,
         )
 
-    def build_tokenizer(self) -> PreTrainedTokenizerFast:
+    def build_tokenizer(self, *, revision: str | None = None) -> PreTrainedTokenizerFast:
         """Load the checkpoint's fast tokenizer for deterministic Engram hashing.
+
+        Args:
+            revision: Resolved Hub revision shared with the config and weight loads.
 
         Returns:
             The original fast tokenizer from this configuration's checkpoint
@@ -448,7 +450,7 @@ class DeepseekV41Config(PretrainedConfig):
             raise ValueError("Engram tokenizer construction requires a checkpoint source or an explicit tokenizer")
         tokenizer = AutoTokenizer.from_pretrained(
             self._name_or_path,
-            revision=self._commit_hash,
+            revision=revision,
             trust_remote_code=False,
             use_fast=True,
         )
