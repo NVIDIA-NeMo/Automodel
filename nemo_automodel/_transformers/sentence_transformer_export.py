@@ -26,6 +26,8 @@ from torch import nn
 from transformers import PretrainedConfig, ProcessorMixin
 from transformers.utils import logging
 
+from nemo_automodel.shared.tokenizer_serialization import restore_source_tokenizer_serialization_state
+
 _SENTENCE_TRANSFORMER_POOLING_KEYS = {
     "avg": "mean",
     "cls": "cls",
@@ -420,56 +422,6 @@ def _remove_stale_text_processor_assets(hf_metadata_dir: str) -> None:
             os.remove(asset_path)
 
 
-def _restore_source_tokenizer_serialization_state(
-    original_model_path: str | None,
-    hf_metadata_dir: str,
-    tokenizer,
-) -> None:
-    """Remove training-time tokenizer state while retaining tokenizer edits."""
-    pad_token = getattr(tokenizer, "pad_token", None)
-    tokenizer_json_path = os.path.join(hf_metadata_dir, "tokenizer.json")
-    source_tokenizer_json_path = (
-        os.path.join(original_model_path, "tokenizer.json") if original_model_path is not None else None
-    )
-    if os.path.isfile(tokenizer_json_path):
-        with open(tokenizer_json_path) as f:
-            tokenizer_json = json.load(f)
-        source_tokenizer_json = {}
-        if source_tokenizer_json_path is not None and os.path.isfile(source_tokenizer_json_path):
-            with open(source_tokenizer_json_path) as f:
-                source_tokenizer_json = json.load(f)
-        for key in ("truncation", "padding"):
-            tokenizer_json[key] = source_tokenizer_json.get(key)
-        _write_json(tokenizer_json_path, tokenizer_json)
-
-    tokenizer_config_path = os.path.join(hf_metadata_dir, "tokenizer_config.json")
-    source_tokenizer_config_path = (
-        os.path.join(original_model_path, "tokenizer_config.json") if original_model_path is not None else None
-    )
-    if os.path.isfile(tokenizer_config_path):
-        with open(tokenizer_config_path) as f:
-            tokenizer_config = json.load(f)
-        source_tokenizer_config = {}
-        if source_tokenizer_config_path is not None and os.path.isfile(source_tokenizer_config_path):
-            with open(source_tokenizer_config_path) as f:
-                source_tokenizer_config = json.load(f)
-        if "local_files_only" in source_tokenizer_config:
-            tokenizer_config["local_files_only"] = source_tokenizer_config["local_files_only"]
-        else:
-            tokenizer_config.pop("local_files_only", None)
-        tokenizer_config.pop("processor_class", None)
-        if pad_token is not None:
-            tokenizer_config["pad_token"] = pad_token
-        _write_json(tokenizer_config_path, tokenizer_config)
-
-    special_tokens_map_path = os.path.join(hf_metadata_dir, "special_tokens_map.json")
-    if pad_token is not None and os.path.isfile(special_tokens_map_path):
-        with open(special_tokens_map_path) as f:
-            special_tokens_map = json.load(f)
-        special_tokens_map["pad_token"] = pad_token
-        _write_json(special_tokens_map_path, special_tokens_map)
-
-
 def _read_source_sentence_transformer_max_seq_length(original_model_path: str | None) -> int | None:
     """Read the source Sentence Transformers deployment limit when present."""
     if original_model_path is None:
@@ -638,7 +590,7 @@ def _save_generated_sentence_transformer_assets(
     )
     _write_json(os.path.join(hf_metadata_dir, "1_Pooling", "config.json"), pooling_config)
     text_tokenizer = tokenizer.tokenizer if input_mode == "structured_multimodal" else tokenizer
-    _restore_source_tokenizer_serialization_state(original_model_path, hf_metadata_dir, text_tokenizer)
+    restore_source_tokenizer_serialization_state(original_model_path, hf_metadata_dir, text_tokenizer)
     if input_mode == "text":
         _remove_stale_text_processor_assets(hf_metadata_dir)
     _copy_source_legal_assets(

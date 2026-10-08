@@ -31,6 +31,7 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+from nemo_automodel.components.models.nemotron_v3.parallelization import NemotronHModelParallelizer
 from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ModelParallelizer
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
@@ -91,6 +92,13 @@ class _ToyLM(nn.Module):
         return head(hidden)
 
 
+class _ToyNemotronH(_ToyLM):
+    @property
+    def backbone(self) -> SimpleNamespace:
+        """Expose the decoder blocks through the remote Nemotron-H layout."""
+        return SimpleNamespace(layers=self.transformer["blocks"])
+
+
 def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
     """Materialize a distributed tensor for numerical comparison.
 
@@ -119,9 +127,10 @@ def _run_case(
     output_in_container: bool = False,
     nested_output: bool = False,
     shared_module: bool = False,
+    model_class: type[_ToyLM] = _ToyLM,
 ) -> None:
     torch.manual_seed(2026)
-    model = _ToyLM(
+    model = model_class(
         tied=tied,
         input_in_container=input_in_container,
         output_in_container=output_in_container,
@@ -226,6 +235,13 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     input_in_container=input_in_container,
                     shared_module=True,
                 )
+        for tied in (False, True):
+            _run_case(
+                mesh,
+                parallelizer=NemotronHModelParallelizer(),
+                tied=tied,
+                model_class=_ToyNemotronH,
+            )
         dist.barrier()
     finally:
         dist.destroy_process_group()

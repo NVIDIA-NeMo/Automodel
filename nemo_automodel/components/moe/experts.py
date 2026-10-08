@@ -47,9 +47,10 @@ _BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr
 # dispatches on the faster single-operation path.
 _BIAS_CHUNK_ROWS = 4096
 _BIAS_CHUNK_THRESHOLD = 12288
-# Above this size, materializing both grouped-GEMM intermediates can exhaust
-# memory even when bias additions themselves are bounded. Recompute row chunks
-# during backward instead of retaining full expert-MLP activations.
+# Above this size, materializing both grouped-GEMM intermediates for biased experts
+# can exhaust memory even when bias additions themselves are bounded. Recompute
+# row chunks during backward instead of retaining full expert-MLP activations.
+# Bias-free experts retain whole-dispatch GEMMs for throughput.
 _EXPERT_MLP_CHUNK_BYTES = 256 * 1024 * 1024
 
 
@@ -1638,13 +1639,16 @@ class GroupedExpertsDeepEP(nn.Module):
                 * permuted_local_hidden_states.element_size()
             )
 
-            if not self.use_mxfp8 and gate_up_output_bytes > _EXPERT_MLP_CHUNK_BYTES:
+            # Retain bounded MLP recomputation for biased experts. Bias-free
+            # dispatches use whole grouped GEMMs: small row chunks introduce
+            # expensive gradient copies and redundant activation recomputation.
+            if self.expert_bias and not self.use_mxfp8 and gate_up_output_bytes > _EXPERT_MLP_CHUNK_BYTES:
                 output2 = _checkpointed_chunked_expert_mlp(
                     permuted_local_hidden_states,
                     gate_and_up_projs,
                     down_projs,
-                    self.gate_up_proj_bias.to_local() if self.expert_bias else None,
-                    self.down_proj_bias.to_local() if self.expert_bias else None,
+                    self.gate_up_proj_bias.to_local(),
+                    self.down_proj_bias.to_local(),
                     tokens_per_expert_gpu,
                     permuted_probs,
                     self.expert_activation,
