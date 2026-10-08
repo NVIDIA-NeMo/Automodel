@@ -1,0 +1,96 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Native recipe smoke test: random four-layer model, FSDP2 + CP2, no downloads.
+# Requires FA4 3c2c6b31e730fd13e7d6f0d384af22684b24c532 (SM90 192-dim GQA fix).
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+step_scheduler:
+  global_batch_size: 2
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  max_steps: 2
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  dtype: float32
+  config:
+    _target_: nemo_automodel.components.models.step5.configuration.Step5Config
+    architectures: [Step5ForCausalLM]
+    hidden_size: 64
+    intermediate_size: 128
+    num_hidden_layers: 4
+    num_attention_heads: 4
+    num_attention_groups: 2
+    head_dim: 192
+    vocab_size: 128
+    moe_num_experts: 4
+    moe_top_k: 2
+    moe_intermediate_size: 32
+    share_expert_dim: 32
+    moe_layer_list: [3]
+    num_nextn_predict_layers: 0
+    dtype: float32
+    sliding_window: 65
+    sparse_config:
+      proxy_dim: 32
+      sparse_indexer_rope_dim: 8
+      sparse_indexer_num_heads: 4
+      num_provider_groups: 2
+      topk: 4
+      region_block_size: 8
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: fa4
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: torch
+    gate_precision: float32
+    enable_hf_state_dict_adapter: false
+    enable_fsdp_optimizations: true
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/step5_cp2_smoke
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 2
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    wrap_outer_model: true
+    reshard_after_forward: true
+    mp_policy:
+      _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+      param_dtype: bfloat16
+      reduce_dtype: float32
+      output_dtype: null
+      cast_forward_inputs: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 16
+  mean_len: 271
+  std_len: 0
+  vocab_size: 128
+  max_sentence_len: 272
+  seed: 42
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.01
+wandb:
+  enable: false

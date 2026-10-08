@@ -113,7 +113,7 @@ class TestActivationFunctions:
         # Should be a functools.partial wrapping swiglu_clamped_deepep with limit=7.0
         assert isinstance(activation_fn, partial)
         assert activation_fn.func is swiglu_clamped_deepep
-        assert activation_fn.keywords == {"limit": 7.0}
+        assert activation_fn.keywords == {"limit": 7.0, "clamp_after_activation": False}
 
     def test_get_expert_activation_for_deepep_swiglu_negative_limit_uses_fused(self, moe_config):
         """A non-positive ``swiglu_limit`` (e.g. 0.0 or negative) falls back to the fused path."""
