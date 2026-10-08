@@ -16,6 +16,7 @@
 
 import re
 from collections.abc import Iterator
+from typing import cast
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -54,13 +55,26 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
 
     def __init__(self, config: Step5Config, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype) -> None:
         super().__init__(config, moe_config, backend, dtype)
+        quantization = config.quantization_config
+        self._load_fp8_experts = quantization is not None
+        excluded: tuple[str, ...] = ()
+        if quantization is not None:
+            if quantization.get("quant_method") != "fp8" or quantization.get("weight_block_size") != [128, 128]:
+                raise ValueError("Step5 checkpoint loading requires FP8 blocks of shape [128, 128]")
+            configured_exclusions = quantization.get("modules_to_not_convert", [])
+            if not isinstance(configured_exclusions, list) or any(
+                not isinstance(name, str) for name in configured_exclusions
+            ):
+                raise ValueError("Step5 modules_to_not_convert must be a list of module or parameter names")
+            excluded = tuple(cast(list[str], configured_exclusions))
+        self._unquantized_expert_modules = frozenset(excluded)
 
     def iter_checkpoint_load_parts(
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: DeviceMesh | None = None,
     ) -> Iterator[CheckpointLoadPart]:
-        """Load FP8 expert projections in bounded parts into final BF16 storage.
+        """Load mixed FP8/BF16 expert projections into final BF16 storage.
 
         Args:
             model_state_dict: Final native storage: fused gate/up tensors
@@ -70,20 +84,24 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
             device_mesh: Optional expert mesh used for native/HF conversion.
 
         Yields:
-            Checkpoint load parts with FP8 projection tensors [experts, out, in]
-            and FP32 block scales [experts, ceil(out / 128), ceil(in / 128)].
-            Finish callbacks write decoded local experts into final model storage.
+            Checkpoint load parts with expert projections [experts, out, in].
+            Quantized projections use temporary FP8 tensors and FP32 block scales
+            [experts, ceil(out / 128), ceil(in / 128)]; finish callbacks decode local
+            experts into final storage. Excluded or unquantized projections use
+            BF16 views aliasing final parameter storage, without temporary copies.
         """
         for name, destination in model_state_dict.items():
             if name.endswith(".moe.experts.gate_and_up_projs"):
                 gate, up = destination.chunk(2, dim=-1)
                 prefix = name.removesuffix("experts.gate_and_up_projs")
+                packed_name = prefix + "experts.w13_weight"
                 views = {
                     prefix + "gate_proj.weight": gate.transpose(1, 2),
                     prefix + "up_proj.weight": up.transpose(1, 2),
                 }
             elif name.endswith(".moe.experts.down_projs"):
                 prefix = name.removesuffix("experts.down_projs")
+                packed_name = prefix + "experts.w2_weight"
                 views = {prefix + "down_proj.weight": destination.transpose(1, 2)}
             else:
                 tensors = dict(self.convert_single_tensor_to_hf(name, destination))
@@ -109,8 +127,20 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
                 continue
 
             tensors = {}
+            temporary_keys = set()
             decode_parts = []
             for source_name, view in views.items():
+                # Source quantization metadata may name the packed original
+                # expert parameter or the exported gate/up/down projection.
+                aliases = (source_name, source_name.removesuffix(".weight"), packed_name)
+                excluded = any(
+                    alias == module or alias.startswith(module + ".")
+                    for alias in aliases
+                    for module in self._unquantized_expert_modules
+                )
+                if not self._load_fp8_experts or excluded:
+                    tensors[source_name] = view
+                    continue
                 local_view = view.to_local() if isinstance(view, DTensor) else view
                 packed = torch.empty_like(view, dtype=torch.float8_e4m3fn, memory_format=torch.contiguous_format)
                 local_packed = packed.to_local() if isinstance(packed, DTensor) else packed
@@ -138,6 +168,7 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
                     scales = local_scales
                 tensors[source_name] = packed
                 tensors[source_name + "_scale_inv"] = scales
+                temporary_keys.update((source_name, source_name + "_scale_inv"))
                 decode_parts.append((source_name, local_packed, local_scales, local_view))
 
             def finish_experts(
@@ -159,7 +190,7 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
                             )
                             target[expert].copy_(decoded)
 
-            yield CheckpointLoadPart(tensors, frozenset((name,)), frozenset(tensors), finish_experts)
+            yield CheckpointLoadPart(tensors, frozenset((name,)), frozenset(temporary_keys), finish_experts)
 
     def from_hf(
         self,

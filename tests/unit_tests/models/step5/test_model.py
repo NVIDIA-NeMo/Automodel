@@ -245,3 +245,92 @@ def test_post_silu_clamp_is_not_pre_silu_clamp():
     expected_grad = torch.autograd.grad(expected.sum(), (gate, up))
     for a, e in zip(actual_grad, expected_grad):
         torch.testing.assert_close(a, e)
+
+
+@pytest.mark.parametrize(
+    "excluded",
+    [
+        ["model.layers.3.moe.experts.w13_weight", "model.layers.3.moe.experts.w2_weight"],
+        ["model.layers.3.moe.gate_proj", "model.layers.3.moe.up_proj", "model.layers.3.moe.down_proj"],
+        ["model.layers.3.moe"],
+    ],
+)
+def test_checkpoint_parts_preserve_unquantized_expert_weights(excluded):
+    model = make_model(
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": excluded,
+        }
+    )
+    adapter = model.state_dict_adapter
+    native = {
+        "model.layers.3.moe.experts.gate_and_up_projs": torch.zeros(4, 32, 32, dtype=torch.bfloat16),
+        "model.layers.3.moe.experts.down_projs": torch.zeros(4, 16, 32, dtype=torch.bfloat16),
+    }
+    source = {
+        "model.layers.3.moe.gate_proj.weight": (torch.arange(4 * 16 * 32).reshape(4, 16, 32) / 256).bfloat16(),
+        "model.layers.3.moe.up_proj.weight": torch.full((4, 16, 32), 0.375, dtype=torch.bfloat16),
+        "model.layers.3.moe.down_proj.weight": torch.full((4, 32, 16), -0.625, dtype=torch.bfloat16),
+    }
+    for part in adapter.iter_checkpoint_load_parts(native):
+        assert set(part.checkpoint_tensors) <= source.keys()
+        assert not part.temporary_checkpoint_keys
+        for name, target in part.checkpoint_tensors.items():
+            assert target.dtype == torch.bfloat16
+            target.copy_(source[name])
+        part.finish()
+    torch.testing.assert_close(
+        native["model.layers.3.moe.experts.gate_and_up_projs"][..., :16],
+        source["model.layers.3.moe.gate_proj.weight"].transpose(1, 2),
+    )
+    torch.testing.assert_close(
+        native["model.layers.3.moe.experts.gate_and_up_projs"][..., 16:],
+        source["model.layers.3.moe.up_proj.weight"].transpose(1, 2),
+    )
+    torch.testing.assert_close(
+        native["model.layers.3.moe.experts.down_projs"], source["model.layers.3.moe.down_proj.weight"].transpose(1, 2)
+    )
+
+
+@pytest.mark.parametrize("bf16_gate", [False, True])
+def test_checkpoint_parts_decode_fp8_with_optional_bf16_gate(bf16_gate):
+    excluded = ["model.layers.3.moe.gate_proj"] if bf16_gate else []
+    adapter = make_model(
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": excluded,
+        }
+    ).state_dict_adapter
+    name = "model.layers.3.moe.experts.gate_and_up_projs"
+    destination = torch.zeros(2, 128, 256, dtype=torch.bfloat16)
+    parts = list(adapter.iter_checkpoint_load_parts({name: destination}))
+    assert len(parts) == 1
+    part = parts[0]
+    for source_name, tensor in part.checkpoint_tensors.items():
+        if source_name.endswith("_scale_inv"):
+            tensor.fill_(0.25)
+        elif bf16_gate and source_name.endswith("gate_proj.weight"):
+            assert tensor.dtype == torch.bfloat16
+            tensor.fill_(0.375)
+            assert source_name not in part.temporary_checkpoint_keys
+        else:
+            assert tensor.dtype == torch.float8_e4m3fn
+            tensor.copy_(torch.full(tensor.shape, 2.0).to(tensor.dtype))
+    part.finish()
+    torch.testing.assert_close(
+        destination[..., :128], torch.full((2, 128, 128), 0.375 if bf16_gate else 0.5, dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(destination[..., 128:], torch.full((2, 128, 128), 0.5, dtype=torch.bfloat16))
+
+
+def test_checkpoint_parts_without_quantization_do_not_request_scales():
+    adapter = make_model().state_dict_adapter
+    destination = torch.zeros(4, 16, 32, dtype=torch.bfloat16)
+    part = next(adapter.iter_checkpoint_load_parts({"model.layers.3.moe.experts.down_projs": destination}))
+    assert set(part.checkpoint_tensors) == {"model.layers.3.moe.down_proj.weight"}
+    assert not part.temporary_checkpoint_keys
+    part.checkpoint_tensors["model.layers.3.moe.down_proj.weight"].fill_(0.375)
+    part.finish()
+    torch.testing.assert_close(destination, torch.full_like(destination, 0.375))

@@ -113,6 +113,7 @@ class Step5Config(Step3p7TextConfig):
         self,
         *,
         sparse_config: Step5SparseConfig | dict[str, ConfigValue] | None = None,
+        quantization_config: dict[str, ConfigValue] | None = None,
         moe_layer_list: list[int] | None = None,
         fp32_residual_connection: bool = True,
         use_moe: bool = True,
@@ -163,6 +164,7 @@ class Step5Config(Step3p7TextConfig):
             )
         defaults["moe_layers_enum"] = list(moe_layer_list)
         super().__init__(**defaults)
+        self.quantization_config = quantization_config
         self.moe_layer_list = list(moe_layer_list)
         self.fp32_residual_connection = fp32_residual_connection
         self.use_moe = use_moe
