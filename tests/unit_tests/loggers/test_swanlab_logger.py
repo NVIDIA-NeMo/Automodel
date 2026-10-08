@@ -31,6 +31,8 @@ def fake_swanlab(monkeypatch):
     calls = []
     module = types.ModuleType("swanlab")
     module.sync_wandb = lambda **kw: calls.append(kw)
+    module.log = lambda data, step=None: calls.append(("log", data, step))
+    module.Text = lambda value: ("text", value)
     monkeypatch.setitem(sys.modules, "swanlab", module)
     monkeypatch.setattr(loggers, "_SWANLAB_MIRROR_INSTALLED", False)
     return calls
@@ -104,3 +106,10 @@ def test_init_wandb_run_mirrors_and_strips_swanlab(fake_swanlab, fake_wandb):
     assert fake_swanlab[0]["mode"] == "local"
     assert "swanlab" not in fake_wandb
     assert fake_wandb["name"] == "d"
+
+
+def test_mirror_logs_string_values_as_text(fake_swanlab):
+    swanlab = sys.modules["swanlab"]
+    SwanLabConfig().mirror_wandb()
+    swanlab.log({"loss": 1.5, "timestamp": "2026-10-08T00:00:00Z"}, step=3)
+    assert fake_swanlab[-1] == ("log", {"loss": 1.5, "timestamp": ("text", "2026-10-08T00:00:00Z")}, 3)
