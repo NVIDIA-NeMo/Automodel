@@ -183,6 +183,9 @@ class DeepseekV41TextConfig(PretrainedConfig):
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
+        # "torch": eager fp32 mHC math (released reference); "compile": the projection, collapse and expand
+        # cores wrapped once per process with torch.compile (layers.compile_hc_cores) — allclose, not bitwise,
+        # static shapes. Persisted by save_pretrained like every config field.
         self.engram_layer_ids = [1, 14] if engram_layer_ids is None else list(engram_layer_ids)
         self.engram_num_embeddings = (
             ([384006168, 384016682] if self.engram_layer_ids else [])
