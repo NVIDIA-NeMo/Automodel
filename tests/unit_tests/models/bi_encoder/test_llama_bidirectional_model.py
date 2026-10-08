@@ -545,14 +545,14 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
     model_dir.mkdir(parents=True)
     (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
 
-    # Mock NeMoAutoConfig.from_pretrained to return a config with the llama_bidirec model_type
+    # Mock AutoConfig.from_pretrained to return a config with the llama_bidirec model_type
     class FakeConfig:
         model_type = "llama_bidirec"
 
     def fake_auto_config_from_pretrained(*args, **kwargs):
         return FakeConfig()
 
-    monkeypatch.setattr(encoder_module.NeMoAutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
+    monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
 
     model = BiEncoderModel.build(
         model_name_or_path=str(model_dir),
@@ -588,7 +588,7 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
     m_bert = BiEncoderModel.build(model_name_or_path=str(bert_dir))
     assert isinstance(m_bert, BiEncoderModel)
 
-    # For hub path tests, we need to mock NeMoAutoConfig.from_pretrained since the new code
+    # For hub path tests, we need to mock AutoConfig.from_pretrained since the new code
     # calls it first to determine model type before using the registry
     class FakeConfig:
         model_type = "llama"
@@ -596,7 +596,7 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
     def fake_auto_config_from_pretrained(*args, **kwargs):
         return FakeConfig()
 
-    monkeypatch.setattr(encoder_module.NeMoAutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
+    monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
     monkeypatch.setattr(encoder_module, "_load_sentence_transformer_wrapper_options", lambda *args, **kwargs: None)
     monkeypatch.setattr(encoder_module, "_cache_hub_source_legal_assets", lambda *args, **kwargs: None)
 
@@ -625,7 +625,7 @@ def test_build_generic_hf_model_score_task(tmp_path, monkeypatch):
         # "qwen3" used to be unregistered and is not any more.
         model_type = "bert"
 
-    monkeypatch.setattr(encoder_module.NeMoAutoConfig, "from_pretrained", lambda *a, **kw: FakeConfig())
+    monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", lambda *a, **kw: FakeConfig())
     monkeypatch.setattr(
         encoder_module.AutoModelForSequenceClassification, "from_pretrained", FakeSeqClsModel.from_pretrained
     )

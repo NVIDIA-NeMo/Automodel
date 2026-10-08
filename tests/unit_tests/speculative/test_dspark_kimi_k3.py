@@ -193,7 +193,6 @@ def test_target_builder_requires_cuda():
 
 def test_target_builder_uses_text_config_and_distributed_loader(monkeypatch):
     target_config = KimiK3Config(text_config=_target_config())
-    # NeMoAutoConfig restores the resolved Hub revision on the loaded config.
     distributed_setup = object()
     target_model = object()
     captured = {}
