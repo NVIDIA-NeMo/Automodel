@@ -27,6 +27,7 @@ from nemo_automodel.components.moe.experts import (
     _apply_bias,
     _permute_tokens_for_grouped_mm,
 )
+from nemo_automodel.components.moe.state_dict_utils import get_sharded_expert_range
 from nemo_automodel.shared.utils import dtype_from_str
 
 
@@ -162,8 +163,14 @@ class GroupedExpertsLoRA(GroupedExperts):
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """Forward pass for GroupedExpertsLoRA with LoRA injection.
 
-        Mirrors GroupedExperts.forward but injects LoRA computations into
-        the expert processing at the projection level.
+        Args:
+            x: Tensor of shape [local_tokens, hidden], with unsharded hidden axis.
+            token_mask: Boolean tensor of shape [local_tokens], marking valid tokens.
+            weights: Tensor of shape [local_tokens, topk], containing router probabilities.
+            indices: Integer tensor of shape [local_tokens, topk], containing global expert IDs.
+
+        Returns:
+            Tensor of shape [local_tokens, hidden] in the input dtype.
         """
         assert not isinstance(x, DTensor)
         input_dtype = x.dtype
@@ -178,8 +185,6 @@ class GroupedExpertsLoRA(GroupedExperts):
             ep_mesh = None
             ep_size = 1
             ep_rank = 0
-
-        assert self.n_routed_experts % ep_size == 0
 
         compute_dtype = x.dtype
         gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
@@ -196,11 +201,23 @@ class GroupedExpertsLoRA(GroupedExperts):
                 x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
             )
 
-        n_local_experts = self.n_routed_experts // ep_size
-        experts_start_idx = ep_rank * n_local_experts
-        experts_end_idx = experts_start_idx + n_local_experts
+        experts_start_idx, experts_end_idx = get_sharded_expert_range(
+            self.n_routed_experts, world_size=ep_size, rank=ep_rank
+        )
+        n_local_experts = experts_end_idx - experts_start_idx
 
-        if self.use_torch_mm:
+        if n_local_experts == 0 or x.shape[0] == 0:
+            y = x.float() * 0.0 + weights[..., :0].sum()
+            for parameter in (
+                gate_and_up_projs,
+                down_projs,
+                lora_gate_and_up_A,
+                lora_gate_and_up_B,
+                lora_down_A,
+                lora_down_B,
+            ):
+                y = y + parameter[..., :0].sum()
+        elif self.use_torch_mm:
             lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
                 lora_gate_and_up_A, lora_gate_and_up_B
             )
@@ -425,6 +442,8 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.n_routed_experts = getattr(orig_module, "n_routed_experts", self.config.n_routed_experts)
         self.ep_size = getattr(orig_module, "ep_size", 1)
         self.ep_rank = getattr(orig_module, "ep_rank", 0)
+        first, last = get_sharded_expert_range(self.n_routed_experts, world_size=self.ep_size, rank=self.ep_rank)
+        self.num_local_experts = last - first
         self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
         self.use_mxfp8 = getattr(orig_module, "use_mxfp8", False)
 
@@ -503,11 +522,17 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     ) -> torch.Tensor:
         """Forward pass for GroupedExpertsDeepEPLoRA with LoRA injection.
 
-        Mirrors GroupedExpertsDeepEP.forward but injects LoRA computations
-        into the expert processing at the projection level.
+        Args:
+            x: Tensor of shape [local_tokens, hidden], with unsharded hidden axis.
+            token_mask: Boolean tensor of shape [local_tokens], marking valid tokens.
+            weights: Tensor of shape [local_tokens, topk], containing router probabilities.
+            indices: Integer tensor of shape [local_tokens, topk], containing global expert IDs.
+
+        Returns:
+            Tensor of shape [local_tokens, hidden] after dispatch, local expert
+            computation and combination, in the input dtype.
         """
         assert not isinstance(x, DTensor)
-        assert self.n_routed_experts % self.ep_size == 0
 
         permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
             x, token_mask, weights, indices
@@ -551,15 +576,22 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 down_bias = _to_local(self.down_proj_bias)
                 output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
         else:
-            # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1 = (
-                output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
-            )
-            output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, down_projs[0])
-            output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
+            output2 = permuted_local_hidden_states * 0.0 + permuted_probs[..., :0].sum()
+            for parameter in (
+                gate_and_up_projs,
+                down_projs,
+                lora_gate_and_up_A,
+                lora_gate_and_up_B,
+                lora_down_A,
+                lora_down_B,
+            ):
+                output2 = output2 + parameter[..., :0].sum()
+            if self.expert_bias:
+                output2 = (
+                    output2
+                    + _to_local(self.gate_up_proj_bias)[..., :0].sum()
+                    + _to_local(self.down_proj_bias)[..., :0].sum()
+                )
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

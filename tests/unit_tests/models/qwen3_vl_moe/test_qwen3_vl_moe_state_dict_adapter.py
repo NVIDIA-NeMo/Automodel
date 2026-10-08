@@ -311,7 +311,7 @@ class TestFromHFEpShard:
 
         captured_list = []
 
-        def fake_create_dtensor(local_tensor, mesh, rank):
+        def fake_create_dtensor(local_tensor, mesh, rank, *, n_experts):
             captured_list.append(local_tensor)
             return local_tensor
 

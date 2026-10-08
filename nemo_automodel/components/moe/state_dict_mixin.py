@@ -855,6 +855,22 @@ class MoESplitExpertsStateDictMixin:
                     del value
                     continue
 
+                if expected_experts_per_rank == 0:
+                    # No source values are needed, but callers still need the
+                    # native keys and correct global DTensor metadata.
+                    if native_key not in state_dict:
+                        source = value.to_local() if is_dtensor(value) else value
+                        inner, outer = source.shape
+                        if which in ("gate_proj", "up_proj"):
+                            shape = (0, outer, inner * (2 if is_gated else 1))
+                        else:
+                            shape = (0, outer, inner)
+                        empty = source.new_empty(shape, dtype=self.dtype)
+                        state_dict[native_key] = create_dtensor_from_local(
+                            empty, device_mesh, rank, n_experts=n_experts
+                        )
+                    continue
+
                 if not should_load_expert_for_rank(expert_num, device_mesh, n_experts):
                     continue
 
@@ -908,7 +924,9 @@ class MoESplitExpertsStateDictMixin:
                                 expert_parts.append((up_weight.transpose(0, 1),))
 
                         merged = self._direct_fill_grouped_expert_tensor(expert_parts)
-                        state_dict[native_key] = create_dtensor_from_local(merged, device_mesh, rank)
+                        state_dict[native_key] = create_dtensor_from_local(
+                            merged, device_mesh, rank, n_experts=n_experts
+                        )
                         merged_on_cuda = merged.is_cuda
 
                         # Release the per-expert sources before processing the next projection or layer so they
@@ -940,7 +958,9 @@ class MoESplitExpertsStateDictMixin:
                             expert_parts.append((down_t,))
 
                         merged = self._direct_fill_grouped_expert_tensor(expert_parts)
-                        state_dict[native_key] = create_dtensor_from_local(merged, device_mesh, rank)
+                        state_dict[native_key] = create_dtensor_from_local(
+                            merged, device_mesh, rank, n_experts=n_experts
+                        )
                         merged_on_cuda = merged.is_cuda
 
                         # See gate/up branch above for the cleanup rationale.

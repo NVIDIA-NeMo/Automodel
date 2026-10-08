@@ -1242,12 +1242,6 @@ def parallelize_model(
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
     if ep_enabled:
-        moe_config = _get_model_moe_config(model)
-        assert moe_config.n_routed_experts % moe_mesh[ep_axis_name].size() == 0, (
-            f"n_routed_experts {moe_config.n_routed_experts} must be divisible by "
-            f"expert_parallel_degree {moe_mesh[ep_axis_name].size()}"
-        )
-
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
     if activation_checkpointing:
