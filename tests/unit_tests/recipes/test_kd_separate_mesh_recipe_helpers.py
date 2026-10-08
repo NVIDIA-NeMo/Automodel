@@ -723,7 +723,9 @@ def _packing_contract_worker(rank, rendezvous):
 
 
 @pytest.mark.runtime_budget(
-    20, hard_timeout=60, reason="Two spawned CPU ranks import both recipe stacks; measured 8.6s locally"
+    40,
+    hard_timeout=120,
+    reason="Two spawned CPU ranks import both recipe stacks under coverage; 8.6s locally, 20.0-20.9s on three CI runs",
 )
 def test_kd_packing_contract_agreement_across_real_cpu_ranks(tmp_path):
     # Process startup imports both recipe stacks; leave room for cold CI workers.
