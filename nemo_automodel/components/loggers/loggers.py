@@ -31,6 +31,15 @@ from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 _SWANLAB_MIRROR_INSTALLED = False
 
 
+def _builtin_scalar(value: Any) -> Any:
+    """Return a 0-d numpy / torch value as the equivalent Python scalar; anything else unchanged."""
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if getattr(value, "ndim", None) == 0 and hasattr(value, "item"):
+        return value.item()
+    return value
+
+
 @dataclass
 class SwanLabConfig:
     """Also log the W&B run to SwanLab (maps to the YAML ``wandb.swanlab:`` block).
@@ -81,6 +90,21 @@ class SwanLabConfig:
             workspace=self.workspace,
             log_dir=self.log_dir,
         )
+        # The mirror only forwards Python ``int``/``float``/``bool``/``str`` values,
+        # so a 0-d numpy or torch value (e.g. a ``grad_norm`` tensor) that W&B logs
+        # fine would be dropped from SwanLab. Convert those before the mirror sees
+        # them; W&B receives the same number either way.
+        _, run_cls = safe_import_from("wandb.sdk.wandb_run", "Run")
+        log_mirrored = run_cls.log
+
+        def log_builtin_scalars(run, *args, **kwargs):
+            if args and isinstance(args[0], Mapping):
+                args = ({k: _builtin_scalar(v) for k, v in args[0].items()},) + args[1:]
+            elif isinstance(kwargs.get("data"), Mapping):
+                kwargs["data"] = {k: _builtin_scalar(v) for k, v in kwargs["data"].items()}
+            return log_mirrored(run, *args, **kwargs)
+
+        run_cls.log = log_builtin_scalars
         # The mirror forwards string values (e.g. the per-step ``timestamp``) to
         # ``swanlab.log`` unchanged, but SwanLab only accepts numbers as scalars and
         # rejects them. Log them as text so SwanLab keeps every item W&B records.
