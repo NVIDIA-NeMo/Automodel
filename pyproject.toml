@@ -81,9 +81,6 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
-    # Before upgrading, recheck the HF #49373 backport in
-    # nemo_automodel/components/models/ministral_bidirectional/pixtral_compat.py
-    # and run tests/functional_tests/retrieval/test_mistral3_vl_flash_attention.py (FA2/FA3).
     "transformers==5.18.0",
     # peft>=0.20 raises ImportError from get_peft_model() when an installed torchao is older than 0.16.0.
     "torchao>=0.16.0",
