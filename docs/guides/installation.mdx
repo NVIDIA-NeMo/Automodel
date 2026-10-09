@@ -13,6 +13,43 @@ This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models 
 | 🧪 **Editable Install** | ✅ | Contribute to the codebase or make local modifications            | Contributors, researchers    |
 | 🐳 **Docker + Mount**   | ✅ | Develop against mounted source with container-provided CUDA dependencies | Multi-node deployments     |
 
+## Use Bundled Tools and Examples
+
+The package includes tools and example scripts under `nemo_automodel.tools` and
+`nemo_automodel.examples`, along with example YAML configurations and chat templates.
+After activating your installation environment, run installed modules with
+`python -m`; a repository checkout is not required.
+Install the extras required by the tool you want to use. For diffusion preprocessing:
+
+```bash
+uv pip install "nemo-automodel[diffusion,diffusion-media]"
+python -m nemo_automodel.tools.diffusion.preprocessing_multiprocess --help
+```
+
+Copy a bundled configuration to your working directory before editing its model,
+data paths, and training settings:
+
+```python
+from importlib.resources import files
+from pathlib import Path
+
+config = files("nemo_automodel.examples").joinpath("diffusion/finetune/wan2_1_t2v_flow.yaml")
+Path("wan_finetune.yaml").write_bytes(config.read_bytes())
+```
+
+After configuring the YAML for your hardware and dataset, launch the example:
+
+```bash
+torchrun --nproc-per-node=8 \
+  --module nemo_automodel.examples.diffusion.finetune.finetune \
+  -c wan_finetune.yaml
+```
+
+Use `importlib.resources` to locate bundled files; installing the package does not
+create an `examples/` directory in your working directory. In a source checkout,
+the existing `tools/` and `examples/` paths remain available. Repository maintenance
+tools still require a checkout for the files they inspect or update.
+
 ## Choose Your Installation Method
 
 Pick the installation method that matches your needs and platform.
