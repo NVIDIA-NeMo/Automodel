@@ -485,9 +485,14 @@ class BackendConfig:
             mixing chain is compiled as well. Compiled numerics are allclose to eager but
             not bitwise-identical.
         compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
-            (currently Kimi K3), fusing cast/pow/mean/rsqrt/mul into one kernel.
+            (currently Kimi K3 and DeepSeek V4.1), fusing cast/pow/mean/rsqrt/mul into one kernel.
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
             allclose to eager but not bitwise-identical.
+        compile_hc: torch.compile the mHC (hyper-connection) cores of models that opt in
+            (currently DeepSeek V4.1): coefficient projection, stream collapse and stream expand,
+            one fused kernel each, static shapes (a new sequence length compiles them again; past
+            dynamo's recompile limit a core runs eager). Same lazy once-per-process pattern as
+            ``compile_situ``; numerics are allclose to eager but not bitwise-identical.
         shared_expert_overlap: run the shared experts of opted-in MoE models (currently Kimi K3)
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
             communication of the routed path; numerics unchanged. Default False.
@@ -552,10 +557,14 @@ class BackendConfig:
     # Kimi K3): fused whole-tensor weighted-SiTU forward/backward, the dense SituAndMul core
     # and the attn-res chain. Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_situ: bool = False
-    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3),
-    # same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
+    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3 and
+    # DeepSeek V4.1), same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
     # not bitwise-identical. Default False.
     compile_norm: bool = False
+    # When True, torch.compile the mHC projection / collapse / expand cores of opted-in models
+    # (currently DeepSeek V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
+    # Numerics are allclose to eager, not bitwise-identical. Default False.
+    compile_hc: bool = False
     # When True, models that opt in (currently Kimi K3) run their shared experts on a side CUDA
     # stream, launched before the routed-expert path and joined after it, so the shared-expert
     # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's

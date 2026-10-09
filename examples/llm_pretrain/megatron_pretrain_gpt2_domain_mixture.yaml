@@ -54,11 +54,13 @@ loss_fn:
 
 domain_mixture:
   domains:
-    # Domain order is positional and must match the weighted paths below.
+    # Each explicit corpus prefix must match the weighted paths below in order.
     - name: web
+      path: /data/web/processed_text_document
       sampling_weight: 0.7
       objective_weight: 0.5
     - name: code
+      path: /data/code/processed_text_document
       sampling_weight: 0.3
       objective_weight: 0.5
 
