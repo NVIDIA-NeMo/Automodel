@@ -405,3 +405,51 @@ def test_rope_fp32_rotation_outputs_and_gradients(packed, q_dtype, k_dtype):
         attention = torch.nn.functional.scaled_dot_product_attention(*actual, value, enable_gqa=True)
         assert attention.dtype == q_dtype
         assert torch.isfinite(attention).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA fusion parity")
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize(
+    "q_dtype,k_dtype",
+    [(torch.float32, torch.float32), (torch.bfloat16, torch.bfloat16), (torch.float32, torch.float16)],
+)
+@pytest.mark.runtime_budget(60, hard_timeout=70, reason="compiles CUDA RoPE forward and backward")
+def test_rope_cuda_fusion_parity(packed, q_dtype, k_dtype):
+    from torch.utils.checkpoint import checkpoint
+
+    torch.manual_seed(4150)
+    batch, length, heads, kv_heads, dim = 2, 17, 4, 2, 128
+    q = torch.randn(batch, length, heads, dim, device="cuda", dtype=q_dtype)
+    k = torch.randn(batch, length, kv_heads, dim, device="cuda", dtype=k_dtype)
+    q = (q.flatten(0, 1) if packed else q.transpose(1, 2)).requires_grad_()
+    k = (k.flatten(0, 1) if packed else k.transpose(1, 2)).requires_grad_()
+    angle = torch.randn(batch, length, dim // 2, device="cuda")
+    angle = torch.cat((angle, angle), -1)
+    if packed:
+        angle = angle.flatten(0, 1)
+    cos, sin = angle.cos(), angle.sin()
+    ref_q = q.detach().clone().requires_grad_()
+    ref_k = k.detach().clone().requires_grad_()
+    originals = (q.detach().clone(), k.detach().clone())
+
+    def reference(value):
+        value_fp32 = value.float()
+        first, second = value_fp32.chunk(2, -1)
+        rotated = torch.cat((-second, first), -1)
+        return (value_fp32 * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)).to(value.dtype)
+
+    expected = (reference(ref_q), reference(ref_k))
+    actual = checkpoint(apply_rotary_pos_emb, q, k, cos, sin, use_reentrant=False)
+    with torch.no_grad():
+        no_grad_output = apply_rotary_pos_emb(q, k, cos, sin)
+    for out, ref, no_grad in zip(actual, expected, no_grad_output):
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+        torch.testing.assert_close(out, no_grad, rtol=0, atol=0)
+        assert out.dtype == ref.dtype
+    upstream = tuple(torch.randn_like(out) for out in actual)
+    torch.autograd.backward(actual, upstream)
+    torch.autograd.backward(expected, upstream)
+    torch.testing.assert_close(q.grad, ref_q.grad, rtol=0, atol=0)
+    torch.testing.assert_close(k.grad, ref_k.grad, rtol=0, atol=0)
+    torch.testing.assert_close(q, originals[0], rtol=0, atol=0)
+    torch.testing.assert_close(k, originals[1], rtol=0, atol=0)
