@@ -14,6 +14,7 @@
 
 """CPU contracts, dispatch and precision boundaries for GLM compiled cores."""
 
+import inspect
 from dataclasses import replace
 
 import pytest
@@ -34,6 +35,7 @@ from nemo_automodel.components.models.glm5_next.optimized_kernels import (
     norm_core,
     project_core,
 )
+from nemo_automodel.components.moe import experts as moe_experts
 from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config
 
 
@@ -124,6 +126,10 @@ def test_compile_dispatch_is_instance_local_and_preserves_state(
 
         return wrapped
 
+    # This MoE activation was compiled at import time, before the fake factory.
+    # Preserve its complete Python arithmetic without invoking an unrelated
+    # compiler in this GLM dispatch test, including on a cold compiler cache.
+    monkeypatch.setattr(moe_experts, "swiglu_clamped_deepep", inspect.unwrap(moe_experts.swiglu_clamped_deepep))
     monkeypatch.setattr(torch, "compile", fake_compile)
     try:
         torch.manual_seed(631)

@@ -3,12 +3,15 @@
 
 """Exercise native checkpoint-owned initialization instead of calling model init directly."""
 
+import inspect
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
+from nemo_automodel.components.moe import experts as moe_experts
 from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config
 
 
@@ -75,6 +78,9 @@ def test_checkpointer_replaces_poisoned_parameters(monkeypatch: pytest.MonkeyPat
 def test_native_initialized_model_has_nonconstant_logits_and_gradients(monkeypatch: pytest.MonkeyPatch) -> None:
     """Check real CPU forward/backward after the same native initialization boundary."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    # Exercise native initialization and real MoE arithmetic without compiling
+    # an unrelated import-time activation wrapper on the cold CPU test path.
+    monkeypatch.setattr(moe_experts, "swiglu_clamped_deepep", inspect.unwrap(moe_experts.swiglu_clamped_deepep))
     torch.manual_seed(79)
     model = _construct_model("meta")
     Checkpointer.initialize_model_weights(model, torch.device("cpu"))
