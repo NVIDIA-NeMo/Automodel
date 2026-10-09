@@ -449,6 +449,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         backend: BackendConfig | None = None,
         *,
         tokenizer: PreTrainedTokenizerFast | None = None,
+        revision: str | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -464,7 +465,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         if engram_process_group is None and dist.is_available() and dist.is_initialized():
             engram_process_group = dist.group.WORLD
         if tokenizer is None and any(i < text.num_hidden_layers for i in text.engram_layer_ids):
-            tokenizer = config.build_tokenizer()
+            tokenizer = config.build_tokenizer(revision=revision)
         moe_config = moe_config or MoEConfig(
             dim=text.hidden_size,
             inter_dim=text.moe_intermediate_size,

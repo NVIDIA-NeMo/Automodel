@@ -203,6 +203,7 @@ class TestResolveMeshContext:
         assert context.strategy_config.multimodal.frozen_sharding == "replicate"
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestFromPretrainedDeviceMesh:
     def test_from_pretrained_accepts_device_mesh_as_topology_shortcut(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
@@ -1144,6 +1145,7 @@ class TestNeedSetupCacheClassesMapping:
 # =============================================================================
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestModelMappingKeyErrorFallback:
     """Test cases for _model_mapping KeyError fallback in _init_model."""
 
@@ -1157,7 +1159,6 @@ class TestModelMappingKeyErrorFallback:
         """force_hf path: _model_mapping lookup succeeds, class gets wrapped with mixin."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1226,7 +1227,6 @@ class TestModelMappingKeyErrorFallback:
         """force_hf pretrained path should restore each tensor dtype from the checkpoint."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1272,7 +1272,6 @@ class TestModelMappingKeyErrorFallback:
         """Explicit fp32 request unifies every floating tensor to fp32 (master weights)."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1322,7 +1321,6 @@ class TestModelMappingKeyErrorFallback:
         """Explicit bf16 request keeps bf16 params bf16 but preserves intrinsically-fp32 params."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1368,7 +1366,6 @@ class TestModelMappingKeyErrorFallback:
         """Fallback (non-force_hf, no custom model) path: _model_mapping succeeds."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1403,7 +1400,6 @@ class TestModelMappingKeyErrorFallback:
         """Fallback pretrained path should preserve tied-weight checkpoint dtypes."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1448,7 +1444,6 @@ class TestModelMappingKeyErrorFallback:
         """Shared architecture names should stay on HF when the config does not match our custom model."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
             architectures = ["NemotronHForCausalLM"]
 
@@ -1625,7 +1620,6 @@ class TestBuildModelRetryDepth:
         """Minimal kwargs for _build_model with all required parameters."""
         mock_config = MagicMock()
         mock_config.quantization_config = None
-        mock_config._commit_hash = None
         mesh = MagicMock()
         mesh.tp_size = 1
         mesh.cp_size = 1
@@ -1873,15 +1867,22 @@ class TestBuildModelRetryDepth:
             assert mock_init.call_count == 2
 
     def test_checkpoint_loading_uses_config_snapshot_not_cached_main(self, hf_config_hub):
-        from transformers import GPT2Config
+        from nemo_automodel._transformers.auto_config import NeMoAutoConfig
 
         root, cache, ref, _ = hf_config_hub
         # main and an unrelated weight index point to A; this config belongs to B.
         (cache / "snapshots" / ("a" * 40) / "model.safetensors.index.json").write_text("{}")
-        config = GPT2Config(n_embd=64, _commit_hash="b" * 40)
+        config = NeMoAutoConfig.from_pretrained("test/config-race", cache_dir=str(root), revision="b" * 40)
         config.name_or_path = "test/config-race"
         build_kwargs, _ = self._make_build_kwargs()
-        build_kwargs.update(is_hf_model=False, cache_dir=str(root), subfolder="nested")
+        from transformers.utils.hub import resolve_revision
+
+        build_kwargs.update(
+            is_hf_model=False,
+            cache_dir=str(root),
+            subfolder="nested",
+            revision=resolve_revision("test/config-race", "b" * 40, cache_dir=str(root)),
+        )
         sentinel_model = MagicMock()
         with (
             patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),
