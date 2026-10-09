@@ -155,12 +155,17 @@ RUN if [ "$INSTALL_TE" = "True" ] || \
 # instead of forcing C++17 (PyTorch's Rubin builds require C++20).
 # deepep.patch also backports https://github.com/deepseek-ai/DeepEP/pull/564 for NVSHMEM 3.6.5 compatibility.
 # Remove the configs.cuh/ibgda_device.cuh hunks when the pinned revision includes that fix.
+# deepep-hybridep-dmabuf.patch backports https://github.com/deepseek-ai/DeepEP/pull/750
+# at 6e6017c62ea466b5c51deea10d7a803d0958b54d (base: DEEPEP_COMMIT below).
+# It falls back to DMA-BUF only when legacy ibv_reg_mr registration fails.
+# Remove this patch when DEEPEP_COMMIT includes the upstream fix.
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
-RUN apt-get update && apt-get install -y --allow-change-held-packages \
+RUN --mount=type=bind,source=docker/common/deepep-hybridep-dmabuf.patch,target=/tmp/deepep-hybridep-dmabuf.patch,ro \
+    apt-get update && apt-get install -y --allow-change-held-packages \
         rdma-core libibverbs-dev && \
     apt-get clean && \
     ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
@@ -174,6 +179,7 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
+    git apply /tmp/deepep-hybridep-dmabuf.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 && \
     NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib && \
     ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so && \
