@@ -64,6 +64,13 @@ def apply_rotary_pos_emb(
         Rotated Q/K with their respective input shapes and dtypes.
         Rotation is computed in FP32; neither output aliases or mutates its input.
     """
+    core = _apply_rotary_pos_emb_cuda if q.is_cuda else _apply_rotary_pos_emb_math
+    return core(q, k, cos, sin)
+
+
+def _apply_rotary_pos_emb_math(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     q_dtype, k_dtype = q.dtype, k.dtype
     q, k = q.float(), k.float()
     cos = cos.unsqueeze(1)
@@ -71,6 +78,12 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed.to(q_dtype), k_embed.to(k_dtype)
+
+
+# Preserve separate fp32 multiply/add rounding while fusing memory passes.
+_apply_rotary_pos_emb_cuda = torch.compile(
+    _apply_rotary_pos_emb_math, dynamic=True, options={"emulate_precision_casts": True}
+)
 
 
 def apply_rotary_pos_emb_quack(
