@@ -73,7 +73,7 @@ constraints = [
     { name = "onnx-ir", specifier = ">=0.1.16" },
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "protobuf", specifier = ">=6.33.5" },
-    { name = "pyarrow", specifier = ">=23.0.1" },
+    { name = "pyarrow", specifier = ">=23.0.1,<26" },
     { name = "pyasn1", specifier = ">=0.6.4" },
     { name = "pygments", specifier = ">=2.20.0" },
     { name = "pyjwt", specifier = ">=2.14.0" },
