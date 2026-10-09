@@ -530,6 +530,8 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
 
     config_class = Mistral3BidirectionalConfig
     base_model_prefix = "model"
+    # Preserve score precision through the outer FSDP wrapper before ranking loss.
+    _nemo_fsdp_output_dtype: torch.dtype = torch.float32
 
     @classmethod
     def supports_config(cls, config: PretrainedConfig) -> bool:

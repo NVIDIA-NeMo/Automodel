@@ -1012,6 +1012,9 @@ class CrossEncoderModel(nn.Module):
         _set_text_backbone_is_causal(model, is_causal)
         _init_encoder_common(self, model)
         self.is_causal = is_causal
+        fsdp_output_dtype = getattr(model, "_nemo_fsdp_output_dtype", None)
+        if fsdp_output_dtype is not None:
+            self._nemo_fsdp_output_dtype = fsdp_output_dtype
 
     def _get_consolidated_hf_metadata_exporter(
         self, *, tokenizer: object, original_model_path: str | None

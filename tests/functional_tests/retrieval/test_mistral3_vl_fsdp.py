@@ -30,6 +30,8 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import Checkpoi
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
+from transformers import PretrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
 from nemo_automodel.components.distributed.parallelizer import (
@@ -264,6 +266,73 @@ def _run_biencoder_recipe_case() -> None:
     dist.barrier()
 
 
+class _PrecisionScorer(PreTrainedModel):
+    """Tiny FP32 scoring backbone for isolating the production FSDP output boundary."""
+
+    _nemo_fsdp_output_dtype: torch.dtype = Mistral3VLBidirectionalForSequenceClassification._nemo_fsdp_output_dtype
+
+    def __init__(self) -> None:
+        super().__init__(PretrainedConfig(hidden_size=4, num_attention_heads=1, is_causal=False))
+        self.layers = torch.nn.ModuleList([torch.nn.Identity()])
+        self.weight = torch.nn.Parameter(torch.tensor([[0.12345, -0.23456, 0.34567, -0.45678]]))
+
+    def forward(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor, return_dict: bool = True
+    ) -> SequenceClassifierOutput:
+        """Compute a scalar score for each passage.
+
+        Args:
+            input_ids: Integer features of shape [passages, 4].
+            attention_mask: Unused mask of shape [passages, 4].
+            return_dict: Whether the caller requests a model output.
+
+        Returns:
+            Classifier output with FP32 logits of shape [passages, 1].
+        """
+        return SequenceClassifierOutput(
+            logits=torch.nn.functional.linear(self.layers[0](input_ids.float()).float(), self.weight.float())
+        )
+
+
+def _run_reranker_output_precision_case() -> None:
+    """Compare FSDP scores, gradients and updates to an FP32 reference."""
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.manual_seed(42)
+    model = CrossEncoderModel(_PrecisionScorer()).to(device)
+    reference = copy.deepcopy(model)
+    mesh = init_device_mesh(
+        "cuda", (1, dist.get_world_size(), 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp")
+    )
+    # Isolate the output boundary: FP32 model math with the normal BF16 root
+    # output policy would still round scores without the model-owned override.
+    policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32, output_dtype=torch.bfloat16)
+    fsdp2_strategy_parallelize(
+        model,
+        mesh,
+        mp_policy=policy,
+        enable_fsdp2_prefetch=False,
+    )
+    assert policy.output_dtype == torch.bfloat16
+    ids = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]], device=device) + dist.get_rank()
+    inputs = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+    actual = model(inputs).logits
+    expected = reference(inputs).logits
+    assert actual.dtype == torch.float32
+    assert not torch.equal(expected, expected.bfloat16().float())
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    labels = torch.zeros(1, dtype=torch.long, device=device)
+    torch.nn.functional.cross_entropy(actual.view(1, 2), labels).backward()
+    torch.nn.functional.cross_entropy(expected.view(1, 2), labels).backward()
+    parameter = model.model.weight
+    reference_parameter = reference.model.weight
+    dist.all_reduce(reference_parameter.grad)
+    reference_parameter.grad.div_(dist.get_world_size())
+    torch.testing.assert_close(parameter.grad.full_tensor(), reference_parameter.grad, rtol=1e-4, atol=1e-6)
+    torch.optim.SGD(model.parameters(), lr=0.001).step()
+    torch.optim.SGD(reference.parameters(), lr=0.001).step()
+    torch.testing.assert_close(parameter.full_tensor(), reference_parameter, rtol=1e-5, atol=1e-6)
+
+
 def _run_worker() -> None:
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(seconds=45))
@@ -271,6 +340,7 @@ def _run_worker() -> None:
         for reranker in (False, True):
             _run_case(reranker)
         _run_biencoder_recipe_case()
+        _run_reranker_output_precision_case()
         if dist.get_rank() == 0:
             print("MISTRAL3_VL_FSDP_PASS", flush=True)
     finally:

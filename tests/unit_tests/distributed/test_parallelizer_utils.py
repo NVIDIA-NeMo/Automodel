@@ -32,6 +32,7 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _group_params_by_dtype,
     _make_compute_dtype_fn,
     _mp_policy_with_param_dtype,
+    _mp_policy_with_output_dtype,
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     get_internal_fsdp_mp_policy,
@@ -1102,3 +1103,21 @@ def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
     assert compute_dtype_of(attention.sinks_param.weight) == torch.float32
     assert compute_dtype_of(attention.sinks_param.scale) == torch.float32
     assert compute_dtype_of(attention.proj.weight) == torch.bfloat16
+
+
+@pytest.mark.parametrize("original_output_dtype", [None, torch.bfloat16])
+def test_mp_policy_with_output_dtype_preserves_compute_policy(original_output_dtype: torch.dtype | None) -> None:
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        output_dtype=original_output_dtype,
+        cast_forward_inputs=False,
+    )
+    overridden = _mp_policy_with_output_dtype(policy, torch.float32)
+    assert overridden is not policy
+    assert overridden.output_dtype == torch.float32
+    assert overridden.param_dtype == policy.param_dtype == torch.bfloat16
+    assert overridden.reduce_dtype == policy.reduce_dtype == torch.float32
+    assert overridden.cast_forward_inputs is policy.cast_forward_inputs is False
+    assert policy.output_dtype == original_output_dtype
+    assert _mp_policy_with_output_dtype(None, torch.float32) is None

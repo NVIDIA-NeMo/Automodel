@@ -486,9 +486,14 @@ class ModelParallelizer:
         # Do not reshard after forward for root model because its parameters
         # will be used in backward immediately
         root_ignored_params = ignored_params_for_root(model, ignored_multimodal_params)
+        root_output_dtype = getattr(model, "_nemo_fsdp_output_dtype", None)
+        root_mp_policy = mp_policy
+        if root_output_dtype is not None and mp_policy is not None:
+            root_mp_policy = parallelizer_utils._mp_policy_with_output_dtype(mp_policy, root_output_dtype)
+            logger.info("Using %s for the root FSDP output dtype", root_output_dtype)
         root_kwargs = {
             "mesh": dp_mesh,
-            "mp_policy": mp_policy,
+            "mp_policy": root_mp_policy,
             "reshard_after_forward": False,
             "offload_policy": offload_policy,
         }
