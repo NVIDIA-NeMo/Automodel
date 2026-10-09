@@ -14,6 +14,7 @@
 
 import logging
 import sys
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -22,6 +23,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.diffusion.sampler import SequentialBucketSampler
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion import train as diffusion_train
@@ -883,7 +885,9 @@ def _patch_setup_dataloaders(monkeypatch, *, validation_batches=1, with_validati
     if with_validation:
         validation_config = SimpleNamespace(
             build=MagicMock(
-                return_value=SimpleNamespace(dataloader=[object()] * validation_batches, sampler="val-sampler")
+                return_value=SimpleNamespace(
+                    dataloader=torch.utils.data.DataLoader(range(validation_batches)), sampler="val-sampler"
+                )
             )
         )
 
@@ -936,6 +940,39 @@ def test_setup_rejects_an_empty_validation_dataloader(monkeypatch):
         recipe.setup()
 
 
+@pytest.mark.parametrize("bucket_sizes,drop_last", [([], False), ([8], True), ([12, 12], True)])
+def test_setup_empty_validation_error_reports_bucket_batching(monkeypatch, bucket_sizes, drop_last):
+    config = _patch_setup_dataloaders(monkeypatch)
+    groups = {}
+    offset = 0
+    for key, size in enumerate(bucket_sizes):
+        groups[key] = {"indices": list(range(offset, offset + size)), "resolution": (256, 256)}
+        offset += size
+    sampler = SequentialBucketSampler(
+        SimpleNamespace(sorted_bucket_keys=list(groups), bucket_groups=groups, calculator=None),
+        base_batch_size=16,
+        drop_last=drop_last,
+        num_replicas=1,
+        rank=0,
+    )
+    loader = torch.utils.data.DataLoader(range(offset), batch_sampler=sampler)
+    config.build.return_value = SimpleNamespace(dataloader=loader, sampler=sampler)
+    cfg = _setup_cfg(val_every_steps=5)
+    cfg.set_by_dotted("step_scheduler.local_batch_size", 16)
+    recipe = TrainDiffusionRecipe(cfg)
+
+    with pytest.raises(RuntimeError) as exc:
+        recipe.setup()
+
+    message = str(exc.value)
+    assert f"dataset_size={offset}" in message
+    assert "local_batch_size=16" in message
+    assert "dp_size=1" in message
+    assert f"drop_last={drop_last}" in message
+    assert "data.validation_dataloader.drop_last: false" in message
+    assert "resolution bucket" in message
+
+
 @pytest.mark.parametrize(
     ("with_validation", "val_every_steps", "expected_warning"),
     [
@@ -965,6 +1002,15 @@ def test_run_validation_epoch_averages_batch_losses_in_eval_mode(monkeypatch):
     assert recipe.flow_matching_pipeline.grad_enabled == [False, False]
     assert recipe.flow_matching_pipeline.model_was_training == [False, False]
     assert recipe.model.training is True
+
+
+@pytest.mark.parametrize("latent_key", ["video_latents", "image_latents", "latents"])
+def test_run_validation_epoch_weights_partial_batches_by_sample_count(monkeypatch, latent_key):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(2.0), torch.tensor(8.0)])
+    recipe.val_dataloader = [{latent_key: torch.zeros(3, 1)}, {latent_key: torch.zeros(1, 1)}]
+
+    assert recipe._run_validation_epoch(global_step=0) == pytest.approx(3.5)
 
 
 def test_run_validation_epoch_runs_under_the_training_autocast(monkeypatch):
@@ -1012,7 +1058,7 @@ def test_run_validation_epoch_raises_when_the_loader_yields_no_batches(monkeypat
     monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
     recipe = _make_validation_recipe([torch.tensor(1.0)], num_batches=0)
 
-    with pytest.raises(RuntimeError, match="Validation produced no batches"):
+    with pytest.raises(RuntimeError, match="Validation produced no samples"):
         recipe._run_validation_epoch(global_step=0)
 
 
@@ -1047,7 +1093,7 @@ def test_run_validation_epoch_reduces_sum_and_count_over_dp_group(monkeypatch):
     val_loss = recipe._run_validation_epoch(global_step=0)
 
     assert all_reduce_calls == [(diffusion_train.dist.ReduceOp.SUM, "dp-group", [6.0, 2.0])]
-    # 12.0 summed loss over 4 summed batches: the mean is invariant to the rank count.
+    # 12.0 summed loss over 4 summed samples: the mean is invariant to the rank count.
     assert val_loss == pytest.approx(3.0)
 
 
@@ -1114,3 +1160,27 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     else:
         recipe._run_validation_epoch.assert_not_called()
         assert all(call_args.args[0].keys() != {"val_loss"} for call_args in wandb_log.call_args_list)
+
+
+def _distributed_validation_worker(rank, rendezvous):
+    torch.distributed.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        recipe = _make_validation_recipe([torch.tensor(2.0 + 2 * rank), torch.tensor(8.0 + 2 * rank)], dp_rank=rank)
+        recipe.val_dataloader = [{"video_latents": torch.zeros(3, 1)}, {"video_latents": torch.zeros(1, 1)}]
+        recipe._get_dp_group = lambda: torch.distributed.group.WORLD
+        # Eight samples: [2, 2, 2, 8] on rank 0, [4, 4, 4, 10] on rank 1.
+        assert recipe._run_validation_epoch(global_step=0) == pytest.approx(4.5)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(
+    30, hard_timeout=60, reason="Spawn two interpreters and run a real Gloo validation reduction"
+)
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="requires Gloo")
+def test_run_validation_epoch_weights_samples_across_real_dp_ranks(tmp_path):
+    torch.multiprocessing.spawn(
+        _distributed_validation_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=2, join=True
+    )

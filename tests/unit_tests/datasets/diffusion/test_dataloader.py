@@ -31,6 +31,7 @@ import pytest
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.diffusion.collate_fns import (
     _build_multiresolution_dataloader_core,
     collate_fn_production,
@@ -41,6 +42,7 @@ from nemo_automodel.components.datasets.diffusion.sampler import (
 from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import (
     TextToImageDataset,
 )
+from nemo_automodel.recipes._typed_config import RecipeConfig
 
 # ============================================================================
 # Fixtures and Helpers
@@ -407,9 +409,6 @@ class TestSequentialBucketSamplerCPU:
         )
 
         batches = list(sampler)
-
-        # Get batch sizes
-        batch_sizes = [len(batch) for batch in batches]
 
         # With multiple resolutions, batch sizes should vary
         # (or at least be calculated dynamically)
@@ -1346,3 +1345,39 @@ class TestDataloaderIntegration:
 
         for i, (expected, actual) in enumerate(zip(full_latents, all_latents)):
             assert torch.equal(expected, actual), f"Batch {i} latents differ after resume"
+
+
+@pytest.mark.parametrize(
+    "num_samples,batch_size,resolutions,expected_sizes",
+    [
+        (8, 16, [(256, 256)], [8]),
+        (5, 4, [(256, 256)], [4, 1]),
+        (6, 4, [(256, 256), (256, 512)], [3, 3]),
+    ],
+)
+def test_validation_config_keeps_real_cache_bucket_tails(
+    tmp_path, num_samples, batch_size, resolutions, expected_sizes
+):
+    MockCacheBuilder(tmp_path, num_samples=num_samples).build_cache(resolutions=resolutions)
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "data": {
+                    "validation_dataloader": {
+                        "_target_": "nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader",
+                        "cache_dir": str(tmp_path),
+                        "shuffle": False,
+                        "num_workers": 0,
+                        "pin_memory": False,
+                    }
+                }
+            }
+        )
+    )
+    built = cfg.diffusion_validation_dataloader.build(dp_rank=0, dp_world_size=1, batch_size=batch_size)
+
+    batches = list(built.dataloader)
+
+    assert [batch["image_latents"].shape[0] for batch in batches] == expected_sizes
+    assert len(built.dataloader) == len(expected_sizes)
+    assert sorted(index for indices in built.sampler for index in indices) == list(range(num_samples))

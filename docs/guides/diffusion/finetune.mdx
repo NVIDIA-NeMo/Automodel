@@ -263,12 +263,20 @@ data:
     cache_dir: PATH_TO_YOUR_VAL_DATA
     model_type: wan
     shuffle: false
+    drop_last: false
 ```
 
 The validation loader takes the same builders and fields as the training one and is sharded across
 data-parallel ranks the same way. Validation scores the held-out set with the training flow-matching
 objective in `eval()` mode under `torch.no_grad()`, and logs `val_loss` to the console and to
 Weights & Biases, on the same scale as `train_loss`.
+
+Validation loaders that support `drop_last` default to `false`, retaining incomplete per-rank
+batches in each resolution bucket. Training loaders continue to default to `true`. An explicit
+`drop_last: true` also applies during validation: it drops bucket tails and can leave the loader
+empty when every per-rank bucket is smaller than a batch. `val_loss` is weighted by the actual
+number of samples in each batch. Distributed sampler padding can repeat samples; those repeats
+are included in the metric.
 
 Timesteps and noise are drawn under a fixed seed, and the training RNG state is restored afterward. The curve therefore reflects the model rather than the sampling. Enabling validation does not change the training trajectory.
 
