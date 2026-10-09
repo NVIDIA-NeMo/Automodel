@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.qwen3_8_flash_next import flex_qsa as qwen3_8_flash_next_flex_qsa
 from nemo_automodel.components.models.qwen3_8_flash_next import layers as qwen3_8_flash_next_layers
 from nemo_automodel.components.models.qwen3_8_flash_next import qsa as qwen3_8_flash_next_qsa
 from nemo_automodel.components.models.qwen3_8_flash_next.backend import Qwen3_8_FlashNextBackendConfig
@@ -25,6 +26,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_F
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import (
     _membership_flat_offset,
     _routes_to_membership,
+    build_flex_qsa_mask,
     flex_sparse_gqa_attention,
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
@@ -423,6 +425,85 @@ def test_flex_qsa_empty_route_rows_have_zero_output_and_gradients() -> None:
         assert tensor.grad is not None
         assert torch.isfinite(tensor.grad).all()
         assert torch.count_nonzero(tensor.grad) == 0
+
+
+_BLOCK_MASK_FIELDS = (
+    "kv_num_blocks",
+    "kv_indices",
+    "full_kv_num_blocks",
+    "full_kv_indices",
+    "q_num_blocks",
+    "q_indices",
+    "full_q_num_blocks",
+    "full_q_indices",
+)
+
+
+def test_flex_compiled_create_block_mask_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = object()
+    calls = []
+
+    def compile_fn(fn, **kwargs):
+        calls.append((fn, kwargs))
+        return sentinel
+
+    qwen3_8_flash_next_flex_qsa._compiled_create_block_mask.cache_clear()
+    monkeypatch.setattr(qwen3_8_flash_next_flex_qsa.torch, "compile", compile_fn)
+    try:
+        assert qwen3_8_flash_next_flex_qsa._compiled_create_block_mask() is sentinel
+        assert qwen3_8_flash_next_flex_qsa._compiled_create_block_mask() is sentinel
+    finally:
+        qwen3_8_flash_next_flex_qsa._compiled_create_block_mask.cache_clear()
+    assert calls == [(qwen3_8_flash_next_flex_qsa.create_block_mask, {})]
+
+
+def test_flex_block_mask_uncompiled_cpu_smoke() -> None:
+    selected = torch.tensor([[[0, -1], [0, 1], [-1, -1]]], dtype=torch.int32)
+
+    mask = build_flex_qsa_mask(selected, kv_length=3, device=torch.device("cpu"), use_compile=False)
+
+    assert mask.block_mask.seq_lengths == (3, 3)
+    assert mask.has_routes.tolist() == [[True, True, False]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention requires CUDA")
+def test_flex_compiled_block_mask_matches_eager() -> None:
+    # Lengths change between calls, as in training, so the compiled builder serves
+    # several shapes. (query_length,
+    # kv_length, routes per query, dense prefix): the dense case routes every query
+    # t < 256 to all of 0..t, as QSA does before its budget is reached, which yields
+    # full tiles; the last shape is a context-parallel shard (local queries, global K/V).
+    shapes = [
+        (256, 256, 64, False),
+        (300, 300, 64, False),
+        (384, 384, 256, True),
+        (520, 520, 64, False),
+        (200, 456, 64, False),
+    ]
+    generator = torch.Generator(device="cuda").manual_seed(44)
+    cases = []
+    for query_length, kv_length, width, dense_prefix in shapes:
+        positions = torch.arange(kv_length - query_length, kv_length, device="cuda")[:, None]
+        slots = torch.arange(width, device="cuda")[None]
+        routes = (torch.rand(query_length, width, device="cuda", generator=generator) * (positions + 1)).long()
+        if dense_prefix:
+            routes = torch.where(positions < width, slots.expand(query_length, -1), routes)
+        routes = torch.where(slots < positions + 1, routes, -1)
+        routes[-3:] = -1  # padding queries take the empty-row path
+        cases.append((routes[None], kv_length))
+
+    compiled = [build_flex_qsa_mask(r, kv_length=kv, device=torch.device("cuda")) for r, kv in cases]
+    eager = [build_flex_qsa_mask(r, kv_length=kv, device=torch.device("cuda"), use_compile=False) for r, kv in cases]
+
+    assert int(eager[2].block_mask.full_kv_num_blocks.sum()) > 0, "the dense case must produce full tiles"
+    for got, want in zip(compiled, eager):
+        for field in _BLOCK_MASK_FIELDS:
+            got_tensor, want_tensor = getattr(got.block_mask, field), getattr(want.block_mask, field)
+            assert torch.equal(got_tensor, want_tensor), field
+            assert got_tensor.dtype == want_tensor.dtype == torch.int32, field
+            assert got_tensor.stride() == want_tensor.stride(), field
+        assert got.block_mask.seq_lengths == want.block_mask.seq_lengths
+        assert torch.equal(got.has_routes, want.has_routes)
 
 
 @pytest.mark.parametrize("attn_backend", ["flex", "cute"])
