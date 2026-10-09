@@ -604,6 +604,35 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
+        """Run text and media inputs while preserving their distinct leading axes.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence] or [tokens] for THD.
+            position_ids: Rotary coordinates of shape [3, batch, sequence],
+                with a placeholder batch axis of size one for THD.
+            attention_mask: Optional padding mask of shape [batch, sequence]
+                or dense mask of shape [batch, 1, sequence, sequence].
+            padding_mask: Optional padding flags of shape [batch, sequence]
+                or [tokens] for THD.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden]
+                supplied by a preceding pipeline stage.
+            cache_position: Optional token positions of shape [sequence].
+            logits_to_keep: Number of trailing logits, or token indices of shape
+                [selected_tokens], to retain.
+            output_hidden_states: Return hidden states for fused loss computation.
+            **kwargs: Attention metadata, including ``cu_seqlens`` and
+                ``cu_seqlens_padded`` of shape [documents + 1] (optionally with
+                a leading placeholder batch axis), and scalar ``max_seqlen``.
+                Media tensors retain ``pixel_values``/``pixel_values_videos``
+                of shape [patches, patch_features] and image/video ``grid_thw``
+                of shape [media_items, 3], including when media_items is one.
+
+        Returns:
+            Model output with logits of shape [batch, sequence, vocab] or
+            [tokens, vocab] for THD, or hidden states with the same leading
+            axes and final dimension ``hidden`` when requested. Intermediate
+            pipeline stages return the hidden-state tensor directly.
+        """
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         output_hidden_states = (
             output_hidden_states
@@ -672,6 +701,16 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, kwargs
             )
+            # Media axes count patches/items, not the THD placeholder batch.
+            # Restore model-owned payloads after the attention helper's squeeze.
+            for key, value in (
+                ("pixel_values", pixel_values),
+                ("pixel_values_videos", pixel_values_videos),
+                ("image_grid_thw", image_grid_thw),
+                ("video_grid_thw", video_grid_thw),
+            ):
+                if value is not None:
+                    kwargs[key] = value
             attention_mask = None
             if padding_mask is not None:
                 kwargs["padding_mask"] = padding_mask
