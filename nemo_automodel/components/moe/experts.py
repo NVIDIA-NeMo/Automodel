@@ -2287,8 +2287,8 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
 
     with torch.device(buffer_device):
         if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):
-            to_local(module.gate_and_up_projs).normal_(mean=0.0, std=init_std)
-            to_local(module.down_projs).normal_(mean=0.0, std=init_std)
+            module.gate_and_up_projs.normal_(mean=0.0, std=init_std)
+            module.down_projs.normal_(mean=0.0, std=init_std)
             if module.expert_bias:
                 to_local(module.gate_up_proj_bias).zero_()
                 to_local(module.down_proj_bias).zero_()
