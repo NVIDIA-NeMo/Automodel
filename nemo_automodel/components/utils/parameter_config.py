@@ -31,6 +31,7 @@ class ParameterConfig:
 
     trainable_names: tuple[str, ...]
     trainable_dtype: torch.dtype = torch.float32
+    frozen_dtype: torch.dtype | None = None
 
 
 def apply_parameter_config(model: nn.Module, config: ParameterConfig) -> None:
@@ -43,12 +44,15 @@ def apply_parameter_config(model: nn.Module, config: ParameterConfig) -> None:
 
     Returns:
         None. Mutates requires_grad and selected storage in place; frozen
-        parameter values, storage dtypes and buffer values remain unchanged.
+        parameter values and buffer values remain unchanged; frozen storage is
+        retained unless frozen_dtype is explicit.
     """
     if len(set(config.trainable_names)) != len(config.trainable_names):
         raise ValueError("ParameterConfig trainable_names must be unique")
     if config.trainable_dtype not in (torch.float32, torch.bfloat16, torch.float16):
         raise ValueError("Trainable parameter storage must be floating point")
+    if config.frozen_dtype not in (None, torch.float32, torch.bfloat16, torch.float16):
+        raise ValueError("Frozen parameter storage must be floating point")
     parameters = dict(model.named_parameters())
     missing = set(config.trainable_names) - parameters.keys()
     if missing:
@@ -59,5 +63,6 @@ def apply_parameter_config(model: nn.Module, config: ParameterConfig) -> None:
     for name, parameter in parameters.items():
         trainable = name in selected
         parameter.requires_grad_(trainable)
-        if trainable:
-            parameter.data = parameter.data.to(config.trainable_dtype)
+        target_dtype = config.trainable_dtype if trainable else config.frozen_dtype
+        if target_dtype is not None:
+            parameter.data = parameter.data.to(target_dtype)

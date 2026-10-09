@@ -36,3 +36,11 @@ def test_surface_rejects_bad_names_before_mutation(names):
     with pytest.raises(ValueError):
         apply_parameter_config(model, ParameterConfig(names))
     assert all(p.requires_grad and p.dtype == torch.bfloat16 for p in model.parameters())
+
+
+def test_explicit_frozen_precision_is_applied_before_loading():
+    model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.Linear(2, 1))
+    config = ParameterConfig(("0.weight", "0.bias"), torch.float32, torch.bfloat16)
+    apply_parameter_config(model, config)
+    assert all(parameter.dtype == torch.float32 for parameter in model[0].parameters())
+    assert all(parameter.dtype == torch.bfloat16 and not parameter.requires_grad for parameter in model[1].parameters())
