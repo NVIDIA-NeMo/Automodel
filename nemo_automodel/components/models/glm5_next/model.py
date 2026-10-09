@@ -36,6 +36,7 @@ from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextDecoderLayer,
     Glm5NextRMSNorm,
 )
+from nemo_automodel.components.models.glm5_next.parallelization import PARALLELIZER
 from nemo_automodel.components.models.glm5_next.vision import Glm5NextVisionModel, Glm5NextVisionOutput
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -451,6 +452,8 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=final_std, a=-3 * final_std, b=3 * final_std)
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
+
+Glm5NextForConditionalGeneration.parallelizer = PARALLELIZER
 
 ModelClass = Glm5NextForConditionalGeneration
 
