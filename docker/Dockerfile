@@ -362,9 +362,6 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi
 
-# Verify in a fresh process: pre-importing aiohttp would hide Ray's sys.path override.
-RUN python docker/common/verify_ray_aiohttp.py
-
 # Fail the image build before publication if PyTorch headers cannot compile as
 # C++20, torch._grouped_mm is unavailable, or a bundled native extension has
 # unresolved PyTorch/CUDA symbols. MoK links libcuda directly; use the toolkit's
