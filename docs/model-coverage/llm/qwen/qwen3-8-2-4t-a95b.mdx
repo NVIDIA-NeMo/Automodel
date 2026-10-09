@@ -47,7 +47,11 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setu
 | Scale | 64 nodes / 256 GPUs |
 | Duration | 100 training steps |
 
-The validated 64-node run loaded the public split-FP8 checkpoint and completed a full-model HellaSwag SFT run. This validates the training mechanics and checkpoint layout, not model convergence.
+The checked-in recipe targets the public checkpoint, whose index at revision
+`207bd685a7e3696cfaff12ded7c6a7ea0f88c996` contains grouped BF16 expert tensors,
+not split-FP8 expert weights. The recipe disables MTP, so this configuration
+does not validate split-FP8 MTP loading or model convergence. Split-FP8 decoder
+and MTP loading are covered separately by checkpoint-loader regression tests.
 
 ## Example Recipe
 
