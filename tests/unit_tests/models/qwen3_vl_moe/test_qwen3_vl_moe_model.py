@@ -147,7 +147,9 @@ class TestFp32SafeRotaryEmbeddings:
             torch.testing.assert_close(buf.float(), original.float())
 
     def test_vision_rotary_inv_freq_remains_fp32(self):
-        rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(dim=16)
+        from transformers import Qwen3VLMoeVisionConfig
+
+        rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionConfig(hidden_size=64, num_heads=2))
         originals = {
             name: buf.detach().clone()
             for name, buf in rotary.named_buffers(recurse=False)

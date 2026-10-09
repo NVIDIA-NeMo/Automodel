@@ -198,7 +198,7 @@ def test_target_builder_uses_text_config_and_distributed_loader(monkeypatch):
     captured = {}
 
     monkeypatch.setattr(
-        _dspark_target_build.AutoConfig,
+        _dspark_target_build.NeMoAutoConfig,
         "from_pretrained",
         lambda *args, **kwargs: target_config,
     )

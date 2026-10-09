@@ -358,6 +358,14 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture
+def mock_hub_revision(monkeypatch):
+    """Keep tests with mocked config/weight loaders independent of Hub access."""
+    from nemo_automodel import NeMoAutoConfig
+
+    monkeypatch.setattr(NeMoAutoConfig, "resolve_revision", lambda source, revision=None, **kwargs: revision)
+
+
+@pytest.fixture
 def device(request):
     """Simple fixture returning string denoting the device [CPU | GPU]"""
     if request.config.getoption("--cpu"):
