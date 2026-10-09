@@ -149,3 +149,37 @@ def test_speculative_trainer_log_helper_forwards_to_trackio():
     recipe._wandb_log({"train/loss": 0.5}, step=3)
 
     assert run.calls == [({"train/loss": 0.5}, 3)]
+
+
+def test_recipe_run_config_keeps_yaml_targets_and_env_placeholders(monkeypatch, tmp_path):
+    """The recipe hands Trackio ``to_yaml_dict(use_orig_values=True)``: targets and ``${oc.env:...}`` stay as written."""
+    import json
+    import sys
+
+    from nemo_automodel.components.config.loader import load_yaml_config
+    from nemo_automodel.recipes._typed_config import RecipeConfig
+
+    captured = {}
+    fake_trackio = types.ModuleType("trackio")
+    fake_trackio.init = lambda **kw: captured.update(kw) or _RecordingRun()
+    monkeypatch.setitem(sys.modules, "trackio", fake_trackio)
+    monkeypatch.setenv("AUTOMODEL_TEST_CKPT_DIR", "/resolved/ckpts")
+    path = tmp_path / "recipe.yaml"
+    path.write_text(
+        "model:\n"
+        "  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained\n"
+        "  pretrained_model_name_or_path: Qwen/Qwen3-0.6B\n"
+        "checkpoint:\n"
+        "  checkpoint_dir: ${oc.env:AUTOMODEL_TEST_CKPT_DIR}\n"
+        "trackio:\n"
+        "  project: p\n"
+    )
+    cfg = RecipeConfig(load_yaml_config(path))
+
+    cfg.trackio.build(run_config=cfg.to_yaml_dict(use_orig_values=True), model_name="Qwen/Qwen3-0.6B")
+
+    run_config = captured["config"]
+    # ``from_pretrained`` is inherited from ``_BaseNeMoAutoModelClass``; the YAML spelling must survive.
+    assert run_config["model"]["_target_"] == "nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained"
+    assert run_config["checkpoint"]["checkpoint_dir"] == "${oc.env:AUTOMODEL_TEST_CKPT_DIR}"
+    json.dumps(run_config)

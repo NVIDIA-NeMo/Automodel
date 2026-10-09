@@ -305,7 +305,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.trackio_logger = None
         if self.dist_env.is_main and self.cfg.trackio is not None:
             self.trackio_logger = self.cfg.trackio.build(
-                run_config=self.cfg.to_dict(), model_name=self.cfg.model.pretrained_model_name_or_path
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True),
+                model_name=self.cfg.model.pretrained_model_name_or_path,
             )
             logging.info("Trackio experiment tracking enabled")
 

@@ -416,7 +416,7 @@ class TrainDFlashRecipe(BaseRecipe):
             trackio_cfg.name = (
                 trackio_cfg.name or type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1]
             )
-            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_dict())
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
             logger.info("Trackio experiment tracking enabled")
 
     def _build_target_model(self, recipe_cfg, target_path: str, draft_spec: DFlashDraftSpec) -> torch.nn.Module:

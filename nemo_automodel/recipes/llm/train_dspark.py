@@ -1244,7 +1244,7 @@ class TrainDSparkRecipe(BaseRecipe):
         if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
             trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
             trackio_cfg.name = trackio_cfg.name or "dspark_" + str(target_path).rstrip("/").split("/")[-1]
-            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_dict())
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
             logger.info("Trackio experiment tracking enabled")
 
     @staticmethod

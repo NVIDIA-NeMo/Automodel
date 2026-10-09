@@ -527,7 +527,9 @@ class TrainDiffusionRecipe(BaseRecipe):
             ):
                 self.cfg.trackio.name = f"{self.cfg.trackio.name}_{str(stage).lower()}"
             model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
-            self.trackio_logger = self.cfg.trackio.build(run_config=self.cfg.to_dict(), model_name=model_name)
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=model_name
+            )
             logging.info("Trackio experiment tracking enabled")
 
         self.seed = self.cfg.get("seed", 42)

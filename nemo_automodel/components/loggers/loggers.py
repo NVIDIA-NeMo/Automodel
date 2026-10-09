@@ -158,7 +158,8 @@ class TrackioConfig:
         """Initialise a Trackio run on rank 0 and return its logger.
 
         Args:
-            run_config: Full training config dict stored as the run config.
+            run_config: JSON-compatible run config, already serialized at the recipe boundary (e.g.
+                ``RecipeConfig.to_yaml_dict(use_orig_values=True)``).
             model_name: Optional model name used to derive the run name when ``name`` is empty.
 
         Returns:
@@ -167,7 +168,7 @@ class TrackioConfig:
         """
         import torch.distributed as dist
 
-        from nemo_automodel.components.loggers.trackio_utils import TrackioLogger, to_json_config
+        from nemo_automodel.components.loggers.trackio_utils import TrackioLogger
 
         if dist.is_initialized() and dist.get_rank() != 0:
             return None
@@ -186,7 +187,7 @@ class TrackioConfig:
         kwargs = {**self.extra, **named}
         if kwargs.get("name", "") == "":
             kwargs["name"] = "_".join(model_name.split("/")[-2:]) if model_name else None
-        run = trackio.init(**kwargs, config=to_json_config(dict(run_config)) if run_config is not None else None)
+        run = trackio.init(**kwargs, config=dict(run_config) if run_config is not None else None)
         return TrackioLogger(run)
 
 

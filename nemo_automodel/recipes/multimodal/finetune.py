@@ -428,7 +428,9 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
             trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
             model_name = str(_resolve_bagel_artifact_path(self.cfg) or "bagel")
-            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_dict(), model_name=model_name)
+            self.trackio_logger = trackio_cfg.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=model_name
+            )
             logging.info("Trackio experiment tracking enabled")
 
         self._log_experiment_details()

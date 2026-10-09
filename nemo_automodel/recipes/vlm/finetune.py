@@ -500,7 +500,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.trackio_logger = None
         if self.dist_env.is_main and self.cfg.trackio is not None:
             self.trackio_logger = self.cfg.trackio.build(
-                run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model)
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=_get_model_name(self.cfg.model)
             )
             logging.info("Trackio experiment tracking enabled")
 
