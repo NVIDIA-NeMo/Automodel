@@ -143,6 +143,11 @@ jobs:
           source ./venv/bin/activate
           uv run lint-imports --debug --verbose --no-cache
 
+      - name: Verify recipe import contract coverage
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tests/ci_tests/test_import_contracts.py
+
   type_checking:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
