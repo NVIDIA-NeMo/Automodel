@@ -169,7 +169,11 @@ _DFLASH_LOSS_TYPES = ("dflash", "variable_prefix")
 
 
 class DFlashTrainerModule(nn.Module):
-    """DFlash online training wrapper with block-wise CE loss."""
+    """DFlash online training wrapper with block-wise CE loss.
+
+    ``max_total_anchors`` optionally bounds rectangular anchor slots across the
+    local microbatch; ``None`` preserves the per-sequence ``num_anchors`` limit.
+    """
 
     def __init__(
         self,
@@ -184,12 +188,17 @@ class DFlashTrainerModule(nn.Module):
         loss_type: str = "dflash",
         prefix_weight_base: float = 0.9,
         sliding_window: int | None = None,
+        *,
+        max_total_anchors: int | None = None,
     ):
         super().__init__()
         if loss_type not in _DFLASH_LOSS_TYPES:
             raise ValueError(f"loss_type must be one of {_DFLASH_LOSS_TYPES}, got {loss_type!r}")
         if prefix_weight_base <= 0:
             raise ValueError(f"prefix_weight_base must be > 0, got {prefix_weight_base}")
+        if max_total_anchors is not None and max_total_anchors <= 0:
+            raise ValueError(f"max_total_anchors must be > 0 or None, got {max_total_anchors}")
+        self.max_total_anchors = max_total_anchors
         self.draft_model = draft_model
         # Keep the frozen target lm_head / embed_tokens as NON-registered
         # references. Under tensor parallelism their weights are DTensors; a
@@ -263,6 +272,13 @@ class DFlashTrainerModule(nn.Module):
         # by ``keep_mask`` below); no -1, which would spuriously raise when the
         # richest sample has exactly one valid anchor and always drop one otherwise.
         max_n = min(self.num_anchors, int(valid_counts.max().item()))
+        if self.max_total_anchors is not None:
+            if self.max_total_anchors < bsz:
+                raise ValueError(
+                    f"max_total_anchors ({self.max_total_anchors}) must be at least the local batch size ({bsz})"
+                )
+            # Include padded slots in the rectangular [B, N, ...] allocation.
+            max_n = min(max_n, self.max_total_anchors // bsz)
         if max_n <= 0:
             doc_note = " with block_size-1 further real tokens in its document" if doc_remaining is not None else ""
             raise NoValidAnchorsError(
@@ -528,6 +544,35 @@ class DFlashTrainerModule(nn.Module):
             )
         return anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, prefix_lengths
 
+    @staticmethod
+    def _resolve_supervision_ids(input_ids: torch.Tensor, label_ids: torch.Tensor | None) -> torch.Tensor:
+        """Validate the optional label stream and return the supervised token ids.
+
+        Args:
+            input_ids: Long tensor of shape ``[batch, sequence]``; the context tokens.
+            label_ids: Long tensor of shape ``[batch, sequence]`` on the same device
+                as ``input_ids``, indexed like ``input_ids`` (unshifted) and holding
+                valid vocabulary ids everywhere, or ``None`` to supervise ``input_ids``.
+                Values are not range-checked here, to avoid a device sync.
+
+        Returns:
+            ``label_ids`` when given, else ``input_ids``; shape ``[batch, sequence]``.
+
+        Raises:
+            ValueError: If ``label_ids`` differs from ``input_ids`` in shape, dtype, or device.
+        """
+        if label_ids is None:
+            return input_ids
+        if label_ids.shape != input_ids.shape:
+            raise ValueError(
+                f"label_ids must match input_ids shape {tuple(input_ids.shape)}, got {tuple(label_ids.shape)}"
+            )
+        if label_ids.dtype != input_ids.dtype:
+            raise ValueError(f"label_ids must have dtype {input_ids.dtype}, got {label_ids.dtype}")
+        if label_ids.device != input_ids.device:
+            raise ValueError(f"label_ids must be on {input_ids.device}, got {label_ids.device}")
+        return label_ids
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -536,6 +581,7 @@ class DFlashTrainerModule(nn.Module):
         position_ids: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
+        label_ids: torch.Tensor | None = None,
     ) -> DFlashStepMetrics:
         """Parallel block-wise training forward pass.
 
@@ -544,8 +590,30 @@ class DFlashTrainerModule(nn.Module):
         keeps every block inside one document: anchors are constrained so the block
         does not cross a boundary, the block's context prefix attends only within the
         anchor's document, and the draft's RoPE uses the per-document positions.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence]; the context tokens.
+            hidden_states: Tensor of shape [batch, sequence, layers * hidden]; the
+                captured target-model context features.
+            loss_mask: Tensor of shape [batch, sequence]; the supervised-token mask.
+            position_ids: Long tensor of shape [batch, sequence] with per-document
+                reset positions under packing, or ``None``.
+            seq_lens: Long tensor of shape [batch, max_docs] with packed document
+                lengths, or ``None`` when unpacked.
+            doc_remaining: Long tensor of shape [batch, sequence]; real tokens left
+                in each position's document, or ``None`` when unpacked.
+            label_ids: Optional long tensor with the shape, dtype and device of
+                ``input_ids``; ``label_ids[:, t]`` is the unshifted supervision
+                token for position ``t``. Every entry must be a valid vocabulary
+                id; exclude positions with ``loss_mask``, not ``-100``. Context,
+                clean anchors and visible ``variable_prefix`` tokens still use
+                ``input_ids``; ``None`` supervises ``input_ids``.
+
+        Returns:
+            DFlashStepMetrics for this micro-batch.
         """
         bsz, seq_len = input_ids.shape
+        supervision_ids = self._resolve_supervision_ids(input_ids, label_ids)
 
         anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, prefix_lengths = (
             self._prepare_block_inputs(
@@ -570,7 +638,7 @@ class DFlashTrainerModule(nn.Module):
 
         # Block position k predicts the token at anchor + k.
         _, target_ids, block_mask = self._build_block_targets(
-            input_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
+            supervision_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
         )
 
         if self.loss_type == "variable_prefix":

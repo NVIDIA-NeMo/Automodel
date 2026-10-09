@@ -70,6 +70,7 @@ def _build_trainer(
     attention_backend="sdpa",
     selector_loss_weight=1.0,
     selector_top_k=TOP_K,
+    max_total_anchors=None,
 ):
     torch.manual_seed(0)
     draft = Qwen3DFlash2DraftModel(_draft_cfg(attention_backend, selector_top_k))
@@ -81,6 +82,7 @@ def _build_trainer(
         block_size=BLOCK_SIZE,
         attention_backend=attention_backend,
         num_anchors=num_anchors,
+        max_total_anchors=max_total_anchors,
         loss_decay_gamma=loss_decay_gamma,
         selector_loss_weight=selector_loss_weight,
     )
@@ -253,3 +255,194 @@ def test_requires_a_dflash2_draft_model():
 def test_rejects_a_negative_selector_loss_weight():
     with pytest.raises(ValueError, match="selector_loss_weight"):
         _build_trainer(selector_loss_weight=-1.0)
+
+
+def test_label_ids_supervise_labels_but_selector_predecessor_is_real_anchor(monkeypatch):
+    trainer = _build_trainer(loss_decay_gamma=7.0, selector_top_k=VOCAB)
+    input_ids, hidden, loss_mask = _inputs(bsz=2, seq_len=12)
+    label_ids = (input_ids + 7) % (VOCAB - 1)
+    anchors = torch.tensor([[2], [3]])
+    keep = torch.ones_like(anchors, dtype=torch.bool)
+    monkeypatch.setattr(
+        trainer,
+        "_sample_anchor_positions",
+        lambda seq_len, loss_mask, device, doc_remaining=None: (anchors.to(device), keep.to(device)),
+    )
+    captured = {}
+    original_selector_scores = trainer._selector_scores
+
+    def capture_selector_scores(hidden, logits, target_ids):
+        captured["target_ids"] = target_ids.detach().clone()
+        return original_selector_scores(hidden, logits, target_ids)
+
+    monkeypatch.setattr(trainer, "_selector_scores", capture_selector_scores)
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask, label_ids=label_ids)
+    assert torch.isfinite(out.loss)
+
+    expected = torch.stack(
+        [
+            torch.cat((input_ids[row, anchor : anchor + 1], label_ids[row, anchor + 1 : anchor + BLOCK_SIZE]))
+            for row, anchor in enumerate((2, 3))
+        ]
+    ).unsqueeze(1)
+    torch.testing.assert_close(captured["target_ids"], expected)
+
+
+def test_label_ids_must_match_input_shape_and_dtype():
+    trainer = _build_trainer()
+    input_ids, hidden, loss_mask = _inputs(bsz=1, seq_len=12)
+    with pytest.raises(ValueError, match="match input_ids shape"):
+        trainer(input_ids, hidden, loss_mask, label_ids=input_ids[:, :-1])
+    with pytest.raises(ValueError, match="must have dtype"):
+        trainer(input_ids, hidden, loss_mask, label_ids=input_ids.float())
+
+
+def test_dflash2_exposes_separate_differentiable_loss_terms():
+    trainer = _build_trainer(selector_loss_weight=0.7, loss_decay_gamma=4.0)
+    input_ids, hidden, loss_mask = _inputs()
+    metrics = trainer(input_ids, hidden, loss_mask)
+    torch.testing.assert_close(metrics.loss, metrics.base_loss + 0.7 * metrics.selector_loss)
+    assert metrics.base_loss.requires_grad and metrics.selector_loss.requires_grad
+    assert not metrics.selector_loss_denominator.requires_grad
+    # Candidate-dependent denominator can be smaller than the backbone weight.
+    assert 0 <= metrics.selector_loss_denominator <= metrics.loss_weight
+    params = tuple(trainer.draft_model.parameters())
+    total = torch.autograd.grad(metrics.loss, params, retain_graph=True, allow_unused=True)
+    separated = torch.autograd.grad(metrics.base_loss + 0.7 * metrics.selector_loss, params, allow_unused=True)
+    for actual, expected in zip(separated, total):
+        if expected is None:
+            assert actual is None
+        else:
+            torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("budget", [0, -1])
+def test_total_anchor_budget_rejects_nonpositive(budget):
+    with pytest.raises(ValueError, match="max_total_anchors"):
+        _build_trainer(max_total_anchors=budget)
+
+
+def test_dflash2_total_anchor_budget_reaches_shared_sampler():
+    trainer = _build_trainer(max_total_anchors=4)
+    input_ids, hidden, mask = _inputs(bsz=2)
+    metrics = trainer(input_ids, hidden, mask)
+    assert metrics.valid_blocks == 4
+
+
+def _fix_anchors(monkeypatch, trainer, anchors):
+    anchors = torch.tensor(anchors)
+    keep = torch.ones_like(anchors, dtype=torch.bool)
+    monkeypatch.setattr(
+        trainer,
+        "_sample_anchor_positions",
+        lambda seq_len, loss_mask, device, doc_remaining=None: (anchors.to(device), keep.to(device)),
+    )
+
+
+def test_split_loss_terms_reconstruct_the_unsharded_weighted_mean(monkeypatch):
+    """``term * denominator`` must be additive across data-parallel shards.
+
+    A caller normalizing over its DP group computes ``sum(term_r * w_r) / sum(w_r)``.
+    Splitting one batch into two shards with different supervision depths must
+    reproduce the unsharded terms, which only holds if each denominator is the
+    exact decay-weighted sum inside its term.
+    """
+    # top_k=32 leaves some true tokens outside the candidates, so the selector
+    # denominator is a strict, non-trivial subset of the backbone one.
+    trainer = _build_trainer(loss_decay_gamma=4.0, selector_top_k=32)
+    input_ids, hidden, loss_mask = _inputs(bsz=2, seq_len=12)
+    label_ids = (input_ids + 7) % (VOCAB - 1)
+    loss_mask[1, 6:] = 0
+    anchors = ([[1, 4]], [[2, 4]])
+
+    shards = []
+    for row, row_anchors in enumerate(anchors):
+        _fix_anchors(monkeypatch, trainer, row_anchors)
+        rows = slice(row, row + 1)
+        shards.append(trainer(input_ids[rows], hidden[rows], loss_mask[rows], label_ids=label_ids[rows]))
+    _fix_anchors(monkeypatch, trainer, [a[0] for a in anchors])
+    full = trainer(input_ids, hidden, loss_mask, label_ids=label_ids)
+
+    # Decayed, not counted: row 0 has two full blocks, row 1 one full block plus
+    # one cut to a single position by its loss mask.
+    decay = torch.exp(-torch.arange(BLOCK_SIZE - 1) / 4.0)
+    torch.testing.assert_close(shards[0].loss_weight, 2 * decay.sum())
+    torch.testing.assert_close(shards[1].loss_weight, decay.sum() + 1)
+    assert 0 < full.selector_loss_denominator < full.loss_weight
+
+    for term, denominator in (("base_loss", "loss_weight"), ("selector_loss", "selector_loss_denominator")):
+        weights = [getattr(shard, denominator) for shard in shards]
+        torch.testing.assert_close(sum(weights), getattr(full, denominator))
+        merged = sum(getattr(shard, term) * w for shard, w in zip(shards, weights)) / sum(weights)
+        torch.testing.assert_close(merged, getattr(full, term), rtol=1e-5, atol=1e-6)
+
+
+def test_bf16_base_loss_reconstructs_its_numerator_within_rounding(monkeypatch):
+    """BF16 logits keep ``base_loss * loss_weight`` within a few BF16 roundings.
+
+    ``DFlashDecayLoss`` reduces in the logits dtype while ``loss_weight`` is FP32,
+    so the product is not exact under BF16 training. The NLL, decay weights, both
+    sums and the quotient each round once (unit roundoff ``2**-8``), so the
+    relative error is bounded by about ``6 * 2**-8``.
+    """
+    trainer = _build_trainer(loss_decay_gamma=4.0)
+    compute_logits = trainer.draft_model.compute_logits
+    captured = {}
+
+    def bf16_logits(*args, **kwargs):
+        captured["logits"] = compute_logits(*args, **kwargs).to(torch.bfloat16)
+        return captured["logits"]
+
+    monkeypatch.setattr(trainer.draft_model, "compute_logits", bf16_logits)
+    input_ids, hidden, loss_mask = _inputs(bsz=2, seq_len=24)
+    loss_mask[:, 1::5] = 0
+    anchors = torch.tensor([[1, 6, 11, 16], [3, 8, 13, 18]])
+    _fix_anchors(monkeypatch, trainer, anchors.tolist())
+    out = trainer(input_ids, hidden * 4, loss_mask)
+    assert out.base_loss.dtype == torch.bfloat16 and out.loss_weight.dtype == torch.float32
+
+    positions = anchors.unsqueeze(-1) + torch.arange(1, BLOCK_SIZE)
+    targets = torch.gather(input_ids.unsqueeze(1).expand(-1, anchors.shape[1], -1), 2, positions)
+    weights = torch.gather(loss_mask.unsqueeze(1).expand(-1, anchors.shape[1], -1), 2, positions)
+    weights = weights * torch.exp(-torch.arange(BLOCK_SIZE - 1) / 4.0)
+    logits = captured["logits"].view(*anchors.shape, BLOCK_SIZE, VOCAB)[:, :, 1:].float()
+    nll = torch.nn.functional.cross_entropy(logits.reshape(-1, VOCAB), targets.reshape(-1), reduction="none")
+    numerator = (nll.view_as(weights) * weights).sum()
+
+    torch.testing.assert_close(out.loss_weight, weights.sum())
+    torch.testing.assert_close(out.base_loss.float() * out.loss_weight, numerator, rtol=6 * 2**-8, atol=0)
+
+
+def test_packed_label_ids_match_per_document_rows(monkeypatch):
+    """Packing two documents with ``label_ids`` must equal running them as rows.
+
+    Each document's blocks take context and clean anchors from ``input_ids`` and
+    targets from ``label_ids`` of that document only. The ``4`` anchor crosses the
+    first document's end; packing must mask the next document's labels exactly
+    as the unpacked row masks out-of-range positions.
+    """
+    trainer = _build_trainer(loss_decay_gamma=4.0, selector_top_k=32)
+    doc_len = 6
+    input_ids, hidden, loss_mask = _inputs(bsz=2, seq_len=doc_len)
+    label_ids = (input_ids + 7) % (VOCAB - 1)
+
+    _fix_anchors(monkeypatch, trainer, [[1, 4], [2, 1]])
+    unpacked = trainer(input_ids, hidden, loss_mask, label_ids=label_ids)
+
+    _fix_anchors(monkeypatch, trainer, [[1, 4, doc_len + 2, doc_len + 1]])
+
+    def run_packed(packed_labels):
+        return trainer(
+            input_ids.reshape(1, -1),
+            hidden.reshape(1, 2 * doc_len, -1),
+            loss_mask.reshape(1, -1),
+            position_ids=torch.arange(doc_len).repeat(2).unsqueeze(0),
+            seq_lens=torch.tensor([[doc_len, doc_len]]),
+            doc_remaining=torch.arange(doc_len - 1, -1, -1).repeat(2).unsqueeze(0),
+            label_ids=packed_labels,
+        )
+
+    packed = run_packed(label_ids.reshape(1, -1))
+    for field in ("valid_tokens", "loss_weight", "selector_loss_denominator", "base_loss", "selector_loss"):
+        torch.testing.assert_close(getattr(packed, field), getattr(unpacked, field))
+    assert not torch.allclose(packed.base_loss, run_packed(None).base_loss)

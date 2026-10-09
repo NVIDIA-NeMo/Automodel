@@ -66,15 +66,20 @@ class DFlash2StepMetrics:
 
     Attributes:
         loss: Scalar tensor containing the differentiable training loss.
-        loss_weight: Scalar tensor containing the effective loss denominator.
+        loss_weight: Scalar tensor containing the effective denominator of
+            ``base_loss``.
         accuracy: Scalar tensor containing selector-path greedy token accuracy.
         valid_tokens: Scalar tensor containing the supervised-token count.
         correct_tokens: Scalar tensor containing selector-path correct-token count.
         accept_len: Scalar tensor containing selector-path mean acceptance length.
         accept_len_sum: Scalar tensor containing selector-path additive acceptance length.
         valid_blocks: Scalar tensor containing the number of evaluated draft blocks.
-        base_loss: Scalar tensor containing the backbone block-CE term.
-        selector_loss: Scalar tensor containing the candidate-selection CE term.
+        base_loss: Scalar tensor containing the backbone block-CE term,
+            normalized by ``loss_weight``.
+        selector_loss: Scalar tensor containing the candidate-selection CE term,
+            normalized by ``selector_loss_denominator``.
+        selector_loss_denominator: Scalar tensor containing the effective
+            denominator of ``selector_loss``.
         base_accuracy: Scalar tensor containing backbone top-1 token accuracy.
         base_correct_tokens: Scalar tensor containing backbone correct-token count.
         base_accept_len: Scalar tensor containing backbone mean acceptance length.
@@ -94,6 +99,7 @@ class DFlash2StepMetrics:
     valid_blocks: torch.Tensor
     base_loss: torch.Tensor
     selector_loss: torch.Tensor
+    selector_loss_denominator: torch.Tensor
     base_accuracy: torch.Tensor
     base_correct_tokens: torch.Tensor
     base_accept_len: torch.Tensor
@@ -116,6 +122,8 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         loss_decay_gamma: float | None = None,
         selector_loss_weight: float = 1.0,
         sliding_window: int | None = None,
+        *,
+        max_total_anchors: int | None = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -127,6 +135,7 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
             sliding_window=sliding_window,
+            max_total_anchors=max_total_anchors,
         )
         if getattr(draft_model, "candidate_selector", None) is None:
             raise ValueError(
@@ -198,6 +207,7 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         position_ids: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
+        label_ids: torch.Tensor | None = None,
     ) -> DFlash2StepMetrics:
         """Parallel block-wise training forward with the DFlash 2 path selector.
 
@@ -217,11 +227,18 @@ class DFlash2TrainerModule(DFlashTrainerModule):
                 lengths, or ``None`` when unpacked.
             doc_remaining: Long tensor of shape [batch, sequence]; real tokens left
                 in each position's document, or ``None`` when unpacked.
+            label_ids: Optional long tensor with the shape, dtype and device of
+                ``input_ids``; ``label_ids[:, t]`` is the unshifted supervision
+                token for position ``t``. Every entry must be a valid vocabulary
+                id, since in-block labels are embedded as selector predecessors;
+                exclude positions with ``loss_mask``, not ``-100``. ``input_ids``
+                remains the context/anchor stream; ``None`` supervises ``input_ids``.
 
         Returns:
             DFlash2StepMetrics for this micro-batch.
         """
         bsz, seq_len = input_ids.shape
+        supervision_ids = self._resolve_supervision_ids(input_ids, label_ids)
 
         anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, _ = (
             self._prepare_block_inputs(
@@ -241,8 +258,13 @@ class DFlash2TrainerModule(DFlashTrainerModule):
 
         n, bs = anchor_positions.size(1), self.block_size
         _, target_ids, block_mask = self._build_block_targets(
-            input_ids, loss_mask, anchor_positions, block_keep_mask, seq_len, doc_remaining=doc_remaining
+            supervision_ids, loss_mask, anchor_positions, block_keep_mask, seq_len, doc_remaining=doc_remaining
         )
+        if label_ids is not None:
+            # Position 1's selector predecessor is the visible clean anchor,
+            # which comes from input_ids even when later labels are distilled.
+            target_ids = target_ids.clone()
+            target_ids[..., 0] = torch.gather(input_ids, 1, anchor_positions.clamp(min=0))
 
         # Drop block position 0 (the clean anchor token, never a target); the
         # remaining bs-1 positions are what both objectives supervise.
@@ -290,8 +312,9 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             accept_len=accept_len.detach(),
             accept_len_sum=accept_len_sum.detach(),
             valid_blocks=valid_blocks.detach(),
-            base_loss=loss_out.total_loss.detach(),
-            selector_loss=selector_loss.detach(),
+            base_loss=loss_out.total_loss,
+            selector_loss=selector_loss,
+            selector_loss_denominator=selector_weights.sum().detach(),
             base_accuracy=(base_correct_tokens / denominator).detach(),
             base_correct_tokens=base_correct_tokens.detach(),
             base_accept_len=base_accept_len.detach(),
