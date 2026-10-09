@@ -47,6 +47,23 @@ def test_reject_unsupported_mtp_cp_pp_allows_disabled_model():
     reject_unsupported_mtp_cp_pp(model)
 
 
+@pytest.mark.parametrize("pp_size", [None, 1, 2])
+@pytest.mark.parametrize("stage_hook", [None, False, True])
+@pytest.mark.parametrize("mtp_enabled, supported", [(True, False), (False, False), (True, True)])
+def test_reject_unsupported_mtp_cp_pp_topology(pp_size, stage_hook, mtp_enabled, supported):
+    model = nn.Module()
+    model.supports = SimpleNamespace(mtp_enabled=mtp_enabled, supports_mtp_cp_pp=supported)
+    if stage_hook is not None:
+        model._is_pipeline_parallel_stage = lambda: stage_hook
+
+    must_reject = mtp_enabled and not supported and (pp_size == 2 or stage_hook is True)
+    if must_reject:
+        with pytest.raises(NotImplementedError, match="use PP size 1 or CP size 1"):
+            reject_unsupported_mtp_cp_pp(model, pp_size=pp_size)
+    else:
+        reject_unsupported_mtp_cp_pp(model, pp_size=pp_size)
+
+
 def test_reject_unsupported_mtp_cp_rejects_enabled_unsupported_model():
     model = nn.Module()
     model.mtp_config = SimpleNamespace(enabled=True)

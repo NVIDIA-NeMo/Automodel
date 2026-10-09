@@ -28,7 +28,11 @@ from nemo_automodel.components.distributed.multimodal_fsdp import (
     module_parameters,
     normalize_frozen_multimodal_sharding,
 )
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallelizer_utils import (
+    fully_shard_by_dtype,
+    reject_unsupported_mtp_cp,
+    reject_unsupported_mtp_cp_pp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +117,10 @@ class Qwen3_5ModelParallelizer(ModelParallelizer):
         """Apply generic TP/AC/FSDP and install Qwen3.5's CP mesh."""
         cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
         cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
+        if cp_enabled:
+            pp_size = device_mesh["pp"].size() if "pp" in device_mesh.mesh_dim_names else 1
+            reject_unsupported_mtp_cp_pp(model, pp_size=pp_size)
+            reject_unsupported_mtp_cp(model)
         result = super()._apply(
             model,
             device_mesh,

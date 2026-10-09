@@ -19,6 +19,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from nemo_automodel.components.distributed.parallelizer_utils import reject_unsupported_mtp_cp_pp
+
 # torch.utils.checkpoint.create_selective_checkpoint_contexts returns
 # ``(forward_ctx, recompute_ctx)``, and apply_ac's context wrappers unpack it,
 # so the stubs below must return a pair rather than a bare sentinel.
@@ -458,16 +460,6 @@ def _import_parallelizer_with_stubs(monkeypatch):
             raise RuntimeError("Model does not support MTP with context parallelism")
 
     parallelizer_utils_stub.reject_unsupported_mtp_cp = reject_unsupported_mtp_cp
-
-    def reject_unsupported_mtp_cp_pp(model):
-        is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
-        if (
-            model.supports.mtp_enabled
-            and not model.supports.supports_mtp_cp_pp
-            and callable(is_pp_stage_fn)
-            and is_pp_stage_fn()
-        ):
-            raise NotImplementedError("MTP with context and pipeline parallelism is not supported")
 
     parallelizer_utils_stub.reject_unsupported_mtp_cp_pp = reject_unsupported_mtp_cp_pp
 
@@ -1943,6 +1935,24 @@ def test_parallelize_model_rejects_cp_mtp_pipeline_stage_before_ep_or_cp(monkeyp
 
     apply_cp_mock.assert_not_called()
     apply_ep_mock.assert_not_called()
+
+
+def test_parallelize_model_rejects_mtp_cp_pp_without_stage_hook_before_tp(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_tp = MagicMock(side_effect=AssertionError("TP surgery reached"))
+    apply_cp = MagicMock(side_effect=AssertionError("CP surgery reached"))
+    monkeypatch.setattr(P, "_resolve_moe_tp_plan", apply_tp)
+    monkeypatch.setattr(P, "apply_cp", apply_cp)
+    model = types.SimpleNamespace(
+        supports=types.SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True, supports_mtp_cp_pp=False)
+    )
+    mesh = FakeWorldMesh({"pp": 2, "cp": 2, "tp": 2}, mesh_dim_names=["pp", "cp", "tp"])
+
+    with pytest.raises(NotImplementedError, match="use PP size 1 or CP size 1"):
+        P.parallelize_model(model, mesh, None, dp_axis_names=(), cp_axis_name="cp", tp_axis_name="tp")
+
+    apply_tp.assert_not_called()
+    apply_cp.assert_not_called()
 
 
 def test_parallelize_model_rejects_cp_mtp_without_capability_before_ep_or_cp(monkeypatch):

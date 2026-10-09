@@ -1195,6 +1195,12 @@ def parallelize_model(
             construction.
     """
 
+    cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
+    if cp_enabled:
+        pp_size = world_mesh["pp"].size() if "pp" in world_mesh.mesh_dim_names else 1
+        parallelizer_utils.reject_unsupported_mtp_cp_pp(model, pp_size=pp_size)
+        parallelizer_utils.reject_unsupported_mtp_cp(model)
+
     tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
     if tp_enabled:
         if enable_async_tensor_parallel:
@@ -1234,10 +1240,7 @@ def parallelize_model(
         parallelize_module(model, tp_mesh, model_parallel_plan)
         ensure_tied_lm_head(model)
 
-    cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
-        parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
-        parallelizer_utils.reject_unsupported_mtp_cp(model)
         apply_cp(model, world_mesh[cp_axis_name])
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
