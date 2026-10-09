@@ -79,6 +79,8 @@ from nemo_automodel.components.models.deepseek_v41.fsdp import PARALLELIZER
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41HyperConnection,
     DeepseekV41RMSNorm,
+    compile_hc_cores,
+    compile_norm_core,
 )
 from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 from nemo_automodel.components.models.deepseek_v41.processing import (
@@ -237,6 +239,10 @@ class DeepseekV41Model(nn.Module):
         config = config.text_config
         self.config = config
         self.moe_config = moe_config
+        if backend.compile_hc:
+            compile_hc_cores()
+        if backend.compile_norm and backend.rms_norm != "te":
+            compile_norm_core()
         dtype = dtype_from_str(config.dtype, torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
         active_engram = any(i < config.num_hidden_layers for i in config.engram_layer_ids)
@@ -449,6 +455,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         backend: BackendConfig | None = None,
         *,
         tokenizer: PreTrainedTokenizerFast | None = None,
+        revision: str | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -464,7 +471,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         if engram_process_group is None and dist.is_available() and dist.is_initialized():
             engram_process_group = dist.group.WORLD
         if tokenizer is None and any(i < text.num_hidden_layers for i in text.engram_layer_ids):
-            tokenizer = config.build_tokenizer()
+            tokenizer = config.build_tokenizer(revision=revision)
         moe_config = moe_config or MoEConfig(
             dim=text.hidden_size,
             inter_dim=text.moe_intermediate_size,

@@ -4,7 +4,7 @@ description: "Fine-tune DeepSeek-V4.1-Flash with NeMo AutoModel using checked-in
 slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V4.1-Flash
 ---
 
-[DeepSeek-V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
+[DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 uses a 40-layer causal encoder/decoder Mixture-of-Experts (MoE) backbone with
 384 routed experts, one shared expert, and six selected experts per token. Its CSA2 attention shares
 compressed KV and index state between Full, Reuse, and Reindex layers.
@@ -41,7 +41,7 @@ The configuration requests 100 updates with validation every 50 updates,
 activation checkpointing, and reshard-after-forward. It uses no gradient
 accumulation or additional expert FSDP shard axis, and requests a one-hour
 allocation. W&B logging is disabled by default; set `wandb.enable: true` to
-enable online logging. TE FusedAdam retains FP32 master-weight precision
+enable online logging. Transformer Engine (TE) FusedAdam retains FP32 master-weight precision
 through int16 remainders for BF16 parameters.
 
 <Note>
@@ -57,6 +57,18 @@ The model and recipe use `attn: tilelang`, `linear: torch`,
 Set `model.backend.rms_norm: te` to use Transformer Engine RMSNorm for the
 text backbone, attention projections, compressor, and indexer. This preserves
 parameter names and dtypes; the default retains eager FP32 normalization.
+Set `model.backend.compile_hc: true` to run the single-pass mHC
+coefficient projection, stream collapse and stream expand through
+`torch.compile` (one fused kernel each instead of four to five FP32 passes;
+the eager `expand` materializes a `[batch, sequence, streams, streams, hidden]`
+FP32 temporary), and `model.backend.compile_norm: true` to compile the FP32
+RMSNorm chain the same way. Both are opt-in: compiled numerics are allclose to
+eager, not bitwise-identical (the 12-layer mini benchmark reproduced the eager
+loss to four decimals). The cores are specialized per shape: a new sequence
+length (or grad mode) compiles them again, so keep them off for runs with many
+distinct packed lengths.
+The Sinkhorn normalization keeps its TileKernels or torch backend. Both knobs are
+backend fields: they select kernels and are not written to `config.json`.
 TileLang and TileKernels are the optional dependencies also used by DeepSeek V4.
 HybridEP provides both token dispatch and expert-output combine. Router
 correction biases remain fixed during fine-tuning through
@@ -105,7 +117,8 @@ gradient-sized norm temporaries for contiguous CUDA owner shards. Set
 The GB200 recipes place 748B trainable parameters on 64 GPUs, about 117 GB per
 GPU for BF16 weights, BF16 gradients, BF16 moments, and int16 master
 remainders. On 80 GB H100 parts the same recipes need twice the ranks: with
-`ep_size: 64` on 128 or more GPUs the mesh derives an additional `ep_shard`
+remainders. On 80 GB H100 parts, the same recipes need twice the ranks: with
+`ep_size: 64` on 128 or more GPUs, the mesh derives an additional `ep_shard`
 FSDP axis over the routed experts, which halves the per-rank expert state.
 The variants below were validated on 8-GPU H100 nodes with InfiniBand, 100
 updates each, using the NGC `nemo-automodel:26.08` container plus this
@@ -130,7 +143,7 @@ Three points apply to every H100 variant:
 - **Set `NCCL_PXN_DISABLE=1`, or `NCCL_NET_PLUGIN=none NCCL_NET=IB`,** on
   multi-node InfiniBand systems. With the container's default NCCL network
   plugin and PXN both active, the Engram row-owner all-to-all received
-  byte-shifted token IDs from the first node's ranks and the recipe stopped in
+  byte-shifted token IDs from the first node's ranks, and the recipe stopped in
   `_validate_received_ids` during the first forward, with NCCL 2.30.5 and
   2.30.7 alike, and with both HPC-X 2.50 plugins the image ships (the default
   Spectrum-X `spcx` and IBext). Either switch alone avoids it: disabling PXN
@@ -144,7 +157,7 @@ Three points apply to every H100 variant:
   true`, torch 2.13 hits an activation-checkpoint recompute mismatch on the
   expert all-gather copy-out ([issue #3958](https://github.com/NVIDIA-NeMo/Automodel/issues/3958)).
   `moe.reshard_after_forward: false` avoids it at about 8.5 GB per rank and
-  becomes unnecessary once [PR #3961](https://github.com/NVIDIA-NeMo/Automodel/pull/3961)
+  becomes unnecessary after [PR #3961](https://github.com/NVIDIA-NeMo/Automodel/pull/3961)
   is merged.
 - **Point the JIT caches at node-local storage** (`HYBRID_EP_CACHE_DIR`,
   `TILELANG_CACHE_DIR`, `TRITON_CACHE_DIR`). HybridEP resolves its cache from
@@ -185,7 +198,7 @@ preserves released parameter names, required FP32 weights, and logical Engram
 rows while removing the original quantization metadata. Quantized re-export
 is not supported.
 
-Recipe initialization uses the NeMo AutoModel wrapper's internal Checkpointer and DCP
+Recipe initialization uses the NeMo AutoModel wrapper's internal Checkpointer and PyTorch Distributed Checkpoint (DCP)
 path to load the base checkpoint into the distributed model.
 
 Text inputs use unpacked `input_ids [batch, sequence]`, right padding, and
@@ -196,7 +209,7 @@ straight-through gradients; there is no quantization toggle.
 
 The released vision tower is enabled by the default model configuration and
 disabled by the HellaSwag recipe. `DeepseekV41Processor` supports ordinary
-text and image conversations and save/reload. Image inputs require unpacked
+text and image conversations and saving and reloading. Image inputs require unpacked
 `input_ids [batch, sequence]`, `pixel_values [all_patches, 3, patch_size, patch_size]`,
 `image_grid_hws [images, 2]`, and `vision_token_types [batch, sequence]`.
 The image encoder and projector reuse DeepSeek V4 modules; image delimiters
@@ -210,7 +223,7 @@ covered all 40 layers, 4,096 positions, and all 129,280 vocabulary entries
 against the pinned checkpoint's unchanged official `inference/` implementation.
 Official TP1 was compared with native EP4 and 4 Engram owners using
 `torch_mm`, native HybridEP dispatch and combine, and TileLang. Dense and expert
-reference weights were decoded for BF16 compute, with the original cache/index quantization retained;
+reference weights were decoded for BF16 compute, with the original cache and index quantization retained;
 this was not a default FP8/FP4 GEMM comparison.
 
 The native execution streamed one production block at a time while carrying

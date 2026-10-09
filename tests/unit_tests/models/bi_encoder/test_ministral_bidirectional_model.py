@@ -2077,8 +2077,8 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
 
 
 @pytest.mark.runtime_budget(
-    20,
-    reason="isolated Transformers startup and two export round trips took 15.6s on CI; allow runner variance",
+    75,
+    reason="two real export/reload paths plus isolated Transformers and ST inference took 56.8s under CI coverage",
 )
 def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Trained heads export through both save paths into stock ST modules and portable Transformers."""

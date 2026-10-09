@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The project pin predates the Pixtral regression. Use the real affected release,
-# isolated from the base environment, so the backport executes in CI coverage.
+# Use a real affected release, isolated from the base environment, so the
+# backport stays covered even if the project pin changes.
 # Remove this lane when the project pin includes HF #49373 and its tests pass.
 # Usage: bash tests/ci_tests/scripts/test_pixtral_compat.sh cpu|gpu [transformers-version]
 set -euo pipefail

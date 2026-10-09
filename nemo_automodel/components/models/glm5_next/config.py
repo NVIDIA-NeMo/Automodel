@@ -3,10 +3,9 @@
 
 """AutoModel-owned configuration for GLM-5.3-Flash.
 
-The released checkpoint requires Transformers 5.16, while AutoModel's current
-runtime baseline predates the upstream ``glm5_next`` config.  These classes keep
-the checkpoint field protocol stable and allow ``AutoConfig`` to resolve the
-model without remote code or a dependency bump.
+Transformers includes an upstream ``glm5_next`` config, but AutoModel's local
+backbone retains the checkpoint's field and layer-name protocol. These classes
+preserve that contract and let ``AutoConfig`` resolve it without remote code.
 """
 
 from __future__ import annotations
@@ -214,6 +213,9 @@ class Glm5NextTextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        # HF 5.18 remaps this legacy name to indexed_attention. The local
+        # backbone owns its layer protocol and still uses the checkpoint name.
+        self.layer_types = list(layer_types)
 
     @property
     def num_local_experts(self) -> int:
