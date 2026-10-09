@@ -15,6 +15,7 @@
 """Native Step-5 Preview text and vision-language training models."""
 
 from dataclasses import dataclass, replace
+from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -66,20 +67,46 @@ class Step5TextModel(nn.Module):
         )
         self.norm = Step3p5RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, embeddings: torch.Tensor, positions: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        positions: torch.Tensor,
+        padding_mask: torch.Tensor,
+        packed_documents: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Evaluate the decoder stack with FP32 residuals.
 
         Args:
             embeddings: Tensor of shape [batch, local_sequence, hidden].
             positions: Tensor of shape [batch, local_sequence].
             padding_mask: Boolean tensor of shape [batch, local_sequence], true for padding.
+            packed_documents: Optional independent document IDs [batch, local_sequence],
+                positive for real tokens and zero for padding.
 
         Returns:
             Final normalized tensor of shape [batch, local_sequence, hidden].
         """
         cp_group = self.layers["0"].self_attn.cp_group
-        metadata = gather_metadata(torch.stack((positions, padding_mask.to(positions.dtype)), dim=-1), cp_group)
+        fields = (positions, padding_mask.to(positions.dtype))
+        if packed_documents is not None:
+            if packed_documents.shape != positions.shape:
+                raise ValueError("Step5 packed document IDs must match position_ids")
+            fields = (*fields, packed_documents)
+        metadata = gather_metadata(torch.stack(fields, dim=-1), cp_group)
         global_positions, global_padding = metadata[..., 0], metadata[..., 1].bool()
+        if packed_documents is not None:
+            # Check once on global metadata, including boundaries crossing CP ranks.
+            # The attention kernels then consume only linear-size compact metadata.
+            documents = metadata[..., 2]
+            valid = ~global_padding
+            starts = valid.clone()
+            starts[:, 1:] &= global_padding[:, :-1] | (documents[:, 1:] != documents[:, :-1])
+            same_document = valid[:, 1:] & valid[:, :-1] & ~starts[:, 1:]
+            invalid = (valid & (documents <= 0)) | (global_padding & (documents != 0))
+            invalid |= starts & (global_positions != 0)
+            invalid[:, 1:] |= same_document & (global_positions[:, 1:] != global_positions[:, :-1] + 1)
+            if invalid.any():
+                raise ValueError("Step5 packed document IDs, padding and position_ids disagree")
         residual = embeddings.float()
         for layer in self.layers.values():
             residual = layer(
@@ -95,6 +122,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
     base_model_prefix = "model"
     _owns_cp_attention = True
     _owns_packed_attention = True
+    packed_mask_type = "document_ids"
     tie_word_embeddings_support = TieSupport.UNTIED_ONLY
     _no_split_modules = ["Step5DecoderLayer"]
     _keep_in_fp32_modules = ["rotary_emb"]
@@ -240,12 +268,21 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             Mapping containing the model's ContextParallelSharder.
         """
         del num_chunks
+        packed_documents = batch.get("_packed_seq_ids")
+        attention_mask = batch.get("attention_mask")
+        if packed_documents is None and attention_mask is not None and attention_mask.ndim == 2:
+            if (attention_mask > 1).any():
+                packed_documents = attention_mask
+        if packed_documents is not None and "position_ids" not in batch:
+            raise ValueError("Step5 packed inputs require document-local position_ids")
         updates: dict[str, ContextParallelSharder | torch.Tensor] = {
             "cp_sharder": ContextParallelSharder(
-                shard_batch=shard_batch_contiguous,
+                shard_batch=partial(shard_batch_contiguous, extra_seq_keys={"_packed_seq_ids": 1}),
                 local_token_global_indices=contiguous_local_indices,
             )
         }
+        if packed_documents is not None:
+            updates["_packed_seq_ids"] = packed_documents
         if "padding_mask" not in batch and "attention_mask" not in batch:
             primary = batch["input_ids"] if "input_ids" in batch else batch["inputs_embeds"]
             updates["padding_mask"] = torch.zeros(primary.shape[:2], device=primary.device, dtype=torch.bool)
@@ -262,6 +299,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool = False,
         labels: torch.Tensor | None = None,
+        _packed_seq_ids: torch.Tensor | None = None,
         **kwargs: ConfigValue | torch.Tensor,
     ) -> CausalLMOutputWithPast:
         """Evaluate all local query positions.
@@ -275,6 +313,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             logits_to_keep: Last-token count or tensor of sequence indices to project.
             output_hidden_states: Return final hidden states for native fused CE.
             labels: Optional tensor of shape [batch, local_sequence] for serial HF-style shifted CE.
+            _packed_seq_ids: Optional [batch, local_sequence] document IDs from native packing.
             **kwargs: Recipe metadata. BSHD inputs are used even for concatenated documents.
 
         Returns:
@@ -283,6 +322,12 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         """
         if kwargs.get("qkv_format", "bshd") != "bshd":
             raise ValueError("Step5 uses BSHD with position resets for packing; qkv_format must be 'bshd'")
+        if attention_mask is not None and attention_mask.ndim != 2:
+            raise ValueError("Step5 attention_mask must have shape [batch, sequence]")
+        if _packed_seq_ids is None and attention_mask is not None and (attention_mask > 1).any():
+            _packed_seq_ids = attention_mask
+        if _packed_seq_ids is not None and position_ids is None:
+            raise ValueError("Step5 packed inputs require document-local position_ids")
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("Step5 requires input_ids or inputs_embeds")
@@ -297,17 +342,19 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
                 if attention_mask is None
                 else ~attention_mask.bool()
             )
-        if attention_mask is not None and attention_mask.ndim != 2:
-            raise ValueError("Step5 attention_mask must have shape [batch, sequence]")
-        hidden = self.model(inputs_embeds, position_ids, padding_mask)
+        hidden = self.model(inputs_embeds, position_ids, padding_mask, _packed_seq_ids)
         out = compute_lm_head_logits(
             self.lm_head, hidden, logits_to_keep, is_thd=False, output_hidden_states=output_hidden_states
         )
         if labels is not None:
             if self.cp_mesh is not None and self.cp_mesh.size() > 1:
                 raise ValueError("Use the native recipe's globally shifted loss with CP")
+            # HF-style labels are unshifted. Never train a document's last
+            # token to predict the next document, or predict from/into padding.
+            valid_targets = ~padding_mask[:, :-1] & ~padding_mask[:, 1:] & (position_ids[:, 1:] != 0)
+            shifted_labels = labels[:, 1:].masked_fill(~valid_targets, -100)
             out.loss = F.cross_entropy(
-                out.logits[:, :-1].float().flatten(0, 1), labels[:, 1:].flatten(), ignore_index=-100
+                out.logits[:, :-1].float().flatten(0, 1), shifted_labels.flatten(), ignore_index=-100
             )
         return out
 
@@ -350,11 +397,8 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
             Tensor of shape [images, image_tokens, hidden].
         """
         pixels = pixels.to(compute_dtype)
-        features = self.vision_model(pixels)
-        grid_h, grid_w = (side // self.vision_model.patch_size for side in pixels.shape[-2:])
-        features = features.transpose(1, 2).reshape(pixels.shape[0], -1, grid_h, grid_w)
-        features = self.vision_model.vit_downsampler2(self.vision_model.vit_downsampler1(features))
-        return self.vit_large_projector(features.flatten(2).transpose(1, 2))
+        features = self.vision_model(pixels, downsample=True)
+        return self.vit_large_projector(features)
 
     def forward(
         self,

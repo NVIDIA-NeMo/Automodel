@@ -369,3 +369,34 @@ def test_checkpoint_parts_preserve_backend_extra_state(weight_name: str) -> None
     torch.testing.assert_close(native[weight_name], expected, rtol=0, atol=0)
     for name in ("model.layers.0.self_attn.qkv_proj._extra_state", "lm_head._extra_state"):
         torch.testing.assert_close(native[name], extra_state, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("first_length,padding", [(1, 0), (3, 0), (3, 2)])
+@pytest.mark.parametrize("check", ["loss", "gradient"])
+def test_packed_shifted_loss_does_not_cross_documents(first_length: int, padding: int, check: str) -> None:
+    """A later document's first label must not train the preceding document."""
+    model = make_model(num_hidden_layers=1, moe_layer_list=[])
+    total = first_length + padding + 4
+    start = first_length + padding
+    inputs = torch.arange(total)[None]
+    positions = torch.cat((torch.arange(first_length), torch.zeros(padding, dtype=torch.long), torch.arange(4)))[None]
+    documents = torch.cat(
+        (torch.ones(first_length, dtype=torch.long), torch.zeros(padding, dtype=torch.long), torch.full((4,), 2))
+    )[None]
+    labels = inputs.clone()
+    labels[:, :start] = -100
+    embeddings = model.get_input_embeddings()(inputs).detach().requires_grad_()
+    actual = model(
+        inputs_embeds=embeddings,
+        labels=labels,
+        position_ids=positions,
+        attention_mask=documents,
+        _packed_seq_ids=documents,
+    )
+    if check == "loss":
+        expected = model(inputs[:, start:], labels=inputs[:, start:]).loss
+        torch.testing.assert_close(actual.loss, expected, rtol=1e-6, atol=1e-6)
+    else:
+        actual.loss.backward()
+        assert torch.count_nonzero(embeddings.grad[:, :start]) == 0
+        assert embeddings.grad[:, start:].abs().sum() > 0

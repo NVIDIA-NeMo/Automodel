@@ -83,6 +83,26 @@ class Step5VisionEncoder(StepRoboticsVisionEncoder):
             for block in self.transformer.resblocks:
                 block.attn.rope = rotary
 
+    def forward(self, pixels: torch.Tensor, *, downsample: bool = False) -> torch.Tensor:
+        """Encode images, optionally completing projection inputs inside the FSDP owner.
+
+        Args:
+            pixels: Images of shape [images, channels, height, width].
+            downsample: Apply both checkpoint-owned stride-2 convolutions before
+                FSDP reshards the vision module's parameters.
+
+        Returns:
+            Patch features [images, patches, width], or downsampled features
+            [images, image_tokens, 4 * width] for the language projector.
+        """
+        features = super().forward(pixels)
+        if downsample:
+            grid_h, grid_w = (side // self.patch_size for side in pixels.shape[-2:])
+            features = features.transpose(1, 2).reshape(pixels.shape[0], -1, grid_h, grid_w)
+            features = self.vit_downsampler2(self.vit_downsampler1(features))
+            features = features.flatten(2).transpose(1, 2)
+        return features
+
     @torch.no_grad()
     def reset_parameters(self) -> None:
         """Initialize every vision parameter after allocation from meta."""

@@ -335,6 +335,23 @@ def fa4_attention(
     # the 192-dimensional Q/K scale and avoids padding Q/K to 256. Autograd
     # sums both contributions to dQ/dK. The second call repeats QK work.
     values = value.split(128, dim=-1) if split_values else (value,)
+    aux_tensors = [
+        positions,
+        key_positions,
+        documents[:, query_start : query_start + queries],
+        documents,
+        key_padding,
+        membership,
+        token_regions,
+    ]
+    for index, tensor in enumerate(aux_tensors):
+        if tensor.numel() == 1 and tensor.stride(-1) == 1:
+            # FA4 cannot infer a unique leading dimension for [1, 1] metadata.
+            # A view carries its supported layout annotation without changing
+            # the caller's tensor or allocating/padding any token storage.
+            annotated = tensor.view_as(tensor)
+            annotated.__leading_dim__ = tensor.ndim - 1
+            aux_tensors[index] = annotated
     outputs = []
     for part in values:
         value_width = part.shape[-1]
@@ -347,15 +364,7 @@ def fa4_attention(
             softmax_scale=dim**-0.5,
             pack_gqa=False,
             mask_mod=mask_mod,
-            aux_tensors=[
-                positions,
-                key_positions,
-                documents[:, query_start : query_start + queries],
-                documents,
-                key_padding,
-                membership,
-                token_regions,
-            ],
+            aux_tensors=aux_tensors,
             block_sparse_tensors=forward,
             block_sparse_tensors_bwd=backward,
         )
