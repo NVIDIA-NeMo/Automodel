@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+from importlib import import_module
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1225,8 +1226,11 @@ class TestTryConvertTikTokenToNative:
         mock_fast_tokenizer = _StubHFTokenizer()
         mock_fast_tokenizer.is_fast = True
 
+        # Transformers also exports a function named convert_slow_tokenizer.
+        # Import the module explicitly so the patch cannot resolve to that function.
+        converter_module = import_module("transformers.convert_slow_tokenizer")
         with (
-            patch("transformers.convert_slow_tokenizer.TikTokenConverter") as mock_converter_cls,
+            patch.object(converter_module, "TikTokenConverter") as mock_converter_cls,
             patch(
                 "transformers.tokenization_utils_tokenizers.TokenizersBackend",
                 return_value=mock_fast_tokenizer,

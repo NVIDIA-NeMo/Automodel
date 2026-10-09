@@ -32,9 +32,8 @@ numerical parity with the single-process replicated reference:
 from __future__ import annotations
 
 import importlib.util
-import os
-import socket
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -48,29 +47,13 @@ _HAS_QWEN3_5 = importlib.util.find_spec("transformers.models.qwen3_5") is not No
 # the full package (several seconds per test on the CPU unit-test job); the sharding they
 # exercise is a multi-GPU context-parallel feature, so keep them off the CPU job like the
 # other 2-rank gloo CP tests.
-# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
-# Shrink the work or the process count before raising this further.
-pytestmark = [
-    pytest.mark.timeout(70),
-    pytest.mark.run_only_on("GPU"),
-]
+pytestmark = pytest.mark.run_only_on("GPU")
 
 
-def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def _init_gloo(rank: int, world_size: int, port: int, timeout: timedelta | None = None) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
+def _init_gloo(rank: int, world_size: int, init_method: str, timeout: timedelta | None = None) -> None:
+    # Each test supplies a fresh file URL so rendezvous never races to rebind a released TCP port.
     kwargs = {"timeout": timeout} if timeout is not None else {}
-    dist.init_process_group("gloo", rank=rank, world_size=world_size, **kwargs)
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=world_size, **kwargs)
 
 
 class _GlooVisual(torch.nn.Module):
@@ -173,10 +156,10 @@ def _sharded_forward_backward(
     return out
 
 
-def _parity_worker(rank: int, world_size: int, port: int) -> None:
+def _parity_worker(rank: int, world_size: int, init_method: str) -> None:
     """Main path: mixed image/video entries (frame units >= world), with deepstack."""
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, init_method)
         torch.set_num_threads(1)
         torch.manual_seed(0)  # identical weights on every rank, like the FSDP all-gather
         visual = _GlooVisual(n_deepstack=2)
@@ -205,10 +188,10 @@ def _parity_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _pad_path_worker(rank: int, world_size: int, port: int) -> None:
+def _pad_path_worker(rank: int, world_size: int, init_method: str) -> None:
     """Pad path: one frame unit < world, so the last rank runs only a dummy frame."""
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, init_method)
         torch.set_num_threads(1)
         torch.manual_seed(0)
         visual = _GlooVisual()
@@ -240,10 +223,10 @@ def _pad_path_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _local_patch_floor_worker(rank: int, world_size: int, port: int) -> None:
+def _local_patch_floor_worker(rank: int, world_size: int, init_method: str) -> None:
     """Local patch-row floor: padded ViT work is removed before real collectives."""
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, init_method)
         torch.set_num_threads(1)
         torch.manual_seed(0)
         visual = _GlooVisual(n_deepstack=2)
@@ -298,7 +281,7 @@ class _DivergentVisual(_GlooVisual):
         return out
 
 
-def _divergent_count_worker(rank: int, world_size: int, port: int) -> None:
+def _divergent_count_worker(rank: int, world_size: int, init_method: str) -> None:
     """One rank's visual output diverges from its planned token count; ALL ranks must raise.
 
     A bare per-rank ``raise`` before the all_gather would hang the non-diverging rank; the
@@ -307,7 +290,7 @@ def _divergent_count_worker(rank: int, world_size: int, port: int) -> None:
     than hanging CI.
     """
     try:
-        _init_gloo(rank, world_size, port, timeout=timedelta(seconds=70))
+        _init_gloo(rank, world_size, init_method, timeout=timedelta(seconds=70))
         torch.set_num_threads(1)
         from nemo_automodel.components.distributed import cp_vision_frame_shard as vs
 
@@ -332,23 +315,29 @@ def _divergent_count_worker(rank: int, world_size: int, port: int) -> None:
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_cp_vision_frame_shard_two_rank_gloo_forward_backward_parity():
-    mp.spawn(_parity_worker, args=(2, _free_port()), nprocs=2, join=True)
+@pytest.mark.runtime_budget(
+    30, hard_timeout=70, reason="Spawns two Gloo workers that each import PyTorch and AutoModel before parity checks."
+)
+def test_cp_vision_frame_shard_two_rank_gloo_forward_backward_parity(tmp_path: Path) -> None:
+    mp.spawn(_parity_worker, args=(2, (tmp_path / "rendezvous").as_uri()), nprocs=2, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_cp_vision_frame_shard_two_rank_gloo_divergent_count_all_ranks_raise():
-    mp.spawn(_divergent_count_worker, args=(2, _free_port()), nprocs=2, join=True)
+@pytest.mark.runtime_budget(
+    30, hard_timeout=70, reason="Spawns two Gloo workers that each import PyTorch and AutoModel before error checks."
+)
+def test_cp_vision_frame_shard_two_rank_gloo_divergent_count_all_ranks_raise(tmp_path: Path) -> None:
+    mp.spawn(_divergent_count_worker, args=(2, (tmp_path / "rendezvous").as_uri()), nprocs=2, join=True)
 
 
-def _real_tower_worker(rank: int, world_size: int, port: int) -> None:
+def _real_tower_worker(rank: int, world_size: int, init_method: str) -> None:
     """Run the real Qwen3.5 vision tower through two-rank gloo sharding.
 
     Assert pooled-output parity with the replicated full forward. This is the exact tower
     used by the dense Qwen3.5 VLM CP pre-embed.
     """
     try:
-        _init_gloo(rank, world_size, port, timeout=timedelta(seconds=120))
+        _init_gloo(rank, world_size, init_method, timeout=timedelta(seconds=120))
         torch.set_num_threads(1)
         from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
@@ -391,15 +380,24 @@ def _real_tower_worker(rank: int, world_size: int, port: int) -> None:
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
 @pytest.mark.skipif(not _HAS_QWEN3_5, reason="transformers Qwen3.5 vision tower is not available")
-def test_cp_vision_frame_shard_two_rank_gloo_real_qwen3_5_tower_forward_parity():
-    mp.spawn(_real_tower_worker, args=(2, _free_port()), nprocs=2, join=True)
+@pytest.mark.runtime_budget(
+    30, hard_timeout=70, reason="Spawns two Gloo workers that import PyTorch, AutoModel and the Qwen3.5 vision tower."
+)
+def test_cp_vision_frame_shard_two_rank_gloo_real_qwen3_5_tower_forward_parity(tmp_path: Path) -> None:
+    mp.spawn(_real_tower_worker, args=(2, (tmp_path / "rendezvous").as_uri()), nprocs=2, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_cp_vision_frame_shard_two_rank_gloo_pad_path_parity():
-    mp.spawn(_pad_path_worker, args=(2, _free_port()), nprocs=2, join=True)
+@pytest.mark.runtime_budget(
+    30, hard_timeout=70, reason="Spawns two Gloo workers that each import PyTorch and AutoModel before parity checks."
+)
+def test_cp_vision_frame_shard_two_rank_gloo_pad_path_parity(tmp_path: Path) -> None:
+    mp.spawn(_pad_path_worker, args=(2, (tmp_path / "rendezvous").as_uri()), nprocs=2, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_cp_vision_frame_shard_two_rank_gloo_local_patch_floor_parity():
-    mp.spawn(_local_patch_floor_worker, args=(2, _free_port()), nprocs=2, join=True)
+@pytest.mark.runtime_budget(
+    30, hard_timeout=70, reason="Spawns two Gloo workers that each import PyTorch and AutoModel before parity checks."
+)
+def test_cp_vision_frame_shard_two_rank_gloo_local_patch_floor_parity(tmp_path: Path) -> None:
+    mp.spawn(_local_patch_floor_worker, args=(2, (tmp_path / "rendezvous").as_uri()), nprocs=2, join=True)

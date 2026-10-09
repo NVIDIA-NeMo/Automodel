@@ -40,7 +40,12 @@ def test_laguna_config_rejects_short_layer_lists():
 def test_laguna_config_derives_swa_rope_from_nested_rope_parameters():
     cfg = LagunaConfig(
         rope_parameters={
-            "full_attention": {"rope_type": "yarn", "rope_theta": 500000.0, "partial_rotary_factor": 0.5},
+            "full_attention": {
+                "rope_type": "yarn",
+                "rope_theta": 500000.0,
+                "factor": 2.0,
+                "partial_rotary_factor": 0.5,
+            },
             "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0},
         },
     )

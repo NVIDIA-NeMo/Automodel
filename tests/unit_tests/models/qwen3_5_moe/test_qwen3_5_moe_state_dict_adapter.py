@@ -1124,6 +1124,7 @@ class TestConditionalGenerationStateDictAdapterWiring:
     def test_passes_top_level_model_name_to_state_dict_adapter(self):
         class DummyRotary:
             inv_freq = torch.ones(4)
+            config = SimpleNamespace()
 
         class DummyVisual:
             def __init__(self):
@@ -1142,8 +1143,9 @@ class TestConditionalGenerationStateDictAdapterWiring:
             enabled = False
 
         class DummyFp32SafeRotary:
-            def __init__(self, dim):
-                self.dim = dim
+            def __init__(self, config):
+                assert config is DummyRotary.config
+                self.config = config
 
             def register_buffer(self, *args, **kwargs):
                 pass

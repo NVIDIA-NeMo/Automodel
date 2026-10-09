@@ -434,8 +434,11 @@ class DeepseekV41Config(PretrainedConfig):
             **kwargs,
         )
 
-    def build_tokenizer(self) -> PreTrainedTokenizerFast:
+    def build_tokenizer(self, *, revision: str | None = None) -> PreTrainedTokenizerFast:
         """Load the checkpoint's fast tokenizer for deterministic Engram hashing.
+
+        Args:
+            revision: Resolved Hub revision shared with the config and weight loads.
 
         Returns:
             The original fast tokenizer from this configuration's checkpoint
@@ -450,7 +453,7 @@ class DeepseekV41Config(PretrainedConfig):
             raise ValueError("Engram tokenizer construction requires a checkpoint source or an explicit tokenizer")
         tokenizer = AutoTokenizer.from_pretrained(
             self._name_or_path,
-            revision=self._commit_hash,
+            revision=revision,
             trust_remote_code=False,
             use_fast=True,
         )
@@ -587,6 +590,7 @@ class DeepseekV41DSparkTargetConfig:
         """
         # The transformers bridge also imports model configs during registration.
         from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+        from nemo_automodel._transformers.auto_config import NeMoAutoConfig
         from nemo_automodel.components.models.common import BackendConfig
 
         if device.type != "cuda":
@@ -599,13 +603,16 @@ class DeepseekV41DSparkTargetConfig:
                 "DeepSeek V4.1 DSpark does not support target_num_hidden_layers: "
                 "the released target feature contract requires layers 37, 38, and 39"
             )
+        revision = NeMoAutoConfig.resolve_revision(self.target_path)
         target_config = DeepseekV41Config.from_pretrained(
             self.target_path,
+            revision=revision,
             name_or_path=self.target_path,
             vision_config={"num_hidden_layers": 0},
         )
         return NeMoAutoModelForCausalLM.from_config(
             config=target_config,
+            revision=revision,
             backend=BackendConfig(
                 attn=self.attn_backend,
                 linear="torch",
