@@ -112,6 +112,15 @@ This uses the shared fused FP64 gradient-norm reduction from main and avoids
 gradient-sized norm temporaries for contiguous CUDA owner shards. Set
 `clip_grad_norm.backend: te` to select the shared Transformer Engine reducer.
 
+Set `model.backend.attn: cudnn` to run the sparse attention core through the
+cuDNN Frontend DSA kernels (forward and backward, the attention sink included)
+instead of the TileLang kernels; the indexer, the compressor and the mHC
+Sinkhorn stay on their TileLang/TileKernels paths. It needs
+`nvidia-cudnn-frontend[cutedsl]` 1.29 or later (FlashMLA's
+`flash_mla_sparse_fwd` is used for the forward when it is installed) on an SM100
+GPU. The kernels round differently from the TileLang path, so losses agree to
+the usual BF16 level rather than bitwise; the default `tilelang` is unchanged.
+
 ## H100 80 GB Systems
 
 The GB200 recipes place 748B trainable parameters on 64 GPUs, about 117 GB per

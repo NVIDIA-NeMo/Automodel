@@ -135,7 +135,7 @@ class DeepseekV41Block(nn.Module):
         )
         self.attn_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.ffn_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
-        sinkhorn_backend = "tilelang" if backend.attn == "tilelang" else "torch"
+        sinkhorn_backend = "tilelang" if backend.attn in ("tilelang", "cudnn") else "torch"
         self.attn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
         self.ffn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
         self.engram = (
