@@ -12,36 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Nemotron 3.5 Super VL text-only SFT with 262144-token THD packs.
-# The configuration below targets 32 H100 GPUs (4 nodes x 8 GPUs).
-# world = TP1 * CP32 * PP1 * DP1 = 32; EP32 = DP*CP.
-# CP32 gives 8192 token slots per rank, including padding. Packed documents
+# Nemotron 3.5 Super VL text-only SFT with 262144-token THD packs on GB200.
+# Target: 16 GB200 GPUs (4 nodes x 4 GPUs).
+# world = TP1 * CP8 * PP1 * DP2 = 16; EP16 = DP*CP.
+# CP8 gives 32768 token slots per rank, including padding. Packed documents
 # retain separate attention/Mamba boundaries.
-# GBS=8 and local batch=1 give 8 microbatches per optimizer step.
+# GBS=8 and local batch=1 give 4 microbatches per rank per optimizer step.
+# Uses compiled fused linear cross entropy and FP32 Adam moments.
+# Activation checkpointing, both reshard_after_forward settings, and immediate
+# gradient synchronization bound memory use. master_weights and
+# store_param_remainders retain FP32 master-weight precision with BF16 parameters.
 #
-# GB200 recommendation: 16 GPUs (4 nodes x 4 GPUs), EP16 / CP8 / DP2.
-# Update these fields in the corresponding sections below:
-#   distributed:
-#     cp_size: 8
-#     ep_size: 16
-#   loss_fn:
-#     _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
-#     impl: torch_compile
-#   optimizer:
-#     exp_avg_dtype: torch.float32
-#     exp_avg_sq_dtype: torch.float32
-# This gives 32768 local token slots and 4 microbatches per rank at GBS=8.
-# Keep activation checkpointing, both reshard_after_forward settings, and
-# defer_fsdp_grad_sync: false. Retain master_weights and store_param_remainders
-# for FP32 master-weight precision with BF16 parameters.
-#
-# For this GB200 allocation, place all four nodes in one healthy NVLink domain.
+# Place all four nodes in one healthy NVLink domain.
 # Node count alone does not guarantee placement. On Slurm sites whose topology
 # blocks map to NVLink domains, use --segment=4 and verify the GPUs share the
 # same fabric CliqueId/ClusterUUID. Cross-domain HybridEP requires working RDMA;
 # dispatcher: torch is an alternative when that setup is unavailable.
 #
-# For either configuration, set PYTORCH_ALLOC_CONF=expandable_segments:True.
+# Set PYTORCH_ALLOC_CONF=expandable_segments:True in the launch environment.
 # Enable online W&B with --wandb.enable=true and provide authentication.
 
 recipe: FinetuneRecipeForVLM
@@ -91,11 +79,11 @@ checkpoint:
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: 32
+  cp_size: 8
   # Reduce and shard gradients after every microbatch to bound accumulation memory.
   defer_fsdp_grad_sync: false
   pp_size: 1
-  ep_size: 32
+  ep_size: 16
   sequence_parallel: false
   activation_checkpointing: true
   reshard_after_forward: true
@@ -108,7 +96,8 @@ freeze_config:
   freeze_language_model: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
 
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
@@ -121,8 +110,8 @@ dataset:
   # into every sample (~245 <image> tokens + a vision-tower forward per sample).
   inject_fake_images: false
 
-# THD packing: 262144 slots per row, with document lengths aligned to 2*CP=64.
-# The collator pads each row to 262144 slots; CP32 leaves 8192 slots per rank.
+# THD packing: 262144 slots per row, with document lengths aligned to 2*CP=16.
+# The collator pads each row to 262144 slots; CP8 leaves 32768 slots per rank.
 # packing_format: thd (not the "neat" default) is required for this hybrid Mamba+MoE
 # backbone: "neat" packing builds a dense block-causal mask / per-token seq_idx
 # convention meant for plain transformer attention, which nemotron_v3's Mamba mixer
@@ -153,8 +142,8 @@ optimizer:
   weight_decay: 0.01
   master_weights: true
   store_param_remainders: true
-  exp_avg_dtype: torch.bfloat16
-  exp_avg_sq_dtype: torch.bfloat16
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
 
 lr_scheduler:
   lr_decay_style: constant
@@ -164,10 +153,11 @@ wandb:
   mode: online
   entity: Nemo-automodel
   project: huiyingl_workspace
-  name: nemotron_3_5_super_vl_tulu3_packed_256k_cp32_100steps
+  name: nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200
 
 ci:
   recipe_owner: HuiyingLi
+  cluster_tag: gb200
   nodes: 4
   time: "01:00:00"
   max_steps: 2
