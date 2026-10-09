@@ -86,12 +86,16 @@ _ROUND_TRIP = textwrap.dedent(
     from nemo_automodel.components.loggers.loggers import TrackioConfig
     from trackio.sqlite_storage import SQLiteStorage
 
-    logger = TrackioConfig(project="nemo-test", name="unit").build(run_config={"lr": 1e-3})
+    run_config = {"lr": 1e-3, "model": {"_target_": "m.f"}, "_validation_dataset": {"split": "val"}}
+    logger = TrackioConfig(project="nemo-test", name="unit").build(run_config=run_config)
     logger.log_metrics({"step": 0, "timestamp": "t", "loss": 2.0, "lr": 1e-3}, step=0)
     logger.log_metrics({"loss": 1.0}, step=1)
     logger.finish()
     logs = SQLiteStorage.get_logs("nemo-test", "unit")
-    print("RESULT " + json.dumps({"runs": SQLiteStorage.get_runs("nemo-test"), "loss": [log["loss"] for log in logs]}))
+    config = {k: v for k, v in SQLiteStorage.get_run_config("nemo-test", "unit").items() if not k.startswith("_")}
+    print("RESULT " + json.dumps(
+        {"runs": SQLiteStorage.get_runs("nemo-test"), "loss": [log["loss"] for log in logs], "config": config}
+    ))
     """
 )
 
@@ -143,12 +147,16 @@ def _run_isolated(script: str, tmp_path, *args: str) -> dict:
 
 @pytest.mark.timeout(150)
 def test_real_trackio_round_trip(tmp_path):
-    """A local Trackio run receives the metrics, without the reserved keys tripping a rename."""
+    """A local Trackio run receives the metrics and config, without reserved metric or config keys tripping it."""
     pytest.importorskip("trackio")
 
     result = _run_isolated(_ROUND_TRIP, tmp_path)
 
-    assert result == {"runs": ["unit"], "loss": [2.0, 1.0]}
+    assert result == {
+        "runs": ["unit"],
+        "loss": [2.0, 1.0],
+        "config": {"lr": 1e-3, "model": {"_target_": "m.f"}},
+    }
 
 
 @pytest.mark.timeout(150)

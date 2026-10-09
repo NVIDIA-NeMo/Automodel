@@ -187,7 +187,13 @@ class TrackioConfig:
         kwargs = {**self.extra, **named}
         if kwargs.get("name", "") == "":
             kwargs["name"] = "_".join(model_name.split("/")[-2:]) if model_name else None
-        run = trackio.init(**kwargs, config=dict(run_config) if run_config is not None else None)
+        config = None
+        if run_config is not None:
+            # ``trackio.init`` raises on top-level config keys starting with "_" (reserved for its own
+            # ``_Username``/``_Created``/``_Group``); YAML anchor-only sections such as ``_validation_dataset`` are
+            # not part of the run, so they are left out.
+            config = {k: v for k, v in run_config.items() if not str(k).startswith("_")}
+        run = trackio.init(**kwargs, config=config)
         return TrackioLogger(run)
 
 

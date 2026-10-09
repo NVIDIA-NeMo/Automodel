@@ -115,6 +115,15 @@ class TestTrackioConfig:
         assert isinstance(logger, TrackioLogger) and logger.run == "run"
         assert captured == {"project": "p", "name": "run-1", "group": "g", "resume": "allow", "config": {"lr": 1e-3}}
 
+    def test_build_leaves_out_top_level_underscore_sections(self, monkeypatch):
+        """``trackio.init`` rejects top-level config keys starting with "_"; nested ``_target_`` keys are kept."""
+        captured = {}
+        _fake_trackio(monkeypatch, captured)
+
+        TrackioConfig().build(run_config={"model": {"_target_": "m.f"}, "_validation_dataset": {"split": "val"}})
+
+        assert captured["config"] == {"model": {"_target_": "m.f"}}
+
     def test_build_derives_the_run_name_from_the_model(self, monkeypatch):
         captured = {}
         _fake_trackio(monkeypatch, captured)
