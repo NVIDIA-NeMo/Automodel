@@ -14,8 +14,6 @@
 
 """Packed text boundaries must not override HF image/video frame boundaries."""
 
-import copy
-
 import pytest
 import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
@@ -24,34 +22,42 @@ from transformers.vision_utils import get_vision_attention_seqlens
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.packing import configure_packing_for_models
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
 
 
-def _model() -> Qwen3_5ForConditionalGeneration:
+def _model(
+    *, attn: str = "sdpa", device: str = "cpu", dtype: torch.dtype = torch.float32, hybrid: bool = False
+) -> Qwen3_5ForConditionalGeneration:
     torch.manual_seed(42)
+    hidden_size = 16 if device == "cpu" else 128
     text = Qwen3_5TextConfig(
         vocab_size=64,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
+        hidden_size=hidden_size,
+        intermediate_size=hidden_size * 2,
+        num_hidden_layers=2 if hybrid else 1,
         num_attention_heads=2,
         num_key_value_heads=2,
-        head_dim=8,
-        layer_types=["full_attention"],
+        head_dim=hidden_size // 2,
+        layer_types=["linear_attention", "full_attention"] if hybrid else ["full_attention"],
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
         pad_token_id=0,
         torch_dtype="float32",
         attn_implementation="sdpa",
     )
     vision = Qwen3_5VisionConfig(
         depth=1,
-        hidden_size=16,
-        intermediate_size=32,
+        hidden_size=hidden_size,
+        intermediate_size=hidden_size * 2,
         num_heads=2,
         patch_size=2,
         spatial_merge_size=1,
         temporal_patch_size=1,
-        out_hidden_size=16,
-        attn_implementation="sdpa",
+        out_hidden_size=hidden_size,
+        attn_implementation="sdpa" if device == "cpu" else "flash_attention_2",
     )
     config = Qwen3_5Config(
         text_config=text.to_dict(),
@@ -62,18 +68,38 @@ def _model() -> Qwen3_5ForConditionalGeneration:
         vision_end_token_id=63,
         tie_word_embeddings=False,
     )
-    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
-    return Qwen3_5ForConditionalGeneration(config, backend=backend).float().eval()
+    backend = BackendConfig(attn=attn, linear="torch", rms_norm="torch", rope_fusion=False)
+    model = Qwen3_5ForConditionalGeneration(config, backend=backend).to(device=device).eval()
+    model.model.language_model.init_weights(buffer_device=torch.device(device))
+    cast_model_to_dtype(model, dtype)
+    return model
 
 
-@pytest.mark.parametrize("media", ["image", "video", "both", "text"])
-@pytest.mark.parametrize("precomputed", [False, True])
-def test_packed_media_matches_independent_documents(media: str, precomputed: bool) -> None:
-    model = _model()
-    reference = copy.deepcopy(model)
+def check_packed_media_parity(
+    media: str,
+    precomputed: bool,
+    *,
+    attn: str = "sdpa",
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float32,
+    pack_sizes: tuple[int, ...] = (2,),
+    hybrid: bool = False,
+) -> None:
+    """Compare packed logits and all parameter gradients to independent documents."""
+    model = _model(attn=attn, device=device, dtype=dtype, hybrid=hybrid)
+    reference = _model(device=device, dtype=dtype, hybrid=hybrid)
+    # TE's attention bookkeeping has no counterpart in the SDPA reference.
+    reference.load_state_dict(
+        {key: value for key, value in model.state_dict().items() if not key.endswith("._extra_state")}
+    )
+    if attn == "te":
+        from transformer_engine.pytorch.attention import DotProductAttention
+
+        full_attention = model.model.language_model.layers[str(int(hybrid))].self_attn
+        assert isinstance(full_attention.attn_module, DotProductAttention)
     contract = configure_packing_for_models([model])
     documents = []
-    for document_index in range(2):
+    for document_index in range(sum(pack_sizes)):
         tokens = [3 + document_index]
         document = {}
         for kind, token, frames, pixels_key in (
@@ -94,12 +120,24 @@ def test_packed_media_matches_independent_documents(media: str, precomputed: boo
         )
         documents.append(document)
 
-    packed = {}
-    for key in documents[0]:
-        packed[key] = torch.cat([document[key] for document in documents], dim=-1 if key == "position_ids" else 0)
-    length = packed["input_ids"].numel()
-    # Exercise real collator metadata: 2D text offsets, uneven documents, and padding.
-    batch = neat_packed_vlm_collater([packed], packing=contract, max_length=length + 2)
+    packs = []
+    offset = 0
+    for count in pack_sizes:
+        group = documents[offset : offset + count]
+        for index, document in enumerate(group):
+            document["attention_mask"].fill_(index + 1)
+        packs.append(
+            {
+                key: torch.cat([document[key] for document in group], dim=-1 if key == "position_ids" else 0)
+                for key in group[0]
+            }
+        )
+        offset += count
+    length = max(pack["input_ids"].numel() for pack in packs)
+    # Uneven documents/rows exercise both token padding and -1 boundary padding.
+    batch = neat_packed_vlm_collater(packs, packing=contract, max_length=length + 2)
+    batch = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
+    documents = [{key: value.to(device) for key, value in document.items()} for document in documents]
     original_boundaries = batch["cu_seqlens"].clone()
     assert original_boundaries.ndim == 2
     if precomputed:
@@ -109,7 +147,7 @@ def test_packed_media_matches_independent_documents(media: str, precomputed: boo
                 batch[f"{kind}_cu_seqlens"] = cu_seqlens
                 batch[f"{kind}_max_seqlen"] = 4
 
-    actual = model(**batch).logits[:, :length]
+    actual = model(**batch).logits[batch["_packed_seq_ids"] > 0]
     expected = torch.cat(
         [
             reference(
@@ -120,12 +158,13 @@ def test_packed_media_matches_independent_documents(media: str, precomputed: boo
                     for key, value in document.items()
                     if key not in ("labels", "attention_mask")
                 }
-            ).logits
+            ).logits.squeeze(0)
             for document in documents
         ],
-        dim=1,
+        dim=0,
     )
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (0.03, 3e-4)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     torch.testing.assert_close(batch["cu_seqlens"], original_boundaries)
 
     upstream = torch.randn_like(actual) / actual.numel()
@@ -138,5 +177,15 @@ def test_packed_media_matches_independent_documents(media: str, precomputed: boo
         else:
             assert param.grad is not None, name
             torch.testing.assert_close(
-                param.grad, reference_grad, rtol=1e-4, atol=2e-6, msg=lambda message: f"{name}: {message}"
+                param.grad,
+                reference_grad,
+                rtol=1e-4 if dtype == torch.float32 else rtol,
+                atol=2e-6 if dtype == torch.float32 else atol,
+                msg=lambda message: f"{name}: {message}",
             )
+
+
+@pytest.mark.parametrize("media", ["image", "video", "both", "text"])
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_packed_media_matches_independent_documents(media: str, precomputed: bool) -> None:
+    check_packed_media_parity(media, precomputed)

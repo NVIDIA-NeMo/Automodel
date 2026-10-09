@@ -19,7 +19,7 @@ from __future__ import annotations
 import copy
 import inspect
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -57,7 +57,7 @@ from nemo_automodel.components.models.common.mtp import (
     prepare_mtp_context_parallel_inputs,
     roll_tensor,
 )
-from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
+from nemo_automodel.components.models.common.packing import flatten_packed_sequence_metadata, is_indexed_packed_mask
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -393,8 +393,8 @@ class Qwen3_5DenseBlock(Block):
 
         Args:
             x: Hidden states of shape [batch, sequence, hidden].
-            freqs_cis: Rotary frequencies of shape [axes, batch, sequence,
-                head_dim].
+            freqs_cis: Rotary cosine/sine values of shape [batch, sequence,
+                rotary_dim].
             attention_mask: Optional validity, indexed document, or backend mask
                 of shape [batch, sequence] or [batch, 1, sequence, sequence].
             padding_mask: Optional padding mask of shape [batch, sequence].
@@ -416,7 +416,17 @@ class Qwen3_5DenseBlock(Block):
         if self.layer_type != "linear_attention":
             attn_kwargs = dict(attn_kwargs)
             attn_kwargs.pop("seq_index", None)
-            return super().forward(
+            padded_x = None
+            indices = attn_kwargs.get("packed_token_indices")
+            if self.self_attn.backend.attn == "te" and indices is not None:
+                # NEAT batches stay BSHD between blocks, but TE consumes the
+                # unpadded THD stream with one causal segment per document.
+                padded_x = x
+                x = x.flatten(0, 1)[indices]
+                freqs_cis = freqs_cis.flatten(0, 1)[indices]
+                attention_mask = None
+                padding_mask = None
+            output = super().forward(
                 x,
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
@@ -424,6 +434,9 @@ class Qwen3_5DenseBlock(Block):
                 position_ids=position_ids,
                 **attn_kwargs,
             )
+            if padded_x is not None:
+                output = padded_x.flatten(0, 1).index_copy(0, indices, output).view_as(padded_x)
+            return output
 
         linear_attn_mask = attention_mask
         from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
@@ -585,6 +598,19 @@ class Qwen3_5DenseTextBackbone(nn.Module):
                 padding_mask = attention_mask[:, 0].diagonal(dim1=-2, dim2=-1).bool().logical_not()
 
         hidden_states = inputs_embeds
+        if self.backend.attn == "te" and attn_kwargs.get("packed_token_indices") is not None:
+            # Flatten after microbatch splitting and vision splicing, once for
+            # all decoder blocks. TE requires int32 cumulative lengths.
+            if not isinstance(attn_kwargs.get("cu_seqlens"), torch.Tensor):
+                raise ValueError("Packed Qwen3.5 TE attention requires cu_seqlens alongside packed_token_indices.")
+            indices, cu_seqlens = flatten_packed_sequence_metadata(
+                attn_kwargs["packed_token_indices"],
+                attn_kwargs["cu_seqlens"],
+                batch_size=hidden_states.shape[0],
+                sequence_length=hidden_states.shape[1],
+            )
+            attn_kwargs["packed_token_indices"] = indices
+            attn_kwargs["cu_seqlens"] = cu_seqlens.to(torch.int32)
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
@@ -1021,6 +1047,11 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         supports_thd: bool = False
         supports_cp_vision_frame_sharding: bool = True
         supports_mtp_cp: bool = True
+
+    @property
+    def packed_mask_type(self) -> Literal["document_ids", "block_causal"]:
+        """Request compact NEAT document IDs when TE consumes packed offsets."""
+        return "document_ids" if self.backend.attn == "te" else "block_causal"
 
     @classmethod
     def from_config(
