@@ -14,6 +14,7 @@
 
 """Tests for nemo_automodel.components.loggers.loggers — WandbConfig, TrackioConfig, MLflowConfig, CometConfig."""
 
+import importlib.util
 import sys
 import types
 
@@ -87,6 +88,8 @@ class TestWandbConfig:
 
 def _fake_trackio(monkeypatch, captured):
     fake_trackio = types.ModuleType("trackio")
+    # importlib.util.find_spec("trackio") raises if __spec__ is None
+    fake_trackio.__spec__ = importlib.util.spec_from_loader("trackio", loader=None)
     fake_trackio.init = lambda **kw: captured.update(kw) or "run"
     monkeypatch.setitem(sys.modules, "trackio", fake_trackio)
 
@@ -114,6 +117,28 @@ class TestTrackioConfig:
 
         assert isinstance(logger, TrackioLogger) and logger.run == "run"
         assert captured == {"project": "p", "name": "run-1", "group": "g", "resume": "allow", "config": {"lr": 1e-3}}
+
+    def test_build_records_the_yaml_run_config_from_the_recipe_boundary(self, monkeypatch):
+        """Recipes pass ``to_yaml_dict(use_orig_values=True)``: targets and env placeholders stay as written.
+
+        ``to_dict()`` would record the inherited ``_BaseNeMoAutoModelClass.from_pretrained`` and the resolved path.
+        """
+        captured = {}
+        _fake_trackio(monkeypatch, captured)
+        monkeypatch.setenv("TEST_TRACKIO_CKPT_DIR", "/resolved/ckpts")
+
+        recipe_cfg = ConfigNode(
+            {
+                "model": {"_target_": "nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained"},
+                "checkpoint": {"checkpoint_dir": "${TEST_TRACKIO_CKPT_DIR}"},
+            }
+        )
+        TrackioConfig().build(run_config=recipe_cfg.to_yaml_dict(use_orig_values=True))
+
+        assert captured["config"] == {
+            "model": {"_target_": "nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained"},
+            "checkpoint": {"checkpoint_dir": "${TEST_TRACKIO_CKPT_DIR}"},
+        }
 
     def test_build_leaves_out_top_level_underscore_sections(self, monkeypatch):
         """``trackio.init`` rejects top-level config keys starting with "_"; nested ``_target_`` keys are kept."""
