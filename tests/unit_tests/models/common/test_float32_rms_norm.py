@@ -194,8 +194,13 @@ def test_float32_rms_norm_compiled_determinism(dtype, hidden, monkeypatch):
         upstream = torch.randn_like(actual)
         actual.backward(upstream)
         expected.backward(upstream)
-        rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (0.016, 1e-5)
+        # Summing signed weight-gradient contributions can cancel near zero;
+        # allow fp32 reduction rounding and also check the float64 oracle.
+        rtol, atol = (1e-5, 2e-6) if dtype == torch.float32 else (0.016, 1e-5)
         torch.testing.assert_close(x.grad, ref_x.grad, rtol=rtol, atol=atol)
         torch.testing.assert_close(module.weight.grad, ref_weight.grad, rtol=rtol, atol=atol)
+        oracle_x_grad, oracle_weight_grad = torch.autograd.grad(reference_f64, (ref_x, ref_weight), upstream)
+        torch.testing.assert_close(x.grad, oracle_x_grad, rtol=rtol, atol=atol)
+        torch.testing.assert_close(module.weight.grad, oracle_weight_grad, rtol=rtol, atol=atol)
         module.zero_grad()
     assert counter.frame_count > 0

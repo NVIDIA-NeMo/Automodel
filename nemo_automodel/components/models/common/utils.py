@@ -692,7 +692,16 @@ class BackendConfig:
 
 @torch.compile(dynamic=True)
 def _float32_rms_norm_cuda(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Fuse fp32 RMSNorm inside the opaque forward's fixed no-grad context."""
+    """Fuse fp32 RMSNorm inside the opaque forward's fixed no-grad context.
+
+    Args:
+        x: CUDA tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden] on the same device as x.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of shape [..., hidden] in x's dtype, without aliasing either input.
+    """
     return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
 
 
@@ -709,11 +718,11 @@ def _float32_rms_norm_impl(x: torch.Tensor, weight: torch.Tensor, eps: float) ->
     Returns:
         Tensor of shape [..., hidden] in x's dtype, without aliasing either input.
     """
-    # Custom-op kernels execute below autograd, including during checkpoint
-    # recomputation. Compiling here therefore retains the identical forward
-    # in grad/no_grad contexts while fusing the fp32 casts and normalization.
+    # The registered backward owns differentiation. Give the compiled helper
+    # identical grad mode and requires_grad metadata in every calling context.
     if x.is_cuda:
-        return _float32_rms_norm_cuda(x, weight, eps)
+        with torch.no_grad():
+            return _float32_rms_norm_cuda(x.detach(), weight.detach(), eps)
     return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
 
 
