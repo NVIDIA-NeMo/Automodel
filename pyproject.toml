@@ -260,8 +260,10 @@ linting = [
 test = [
     "coverage",
     "pytest",
+    "pytest-cov>=7.0",
     "pytest-shard",
     "pytest-timeout",
+    "pytest-xdist>=3.8",
     "peft>=0.20.0",
     "ruamel.yaml",
     "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
