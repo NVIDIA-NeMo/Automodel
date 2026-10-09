@@ -38,6 +38,7 @@ from nemo_automodel.components.models.glm5_next.layers import (
 from nemo_automodel.components.models.glm5_next.vision import Glm5NextVisionModel, Glm5NextVisionOutput
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -174,7 +175,7 @@ class Glm5NextTextModel(nn.Module):
         with buffer_device:
             nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
             if self.padding_idx is not None:
-                self.embed_tokens.weight[self.padding_idx].zero_()
+                zero_embedding_row_(self.embed_tokens.weight, self.padding_idx)
             self.norm.reset_parameters()
         for layer in self.layers.values():
             layer.init_weights(buffer_device, init_std)
@@ -209,7 +210,6 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
     """Trainable GLM-5.3 VLM with EP and contiguous packed CP support."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
-    _skip_init_weights_on_load = True
     _owns_cp_attention = True
     _owns_packed_attention = True
     _packed_cp_attn_backends = ("sdpa", "cudnn")
