@@ -39,6 +39,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.packing import PackedMaskType
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -341,6 +342,9 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = copy(backend) if backend is not None else BackendConfig()
         self.model = MiniMaxM3TextModel(config, backend=self.backend, moe_config=moe_config)
+        if self.model.uses_msa:
+            # MSA converts this mask to document boundaries before invoking TE.
+            self.packed_mask_type: PackedMaskType = "block_causal"
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MiniMaxM3StateDictAdapter(
@@ -507,6 +511,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         text_config = config.text_config
         self.backend = copy(backend) if backend is not None else BackendConfig()
         self.model = MiniMaxM3TextModel(text_config, backend=self.backend, moe_config=moe_config)
+        if self.model.uses_msa:
+            # MSA converts this mask to document boundaries before invoking TE.
+            self.packed_mask_type: PackedMaskType = "block_causal"
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
         )

@@ -868,6 +868,8 @@ class Gemma4MoEModel(HFGemma4Model):
 class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
+    # Both dense and MoE variants use HF attention; backend.attn does not select it.
+    _uses_hf_attention: bool = True
     # Gemma4 owns CP batch sharding and its decoder-layer p2p attention ring.
     _owns_cp_attention = True
     # Whole-block activation checkpointing replays each decoder layer during backward.
