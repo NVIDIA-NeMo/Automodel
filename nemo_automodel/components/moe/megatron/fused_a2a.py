@@ -24,7 +24,7 @@ import shutil
 import tempfile
 import time
 
-from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
+from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
 
 try:
     from deep_ep import Buffer

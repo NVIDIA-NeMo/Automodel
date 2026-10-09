@@ -498,7 +498,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     # apply_ac wraps each block's context in the DeepEP dispatch-replay channel,
     # which imports fused_a2a lazily. Stub it so this module does not depend on
     # some earlier test having imported it under the real torch.
-    from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
+    from nemo_automodel.shared.recompute_replay import RecomputeReplay
 
     fused_a2a_stub = types.ModuleType("nemo_automodel.components.moe.megatron.fused_a2a")
     fused_a2a_stub.deepep_dispatch_replay = RecomputeReplay("DeepEP dispatch (stub)")

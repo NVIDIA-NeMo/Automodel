@@ -17,7 +17,7 @@ from contextlib import contextmanager
 
 import pytest
 
-from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
+from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
 
 
 def test_recorder_replays_in_order_then_reports_misses() -> None:
