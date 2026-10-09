@@ -28,6 +28,9 @@ no MTP).  Mirrors the canonical sglang reference
 * per-layer dense-vs-MoE selection from ``moe_layer_freq``.
 """
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -42,7 +45,35 @@ from nemo_automodel.components.attention.utils import (
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.models.minimax_m3_vl.msa import MSAMicrobatch, require_msa_support, sparse_attention
+from nemo_automodel.components.models.minimax_m3_vl.recompute import sparse_route_replay
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
+
+
+def _rms_norm_core(x: torch.Tensor, weight: torch.Tensor, eps: float, gemma: bool) -> torch.Tensor:
+    """Evaluate M3's FP32 normalization and scale before the final activation cast.
+
+    Args:
+        x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden], zero-centered when gemma is true.
+        eps: Variance epsilon.
+        gemma: Whether to add one to the FP32 scale.
+
+    Returns:
+        Tensor of shape [..., hidden], with x's dtype and independently owned storage.
+    """
+    dtype = x.dtype
+    x = x.float()
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    weight = weight.float()
+    if gemma:
+        weight = weight + 1.0
+    return (x * weight).to(dtype)
+
+
+@lru_cache(maxsize=1)
+def _compiled_rms_norm() -> Callable[[torch.Tensor, torch.Tensor, float, bool], torch.Tensor]:
+    """Share one lazily compiled stateless core while keeping eager instances eager."""
+    return torch.compile(_rms_norm_core, fullgraph=True, dynamic=True, options={"use_fast_math": False})
 
 
 class MiniMaxM3RMSNorm(nn.Module):
@@ -55,20 +86,23 @@ class MiniMaxM3RMSNorm(nn.Module):
     ``[..., num_heads, head_dim]`` tensor is normalized independently per head).
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, gemma: bool = True):
+    def __init__(self, dim: int, eps: float = 1e-6, gemma: bool = True, *, compile_norm: bool = False) -> None:
         super().__init__()
         self.eps = eps
         self.gemma = gemma
+        self._norm = _compiled_rms_norm() if compile_norm else _rms_norm_core
         self.weight = nn.Parameter(torch.zeros(dim) if gemma else torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        weight = self.weight.float()
-        if self.gemma:
-            weight = weight + 1.0
-        return (x * weight).to(dtype)
+        """Normalize the last dimension with FP32 variance and weight arithmetic.
+
+        Args:
+            x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+        Returns:
+            Tensor of shape [..., hidden], preserving the activation dtype.
+        """
+        return self._norm(x, self.weight, self.eps, self.gemma)
 
     def reset_parameters(self) -> None:
         if self.gemma:
@@ -345,8 +379,12 @@ class MiniMaxM3Indexer(nn.Module):
         self.index_k_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.index_head_dim, bias=False
         )
-        self.index_q_norm = MiniMaxM3RMSNorm(self.index_head_dim, eps=config.rms_norm_eps, gemma=gemma)
-        self.index_k_norm = MiniMaxM3RMSNorm(self.index_head_dim, eps=config.rms_norm_eps, gemma=gemma)
+        self.index_q_norm = MiniMaxM3RMSNorm(
+            self.index_head_dim, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
+        self.index_k_norm = MiniMaxM3RMSNorm(
+            self.index_head_dim, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
 
     def project_qk(
         self,
@@ -450,8 +488,12 @@ class MiniMaxM3Attention(nn.Module):
         )
 
         if self.use_qk_norm:
-            self.q_norm = MiniMaxM3RMSNorm(self.head_dim, eps=config.rms_norm_eps, gemma=gemma)
-            self.k_norm = MiniMaxM3RMSNorm(self.head_dim, eps=config.rms_norm_eps, gemma=gemma)
+            self.q_norm = MiniMaxM3RMSNorm(
+                self.head_dim, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+            )
+            self.k_norm = MiniMaxM3RMSNorm(
+                self.head_dim, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+            )
         else:
             self.q_norm = None
             self.k_norm = None
@@ -645,9 +687,9 @@ class Block(nn.Module):
         elif is_sparse_attention_layer:
             # Sparse layers use the CP-aware attention so context parallelism can
             # rebuild a correct global-sequence block-sparse mask (FlexAttention).
-            # It delegates to the plain sparse forward when CP is off (_cp_mesh
-            # is None/size 1), so this is a no-op for non-CP runs. Lazy import
-            # breaks the layers <-> cp_sparse_attn import cycle.
+            # It selects the local Flex path for supported CUDA SDPA/FA4 inputs,
+            # or the gathered-key path under CP. Other SDPA cases keep the eager
+            # implementation. Lazy import breaks the layers/cp_sparse_attn cycle.
             from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import MiniMaxM3CPSparseAttention
 
             self.self_attn = MiniMaxM3CPSparseAttention(
@@ -672,8 +714,30 @@ class Block(nn.Module):
             self.shared_experts = None
 
         gemma = getattr(config, "use_gemma_norm", False)
-        self.input_layernorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
-        self.post_attention_layernorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
+        self.input_layernorm = MiniMaxM3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
+        self.post_attention_layernorm = MiniMaxM3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
+
+    def nemo_checkpoint_context_fn(
+        self,
+        context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Compose sparse-selection replay with existing activation-checkpoint contexts.
+
+        Args:
+            context_fn: Existing forward/recompute context factory, or None.
+
+        Returns:
+            A factory owning a fresh selection recorder for every checkpointed
+            sparse call. Dense and MSA blocks retain the original factory.
+            CP and CPU fallback attention do not consume the replay channel.
+        """
+        if not self.self_attn.is_sparse_attention_layer or self.self_attn.backend.sparse_attn != "generic":
+            return context_fn
+        return sparse_route_replay.checkpoint_context_fn(context_fn)
 
     def forward(
         self,
