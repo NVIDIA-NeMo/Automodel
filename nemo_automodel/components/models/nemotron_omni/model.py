@@ -1358,7 +1358,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
         # Vision model and projectors are loaded from checkpoint
         # Cast everything to target dtype
-        cast_model_to_dtype(self, dtype)
+        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 
 ModelClass = NemotronOmniForConditionalGeneration
