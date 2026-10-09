@@ -80,6 +80,41 @@ def sdpa_backend():
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("hidden", [128, 4096])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.runtime_budget(60, hard_timeout=70, reason="compiles CUDA norm and checks checkpoint recomputation")
+def test_rms_norm_cuda_parity_and_checkpoint(dtype, hidden, strided):
+    from torch.utils.checkpoint import checkpoint
+
+    torch.manual_seed(1234)
+    norm = Step3p5RMSNorm(hidden).to(device="cuda", dtype=dtype)
+    with torch.no_grad():
+        norm.weight.normal_(std=0.1)
+    x = torch.randn(2, 3, 5, hidden, device="cuda", dtype=dtype)
+    if strided:
+        x = x.transpose(1, 2)
+    x = x.requires_grad_()
+    ref_x = x.detach().clone().requires_grad_()
+    ref_weight = norm.weight.detach().clone().requires_grad_()
+    value = ref_x.float()
+    expected = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + norm.variance_epsilon)
+    expected = (expected * (ref_weight.float() + 1)).to(dtype)
+
+    actual = checkpoint(norm, x, use_reentrant=False)
+    with torch.no_grad():
+        no_grad_output = norm(x)
+    torch.testing.assert_close(actual, no_grad_output, rtol=0, atol=0)
+    rtol, atol = (2e-6, 1e-6) if dtype == torch.float32 else (0.008, 1e-5)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream)
+    grad_rtol, grad_atol = (1e-4, 1e-5) if dtype == torch.float32 else (0.02, 0.02)
+    torch.testing.assert_close(x.grad, ref_x.grad, rtol=grad_rtol, atol=grad_atol)
+    torch.testing.assert_close(norm.weight.grad, ref_weight.grad, rtol=grad_rtol, atol=grad_atol)
+
+
 class TestStep3p5RMSNorm:
     def test_initialization(self):
         hidden_size = 64

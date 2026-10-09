@@ -27,6 +27,7 @@ from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
 )
+from nemo_automodel.components.models.common.utils import _float32_rms_norm_fwd
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -52,6 +53,8 @@ class Step3p5RMSNorm(nn.Module):
         nn.init.zeros_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            return _float32_rms_norm_fwd(x, self.weight.float() + 1, self.variance_epsilon)
         dtype = x.dtype
         x = x.float()
         variance = x.pow(2).mean(dim=-1, keepdim=True)
