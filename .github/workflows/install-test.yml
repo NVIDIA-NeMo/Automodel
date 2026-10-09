@@ -319,6 +319,9 @@ jobs:
             python scripts/cuda_wheelhouse_lock.py \
               --output constraints \
               "${LOCK_ARGS[@]}" > "${CONSTRAINTS_FILE}"
+            # PyArrow 26 requires NumPy 2 at import time. Keep this cap until
+            # the CUDA wheelhouse build moves off its NumPy 1.26 pin.
+            echo 'pyarrow<26' >> "${CONSTRAINTS_FILE}"
 
             pip install --find-links "${PIP_FIND_LINKS}" "${BUILD_TOOL_REQUIREMENTS[@]}"
             pip install \
