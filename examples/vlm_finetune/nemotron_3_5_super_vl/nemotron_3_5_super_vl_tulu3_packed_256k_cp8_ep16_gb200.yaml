@@ -1,0 +1,178 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nemotron 3.5 Super VL text-only SFT with 262144-token THD packs on GB200.
+# Hardware: 4 nodes x 4 GB200 GPUs (16 ranks), all in one NVLink domain.
+# world = TP1 * CP8 * PP1 * DP2 = 16; EP16 = DP*CP, with no extra expert sharding.
+# CP8 gives 32768 token slots per rank, including padding. Packed documents
+# retain separate attention/Mamba boundaries.
+# GBS=8 and local batch=1 give 4 microbatches per rank per optimizer step.
+#
+# Allocate all four nodes in one healthy NVLink domain; node count alone does
+# not guarantee this. On Slurm sites whose topology blocks map to NVLink domains,
+# use --segment=4 and verify the GPUs share the same fabric CliqueId/ClusterUUID.
+# Cross-domain HybridEP requires a working RDMA setup; dispatcher: torch is an
+# alternative when that setup is unavailable.
+#
+# Set these variables in the environment of every training rank:
+#   USE_MNNVL=1
+#   NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=16
+#   PYTORCH_ALLOC_CONF=expandable_segments:True
+#   CUDA_DEVICE_MAX_CONNECTIONS=1
+#   TORCHINDUCTOR_COMPILE_THREADS=1
+# The HybridEP rank count is 16 for this single-domain allocation, not 4 GPUs
+# per node or the full rack capacity. Do not inherit 64 from a larger recipe:
+# it must match the participating ranks per domain and divide the EP group size.
+# Enable online W&B with --wandb.enable=true and provide authentication.
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 100000
+  val_every_steps: 100000
+  max_steps: 100
+  gc_every_steps: 10
+  validate_on_checkpoint: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+  trust_remote_code: true
+  num_nextn_predict_layers: 0
+  dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    dispatcher: hybridep
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+  trust_remote_code: true
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 8
+  # Reduce and shard gradients after every microbatch to bound accumulation memory.
+  defer_fsdp_grad_sync: false
+  pp_size: 1
+  ep_size: 16
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  moe:
+    reshard_after_forward: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
+  path_or_dataset: allenai/tulu-3-sft-mixture
+  split: train
+  # Truncate over-long samples instead of substituting a random other sample
+  # (keeps every rank of a CP/TP group on identical packs).
+  truncate: true
+  # Tulu-3 is text-only. The VLM pipeline otherwise injects a fake 512x512 image
+  # into every sample (~245 <image> tokens + a vision-tower forward per sample).
+  inject_fake_images: false
+
+# THD packing: 262144 slots per row, with document lengths aligned to 2*CP=16.
+# The collator pads each row to 262144 slots; CP8 leaves 32768 slots per rank.
+# packing_format: thd (not the "neat" default) is required for this hybrid Mamba+MoE
+# backbone: "neat" packing builds a dense block-causal mask / per-token seq_idx
+# convention meant for plain transformer attention, which nemotron_v3's Mamba mixer
+# does not understand (it reads a document-boundary attention_mask, not a dense mask).
+# "thd" wires qkv_format=thd + real cu_seqlens end to end instead.
+packed_sequence:
+  pretokenize: true
+  packing_format: thd
+  max_length: 262144
+  pack_size: 262144
+  collate_max_length: 262144
+  packing_ratio: 0.9
+  drop_long_samples: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  drop_last: true
+  # Shuffles packed rows with the sampler's default seed (0).
+  # rng.seed above independently controls model/training randomness.
+  shuffle: true
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.01
+  # Preserve FP32 master-weight precision using BF16 parameters plus remainders.
+  master_weights: true
+  store_param_remainders: true
+  # Keep both Adam moments in FP32.
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+
+lr_scheduler:
+  lr_decay_style: constant
+
+wandb:
+  enable: false
+  mode: online
+  entity: Nemo-automodel
+  project: huiyingl_workspace
+  name: nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 4
+  nproc_per_node: 4
+  cluster_tag: gb200
+  time: "01:00:00"
+  max_steps: 2
+  env_vars:
+    USE_MNNVL: "1"
+    NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "16"
+    PYTORCH_ALLOC_CONF: expandable_segments:True
+    CUDA_DEVICE_MAX_CONNECTIONS: "1"
+    TORCHINDUCTOR_COMPILE_THREADS: "1"
