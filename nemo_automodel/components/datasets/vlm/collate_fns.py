@@ -2115,6 +2115,12 @@ def _inject_thinking_prefix_tokens(
         seq_keys.append("mm_token_type_ids")
         fill_defaults["mm_token_type_ids"] = 0
         inject_defaults["mm_token_type_ids"] = 0
+    if "assistant_masks" in batch:
+        # Generation-template masks are read after this hook; injected prefix
+        # tokens and padding are never supervised.
+        seq_keys.append("assistant_masks")
+        fill_defaults["assistant_masks"] = 0
+        inject_defaults["assistant_masks"] = 0
 
     B = batch["input_ids"].size(0)
     new_seqs: Dict[str, List[torch.Tensor]] = {k: [] for k in seq_keys}
@@ -2191,6 +2197,7 @@ _TOKEN_AXIS_KEYS: tuple[str, ...] = (
     "labels",
     "token_type_ids",
     "mm_token_type_ids",
+    "assistant_masks",
 )
 
 
