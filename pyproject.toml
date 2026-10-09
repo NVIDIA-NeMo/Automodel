@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools >= 80.10.2"]
+requires = ["setuptools >= 83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -292,6 +292,15 @@ no-build-isolation-package = [
     "transformer-engine-torch",
 ]
 constraint-dependencies = [
+    "flask>=3.1.3", # Address CVE-2026-27205
+    "h2>=4.4.1", # Address CVE-2026-71554
+    "hpack>=4.2.0", # Address CVE-2026-59980
+    "idna>=3.15", # Address CVE-2026-45409
+    "multidict>=6.9.1", # Address CVE-2026-104874
+    "python-dotenv>=1.2.2", # Address CVE-2026-28684
+    "requests>=2.33.0", # Address CVE-2026-25645
+    "virtualenv>=21.7.13", # Address activation, seed-wheel, and directory-creation CVEs
+    "werkzeug>=3.1.9", # Address Windows safe_join security fixes through CVE-2026-102598
     "accelerate>=1.15.0", # Security floor requested by AUT-2490
     "click>=8.3.3", # Security floor requested by AUT-2490
     "anyio>=4.14.2", # Security floor requested by AUT-2465
@@ -301,7 +310,7 @@ constraint-dependencies = [
     "fsspec>=2026.6.0", # Security floor requested by AUT-2490
     "gitpython>=3.1.60",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
-    "mako>=1.3.11",
+    "mako>=1.4.2", # Address CVE-2026-102991
     "msgpack>=1.2.1", # Address CVE GHSA-6v7p-g79w-8964
     "pillow>=12.3.0", # Address the Pillow 12.3.0 security fixes
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
@@ -309,7 +318,7 @@ constraint-dependencies = [
     "pyasn1>=0.6.4", # Address GHSA-hm4w-wwcw-mr6r and GHSA-8ppf-4f7h-5ppj
     "ray>=2.56.0", # Address CVE-2026-57516
     "starlette>=1.3.1", # Address GHSA-wqp7-x3pw-xc5r and later Starlette security fixes
-    "setuptools>=80.10.2",
+    "setuptools>=83.0.0", # Address CVE-2026-59890
     "soupsieve>=2.8.4", # Address GHSA-836r-79rf-4m37 and GHSA-2wc2-fm75-p42x
     "sqlparse>=0.6.0", # Security floor requested by AUT-2465
     "urllib3>=2.8.0", # Address CVE GHSA-gm62-xv2j-4w53
@@ -320,7 +329,7 @@ constraint-dependencies = [
     "mlflow-skinny>=3.16.1", # Keep the tracking-only extra on the same security floor
     "thrift>=0.24.0", # Address CVE-2026-41608 and related Thrift 0.24.0 fixes
     "tornado>=6.5.5",
-    "onnx>=1.21.0",
+    "onnx>=1.22.0", # Address CVE-2026-44512 and CVE-2026-63632
     "onnx-ir>=0.1.16", # PyTorch 26.04 needs onnx_ir.schemas
     "pyjwt>=2.14.0",
     "pytest>=8.4.3",
