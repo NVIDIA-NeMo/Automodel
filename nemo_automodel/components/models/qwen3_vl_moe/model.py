@@ -610,8 +610,9 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             input_ids: Token IDs of shape [batch, sequence] or [tokens] for THD.
             position_ids: Rotary coordinates of shape [3, batch, sequence],
                 with a placeholder batch axis of size one for THD.
-            attention_mask: Optional padding mask of shape [batch, sequence]
-                or dense mask of shape [batch, 1, sequence, sequence].
+            attention_mask: Optional binary padding mask of shape [batch, sequence].
+                Dense NEAT masks are unsupported; packed inputs use THD with
+                ``qkv_format="thd"`` and ``attention_mask=None``.
             padding_mask: Optional padding flags of shape [batch, sequence]
                 or [tokens] for THD.
             inputs_embeds: Optional embeddings of shape [batch, sequence, hidden]
