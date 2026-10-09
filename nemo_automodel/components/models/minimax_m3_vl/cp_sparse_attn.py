@@ -631,11 +631,12 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         block_sel_flat = block_sel.reshape(-1)
 
         def cp_sparse_mask(b, h, q_idx, kv_idx):
-            # Mask construction visits the padded tile boundary too. Clamp metadata
-            # reads before masking so ragged lengths never index beyond their tensors.
+            # Mask construction visits padded tile boundaries too. Read metadata
+            # at zero for those lanes, then exclude them with in_bounds below.
+            # Using where avoids SymPy Min recursion in compiled ragged masks.
             in_bounds = (q_idx < t_local) & (kv_idx < t_global)
-            q_idx = q_idx.clamp(max=t_local - 1)
-            kv_idx = kv_idx.clamp(max=t_global - 1)
+            q_idx = torch.where(q_idx < t_local, q_idx, 0)
+            kv_idx = torch.where(kv_idx < t_global, kv_idx, 0)
             if group_masks:
                 h_idx = b % self.num_kv_heads
                 b = b // self.num_kv_heads
@@ -672,6 +673,13 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
                 keep = keep | (kv_idx == q_positions[q_idx])
             return keep & in_bounds
 
+        # Selection still uses 128-token key blocks. FLASH on SM100/110
+        # pipelines two 128-row query tiles, so its execution mask needs a
+        # 256-row query block independently of the model's key-block size.
+        use_flash = self.backend.attn == "fa4" and not rescue_pad_queries
+        mask_block_size = (block_size, block_size)
+        if use_flash and torch.cuda.get_device_capability(q.device)[0] in (10, 11):
+            mask_block_size = (256, block_size)
         block_mask = create_block_mask(
             cp_sparse_mask,
             B=mask_batch,
@@ -679,12 +687,11 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
             Q_LEN=t_local,
             KV_LEN=t_global,
             device=q.device,
-            BLOCK_SIZE=block_size,
+            BLOCK_SIZE=mask_block_size,
             _compile=True,
         )
         # The existing attn knob also selects FA4 for dense layers. Sparse
         # local layers use Flex's mask-capable FLASH backend; CP keeps Triton.
-        use_flash = self.backend.attn == "fa4" and not rescue_pad_queries
         flex = _get_compiled_flash_attention() if use_flash else _get_compiled_flex_attention()
         out = flex(
             qh,

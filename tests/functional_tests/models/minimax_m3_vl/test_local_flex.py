@@ -153,22 +153,34 @@ def _error(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     }
 
 
+@pytest.mark.filterwarnings("error:.*flex_attention called without torch.compile.*:UserWarning")
 @pytest.mark.parametrize(
-    "dtype,mask_kind,local_blocks,length",
+    "attn_backend,dtype,mask_kind,local_blocks,length",
     [
-        (torch.float32, "none", 1, 384),
-        (torch.bfloat16, "padding", 1, 385),
-        (torch.bfloat16, "packed", 1, 384),
-        (torch.float32, "none", 0, 384),
-        (torch.float32, "key_broadcast_true", 1, 384),
-        (torch.float32, "key_broadcast_false", 1, 384),
-        (torch.float32, "key_broadcast_queries", 1, 384),
-        (torch.bfloat16, "none", 1, 4096),
+        ("sdpa", torch.float32, "none", 1, 384),
+        ("sdpa", torch.bfloat16, "padding", 1, 385),
+        ("sdpa", torch.bfloat16, "packed", 1, 384),
+        ("sdpa", torch.float32, "none", 0, 384),
+        ("sdpa", torch.float32, "key_broadcast_true", 1, 384),
+        ("sdpa", torch.float32, "key_broadcast_false", 1, 384),
+        ("sdpa", torch.float32, "key_broadcast_queries", 1, 384),
+        ("sdpa", torch.bfloat16, "none", 1, 4096),
+        ("fa4", torch.bfloat16, "packed", 1, 17),
+        ("fa4", torch.bfloat16, "padding", 1, 385),
+        ("fa4", torch.bfloat16, "packed", 1, 384),
+        ("fa4", torch.bfloat16, "none", 1, 4096),
     ],
 )
 def test_local_flex_forward_backward(
-    dtype: torch.dtype, mask_kind: str, local_blocks: int, length: int, monkeypatch: pytest.MonkeyPatch
+    attn_backend: str,
+    dtype: torch.dtype,
+    mask_kind: str,
+    local_blocks: int,
+    length: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Isolate shape/backend variants so Dynamo cannot silently fall back to eager.
+    torch._dynamo.reset()
     torch.manual_seed(119)
     torch.backends.cuda.matmul.allow_tf32 = False
     real_shape = length == 4096
@@ -190,7 +202,7 @@ def test_local_flex_forward_backward(
             "sparse_score_type": "max",
         },
     )
-    backend = BackendConfig(attn="sdpa", linear="torch", rope_fusion=False, experts="torch", dispatcher="torch")
+    backend = BackendConfig(attn=attn_backend, linear="torch", rope_fusion=False, experts="torch", dispatcher="torch")
     attn = MiniMaxM3CPSparseAttention(cfg, backend).cuda().to(dtype)
     with torch.no_grad():
         for p in attn.parameters():
@@ -228,7 +240,10 @@ def test_local_flex_forward_backward(
     selections = []
     mask_metrics = {}
     original_select = cp.select_sparse_blocks
-    original_flex_getter = cp._get_compiled_flex_attention
+    getter = "_get_compiled_flash_attention" if attn_backend == "fa4" else "_get_compiled_flex_attention"
+    original_flex_getter = (
+        cp._get_compiled_flash_attention if attn_backend == "fa4" else cp._get_compiled_flex_attention
+    )
 
     def record_flex():
         flex = original_flex_getter()
@@ -239,12 +254,19 @@ def test_local_flex_forward_backward(
             if block_mask.full_kv_num_blocks is not None:
                 visited = visited + block_mask.full_kv_num_blocks.sum()
             mask_batch, mask_heads = block_mask.kv_num_blocks.shape[:2]
-            rows = (length + 127) // 128
-            causal = mask_batch * mask_heads * rows * (rows + 1) // 2
+            query_block, key_block = block_mask.BLOCK_SIZE
+            rows = (length + query_block - 1) // query_block
+            causal = (
+                mask_batch
+                * mask_heads
+                * sum((min((row + 1) * query_block, length) + key_block - 1) // key_block for row in range(rows))
+            )
             mask_metrics.update(
                 {
                     "batch": mask_batch,
                     "heads": mask_heads,
+                    "query_block": query_block,
+                    "key_block": key_block,
                     "visited_tiles": visited.item(),
                     "causal_tiles": causal,
                     "extra_tile_skip_fraction": 1 - visited.item() / causal,
@@ -262,7 +284,7 @@ def test_local_flex_forward_backward(
     def reject_dense_mask(*args, **kwargs):
         raise AssertionError("local CUDA attention materialized a quadratic per-head keep-mask")
 
-    monkeypatch.setattr(cp, "_get_compiled_flex_attention", record_flex)
+    monkeypatch.setattr(cp, getter, record_flex)
     monkeypatch.setattr(cp, "select_sparse_blocks", record_selection)
     monkeypatch.setattr(layers, "build_block_sparse_attn_mask", reject_dense_mask)
     actual = attn(x, freqs_cis=freqs, attention_mask=mask)
@@ -270,22 +292,28 @@ def test_local_flex_forward_backward(
     assert len(selections) == 1
     torch.testing.assert_close(selections[0], selected, rtol=0, atol=0)
     boundary = attn.indexer.topk_blocks * attn.indexer.block_size
-    dropped = keep[0, :, boundary:].sum(-1) < torch.arange(boundary + 1, length + 1, device="cuda")
-    assert dropped.any()
+    has_sparse_tail = length > boundary
+    dropped = keep[0, :, boundary:].sum(-1) < torch.arange(boundary + 1, max(boundary, length) + 1, device="cuda")
+    if has_sparse_tail:
+        assert dropped.any()
     metrics = {
+        "backend": attn_backend,
         "length": length,
         "dtype": str(dtype),
         "mask": mask_kind,
         "dropped_query_heads": dropped.sum().item(),
         "selected_set_agreement": 1.0,
+        "selection_is_sparse": has_sparse_tail,
         "prefix": _error(actual[:, :boundary], expected[:, :boundary]),
-        "sparse_tail": _error(actual[:, boundary:], expected[:, boundary:]),
         "block_mask": dict(mask_metrics),
     }
+    if has_sparse_tail:
+        metrics["sparse_tail"] = _error(actual[:, boundary:], expected[:, boundary:])
     if mask_kind == "packed":
         torch.testing.assert_close(actual[:, -1], torch.zeros_like(actual[:, -1]), rtol=0, atol=0)
     tolerance = 3e-5 if dtype == torch.float32 else 0.02
-    for start, end in ((0, boundary), (boundary, length)):
+    ranges = ((0, boundary), (boundary, length)) if has_sparse_tail else ((0, length),)
+    for start, end in ranges:
         torch.testing.assert_close(actual[:, start:end], expected[:, start:end], rtol=tolerance, atol=tolerance)
     gradient = torch.randn_like(actual)
     actual.backward(gradient)
@@ -311,7 +339,9 @@ def test_local_flex_forward_backward(
                 # accumulation near cancellation makes a fixed elementwise
                 # absolute threshold unsuitable for large weight gradients.
                 assert metrics["parameter_gradients"][name]["relative_l2"] <= 0.006
-    if real_shape:
+    if real_shape and attn_backend == "sdpa":
+        # This existing bitwise layout control compares two Triton executions.
+        # FLASH is checked against the independent oracle above.
         # With no padding and a forced current block, the CP self-rescue is
         # provably a no-op and selects the original ungrouped Flex layout.
         own = torch.arange(length, device="cuda") // attn.indexer.block_size
@@ -338,7 +368,7 @@ def test_local_flex_forward_backward(
             if parameter.grad is not None:
                 torch.testing.assert_close(parameter.grad, control_parameter.grad, rtol=0, atol=0)
         metrics["grouped_vs_ungrouped_forward_and_gradients_bitwise_equal"] = True
-    if mask_kind == "none":
+    if mask_kind == "none" and has_sparse_tail:
         with torch.no_grad():
             wrong, _, _ = _reference(reference, xr, freqs, mask, dense=True)
         assert (wrong[:, boundary:] - expected[:, boundary:]).abs().max() > 0.01
