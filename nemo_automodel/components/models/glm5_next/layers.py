@@ -12,7 +12,7 @@ kernel; small pure-Torch fallbacks keep CPU construction and unit tests useful.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +24,8 @@ from nemo_automodel.components.models.common.cudnn_sparse_attention import (
     cudnn_sparse_attention,
     is_cudnn_sparse_attention_available,
 )
+from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sinkhorn_normalize
+from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
@@ -31,6 +33,7 @@ from nemo_automodel.components.models.glm5_next.cp import (
     all_gather_sequence,
     build_fla_cp_context,
 )
+from nemo_automodel.components.models.glm5_next.optimized_kernels import hc_cores, rms_norm_core
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.shared.import_utils import safe_import_from
@@ -49,17 +52,15 @@ class Glm5NextRMSNorm(nn.Module):
     may be replaced by any token layout as long as hidden is last.
     """
 
-    def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype) -> None:
+    def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype, *, compile_norm: bool = False) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.variance_epsilon = eps
+        self._norm_core = rms_norm_core(compile_norm)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Normalize ``[..., hidden]`` and preserve the input dtype."""
-        input_dtype = hidden_states.dtype
-        states = hidden_states.float()
-        states = states * torch.rsqrt(states.square().mean(-1, keepdim=True) + self.variance_epsilon)
-        return self.weight * states.to(input_dtype)
+        return self._norm_core(hidden_states, self.weight, self.variance_epsilon)
 
     def reset_parameters(self) -> None:
         nn.init.ones_(self.weight)
@@ -82,8 +83,9 @@ class Glm5NextUnweightedRMSNorm(nn.Module):
 class Glm5NextHyperConnectionFp32Params(nn.Module):
     """Own mHC parameters that must remain fp32 under FSDP mixed precision."""
 
-    def __init__(self, mix_size: int) -> None:
+    def __init__(self, mix_size: int, *, sinkhorn_backend: Literal["torch", "tilelang"] = "torch") -> None:
         super().__init__()
+        self.sinkhorn_backend = sinkhorn_backend
         self.base = nn.Parameter(torch.empty(mix_size, dtype=torch.float32))
         self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
@@ -102,11 +104,7 @@ class Glm5NextHyperConnectionFp32Params(nn.Module):
         pre = torch.sigmoid(pre_w * pre_scale + pre_b) + eps
         post = 2 * torch.sigmoid(post_w * post_scale + post_b)
         comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-        comb = torch.softmax(comb_logits, dim=-1) + eps
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-        for _ in range(sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        comb = dsv4_sinkhorn_normalize(comb_logits, backend=self.sinkhorn_backend, repeat=sinkhorn_iters, eps=eps)
         return pre, post, comb
 
 
@@ -118,16 +116,24 @@ class Glm5NextHyperConnection(nn.Module):
     hc_mult, hc_mult]`` and ``collapsed [batch, sequence, hidden]``.
     """
 
-    def __init__(self, config: Glm5NextTextConfig) -> None:
+    def __init__(
+        self,
+        config: Glm5NextTextConfig,
+        *,
+        sinkhorn_backend: Literal["torch", "tilelang"] = "torch",
+        compile_hc: bool = False,
+    ) -> None:
         super().__init__()
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
         self.input_norm = Glm5NextUnweightedRMSNorm(config.rms_norm_eps)
+        self._compile_hc = compile_hc
+        self._project_core, self._collapse_core, _ = hc_cores(compile_hc)
         mix = (2 + self.hc_mult) * self.hc_mult
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * config.hidden_size, dtype=dtype))
-        self._fp32_params = Glm5NextHyperConnectionFp32Params(mix)
+        self._fp32_params = Glm5NextHyperConnectionFp32Params(mix, sinkhorn_backend=sinkhorn_backend)
 
     @property
     def base(self) -> nn.Parameter:
@@ -142,8 +148,12 @@ class Glm5NextHyperConnection(nn.Module):
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build Sinkhorn mixing weights and collapse streams for one sublayer."""
         hc = self.hc_mult
-        flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
-        pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
+        if self._compile_hc:
+            projected = self._project_core(hidden_streams, self.fn, self.input_norm.eps)
+        else:
+            flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+            projected = F.linear(flat, self.fn.float())
+        pre_w, post_w, comb_w = projected.split([hc, hc, hc * hc], dim=-1)
         pre, post, comb = self._fp32_params(
             pre_w,
             post_w,
@@ -152,7 +162,7 @@ class Glm5NextHyperConnection(nn.Module):
             self.hc_eps,
             self.hc_sinkhorn_iters,
         )
-        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+        collapsed = self._collapse_core(hidden_streams, pre)
         return post, comb, collapsed
 
     @torch.no_grad()
@@ -831,10 +841,16 @@ class Glm5NextDecoderLayer(nn.Module):
                 swiglu_limit=config.swiglu_limit,
             )
         )
-        self.input_layernorm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
-        self.post_attention_layernorm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
-        self.attn_hc = Glm5NextHyperConnection(config)
-        self.ffn_hc = Glm5NextHyperConnection(config)
+        self.input_layernorm = Glm5NextRMSNorm(
+            config.hidden_size, config.rms_norm_eps, dtype, compile_norm=backend.compile_norm
+        )
+        self.post_attention_layernorm = Glm5NextRMSNorm(
+            config.hidden_size, config.rms_norm_eps, dtype, compile_norm=backend.compile_norm
+        )
+        sinkhorn_backend = backend.sinkhorn if isinstance(backend, Glm5NextBackendConfig) else "torch"
+        self.attn_hc = Glm5NextHyperConnection(config, sinkhorn_backend=sinkhorn_backend, compile_hc=backend.compile_hc)
+        self.ffn_hc = Glm5NextHyperConnection(config, sinkhorn_backend=sinkhorn_backend, compile_hc=backend.compile_hc)
+        _, _, self._expand_core = hc_cores(backend.compile_hc)
 
     def forward(
         self,
@@ -845,7 +861,6 @@ class Glm5NextDecoderLayer(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         """Transform residual streams ``[batch, local_sequence, hc_mult, hidden]``."""
-        dtype = hidden_streams.dtype
         residual = hidden_streams
         post, comb, collapsed = self.attn_hc(hidden_streams)
         update = self.self_attn(
@@ -854,16 +869,12 @@ class Glm5NextDecoderLayer(nn.Module):
             padding_mask=padding_mask,
             **kwargs,
         )
-        hidden_streams = post.to(dtype).unsqueeze(-1) * update.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), residual
-        )
+        hidden_streams = self._expand_core(update, residual, post, comb)
         residual = hidden_streams
         post, comb, collapsed = self.ffn_hc(hidden_streams)
         update = self.post_attention_layernorm(collapsed)
         update = self.mlp(update, padding_mask) if self.is_moe_layer else self.mlp(update)
-        return post.to(dtype).unsqueeze(-1) * update.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), residual
-        )
+        return self._expand_core(update, residual, post, comb)
 
     def update_moe_gate_bias(self) -> None:
         """Update the correction bias for this layer's learned MoE router."""

@@ -25,6 +25,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
 from nemo_automodel.components.models.glm5_next.config import Glm5NextConfig, Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
@@ -138,7 +139,7 @@ class Glm5NextTextModel(nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             }
         )
-        self.norm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
+        self.norm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps, dtype, compile_norm=backend.compile_norm)
 
     def forward(
         self,
@@ -262,7 +263,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.config = config
-        self.backend = copy.copy(backend) if backend is not None else BackendConfig()
+        self.backend = copy.copy(backend) if backend is not None else Glm5NextBackendConfig()
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
         moe_overrides = kwargs.pop("moe_overrides", None)
