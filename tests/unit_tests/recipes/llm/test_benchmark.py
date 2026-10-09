@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import types
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -21,8 +22,10 @@ import pytest
 import torch
 from transformers import LlamaConfig, PretrainedConfig
 
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import Gate
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.utils.flops_utils import llama2_flops
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
@@ -159,6 +162,9 @@ def mock_recipe(mock_config, monkeypatch):
         recipe.step_scheduler = SimpleNamespace(step=0, gc_every_steps=None)
         recipe._dp_allreduce = MagicMock(side_effect=lambda x, include_cp=False: x)
         recipe.device_mesh = None
+        recipe.moe_mesh = None
+        recipe.loss_fn = MaskedCrossEntropy()
+        recipe.max_grad_norm = None
         return recipe
 
 
@@ -1177,3 +1183,263 @@ def test_benchmark_router_bias_lifecycle(
                 atol=0,
             )
             assert part.gate._cumulative_expert_load is None
+
+
+class _BenchmarkGradientModel(torch.nn.Module):
+    """Tiny real logits model; an optional auxiliary loss has its own parameter."""
+
+    def __init__(self, *, with_auxiliary: bool = False) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor([[0.2, -0.3], [-0.4, 0.6], [0.7, 0.1]]))
+        self.auxiliary = torch.nn.Parameter(torch.tensor(0.3)) if with_auxiliary else None
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Compute logits, optionally attaching the production auxiliary scaler.
+
+        Args:
+            input_ids: Integer token IDs of shape [batch, sequence], each zero or one.
+
+        Returns:
+            Logits of shape [batch, sequence, vocab=3].
+        """
+        features = torch.nn.functional.one_hot(input_ids, num_classes=2).float()
+        logits = torch.nn.functional.linear(features, self.weight)
+        if self.auxiliary is not None:
+            auxiliary_loss = self.auxiliary.square() * (1.0 + input_ids.float().mean())
+            logits = MoEAuxLossAutoScaler.apply(logits, auxiliary_loss)
+        return logits
+
+
+def _gradient_batches(rank: int, ga_steps: int, ignore_index: int) -> list[dict[str, torch.Tensor]]:
+    """Build unequal supervision, retaining both dataset and loss ignore sentinels."""
+    batches = []
+    for microbatch in range(ga_steps):
+        input_ids = torch.tensor([[(rank + microbatch + token) % 2 for token in range(4)]])
+        labels = torch.tensor([[(2 * rank + microbatch + token) % 3 for token in range(4)]])
+        valid_count = 1 + (rank + 2 * microbatch) % 4
+        labels[:, valid_count:] = ignore_index
+        if valid_count < 4:
+            labels[:, -1] = -100
+        batches.append({"input_ids": input_ids, "labels": labels})
+    return batches
+
+
+def _gradient_recipe(
+    model: torch.nn.Module,
+    batches: list[dict[str, torch.Tensor]],
+    *,
+    ga_steps: int,
+    rank: int = 0,
+    world_size: int = 1,
+    ignore_index: int = -100,
+    max_grad_norm: float | None = None,
+) -> BenchmarkingRecipeForNextTokenPrediction:
+    """Construct the CPU fixture without replacing the native loop or backward.
+
+    Args:
+        model: Local model or real DDP wrapper producing [batch, sequence, vocab] logits.
+        batches: Microbatches containing input_ids and labels, both [batch=1, sequence=4].
+        ga_steps: Number of microbatches in the optimizer step.
+        rank: Real process rank.
+        world_size: Real data-parallel process count.
+        ignore_index: Loss-specific ignored label.
+        max_grad_norm: Optional global gradient norm limit.
+
+    Returns:
+        Recipe using native loss, forward/backward, DP reduction, and SGD.
+    """
+    config = ConfigNamespace(
+        benchmark=SimpleNamespace(warmup_steps=0, peak_tflops=989, nsys_start=-1, nsys_end=-1, nsys_ranks=[]),
+        step_scheduler=SimpleNamespace(max_steps=1, local_batch_size=1, global_batch_size=ga_steps * world_size),
+        dataset=SimpleNamespace(seq_len=4),
+    )
+    with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
+        recipe = BenchmarkingRecipeForNextTokenPrediction(config)
+    recipe.cfg = config
+    recipe.dist_env = SimpleNamespace(rank=rank, world_size=world_size, device=torch.device("cpu"), is_main=rank == 0)
+    recipe.model_parts = [model]
+    recipe.optimizer = [torch.optim.SGD(model.parameters(), lr=0.07)]
+    recipe.dataloader = batches
+    recipe.loss_fn = MaskedCrossEntropy(ignore_index=ignore_index)
+    recipe.max_grad_norm = max_grad_norm
+    recipe.device_mesh = None
+    recipe.moe_mesh = None
+    recipe.pp_enabled = False
+    recipe.tokenizer = None
+    recipe.domain_mixture = None
+    recipe.te_fp8 = None
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.partial_cuda_graph_manager = None
+    recipe._partial_cuda_graph_capture_pending = False
+    recipe.step_scheduler = SimpleNamespace(step=0, gc_every_steps=None)
+    recipe.timers = MagicMock()
+    recipe._wandb_enabled = True
+    recipe.wandb_run = MagicMock()
+    recipe._log_iteration_metrics = MagicMock()
+    recipe._log_benchmark_summary = MagicMock()
+    recipe._collect_moe_load_balance = MagicMock()
+    recipe._log_moe_metrics = MagicMock()
+    return recipe
+
+
+def _mean_gradient_oracle(
+    batches: list[dict[str, torch.Tensor]],
+    *,
+    ignore_index: int,
+    max_grad_norm: float | None,
+    with_auxiliary: bool = False,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], float]:
+    """Differentiate one concatenated valid-token mean, independently of native helpers.
+
+    Args:
+        batches: All ranks' microbatches, each containing [1, sequence=4] IDs and labels.
+        ignore_index: Loss-specific ignored label in addition to dataset sentinel -100.
+        max_grad_norm: Optional clipping bound applied to the complete reference gradient.
+        with_auxiliary: Include the mathematical mean of per-microbatch auxiliary losses.
+
+    Returns:
+        Named complete reference gradients, post-SGD parameters, and scalar main loss.
+        Weight tensors have shape [vocab=3, hidden=2]; auxiliary tensors are scalars.
+    """
+    model = _BenchmarkGradientModel(with_auxiliary=with_auxiliary)
+    ids = torch.cat([batch["input_ids"].reshape(-1) for batch in batches])
+    labels = torch.cat([batch["labels"].reshape(-1) for batch in batches])
+    valid = (labels != -100) & (labels != ignore_index)
+    features = torch.nn.functional.one_hot(ids, num_classes=2).float()
+    logits = features @ model.weight.T
+    main_loss = (
+        torch.nn.functional.cross_entropy(logits[valid], labels[valid], reduction="mean")
+        if valid.any()
+        else logits.sum() * 0.0
+    )
+    objective = main_loss
+    if with_auxiliary:
+        objective = (
+            objective
+            + model.auxiliary.square()
+            * torch.stack([1.0 + batch["input_ids"].float().mean() for batch in batches]).mean()
+        )
+    objective.backward()
+    gradients = {name: parameter.grad.clone() for name, parameter in model.named_parameters()}
+    if max_grad_norm is not None:
+        norm = torch.sqrt(sum(gradient.double().square().sum() for gradient in gradients.values()))
+        coefficient = min(1.0, max_grad_norm / (norm.item() + 1e-6))
+        gradients = {name: gradient * coefficient for name, gradient in gradients.items()}
+    updated = {name: parameter.detach() - 0.07 * gradients[name] for name, parameter in model.named_parameters()}
+    return gradients, updated, main_loss.item()
+
+
+def _run_gradient_recipe(recipe: BenchmarkingRecipeForNextTokenPrediction) -> None:
+    """Disable CUDA-only instrumentation while retaining the native CPU lifecycle."""
+    with (
+        patch.object(torch.cuda, "is_available", return_value=False),
+        patch.object(torch.cuda.nvtx, "range_push"),
+        patch.object(torch.cuda.nvtx, "range_pop"),
+        patch.object(torch.cuda, "max_memory_allocated", return_value=0),
+    ):
+        recipe.run_benchmark()
+
+
+def _assert_gradient_result(
+    model: _BenchmarkGradientModel,
+    recipe: BenchmarkingRecipeForNextTokenPrediction,
+    expected: tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], float],
+) -> None:
+    """Compare complete gradients/SGD updates and the independently derived mean loss.
+
+    Args:
+        model: Complete local model after its native optimizer step.
+        recipe: Executed recipe whose rank-zero loss is retained by a logging mock.
+        expected: Named gradients and parameters [vocab=3, hidden=2] (optional scalar
+            auxiliary), followed by the scalar reference main loss.
+    """
+    gradients, updated, main_loss = expected
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(parameter.grad, gradients[name], rtol=3e-6, atol=3e-7)
+        torch.testing.assert_close(parameter, updated[name], rtol=3e-6, atol=3e-7)
+    if recipe.dist_env.rank == 0:
+        losses = [call.args[0]["loss"] for call in recipe.wandb_run.log.call_args_list if "loss" in call.args[0]]
+        assert losses == pytest.approx([main_loss], rel=3e-6, abs=3e-7)
+
+
+@pytest.mark.parametrize("ga_steps", [1, 3])
+@pytest.mark.parametrize("ignore_index", [-100, -7])
+@pytest.mark.parametrize("max_grad_norm", [None, 0.1])
+def test_benchmark_global_mean_gradient(ga_steps: int, ignore_index: int, max_grad_norm: float | None) -> None:
+    """Actual inherited backward must match a single valid-token mean and SGD."""
+    batches = _gradient_batches(0, ga_steps, ignore_index)
+    model = _BenchmarkGradientModel()
+    recipe = _gradient_recipe(model, batches, ga_steps=ga_steps, ignore_index=ignore_index, max_grad_norm=max_grad_norm)
+    expected = _mean_gradient_oracle(batches, ignore_index=ignore_index, max_grad_norm=max_grad_norm)
+    _run_gradient_recipe(recipe)
+    _assert_gradient_result(model, recipe, expected)
+
+
+def test_benchmark_zero_supervised_tokens() -> None:
+    """An all-ignored window has finite zero main loss and no SGD update."""
+    batches = _gradient_batches(0, 2, -100)
+    for batch in batches:
+        batch["labels"].fill_(-100)
+    model = _BenchmarkGradientModel()
+    recipe = _gradient_recipe(model, batches, ga_steps=2, max_grad_norm=0.1)
+    expected = _mean_gradient_oracle(batches, ignore_index=-100, max_grad_norm=0.1)
+    _run_gradient_recipe(recipe)
+    _assert_gradient_result(model, recipe, expected)
+
+
+@pytest.mark.parametrize("ga_steps", [1, 3])
+def test_benchmark_auxiliary_gradient_scale(ga_steps: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale auxiliary scale must be replaced by the current accumulation mean."""
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(7.0))
+    batches = _gradient_batches(0, ga_steps, -100)
+    model = _BenchmarkGradientModel(with_auxiliary=True)
+    recipe = _gradient_recipe(model, batches, ga_steps=ga_steps)
+    expected = _mean_gradient_oracle(batches, ignore_index=-100, max_grad_norm=None, with_auxiliary=True)
+    _run_gradient_recipe(recipe)
+    _assert_gradient_result(model, recipe, expected)
+
+
+def _benchmark_dp_gradient_worker(rank: int, rendezvous: str) -> None:
+    """Exercise real two-process Gloo DDP with unequal rank-local supervision."""
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=90)
+    )
+    errors = []
+    try:
+        for ga_steps in (1, 2):
+            for max_grad_norm in (None, 0.1):
+                model = _BenchmarkGradientModel()
+                wrapped = torch.nn.parallel.DistributedDataParallel(model)
+                batches = _gradient_batches(rank, ga_steps, -7)
+                all_batches = [batch for peer in range(2) for batch in _gradient_batches(peer, ga_steps, -7)]
+                recipe = _gradient_recipe(
+                    wrapped,
+                    batches,
+                    ga_steps=ga_steps,
+                    rank=rank,
+                    world_size=2,
+                    ignore_index=-7,
+                    max_grad_norm=max_grad_norm,
+                )
+                expected = _mean_gradient_oracle(all_batches, ignore_index=-7, max_grad_norm=max_grad_norm)
+                _run_gradient_recipe(recipe)
+                try:
+                    _assert_gradient_result(model, recipe, expected)
+                except AssertionError as exc:
+                    errors.append(f"rank={rank}, GA={ga_steps}, clip={max_grad_norm}: {exc}")
+        gathered = [None, None]
+        torch.distributed.all_gather_object(gathered, errors)
+        assert not any(gathered), str(gathered)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_benchmark_global_mean_gradient_two_process(tmp_path: Path) -> None:
+    """Native loss/loop plus actual DP averaging must equal the global mean oracle."""
+    torch.multiprocessing.spawn(
+        _benchmark_dp_gradient_worker,
+        args=((tmp_path / "benchmark_dp_rendezvous").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
