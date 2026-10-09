@@ -727,7 +727,7 @@ class TestFromHF:
         device_mesh.mesh_dim_names = ["dp"]  # no "ep"
         device_mesh.get_rank.return_value = 0
 
-        def fake_create_dtensor(local_tensor, mesh, rank):
+        def fake_create_dtensor(local_tensor, mesh, rank, *, n_experts):
             return local_tensor
 
         monkeypatch.setattr(
@@ -885,7 +885,7 @@ class TestFromHF:
 
         rebuilt_locals = []
 
-        def fake_create_dtensor(local_tensor, mesh, rank):
+        def fake_create_dtensor(local_tensor, mesh, rank, *, n_experts):
             assert not getattr(local_tensor, "_is_fake_dtensor", False)
             rebuilt_locals.append(local_tensor)
             return local_tensor
@@ -939,7 +939,7 @@ class TestFromHF:
             lambda mesh, dims: Mock(get_rank=lambda: 0),
         )
 
-        def fake_create_dtensor(local_tensor, mesh, rank):
+        def fake_create_dtensor(local_tensor, mesh, rank, *, n_experts):
             return local_tensor
 
         monkeypatch.setattr(
@@ -1224,7 +1224,7 @@ class TestFromHFEpShard:
 
         captured_list = []
 
-        def fake_create_dtensor(local_tensor, mesh, rank):
+        def fake_create_dtensor(local_tensor, mesh, rank, *, n_experts):
             captured_list.append(local_tensor)
             return local_tensor
 

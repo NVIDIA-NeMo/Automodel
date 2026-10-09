@@ -496,7 +496,9 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                         assert local_tensor.shape[1] % ep_shard_size == 0
                         chunk = local_tensor.shape[1] // ep_shard_size
                         local_tensor = local_tensor[:, ep_shard_rank * chunk : (ep_shard_rank + 1) * chunk, :]
-                    state_dict[native_key] = state_dict_utils.create_dtensor_from_local(local_tensor, device_mesh, rank)
+                    state_dict[native_key] = state_dict_utils.create_dtensor_from_local(
+                        local_tensor, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
+                    )
                 continue
 
             mtp_split_match = re.match(
@@ -579,14 +581,10 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
 
             native_prefix = f"{model_prefix}{language_model_prefix}layers.{layer_num}.mlp.experts."
             state_dict[f"{native_prefix}gate_and_up_projs"] = state_dict_utils.create_dtensor_from_local(
-                gate_up_tensor,
-                device_mesh,
-                rank,
+                gate_up_tensor, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
             )
             state_dict[f"{native_prefix}down_projs"] = state_dict_utils.create_dtensor_from_local(
-                down_tensor,
-                device_mesh,
-                rank,
+                down_tensor, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
             )
 
         for layer_num, parts in mtp_expert_parts.items():
@@ -632,10 +630,12 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 )
 
             state_dict[f"mtp.layers.{layer_num}.mlp.experts.gate_and_up_projs"] = (
-                state_dict_utils.create_dtensor_from_local(gate_up_tensor, device_mesh, rank)
+                state_dict_utils.create_dtensor_from_local(
+                    gate_up_tensor, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
+                )
             )
             state_dict[f"mtp.layers.{layer_num}.mlp.experts.down_projs"] = state_dict_utils.create_dtensor_from_local(
-                down_tensor, device_mesh, rank
+                down_tensor, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
             )
 
         return state_dict

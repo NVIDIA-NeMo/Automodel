@@ -467,7 +467,9 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                         tensors.append(torch.cat([gate_w.T, up_w.T], dim=-1))
                     stacked = torch.stack(tensors, dim=0).to(self.dtype)
                     native_key = f"model.layers.{layer_num}.mlp.experts.gate_and_up_projs"
-                    out[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
+                    out[native_key] = create_dtensor_from_local(
+                        stacked, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
+                    )
                     del by_layer[layer_num]["gate_and_up"]
 
             # Once all experts for this layer's down are ready, stack them.
@@ -482,7 +484,9 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                     tensors.append(w.T)
                 stacked = torch.stack(tensors, dim=0).to(self.dtype)
                 native_key = f"model.layers.{layer_num}.mlp.experts.down_projs"
-                out[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
+                out[native_key] = create_dtensor_from_local(
+                    stacked, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
+                )
                 del by_layer[layer_num]["down"]
 
         return out
@@ -551,8 +555,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 packed_stack = torch.stack([torch.cat([gu[e]["w1"][0], gu[e]["w3"][0]], dim=0) for e in eids], dim=0)
                 scale_stack = torch.stack([torch.cat([gu[e]["w1"][1], gu[e]["w3"][1]], dim=0) for e in eids], dim=0)
                 base = f"model.layers.{layer_num}.mlp.experts.gate_and_up_projs"
-                out[base + "_packed"] = create_dtensor_from_local(packed_stack, device_mesh, rank)
-                out[base + "_scales"] = create_dtensor_from_local(scale_stack, device_mesh, rank)
+                out[base + "_packed"] = create_dtensor_from_local(
+                    packed_stack, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
+                )
+                out[base + "_scales"] = create_dtensor_from_local(
+                    scale_stack, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
+                )
                 del layer["gate_and_up"]
 
             down = layer.get("down")
@@ -561,8 +569,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 packed_stack = torch.stack([down[e][0] for e in eids], dim=0)
                 scale_stack = torch.stack([down[e][1] for e in eids], dim=0)
                 base = f"model.layers.{layer_num}.mlp.experts.down_projs"
-                out[base + "_packed"] = create_dtensor_from_local(packed_stack, device_mesh, rank)
-                out[base + "_scales"] = create_dtensor_from_local(scale_stack, device_mesh, rank)
+                out[base + "_packed"] = create_dtensor_from_local(
+                    packed_stack, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
+                )
+                out[base + "_scales"] = create_dtensor_from_local(
+                    scale_stack, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
+                )
                 del layer["down"]
 
         return out
