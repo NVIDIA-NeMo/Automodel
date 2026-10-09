@@ -31,20 +31,24 @@ on CPU without a process group.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
 import torch.distributed as dist
 from torch.autograd import Function
+from torch.utils._python_dispatch import _disable_current_modes
 
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3Attention, select_sparse_blocks
+from nemo_automodel.components.models.minimax_m3_vl.recompute import sparse_route_replay
 
-# Compiled FlexAttention is built lazily (and cached) on first CP use so that
+# Compiled FlexAttention is built lazily (and cached) on first use so that
 # importing this module / instantiating the attention on CPU does not require a
 # FlexAttention-capable build. ``dynamic=True`` because the gathered global key
 # length varies across batches / CP configs.
 _COMPILED_FLEX_ATTENTION = None
+_COMPILED_FLASH_ATTENTION: Callable[..., torch.Tensor] | None = None
 
 
 def _get_compiled_flex_attention():
@@ -54,6 +58,61 @@ def _get_compiled_flex_attention():
 
         _COMPILED_FLEX_ATTENTION = torch.compile(flex_attention, dynamic=True)
     return _COMPILED_FLEX_ATTENTION
+
+
+def _get_compiled_flash_attention() -> Callable[..., torch.Tensor]:
+    """Return static-shape FlexAttention compiled for the optional FLASH backend.
+
+    FLASH currently rejects symbolic scalar captures in the sparse mask. Keep
+    its shape-specialized cache separate from the existing dynamic Triton/CP
+    cache; changing sequence length explicitly compiles another specialization.
+
+    Returns:
+        Compiled FlexAttention callable for local sparse CUDA attention.
+    """
+    global _COMPILED_FLASH_ATTENTION
+    if _COMPILED_FLASH_ATTENTION is None:
+        from torch.nn.attention.flex_attention import flex_attention
+
+        _COMPILED_FLASH_ATTENTION = torch.compile(flex_attention, dynamic=False)
+    return _COMPILED_FLASH_ATTENTION
+
+
+def _block_sel_flat_offset(
+    batch_idx: torch.Tensor,
+    index_head: torch.Tensor,
+    query_idx: torch.Tensor,
+    kv_block: torch.Tensor,
+    num_index_heads: int,
+    query_length: int,
+    num_blocks: int,
+) -> torch.Tensor:
+    """Flat offset into a ``[B, num_index_heads, query_length, num_blocks]`` block-selection table, in int64.
+
+    FlexAttention inlines ``mask_mod`` into its Triton template and emits the inlined
+    index arithmetic in int32. A 4-D gather such as ``block_sel[b, h, q, kb]`` is
+    lowered to ``((b * H + h) * S + q) * NB + kb``, which wraps once the table has more
+    than ``2**31`` elements: with four index heads and 128-token blocks that is a single
+    sequence of 262,144 tokens. Just past the limit the wrapped address still lands in
+    mapped memory, so tail queries silently read a wrong selection before the failure
+    escalates to an illegal memory access. Widening the operands here keeps the
+    generated address arithmetic in int64 (same fix as the Qwen3.8 flex QSA mask).
+
+    Args:
+        batch_idx: Scalar batch coordinate of the table (after any head grouping).
+        index_head: Scalar index-head coordinate.
+        query_idx: Scalar local query coordinate, already clamped in range.
+        kv_block: Scalar key block coordinate (``kv_idx // block_size``), already clamped.
+        num_index_heads: Size of the table's index-head axis.
+        query_length: Size of the table's query axis.
+        num_blocks: Size of the table's key-block axis.
+
+    Returns:
+        int64 offset of ``[batch_idx, index_head, query_idx, kv_block]`` in the flattened table.
+    """
+    flat_head = batch_idx.to(torch.int64) * num_index_heads + index_head.to(torch.int64)
+    flat_query = flat_head * query_length + query_idx.to(torch.int64)
+    return flat_query * num_blocks + kv_block.to(torch.int64)
 
 
 class _AllGatherConcatFn(Function):
@@ -219,11 +278,11 @@ def cp_load_balanced_global_slots(
 class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
     """Context-parallel-aware drop-in for a MiniMax M3 sparse-attention layer.
 
-    Inherits every parameter and the eager forward from ``MiniMaxM3Attention``.
-    The only addition is ``_cp_mesh``, installed post-FSDP via
+    Inherits every parameter from ``MiniMaxM3Attention``. Supported local CUDA
+    SDPA/FA4 cases use FlexAttention without a quadratic per-head keep-mask.
+    Other SDPA cases retain the eager forward; unsupported local FA4 cases reject.
+    ``_cp_mesh`` is installed post-FSDP via
     :meth:`setup_cp_attention` (called by the MoE parallelizer's ``apply_cp``).
-    When CP is off (``_cp_mesh`` is None / size 1) it delegates to the parent's
-    eager sparse forward, so non-CP runs are unaffected.
 
     Under CP (``cp_size > 1``) the sequence is sharded across ranks, so the DSA
     block selection -- which is causal over the *global* sequence -- cannot be
@@ -272,8 +331,149 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
     ) -> torch.Tensor:
         cp_mesh = self._cp_mesh
         if cp_mesh is None or cp_mesh.size() <= 1 or self.indexer is None:
+            # Local sparse attention owns its explicit keep-mask. Compact packed
+            # metadata must not be silently dropped when bypassing generic FA4.
+            compact_packing_fields = (
+                "cu_seqlens",
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_padded",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
+                "max_seqlen",
+                "max_seqlen_q",
+                "max_seqlen_kv",
+                "packed_token_indices",
+                "_packed_seq_ids",
+            )
+            if (
+                self.indexer is not None
+                and self.backend.attn == "fa4"
+                and any(attn_kwargs.get(field) is not None for field in compact_packing_fields)
+            ):
+                raise NotImplementedError(
+                    "MiniMax M3 local FA4 sparse attention does not support compact packed metadata. "
+                    "This sparse layer requires unpacked BSHD inputs or an explicit 4-D document "
+                    "keep-mask without compact packing fields."
+                )
+            if (
+                self.indexer is not None
+                and x.is_cuda
+                and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and self.backend.attn in ("sdpa", "fa4")
+                and (self.backend.attn != "fa4" or x.dtype in (torch.float16, torch.bfloat16))
+                and not self.backend.rope_fusion
+                and attn_kwargs.get("qkv_format", "bshd") == "bshd"
+                and attn_kwargs.get("window_size", (-1, 0)) == (-1, 0)
+                and self.indexer.block_size == 128
+                and self.head_dim in (64, 128, 256)
+            ):
+                return self._local_sparse_forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
+            if self.indexer is not None and self.backend.attn == "fa4":
+                raise NotImplementedError(
+                    "MiniMax M3 local FA4 sparse attention requires CUDA FP16/BF16, "
+                    "non-fused RoPE, BSHD layout, block_size=128, head_dim in "
+                    "(64, 128, 256), and window_size=(-1, 0). Use attn='sdpa' "
+                    "for other supported generic sparse configurations."
+                )
             return super().forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
         return self._cp_forward(x, freqs_cis=freqs_cis, **attn_kwargs)
+
+    def _local_sparse_forward(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run local BSHD sparse attention without a ``[batch, heads, sequence, sequence]`` mask.
+
+        Block selection is unchanged. The optional caller keep-mask is composed inside
+        FlexAttention, including packed document masks and completely masked padding rows.
+
+        Args:
+            x: Hidden states [batch, sequence, hidden].
+            freqs_cis: Non-fused rotary cos/sin table [batch, sequence, rotary_dim].
+            attention_mask: Optional [batch, sequence] padding keep-mask or boolean
+                mask broadcastable to [batch, heads, sequence, sequence].
+
+        Returns:
+            Attention output [batch, sequence, hidden], with zero output for fully
+            masked queries, matching SDPA.
+        """
+        if x.dim() != 3:
+            raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
+        if attention_mask is not None:
+            if attention_mask.is_floating_point() and attention_mask.dim() >= 3:
+                raise ValueError("MiniMax M3 expects a padding keep-mask; additive float masks are not supported.")
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask[:, None, None, :]
+            if attention_mask.dim() != 4:
+                raise ValueError("MiniMax M3 attention_mask must be a 2-D padding or 4-D boolean keep-mask.")
+            expected = (x.shape[0], self.num_heads, x.shape[1], x.shape[1])
+            if any(size not in (1, extent) for size, extent in zip(attention_mask.shape, expected)):
+                raise ValueError(f"MiniMax M3 attention_mask {attention_mask.shape} cannot broadcast to {expected}.")
+            attention_mask = attention_mask.to(device=x.device, dtype=torch.bool)
+        q, k, v = self._project_qkv(x)
+        q, k = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=self.backend.rope_fusion)
+        q_positions = torch.arange(x.shape[1], device=x.device)
+        block_sel = self._select_local_blocks(x, freqs_cis=freqs_cis, q_positions=q_positions)
+        out = self._flex_sparse_attention(
+            q,
+            k,
+            v,
+            block_sel=block_sel,
+            q_positions=q_positions,
+            keep_mask=attention_mask,
+            rescue_pad_queries=False,
+        )
+        return self.o_proj(out.flatten(2))
+
+    def _select_local_blocks(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        q_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select key blocks once per checkpointed local attention call.
+
+        Only the final non-differentiable selection is retained for recompute.
+        Excluding the selection-only branch from TorchDispatch checkpoint modes
+        prevents selective checkpointing from saving its quadratic score matrix.
+        Trainable main Q/K/V projections and attention stay outside this region.
+
+        Args:
+            x: Hidden states [batch, sequence, hidden].
+            freqs_cis: Rotary cosine/sine table [batch, sequence, rotary_dim].
+            q_positions: Global token slots [sequence] for the local sequence.
+
+        Returns:
+            Boolean selected blocks [batch, index_heads, sequence, key_blocks],
+            where key_blocks is ceil(sequence / block_size). A replay aliases
+            the original selection, which callers must treat as read-only.
+        """
+        replay = sparse_route_replay.current()
+        if replay is not None and replay[1] == "replay":
+            cached = replay[0].take()
+            if cached is not None:
+                return cached
+
+        with torch.no_grad(), _disable_current_modes():
+            index_q, index_k = self.indexer.project_qk(x, freqs_cis=freqs_cis, cp_size=1, cp_rank=0)
+            block_sel = select_sparse_blocks(
+                index_q,
+                index_k,
+                block_size=self.indexer.block_size,
+                topk_blocks=self.indexer.topk_blocks,
+                init_blocks=self.indexer.init_blocks,
+                local_blocks=self.indexer.local_blocks,
+                score_type=self.indexer.score_type,
+                q_positions=q_positions,
+            )
+        if replay is not None and replay[1] == "record":
+            replay[0].record(block_sel)
+        return block_sel
 
     def _cp_forward(self, x: torch.Tensor, *, freqs_cis: torch.Tensor, **attn_kwargs: Any) -> torch.Tensor:
         if x.dim() != 3:
@@ -390,6 +590,8 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         key_valid: torch.Tensor | None = None,
         doc_global: torch.Tensor | None = None,
         q_doc: torch.Tensor | None = None,
+        keep_mask: torch.Tensor | None = None,
+        rescue_pad_queries: bool = True,
     ) -> torch.Tensor:
         from torch.nn.attention.flex_attention import create_block_mask
 
@@ -402,37 +604,104 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         qh = q.transpose(1, 2).contiguous()  # [B, num_heads, T_local, D]
         kh = k_global.transpose(1, 2).contiguous()  # [B, n_kv, T_global, D]
         vh = v_global.transpose(1, 2).contiguous()
+        # Local M3 has one index head per KV head, shared by a group of query
+        # heads. Move that group axis into batch so mask construction evaluates
+        # each predicate once instead of once per query head. CP retains its
+        # existing layout; an explicitly head-specific caller mask does too.
+        group_masks = (
+            not rescue_pad_queries
+            and self.indexer.num_index_heads == self.num_kv_heads
+            and (keep_mask is None or keep_mask.shape[1] == 1)
+        )
+        mask_batch, mask_heads = bsz, self.num_heads
+        if group_masks:
+            mask_batch, mask_heads = bsz * self.num_kv_heads, 1
+            qh = qh.reshape(mask_batch, rep, t_local, self.head_dim)
+            kh = kh.reshape(mask_batch, 1, t_global, self.head_dim)
+            vh = vh.reshape(mask_batch, 1, t_global, self.head_dim)
 
         # Composable predicate: causal (by global slot) + block selection, plus the
         # optional pad-key and per-document (block-diagonal) terms when supplied. The
         # ``is not None`` checks are resolved at trace time, so the compiled mask only
         # includes the active terms.
+        # Looked up through a flat int64 offset rather than ``block_sel[b, h, q, kb]``:
+        # the inlined int32 index arithmetic wraps for long sequences. See
+        # _block_sel_flat_offset.
+        sel_heads, sel_queries, sel_blocks = block_sel.shape[1], block_sel.shape[2], block_sel.shape[3]
+        block_sel_flat = block_sel.reshape(-1)
+
         def cp_sparse_mask(b, h, q_idx, kv_idx):
-            h_idx = h // rep
-            keep = (kv_idx <= q_positions[q_idx]) & block_sel[b, h_idx, q_idx, kv_idx // block_size]
+            # Mask construction visits padded tile boundaries too. Read metadata
+            # at zero for those lanes, then exclude them with in_bounds below.
+            # Using where avoids SymPy Min recursion in compiled ragged masks.
+            in_bounds = (q_idx < t_local) & (kv_idx < t_global)
+            q_idx = torch.where(q_idx < t_local, q_idx, 0)
+            kv_idx = torch.where(kv_idx < t_global, kv_idx, 0)
+            if group_masks:
+                h_idx = b % self.num_kv_heads
+                b = b // self.num_kv_heads
+            else:
+                h_idx = h // rep
+            sel_offset = _block_sel_flat_offset(
+                b, h_idx, q_idx, kv_idx // block_size, sel_heads, sel_queries, sel_blocks
+            )
+            keep = (kv_idx <= q_positions[q_idx]) & block_sel_flat[sel_offset]
             if key_valid is not None:
                 keep = keep & key_valid[b, kv_idx]
             if doc_global is not None:
                 keep = keep & (doc_global[b, kv_idx] == q_doc[b, q_idx])
-            # Guarantee every query row attends at least its own key. Real queries
+            if keep_mask is not None:
+                keep = (
+                    keep
+                    & keep_mask[
+                        b if keep_mask.shape[0] > 1 else 0,
+                        h if keep_mask.shape[1] > 1 else 0,
+                        q_idx if keep_mask.shape[2] > 1 else 0,
+                        kv_idx if keep_mask.shape[3] > 1 else 0,
+                    ]
+                )
+            # Guarantee every CP query row attends at least its own key. Real queries
             # already include self (causal + same-doc + the forced local block), so
             # this is a no-op for them; it only rescues *pad* queries whose every
             # key is otherwise masked (key_valid + same-doc exclude the pad's own
             # padded keys) -> an all--inf softmax row -> NaN, which would corrupt the
             # residual stream / MoE router / EP all-to-all even though the pad's loss
             # is discarded. Self-attention to a pad's own (discarded) V is harmless.
-            return keep | (kv_idx == q_positions[q_idx])
+            # The local SDPA contract instead returns zero for a completely masked
+            # query, and local_blocks=0 must not acquire an extra selected key.
+            if rescue_pad_queries:
+                keep = keep | (kv_idx == q_positions[q_idx])
+            return keep & in_bounds
 
+        # Selection still uses 128-token key blocks. FLASH on SM100/110
+        # pipelines two 128-row query tiles, so its execution mask needs a
+        # 256-row query block independently of the model's key-block size.
+        use_flash = self.backend.attn == "fa4" and not rescue_pad_queries
+        mask_block_size = (block_size, block_size)
+        if use_flash and torch.cuda.get_device_capability(q.device)[0] in (10, 11):
+            mask_block_size = (256, block_size)
         block_mask = create_block_mask(
             cp_sparse_mask,
-            B=bsz,
-            H=self.num_heads,
+            B=mask_batch,
+            H=mask_heads,
             Q_LEN=t_local,
             KV_LEN=t_global,
             device=q.device,
-            BLOCK_SIZE=block_size,
+            BLOCK_SIZE=mask_block_size,
             _compile=True,
         )
-        flex = _get_compiled_flex_attention()
-        out = flex(qh, kh, vh, block_mask=block_mask, scale=self.head_dim**-0.5, enable_gqa=True)
+        # The existing attn knob also selects FA4 for dense layers. Sparse
+        # local layers use Flex's mask-capable FLASH backend; CP keeps Triton.
+        flex = _get_compiled_flash_attention() if use_flash else _get_compiled_flex_attention()
+        out = flex(
+            qh,
+            kh,
+            vh,
+            block_mask=block_mask,
+            scale=self.head_dim**-0.5,
+            enable_gqa=True,
+            kernel_options={"BACKEND": "FLASH"} if use_flash else None,
+        )
+        if group_masks:
+            out = out.reshape(bsz, self.num_heads, t_local, self.head_dim)
         return out.transpose(1, 2)  # [B, T_local, num_heads, D]
