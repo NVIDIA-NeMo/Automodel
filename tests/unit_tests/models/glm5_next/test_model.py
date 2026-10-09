@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -122,8 +124,12 @@ def test_sparse_indexer_prepares_document_pools_once_across_query_chunks():
     assert calls == 1
 
 
-def test_cudnn_sparse_attention_matches_sdpa_absorbed_math(monkeypatch):
-    """The cuDNN dispatch preserves GLM-5.3 forward and gradient math."""
+@pytest.mark.parametrize(
+    ("length", "query_start", "query_end"),
+    [(1, 0, 1), (6, 0, 6), (69, 0, 69), (69, 5, 64)],
+)
+def test_cudnn_sparse_attention_matches_sdpa_absorbed_math(monkeypatch, length, query_start, query_end):
+    """Check absorbed math, sparse tails and nonzero local query offsets."""
     torch.manual_seed(19)
     config = tiny_glm5_next_config().text_config
     config.kv_lora_rank = 512
@@ -138,20 +144,120 @@ def test_cudnn_sparse_attention_matches_sdpa_absorbed_math(monkeypatch):
     monkeypatch.setattr(glm5_next_layers, "is_cudnn_sparse_attention_available", lambda: True)
     monkeypatch.setattr(glm5_next_layers, "cudnn_sparse_attention", _torch_sparse_latent_attention)
 
-    sdpa_input = torch.randn(1, 6, config.hidden_size, requires_grad=True)
+    cudnn.indexer_query_chunk_size = 17
+    sdpa_input = torch.randn(1, length, config.hidden_size, requires_grad=True)
     cudnn_input = sdpa_input.detach().clone().requires_grad_(True)
-    sdpa_output = sdpa._forward_document(sdpa_input, 0, 6)
-    cudnn_output = cudnn._forward_document(cudnn_input, 0, 6)
+    sdpa_output = sdpa._forward_document(sdpa_input, query_start, query_end)
+    with (
+        patch.object(cudnn.q_a_proj, "forward", wraps=cudnn.q_a_proj.forward) as q_a_projection,
+        patch.object(cudnn.q_b_proj, "forward", wraps=cudnn.q_b_proj.forward) as q_b_projection,
+        patch.object(cudnn.indexer, "select", wraps=cudnn.indexer.select) as selections,
+    ):
+        cudnn_output = cudnn._forward_document(cudnn_input, query_start, query_end)
     upstream = torch.randn_like(sdpa_output)
     (sdpa_output * upstream).sum().backward()
     (cudnn_output * upstream).sum().backward()
 
     torch.testing.assert_close(cudnn_output, sdpa_output, rtol=2e-4, atol=2e-6)
     torch.testing.assert_close(cudnn_input.grad, sdpa_input.grad, rtol=5e-4, atol=2e-6)
-    for name in ("q_b_proj.weight", "kv_a_proj_with_mqa.weight", "kv_b_proj.weight"):
-        sdpa_grad = dict(sdpa.named_parameters())[name].grad
-        cudnn_grad = dict(cudnn.named_parameters())[name].grad
-        torch.testing.assert_close(cudnn_grad, sdpa_grad, rtol=5e-4, atol=2e-6)
+    for name, sdpa_parameter in sdpa.named_parameters():
+        cudnn_parameter = dict(cudnn.named_parameters())[name]
+        if name.startswith("indexer."):
+            assert sdpa_parameter.grad is None
+            assert cudnn_parameter.grad is None
+        else:
+            assert sdpa_parameter.grad is not None, name
+            assert cudnn_parameter.grad is not None, name
+            torch.testing.assert_close(cudnn_parameter.grad, sdpa_parameter.grad, rtol=5e-4, atol=2e-6)
+
+    # The numerical assertions above stay valid for the old implementation.
+    # These dispatch assertions detect a regression in the intended batching.
+    assert q_b_projection.call_count == 1
+    assert q_a_projection.call_count == 1
+    positions = [call.args[2] for call in selections.call_args_list]
+    assert max(position.numel() for position in positions) <= cudnn.indexer_query_chunk_size
+    torch.testing.assert_close(torch.cat(positions), torch.arange(query_start, query_end))
+
+
+def test_cudnn_sparse_attention_packed_documents_match_separate_execution(monkeypatch):
+    """Packed cuDNN dispatch preserves each document's outputs and gradients."""
+    torch.manual_seed(91)
+    config = tiny_glm5_next_config().text_config
+    config.kv_lora_rank = 512
+    backend = tiny_backend()
+    backend.attn = "cudnn"
+    attention = Glm5NextSparseAttention(config, layer_idx=3, backend=backend)
+    attention.init_weights(torch.device("cpu"), init_std=0.02)
+    attention.indexer_query_chunk_size = 17
+    monkeypatch.setattr(glm5_next_layers, "is_cudnn_sparse_attention_available", lambda: True)
+    monkeypatch.setattr(glm5_next_layers, "cudnn_sparse_attention", _torch_sparse_latent_attention)
+    lengths = [5, 69, 7]
+    document_ids = torch.cat(
+        [torch.full((length,), index + 1, dtype=torch.int32) for index, length in enumerate(lengths)]
+    )
+    context = Glm5NextPackedContext(doc_ids=document_ids.unsqueeze(0))
+    packed_input = torch.randn(1, sum(lengths), config.hidden_size, requires_grad=True)
+    separate_input = packed_input.detach().clone().requires_grad_(True)
+    selected = []
+    original_select = attention.indexer.select
+
+    def record_selection(
+        query_hidden: torch.Tensor,
+        query_resid: torch.Tensor,
+        query_positions: torch.Tensor,
+        pool_keys: torch.Tensor,
+        pool_indices: torch.Tensor,
+        key_length: int,
+    ) -> torch.Tensor:
+        """Record actual document-local selections and check their boundaries.
+
+        Args:
+            query_hidden: Input states [1, queries, hidden].
+            query_resid: Low-rank queries [1, queries, q_lora_rank].
+            query_positions: Document-local query positions [queries].
+            pool_keys: Compressed keys [complete_pools, index_head_dim].
+            pool_indices: Raw document-local key positions [complete_pools, index_kpool].
+            key_length: Unpadded document length.
+
+        Returns:
+            Selected raw document-local key indices [1, queries, sparse_width].
+        """
+        indices = original_select(query_hidden, query_resid, query_positions, pool_keys, pool_indices, key_length)
+        assert (indices >= -1).all()
+        assert (indices < key_length).all()
+        assert (indices <= query_positions[None, :, None]).all()
+        selected.append(indices.detach().clone())
+        return indices
+
+    monkeypatch.setattr(attention.indexer, "select", record_selection)
+    packed_output = attention(packed_input, packed_context=context)
+    packed_selected = torch.cat(selected, dim=1)
+    selected.clear()
+    separate_output = torch.cat(
+        [
+            attention._forward_document(document, 0, document.shape[1])
+            for document in separate_input.split(lengths, dim=1)
+        ],
+        dim=1,
+    )
+    separate_selected = torch.cat(selected, dim=1)
+    torch.testing.assert_close(packed_selected.sort(dim=-1).values, separate_selected.sort(dim=-1).values)
+    local_positions = torch.cat([torch.arange(length) for length in lengths])
+    assert ((packed_selected[0] >= 0).sum(-1) < local_positions + 1).any()
+    upstream = torch.randn_like(packed_output)
+    (packed_output * upstream).sum().backward()
+    (separate_output * upstream).sum().backward()
+    torch.testing.assert_close(packed_output, separate_output, rtol=2e-4, atol=2e-6)
+    torch.testing.assert_close(packed_input.grad, separate_input.grad, rtol=5e-4, atol=2e-6)
+
+    perturbed = packed_input.detach().clone()
+    middle_document = slice(lengths[0], lengths[0] + lengths[1])
+    perturbed[:, middle_document] += torch.randn_like(perturbed[:, middle_document])
+    with torch.no_grad():
+        changed_output = attention(perturbed, packed_context=context)
+    torch.testing.assert_close(changed_output[:, : lengths[0]], packed_output[:, : lengths[0]], rtol=0, atol=0)
+    torch.testing.assert_close(changed_output[:, -lengths[-1] :], packed_output[:, -lengths[-1] :], rtol=0, atol=0)
+    assert not torch.allclose(changed_output[:, middle_document], packed_output[:, middle_document])
 
 
 def test_cudnn_sparse_attention_rejects_dropout():

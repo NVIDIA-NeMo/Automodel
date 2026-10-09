@@ -585,6 +585,7 @@ class Glm5NextSparseAttention(nn.Module):
     """NoPE MLA whose visibility is selected by the GLM KPool indexer."""
 
     query_chunk_size = 32
+    indexer_query_chunk_size = 256
 
     def __init__(self, config: Glm5NextTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
@@ -768,28 +769,29 @@ class Glm5NextSparseAttention(nn.Module):
             self.kv_lora_rank,
         )
         w_kc, w_vc = weight.split([self.qk_head_dim, self.v_head_dim], dim=1)
-        absorbed_queries = []
+        q_resid = self.q_a_layernorm(self.q_a_proj(full_hidden[:, query_start:query_end]))
         selected_indices = []
         length = full_hidden.shape[1]
-        for start in range(query_start, query_end, self.query_chunk_size):
-            end = min(start + self.query_chunk_size, query_end)
-            query_hidden = full_hidden[:, start:end]
-            q_resid = self.q_a_layernorm(self.q_a_proj(query_hidden))
-            query = self.q_b_proj(q_resid).view(1, end - start, self.num_heads, self.qk_head_dim)
-            absorbed_queries.append(torch.einsum("bqhd,hdc->bqhc", query, w_kc.to(query.dtype)).squeeze(0))
-            positions = torch.arange(start, end, device=full_hidden.device)
+        # Bound the FP32 [queries, index_heads, pools] score tensor to 256 MiB.
+        # At 256K/KPool4 this retains the original 32-query score workspace.
+        bytes_per_query = max(1, pool_keys.shape[0]) * self.indexer.n_heads * 4
+        indexer_chunk = min(self.indexer_query_chunk_size, max(1, (256 * 1024**2) // bytes_per_query))
+        for start in range(query_start, query_end, indexer_chunk):
+            end = min(start + indexer_chunk, query_end)
             indices = self.indexer.select(
-                query_hidden,
-                q_resid,
-                positions,
+                full_hidden[:, start:end],
+                q_resid[:, start - query_start : end - query_start],
+                torch.arange(start, end, device=full_hidden.device),
                 pool_keys,
                 pool_indices,
                 length,
             )
             selected_indices.append(indices.squeeze(0).unsqueeze(1))
 
+        query = self.q_b_proj(q_resid).view(1, query_end - query_start, self.num_heads, self.qk_head_dim)
+        absorbed_query = torch.einsum("bqhd,hdc->bqhc", query, w_kc.to(query.dtype)).squeeze(0)
         latent_output = cudnn_sparse_attention(
-            torch.cat(absorbed_queries, dim=0).contiguous(),
+            absorbed_query.contiguous(),
             latent.squeeze(0).unsqueeze(1).contiguous(),
             torch.cat(selected_indices, dim=0).contiguous(),
             self.scaling,
