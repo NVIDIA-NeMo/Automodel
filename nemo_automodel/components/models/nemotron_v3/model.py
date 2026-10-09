@@ -388,6 +388,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         position_ids: Optional[torch.LongTensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        compute_logits: bool = True,
+        compute_mtp: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs: Any,
@@ -412,6 +414,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             padding_mask: Padding mask ``[B, S]`` used by THD squeeze helper.
             logits_to_keep: If > 0, only compute logits for the last ``logits_to_keep``
                 token positions (avoids materialising the full logit matrix during generation).
+            compute_logits: Materialize LM-head logits; disable for response-only projection.
+            compute_mtp: Override auxiliary MTP computation while preserving checkpoint weights.
             output_hidden_states: Whether to return hidden states.
             return_dict: Accepted for API compatibility (always returns CausalLMOutputWithPast).
             **kwargs: Additional arguments forwarded to the base model
@@ -422,6 +426,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             ``logits`` (float32), optional ``loss``, ``past_key_values``, and
             ``hidden_states``.
         """
+        if not compute_logits and labels is not None:
+            raise ValueError("compute_logits=False cannot compute a label loss")
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -451,17 +457,18 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if past_key_values is not None:
             past_key_values.has_previous_state = True
 
-        # Optionally restrict logit computation to the last few positions.
-        # When logits_to_keep == 0 we compute all positions (training default).
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                logits = self.lm_head(hidden_states[slice_indices, :])
+        logits = None
+        if compute_logits:
+            # Optionally restrict logit computation to the last few positions.
+            # When logits_to_keep == 0 we compute all positions (training default).
+            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+                logits = self.lm_head(hidden_states)
             else:
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
-
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                if hidden_states.dim() == 2:
+                    logits = self.lm_head(hidden_states[slice_indices, :])
+                else:
+                    logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         if labels is not None:
             # Shift for next-token prediction
@@ -475,7 +482,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # Per-depth hidden states for the MTP auxiliary head; the recipe
         # dispatches CE per depth via the configured loss class.
         mtp_per_depth_h = None
-        if self.mtp is not None and self.training:
+        run_mtp = self.training if compute_mtp is None else compute_mtp
+        if self.mtp is not None and run_mtp:
             mtp_per_depth_h = self.mtp(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
@@ -493,7 +501,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # before returning (see the ``squeezed_for_thd`` branch); the lm_head
         # then yields ``[1, T, V]`` already and a second unsqueeze here would
         # produce a spurious ``[1, 1, T, V]``.
-        if is_thd and logits.dim() == 2:
+        if is_thd and logits is not None and logits.dim() == 2:
             logits = logits.unsqueeze(0)
 
         return NemotronHCausalLMOutputWithPast(

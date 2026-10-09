@@ -1089,3 +1089,24 @@ class TestNemotronV3ModelWithMoE:
         # Shared experts should not have gate_proj (relu2 is non-gated)
         assert shared_experts.gate_proj is None
         assert shared_experts.up_proj is not None
+
+
+def test_response_only_hidden_states_match_dense_logits_and_keep_mtp():
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+    config = MockNemotronV3Config(torch_dtype="float32", num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*")
+    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False)
+    model = NemotronHForCausalLM(config, backend=backend)
+    model.train()
+    ids = torch.tensor([[1, 2, 3, 4]])
+    native_keys = set(model.state_dict())
+    dense = model(ids, compute_mtp=False, output_hidden_states=True)
+    native = model(ids, compute_logits=False, compute_mtp=False, output_hidden_states=True)
+    assert native.logits is None
+    assert native.mtp_per_depth_h is None
+    assert model.mtp is not None
+    assert set(model.state_dict()) == native_keys
+    torch.testing.assert_close(model.lm_head(native.hidden_states[-1]), dense.logits)
+    native.hidden_states[-1].sum().backward()
+    assert any(parameter.grad is not None for parameter in model.model.parameters())
+    assert all(parameter.grad is None for parameter in model.mtp.parameters())
