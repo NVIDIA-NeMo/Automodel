@@ -581,6 +581,34 @@ class Glm5NextKPoolIndexer(nn.Module):
             self.index_kpool_compress_gate.fill_(1.0)
 
 
+def _dense_prefix_indices(
+    positions: torch.Tensor, index_topk: int, pool_size: int, always_select_tail: bool
+) -> torch.Tensor:
+    """Enumerate every visible key when all complete causal pools fit the budget.
+
+    Args:
+        positions: Document-local query positions [queries].
+        index_topk: Maximum number of tokens selected from complete pools.
+        pool_size: Number of tokens per complete pool.
+        always_select_tail: Whether to include the incomplete causal pool.
+
+    Returns:
+        Int32 indices [1, queries, index_topk + tail_width], with an ascending
+        valid prefix and -1 padding. The caller establishes that the complete
+        pool count of every query is no greater than index_topk // pool_size.
+    """
+    width = index_topk + (pool_size - 1 if always_select_tail else 0)
+    keys = torch.arange(width, dtype=torch.int32, device=positions.device)
+    visible = positions + 1
+    if not always_select_tail:
+        visible = visible.div(pool_size, rounding_mode="floor") * pool_size
+    return (
+        keys.view(1, 1, -1)
+        .expand(1, positions.numel(), -1)
+        .masked_fill(keys.view(1, 1, -1) >= visible.view(1, -1, 1), -1)
+    )
+
+
 class Glm5NextSparseAttention(nn.Module):
     """NoPE MLA whose visibility is selected by the GLM KPool indexer."""
 
@@ -778,14 +806,24 @@ class Glm5NextSparseAttention(nn.Module):
         indexer_chunk = min(self.indexer_query_chunk_size, max(1, (256 * 1024**2) // bytes_per_query))
         for start in range(query_start, query_end, indexer_chunk):
             end = min(start + indexer_chunk, query_end)
-            indices = self.indexer.select(
-                full_hidden[:, start:end],
-                q_resid[:, start - query_start : end - query_start],
-                torch.arange(start, end, device=full_hidden.device),
-                pool_keys,
-                pool_indices,
-                length,
-            )
+            positions = torch.arange(start, end, device=full_hidden.device)
+            # Skip only complete original chunks; sparse GEMM shapes stay unchanged.
+            if end // self.indexer.index_kpool <= self.indexer.index_topk // self.indexer.index_kpool:
+                indices = _dense_prefix_indices(
+                    positions,
+                    self.indexer.index_topk,
+                    self.indexer.index_kpool,
+                    self.indexer.always_select_tail,
+                )
+            else:
+                indices = self.indexer.select(
+                    full_hidden[:, start:end],
+                    q_resid[:, start - query_start : end - query_start],
+                    positions,
+                    pool_keys,
+                    pool_indices,
+                    length,
+                )
             selected_indices.append(indices.squeeze(0).unsqueeze(1))
 
         query = self.q_b_proj(q_resid).view(1, query_end - query_start, self.num_heads, self.qk_head_dim)
