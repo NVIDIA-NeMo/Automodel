@@ -13,13 +13,44 @@
 # limitations under the License.
 
 # Nemotron 3.5 Super VL text-only SFT with 262144-token THD packs.
+# The configuration below targets 32 H100 GPUs (4 nodes x 8 GPUs).
+# world = TP1 * CP32 * PP1 * DP1 = 32; EP32 = DP*CP.
 # CP32 gives 8192 token slots per rank, including padding. Packed documents
 # retain separate attention/Mamba boundaries.
-# world = TP1 * CP32 * PP1 * DP1 = 32 (4 nodes x 8 GPUs); EP32 = DP*CP.
 # GBS=8 and local batch=1 give 8 microbatches per optimizer step.
 #
-# Launch on four 8-GPU nodes and enable W&B with --wandb.enable=true.
-# Set PYTORCH_ALLOC_CONF=expandable_segments:True in the launch environment.
+# GB200 recommendation: 16 GPUs (4 nodes x 4 GPUs), EP16 / CP8 / DP2.
+# Update these fields in the corresponding sections below:
+#   distributed:
+#     cp_size: 8
+#     ep_size: 16
+#   loss_fn:
+#     _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+#     impl: torch_compile
+#   optimizer:
+#     exp_avg_dtype: torch.float32
+#     exp_avg_sq_dtype: torch.float32
+# This gives 32768 local token slots and 4 microbatches per rank at GBS=8.
+# Keep activation checkpointing, both reshard_after_forward settings, and
+# defer_fsdp_grad_sync: false. Retain master_weights and store_param_remainders
+# for FP32 master-weight precision with BF16 parameters.
+#
+# For this GB200 allocation, place all four nodes in one healthy NVLink domain.
+# Node count alone does not guarantee placement. On Slurm sites whose topology
+# blocks map to NVLink domains, use --segment=4 and verify the GPUs share the
+# same fabric CliqueId/ClusterUUID. Cross-domain HybridEP requires working RDMA;
+# dispatcher: torch is an alternative when that setup is unavailable.
+# Set these GB200 environment variables on every training rank:
+#   USE_MNNVL=1
+#   NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=16
+#   CUDA_DEVICE_MAX_CONNECTIONS=1
+#   TORCHINDUCTOR_COMPILE_THREADS=1
+# The HybridEP rank count is 16 for this single-domain allocation, not 4 GPUs
+# per node or the full rack capacity. Do not inherit 64 from a larger recipe:
+# it must match the participating ranks per domain and divide the EP group size.
+#
+# For either configuration, set PYTORCH_ALLOC_CONF=expandable_segments:True.
+# Enable online W&B with --wandb.enable=true and provide authentication.
 
 recipe: FinetuneRecipeForVLM
 
