@@ -159,19 +159,22 @@ def test_float32_rms_norm_dtensor(world_size, tmp_path):
     not torch.cuda.is_available(), reason="CUDA is required to reproduce the compiled grad/no_grad regression"
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("hidden", [257, 3584, 4096])
 # This checks actual Inductor compilation, including activation recomputation.
 @pytest.mark.runtime_budget(60, hard_timeout=70, reason="runs Inductor compilation and activation recomputation")
-def test_float32_rms_norm_compiled_determinism(dtype, monkeypatch):
+def test_float32_rms_norm_compiled_determinism(dtype, hidden, monkeypatch):
     from torch._dynamo.testing import CompileCounterWithBackend
 
     monkeypatch.delenv("TORCH_COMPILE_DISABLE", raising=False)
+    # Each parameter case owns a distinct counting backend and compilation cache.
+    torch._dynamo.reset()
     torch.manual_seed(17)
-    module = Float32RMSNorm(257, device="cuda", dtype=dtype)
+    module = Float32RMSNorm(hidden, device="cuda", dtype=dtype)
     with torch.no_grad():
         module.weight.normal_()
     counter = CompileCounterWithBackend("inductor")
     compiled = torch.compile(module, backend=counter, fullgraph=True, dynamic=True)
-    for shape, recompute in [((2, 7, 257), False), ((3, 5, 257), True)]:
+    for shape, recompute in [((2, 7, hidden), False), ((3, 5, hidden), True)]:
         x = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
         ref_x = x.detach().clone().requires_grad_()
         ref_weight = module.weight.detach().clone().requires_grad_()
@@ -179,8 +182,15 @@ def test_float32_rms_norm_compiled_determinism(dtype, monkeypatch):
         with torch.no_grad():
             no_grad_output = compiled(x)
         torch.testing.assert_close(actual, no_grad_output, rtol=0, atol=0)
-        expected = torch.nn.functional.rms_norm(ref_x.float(), (257,), ref_weight.float(), module.eps).to(dtype)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        expected = torch.nn.functional.rms_norm(ref_x.float(), (hidden,), ref_weight.float(), module.eps).to(dtype)
+        # Fusion changes fp32 reduction rounding, but grad/no_grad must remain
+        # bitwise identical. Bound both output and gradients against native math.
+        forward_rtol, forward_atol = (2e-6, 1e-7) if dtype == torch.float32 else (0.008, 1e-5)
+        torch.testing.assert_close(actual, expected, rtol=forward_rtol, atol=forward_atol)
+        reference_f64 = torch.nn.functional.rms_norm(ref_x.double(), (hidden,), ref_weight.double(), module.eps).to(
+            dtype
+        )
+        torch.testing.assert_close(actual, reference_f64, rtol=forward_rtol, atol=forward_atol)
         upstream = torch.randn_like(actual)
         actual.backward(upstream)
         expected.backward(upstream)
