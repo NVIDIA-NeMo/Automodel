@@ -18,7 +18,9 @@ from unittest.mock import MagicMock
 
 import torch
 from PIL import Image as PILImage
+from transformers.processing_utils import ProcessorMixin
 
+from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
     PackedSequenceContract,
@@ -1302,12 +1304,18 @@ def default_collate_fn(
         processing_kwargs["padding"] = "max_length"
         if drop_overlong:
             processing_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
+    chat_template = processor.chat_template if isinstance(processor, ProcessorMixin) else None
+    if isinstance(chat_template, dict):
+        chat_template = chat_template.get("default")
+    template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
+    template_kwargs = {"return_assistant_tokens_mask": True} if template_has_generation_kwd else {}
     batch = processor.apply_chat_template(
         conversations,
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
         processor_kwargs=processing_kwargs,
+        **template_kwargs,
     )
 
     if _post_tokenize_hook is not None:
@@ -1337,11 +1345,10 @@ def default_collate_fn(
                 value.to(torch.bfloat16) if isinstance(value, torch.Tensor) else value for value in pixel_values_videos
             ]
 
-    labels = build_labels_from_template(
-        batch["input_ids"],
-        conversations,
-        processor,
-    )
+    if template_has_generation_kwd:
+        labels = batch["input_ids"].masked_fill(batch.pop("assistant_masks") == 0, -100)
+    else:
+        labels = build_labels_from_template(batch["input_ids"], conversations, processor)
     batch["labels"] = labels[:, 1:]
 
     input_shape = batch["input_ids"].shape
