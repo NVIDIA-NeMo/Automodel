@@ -310,6 +310,58 @@ def test_ordered_drafter_trains_on_full_vocabulary_logits(device_and_dtype):
     torch.testing.assert_close(actual, expected)
 
 
+def test_ordered_drafter_backward_matches_full_vocabulary_head(device_and_dtype):
+    """Issue #4022: a target outside the selected centroid cluster gets the full-vocabulary gradient."""
+    import copy
+
+    from transformers.models.gemma4_assistant.modeling_gemma4_assistant import Gemma4AssistantMaskedEmbedder
+
+    from nemo_automodel.components.models.gemma4_drafter.model import Gemma4DrafterForCausalLM
+
+    device, dtype = device_and_dtype
+    torch.manual_seed(0)
+    base, base_text_cfg = _build_tiny_base(device, dtype)
+    plain, _ = _build_tiny_drafter(base_text_cfg, device, dtype)
+    ordered_cfg = copy.deepcopy(plain.config)
+    ordered_cfg.use_ordered_embeddings = True
+    ordered_cfg.num_centroids = 4
+    ordered_cfg.centroid_intermediate_top_k = 1
+    ordered = Gemma4DrafterForCausalLM(ordered_cfg).to(device=device, dtype=dtype).eval()
+    ordered.load_state_dict(plain.state_dict(), strict=False)
+    vocab = base_text_cfg.vocab_size
+    with torch.no_grad():
+        ordered.masked_embedding.token_ordering.copy_(torch.arange(vocab, device=device))
+
+    head_inputs = []
+    ordered.masked_embedding.register_forward_hook(lambda _m, args, _out: head_inputs.append(args[0].detach()))
+    ids = _input_ids(base_text_cfg, device, seq=6)
+    plain_logits = Gemma4WithDrafter(base, plain)(input_ids=ids).drafter_logits[0]
+    ordered_logits = Gemma4WithDrafter(base, ordered)(input_ids=ids).drafter_logits[0]
+
+    # With top-1 of 4 clusters over an identity token ordering, cluster c holds tokens [16c, 16c + 16).
+    hidden = head_inputs[0]
+    picked = ordered.masked_embedding.centroids(hidden).argmax(-1)
+    cluster_size = vocab // ordered_cfg.num_centroids
+    targets = ((picked + 1) % ordered_cfg.num_centroids) * cluster_size
+    assert not (targets // cluster_size == picked).any()
+
+    loss = torch.nn.functional.cross_entropy
+    loss(plain_logits.float().flatten(0, 1), targets.flatten()).backward()
+    loss(ordered_logits.float().flatten(0, 1), targets.flatten()).backward()
+    expected_grad = plain.model.embed_tokens.weight.grad
+    actual_grad = ordered.model.embed_tokens.weight.grad
+    assert ordered.lm_head.weight is ordered.model.embed_tokens.weight
+    torch.testing.assert_close(actual_grad, expected_grad)
+    target_rows = targets.unique()
+    assert actual_grad[target_rows].abs().sum(-1).gt(0).all()
+
+    # The HF ordered head gives those targets no gradient at all, which is what made training diverge.
+    hf_weight = ordered.lm_head.weight.detach().clone().requires_grad_()
+    hf_logits = Gemma4AssistantMaskedEmbedder.forward(ordered.masked_embedding, hidden, hf_weight)
+    loss(hf_logits.float().flatten(0, 1), targets.flatten()).backward()
+    assert hf_weight.grad[target_rows].abs().sum() == 0
+
+
 # ---------------------------------------------------------------------------
 # Gradient flow on a joint loss — the most failure-prone path. Both losses
 # must reach the parameters the plan promises will be trained.
