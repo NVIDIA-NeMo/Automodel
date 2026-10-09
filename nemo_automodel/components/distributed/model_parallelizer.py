@@ -240,6 +240,7 @@ def _parallelize_moe(
         moe_mesh=mesh_context.moe_mesh,
         activation_checkpointing=mesh_context.activation_checkpointing,
         ignore_router_for_ac=moe.ignore_router_for_ac,
+        checkpoint_moe_only=moe.checkpoint_moe_only,
         activation_checkpointing_scope=activation_checkpointing_scope,
         reshard_after_forward=reshard_after_forward,
         lm_head_precision=moe.lm_head_precision,
