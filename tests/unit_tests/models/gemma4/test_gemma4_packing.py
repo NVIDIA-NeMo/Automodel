@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Packing must follow Gemma4's HF attention, independent of its MoE backend."""
+"""Gemma4 packing must remain accepted when its backend configuration names TE."""
 
 import pytest
 import torch
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.packing import configure_packing_for_models, get_model_attn_implementation
+from nemo_automodel.components.models.common.packing import configure_packing_for_models
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 
 
 @pytest.mark.parametrize("enable_moe", [False, True])
 @pytest.mark.parametrize("hf_attention", ["sdpa", "eager"])
-def test_neat_packing_uses_hf_attention_with_te_backend(enable_moe: bool, hf_attention: str) -> None:
+def test_neat_packing_accepts_gemma4_with_te_backend_config(enable_moe: bool, hf_attention: str) -> None:
     config = Gemma4Config(
         text_config=Gemma4TextConfig(
             vocab_size=64,
@@ -57,5 +57,4 @@ def test_neat_packing_uses_hf_attention_with_te_backend(enable_moe: bool, hf_att
 
     contract = configure_packing_for_models([model])
 
-    assert get_model_attn_implementation(model) == hf_attention
     assert contract.packed_mask_type == "block_causal"

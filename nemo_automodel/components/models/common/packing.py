@@ -92,7 +92,7 @@ def get_packing_capabilities(
     *,
     model: torch.nn.Module | None = None,
 ) -> PackingCapabilities:
-    """Map a model attention implementation to NEAT packed-data requirements.
+    """Map a model attention implementation to semantic packed-data requirements.
 
     Args:
         attn_implementation: Attention implementation resolved from the built model.
@@ -104,18 +104,11 @@ def get_packing_capabilities(
         cross the dataset boundary.
 
     Raises:
-        ValueError: If native FA4 packing is requested without a native consumer,
-            or native TE packing has no model-owned packed-mask implementation.
+        ValueError: If native FA4 packing is requested without a native consumer.
     """
     model = getattr(model, "module", model)
     requires_metadata = isinstance(model, PackingMetadataConsumer) and model.requires_packed_sequence_metadata
     model_mask_type = model.packed_mask_type if isinstance(model, PackedMaskConsumer) else None
-    if attn_implementation == "te" and model_mask_type is None:
-        raise ValueError(
-            "Native Transformer Engine attention cannot consume NEAT's dense block-causal mask. "
-            "Use THD packing (VLM: packed_sequence.packing_format='thd'; "
-            "LLM: packed_sequence.packing_strategy='thd'), or select a supported NEAT attention backend."
-        )
     if attn_implementation == "fa4":
         uses_native_fa4 = isinstance(model, NativeFA4Consumer) and model._uses_native_fa4
         if not uses_native_fa4:

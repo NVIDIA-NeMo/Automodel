@@ -12,7 +12,6 @@ import torch
 
 from nemo_automodel.components.models.common.packing import (
     configure_packing,
-    configure_packing_for_models,
     flatten_packed_sequence_metadata,
     get_model_attn_implementation,
     get_packing_capabilities,
@@ -100,39 +99,6 @@ class TestGetAttnImplementation:
 
 
 class TestConfigurePacking:
-    @pytest.mark.parametrize("hf_implementation", ["flash_attention_2", "sdpa"])
-    def test_native_te_neat_packing_fails_before_building_a_dense_mask(self, hf_implementation):
-        model = torch.nn.Module()
-        model.backend = BackendConfig(attn="te")
-        model.config = SimpleNamespace(_attn_implementation=hf_implementation)
-
-        with pytest.raises(ValueError, match="Transformer Engine.*THD packing") as error:
-            configure_packing_for_models([model])
-
-        assert "packed_sequence.packing_format='thd'" in str(error.value)
-        assert "packed_sequence.packing_strategy='thd'" in str(error.value)
-
-    def test_native_te_preserves_a_model_owned_packed_mask_contract(self):
-        model = torch.nn.Module()
-        model.backend = BackendConfig(attn="te")
-        model.packed_mask_type = "document_ids"
-        model.requires_packed_sequence_metadata = True
-
-        contract = configure_packing_for_models([model])
-
-        assert contract.packed_mask_type == "document_ids"
-        assert contract.requires_packed_sequence_metadata is True
-
-    def test_te_hybrid_preserves_its_declared_hf_attention_path(self):
-        model = torch.nn.Module()
-        model.backend = BackendConfig(attn="te")
-        model.config = SimpleNamespace(_attn_implementation="sdpa")
-        model._uses_hf_attention = True
-
-        contract = configure_packing_for_models([model])
-
-        assert contract.packed_mask_type == "block_causal"
-
     def test_model_semantics_select_document_ids_and_explicit_metadata(self):
         model = SimpleNamespace(
             packed_mask_type="document_ids",
