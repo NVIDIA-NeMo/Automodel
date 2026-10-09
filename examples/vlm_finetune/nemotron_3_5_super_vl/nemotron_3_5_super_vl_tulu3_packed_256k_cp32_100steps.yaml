@@ -40,14 +40,12 @@
 # blocks map to NVLink domains, use --segment=4 and verify the GPUs share the
 # same fabric CliqueId/ClusterUUID. Cross-domain HybridEP requires working RDMA;
 # dispatcher: torch is an alternative when that setup is unavailable.
-# Set these GB200 environment variables on every training rank:
-#   USE_MNNVL=1
-#   NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=16
-#   CUDA_DEVICE_MAX_CONNECTIONS=1
-#   TORCHINDUCTOR_COMPILE_THREADS=1
-# The HybridEP rank count is 16 for this single-domain allocation, not 4 GPUs
-# per node or the full rack capacity. Do not inherit 64 from a larger recipe:
-# it must match the participating ranks per domain and divide the EP group size.
+# HybridEP versions with automatic fabric/rank detection can leave USE_MNNVL
+# and NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN unset. Clear inherited overrides:
+# USE_MNNVL=0 disables fabric use, and an inherited domain rank count of 64 is
+# invalid for this EP16 job. If explicitly overriding the domain rank count,
+# set NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=16 for this allocation: participating
+# ranks in the domain, not GPUs per node or full rack capacity.
 #
 # For either configuration, set PYTORCH_ALLOC_CONF=expandable_segments:True.
 # Enable online W&B with --wandb.enable=true and provide authentication.
