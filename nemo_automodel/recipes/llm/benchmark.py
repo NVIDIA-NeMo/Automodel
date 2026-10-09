@@ -396,6 +396,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
                     for opt in self.optimizer:
                         opt.step()
+                    if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+                        for mp in self.model_parts:
+                            mp.update_moe_gate_bias()
                     logger.debug("Optimizer step")
 
             # Match the training-loop lifecycle: record one complete eager

@@ -21,6 +21,8 @@ import pytest
 import torch
 from transformers import LlamaConfig, PretrainedConfig
 
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import Gate
 from nemo_automodel.components.utils.flops_utils import llama2_flops
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
@@ -1048,3 +1050,130 @@ class TestBenchmarkingRecipeLossCalculation:
         # Verify loss reduction includes context parallelism
         loss_reduction_calls = [call for call in dp_allreduce_calls if call["include_cp"]]
         assert len(loss_reduction_calls) >= 1
+
+
+class _BenchmarkRouterModel(torch.nn.Module):
+    """A tiny real MoE gate with observable optimizer-boundary state."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = Gate(
+            MoEConfig(
+                dim=2,
+                inter_dim=4,
+                moe_inter_dim=4,
+                n_routed_experts=4,
+                n_shared_experts=0,
+                n_activated_experts=1,
+                n_expert_groups=1,
+                n_limited_groups=1,
+                train_gate=True,
+                gate_bias_update_factor=0.125,
+                aux_loss_coeff=0.0,
+                score_func="sigmoid_with_bias",
+                route_scale=1.0,
+                norm_topk_prob=False,
+                dtype=torch.float32,
+            )
+        )
+        with torch.no_grad():
+            self.gate.weight.copy_(torch.tensor([[4.0, 0.0], [0.0, 0.0], [-4.0, 0.0], [-8.0, 0.0]]))
+        self.weights_at_bias_update: list[torch.Tensor] = []
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the actual gate and accumulate expert loads.
+
+        Args:
+            hidden_states: Tensor of shape [tokens, hidden=2].
+
+        Returns:
+            Tensor of selected routing weights with shape [tokens, top_k=1].
+        """
+        token_mask = torch.ones(hidden_states.shape[0], dtype=torch.bool)
+        weights, indices, _ = self.gate(hidden_states, token_mask, cp_mesh=None)
+        # The deliberately separated logits keep all tokens on expert zero,
+        # including after both optimizer and correction-bias updates.
+        torch.testing.assert_close(indices, torch.zeros_like(indices))
+        return weights
+
+    def update_moe_gate_bias(self) -> None:
+        """Apply the production gate update and retain its optimizer boundary."""
+        self.weights_at_bias_update.append(self.gate.weight.detach().clone())
+        self.gate.update_bias()
+
+
+@pytest.mark.parametrize("ga_steps", [1, 3])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("with_router", [False, True])
+def test_benchmark_router_bias_lifecycle(
+    mock_recipe: BenchmarkingRecipeForNextTokenPrediction,
+    ga_steps: int,
+    rank: int,
+    with_router: bool,
+) -> None:
+    """Update real router state once after every accumulated optimizer step."""
+    parts = (
+        [_BenchmarkRouterModel(), _BenchmarkRouterModel()]
+        if with_router
+        else [torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)]
+    )
+    initial_weights = [next(part.parameters()).detach().clone() for part in parts]
+    mock_recipe.model_parts = parts
+    mock_recipe.optimizer = [torch.optim.SGD(part.parameters(), lr=0.05) for part in parts]
+    mock_recipe.dist_env.rank = rank
+    mock_recipe.dist_env.is_main = rank == 0
+    mock_recipe.cfg.step_scheduler.local_batch_size = 1
+    mock_recipe.cfg.step_scheduler.global_batch_size = ga_steps
+    mock_recipe._get_dp_group_size = MagicMock(return_value=1)
+    mock_recipe._bench_steps = 2
+    mock_recipe._bench_warmup_steps = 0
+    mock_recipe._log_iteration_metrics = MagicMock()
+    mock_recipe._log_benchmark_summary = MagicMock()
+    mock_recipe._maybe_collect_garbage = MagicMock()
+    mock_recipe.dataloader = [
+        {"hidden_states": torch.ones(4, 2), "labels": torch.ones(1, 4, dtype=torch.long)} for _ in range(2 * ga_steps)
+    ]
+
+    def forward_backward(
+        ga_step_idx: int,
+        batch: dict[str, torch.Tensor],
+        *,
+        loss_buffer: list[torch.Tensor],
+        num_label_tokens: int | None,
+        num_batches: int,
+        is_train: bool,
+    ) -> None:
+        """Use actual CPU model forward/backward inside the native loop.
+
+        Args:
+            ga_step_idx: Index within the accumulation window.
+            batch: Contains hidden_states [tokens=4, hidden=2] and labels [1, 4].
+            loss_buffer: Receives detached scalar loss tensors.
+            num_label_tokens: Native benchmark loss-normalization argument.
+            num_batches: Number of accumulated microbatches.
+            is_train: Whether this is a training step.
+        """
+        for part in parts:
+            if isinstance(part, _BenchmarkRouterModel) and ga_step_idx == 0:
+                assert part.gate._cumulative_expert_load is None
+            loss = part(batch["hidden_states"]).sum() / num_batches
+            loss.backward()
+            loss_buffer.append(loss.detach())
+
+    mock_recipe._forward_backward_step = forward_backward
+    mock_recipe.run_benchmark()
+
+    for part, initial_weight in zip(parts, initial_weights):
+        final_weight = next(part.parameters()).detach()
+        assert not torch.equal(initial_weight, final_weight)
+        if isinstance(part, _BenchmarkRouterModel):
+            assert len(part.weights_at_bias_update) == 2
+            assert not torch.equal(initial_weight, part.weights_at_bias_update[0])
+            torch.testing.assert_close(part.weights_at_bias_update[-1], final_weight, rtol=0, atol=0)
+            torch.testing.assert_close(
+                part.gate.e_score_correction_bias,
+                torch.tensor([-0.25, 0.25, 0.25, 0.25]),
+                rtol=0,
+                atol=0,
+            )
+            assert part.gate._cumulative_expert_load is None
