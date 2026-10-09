@@ -97,6 +97,7 @@ from nemo_automodel._transformers.model_init import (
     no_hf_meta_device,
     resolve_sdpa_method,
 )
+from nemo_automodel.components.utils.parameter_config import ParameterConfig, apply_parameter_config
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
     from transformers.cache_utils import StaticCache
@@ -260,6 +261,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config,
         compile_config,
         load_base_model,
+        parameter_config: ParameterConfig | None = None,
         _retry_depth=0,
         **kwargs,
     ):
@@ -310,6 +312,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 fp8_config=fp8_config,
                 compile_config=compile_config,
                 load_base_model=load_base_model,
+                parameter_config=parameter_config,
                 _retry_depth=_retry_depth + 1,
                 **retry_kwargs,
             )
@@ -459,6 +462,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         attach_capabilities_and_validate(model, mesh)
 
+        if parameter_config is not None:
+            if weights_already_loaded:
+                raise ValueError("parameter_config requires initialization before pretrained weights are loaded")
+            apply_parameter_config(model, parameter_config)
+
         model = apply_model_infrastructure(
             model=model,
             pretrained_model_name_or_path=pretrained_path,
@@ -506,6 +514,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
+        parameter_config: ParameterConfig | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -561,6 +570,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 configuration. Default: None.
             activation_checkpointing (bool, default=False): Enable activation checkpointing
                 for transformer blocks to reduce memory usage. Default: False.
+            parameter_config (ParameterConfig | None, optional): Exact update surface
+                and storage precision, applied before checkpoint loading and sharding.
+                Requires a checkpoint-free/meta construction path. Default: None.
             peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.
@@ -624,6 +636,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             peft_config=peft_config,
             fp8_config=fp8_config,
             compile_config=compile_config,
+            parameter_config=parameter_config,
             load_base_model=True,
             **kwargs,
         )
@@ -651,6 +664,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
+        parameter_config: ParameterConfig | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -728,6 +742,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             peft_config=peft_config,
             fp8_config=fp8_config,
             compile_config=compile_config,
+            parameter_config=parameter_config,
             load_base_model=kwargs.pop("load_base_model", False),
             **kwargs,
         )
