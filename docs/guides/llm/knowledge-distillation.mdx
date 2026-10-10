@@ -140,6 +140,27 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 ```
 
+### Reduce KD Intermediate Memory
+
+Set `kd_loss_fn.chunk_size` to a positive number of valid tokens to trade
+backward recomputation for lower KD intermediate memory:
+
+```yaml
+kd_loss_fn:
+  _target_: nemo_automodel.components.loss.kd_loss.KDLoss
+  temperature: 1.0
+  fp32_upcast: true
+  chunk_size: 512
+```
+
+Each chunk keeps the full vocabulary and recomputes its FP32 loss intermediates
+during backward. Smaller chunks reduce the temporary working set and increase
+the number of launches. Compare complete training-step memory and time when
+choosing a size; teacher and student output logits occupy memory throughout the loss.
+The default `chunk_size: 0` disables chunking. Tensor-parallel loss ignores this
+setting. Tensor-valued temperatures and logits wider than 32 bits use eager
+chunking without recomputation.
+
 ### Current Constraints
 
 * Pipeline parallelism requires `pp_microbatch_size` to equal `pp_batch_size` so each student microbatch uses the correct teacher logits.
