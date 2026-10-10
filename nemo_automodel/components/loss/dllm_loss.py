@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.loss.chunked_ce import _validate_chunk_len
+from nemo_automodel.components.loss.kd_loss import KDLoss
 
 # Probability floor used throughout the SCDD schedule/ELBO. Quantities that are
 # exactly zero at the schedule boundaries (rho -> 1 gives a zero uniform base)
@@ -1078,3 +1079,109 @@ class IDLMLoss(nn.Module):
             alpha = self.clean_loss_weight
         loss = ce_noisy + alpha * ce_clean
         return DLLMLossOutput(total_loss=loss, dllm_loss=ce_noisy.detach().clone())
+
+
+def _total_variation_rows(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
+    """Per-row L1 distance between the student and teacher softmax distributions.
+
+    Args:
+        student_logits: Tensor of shape [rows, vocab].
+        teacher_logits: Tensor of shape [rows, vocab], detached.
+
+    Returns:
+        Tensor of shape [rows] with ``sum_v |softmax(student) - softmax(teacher)|`` in float32.
+    """
+    student_probs = F.softmax(student_logits, dim=-1, dtype=torch.float32)
+    teacher_probs = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
+    return (student_probs - teacher_probs).abs().sum(dim=-1)
+
+
+class UnoDistillLoss(nn.Module):
+    """Uno diffusion-adapter loss (Sahoo et al., 2026; arXiv:2609.04010).
+
+    Operates on the concatenated ``[x_t (L) | x_0 (L)]`` forward output produced under the
+    block-diffusion attention mask, where the LoRA adapter is gated on for the noisy ``x_t`` half
+    only. The clean half therefore gives the frozen AR distribution, which serves as the detached
+    teacher; the noisy half is the diffusion student. Both are compared at the same index over the
+    response positions:
+
+    .. math::
+        L = \\gamma \\cdot \\text{TV} + \\beta \\cdot \\text{KL}(p_\\text{student} \\| p_\\text{teacher})
+
+    - ``TV`` — the blockwise total-variation objective of the paper (Sec. 3, after Leviathan et al.
+      2023, Cor. 3.6): the full L1 distance ``sum_v |p_student - p_teacher|`` per position. Computed in position chunks wrapped in
+      :func:`torch.utils.checkpoint` so only one ``[chunk, vocab]`` pair of fp32 probabilities is
+      live at a time.
+    - ``KL`` — reverse KL, computed by :class:`KDLoss` with the arguments swapped (``KDLoss``
+      computes ``KL(P_teacher_arg || P_student_arg)``).
+
+    The released Uno-Qwen3-8B recipe uses TV only (``tv_weight=1``, ``kl_weight=0``).
+
+    Args:
+        tv_weight: Weight ``gamma`` of the total-variation term.
+        kl_weight: Weight ``beta`` of the reverse-KL term.
+        chunk_size: Positions per checkpointed TV chunk (also the ``KDLoss`` chunk size). ``None``
+            computes everything in one shot without checkpointing.
+    """
+
+    def __init__(self, tv_weight: float = 1.0, kl_weight: float = 0.0, chunk_size: int | None = 1024):
+        super().__init__()
+        self.tv_weight = float(tv_weight)
+        self.kl_weight = float(kl_weight)
+        self.chunk_size = None if chunk_size is None else _validate_chunk_len(chunk_size)
+        self.reverse_kl = KDLoss(chunk_size=self.chunk_size or 0)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        answer_mask: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        seq_len: int,
+        num_diffusion_tokens: int | None = None,
+    ) -> DLLMLossOutput:
+        """Compute the Uno distillation loss.
+
+        Args:
+            logits: Concatenated forward logits, Tensor of shape [batch, 2 * sequence, vocab] ordered
+                ``[x_t | x_0]``; the ``x_0`` half is the LoRA-off teacher and is detached here.
+            answer_mask: Bool Tensor of shape [batch, sequence] marking supervised (response)
+                positions, unshifted: position ``i`` compares the next-token distributions predicted
+                at ``i`` by the two halves.
+            valid_mask: Bool/long padding-validity Tensor of shape [batch, sequence].
+            seq_len: Length ``sequence`` of one copy.
+            num_diffusion_tokens: Global, DP-all-reduced supervised-token count used as the loss
+                denominator (summed across grad-accum microbatches and data-parallel ranks). Falls
+                back to the local supervised count when ``None``.
+
+        Returns:
+            :class:`DLLMLossOutput` with the weighted ``total_loss`` and ``dllm_loss`` set to the
+            detached TV term.
+        """
+        supervise = answer_mask.bool() & valid_mask.bool()
+        student_logits = logits[:, :seq_len, :][supervise]  # [tokens, vocab]
+        teacher_logits = logits[:, seq_len : 2 * seq_len, :][supervise].detach()  # [tokens, vocab]
+        denom = max(int(num_diffusion_tokens), 1) if num_diffusion_tokens is not None else max(int(supervise.sum()), 1)
+
+        num_tokens = student_logits.size(0)
+        if num_tokens == 0:
+            # Keep the zero connected to the logits so a fully masked microbatch still backpropagates.
+            zero = logits.sum() * 0.0
+            return DLLMLossOutput(total_loss=zero, dllm_loss=zero.detach().clone())
+
+        chunk = num_tokens if self.chunk_size is None else self.chunk_size
+        parts = []
+        for start in range(0, num_tokens, chunk):
+            args = (student_logits[start : start + chunk], teacher_logits[start : start + chunk])
+            if self.chunk_size is None:
+                parts.append(_total_variation_rows(*args))
+            else:
+                parts.append(torch.utils.checkpoint.checkpoint(_total_variation_rows, *args, use_reentrant=False))
+        tv = torch.cat(parts).sum() / denom
+
+        loss = self.tv_weight * tv
+        if self.kl_weight > 0:
+            labels = torch.zeros(num_tokens, dtype=torch.long, device=student_logits.device)
+            kl = self.reverse_kl(teacher_logits, student_logits, labels, num_batch_labels=denom)
+            loss = loss + self.kl_weight * kl
+        return DLLMLossOutput(total_loss=loss, dllm_loss=tv.detach().clone())

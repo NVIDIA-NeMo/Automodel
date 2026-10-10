@@ -1,0 +1,88 @@
+# Smoke config for Uno diffusion-adapter training (dllm.mode: uno) on a small Qwen3.
+#
+# Trains only a token-gated LoRA adapter on a frozen Qwen3: the adapter is on for the noisy x_t copy
+# and off for the clean x_0 copy, whose logits are the frozen AR teacher for the total-variation loss.
+# A short 3-stage block-size curriculum (2 -> 4 -> 8) exercises the stage switches within 6 steps.
+# Data: uno_smoke_data.jsonl holds the first 32 rows of open-thoughts/OpenThoughts3-1.2M (Apache-2.0,
+# revision 61bcf9d4, the Uno training set) in its ShareGPT format, truncated to 1500/2000 characters.
+#
+# Launched by L2_DLLM_Uno_Smoke.sh.
+
+recipe: DiffusionLMSFTRecipe
+
+step_scheduler:
+  global_batch_size: 2
+  local_batch_size: 1
+  max_steps: 6
+  num_epochs: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+seed: 42
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-0.6B
+  torch_dtype: float32
+  attn_implementation: sdpa
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["*_proj"]
+  dim: 16
+  alpha: 256      # Uno ratio alpha = 16 * r
+  dropout: 0.0
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  activation_checkpointing: true
+  mp_policy:              # fp32 end to end, like the SCDD smoke test
+    param_dtype: float32
+    reduce_dtype: float32
+    output_dtype: float32
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dllm:
+  mode: uno
+  tv_weight: 1.0
+  kl_weight: 0.0
+  block_curriculum:
+    tokens_per_step: 1024  # global_batch_size * seq_length
+    stages:
+      - {block_size: 2, tokens: 2048}
+      - {block_size: 4, tokens: 2048}
+      - {block_size: 8, tokens: 2048}
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+
+clip_grad_norm:
+  max_norm: 1.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: tests/functional_tests/dllm/uno_smoke_data.jsonl
+  seq_length: 512
+  padding: max_length
+  truncation: true
+  unshifted: true
+  tokenizer:
+    pretrained_model_name_or_path: Qwen/Qwen3-0.6B
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater

@@ -1,0 +1,128 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Uno diffusion-adapter training for Qwen3-8B (Sahoo et al., 2026, arXiv:2609.04010).
+#
+# Trains only a LoRA adapter on the frozen Qwen3-8B. The adapter is gated on for the noisy x_t copy of a
+# [x_t | x_0] block-diffusion forward and off for the clean x_0 copy, whose logits are the frozen AR
+# teacher; the loss is the total variation between the two. At inference the Psi-Spec sampler drafts a
+# block with the adapter on and verifies it losslessly with the adapter off.
+#
+# Hyperparameters follow the paper's Uno-Qwen3-8B setup:
+#   LoRA r=128, alpha=2048 on all 7 projections; TV loss only; lr 1e-5 with 562 warmup steps, then constant;
+#   global batch 128 x 4096 tokens; block-size curriculum 2 -> 4 -> 6 -> 8 -> 12 -> 16 over 3 epochs
+#   (28,125 steps) of OpenThoughts3-1.2M.
+#
+# The resulting adapter (checkpoint model/ directory) is a standard PEFT adapter, applied with the gate on
+# draft tokens only at inference.
+#
+# Usage (8 GPUs, single node):
+#   python -m torch.distributed.run --nproc-per-node=8 \
+#       nemo_automodel/recipes/dllm/train_ft.py \
+#       -c examples/dllm_sft/qwen3_8b_uno.yaml
+
+recipe: DiffusionLMSFTRecipe
+
+step_scheduler:
+  global_batch_size: 128    # per-device 1 x grad-accum 16 x 8 GPUs
+  local_batch_size: 1
+  ckpt_every_steps: 4688    # ~one curriculum stage
+  val_every_steps: 100000
+  max_steps: 28125          # last curriculum stage end
+  num_epochs: 3
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+seed: 20260813
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-8B
+  torch_dtype: float32      # fp32 master weights (LoRA trains in fp32), bf16 compute via mp_policy
+  attn_implementation: sdpa
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["*_proj"]   # q, k, v, o, gate, up, down
+  dim: 128
+  alpha: 2048
+  dropout: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/qwen3-8b-uno
+  model_save_format: safetensors
+
+distributed:
+  strategy: fsdp2
+  dp_size: null
+  tp_size: 1
+  cp_size: 1                 # Uno rejects context parallelism (block-diffusion mask)
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: float32
+
+dllm:
+  mode: uno
+  tv_weight: 1.0
+  kl_weight: 0.0
+  block_curriculum:          # 2 -> 16, block size grows every half epoch
+    tokens_per_step: 524288  # global_batch_size * seq_length
+    stages:
+      - {block_size: 2, tokens: 2457862144}
+      - {block_size: 4, tokens: 2457337856}
+      - {block_size: 6, tokens: 2457862144}
+      - {block_size: 8, tokens: 2457337856}
+      - {block_size: 12, tokens: 2457862144}
+      - {block_size: 16, tokens: 2457337856}
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0.0
+
+clip_grad_norm:
+  max_norm: 1.0
+
+lr_scheduler:
+  lr_decay_style: constant
+  init_lr: 0.0
+  lr_warmup_steps: 562
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: open-thoughts/OpenThoughts3-1.2M
+  split: train
+  shuffle_seed: 20260813
+  seq_length: 4096
+  padding: max_length
+  truncation: true
+  unshifted: true
+  tokenizer:
+    pretrained_model_name_or_path: Qwen/Qwen3-8B
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater

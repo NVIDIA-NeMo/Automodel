@@ -1,6 +1,6 @@
 ---
 title: "dLLM Fine-Tuning"
-description: "Fine-tune diffusion language models (dLLMs), including LLaDA, DiffusionGemma, DFlash, and I-DLM, with NeMo AutoModel."
+description: "Fine-tune diffusion language models (dLLMs), including LLaDA, DiffusionGemma, DFlash, I-DLM, and Uno, with NeMo AutoModel."
 position: 17
 ---
 ## Introduction
@@ -49,6 +49,7 @@ The following table lists the supported models, their training modes, loss funct
 | DiffusionGemma | `block_diffusion` | Flat block-diffusion cross-entropy and encoder AR | Built-in Hugging Face diffusion sampler (entropy-bounded denoising) | [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) |
 | DFlash | `dflash` | Decay-weighted cross-entropy (Equation 4) | Training only (decoding occurs in the speculative-decoding stack) | [dflash_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) |
 | I-DLM | `idlm` | Two block-diffusion cross-entropy terms (`CE_noisy + α·CE_clean`) | Block-by-block diffusion decoding | [qwen3_8b_idlm.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_idlm.yaml) |
+| Uno | `uno` | Total variation between the LoRA-on noisy copy and the frozen LoRA-off clean copy | Training only (the adapter drives Ψ-Spec speculative decoding outside AutoModel) | [qwen3_8b_uno.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_uno.yaml) |
 
 For a dedicated walkthrough of DiffusionGemma fine-tuning, including full fine-tuning and LoRA with expert parallelism for its 26B-A4B MoE, refer to the [DiffusionGemma Fine-Tuning Guide](/recipes-e2e-examples/diffusiongemma).
 
@@ -62,7 +63,7 @@ source .venv/bin/activate
 uv pip install "nemo-automodel"
 ```
 
-Alternatively, use the prebuilt Docker container.
+Alternatively, use the prebuilt Docker container:
 
 ```bash
 docker pull nvcr.io/nvidia/nemo-automodel:26.10.00
@@ -75,8 +76,8 @@ For the full set of installation methods, see the [Installation Guide](/get-star
 
 The following components drive dLLM fine-tuning:
 
-1. A recipe script ([`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/dllm/train_ft.py)) orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
-2. A YAML configuration file specifies the model, data, optimizer, dLLM-specific settings, and distributed training strategy.
+- A recipe script ([`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/dllm/train_ft.py)) orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
+- A YAML configuration file specifies the model, data, optimizer, dLLM-specific settings, and distributed training strategy.
 
 The recipe uses a strategy pattern to handle differences between model families. The `dllm.mode` field in the YAML configuration selects the strategy.
 
@@ -88,6 +89,7 @@ The recipe uses a strategy pattern to handle differences between model families.
 | `block_diffusion` | `BlockDiffusionStrategy` | DiffusionGemma-style: uniform random-token corruption over a response canvas, with flat cross-entropy and co-trained encoder AR loss |
 | `dflash` | `DFlashStrategy` | DFlash: frozen target LM provides hidden states, and the draft model trains with decay-weighted loss |
 | `idlm` | `IDLMStrategy` | I-DLM: converts an AR LM to a diffusion LM using an all-masked `[x_t \| x_0]` block-diffusion forward pass |
+| `uno` | `UnoStrategy` | Uno: trains a token-gated LoRA adapter on a frozen AR LM over the I-DLM `[x_t \| x_0]` forward pass, with uniform noise and a total-variation loss |
 
 ### Configure LLaDA
 
@@ -122,7 +124,7 @@ Because the objective covers every supervised position (corrupted or not), the l
 the supervised-token count, not the corrupted-token count.
 
 Refer to [`llada_scdd.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_scdd.yaml)
-for the full working configuration. The following example shows the key dLLM-specific sections.
+for the full working configuration. The following example shows the key dLLM-specific sections:
 
 ```yaml
 model:
@@ -211,9 +213,9 @@ The following table describes the key configuration fields for dLLM fine-tuning:
 
 | Field | Description |
 |-------|-------------|
-| `dllm.mode` | Training strategy (`mdlm`, `scdd`, `hybrid`, `block_diffusion`, `dflash`, or `idlm`) |
-| `dllm.mask_token_id` | Token ID used for masking (`126336` for LLaDA, `156895` for LLaDA2.1, `100` for Nemotron-Labs-Diffusion). Unused by `block_diffusion`. |
-| `dllm.eps` | Minimum corruption ratio to avoid zero-corruption samples |
+| `dllm.mode` | Training strategy (`mdlm`, `scdd`, `hybrid`, `block_diffusion`, `dflash`, `idlm`, or `uno`). |
+| `dllm.mask_token_id` | Token ID used for masking (`126336` for LLaDA, `156895` for LLaDA2.1, `100` for Nemotron-Labs-Diffusion). Unused by `block_diffusion` and `uno`. |
+| `dllm.eps` | Minimum corruption ratio to avoid zero-corruption samples. |
 | `dllm.block_size` | Hybrid: when set, use blockwise corruption (otherwise uniform). Block-diffusion: response-block size for one-canvas-per-step selection (default `256`). |
 | `dllm.encoder_loss_weight` | Weight on the co-trained encoder AR loss. Block-diffusion only (default `1.0`). |
 | `dllm.self_conditioning_p` | Per-example probability of two-pass self-conditioning. Block-diffusion only (default `0.5`). |
@@ -222,6 +224,8 @@ The following table describes the key configuration fields for dLLM fine-tuning:
 | `dllm.block_length` | Diffusion block size for the I-DLM block-diffusion mask (paper curriculum 1→2→3). I-DLM mode only. |
 | `dllm.clean_loss_weight` | Fixed `α` on the clean-copy verification CE (paper `0.2`). I-DLM mode only. |
 | `dllm.auto_balance_clean_loss` | Replaces `α` with `(CE_noisy/CE_clean).detach()` (paper Equation 2, b3 stage). I-DLM mode only. |
+| `dllm.block_curriculum` | Block-size curriculum: `tokens_per_step` (`global_batch_size × seq_length`) and `stages` of `{block_size, tokens}`; the block size grows as training passes each stage's token budget. Uno mode only; replaces `block_length`. |
+| `dllm.tv_weight` / `dllm.kl_weight` | Weights of the total-variation and reverse-KL terms (defaults `1.0` and `0.0`). Uno mode only. |
 | `dllm.vocab_size` | Vocabulary size, including `[MASK]`. Required by `scdd` and `block_diffusion`, whose corruption draws replacement tokens over the vocabulary (`262144` for DiffusionGemma). |
 | `dllm.num_timesteps` | Number of discrete diffusion steps `T` in the SCDD NELBO (default `1000`). SCDD mode only. |
 | `dllm.uniform_ratio` | Peak share of uniform (correctable) noise. `0` degenerates SCDD to plain MDLM. SCDD mode only. |
@@ -263,12 +267,12 @@ The following table describes the key configuration fields for DFlash fine-tunin
 
 | Field | Description |
 |-------|-------------|
-| `dflash.target_model_id` | Hub ID of the frozen causal LM that conditions the draft |
+| `dflash.target_model_id` | Hub ID of the frozen causal LM that conditions the draft. |
 | `dflash.block_size` | Tokens per draft block. `0` reads from the draft model config. |
 | `dflash.loss_decay_gamma` | Decay γ for Equation 4. `0` uses paper defaults (7, 5, and 4 for block sizes 16, 10, and 8). |
-| `dflash.num_blocks_per_sample` | Number of anchor blocks processed per sequence per step (paper default: 512, Appendix A.1) |
+| `dflash.num_blocks_per_sample` | Number of anchor blocks processed per sequence per step (paper default: 512, Appendix A.1). |
 | `dflash.attention_backend` | `flex_attention` (sparse, scales to 512 anchors) or `sdpa` (dense, runs out of memory above approximately 64). The default is `sdpa` for backward compatibility. Set it to `flex_attention` for production runs. |
-| `dflash.overlap_anchors` | `true` (paper, independent sampling) or `false` (non-overlapping stars-and-bars, caps at `seq_len // block_size`) |
+| `dflash.overlap_anchors` | `true` (paper, independent sampling) or `false` (non-overlapping stars-and-bars, caps at `seq_len // block_size`). |
 
 #### DFlash Training Metrics
 
@@ -276,7 +280,7 @@ In addition to the shared metrics (such as `loss`, `grad_norm`, `lr`, `mem`, `tp
 
 | Metric | Meaning | Where |
 |--------|---------|-------|
-| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` | Console line and `wandb`, `mlflow`, `comet`, and file loggers |
+| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` | Console line and `wandb`, `mlflow`, `comet`, and file loggers. |
 | `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`), which forms the acceptance-length curve | `wandb`, `mlflow`, `comet`, and file loggers (one panel per offset). Intentionally omitted from the console line to keep it readable. |
 
 Both metrics are computed from the logits that the chunked linear cross-entropy path already produces, without an additional model forward pass. They are reduced across data-parallel and context-parallel ranks using per-rank raw `(correct, count)` sums. An all-reduce operation sums these values before division. This process ensures that the values are correct across arbitrary per-rank token distributions in any AutoModel distributed mode.
@@ -313,7 +317,7 @@ You can then point the recipe configuration `dataset.path_or_dataset_id` to the 
 
 I-DLM ([Introspective Diffusion LM](https://arxiv.org/abs/2604.11035), Yu et al., 2026) converts a pretrained autoregressive LM into a diffusion LM by all-masked fine-tuning. Each step concatenates a fully masked copy `x_t` and the clean copy `x_0` into a length-`2L` sequence run under a block-diffusion attention mask, with a Dream-style next-token logit shift. Two cross-entropy terms, both over the response tokens, are combined: `CE_noisy` (decode `q`, the masked copy conditioned on the clean ground-truth prefix) and `CE_clean` (verify `p`, the clean copy under strict causal attention).
 
-See [`qwen3_8b_idlm.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_idlm.yaml) for the full working configuration. The following example shows the key I-DLM-specific sections.
+See [`qwen3_8b_idlm.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_idlm.yaml) for the full working configuration. The following example shows the key I-DLM-specific sections:
 
 ```yaml
 model:
@@ -334,6 +338,32 @@ dataset:
 ```
 
 The mask is built for `sdpa` or `eager` (dense additive) or `flex_attention` (sparse `BlockMask`, preferred at scale). FlashAttention-2 is unsupported because it ignores arbitrary masks, and context parallelism is also unsupported. The paper trains a `block_length` 1→2→3 curriculum (one epoch each). Run the stages as successive fine-tunes, and enable `auto_balance_clean_loss` at the b3 stage.
+
+### Configure Uno
+
+[Uno](https://arxiv.org/abs/2609.04010) (Sahoo et al., 2026) adds diffusion weights to a frozen autoregressive LM as a LoRA adapter so that the model can draft a block of tokens in parallel and verify them losslessly with the same weights, without a separate draft model. Training uses the I-DLM `[x_t | x_0]` forward pass: every response token in `x_t` is replaced by a uniform random token, the adapter is applied to the `x_t` copy only, and the loss is the total variation between the adapter-on `x_t` and the frozen adapter-off `x_0` next-token distributions. The block size follows an increasing curriculum.
+
+See [`qwen3_8b_uno.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_uno.yaml) for the full configuration of the released Uno-Qwen3-8B recipe. The following example shows the key Uno-specific sections:
+
+```yaml
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["*_proj"]
+  dim: 128
+  alpha: 2048
+
+dllm:
+  mode: uno
+  tv_weight: 1.0
+  block_curriculum:
+    tokens_per_step: 524288      # global_batch_size * seq_length
+    stages:
+      - {block_size: 2, tokens: 2457862144}
+      # ... 4, 6, 8, 12
+      - {block_size: 16, tokens: 2457337856}
+```
+
+Uno requires a `peft:` LoRA config and, like I-DLM, does not support FlashAttention-2 or context parallelism. The saved adapter (the checkpoint's `model/` directory) is a standard PEFT adapter for Uno's lossless speculative decoding.
 
 ## Fine-Tune the Model
 
@@ -379,6 +409,14 @@ uv run torchrun --nproc-per-node=8 \
 uv run torchrun --nproc-per-node=8 \
     nemo_automodel/recipes/dllm/train_ft.py \
     -c examples/dllm_sft/qwen3_8b_idlm.yaml
+```
+
+### Fine-Tune with Uno
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+    nemo_automodel/recipes/dllm/train_ft.py \
+    -c examples/dllm_sft/qwen3_8b_uno.yaml
 ```
 
 ### Fine-Tune Nemotron-Labs-Diffusion
