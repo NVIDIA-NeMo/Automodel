@@ -19,6 +19,7 @@ from typing import Callable, Iterator, List, Optional, Set, Tuple, Union
 import torch
 import torch.nn as nn
 from torch.distributed.fsdp import (
+    FSDPModule,
     fully_shard,
 )
 
@@ -159,13 +160,26 @@ def _fully_shard_storage_and_compute_dtypes(
     already distributed outside FSDP remain excluded from every group.
     """
     ignored = set() if ignored_params is None else set(ignored_params)
-    predicate = lambda tensor: torch.is_floating_point(tensor) and tensor not in ignored
+
+    def unmanaged_parameters(target):
+        yield from target.parameters(recurse=False)
+        for child in target.children():
+            if not isinstance(child, FSDPModule):
+                yield from unmanaged_parameters(child)
+
+    unmanaged = list(unmanaged_parameters(module))
+    unmanaged_ids = {id(tensor) for tensor in unmanaged}
+    predicate = lambda tensor: id(tensor) in unmanaged_ids and torch.is_floating_point(tensor) and tensor not in ignored
     group_key = lambda tensor: (tensor.dtype, compute_dtype_of(tensor))
     groups = {}
-    for parameter in module.parameters():
+    for parameter in unmanaged:
         if parameter not in ignored:
             groups.setdefault(group_key(parameter), []).append(parameter)
     if not groups:
+        fully_shard(
+            module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy,
+            reshard_after_forward=reshard_after_forward, ignored_params=ignored,
+        )
         return
 
     def shard(target, key):
@@ -193,3 +207,10 @@ def _fully_shard_storage_and_compute_dtypes(
                 shard(subtree, key)
     if len(groups) == 2:
         shard(module, next(key for key in groups if key != minority))
+    else:
+        # All numerical parameters belong to child groups; retain the normal
+        # root FSDP hooks without wrapping any already-managed child again.
+        fully_shard(
+            module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy,
+            reshard_after_forward=reshard_after_forward, ignored_params=ignored,
+        )
