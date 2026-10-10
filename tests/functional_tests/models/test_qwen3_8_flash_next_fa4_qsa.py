@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
-from nemo_automodel.components.models.qwen3_8_flash_next.qsa import qsa_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.qsa import qsa_gqa_attention, select_qsa_cuda_kernel
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
@@ -97,7 +97,7 @@ def test_output_and_all_gradients(seed: int, batch: int, sq: int, sk: int, width
         routes[:, 3 : sq // 2] = routes[:, 3 : sq // 2].remainder(sk // 3)
         routes[:, sq // 2 :] = routes[:, sq // 2 :].remainder(sk - sk * 2 // 3) + sk * 2 // 3
     scale = 0.125
-    out = qsa_gqa_attention(q, k, v, routes, backend="cute", softmax_scale=scale)
+    out = qsa_gqa_attention(q, k, v, routes, cuda_kernel=select_qsa_cuda_kernel("fa4"), softmax_scale=scale)
     grads = torch.autograd.grad(out, (q, k, v), dy)
     inputs64 = [x.detach().double().requires_grad_() for x in (q, k, v)]
     ref, mask = _reference(*inputs64, routes, scale=scale)
@@ -203,8 +203,8 @@ def test_4k_routes_with_sampled_fp64_backward() -> None:
 def test_model_qsa_layer_parameter_gradients(monkeypatch: pytest.MonkeyPatch) -> None:
     import copy
 
+    from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.qwen3_8_flash_next import qsa
-    from nemo_automodel.components.models.qwen3_8_flash_next.backend import Qwen3_8_FlashNextBackendConfig
     from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
     from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
 
@@ -229,9 +229,7 @@ def test_model_qsa_layer_parameter_gradients(monkeypatch: pytest.MonkeyPatch) ->
         partial_rotary_factor=0.25,
         rope_parameters={"rope_theta": 10000.0, "rope_type": "default", "partial_rotary_factor": 0.25},
     )
-    backend = Qwen3_8_FlashNextBackendConfig(
-        attn="cute", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch"
-    )
+    backend = BackendConfig(attn="fa4", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
     layer = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=backend).cuda()
     layer.init_weights(buffer_device=torch.device("cuda"))
     reference = copy.deepcopy(layer)
