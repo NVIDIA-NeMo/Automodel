@@ -39,6 +39,20 @@ from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 
 
+def _clamped_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float, output_dtype: torch.dtype) -> torch.Tensor:
+    """Apply asymmetric FP32 SwiGLU clamps and cast once before the down projection."""
+    gate = gate.float().clamp(max=limit)
+    up = up.float().clamp(min=-limit, max=limit)
+    return (F.silu(gate) * up).to(output_dtype)
+
+
+_compiled_clamped_swiglu = torch.compile(
+    _clamped_swiglu,
+    dynamic=False,
+    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+)
+
+
 class MLP(nn.Module):
     """
     Multi-Layer Perceptron (MLP) used as a feed-forward layer.
@@ -112,10 +126,8 @@ class MLP(nn.Module):
         if self.swiglu_limit > 0.0:
             # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
             # gate clamp and symmetric up clamp; cast back before down_proj.
-            dtype = x.dtype
-            gate = self.gate_proj(x).float().clamp(max=self.swiglu_limit)
-            up = self.up_proj(x).float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-            return self.down_proj((F.silu(gate) * up).to(dtype))
+            activation = _compiled_clamped_swiglu if x.is_cuda else _clamped_swiglu
+            return self.down_proj(activation(self.gate_proj(x), self.up_proj(x), self.swiglu_limit, x.dtype))
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
