@@ -17,7 +17,6 @@ import torch
 import torch.distributed.nn.functional as dist_nn_func
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
 
 try:
     from torch.distributed.tensor import DTensor, Shard
@@ -63,7 +62,7 @@ def _forward_kl_from_log_probs(
     """
     teacher_prob = teacher_log_prob.exp()
     log_ratio = teacher_log_prob - student_log_prob
-    log_ratio = torch.where(teacher_prob > 0, log_ratio, torch.zeros_like(log_ratio))
+    log_ratio = torch.where(teacher_prob > 0, log_ratio, 0.0)
     return (teacher_prob * log_ratio).sum(dim=-1)
 
 
@@ -186,7 +185,7 @@ def _kl_forward_raw_chunk(
     temperature: float,
     fp32_upcast: bool,
 ) -> torch.Tensor:
-    """Compute a raw-logit chunk's KL inside the checkpoint boundary.
+    """Compute a raw-logit chunk's KL with chunk-local preprocessing.
 
     Args:
         t_logits: Tensor of shape ``[tokens, vocab]`` containing teacher logits.
@@ -199,12 +198,16 @@ def _kl_forward_raw_chunk(
     """
     if fp32_upcast:
         t_logits = t_logits.float()
-        s_logits = s_logits.float()
     if temperature != 1.0:
         t_logits = t_logits.mul(1.0 / temperature)
-        s_logits = s_logits.mul(1.0 / temperature)
     teacher_logprob = F.log_softmax(t_logits, dim=-1, dtype=torch.float32)
+    del t_logits
+    if fp32_upcast:
+        s_logits = s_logits.float()
+    if temperature != 1.0:
+        s_logits = s_logits.mul(1.0 / temperature)
     student_logprob = F.log_softmax(s_logits, dim=-1, dtype=torch.float32)
+    del s_logits
     return _forward_kl_from_log_probs(teacher_logprob, student_logprob)
 
 
@@ -229,10 +232,9 @@ class KDLoss(nn.Module):
             tensors.
         chunk_size: When positive, valid tokens are processed in chunks of this size to avoid
             materializing the full ``[num_valid_tokens, vocab_size]`` probability matrix in fp32.
-            With a Python scalar temperature, chunks are checkpointed to recompute fp32 intermediates
-            during backward, trading computation for memory. Tensor-valued temperatures and
-            logits wider than 32 bits retain eager chunking, as does a single chunk covering all
-            valid tokens. ``0`` (default) disables chunking.
+            With a Python scalar temperature, multi-chunk logits up to 32 bits use chunk-local
+            preprocessing. Other inputs retain the existing preprocessing path.
+            ``0`` (default) disables chunking.
             Ignored when using the TP path.
     """
 
@@ -319,19 +321,11 @@ class KDLoss(nn.Module):
             and t_logits.element_size() <= 4
             and s_logits.element_size() <= 4
         ):
-            # Keep casts inside checkpoint so only the raw logits survive until backward.
-            kl_parts = []
-            for start in range(0, t_logits.shape[0], self.chunk_size):
-                end = start + self.chunk_size
+            kl_parts: list[torch.Tensor] = []
+            # Split shares one backward concatenation across all token chunks.
+            for t_chunk, s_chunk in zip(t_logits.split(self.chunk_size), s_logits.split(self.chunk_size)):
                 kl_parts.append(
-                    torch.utils.checkpoint.checkpoint(
-                        _kl_forward_raw_chunk,
-                        t_logits[start:end],
-                        s_logits[start:end],
-                        temperature=self.temperature,
-                        fp32_upcast=self.fp32_upcast,
-                        use_reentrant=False,
-                    )
+                    _kl_forward_raw_chunk(t_chunk, s_chunk, temperature=self.temperature, fp32_upcast=self.fp32_upcast)
                 )
             kl_per_token = torch.cat(kl_parts, dim=0)
         else:
