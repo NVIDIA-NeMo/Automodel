@@ -82,8 +82,9 @@ def test_kimi_k3_moe_uses_learned_gate_by_default():
 
 def test_kimi_k3_moe_honors_fake_balanced_gate():
     moe = _build_moe(_torch_backend(fake_balanced_gate=True, fake_gate_noise=0.25))
-    assert isinstance(moe.gate, FakeBalancedGate)
-    assert moe.gate.noise == 0.25
+    assert isinstance(moe.gate, KimiK3Gate)
+    assert isinstance(moe.balanced_gate, FakeBalancedGate)
+    assert moe.balanced_gate.noise == 0.25
 
 
 def test_kimi_k3_fake_balanced_gate_spreads_tokens_across_experts():
@@ -92,9 +93,31 @@ def test_kimi_k3_fake_balanced_gate_spreads_tokens_across_experts():
     token_mask = torch.ones(8, dtype=torch.bool)
 
     weights, indices, _ = moe.gate(hidden_states, token_mask, None)
+    indices = moe._maybe_balance_routing(indices, hidden_states)
 
     assert weights.shape == indices.shape == (8, moe.n_activated_experts)
     # noise=0.0 assigns tokens round-robin: every expert receives the same
     # number of (token, slot) assignments instead of collapsing onto [0..topk).
     counts = torch.bincount(indices.flatten(), minlength=moe.n_routed_experts)
     assert (counts == counts[0]).all()
+
+
+def test_kimi_k3_balanced_dispatch_retains_learned_gate_gradients():
+    torch.manual_seed(123)
+    moe = _build_moe(_torch_backend(fake_balanced_gate=True))
+    with torch.no_grad():
+        for parameter in moe.parameters():
+            parameter.normal_(std=0.1)
+    dispatched = []
+    handle = moe.experts.register_forward_pre_hook(lambda module, args: dispatched.append(args[3].detach()))
+    try:
+        with torch.compiler.set_stance("force_eager"):
+            output = moe(torch.randn(1, 8, moe.dim))
+            output.backward(torch.randn_like(output))
+    finally:
+        handle.remove()
+    counts = torch.bincount(dispatched[0].flatten(), minlength=moe.n_routed_experts)
+    assert (counts == 4).all()
+    assert isinstance(moe.gate, KimiK3Gate)
+    assert torch.isfinite(moe.gate.weight.grad).all()
+    assert moe.gate.weight.grad.abs().sum() > 0

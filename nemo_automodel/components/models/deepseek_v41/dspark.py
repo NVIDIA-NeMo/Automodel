@@ -223,15 +223,12 @@ class _DeepseekV41DSparkBlock(nn.Module):
         layer_idx = config.num_hidden_layers + stage_idx
         self.attn = _DeepseekV41DSparkAttention(config, layer_idx, backend)
         self.ffn = MoE(moe_config, backend)
-        # As in the backbone block, BackendConfig.fake_balanced_gate keeps the
-        # FakeBalancedGate that MoE built.
-        if not backend.fake_balanced_gate:
-            self.ffn.gate = DeepseekV4VisionGate(
-                DeepseekV4Config(vocab_size=config.vocab_size),
-                moe_config,
-                gate_precision=torch.float32,
-                hash_routing=False,
-            )
+        self.ffn.gate = DeepseekV4VisionGate(
+            DeepseekV4Config(vocab_size=config.vocab_size),
+            moe_config,
+            gate_precision=torch.float32,
+            hash_routing=False,
+        )
         norm = (
             partial(initialize_rms_norm_module, "te", device=self.attn.wq_a.weight.device)
             if backend.rms_norm == "te"

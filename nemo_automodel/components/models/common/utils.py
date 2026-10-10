@@ -464,13 +464,14 @@ class BackendConfig:
             unpermutation blocks. ``None`` preserves HybridEP's default.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
-        fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
-            that assigns tokens to experts without learned routing weights.
-        fake_gate_noise: Noise level [0, 1] for FakeBalancedGate. When > 0, uses
-            biased topk selection seeded from the input content so routing varies
-            dynamically across training steps (like real Gate) while remaining
-            deterministic for activation checkpointing recompute (same input = same
-            routing). Only used when fake_balanced_gate=True.
+        fake_balanced_gate: Benchmark-only. Execute the model's gate normally, then
+            replace expert indices with synthetic assignments from FakeBalancedGate.
+            Retains learned routing weights, gradients, auxiliary losses, and gate
+            statistics. With fake_gate_noise=0.0, assignments are balanced cyclically.
+        fake_gate_noise: Noise level [0, 1] for synthetic expert assignments. When > 0,
+            uses biased topk selection seeded from input content so routing varies
+            dynamically across training steps. Learned routing weights are unchanged.
+            Only used when fake_balanced_gate=True.
         enable_hf_state_dict_adapter: Whether to enable HuggingFace state dict adapter.
         enable_fsdp_optimizations: Whether to enable FSDP2 optimizations.
         gate_precision: Optional dtype override for the gate computation. Accepts
@@ -507,7 +508,7 @@ class BackendConfig:
             per-microbatch device-to-host reads of that metadata (`.tolist()` /
             `count_nonzero` / dispatcher size checks) by caching the first
             microbatch's values, removing recurring host-sync stalls on the hot
-            path. Never enable with a learned gate: cached metadata would go
+            path. Never enable with learned expert assignments: cached metadata would go
             stale and silently corrupt expert dispatch.
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
@@ -678,8 +679,6 @@ class BackendConfig:
                     f"{sorted(attention_graph_modules)} in cuda_graph.modules requires BF16 dot-product attention "
                     "(fp8_dpa=False)"
                 )
-        if "moe_router" in graph_modules and self.fake_balanced_gate:
-            raise ValueError("'moe_router' in cuda_graph.modules requires the learned Gate (fake_balanced_gate=False)")
         if "moe_preprocess" in graph_modules and self.dispatcher != "hybridep":
             raise ValueError("'moe_preprocess' in cuda_graph.modules requires dispatcher='hybridep'")
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)

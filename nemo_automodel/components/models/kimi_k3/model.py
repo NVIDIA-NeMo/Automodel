@@ -1150,13 +1150,10 @@ class KimiK3MoE(MoE):
         self.dim = moe_config.dim
         self.n_routed_experts = moe_config.n_routed_experts
         self.n_activated_experts = moe_config.n_activated_experts
-        if backend.fake_balanced_gate:
-            # Mirror the base MoE: with random-init weights the learned gate's
-            # near-equal scores make topk pick experts [0..topk) for every token,
-            # collapsing all traffic onto each EP group's first rank.
-            self.gate = FakeBalancedGate(moe_config, noise=backend.fake_gate_noise)
-        else:
-            self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        self.balanced_gate = (
+            FakeBalancedGate(moe_config, noise=backend.fake_gate_noise) if backend.fake_balanced_gate else None
+        )
         if backend.compile_situ:
             _compile_situ_cores()
         situ_backend = getattr(config, "situ_backend", "torch")
@@ -1218,7 +1215,16 @@ class KimiK3MoE(MoE):
         padding_mask: torch.Tensor | None = None,
         cp_mesh: Any = None,
     ) -> torch.Tensor:
-        """Run K3 MoE on ``[batch, sequence, hidden]`` states."""
+        """Run K3 shared and routed experts.
+
+        Args:
+            hidden_states: Local token states of shape [batch, sequence, hidden].
+            padding_mask: Optional boolean padding mask of shape [batch, sequence].
+            cp_mesh: Optional context-parallel mesh for the gate.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
         shape = hidden_states.shape
         identity = hidden_states.reshape(-1, shape[-1])
         token_mask = (
@@ -1228,6 +1234,7 @@ class KimiK3MoE(MoE):
         )
         gate_cp_mesh = cp_mesh if cp_mesh is not None else self.cp_mesh
         weights, indices, _ = self.gate(identity, token_mask, gate_cp_mesh)
+        indices = self._maybe_balance_routing(indices, identity)
         routed_input = self.routed_expert_down_proj(identity)
         # Shared-expert overlap (BackendConfig.shared_expert_overlap): the shared experts only
         # depend on ``identity``, so launch them on a side stream before the routed path and
