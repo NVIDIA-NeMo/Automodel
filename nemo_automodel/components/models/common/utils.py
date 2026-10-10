@@ -494,6 +494,10 @@ class BackendConfig:
             one fused kernel each, static shapes (a new sequence length compiles them again; past
             dynamo's recompile limit a core runs eager). Same lazy once-per-process pattern as
             ``compile_situ``; numerics are allclose to eager but not bitwise-identical.
+        compile_cache_quant: torch.compile DeepSeek V4.1's cache quantize/dequantize core
+            (the released fp8 / mxfp4 / nvfp4 cache rounding applied to SWA KV, index Q/K and
+            compressed KV): a dozen elementwise kernels per cache tensor become one or two. Same
+            lazy once-per-process pattern as ``compile_hc``; numerics match eager.
         shared_expert_overlap: run the shared experts of MoE models (the shared ``MoE`` class, e.g. DeepSeek V4 / V4.1, and Kimi K3)
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
             communication of the routed path; numerics unchanged. Default False.
@@ -566,6 +570,10 @@ class BackendConfig:
     # (currently DeepSeek V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
     # Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_hc: bool = False
+    # When True, torch.compile DeepSeek V4.1's cache quantize/dequantize core (fp8 SWA KV, mxfp4 index
+    # Q/K, nvfp4 compressed KV): the per-tensor chain of a dozen elementwise kernels becomes one or two,
+    # same lazy once-per-process pattern as compile_hc. Numerics match eager (elementwise ops only). Default False.
+    compile_cache_quant: bool = False
     # When True, MoE models with shared experts (the shared MoE class and Kimi K3) run them on a side CUDA
     # stream, launched before the routed-expert path and joined after it, so the shared-expert
     # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's
