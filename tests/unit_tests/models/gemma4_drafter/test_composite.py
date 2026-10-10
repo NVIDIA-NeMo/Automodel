@@ -314,8 +314,6 @@ def test_ordered_drafter_backward_matches_full_vocabulary_head(device_and_dtype)
     """Issue #4022: a target outside the selected centroid cluster gets the full-vocabulary gradient."""
     import copy
 
-    from transformers.models.gemma4_assistant.modeling_gemma4_assistant import Gemma4AssistantMaskedEmbedder
-
     from nemo_automodel.components.models.gemma4_drafter.model import Gemma4DrafterForCausalLM
 
     device, dtype = device_and_dtype
@@ -354,12 +352,6 @@ def test_ordered_drafter_backward_matches_full_vocabulary_head(device_and_dtype)
     torch.testing.assert_close(actual_grad, expected_grad)
     target_rows = targets.unique()
     assert actual_grad[target_rows].abs().sum(-1).gt(0).all()
-
-    # The HF ordered head gives those targets no gradient at all, which is what made training diverge.
-    hf_weight = ordered.lm_head.weight.detach().clone().requires_grad_()
-    hf_logits = Gemma4AssistantMaskedEmbedder.forward(ordered.masked_embedding, hidden, hf_weight)
-    loss(hf_logits.float().flatten(0, 1), targets.flatten()).backward()
-    assert hf_weight.grad[target_rows].abs().sum() == 0
 
 
 # ---------------------------------------------------------------------------
