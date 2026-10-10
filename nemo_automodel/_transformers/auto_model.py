@@ -262,6 +262,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         compile_config,
         load_base_model,
         parameter_config: ParameterConfig | None = None,
+        preserve_parameter_dtypes: bool = False,
         _retry_depth=0,
         **kwargs,
     ):
@@ -313,6 +314,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 compile_config=compile_config,
                 load_base_model=load_base_model,
                 parameter_config=parameter_config,
+                preserve_parameter_dtypes=preserve_parameter_dtypes,
                 _retry_depth=_retry_depth + 1,
                 **retry_kwargs,
             )
@@ -486,7 +488,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             cache_dir=cache_dir,
             freeze_config=freeze_config,
             weights_already_loaded=weights_already_loaded,
-            preserve_parameter_dtypes=parameter_config is not None,
+            preserve_parameter_dtypes=preserve_parameter_dtypes or parameter_config is not None,
             inject_te_attention=inject_te_attention,
         )
 
@@ -516,6 +518,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
         parameter_config: ParameterConfig | None = None,
+        preserve_parameter_dtypes: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -580,6 +583,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 If provided, FP8 quantization will be applied. Default: None.
             compile_config (CompileConfig | None, optional): Configuration for torch.compile.
                 If provided, the model will be compiled. Default: None.
+            preserve_parameter_dtypes (bool, default=False): Preserve constructor storage
+                dtypes during materialization and initialization. Useful when loading
+                native checkpoints with intrinsic mixed precision (for example Mamba
+                FP32 state parameters) without changing trainability. The model must
+                support dtype-preserving initialization; dtype drift raises an error.
             **kwargs: Additional keyword arguments. Notable ones include:
                 - has_packed_sequence (bool): Whether using packed sequences. Default: False.
                 - cache_dir (str): Cache directory for model weights.
@@ -638,6 +646,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config=fp8_config,
             compile_config=compile_config,
             parameter_config=parameter_config,
+            preserve_parameter_dtypes=preserve_parameter_dtypes,
             load_base_model=True,
             **kwargs,
         )
@@ -666,6 +675,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
         parameter_config: ParameterConfig | None = None,
+        preserve_parameter_dtypes: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -744,6 +754,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config=fp8_config,
             compile_config=compile_config,
             parameter_config=parameter_config,
+            preserve_parameter_dtypes=preserve_parameter_dtypes,
             load_base_model=kwargs.pop("load_base_model", False),
             **kwargs,
         )

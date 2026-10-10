@@ -600,6 +600,10 @@ class Checkpointer:
             {name: parameter.dtype for name, parameter in model.named_parameters()}
             if preserve_parameter_dtypes else None
         )
+        expected_buffer_dtypes = (
+            {name: buffer.dtype for name, buffer in model.named_buffers()}
+            if preserve_parameter_dtypes else None
+        )
         has_meta_params = any(p.device.type == "meta" for p in model.parameters())
         if has_meta_params:
             to_empty_parameters_only(model, device=device)
@@ -690,6 +694,10 @@ class Checkpointer:
             actual_dtypes = {name: parameter.dtype for name, parameter in model.named_parameters()}
             if actual_dtypes != expected_dtypes:
                 raise ValueError("Configured parameter storage changed during materialization/initialization")
+        if expected_buffer_dtypes is not None:
+            actual_buffer_dtypes = {name: buffer.dtype for name, buffer in model.named_buffers()}
+            if actual_buffer_dtypes != expected_buffer_dtypes:
+                raise ValueError("Configured buffer storage changed during materialization/initialization")
 
     def load_base_model(
         self,

@@ -1173,3 +1173,66 @@ def test_native_mamba_adapter_preserves_intrinsic_fp32_export():
     assert converted[0][0] == "backbone.layers.0.mixer.A_log"
     torch.testing.assert_close(converted[0][1], value, rtol=0, atol=0)
     assert adapter.forced_hf_dtype_mapping({name: value}) == {name: "F32"}
+
+
+@skip_if_no_gpu
+def test_factory_preserves_intrinsic_fp32_without_a_trainable_surface(tmp_path):
+    from safetensors.torch import save_file
+    from transformers import PretrainedConfig
+    from nemo_automodel import NeMoAutoModelForCausalLM
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+    config = PretrainedConfig(**MockNemotronV3Config(layers_block_type=["mamba", "moe"]).to_dict())
+    config.architectures = ["NemotronHForCausalLM"]
+    config.name_or_path = str(tmp_path)
+    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False)
+    seed = NemotronHForCausalLM(config, backend=backend)
+    seed.initialize_weights()
+    weights = {name: value.detach().clone() for name, value in seed.state_dict().items()}
+    intrinsic = "model.layers.0.mixer._fp32_params.A_log"
+    assert weights[intrinsic].dtype == torch.float32
+    weights[intrinsic].fill_(0.1234567)
+    bias_name = next(name for name in weights if name.endswith("e_score_correction_bias"))
+    weights[bias_name].fill_(0.2345678)
+    save_file(weights, tmp_path / "model.safetensors")
+    model = NeMoAutoModelForCausalLM.from_config(
+        config, backend=backend, torch_dtype=torch.bfloat16,
+        use_liger_kernel=False, use_sdpa_patching=False, attn_implementation="sdpa",
+        load_base_model=True, preserve_parameter_dtypes=True,
+    )
+    parameters = dict(model.named_parameters())
+    assert parameters[intrinsic].dtype == torch.float32
+    torch.testing.assert_close(parameters[intrinsic].detach().cpu(), weights[intrinsic], rtol=0, atol=0)
+    bias = dict(model.named_buffers())[bias_name]
+    assert bias.dtype == torch.float32
+    torch.testing.assert_close(bias.detach().cpu(), weights[bias_name], rtol=0, atol=0)
+    assert parameters["model.layers.0.norm.weight"].dtype == torch.bfloat16
+    assert all(p.requires_grad for p in parameters.values())
+
+
+def test_native_mixed_precision_survives_materialization_without_surface(tmp_path):
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False)
+    with torch.device("meta"):
+        model = NemotronHForCausalLM(MockNemotronV3Config(layers_block_type=["mamba", "moe"]), backend=backend)
+    before = {name: p.dtype for name, p in model.named_parameters()}
+    before_buffers = {name: b.dtype for name, b in model.named_buffers()}
+    Checkpointer.initialize_model_weights(model, torch.device("cpu"), preserve_parameter_dtypes=True)
+    assert {name: p.dtype for name, p in model.named_parameters()} == before
+    assert all(not p.is_meta for p in model.parameters())
+    assert dict(model.named_parameters())["model.layers.0.mixer._fp32_params.A_log"].dtype == torch.float32
+    assert {name: b.dtype for name, b in model.named_buffers()} == before_buffers
+    bias_name = next(name for name in before_buffers if name.endswith("e_score_correction_bias"))
+    assert before_buffers[bias_name] == torch.float32
+    intrinsic = "model.layers.0.mixer._fp32_params.A_log"
+    values = torch.full_like(dict(model.named_parameters())[intrinsic], 0.1234567)
+    bias_values = torch.full_like(dict(model.named_buffers())[bias_name], 0.2345678)
+    from torch.distributed.checkpoint import load, save
+    save({intrinsic: values, bias_name: bias_values}, checkpoint_id=tmp_path / "weights")
+    targets = {intrinsic: dict(model.named_parameters())[intrinsic], bias_name: dict(model.named_buffers())[bias_name]}
+    load(targets, checkpoint_id=tmp_path / "weights")
+    torch.testing.assert_close(targets[intrinsic], values, rtol=0, atol=0)
+    torch.testing.assert_close(targets[bias_name], bias_values, rtol=0, atol=0)
+    assert targets[bias_name].dtype == torch.float32
