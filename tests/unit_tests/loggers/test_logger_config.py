@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for nemo_automodel.components.loggers.loggers — WandbConfig, MLflowConfig, CometConfig."""
+"""Tests for nemo_automodel.components.loggers.loggers — WandbConfig, TrackioConfig, MLflowConfig, CometConfig."""
 
+import importlib.util
 import sys
 import types
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
+from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
+from nemo_automodel.components.loggers.trackio_utils import TrackioLogger
 
 
 class TestWandbConfig:
@@ -82,6 +84,89 @@ class TestWandbConfig:
         assert cfg.build() == "run"
         assert captured["project"] == "resolved-project"
         assert captured["dir"] == "/tmp/resolved-wandb"
+
+
+def _fake_trackio(monkeypatch, captured):
+    fake_trackio = types.ModuleType("trackio")
+    # importlib.util.find_spec("trackio") raises if __spec__ is None
+    fake_trackio.__spec__ = importlib.util.spec_from_loader("trackio", loader=None)
+    fake_trackio.init = lambda **kw: captured.update(kw) or "run"
+    monkeypatch.setitem(sys.modules, "trackio", fake_trackio)
+
+
+class TestTrackioConfig:
+    def test_defaults(self):
+        cfg = TrackioConfig()
+        assert cfg.project == "automodel"
+        assert cfg.name == ""
+        assert cfg.group is None
+        assert cfg.space_id is None
+        assert cfg.extra == {}
+
+    def test_from_kwargs_routes_passthrough_keys_to_extra(self):
+        cfg = TrackioConfig.from_kwargs(project="p", space_id="me/runs", resume="allow", private=True)
+        assert (cfg.project, cfg.space_id) == ("p", "me/runs")
+        assert cfg.extra == {"resume": "allow", "private": True}
+
+    def test_build_forwards_fields_extra_and_run_config(self, monkeypatch):
+        captured = {}
+        _fake_trackio(monkeypatch, captured)
+
+        cfg = TrackioConfig.from_kwargs(project="p", name="run-1", group="g", resume="allow")
+        logger = cfg.build(run_config={"lr": 1e-3})
+
+        assert isinstance(logger, TrackioLogger) and logger.run == "run"
+        assert captured == {"project": "p", "name": "run-1", "group": "g", "resume": "allow", "config": {"lr": 1e-3}}
+
+    def test_build_records_the_yaml_run_config_from_the_recipe_boundary(self, monkeypatch):
+        """Recipes pass ``to_yaml_dict(use_orig_values=True)``: targets and env placeholders stay as written.
+
+        ``to_dict()`` would record the inherited ``_BaseNeMoAutoModelClass.from_pretrained`` and the resolved path.
+        """
+        captured = {}
+        _fake_trackio(monkeypatch, captured)
+        monkeypatch.setenv("TEST_TRACKIO_CKPT_DIR", "/resolved/ckpts")
+
+        recipe_cfg = ConfigNode(
+            {
+                "model": {"_target_": "nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained"},
+                "checkpoint": {"checkpoint_dir": "${TEST_TRACKIO_CKPT_DIR}"},
+            }
+        )
+        TrackioConfig().build(run_config=recipe_cfg.to_yaml_dict(use_orig_values=True))
+
+        assert captured["config"] == {
+            "model": {"_target_": "nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained"},
+            "checkpoint": {"checkpoint_dir": "${TEST_TRACKIO_CKPT_DIR}"},
+        }
+
+    def test_build_leaves_out_top_level_underscore_sections(self, monkeypatch):
+        """``trackio.init`` rejects top-level config keys starting with "_"; nested ``_target_`` keys are kept."""
+        captured = {}
+        _fake_trackio(monkeypatch, captured)
+
+        TrackioConfig().build(run_config={"model": {"_target_": "m.f"}, "_validation_dataset": {"split": "val"}})
+
+        assert captured["config"] == {"model": {"_target_": "m.f"}}
+
+    def test_build_derives_the_run_name_from_the_model(self, monkeypatch):
+        captured = {}
+        _fake_trackio(monkeypatch, captured)
+
+        TrackioConfig(project="p").build(model_name="Qwen/Qwen3-0.6B")
+
+        assert captured["name"] == "Qwen_Qwen3-0.6B"
+
+    def test_build_returns_none_on_non_zero_ranks(self, monkeypatch):
+        import torch.distributed as dist
+
+        captured = {}
+        _fake_trackio(monkeypatch, captured)
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_rank", lambda: 1)
+
+        assert TrackioConfig().build(run_config={"lr": 1e-3}) is None
+        assert captured == {}
 
 
 class TestMLflowConfig:

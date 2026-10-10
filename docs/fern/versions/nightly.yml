@@ -1041,6 +1041,9 @@ navigation:
       - page: "MLflow Logging"
         path: ../../guides/mlflow-logging.mdx
         slug: mlflow-logging
+      - page: "Trackio Logging"
+        path: ../../guides/trackio-logging.mdx
+        slug: trackio-logging
       - page: "Breaking Changes"
         path: ../../breaking-changes.mdx
         slug: breaking-changes

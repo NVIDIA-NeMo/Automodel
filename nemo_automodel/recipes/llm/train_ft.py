@@ -597,6 +597,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=_get_model_name(self.cfg.model)
+            )
+            logging.info("Trackio experiment tracking enabled")
+
         if self.dist_env.is_main and self.cfg.mlflow is not None:
             run_config = self.cfg.to_yaml_dict(use_orig_values=True)
             checkpoint_dir = self.cfg.get("checkpoint.checkpoint_dir", None)
@@ -1785,6 +1792,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
                 wandb.log(metrics, step=log_data.step)
 
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            if val_name == "default":
+                trackio_logger.log_metrics(log_data.metrics, step=log_data.step)
+            else:
+                metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
+                trackio_logger.log_metrics(metrics, step=log_data.step)
+
         if _HAS_MLFLOW and mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
 
@@ -1836,10 +1851,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB, MLflow, Comet) according to step_scheduler frequency
+        # Log to remote services (WandB, Trackio, MLflow, Comet) according to step_scheduler frequency
+        trackio_logger = getattr(self, "trackio_logger", None)
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
             if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
             if self.comet_logger is not None:
@@ -1849,6 +1867,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+            if trackio_logger is not None:
+                self._log_moe_metrics(self.step_scheduler.step, trackio_logger.log_metrics)
             if self.comet_logger is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)

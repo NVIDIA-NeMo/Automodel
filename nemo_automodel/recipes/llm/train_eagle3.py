@@ -55,6 +55,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
@@ -846,6 +847,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self.cfg.to_dict(),
                 default_name="eagle3_" + str(target_path).rstrip("/").split("/")[-1],
             )
+
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
+            trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
+            trackio_cfg.name = trackio_cfg.name or "eagle3_" + str(target_path).rstrip("/").split("/")[-1]
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
+            logger.info("Trackio experiment tracking enabled")
 
         # Optional periodic real-acceptance-length eval (rank 0 only): snapshot
         # the current draft on a cadence and measure accept_length inside an
@@ -1904,10 +1912,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         )
 
     def _wandb_log(self, data: dict, step: int) -> None:
-        """Log a metrics dict to W&B when a run is active (rank 0)."""
+        """Log a metrics dict to W&B and Trackio when a run is active (rank 0)."""
         run = getattr(self, "wandb_run", None)
         if run is not None:
             run.log(data, step=step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(data, step=step)
 
     def run_train_validation_loop(self):
         """Run the minimal EAGLE-3 train loop."""
@@ -1978,6 +1989,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             _best_effort("stopping regen worker", self.regen_runner.shutdown)
         if getattr(self, "wandb_run", None) is not None:
             _best_effort("finishing W&B run", self.wandb_run.finish)
+        if getattr(self, "trackio_logger", None) is not None:
+            _best_effort("finishing Trackio run", self.trackio_logger.finish)
 
     def _train_epochs(self, start_epoch, is_ddp, pbar=None):
         """Run the epoch loop (extracted so :meth:`run_train_validation_loop` can
