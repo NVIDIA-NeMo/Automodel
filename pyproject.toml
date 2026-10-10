@@ -19,8 +19,14 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 include-package-data = true
 
-[tool.setuptools.packages.find]
-include = ["nemo_automodel", "nemo_automodel.*"]
+# Keep checkout paths stable while installing tools and examples under our namespace.
+[tool.setuptools.package-dir]
+nemo_automodel = "nemo_automodel"
+"nemo_automodel.tools" = "tools"
+"nemo_automodel.examples" = "examples"
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml", "*.json", "*.jinja", "*.sh", "*.sub", "*.md", "*.ipynb", "*.png", "*.mjs"]
 
 [tool.setuptools.dynamic]
 version = { attr = "nemo_automodel.package_info.__version__" } # any module attribute compatible with ast.literal_eval
