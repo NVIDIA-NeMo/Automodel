@@ -1,0 +1,75 @@
+---
+title: "Tevatron/colpali-corpus"
+description: "Explore Tevatron/colpali-corpus: visual document retrieval corpus, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/Tevatron/colpali-corpus
+---
+
+This Tevatron conversion of ColPali supplies the page-image corpus referenced by the query rows in [Tevatron/colpali](/dataset-coverage/Tevatron/colpali). The source is hosted as [Tevatron/colpali-corpus](https://huggingface.co/datasets/Tevatron/colpali-corpus).
+
+## Task
+
+**Visual document retrieval corpus.** Relevance supervision comes from `Tevatron/colpali`; this companion dataset provides the documents being retrieved.
+
+| Property | Description |
+| --- | --- |
+| Input | Candidate documents: document-page images, associated text, document IDs, and source labels. |
+| Target | No standalone supervised target. Query text and relevance labels come from `Tevatron/colpali`. |
+| Modality | Document images and associated text |
+| Language | Not declared in Hub metadata |
+| License Metadata | Not declared in Hub metadata; consult the upstream source |
+
+## Example Record
+
+This **synthetic example** uses invented values in the source fields; it is not a copied dataset row. The image is represented by a placeholder path instead of binary image data. The path does not refer to a downloadable file.
+
+```json
+{
+  "docid": "synthetic-page-1",
+  "image": {
+    "path": "synthetic-budget-page.png",
+    "bytes": null
+  },
+  "text": "Monthly budget: travel 120, supplies 80.",
+  "source": "synthetic-example"
+}
+```
+
+## Schema and Splits
+
+The table lists all four fields declared in the pinned upstream metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `docid` | string | Document identifier. |
+| `image` | image | Document-page image. |
+| `text` | string | Associated document text. |
+| `source` | string | Source provenance. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 118,195 |
+| `default` | `test` | 500 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/Tevatron/colpali-corpus/blob/afd2f86ba2e6c7d62c781a03aafb005f6b8c2b85/README.md) before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Visual Embedding Fine-Tuning | Nemotron VL 1B; prepared ColPali plus MIRACL | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml) |
+
+**Adapter:** [`RetrievalDatasetConfig`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/retrieval_dataset.py).
+
+Run [the ColPali conversion notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb) to download both sources and write local corpus shards and `colpali_train.json`. Replace the ColPali entry in `dataset.data_dir_list` with the generated JSON path. The example mixes 5,000 ColPali samples with 5,000 MIRACL samples. For full-scale data loading, follow [the normalization guide](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/nemotron_vl_1b/README.md).
+
+The conversion notebook uses `train` from the query and corpus datasets. Corpus test rows are not training queries.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/Tevatron/colpali-corpus)
+- [Upstream card at revision `afd2f86b`](https://huggingface.co/datasets/Tevatron/colpali-corpus/blob/afd2f86ba2e6c7d62c781a03aafb005f6b8c2b85/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/retrieval_dataset.py)
+- [Preparation reference](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb)
+- [Dataset catalog](/dataset-coverage/overview)

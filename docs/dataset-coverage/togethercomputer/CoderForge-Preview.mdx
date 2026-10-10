@@ -1,0 +1,76 @@
+---
+title: "togethercomputer/CoderForge-Preview"
+description: "Explore togethercomputer/CoderForge-Preview: coding-agent trajectory modeling, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/togethercomputer/CoderForge-Preview
+---
+
+CoderForge-Preview provides coding-agent trajectories. The source is hosted as [togethercomputer/CoderForge-Preview](https://huggingface.co/datasets/togethercomputer/CoderForge-Preview).
+
+## Task
+
+**Coding-agent trajectory modeling.** The raw `trajectories` configuration serializes messages and tools as strings. The separately tokenized configuration has a different schema.
+
+| Property | Description |
+| --- | --- |
+| Input | A software task, prior conversation, and tool definitions. |
+| Target | The next assistant response or tool action in the trajectory. |
+| Modality | Text |
+| Language | Not declared in Hub metadata |
+| License Metadata | No dataset-wide license tag is declared. The raw schema includes a per-row `license` field; consult it and the upstream source. |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row.
+
+```json
+{
+  "trajectory_id": "synthetic-trajectory-1",
+  "messages": "[{\"role\": \"user\", \"content\": \"Implement a function that doubles a number.\"}, {\"role\": \"assistant\", \"content\": \"def double(x):\\n    return 2 * x\"}]",
+  "tools": "[]",
+  "reward": 1.0
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `trajectory_id` | string | Trajectory identifier. |
+| `messages` | JSON string | Serialized conversation turns in the trajectories configuration. |
+| `tools` | JSON string | Serialized tool definitions. |
+| `reward` | number | Recorded trajectory reward. |
+
+The table shows the `trajectories` Hub configuration. Other configurations, when available, are listed on the [Hub dataset page](https://huggingface.co/datasets/togethercomputer/CoderForge-Preview).
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `trajectories` | `SWE_Rebench` | 77,169 |
+| `trajectories` | `SWE_Smith` | 148,001 |
+| `trajectories` | `R2E_Gym` | 32,964 |
+| `trajectories` | `filtered_reward1` | 155,144 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/togethercomputer/CoderForge-Preview/blob/060fca96cf723b2ebab3181e9e59fafd273df3cb/README.md) before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Long-Context Fine-Tuning | Qwen3 32B; context parallelism size 16; 131,072 tokens | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/long_context_validation/qwen3_32b/qwen3_32b_coderforge_cp16_128k_lowerLR.yaml) |
+
+**Adapter:** [`ChatDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py).
+
+Follow [the Qwen3 pipeline](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/long_context_validation/qwen3_32b/README.md) to parse the serialized `messages` and `tools`, clean the messages, and measure token lengths with the training chat template. Filtering removes overlength trajectories instead of cutting their final assistant turn. The output JSONL contains parsed messages and tools; `ChatDataset` tokenizes these when preparing samples.
+
+Create a separate held-out `val.jsonl` and set the recipe's training and validation paths to the prepared files. The recipe uses context parallelism size 16 and needs a matching distributed launch; the preparation command is documented in the linked pipeline.
+
+The preparation pipeline selects the `filtered_reward1` split of the `trajectories` configuration. Training and validation subsequently read local JSONL files; their counts depend on filtering and holdout preparation.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/togethercomputer/CoderForge-Preview)
+- [Upstream card at revision `060fca96`](https://huggingface.co/datasets/togethercomputer/CoderForge-Preview/blob/060fca96cf723b2ebab3181e9e59fafd273df3cb/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py)
+- [Preparation reference](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/long_context_validation/qwen3_32b/README.md)
+- [Dataset catalog](/dataset-coverage/overview)

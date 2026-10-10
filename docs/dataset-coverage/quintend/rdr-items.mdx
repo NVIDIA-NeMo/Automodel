@@ -1,0 +1,70 @@
+---
+title: "quintend/rdr-items"
+description: "Explore quintend/rdr-items: image-to-text generation, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/quintend/rdr-items
+---
+
+The [quintend/rdr-items](https://huggingface.co/datasets/quintend/rdr-items) dataset contains 48 image and text pairs used by NeMo AutoModel image-description fine-tuning examples.
+
+## Task
+
+**Image-to-text generation.** NeMo AutoModel examples use each image as input and its paired text as the target description. The upstream dataset card is empty, so it does not document the collection process or intended task.
+
+| Property | Description |
+| --- | --- |
+| Input | An image. |
+| Target | The paired text description. |
+| Modality | Image and text |
+| Language | Not declared in Hub metadata |
+| License Metadata | Not declared in Hub metadata; consult the upstream source |
+
+## Example Record
+
+This **synthetic example** uses invented values in the source fields; it is not a copied dataset row. The image path is a placeholder and does not refer to a downloadable file.
+
+```json
+{
+  "image": {
+    "path": "synthetic-item.png",
+    "bytes": null
+  },
+  "text": "A brown leather satchel with a shoulder strap."
+}
+```
+
+## Schema and Splits
+
+The source schema contains two fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `image` | image | Visual input. |
+| `text` | string | Text paired with the image. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 48 |
+
+The count comes from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=quintend%2Frdr-items) before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Image-to-Text Fine-Tuning | Qwen2.5-VL 3B; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml) |
+| Image-to-Text Fine-Tuning | North Micro Vision; 2 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml) |
+
+**Adapter:** [`make_rdr_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
+
+The loader places the source image in a user turn with a fixed description instruction and uses `text` as the assistant response. Keep the processor and collator from the chosen model recipe when adapting this source.
+
+Both listed examples use `train` without a validation dataset.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/quintend/rdr-items)
+- [Upstream card at revision `3fd0b1c9`](https://huggingface.co/datasets/quintend/rdr-items/blob/3fd0b1c937a8c437c9ff0f4780b58c077fd2b364/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py)
+- [Dataset catalog](/dataset-coverage/overview)

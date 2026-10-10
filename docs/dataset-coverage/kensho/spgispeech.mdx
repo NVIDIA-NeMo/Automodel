@@ -1,0 +1,73 @@
+---
+title: "kensho/spgispeech"
+description: "Explore kensho/spgispeech for English speech recognition, with a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/kensho/spgispeech
+---
+
+SPGISpeech supplies audio and transcripts from public earnings calls. The NeMo AutoModel mixture selects configuration `S`. The source is hosted as [kensho/spgispeech](https://huggingface.co/datasets/kensho/spgispeech).
+
+## Task
+
+**English speech recognition.** The example uses the `S` configuration. The waveform is omitted from the illustrative record.
+
+| Property | Description |
+| --- | --- |
+| Input | A segment of speech audio. |
+| Target | The corresponding transcript. |
+| Modality | Audio and text |
+| Language | English (`en`) |
+| License Metadata | `other`; custom [Kensho Terms of Usage](https://huggingface.co/datasets/kensho/spgispeech/blob/14e69dd3b80e968282ca55d3eb2b39cc9db2b62e/README.md). |
+
+Access is gated. Before running the recipe, accept the dataset's terms on its [Hub page](https://huggingface.co/datasets/kensho/spgispeech) and authenticate with a Hugging Face account that has access.
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. The `audio` object illustrates the undecoded representation. Its path is a placeholder, and the audio bytes are omitted.
+
+```json
+{
+  "audio": {
+    "path": "synthetic-speech.wav",
+    "bytes": null
+  },
+  "transcript": "Revenue grew by nine percent."
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source also includes `wav_filename` (string) and `wav_filesize` (32-bit integer).
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `audio` | audio | Audio segment with a 16,000 Hz sampling rate in the source metadata. |
+| `transcript` | string | Transcript for the audio segment. |
+
+The table shows the `S` Hub configuration. Other configurations, when available, are listed on the [Hub dataset page](https://huggingface.co/datasets/kensho/spgispeech).
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `S` | `train` | 77,073 |
+| `S` | `validation` | 39,304 |
+| `S` | `test` | 39,341 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/kensho/spgispeech/blob/14e69dd3b80e968282ca55d3eb2b39cc9db2b62e/README.md) before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Mixed-Corpus Speech Fine-Tuning | Qwen2.5-Omni 3B; six English sources | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml) |
+
+**Adapter:** [`make_multi_en_asr_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/multi_en.py).
+
+The mixture maps `transcript` to `text`, adds a `source` label, normalizes transcripts to uppercase, removes punctuation except apostrophes, and decodes audio lazily at 16,000 Hz. The recipe uses AMI, Earnings22, VoxPopuli, GigaSpeech, SPGISpeech, and LibriSpeech together. Override `dataset.sources` to change the mixture.
+
+The mixture uses the `train` split of configuration `S` from this source. The recipe does not configure a validation dataset. It keeps audio clips from 1 to 30 seconds and removes empty transcripts after normalization, so the loaded count can be lower than the Hub count.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/kensho/spgispeech)
+- [Upstream card at revision `14e69dd3`](https://huggingface.co/datasets/kensho/spgispeech/blob/14e69dd3b80e968282ca55d3eb2b39cc9db2b62e/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/multi_en.py)
+- [Dataset catalog](/dataset-coverage/overview)

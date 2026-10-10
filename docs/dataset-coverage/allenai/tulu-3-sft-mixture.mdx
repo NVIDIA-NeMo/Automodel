@@ -1,0 +1,82 @@
+---
+title: "allenai/tulu-3-sft-mixture"
+description: "Explore allenai/tulu-3-sft-mixture: instruction following and conversation, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/allenai/tulu-3-sft-mixture
+---
+
+Tulu 3 combines instruction and conversation data. The source is hosted as [allenai/tulu-3-sft-mixture](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture).
+
+## Task
+
+**Instruction following and conversation.**
+
+| Property | Description |
+| --- | --- |
+| Input | A user instruction and any preceding conversation. |
+| Target | The assistant response or subsequent assistant turns. |
+| Modality | Text |
+| Language | Multilingual; see upstream language list |
+| License Metadata | odc-by |
+
+The publisher labels the collection ODC-BY and notes that individual components have different terms, including non-commercial components. See the pinned upstream card for the source-level terms.
+
+## Example Record
+
+This **synthetic example** uses invented values in the source fields; it is not a copied dataset row.
+
+```json
+{
+  "id": "synthetic-chat-1",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Give one way to reuse a glass jar."
+    },
+    {
+      "role": "assistant",
+      "content": "Use it to store dried beans."
+    }
+  ],
+  "source": "synthetic-example"
+}
+```
+
+## Schema and Splits
+
+The table describes the fields declared in the pinned upstream schema.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | Record identifier. |
+| `messages` | list of objects | Conversation turns, each with string fields `role` and `content`. |
+| `source` | string | Component-dataset provenance. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 939,343 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture/blob/b14afda60f1bbebe55d5d2fa1e4df5042f97f8be/README.md) before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Chat Fine-Tuning | Qwen3-4B-Base; FSDP2; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp1_flashoptim.yaml) |
+| Joint Drafter Training | Gemma 4 E4B; Tulu 3 and Magicoder mixture | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml) |
+
+**Adapters:** The Qwen recipe uses [`ChatDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py). The joint-drafter recipe uses [`make_tulu3_magicoder_text_mix_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
+
+The chat loader renders messages with the selected tokenizer and chat template. The Qwen example sets `truncation: false`; follow its [preparation instructions](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/convergence/tulu3/models/qwen3-4b/README.md) to filter sequences for the intended length.
+
+The joint-drafter loader converts source messages into text-only conversation objects. It samples Tulu 3 and Magicoder with probabilities 0.8 and 0.2, drops Tulu conversations longer than 16 turns, and interleaves until both sources are exhausted. Sampling probabilities do not specify exact final row proportions.
+
+The Qwen example evaluates `train[:128]` while training on `train`, so these validation rows overlap training. The joint-drafter validation mixture also reuses training sources. Use a separate holdout for an independent evaluation.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture)
+- [Upstream card at revision `b14afda6`](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture/blob/b14afda60f1bbebe55d5d2fa1e4df5042f97f8be/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py)
+- [Dataset catalog](/dataset-coverage/overview)

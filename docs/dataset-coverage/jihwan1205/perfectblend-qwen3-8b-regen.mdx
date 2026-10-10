@@ -1,0 +1,82 @@
+---
+title: "jihwan1205/perfectblend-qwen3-8b-regen"
+description: "Qwen3-8B-regenerated conversations for speculative draft training, with source schema, a synthetic example, splits, and a NeMo AutoModel recipe."
+slug: dataset-coverage/jihwan1205/perfectblend-qwen3-8b-regen
+---
+
+This derivative of [Open Perfect Blend](https://huggingface.co/datasets/mlabonne/open-perfectblend) contains conversations regenerated with `Qwen/Qwen3-8B`. The source is hosted as [jihwan1205/perfectblend-qwen3-8b-regen](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen).
+
+## Task
+
+**Speculative decoding draft training.** The upstream dataset is intended to train draft models whose predictions align with `Qwen/Qwen3-8B`. Its records pair conversation prompts with regenerated assistant responses. NeMo AutoModel uses these conversations for parallel EAGLE draft training, with additional supervision from the target model.
+
+| Property | Description |
+| --- | --- |
+| Input | A conversation prompt or preceding turns. |
+| Target | Assistant turns regenerated with `Qwen/Qwen3-8B`. |
+| Modality | Text |
+| Language | Not declared in Hub metadata |
+| License Metadata | No license identifier is declared in Hub metadata. The upstream card refers to [Open Perfect Blend](https://huggingface.co/datasets/mlabonne/open-perfectblend) for license details. |
+
+## Example Record
+
+This **synthetic example** uses invented values with the source schema; it is not a copied dataset row.
+
+```json
+{
+  "id": 0,
+  "conversations": [
+    {
+      "role": "user",
+      "content": "Name one use for an empty jar.",
+      "thinking": null
+    },
+    {
+      "role": "assistant",
+      "content": "An empty jar can hold pencils.",
+      "thinking": null
+    }
+  ],
+  "status": "success"
+}
+```
+
+## Schema and Splits
+
+The pinned source schema contains the following fields, including the fields within each conversation turn.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | int64 | Record identifier. |
+| `conversations` | list of objects | Ordered conversation turns. |
+| `conversations[].role` | string | Speaker role, such as `user` or `assistant`. |
+| `conversations[].content` | string | Message text. |
+| `conversations[].thinking` | null | Thinking content; declared as null in the pinned schema. |
+| `status` | string | Regeneration status, such as `success`. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 1,418,401 |
+
+The schema and count come from [upstream metadata at the linked revision](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen/blob/cbe50897f5ce9e059fdf53850dfb17b91b3f3e3f/README.md), before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Parallel EAGLE Draft Training | Qwen3 8B target; prepared Parquet files | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/speculative/p-eagle/qwen_peagle_perfectblend.yaml) |
+
+**Adapter:** [`ChatDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py).
+
+The recipe comments provide a preparation command that downloads Parquet shards and renames `conversations` to `messages`. It writes `./cache/dataset/perfectblend-qwen3-8b-regen-messages`, which is the recipe's configured input. Keep regenerated responses aligned with the target checkpoint.
+
+The recipe reads `train[:70000]` from the prepared directory and does not configure validation.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen)
+- [Upstream card at revision `cbe50897`](https://huggingface.co/datasets/jihwan1205/perfectblend-qwen3-8b-regen/blob/cbe50897f5ce9e059fdf53850dfb17b91b3f3e3f/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py)
+- [Dataset catalog](/dataset-coverage/overview)

@@ -1,0 +1,69 @@
+---
+title: "openai/gsm8k"
+description: "Explore openai/gsm8k: multi-step mathematical question answering, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/openai/gsm8k
+---
+
+GSM8K pairs grade-school math questions with worked answers. The source is hosted as [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k).
+
+## Task
+
+**Multi-step mathematical question answering.**
+
+| Property | Description |
+| --- | --- |
+| Input | A grade-school mathematical word problem. |
+| Target | A worked solution followed by the final numeric answer. |
+| Modality | Text |
+| Language | English (`en`) |
+| License Metadata | `mit` |
+
+## Example Record
+
+This **synthetic example** uses invented values in the source fields; it is not a copied dataset row.
+
+```json
+{
+  "question": "Lena has 3 bags with 4 marbles each. She gives 5 marbles to a friend. How many marbles does she have left?",
+  "answer": "Three bags contain 3 * 4 = <<3*4=12>>12 marbles.\nAfter giving away 5 marbles, Lena has 12 - 5 = <<12-5=7>>7 marbles left.\n#### 7"
+}
+```
+
+## Schema and Splits
+
+The `main` configuration contains two string fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `question` | string | Mathematical word problem. |
+| `answer` | string | Worked solution with calculator annotations such as `<<3*4=12>>`, followed by the final numeric answer after the `####` delimiter. |
+
+The table shows the `main` Hub configuration used by the preparation script. The `socratic` configuration uses the same fields and adds guiding sub-questions within each answer.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `main` | `train` | 7,473 |
+| `main` | `test` | 1,319 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/openai/gsm8k/blob/740312add88f781978c0658806c59bc2815b9866/README.md) before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | DiffusionGemma; prepared GSM8K chat | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/dllm_sft/diffusion_gemma_lora.yaml) |
+| Full Fine-Tuning | DiffusionGemma; prepared GSM8K chat | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/dllm_sft/diffusion_gemma_sft.yaml) |
+
+**Adapter:** [`ChatDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py).
+
+The preparation script writes a user message from `question` and an assistant message from the complete `answer` into `gsm8k_chat_train.jsonl`. The recipe reads that local file, not the raw question/answer Hub schema. Obtain access to the DiffusionGemma checkpoint before launching.
+
+The preparation script uses the `main` configuration and defaults to the `train` split. Upstream `test` is available, but the listed recipes do not configure it as a validation dataset.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/openai/gsm8k)
+- [Upstream card at revision `740312ad`](https://huggingface.co/datasets/openai/gsm8k/blob/740312add88f781978c0658806c59bc2815b9866/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py)
+- [Preparation reference](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/dllm_sft/prep_gsm8k.py)
+- [Dataset catalog](/dataset-coverage/overview)
