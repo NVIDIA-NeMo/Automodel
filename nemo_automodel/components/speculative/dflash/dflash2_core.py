@@ -34,8 +34,27 @@ inside the candidate list. Positions whose true token missed the candidate list
 carry no selector signal -- there is nothing there to select -- and are excluded
 from the selector term; ``candidate_recall`` reports how often that happens.
 
-Both terms use the same block-position decay weights, so a position's importance
-is identical in the two objectives.
+Both terms share ``base_loss``'s ``DFlashDecayLoss`` position-weighting scheme
+(fixed decay for ``loss_type="dflash"``, detached D-PACE confidence for the
+``"dpace*"`` variants, arXiv:2605.18810) via
+:meth:`~nemo_automodel.components.loss.dllm_loss.DFlashDecayLoss.weighted_mean`,
+so a position's importance is identical in the two objectives and switching
+``loss_type`` rescales both consistently. The selector term's weight *schedule*
+is always built from the full ``pred_mask`` -- the same mask ``base_loss`` uses
+-- and only narrowed to the positions with selector signal (``has_target``)
+afterward, via ``weighted_mean``'s ``value_mask``. D-PACE's weight is a
+sequential cumprod/cumsum across the block, so building it from a narrower mask
+directly (e.g. ``pred_mask * has_target``) would corrupt neighboring positions'
+weights, not just the excluded one's. ``loss_type="variable_prefix"`` is
+rejected: the selector teacher-forces the predecessor from the fixed-anchor
+block layout, which a variable visible prefix breaks.
+
+Both terms also share the base objective's ``total_blocks`` fix: D-PACE's
+"mean" denominator is ``batch_size * num_anchors`` (the trainer's *configured*
+block-sampling budget), not the batch's achieved sampled-block count, which
+varies with each micro-batch's own content and therefore differs across DP
+ranks -- see
+:meth:`~nemo_automodel.components.loss.dllm_loss.DFlashDecayLoss._mean_denominator`.
 """
 
 from __future__ import annotations
@@ -116,7 +135,19 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         loss_decay_gamma: float | None = None,
         selector_loss_weight: float = 1.0,
         sliding_window: int | None = None,
+        # Keyword-only, and appended after the pre-existing params above: an
+        # old positional caller of this constructor must not have a later
+        # argument silently rebound to one of these when they were inserted.
+        *,
+        loss_type: str = "dflash",
+        dpace_alpha: float = 0.5,
     ):
+        if loss_type == "variable_prefix":
+            raise ValueError(
+                "DFlash 2 does not support loss_type='variable_prefix': the candidate selector "
+                "teacher-forces the predecessor from the fixed-anchor block layout, which a variable "
+                "visible prefix breaks."
+            )
         super().__init__(
             draft_model=draft_model,
             target_lm_head=target_lm_head,
@@ -126,6 +157,8 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             attention_backend=attention_backend,
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
+            loss_type=loss_type,
+            dpace_alpha=dpace_alpha,
             sliding_window=sliding_window,
         )
         if getattr(draft_model, "candidate_selector", None) is None:
@@ -136,22 +169,6 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         if selector_loss_weight < 0:
             raise ValueError(f"selector_loss_weight must be >= 0, got {selector_loss_weight}.")
         self.selector_loss_weight = float(selector_loss_weight)
-
-    def _depth_weights(self, mask: torch.Tensor) -> torch.Tensor:
-        """Block-position decay weights for the ``block_size - 1`` predicted positions.
-
-        Args:
-            mask: Tensor of shape [batch, blocks, depth]; the supervised-position
-                mask the weights are multiplied into.
-
-        Returns:
-            Tensor of shape [batch, blocks, depth] equal to ``mask`` scaled by
-            ``exp(-k / loss_decay_gamma)``, or ``mask`` itself when decay is off.
-        """
-        if self.loss_decay_gamma is None:
-            return mask
-        depth = torch.exp(-torch.arange(mask.shape[-1], device=mask.device, dtype=mask.dtype) / self.loss_decay_gamma)
-        return mask * depth
 
     def _selector_scores(
         self,
@@ -252,22 +269,26 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         pred_mask = block_mask[:, :, 1:]
 
         loss_fn = self.loss_fn
-        assert loss_fn is not None, "loss_fn is always constructed for loss_type='dflash'"
-        loss_out = loss_fn(
-            pred_logits.reshape(bsz, n * (bs - 1), -1),
-            pred_targets.reshape(bsz, -1),
-            pred_mask.reshape(bsz, -1),
-            num_tokens=None,
-            block_size=bs,
+        assert loss_fn is not None, "loss_fn is always constructed (loss_type='variable_prefix' is rejected)"
+        # forward_with_token_nll's own per-token NLL is reused below for the
+        # selector's D-PACE weighting, instead of a second full-vocabulary CE
+        # pass over pred_logits.
+        loss_details = loss_fn.forward_with_token_nll(
+            pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors
         )
+        base_token_nll = loss_details.token_nll
+        loss_out = loss_details.output
 
         scores, candidate_ids, target_index, has_target = self._selector_scores(pred_hidden, pred_logits, target_ids)
         selector_mask = pred_mask * has_target.to(pred_mask.dtype)
-        selector_weights = self._depth_weights(selector_mask)
-        token_nll = F.cross_entropy(
+        selector_nll = F.cross_entropy(
             scores.reshape(-1, scores.shape[-1]).float(), target_index.reshape(-1), reduction="none"
         ).view_as(selector_mask)
-        selector_loss = (token_nll * selector_weights).sum() / (selector_weights.sum() + 1e-6)
+        # See the module docstring for why the schedule mask stays pred_mask and
+        # has_target only narrows via value_mask.
+        selector_loss = loss_fn.weighted_mean(
+            selector_nll, base_token_nll, pred_mask, value_mask=selector_mask, total_blocks=self.num_anchors
+        )
         loss = loss_out.total_loss + self.selector_loss_weight * selector_loss
 
         with torch.no_grad():
@@ -276,14 +297,14 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             selected_ids = candidate_ids.gather(-1, scores.argmax(dim=-1, keepdim=True)).squeeze(-1)
             correct_tokens = ((selected_ids == pred_targets) & eval_mask).sum()
             accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(selected_ids, pred_targets, eval_mask)
-            base_ids = pred_logits.argmax(dim=-1)
+            base_ids = loss_details.pred_ids
             base_correct_tokens = ((base_ids == pred_targets) & eval_mask).sum()
             base_accept_len, base_accept_len_sum, _ = compute_acceptance_stats(base_ids, pred_targets, eval_mask)
             denominator = valid_tokens.clamp_min(1)
 
         return DFlash2StepMetrics(
             loss=loss,
-            loss_weight=self._depth_weights(pred_mask).sum().detach(),
+            loss_weight=loss_details.denominator,
             accuracy=(correct_tokens / denominator).detach(),
             valid_tokens=valid_tokens.detach(),
             correct_tokens=correct_tokens.detach(),

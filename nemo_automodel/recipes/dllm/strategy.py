@@ -545,6 +545,8 @@ class DFlashStrategy(DLLMStrategy):
     - ``target_torch_dtype`` (default ``"bfloat16"``) — target dtype string.
     - ``block_size`` (default 0) — draft block size; 0 reads from draft config.
     - ``loss_decay_gamma`` (default 0.0) — γ for Eq. 4; 0 uses paper defaults.
+    - ``loss_type`` (default ``"dflash"``) — ``"dflash"`` or a D-PACE variant.
+    - ``dpace_alpha`` (default 0.5) — smoothing alpha for D-PACE variants.
     - ``num_blocks_per_sample`` (default 1) — N anchor blocks per sequence per
       step, enabling the multi-block sparse-attention pass from §4.2. Paper
       default is 512 (Appendix A.1); requires ``attention_backend=flex_attention``.
@@ -554,6 +556,18 @@ class DFlashStrategy(DLLMStrategy):
     - ``overlap_anchors`` (default ``True``) — when ``True``, anchors are
       sampled independently (paper behaviour); when ``False``, anchors are
       forced non-overlapping (stars-and-bars, caps at ``seq_len // block_size``).
+
+    ``loss_type="dflash"`` here uses ``normalize="tokens"`` (a real, globally
+    all-reduced token count, ``num_diffusion_tokens``), while
+    ``nemo_automodel.recipes.llm.train_dflash.TrainDFlashRecipe`` -- the
+    dedicated DFlash recipe built on the same loss class -- hardcodes
+    ``normalize="mean"`` (``batch_size * num_anchors`` blocks, not tokens) for
+    it. The two therefore divide by denominators that differ by about
+    ``block_size - 1``, so the *same* ``loss_decay_gamma`` / learning rate is
+    NOT directly comparable, or portable, between this strategy and that
+    recipe for ``"dflash"``. D-PACE uses a globally reduced
+    batch-times-configured-block denominator here and the equivalent local mean
+    in the dedicated recipe, so its hyperparameters are portable between paths.
     """
 
     def __init__(self):
@@ -599,7 +613,10 @@ class DFlashStrategy(DLLMStrategy):
         """Load and freeze the target LM; resolve block_size, layer_ids, decay loss."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+        from nemo_automodel.components.loss.loss import DFlashDecayLossConfig
+
+        if getattr(getattr(recipe, "distributed_config", None), "cp_size", 1) > 1:
+            raise ValueError("DFlash does not support context parallelism (cp_size must be 1).")
 
         dflash_cfg = recipe.cfg.get("dflash", None) or {}
 
@@ -683,11 +700,17 @@ class DFlashStrategy(DLLMStrategy):
         # ce_chunk_size trades peak memory (smaller = lower) against recompute.
         self.use_fused_linear_ce = bool(dflash_cfg.get("use_fused_linear_ce", True))
         ce_chunk_size = int(dflash_cfg.get("ce_chunk_size", 1024))
-        self.dflash_loss_fn = DFlashDecayLoss(
+        loss_type = str(dflash_cfg.get("loss_type", "dflash"))
+        # This strategy always consumes a globally reduced denominator. For
+        # D-PACE, pre_step reports batch * configured blocks instead of tokens.
+        self.dflash_loss_fn = DFlashDecayLossConfig(
             loss_gamma=loss_gamma,
             use_fused_linear_ce=self.use_fused_linear_ce,
             chunk_size=ce_chunk_size,
-        )
+            loss_type=loss_type,
+            dpace_alpha=float(dflash_cfg.get("dpace_alpha", 0.5)),
+            normalize="tokens",
+        ).build()
 
         # --- Multi-block ---
         self.num_blocks_per_sample = int(dflash_cfg.get("num_blocks_per_sample", 1))
@@ -854,6 +877,7 @@ class DFlashStrategy(DLLMStrategy):
         """Sample anchor blocks and run frozen target forwards for all microbatches."""
         device = recipe.dist_env.device
         num_predicted = 0
+        num_loss_units = 0
         for batch in batches:
             input_ids = batch["input_ids"].to(device)
             attn = batch.get("attention_mask", torch.ones_like(input_ids)).to(device)
@@ -878,6 +902,10 @@ class DFlashStrategy(DLLMStrategy):
             batch["_dflash_block_targets"] = block_targets
             batch["_dflash_block_mask"] = block_mask
             num_predicted += int(block_mask.sum().item())
+            num_loss_units += int(input_ids.shape[0]) * self.num_blocks_per_sample
+        if getattr(self.dflash_loss_fn, "loss_type", "dflash") != "dflash":
+            # normalization_mode="supervised" makes the recipe select slot two.
+            return num_predicted, num_loss_units
         return num_predicted, num_predicted
 
     # ------------------------------------------------------------------
@@ -1012,21 +1040,26 @@ class DFlashStrategy(DLLMStrategy):
             if not torch.is_tensor(draft_hidden):
                 draft_hidden = getattr(draft_hidden, "last_hidden_state", draft_hidden[0])
 
-            # Extract predicted positions (skip the anchor token at index 0 of
-            # each block). draft_hidden: [B, N*block_size, dim] → [B, N*(block_size-1), dim].
-            pred = draft_hidden.view(B, N, self.block_size, -1)[:, :, 1:, :].reshape(B, N * (self.block_size - 1), -1)
+            # Extract predicted positions (skip the anchor token at index 0 of each
+            # block). draft_hidden: [B, N*block_size, dim] → [B, N, block_size-1, dim].
+            # The [B, N, k] block layout is kept (not flattened) so the loss's
+            # per-block confidence reset is structural.
+            k = self.block_size - 1
+            pred = draft_hidden.view(B, N, self.block_size, -1)[:, :, 1:, :]  # [B, N, k, dim]
+            block_targets = block_targets.view(B, N, k)
+            block_mask = block_mask.view(B, N, k)
             if self.use_fused_linear_ce:
                 # Fuse the LM-head projection into the CE — avoids materialising
-                # the [B, N*(block_size-1), vocab] logits tensor (the main OOM
-                # source at large N on a full-vocab target).
+                # the [B, N, k, vocab] logits tensor (the main OOM source at large
+                # N on a full-vocab target).
                 loss_result = self.dflash_loss_fn.forward_fused(
                     hidden=pred,
                     lm_head_weight=self.target_head.weight,
                     target_ids=block_targets,
                     block_mask=block_mask,
                     num_tokens=num_diffusion_tokens,
-                    block_size=self.block_size if N > 1 else None,
                     lm_head_bias=getattr(self.target_head, "bias", None),
+                    total_blocks=self.num_blocks_per_sample,
                 )
             else:
                 logits = self.target_head(pred)
@@ -1035,7 +1068,7 @@ class DFlashStrategy(DLLMStrategy):
                     target_ids=block_targets,
                     block_mask=block_mask,
                     num_tokens=num_diffusion_tokens,
-                    block_size=self.block_size if N > 1 else None,
+                    total_blocks=self.num_blocks_per_sample,
                 )
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())

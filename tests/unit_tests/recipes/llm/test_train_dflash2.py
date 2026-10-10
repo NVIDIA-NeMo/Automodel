@@ -154,14 +154,47 @@ def test_build_trainer_module_defaults_loss_decay_gamma_to_paper_value():
     assert module.sliding_window is None
 
 
-def test_build_trainer_module_rejects_loss_type():
-    """The DFlash loss_type knob must fail loudly here instead of being silently
-    ignored (DFlash 2 teacher-forces the selector from the fixed-anchor layout)."""
+def test_build_trainer_module_rejects_variable_prefix_loss_type():
+    """``variable_prefix`` must fail loudly instead of being silently ignored:
+    DFlash 2 teacher-forces the selector's predecessor from the fixed-anchor
+    block layout, which a variable visible prefix breaks."""
     recipe = _recipe()
     recipe.draft_model = _dflash2_draft()
     recipe.mask_token_id = MASK_ID
-    with pytest.raises(ValueError, match="loss_type"):
+    recipe.block_size = BLOCK_SIZE
+    recipe.target_model = _target_model()
+    recipe.draft_sliding_window = None
+    with pytest.raises(ValueError, match="variable_prefix"):
         recipe._build_trainer_module("sdpa", {"loss_type": "variable_prefix"})
+
+
+def test_build_trainer_module_threads_dpace_loss_type():
+    """``loss_type`` / ``dpace_alpha`` must reach the trainer, not silently stay
+    on the ``"dflash"`` default -- the gap the DFlash recipe already closed."""
+    recipe = _recipe()
+    recipe.draft_model = _dflash2_draft()
+    recipe.mask_token_id = MASK_ID
+    recipe.block_size = BLOCK_SIZE
+    recipe.target_model = _target_model()
+    recipe.draft_sliding_window = None
+    module = recipe._build_trainer_module("sdpa", {"loss_type": "dpace", "dpace_alpha": 0.3})
+    assert isinstance(module, DFlash2TrainerModule)
+    assert module.loss_type == "dpace"
+    assert module.dpace_alpha == 0.3
+
+
+def test_build_trainer_module_defaults_loss_type_to_dflash():
+    """An unset ``loss_type`` must keep the fixed-decay default, matching the
+    DFlash recipe's own null-folding convention."""
+    recipe = _recipe()
+    recipe.draft_model = _dflash2_draft()
+    recipe.mask_token_id = MASK_ID
+    recipe.block_size = BLOCK_SIZE
+    recipe.target_model = _target_model()
+    recipe.draft_sliding_window = None
+    module = recipe._build_trainer_module("sdpa", {"loss_type": None})
+    assert module.loss_type == "dflash"
+    assert module.dpace_alpha == 0.5
 
 
 def _metrics(**overrides):
