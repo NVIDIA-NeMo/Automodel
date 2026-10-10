@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
 # Type aliases for API signatures.
-ActivationCheckpointingMode = Union[bool, Literal["full", "selective"]]
+ActivationCheckpointingMode = Union[bool, Literal["full", "selective", "moe"]]
 ActivationCheckpointingScope = Union[str, List[str], Tuple[str, ...]]
 DistributedStrategyConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
 # Backwards-compatible alias for external / type-checking references.
@@ -195,11 +195,6 @@ class MoEParallelizerConfig:
     # different number of tokens per expert than the forward pass, which makes
     # torch.utils.checkpoint raise a CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
-    # When True (and activation checkpointing is on), only the MoE sub-block of each decoder
-    # layer is checkpointed; attention / linear-attention / residual-mixing activations are
-    # saved instead of recomputed. Trades activation memory for the recompute of everything
-    # outside the experts. Requires ignore_router_for_ac=True and the non-selective mode.
-    checkpoint_moe_only: bool = False
     reshard_after_forward: bool = False
     lm_head_precision: Union[str, torch.dtype] | None = None
     wrap_outer_model: bool = True
@@ -291,9 +286,10 @@ class FSDP2Config:
             ``output_dtype=float32`` in mp_policy to keep the residual stream in fp32
             while running matmuls in lower precision.  Set to ``None`` to disable.
             Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
-        activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
+        activation_checkpointing (bool | "full" | "selective" | "moe"): Enable activation checkpointing. ``True`` or
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
-            blocks with PyTorch selective activation checkpointing.
+            blocks with PyTorch selective activation checkpointing. ``"moe"`` (expert-parallel models only)
+            checkpoints just each decoder block's MoE sub-block and keeps the other activations.
         activation_checkpointing_scope (str | list[str]): Which extracted
             layer groups activation checkpointing should wrap. ``"all"``
             selects every extracted group. Scoped values such as
@@ -446,9 +442,10 @@ class DDPConfig:
     Only dp_size is relevant (inferred from world_size).
 
     Attributes:
-        activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
+        activation_checkpointing (bool | "full" | "selective" | "moe"): Enable activation checkpointing. ``True`` or
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
-            blocks with PyTorch selective activation checkpointing.
+            blocks with PyTorch selective activation checkpointing. ``"moe"`` (expert-parallel models only)
+            checkpoints just each decoder block's MoE sub-block and keeps the other activations.
         activation_checkpointing_scope (str | list[str]): Which extracted
             layer groups activation checkpointing should wrap. ``"all"``
             selects every extracted group. Scoped values such as

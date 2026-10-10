@@ -124,6 +124,11 @@ def _is_selective_ac(activation_checkpointing: object) -> bool:
     )
 
 
+def _is_moe_only_ac(activation_checkpointing: object) -> bool:
+    """Return True when the AC mode requests checkpointing of the MoE sub-blocks only."""
+    return isinstance(activation_checkpointing, str) and activation_checkpointing.lower() == "moe"
+
+
 def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     config = getattr(model, "config", None)
     if getattr(config, "model_type", None) == "deepseek_v4":
@@ -144,7 +149,7 @@ def _get_cp_stream() -> torch.cuda.Stream:
 def _get_moe_module(block: nn.Module) -> MoE | None:
     """Return the block's MoE sub-block, looking through a checkpoint wrapper around it.
 
-    With ``checkpoint_moe_only`` the MoE sub-block itself is the checkpoint unit, so the
+    With ``activation_checkpointing='moe'`` the MoE sub-block itself is the checkpoint unit, so the
     FSDP wrapping that separates expert parameters from the block must still find it.
     """
     for name in ("moe", "mlp"):
@@ -643,8 +648,8 @@ def apply_ac(
     checkpoint_decoder = "all" in scopes or "language" in scopes
     if moe_only and (selective or not ignore_router):
         raise ValueError(
-            "checkpoint_moe_only requires the default block checkpointing mode "
-            "(activation_checkpointing=true, ignore_router_for_ac=true); got "
+            "activation_checkpointing='moe' requires ignore_router_for_ac=true and cannot be "
+            "combined with selective checkpointing; got "
             f"selective={selective}, ignore_router={ignore_router}"
         )
     uses_hybridep_dispatch = checkpoint_decoder and _uses_hybridep_dispatch(model)
@@ -1220,7 +1225,6 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
-    checkpoint_moe_only: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
@@ -1303,7 +1307,7 @@ def parallelize_model(
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
             activation_checkpointing_scope=activation_checkpointing_scope,
-            moe_only=checkpoint_moe_only,
+            moe_only=_is_moe_only_ac(activation_checkpointing),
         )
 
     if reapply_trainability is not None:

@@ -20,8 +20,8 @@ import pytest
 import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-from nemo_automodel.components.distributed.config import MoEParallelizerConfig
-from nemo_automodel.components.moe.parallelizer import apply_ac
+from nemo_automodel.components.moe.parallelizer import _is_moe_only_ac, _is_selective_ac, apply_ac
+from nemo_automodel.recipes._dist_utils import _normalize_activation_checkpointing
 from tests.unit_tests.models.qwen3_8_flash_next.test_qsa_route_replay import _build_model, _run_step
 
 
@@ -29,16 +29,18 @@ def _layers(model):
     return model.model.language_model.layers
 
 
-def test_config_exposes_checkpoint_moe_only_with_default_off() -> None:
-    assert MoEParallelizerConfig().checkpoint_moe_only is False
-    assert MoEParallelizerConfig(checkpoint_moe_only=True).to_dict()["checkpoint_moe_only"] is True
+def test_moe_mode_is_a_third_activation_checkpointing_value() -> None:
+    assert _normalize_activation_checkpointing("moe") == "moe"
+    assert _normalize_activation_checkpointing("MoE") == "moe"
+    assert _is_moe_only_ac("moe") and not _is_selective_ac("moe")
+    assert not _is_moe_only_ac("selective") and not _is_moe_only_ac(True) and not _is_moe_only_ac(False)
 
 
 def test_moe_only_rejects_selective_and_unpinned_router() -> None:
     model = _build_model(reuse_routes=True)
-    with pytest.raises(ValueError, match="checkpoint_moe_only"):
+    with pytest.raises(ValueError, match="activation_checkpointing='moe'"):
         apply_ac(model, ignore_router=True, selective=True, moe_only=True)
-    with pytest.raises(ValueError, match="checkpoint_moe_only"):
+    with pytest.raises(ValueError, match="activation_checkpointing='moe'"):
         apply_ac(model, ignore_router=False, moe_only=True)
 
 

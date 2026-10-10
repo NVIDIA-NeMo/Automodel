@@ -22,16 +22,16 @@ from nemo_automodel.components.distributed import model_parallelizer
 from nemo_automodel.components.distributed.config import MoEParallelizerConfig
 
 
-def test_parallelize_moe_forwards_checkpoint_moe_only() -> None:
-    """Every MoE activation-checkpointing knob on the typed config must reach parallelize_model."""
+def test_parallelize_moe_forwards_the_moe_checkpointing_mode() -> None:
+    """The activation-checkpointing mode and the router knob must reach parallelize_model unchanged."""
     model = nn.Linear(2, 2)
-    moe = MoEParallelizerConfig(ignore_router_for_ac=True, checkpoint_moe_only=True)
+    moe = MoEParallelizerConfig(ignore_router_for_ac=True)
     mesh_context = SimpleNamespace(
         device_mesh=object(),
         moe_mesh=object(),
         moe_parallel_config=moe,
         strategy_config=None,
-        activation_checkpointing=True,
+        activation_checkpointing="moe",
         reapply_trainability=None,
         parallelize_axis_kwargs=lambda: {},
     )
@@ -41,6 +41,6 @@ def test_parallelize_moe_forwards_checkpoint_moe_only() -> None:
         assert model_parallelizer._parallelize_moe(model, mesh_context, parallelizer=parallelizer) is model
 
     kwargs = parallelize.call_args.kwargs
-    assert kwargs["activation_checkpointing"] is True
+    assert kwargs["activation_checkpointing"] == "moe"
     assert kwargs["ignore_router_for_ac"] is True
-    assert kwargs["checkpoint_moe_only"] is True
+    assert "checkpoint_moe_only" not in kwargs

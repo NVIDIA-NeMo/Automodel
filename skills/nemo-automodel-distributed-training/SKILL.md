@@ -389,9 +389,13 @@ distributed:
   moe:
     reshard_after_forward: false
     ignore_router_for_ac: false
-    checkpoint_moe_only: false   # true: checkpoint only each block's MoE sub-block (needs ignore_router_for_ac=true)
     wrap_outer_model: true
 ```
+
+`activation_checkpointing: moe` (expert-parallel FSDP2 only, needs
+`ignore_router_for_ac: true`) checkpoints just each decoder block's MoE
+sub-block and keeps attention / linear-attention / residual-mixing
+activations: less recompute for more activation memory.
 
 The `moe` sub-section maps to `MoEParallelizerConfig` and is only
 instantiated when `ep_size > 1`.
@@ -558,7 +562,7 @@ MoE config:
 
 ```
 components/distributed/config.py
-    MoEParallelizerConfig  -- reshard_after_forward, ignore_router_for_ac, checkpoint_moe_only, wrap_outer_model, etc.
+    MoEParallelizerConfig  -- reshard_after_forward, ignore_router_for_ac, wrap_outer_model, etc.
 components/moe/config.py
     MoEConfig              -- n_routed_experts, n_activated_experts, score_func, etc.
 ```
