@@ -212,6 +212,9 @@ mlflow-full = [
     "mlflow>=3.16.1",
 ]
 wandb = ["wandb>=0.30.0"]
+# SwanLab mirrors the W&B run, so it needs the wandb extra as well.
+# Upper bound: the mirror relies on how swanlab 0.10's ``sync_wandb`` forwards values.
+swanlab = ["nemo-automodel[wandb]", "swanlab>=0.10.0,<0.11"]
 tracking = [
     # Convenience meta-extra: installs both experiment-tracking backends.
     "nemo-automodel[mlflow]",
