@@ -66,12 +66,22 @@ fi
 # installed when building the CI image.
 
 # Default pytest capture reports module progress and includes stdout, stderr, and logs only for failed tests.
-coverage run \
-    -m pytest \
+TEST_COMMAND=(coverage run -m pytest)
+if [[ "$UNIT_TEST" == "true" && "$CPU" == "true" ]]; then
+    # Keep one CI job, with bounded concurrency for tests that spawn CPU ranks.
+    # File scheduling keeps module fixtures and fixed-port tests on one worker.
+    export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+    # pytest-cov collects worker coverage; coverage run alone only traces the controller.
+    TEST_COMMAND=(python -m pytest -n 2 --dist loadfile --cov --cov-config=pyproject.toml --cov-report=)
+fi
+
+"${TEST_COMMAND[@]}" \
     --durations 32 \
     --durations-min=0 \
     "${TEST_DIRS[@]}" \
     -m "not pleasefixme" --tb=short -rfE \
     $SHARD_ARGS \
     $ADDITIONAL_ARGS
-coverage combine -q
+if [[ "$UNIT_TEST" != "true" || "$CPU" != "true" ]]; then
+    coverage combine -q
+fi

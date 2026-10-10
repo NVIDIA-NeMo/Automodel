@@ -404,11 +404,13 @@ def dsv4_sparse_attention(
             sinks = torch.cat([sinks, sinks.new_zeros(head_pad)], dim=0).contiguous()
 
         # Miles runs this kernel under tensor parallelism, so the kernel sees a
-        # small local head count. AutoModel's DSV4 recipe currently uses TP=1,
-        # which would launch a single H=64, D=512 kernel with excessive shared
-        # memory/register pressure. Chunking heads preserves the same TileLang
-        # fwd/bwd kernels and lets autograd sum the per-chunk KV gradients.
-        max_heads_per_kernel = 16 if q.shape[-1] >= 256 else 64
+        # small local head count. AutoModel's DSV4 recipes use TP=1 (64 heads,
+        # D=512). One backward kernel over all 64 heads, with its thread count
+        # scaled to the head count (see sparse_mqa_bwd_interface), gathers the
+        # top-k KV rows and accumulates the fp32 KV gradient once per layer; the
+        # earlier 16-head chunks repeated both four times and ran the backward
+        # 7-8x slower than the forward. Chunking remains for more than 64 heads.
+        max_heads_per_kernel = 64
         if q.shape[2] > max_heads_per_kernel:
             if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
                 raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
