@@ -829,6 +829,28 @@ class TestDeepseekV4GroupedLinear:
         out_ref = torch.stack([x[:, g, :] @ w_ref[g].t() for g in range(n_groups)], dim=1)
         torch.testing.assert_close(out, out_ref)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_token_major_output_and_gradients_match_the_per_group_reference(self, dtype: torch.dtype):
+        """The out= path returns a contiguous token-major output (the caller's flatten is a view) and the
+        same input / weight gradients as the per-group matmul."""
+        torch.manual_seed(0)
+        n_groups, in_per, out_total = 4, 6, 20
+        proj = DeepseekV4GroupedLinear(in_per, out_total, n_groups=n_groups).to(dtype)
+        x = torch.randn(2, 3, n_groups, in_per, dtype=dtype, requires_grad=True)
+        out = proj(x)
+        assert out.shape == (2, 3, n_groups, out_total // n_groups) and out.is_contiguous()
+        assert out.flatten(2).data_ptr() == out.data_ptr()
+        gx, gw = torch.autograd.grad((out.float() ** 2).sum(), (x, proj.weight))
+        x_ref = x.detach().clone().requires_grad_()
+        w_ref = proj.weight.detach().clone().requires_grad_()
+        w_groups = w_ref.view(n_groups, out_total // n_groups, in_per)
+        ref = torch.stack([x_ref[..., g, :] @ w_groups[g].t() for g in range(n_groups)], dim=-2)
+        ref_gx, ref_gw = torch.autograd.grad((ref.float() ** 2).sum(), (x_ref, w_ref))
+        tol = {} if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(out, ref, **tol)
+        torch.testing.assert_close(gx, ref_gx, **tol)
+        torch.testing.assert_close(gw, ref_gw, **tol)
+
 
 class TestDeepseekV4HyperConnection:
     """``compute_weights`` returns the (pre, post, comb) tensors used at

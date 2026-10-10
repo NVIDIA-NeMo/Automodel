@@ -277,6 +277,40 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+class _GroupedLinearTokenMajor(torch.autograd.Function):
+    """Per-group matmul that reads and writes token-major activations in place.
+
+    ``torch.bmm`` wants the group axis first. Permuting a token-major ``[tokens, groups, d_in]``
+    activation is a free view on the input side, but the ``[groups, tokens, d_out]`` result had to be
+    permuted back and copied (``flatten`` / ``reshape`` by the caller) and, in backward, the
+    permuted input gradient was copied again by the ``reshape`` that produced the grouped view
+    (``ViewBackward``): two 0.5 GB copies per attention layer at the DeepSeek-V4.1 benchmark shape.
+    cuBLAS handles a strided output, so the forward and the input gradient are written straight
+    into token-major buffers through ``out=`` and the copies disappear.
+    """
+
+    @staticmethod
+    def forward(ctx: object, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """Args: x ``[tokens, groups, d_in]`` (contiguous), w ``[groups, d_out, d_in]``. Returns ``[tokens, groups, d_out]``."""
+        ctx.save_for_backward(x, w)
+        y = x.new_empty(x.shape[0], w.shape[0], w.shape[1])
+        torch.bmm(x.permute(1, 0, 2), w.transpose(-1, -2), out=y.permute(1, 0, 2))
+        return y
+
+    @staticmethod
+    def backward(ctx: object, grad_y: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Input gradient written token-major; weight gradient as a grouped ``bmm`` over the token axis."""
+        x, w = ctx.saved_tensors
+        grad_y = grad_y.contiguous()
+        grad_x = grad_w = None
+        if ctx.needs_input_grad[0]:
+            grad_x = torch.empty_like(x)
+            torch.bmm(grad_y.permute(1, 0, 2), w, out=grad_x.permute(1, 0, 2))
+        if ctx.needs_input_grad[1]:
+            grad_w = torch.bmm(grad_y.permute(1, 2, 0), x.permute(1, 0, 2))
+        return grad_x, grad_w
+
+
 class DeepseekV4GroupedLinear(nn.Linear):
     """Block-diagonal grouped linear (HF PR 45616 port).
 
@@ -295,9 +329,8 @@ class DeepseekV4GroupedLinear(nn.Linear):
         d_in = x.shape[-1]
         out_per_group = self.out_features // self.n_groups
         w = self.weight.view(self.n_groups, out_per_group, d_in)
-        x = x.reshape(-1, self.n_groups, d_in).permute(1, 0, 2)
-        y = torch.bmm(x, w.transpose(-1, -2)).permute(1, 0, 2)
-        return y.reshape(*batch_shape, self.n_groups, out_per_group)
+        y = _GroupedLinearTokenMajor.apply(x.reshape(-1, self.n_groups, d_in), w)
+        return y.view(*batch_shape, self.n_groups, out_per_group)
 
 
 class DeepseekV4TrainCache:
