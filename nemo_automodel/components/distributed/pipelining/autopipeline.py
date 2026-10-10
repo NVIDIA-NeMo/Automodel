@@ -187,13 +187,13 @@ class AutoPipeline:
             from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B
 
             from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
-                install_interleaved_backward_recv_pool,
+                install_interleaved_recv_pool,
                 install_recv_buffer_pool,
                 schedule_supports_recv_pool,
             )
 
             if self.pp_schedule_csv is None and type(pp_schedule_obj) is ScheduleInterleaved1F1B:
-                install_interleaved_backward_recv_pool(pp_schedule_obj, slack=self.pp_recv_buffer_pool_slack)
+                install_interleaved_recv_pool(pp_schedule_obj, slack=self.pp_recv_buffer_pool_slack)
             elif self.pp_schedule_csv is None and schedule_supports_recv_pool(self.pp_schedule):
                 install_recv_buffer_pool(slack=self.pp_recv_buffer_pool_slack)
             else:

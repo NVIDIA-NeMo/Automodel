@@ -24,8 +24,9 @@ from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B, _Action, _ComputationType
 
 from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
-    _backward_recv_slots,
     _pool_stage_backward_recvs,
+    _pool_stage_forward_recvs,
+    _recv_slots,
 )
 
 
@@ -47,23 +48,30 @@ def make_schedule(virtual: int, microbatches: int, physical: int = 4) -> Schedul
 
 @pytest.mark.parametrize("virtual,microbatches", [(2, 8), (2, 16), (3, 16), (4, 16)])
 @pytest.mark.parametrize("slack", [0, 2])
-def test_native_schedule_never_reuses_a_live_backward_buffer(virtual: int, microbatches: int, slack: int) -> None:
+@pytest.mark.parametrize("forward", [False, True])
+def test_native_schedule_never_reuses_a_live_receive_buffer(
+    virtual: int, microbatches: int, slack: int, forward: bool
+) -> None:
     schedule = make_schedule(virtual, microbatches)
     savings = 0
     for rank, actions in schedule.pipeline_order_with_comms.items():
-        for stage in range(rank, schedule._num_stages - 1, schedule.pp_group_size):
-            slots, count = _backward_recv_slots(actions, stage, microbatches, slack)
+        for stage in range(rank, schedule._num_stages, schedule.pp_group_size):
+            if (forward and stage == 0) or (not forward and stage == schedule._num_stages - 1):
+                continue
+            receive_kind = _ComputationType.RECV_F if forward else _ComputationType.RECV_B
+            consume_kind = _ComputationType.FORWARD if forward else _ComputationType.FULL_BACKWARD
+            slots, count = _recv_slots(actions, stage, microbatches, slack, forward=forward)
             active: dict[int, int] = {}
             seen: set[int] = set()
             for action in actions:
                 if action.stage_index != stage:
                     continue
                 microbatch = action.microbatch_index
-                if action.computation_type == _ComputationType.RECV_B:
+                if action.computation_type == receive_kind:
                     assert slots[microbatch] not in active
                     active[slots[microbatch]] = microbatch
                     seen.add(microbatch)
-                elif action.computation_type == _ComputationType.FULL_BACKWARD:
+                elif action.computation_type == consume_kind:
                     assert active.pop(slots[microbatch]) == microbatch
             assert not active and seen == set(range(microbatches))
             assert max(slots) < count <= microbatches
@@ -82,7 +90,7 @@ def test_invalid_receive_lifetimes_are_rejected(defect: str) -> None:
         "split_backward": [receive, _Action(0, _ComputationType.BACKWARD_INPUT, 0)],
     }[defect]
     with pytest.raises(ValueError):
-        _backward_recv_slots(actions, 0, 1, 0)
+        _recv_slots(actions, 0, 1, 0)
 
 
 def test_too_small_pool_negative_control_detects_overlapping_receives() -> None:
@@ -133,3 +141,40 @@ def test_reinitialization_restores_chunk_count_and_gradients_own_their_storage()
         assert not torch.equal(unowned_negative_control, expected)
     with pytest.raises(ValueError, match="microbatch count"):
         stage._setup_backward_recv_info(8)
+
+
+def test_forward_inputs_are_independent_leaves_across_reused_slots() -> None:
+    stage = object.__new__(PipelineStage)
+    stage.stage_index = 1
+    stage.args_recv_info = {}
+
+    def original_setup(self: PipelineStage, count: int, has_backward: bool) -> None:
+        self.args_recv_info = {
+            index: (torch.ones(8, requires_grad=has_backward), torch.arange(8)) for index in range(count)
+        }
+
+    def original_retrieve(self: PipelineStage, microbatch: int) -> tuple[torch.Tensor, ...]:
+        return self.args_recv_info[microbatch]
+
+    stage._setup_forward_recv_info = MethodType(original_setup, stage)
+    stage._retrieve_recv_activations = MethodType(original_retrieve, stage)
+    _pool_stage_forward_recvs(stage, (0, 1, 0, 1), 2)
+    for has_backward in (True, False):
+        stage._setup_forward_recv_info(4, has_backward)
+        activation, positions = stage._retrieve_recv_activations(0)
+        assert activation.is_leaf and activation.requires_grad == has_backward
+        assert not positions.requires_grad and stage.chunks == 4
+        assert len({id(info) for info in stage.args_recv_info.values()}) == 2
+        with torch.no_grad():
+            stage.args_recv_info[2][0].fill_(99)
+            stage.args_recv_info[2][1].fill_(99)
+        torch.testing.assert_close(activation, torch.ones(8), rtol=0, atol=0)
+        torch.testing.assert_close(positions, torch.arange(8), rtol=0, atol=0)
+        if has_backward:
+            activation.square().sum().backward()
+            torch.testing.assert_close(activation.grad, torch.full((8,), 2.0), rtol=0, atol=0)
+            assert stage.args_recv_info[0][0].grad is None
+        # The unowned negative control sees the overwritten receive.
+        assert not torch.equal(stage.args_recv_info[0][0], activation)
+    with pytest.raises(ValueError, match="microbatch count"):
+        stage._setup_forward_recv_info(8, True)

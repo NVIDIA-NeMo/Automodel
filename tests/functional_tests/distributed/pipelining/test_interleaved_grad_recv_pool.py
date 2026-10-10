@@ -28,7 +28,7 @@ from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B
 from torch.utils.checkpoint import checkpoint
 
-from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import install_interleaved_backward_recv_pool
+from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import install_interleaved_recv_pool
 
 
 class _Block(nn.Module):
@@ -52,7 +52,14 @@ def _free_port() -> int:
 
 
 def _run_pipeline(
-    rank: int, world_size: int, virtual: int, dtype: torch.dtype, activation_checkpointing: bool, pooled: bool
+    rank: int,
+    world_size: int,
+    virtual: int,
+    dtype: torch.dtype,
+    activation_checkpointing: bool,
+    pooled: bool,
+    unsafe_forward_alias: bool = False,
+    pool_slack: int = 2,
 ) -> list[list[torch.Tensor]]:
     device = torch.device("cuda", rank)
     torch.manual_seed(911)
@@ -66,7 +73,14 @@ def _run_pipeline(
 
     schedule = ScheduleInterleaved1F1B(stages, n_microbatches=16, loss_fn=loss_fn, scale_grads=False)
     if pooled:
-        install_interleaved_backward_recv_pool(schedule)
+        install_interleaved_recv_pool(schedule, slack=pool_slack)
+        if unsafe_forward_alias:
+            # Test-only defect: leave receives pooled but remove their owned input copy.
+            for stage in stages:
+                if not stage.is_first:
+                    stage._retrieve_recv_activations = PipelineStage._retrieve_recv_activations.__get__(
+                        stage, PipelineStage
+                    )
     parameters = [parameter for block in blocks for parameter in block.parameters()]
     optimizer = torch.optim.SGD(parameters, lr=0.001)
     rng = torch.Generator().manual_seed(912)
@@ -95,7 +109,8 @@ def _run_pipeline(
         for stage in stages:
             assert stage.chunks == 16
             if not stage.is_first:
-                assert len({id(info) for info in stage.args_recv_info.values()}) == 16
+                distinct = len({id(info) for info in stage.args_recv_info.values()})
+                assert distinct < 16 if pooled else distinct == 16
             if not stage.is_last:
                 distinct = len({id(info) for info in stage.grad_recv_info.values()})
                 assert distinct < 16 if pooled else distinct == 16
@@ -103,7 +118,14 @@ def _run_pipeline(
 
 
 def _worker(
-    rank: int, world_size: int, port: int, virtual: int, dtype_name: str, activation_checkpointing: bool
+    rank: int,
+    world_size: int,
+    port: int,
+    virtual: int,
+    dtype_name: str,
+    activation_checkpointing: bool,
+    unsafe_forward_alias: bool = False,
+    pool_slack: int = 2,
 ) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -113,7 +135,9 @@ def _worker(
     try:
         dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float32
         reference = _run_pipeline(rank, world_size, virtual, dtype, activation_checkpointing, False)
-        actual = _run_pipeline(rank, world_size, virtual, dtype, activation_checkpointing, True)
+        actual = _run_pipeline(
+            rank, world_size, virtual, dtype, activation_checkpointing, True, unsafe_forward_alias, pool_slack
+        )
         assert len(reference) == len(actual) == 3
         for reference_step, actual_step in zip(reference, actual):
             assert len(reference_step) == len(actual_step)
@@ -125,24 +149,37 @@ def _worker(
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices required")
 @pytest.mark.parametrize(
-    "world_size,virtual,dtype_name,activation_checkpointing",
+    "world_size,virtual,dtype_name,activation_checkpointing,pool_slack",
     [
-        (2, 2, "float32", False),
-        (2, 2, "bfloat16", True),
-        (2, 4, "bfloat16", False),
-        (2, 4, "bfloat16", True),
-        (4, 4, "bfloat16", True),
+        (2, 2, "float32", False, 2),
+        (2, 2, "bfloat16", True, 2),
+        (2, 4, "bfloat16", False, 2),
+        (2, 4, "bfloat16", True, 2),
+        (4, 4, "bfloat16", True, 2),
+        (4, 4, "bfloat16", True, 0),
     ],
 )
 @pytest.mark.timeout(240)
 def test_interleaved_pooled_receives_preserve_every_gradient_and_update(
-    world_size: int, virtual: int, dtype_name: str, activation_checkpointing: bool
+    world_size: int, virtual: int, dtype_name: str, activation_checkpointing: bool, pool_slack: int
 ) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"{world_size} CUDA devices required")
     mp.spawn(
         _worker,
-        args=(world_size, _free_port(), virtual, dtype_name, activation_checkpointing),
+        args=(world_size, _free_port(), virtual, dtype_name, activation_checkpointing, False, pool_slack),
         nprocs=world_size,
         join=True,
     )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Four CUDA devices required")
+@pytest.mark.timeout(240)
+def test_omitting_owned_forward_inputs_fails_the_checkpointed_parity_check() -> None:
+    # A version-counter error or numerical mismatch is evidence of the storage
+    # defect; unrelated initialization/communication failures must not pass.
+    with pytest.raises(
+        mp.ProcessRaisedException,
+        match="not equal|not close|modified by an inplace operation|backward through the graph a second time",
+    ):
+        mp.spawn(_worker, args=(4, _free_port(), 4, "bfloat16", True, True, 0), nprocs=4, join=True)
