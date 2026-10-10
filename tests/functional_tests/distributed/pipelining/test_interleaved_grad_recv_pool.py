@@ -60,6 +60,7 @@ def _run_pipeline(
     pooled: bool,
     unsafe_forward_alias: bool = False,
     pool_slack: int = 2,
+    num_microbatches: int = 16,
 ) -> list[list[torch.Tensor]]:
     device = torch.device("cuda", rank)
     torch.manual_seed(911)
@@ -71,7 +72,7 @@ def _run_pipeline(
     def loss_fn(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return (output.float() - target.float()).square().mean()
 
-    schedule = ScheduleInterleaved1F1B(stages, n_microbatches=16, loss_fn=loss_fn, scale_grads=False)
+    schedule = ScheduleInterleaved1F1B(stages, n_microbatches=num_microbatches, loss_fn=loss_fn, scale_grads=False)
     if pooled:
         install_interleaved_recv_pool(schedule, slack=pool_slack)
         if unsafe_forward_alias:
@@ -86,8 +87,8 @@ def _run_pipeline(
     rng = torch.Generator().manual_seed(912)
     observations = []
     for _ in range(3):
-        x = torch.randn(32, 32, generator=rng).to(device=device, dtype=dtype).requires_grad_()
-        target = torch.randn(32, 32, generator=rng).to(device=device, dtype=dtype)
+        x = torch.randn(2 * num_microbatches, 32, generator=rng).to(device=device, dtype=dtype).requires_grad_()
+        target = torch.randn(2 * num_microbatches, 32, generator=rng).to(device=device, dtype=dtype)
         optimizer.zero_grad(set_to_none=True)
         losses = []
         if rank == 0:
@@ -107,13 +108,13 @@ def _run_pipeline(
         assert all(torch.isfinite(tensor).all() for tensor in snapshot)
         observations.append(snapshot)
         for stage in stages:
-            assert stage.chunks == 16
+            assert stage.chunks == num_microbatches
             if not stage.is_first:
                 distinct = len({id(info) for info in stage.args_recv_info.values()})
-                assert distinct < 16 if pooled else distinct == 16
+                assert distinct < num_microbatches if pooled else distinct == num_microbatches
             if not stage.is_last:
                 distinct = len({id(info) for info in stage.grad_recv_info.values()})
-                assert distinct < 16 if pooled else distinct == 16
+                assert distinct < num_microbatches if pooled else distinct == num_microbatches
     return observations
 
 
@@ -126,6 +127,7 @@ def _worker(
     activation_checkpointing: bool,
     unsafe_forward_alias: bool = False,
     pool_slack: int = 2,
+    num_microbatches: int = 16,
 ) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -134,9 +136,19 @@ def _worker(
     dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=180))
     try:
         dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float32
-        reference = _run_pipeline(rank, world_size, virtual, dtype, activation_checkpointing, False)
+        reference = _run_pipeline(
+            rank, world_size, virtual, dtype, activation_checkpointing, False, num_microbatches=num_microbatches
+        )
         actual = _run_pipeline(
-            rank, world_size, virtual, dtype, activation_checkpointing, True, unsafe_forward_alias, pool_slack
+            rank,
+            world_size,
+            virtual,
+            dtype,
+            activation_checkpointing,
+            True,
+            unsafe_forward_alias,
+            pool_slack,
+            num_microbatches,
         )
         assert len(reference) == len(actual) == 3
         for reference_step, actual_step in zip(reference, actual):
@@ -149,25 +161,42 @@ def _worker(
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices required")
 @pytest.mark.parametrize(
-    "world_size,virtual,dtype_name,activation_checkpointing,pool_slack",
+    "world_size,virtual,dtype_name,activation_checkpointing,pool_slack,num_microbatches",
     [
-        (2, 2, "float32", False, 2),
-        (2, 2, "bfloat16", True, 2),
-        (2, 4, "bfloat16", False, 2),
-        (2, 4, "bfloat16", True, 2),
-        (4, 4, "bfloat16", True, 2),
-        (4, 4, "bfloat16", True, 0),
+        (2, 2, "float32", False, 2, 16),
+        (2, 2, "bfloat16", True, 2, 16),
+        (2, 4, "bfloat16", False, 2, 16),
+        (2, 4, "bfloat16", True, 2, 16),
+        (4, 4, "bfloat16", True, 2, 16),
+        (4, 4, "bfloat16", True, 0, 16),
+        (4, 2, "float32", False, 2, 32),
+        (4, 2, "bfloat16", True, 2, 32),
+        (4, 2, "bfloat16", True, 2, 64),
     ],
 )
 @pytest.mark.timeout(240)
 def test_interleaved_pooled_receives_preserve_every_gradient_and_update(
-    world_size: int, virtual: int, dtype_name: str, activation_checkpointing: bool, pool_slack: int
+    world_size: int,
+    virtual: int,
+    dtype_name: str,
+    activation_checkpointing: bool,
+    pool_slack: int,
+    num_microbatches: int,
 ) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"{world_size} CUDA devices required")
     mp.spawn(
         _worker,
-        args=(world_size, _free_port(), virtual, dtype_name, activation_checkpointing, False, pool_slack),
+        args=(
+            world_size,
+            _free_port(),
+            virtual,
+            dtype_name,
+            activation_checkpointing,
+            False,
+            pool_slack,
+            num_microbatches,
+        ),
         nprocs=world_size,
         join=True,
     )
@@ -175,11 +204,14 @@ def test_interleaved_pooled_receives_preserve_every_gradient_and_update(
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Four CUDA devices required")
 @pytest.mark.timeout(240)
-def test_omitting_owned_forward_inputs_fails_the_checkpointed_parity_check() -> None:
+@pytest.mark.parametrize("virtual,num_microbatches", [(4, 16), (2, 32), (2, 64)])
+def test_omitting_owned_forward_inputs_fails_the_checkpointed_parity_check(virtual: int, num_microbatches: int) -> None:
     # A version-counter error or numerical mismatch is evidence of the storage
     # defect; unrelated initialization/communication failures must not pass.
     with pytest.raises(
         mp.ProcessRaisedException,
         match="not equal|not close|modified by an inplace operation|backward through the graph a second time",
     ):
-        mp.spawn(_worker, args=(4, _free_port(), 4, "bfloat16", True, True, 0), nprocs=4, join=True)
+        mp.spawn(
+            _worker, args=(4, _free_port(), virtual, "bfloat16", True, True, 0, num_microbatches), nprocs=4, join=True
+        )
