@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1207,3 +1208,51 @@ def test_moe_rank_scaling_output_equivalence(moe_config, device):
         out_lora = model(x, token_mask, weights, indices)
 
     assert torch.allclose(out_orig, out_lora, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "expert_type,wrapper_type",
+    [
+        (GroupedExperts, GroupedExpertsLoRA),
+        (GroupedExpertsDeepEP, GroupedExpertsDeepEPLoRA),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("device_name", ["cpu", "meta"])
+@pytest.mark.parametrize("expert_bias", [False, True])
+def test_lora_wrapper_preserves_base_storage(
+    moe_config: MoEConfig,
+    expert_type: type[GroupedExperts] | type[GroupedExpertsDeepEP],
+    wrapper_type: type[GroupedExpertsLoRA] | type[GroupedExpertsDeepEPLoRA],
+    dtype: torch.dtype,
+    device_name: str,
+    expert_bias: bool,
+) -> None:
+    """Wrapping experts must reuse frozen bases without changing precision or values."""
+    config = replace(moe_config, expert_bias=expert_bias)
+    with torch.device(device_name):
+        original = expert_type(config).to(dtype=dtype)
+    if device_name == "cpu":
+        with torch.no_grad():
+            for parameter in original.parameters():
+                parameter.uniform_(-0.25, 0.25)
+    base_parameters = dict(original.named_parameters())
+    expected_values = {name: parameter.detach().clone() for name, parameter in base_parameters.items()}
+    wrapped = wrapper_type(original, lora_dim=4)
+    for name, expected in base_parameters.items():
+        actual = wrapped.get_parameter(name)
+        assert actual.dtype == dtype
+        assert actual.device == expected.device
+        assert actual.shape == expected.shape
+        assert actual is expected
+        assert not actual.requires_grad
+        if device_name == "cpu":
+            torch.testing.assert_close(actual, expected_values[name], rtol=0, atol=0)
+    if not expert_bias:
+        assert wrapped.gate_up_proj_bias is None
+        assert wrapped.down_proj_bias is None
+    for name in ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"):
+        adapter = wrapped.get_parameter(name)
+        assert adapter.dtype == dtype
+        assert adapter.device == original.gate_and_up_projs.device
+        assert adapter.requires_grad

@@ -66,14 +66,17 @@ class GroupedExpertsLoRA(GroupedExperts):
     """
 
     def __init__(self, orig_module: GroupedExperts, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
-        super().__init__(orig_module.config)
+        with torch.device("meta"):
+            super().__init__(orig_module.config)
 
-        self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
-        self.down_projs.data.copy_(orig_module.down_projs.data)
-
+        # This wrapper replaces orig_module and takes ownership of its frozen
+        # base parameters. Reusing them preserves dtype/device without a second
+        # expert allocation or a copy through the constructor's default dtype.
+        self.gate_and_up_projs = orig_module.gate_and_up_projs
+        self.down_projs = orig_module.down_projs
         if self.expert_bias:
-            self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
-            self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
+            self.gate_up_proj_bias = orig_module.gate_up_proj_bias
+            self.down_proj_bias = orig_module.down_proj_bias
 
         # Copy backend setting from original (super().__init__ defaults to False without backend)
         self.use_torch_mm = orig_module.use_torch_mm
@@ -401,25 +404,27 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     def __init__(
         self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
     ):
-        super().__init__(
-            orig_module.config,
-            dispatcher_backend=orig_module.dispatcher_backend,
-            dispatcher_num_sms=orig_module.dispatcher_num_sms,
-            dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
-            dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
-        )
+        with torch.device("meta"):
+            super().__init__(
+                orig_module.config,
+                dispatcher_backend=orig_module.dispatcher_backend,
+                dispatcher_num_sms=orig_module.dispatcher_num_sms,
+                dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
+                dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
+            )
         self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
         self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
         self.dispatcher_hybridep_num_blocks_permute = orig_module.dispatcher_hybridep_num_blocks_permute
         self.dispatcher_hybridep_num_blocks_unpermute = orig_module.dispatcher_hybridep_num_blocks_unpermute
 
-        self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
-        self.down_projs.data.copy_(orig_module.down_projs.data)
-
+        # The replacement owns the existing frozen bases, preserving their
+        # storage, dtype and device rather than allocating default-dtype copies.
+        self.gate_and_up_projs = orig_module.gate_and_up_projs
+        self.down_projs = orig_module.down_projs
         if self.expert_bias:
-            self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
-            self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
+            self.gate_up_proj_bias = orig_module.gate_up_proj_bias
+            self.down_proj_bias = orig_module.down_proj_bias
 
         # Copy DeepEP state from orig_module (set by init_token_dispatcher, not __init__)
         self.n_routed_experts = getattr(orig_module, "n_routed_experts", self.config.n_routed_experts)
