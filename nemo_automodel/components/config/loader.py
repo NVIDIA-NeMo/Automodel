@@ -22,10 +22,11 @@ import re
 import sys
 import types
 from copy import deepcopy
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 
 # Security/Policy configuration
-from typing import Any, Mapping, SupportsIndex
+from typing import Any, Mapping, SupportsIndex, Union, get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -333,6 +334,46 @@ def _resolve_target(dotted_path: str) -> Any:
     raise ImportError(f"Cannot resolve target (blocked or not found): {dotted_path}")
 
 
+def _get_dataclass_hints(cls: type) -> dict[str, Any]:
+    """Resolve hints best-effort, retaining untyped mapping semantics on failure.
+
+    TYPE_CHECKING-only names may raise NameError. Forward references may also
+    raise TypeError when runtime aliases do not support annotation operations
+    such as subscripting. Neither should prevent otherwise valid construction.
+    Resolution is all-or-nothing for each class: either error disables all
+    annotation-based field conversion for that class, even for resolvable fields.
+    """
+    try:
+        return get_type_hints(cls)
+    except (NameError, TypeError):
+        return {}
+
+
+def _convert_dataclass_value(value: Any, annotation: Any) -> Any:
+    """Convert only unambiguous typed dataclass mappings at the YAML boundary.
+
+    Optional dataclasses and homogeneous sequences are supported. Other values,
+    including explicitly instantiated objects, retain their existing semantics.
+    The caller opts in at the subtree root. Within plain nested dataclass
+    mappings, annotations drive recursion without consulting field metadata again.
+    """
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin in (Union, types.UnionType):
+        candidates = tuple(arg for arg in args if arg is not type(None))
+        if len(candidates) == 1 and value is not None:
+            return _convert_dataclass_value(value, candidates[0])
+    elif origin in (tuple, list) and isinstance(value, (tuple, list)):
+        if len(args) == 1 or (len(args) == 2 and args[1] is Ellipsis):
+            return origin(_convert_dataclass_value(item, args[0]) for item in value)
+    elif isinstance(annotation, type) and is_dataclass(annotation) and isinstance(value, dict):
+        if "_target_" in value:
+            return ConfigNode(value).instantiate()
+        hints = _get_dataclass_hints(annotation)
+        return annotation(**{key: _convert_dataclass_value(item, hints.get(key)) for key, item in value.items()})
+    return value
+
+
 class ConfigNode:
     """
     A configuration node that wraps a dictionary (or parts of it) from a YAML file.
@@ -457,6 +498,18 @@ class ConfigNode:
         This method looks for the "_target_" attribute in the configuration and resolves
         it to a callable function or class which is then instantiated.
 
+        Dataclass fields with metadata={"instantiate": True} opt into recursive
+        annotation-based conversion of their entire supported typed subtree.
+        Plain nested dataclass fields need no additional metadata; homogeneous
+        list/tuple fields follow their annotations too. Unmarked fields on this
+        target retain the existing list/dict behavior. Explicitly instantiated
+        objects and runtime overrides are not reprocessed by typed conversion.
+
+        Type hints are resolved per class, not per field. If any annotation raises
+        NameError or TypeError, no annotation-based field conversion is performed
+        for that class; plain mappings can remain dictionaries even for marked
+        fields. Existing explicit nested _target_ construction is unchanged.
+
         Args:
             *args: Positional arguments for the target instantiation.
             **kwargs: Keyword arguments to override or add to the configuration values.
@@ -489,6 +542,16 @@ class ConfigNode:
         # update() would cause resolve_yaml_env_vars to scan actual data content,
         # which can contain arbitrary strings like "$P" and raise spurious KeyErrors.
         config_kwargs = resolve_yaml_env_vars(config_kwargs)
+
+        # Typed conversion is field opt-in; do not evaluate hints for legacy configs.
+        if isinstance(func, type) and is_dataclass(func):
+            typed_fields = [
+                f.name for f in fields(func) if f.metadata.get("instantiate") is True and f.name in config_kwargs
+            ]
+            if typed_fields:
+                hints = _get_dataclass_hints(func)
+                for key in typed_fields:
+                    config_kwargs[key] = _convert_dataclass_value(config_kwargs[key], hints.get(key))
 
         # Override/add with passed kwargs (runtime data — must NOT be env-var-resolved)
         config_kwargs.update(kwargs)
