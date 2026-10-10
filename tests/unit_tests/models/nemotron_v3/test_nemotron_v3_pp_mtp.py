@@ -62,6 +62,53 @@ def _make_model(backend, *, mtp_layers=0, mtp_pattern="", mtp_layers_block_type=
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("residual_in_fp32", [False, True])
+@pytest.mark.parametrize("mtp_layers", [0, 1])
+def test_pipeline_metadata_matches_native_forward_dtypes(backend, residual_in_fp32, mtp_layers):
+    """Metadata must describe FP32 residuals separately from BF16 MTP carries."""
+    first, _ = _make_model(
+        backend,
+        residual_in_fp32=residual_in_fp32,
+        mtp_layers=mtp_layers,
+        mtp_pattern="*",
+        layers_block_type=["attention", "mlp"],
+    )
+    last, _ = _make_model(
+        backend,
+        residual_in_fp32=residual_in_fp32,
+        mtp_layers=mtp_layers,
+        mtp_pattern="*",
+        layers_block_type=["attention", "mlp"],
+    )
+    first.lm_head = None
+    first.model.norm = None
+    first.mtp = None
+    del first.model.layers["1"]
+    last.model.embed_tokens = None
+    del last.model.layers["0"]
+
+    for seq_len in (8, 16):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            sent = first(torch.arange(seq_len).reshape(1, seq_len))
+            sent = sent if isinstance(sent, tuple) else (sent,)
+            outputs = last(*sent)
+            outputs = outputs if isinstance(outputs, tuple) else (outputs,)
+        _, send_meta = first.get_pipeline_stage_metas(
+            is_first=True, microbatch_size=1, seq_len=seq_len, dtype=torch.bfloat16
+        )
+        recv_meta, output_meta = last.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=1, seq_len=seq_len, dtype=torch.bfloat16
+        )
+        assert len(sent) == len(send_meta) == len(recv_meta)
+        assert len(outputs) == len(output_meta)
+        for actual, declared_send, declared_recv in zip(sent, send_meta, recv_meta):
+            assert actual.shape == declared_send.shape == declared_recv.shape
+            assert actual.dtype == declared_send.dtype == declared_recv.dtype
+        for actual, declared in zip(outputs, output_meta):
+            assert actual.shape == declared.shape
+            assert actual.dtype == declared.dtype
+
+
 class TestIsPipelineParallelStage:
     def test_full_model_is_not_pp_stage(self, backend):
         model, _ = _make_model(backend)

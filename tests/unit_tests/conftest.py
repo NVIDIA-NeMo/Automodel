@@ -504,7 +504,8 @@ def _kill_leaked_child_processes(request: pytest.FixtureRequest):
     yield
 
     multiprocessing_children = multiprocessing.active_children()
-    leaked_pids = {process.pid for process in multiprocessing_children if process.pid is not None}
+    multiprocessing_pids = {process.pid for process in multiprocessing_children if process.pid is not None}
+    leaked_pids = multiprocessing_pids.copy()
     if getattr(request.node, "_automodel_timed_out", False):
         child_pids_before = getattr(request.node, "_automodel_child_pids_before", set())
         leaked_pids.update(
@@ -520,12 +521,13 @@ def _kill_leaked_child_processes(request: pytest.FixtureRequest):
         try:
             process = psutil.Process(pid)
             process.kill()
-            leaked_processes.append(process)
+            if pid not in multiprocessing_pids:
+                leaked_processes.append(process)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    # Let multiprocessing reap its own children first. If psutil consumes their
-    # waitpid status, Process.join() cannot record an exit code and active_children()
-    # keeps reporting the dead workers in every subsequent test.
+    # Only multiprocessing may reap its own children, even if a bounded join
+    # returns before reaping. If psutil consumes their waitpid status, multiprocessing
+    # cannot record an exit code and active_children() keeps reporting dead workers.
     for process in multiprocessing_children:
         process.join(timeout=5)
     if leaked_processes:

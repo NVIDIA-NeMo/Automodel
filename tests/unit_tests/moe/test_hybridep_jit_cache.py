@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import mmap
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -101,6 +103,23 @@ def test_store_adds_new_kernels_and_keeps_existing_ones(jit_env):
     assert (shared / "new.so").read_bytes() == b"new"
     # Second store finds nothing new.
     assert fused_a2a.store_hybrid_ep_jit_cache() == 0
+
+
+def test_warm_start_preserves_already_mapped_kernels(jit_env: tuple[Path, Path]) -> None:
+    """Recreating a buffer must not truncate a library mapped by its predecessor."""
+    shared_root, proc_dir = jit_env
+    shared = shared_root / "deep_ep-1.2.1_cuda-13.0_sm100"
+    shared.mkdir(parents=True)
+    proc_dir.mkdir(parents=True)
+    (shared / "loaded.so").write_bytes(b"shared kernel")
+    (shared / "new.so").write_bytes(b"new kernel")
+    loaded = proc_dir / "loaded.so"
+    loaded.write_bytes(b"mapped kernel")
+    with loaded.open("rb") as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+        fused_a2a.init_hybrid_ep_buffer(None, 8, 4, 2, 8, 8, False)
+        assert mapped[:] == b"mapped kernel"
+    assert (proc_dir / "new.so").read_bytes() == b"new kernel"
+    assert _RecordingBuffer.kwargs["load_cached_kernels"] is True
 
 
 def test_store_only_from_local_rank_zero(jit_env, monkeypatch):

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import timedelta
 from types import SimpleNamespace
@@ -147,6 +148,7 @@ def _check_ddp_chunked_ce_training(rank, world_size, model_factory):
         domain_mixture=None,
         te_fp8=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
+        _autocast_context=nullcontext,
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: world_size,
         _get_dp_group=lambda **kw: dist.group.WORLD,

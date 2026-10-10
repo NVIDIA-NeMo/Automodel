@@ -335,21 +335,43 @@ class TestNemotronV3Block:
         # Output should differ from input due to MLP transformation
         assert not torch.allclose(output, hidden_states_clone)
 
-    def test_block_residual_fp32(self, config, backend):
-        """Test block with fp32 residual option."""
-        config.layers_block_type = ["mlp"]
-        config.residual_in_fp32 = True
-        block = NemotronV3Block(config, layer_idx=0, moe_config=None, backend=backend)
+    @pytest.mark.parametrize("residual_in_fp32", [False, True])
+    @pytest.mark.parametrize("autocast", [False, True])
+    def test_block_residual_precision(self, backend, residual_in_fp32, autocast):
+        """Two blocks retain small FP32 updates while computing in the weight dtype."""
+        config = MockNemotronV3Config(
+            hidden_size=16,
+            intermediate_size=32,
+            layers_block_type=["mlp", "mlp"],
+            residual_in_fp32=residual_in_fp32,
+            mlp_bias=True,
+        )
+        blocks = torch.nn.Sequential(*(NemotronV3Block(config, i, backend=backend) for i in range(2)))
+        norm_input_dtypes = []
+        # Each block adds 2**-9, less than half a BF16 ULP at 1. The FP32
+        # residual must retain both updates even when the compute branch rounds.
+        with torch.no_grad():
+            for block in blocks:
+                block.mixer.up_proj.weight.zero_()
+                block.mixer.up_proj.bias.zero_()
+                block.mixer.down_proj.weight.zero_()
+                block.mixer.down_proj.bias.fill_(2**-9)
+                block.norm.register_forward_pre_hook(lambda module, inputs: norm_input_dtypes.append(inputs[0].dtype))
+        hidden_states = torch.ones(2, 3, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
 
-        assert block.residual_in_fp32 is True
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+            output = blocks(hidden_states)
 
-        batch_size, seq_len = 2, 8
-        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, dtype=torch.bfloat16)
-
-        output = block(hidden_states)
-
-        # Should still produce correct shape
-        assert output.shape == (batch_size, seq_len, config.hidden_size)
+        expected_dtype = torch.float32 if residual_in_fp32 else torch.bfloat16
+        expected_value = 1 + 2**-8 if residual_in_fp32 else 1
+        torch.testing.assert_close(
+            output, torch.full(hidden_states.shape, expected_value, dtype=expected_dtype), rtol=0, atol=0
+        )
+        assert norm_input_dtypes == [torch.bfloat16, torch.bfloat16]
+        torch.manual_seed(42)
+        upstream = torch.randn_like(output)
+        output.backward(upstream)
+        torch.testing.assert_close(hidden_states.grad, upstream.to(hidden_states.dtype), rtol=0, atol=0)
 
     def test_block_mlp_property(self, config, backend, moe_config):
         """Test mlp property returns mixer for MoE blocks."""
