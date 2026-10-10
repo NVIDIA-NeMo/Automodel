@@ -1141,3 +1141,35 @@ def test_factory_materialization_and_checkpoint_load_preserve_selected_fp32(tmp_
     assert parameters[selected].requires_grad
     torch.testing.assert_close(parameters[selected].detach().cpu(), weights[selected], rtol=0, atol=0)
     assert all(p.dtype == torch.bfloat16 and not p.requires_grad for name, p in parameters.items() if name != selected)
+
+
+def test_native_mamba_fp32_holder_matches_seed_names_and_preserves_gradients():
+    from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+
+    mixer = NemotronV3Mamba2Mixer(MockNemotronV3Config(), layer_idx=0)
+    names = dict(mixer.named_parameters())
+    for key in ("A_log", "dt_bias", "D"):
+        assert key not in names
+        value = names[f"_fp32_params.{key}"]
+        assert value.dtype == torch.float32
+        assert getattr(mixer, key) is value
+    values = mixer._get_fp32_ssm_params()
+    assert all(value.dtype == torch.float32 for value in values)
+    sum(value.sum() for value in values).backward()
+    assert all(names[f"_fp32_params.{key}"].grad is not None for key in ("A_log", "dt_bias", "D"))
+
+
+def test_native_mamba_adapter_preserves_intrinsic_fp32_export():
+    from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
+
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+
+    config = MockNemotronV3Config()
+    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", enable_deepep=False)
+    adapter = NemotronV3StateDictAdapter(config, NemotronV3Model(config, backend).moe_config, backend)
+    name = "model.layers.0.mixer._fp32_params.A_log"
+    value = torch.tensor([0.1234567016], dtype=torch.float32)
+    converted = adapter.convert_single_tensor_to_hf(name, value)
+    assert converted[0][0] == "backbone.layers.0.mixer.A_log"
+    torch.testing.assert_close(converted[0][1], value, rtol=0, atol=0)
+    assert adapter.forced_hf_dtype_mapping({name: value}) == {name: "F32"}

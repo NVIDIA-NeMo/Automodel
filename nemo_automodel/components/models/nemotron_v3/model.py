@@ -60,6 +60,8 @@ class NemotronV3Model(nn.Module):
     This is a hybrid architecture with Mamba2, Attention, MLP, and MoE layers.
     """
 
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
+
     def __init__(
         self,
         config,
@@ -228,6 +230,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     # architecture uses its own NemotronHybridCache.
     _is_stateful: bool = True
     main_input_name: str = "input_ids"
+
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
 
     @classmethod
     def from_config(
