@@ -5,7 +5,7 @@
 # found in the LICENSE file in the root directory of this source tree.
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, Dict, List, Literal
 
@@ -200,6 +200,9 @@ def apply_fp8_to_model(
     # Handle config creation or recipe-based configuration
     if fp8_config.recipe_name is not None and fp8_config.recipe_name != "tensorwise":
         torchao_config = Float8LinearConfig.from_recipe_name(fp8_config.recipe_name)
+        # from_recipe_name does not take emulate, so carry the user's flag over
+        if fp8_config.emulate:
+            torchao_config = replace(torchao_config, emulate=True)
         logger.info(f"Using FP8 recipe: {fp8_config.recipe_name}")
 
         # Enable inductor precision cast emulation for rowwise recipe
