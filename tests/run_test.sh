@@ -67,10 +67,14 @@ fi
 
 # Default pytest capture reports module progress and includes stdout, stderr, and logs only for failed tests.
 TEST_COMMAND=(coverage run -m pytest)
+if [[ "$UNIT_TEST" == "true" ]]; then
+    # CPU/Gloo tests also run in the GPU shards. Bound their host thread pools
+    # consistently so spawned ranks do not oversubscribe the runner.
+    export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+fi
 if [[ "$UNIT_TEST" == "true" && "$CPU" == "true" ]]; then
     # Keep one CI job, with bounded concurrency for tests that spawn CPU ranks.
     # File scheduling keeps module fixtures and fixed-port tests on one worker.
-    export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
     # pytest-cov collects worker coverage; coverage run alone only traces the controller.
     TEST_COMMAND=(python -m pytest -n 2 --dist loadfile --cov --cov-config=pyproject.toml --cov-report=)
 fi
