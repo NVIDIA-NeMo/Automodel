@@ -6,6 +6,14 @@ on:
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      source-build:
+        description: Also run a clean UV source installation
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
@@ -15,7 +23,7 @@ concurrency:
 
 env:
   TORCH_CU_INDEX: https://download.pytorch.org/whl/cu130
-  CUDA_CONTAINER_IMAGE: nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04
+  CUDA_CONTAINER_IMAGE: nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04@sha256:843a5e81ed49ad2a2787aa10e48e926dc1f9440522a122ec2a637c27039fc77d
 
 jobs:
   pre-flight:
@@ -27,18 +35,28 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       cuda_image: ${{ steps.cfg.outputs.cuda_image }}
+      uv_modes: ${{ steps.modes.outputs.uv_modes }}
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
       - id: cfg
         shell: bash
         run: |
           echo "cuda_image=${CUDA_CONTAINER_IMAGE}" >> "$GITHUB_OUTPUT"
+      - name: Select UV source-build coverage
+        id: modes
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          FORCE_SOURCE_BUILD: ${{ inputs.source-build || false }}
+        run: bash .github/scripts/select-uv-install-modes.sh
 
   pip-test:
     runs-on: ${{ matrix.arch }}
     name: Pip - Python${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || (matrix.arch == 'ubuntu-24.04-arm' && 'ARM64/Linux' || 'ARM64/Darwin') }} - No CUDA
     needs: [pre-flight]
     if: |
-      !(needs.pre-flight.outputs.docs_only == 'true'
+      !((needs.pre-flight.outputs.docs_only == 'true' && github.event_name == 'push')
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     strategy:
       fail-fast: false
@@ -77,10 +95,11 @@ jobs:
 
   ngc-cuda-test-uv:
     runs-on: linux-amd64-cpu16
-    name: UV - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
-    needs: [pre-flight, setup-install-image, cuda-wheelhouse]
+    name: UV (${{ matrix.mode }}) - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
+    needs: [pre-flight, setup-install-image, cuda-wheelhouse, verify-cuda-wheelhouse]
+    timeout-minutes: 120
     if: |
-      !(needs.pre-flight.outputs.docs_only == 'true'
+      !((needs.pre-flight.outputs.docs_only == 'true' && github.event_name == 'push')
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     container:
       image: ${{ needs.setup-install-image.outputs.cuda_image }}
@@ -89,6 +108,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12"]
+        mode: ${{ fromJSON(needs.setup-install-image.outputs.uv_modes) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -116,10 +136,22 @@ jobs:
           version: 0.9.26
 
       - name: Download cached CUDA wheelhouse
+        if: matrix.mode == 'wheelhouse'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: cuda-wheelhouse-py${{ matrix.python-version }}
+          artifact-ids: ${{ needs.cuda-wheelhouse.outputs.artifact_id }}
+          merge-multiple: true
           path: /tmp/cuda-wheelhouse
+
+      - name: Verify CUDA wheelhouse before installation
+        if: matrix.mode == 'wheelhouse'
+        env:
+          WHEELHOUSE_FINGERPRINT: ${{ needs.cuda-wheelhouse.outputs.fingerprint }}
+          MANIFEST_SHA256: ${{ needs.verify-cuda-wheelhouse.outputs.manifest_sha256 }}
+        run: |
+          python scripts/cuda_wheelhouse_manifest.py verify \
+            --directory /tmp/cuda-wheelhouse \
+            --fingerprint "${WHEELHOUSE_FINGERPRINT}" --manifest-sha256 "${MANIFEST_SHA256}"
 
       - name: Set up yq
         shell: bash
@@ -138,6 +170,7 @@ jobs:
           # TE's optional NCCL-EP binding requires private PyTorch headers that
           # are not included in the public wheel used by this source build.
           NVTE_WITH_NCCL_EP: "0"
+          INSTALL_MODE: ${{ matrix.mode }}
         shell: bash
         run: |
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
@@ -148,8 +181,6 @@ jobs:
 
           export PATH="./bin/:$PATH"
 
-          # Locked sync uses the recorded artifact URLs, not --find-links.
-          # Seed exact registry requirements so sync can reuse the installed wheels.
           requirements="$(
             python scripts/cuda_wheelhouse_lock.py \
               --output wheels \
@@ -157,13 +188,25 @@ jobs:
               --python-version "${{ matrix.python-version }}"
           )"
           mapfile -t wheel_requirements <<< "${requirements}"
-          # Require every exact wheel locally. Source-build settings (including
-          # match-runtime torch) do not apply to this wheel-only bootstrap.
-          uv pip install --no-config --python ./venv/bin/python \
-            --no-deps --no-index --only-binary :all: \
-            --find-links /tmp/cuda-wheelhouse "${wheel_requirements[@]}"
+          sync_args=()
+          if [[ ${INSTALL_MODE} == wheelhouse ]]; then
+            # Seed exact registry requirements; locked sync ignores --find-links.
+            # Source-build settings do not apply to this wheel-only bootstrap.
+            uv pip install --no-config --python ./venv/bin/python \
+              --no-deps --no-index --only-binary :all: \
+              --find-links /tmp/cuda-wheelhouse "${wheel_requirements[@]}"
+          else
+            # Exercise UV's actual build configuration without any cached wheels.
+            sync_args+=(--no-cache)
+            for requirement in "${wheel_requirements[@]}"; do
+              package="${requirement%%==*}"
+              sync_args+=(--no-binary-package "${package%%\[*}")
+            done
+            # These backends otherwise download release wheels during a source build.
+            export MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE
+          fi
 
-          uv sync --link-mode copy --locked --all-groups --no-group magi --extra all
+          uv sync --link-mode copy --locked --all-groups --no-group magi --extra all "${sync_args[@]}"
 
           uv pip install --no-deps -e .
 
@@ -186,9 +229,18 @@ jobs:
     container:
       image: ${{ needs.setup-install-image.outputs.cuda_image }}
     environment: nemo-ci
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      provenance_id: ${{ steps.provenance-upload.outputs.artifact-id }}
+      fingerprint: ${{ steps.cuda-wheelhouse-key.outputs.fingerprint }}
+      cache_hit: ${{ steps.cuda-wheelhouse-cache-main.outputs.cache-hit == 'true' || steps.cuda-wheelhouse-cache-branch.outputs.cache-hit == 'true' }}
     needs: [pre-flight, setup-install-image]
     if: |
-      !(needs.pre-flight.outputs.docs_only == 'true'
+      !((needs.pre-flight.outputs.docs_only == 'true' && github.event_name == 'push')
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     strategy:
       fail-fast: false
@@ -226,7 +278,8 @@ jobs:
               --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}" \
               --build-script .github/scripts/build-cuda-wheelhouse.sh
           )"
-          echo "key=install-test-cuda-wheelhouse-v3-${RUNNER_OS}-py${PYTHON_VERSION}-${fingerprint}" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=${fingerprint}" >> "$GITHUB_OUTPUT"
+          echo "key=install-test-cuda-wheelhouse-v4-${RUNNER_OS}-py${PYTHON_VERSION}-${fingerprint}" >> "$GITHUB_OUTPUT"
 
       # Keep the canonical wheelhouse on main. Copied PR branches restore it
       # without creating duplicate branch-scoped multi-GB cache entries.
@@ -249,11 +302,35 @@ jobs:
           key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
 
       - name: Build cached CUDA dependency wheels
+        id: build
         if: |
           steps.cuda-wheelhouse-cache-main.outputs.cache-hit != 'true'
           && steps.cuda-wheelhouse-cache-branch.outputs.cache-hit != 'true'
         shell: bash -x -e -u -o pipefail {0}
         run: .github/scripts/build-cuda-wheelhouse.sh
+
+      - name: Record newly built wheel checksums and compatibility
+        if: steps.build.outcome == 'success'
+        env:
+          WHEELHOUSE_FINGERPRINT: ${{ steps.cuda-wheelhouse-key.outputs.fingerprint }}
+        run: |
+          python scripts/cuda_wheelhouse_manifest.py write \
+            --directory "${WHEELHOUSE_DIR}" --fingerprint "${WHEELHOUSE_FINGERPRINT}"
+
+      # Never attest a cache hit: preserve and verify the original builder identity.
+      - name: Attest newly built wheelhouse
+        id: attest
+        if: steps.build.outcome == 'success'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ env.WHEELHOUSE_DIR }}/manifest.json
+          create-storage-record: false
+
+      - name: Preserve build attestation with cached wheels
+        if: steps.build.outcome == 'success'
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "${BUNDLE_PATH}" "${WHEELHOUSE_DIR}/attestation.json"
 
       - name: Verify CUDA wheelhouse contents
         shell: bash -x -e -u -o pipefail {0}
@@ -266,12 +343,46 @@ jobs:
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/transformer_engine_torch*.whl 2>/dev/null)"
 
       - name: Upload CUDA wheelhouse artifact
+        id: upload
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: cuda-wheelhouse-py${{ matrix.python-version }}
-          path: ${{ env.WHEELHOUSE_DIR }}/*.whl
+          path: ${{ env.WHEELHOUSE_DIR }}/*
           if-no-files-found: error
           retention-days: 1
+
+      - name: Upload wheelhouse provenance for verification
+        id: provenance-upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: cuda-wheelhouse-provenance-py${{ matrix.python-version }}
+          path: |
+            ${{ env.WHEELHOUSE_DIR }}/manifest.json
+            ${{ env.WHEELHOUSE_DIR }}/attestation.json
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-cuda-wheelhouse:
+    needs: [cuda-wheelhouse]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      manifest_sha256: ${{ steps.verify.outputs.manifest_sha256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ needs.cuda-wheelhouse.outputs.provenance_id }}
+          merge-multiple: true
+          path: /tmp/cuda-wheelhouse-provenance
+      - name: Verify builder identity and signed manifest
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WHEELHOUSE_DIR: /tmp/cuda-wheelhouse-provenance
+          WHEELHOUSE_CACHE_HIT: ${{ needs.cuda-wheelhouse.outputs.cache_hit }}
+        run: bash .github/scripts/verify-cuda-wheelhouse-provenance.sh
 
   ngc-cuda-test-pip:
     runs-on: linux-amd64-cpu16
@@ -279,9 +390,9 @@ jobs:
     container:
       image: ${{ needs.setup-install-image.outputs.cuda_image }}
     environment: nemo-ci
-    needs: [pre-flight, setup-install-image, cuda-wheelhouse]
+    needs: [pre-flight, setup-install-image, cuda-wheelhouse, verify-cuda-wheelhouse]
     if: |
-      !(needs.pre-flight.outputs.docs_only == 'true'
+      !((needs.pre-flight.outputs.docs_only == 'true' && github.event_name == 'push')
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     strategy:
       fail-fast: false
@@ -298,10 +409,14 @@ jobs:
       - name: Download cached CUDA wheelhouse
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: cuda-wheelhouse-py${{ matrix.python-version }}
+          artifact-ids: ${{ needs.cuda-wheelhouse.outputs.artifact_id }}
+          merge-multiple: true
           path: ${{ env.WHEELHOUSE_DIR }}
 
       - name: Install automodel${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
+        env:
+          WHEELHOUSE_FINGERPRINT: ${{ needs.cuda-wheelhouse.outputs.fingerprint }}
+          MANIFEST_SHA256: ${{ needs.verify-cuda-wheelhouse.outputs.manifest_sha256 }}
         shell: bash -x -e -u -o pipefail {0}
         run: |
           for i in 1 2 3; do
@@ -309,6 +424,9 @@ jobs:
             echo "Attempt $i failed, retrying in 10s..."
             sleep 10
           done
+          python3 scripts/cuda_wheelhouse_manifest.py verify \
+            --directory "${WHEELHOUSE_DIR}" \
+            --fingerprint "${WHEELHOUSE_FINGERPRINT}" --manifest-sha256 "${MANIFEST_SHA256}"
           python3 -m venv ./venv
 
           . ./venv/bin/activate
@@ -374,7 +492,7 @@ jobs:
     name: UV - Python ${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || 'ARM64/Darwin' }} - No CUDA
     needs: [pre-flight]
     if: |
-      !(needs.pre-flight.outputs.docs_only == 'true'
+      !((needs.pre-flight.outputs.docs_only == 'true' && github.event_name == 'push')
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     environment: nemo-ci
     strategy:
@@ -424,7 +542,7 @@ jobs:
           python-binary: ./venv/bin/python
 
   install-test-summary:
-    needs: [pip-test, uv-test, ngc-cuda-test-uv, cuda-wheelhouse, ngc-cuda-test-pip, pre-flight, setup-install-image]
+    needs: [pip-test, uv-test, ngc-cuda-test-uv, cuda-wheelhouse, verify-cuda-wheelhouse, ngc-cuda-test-pip, pre-flight, setup-install-image]
     runs-on: ubuntu-latest
     name: Install test summary
     if: |
@@ -444,7 +562,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
+          SKIPPING_IS_ALLOWED: ${{ (needs.pre-flight.outputs.docs_only == 'true' && github.event_name == 'push') || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
 
