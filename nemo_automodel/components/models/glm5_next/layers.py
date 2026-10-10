@@ -374,6 +374,10 @@ class Glm5NextLinearAttention(nn.Module):
         cp_context: Any = None,
     ) -> torch.Tensor:
         """Project and execute KDA for one packed row or a regular batch."""
+        if cu_seqlens is not None:
+            # FLA caches metadata by tensor identity. PP interleaves microbatches,
+            # so use a fresh identity on both forward and checkpoint recompute.
+            cu_seqlens = cu_seqlens.clone()
         kernel_kwargs: dict[str, Any] = {} if cp_context is None else {"cp_context": cp_context}
         conv_kwargs = dict(cache=None, output_final_state=False, cu_seqlens=cu_seqlens, **kernel_kwargs)
         q, _ = self.q_conv1d(x=self.q_proj(hidden_states), **conv_kwargs)

@@ -151,11 +151,19 @@ class Glm5NextTextModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Run ``[batch, local_sequence]`` ids/embeddings through the text model."""
+        """Decode local tokens, preserving ``[B, S, hc_mult, H]`` between PP stages.
+
+        Only the embedding stage expands the streams; the final norm stage
+        collapses them to ``[B, S, H]``.
+        """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids and inputs_embeds")
         hidden = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
-        hidden = hidden.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+        if self.embed_tokens is not None:
+            hidden = hidden.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+        # Boundary caches must be populated before checkpointed decoder calls.
+        for row in range(hidden.shape[0]):
+            glm5_next_packed_context.row_cu_seqlens(row)
         for layer in self.layers.values():
             hidden = layer(
                 hidden,
@@ -163,7 +171,7 @@ class Glm5NextTextModel(nn.Module):
                 padding_mask=padding_mask,
                 **kwargs,
             )
-        return self.norm(hidden.mean(dim=2))
+        return self.norm(hidden.mean(dim=2)) if self.norm is not None else hidden
 
     def update_moe_gate_bias(self) -> None:
         """Update every sparse layer's no-aux-loss routing correction bias."""
@@ -175,10 +183,12 @@ class Glm5NextTextModel(nn.Module):
         """Initialize a checkpoint-free text model on ``buffer_device``."""
         init_std = self.config.initializer_range
         with buffer_device:
-            nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
-            if self.padding_idx is not None:
-                zero_embedding_row_(self.embed_tokens.weight, self.padding_idx)
-            self.norm.reset_parameters()
+            if self.embed_tokens is not None:
+                nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
+                if self.padding_idx is not None:
+                    zero_embedding_row_(self.embed_tokens.weight, self.padding_idx)
+            if self.norm is not None:
+                self.norm.reset_parameters()
         for layer in self.layers.values():
             layer.init_weights(buffer_device, init_std)
 
@@ -209,7 +219,7 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    """Trainable GLM-5.3 VLM with EP and contiguous packed CP support."""
+    """Trainable GLM-5.3 VLM with PP, EP and contiguous packed CP support."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _owns_cp_attention = True
@@ -221,6 +231,13 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         "rotary_pos_emb",
     ]
     cp_mesh = None
+    _pp_keep_self_forward = True
+    _pp_return_hidden_states_supported = True
+    _pp_return_hidden_states = False
+    _vlm_pixel_values_chunks: list[torch.Tensor] | None = None
+    _vlm_image_grid_hws_chunks: list[torch.Tensor] | None = None
+    _vlm_pixel_values_videos_chunks: list[torch.Tensor] | None = None
+    _vlm_chunk_idx: int | None = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -228,7 +245,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
 
         supports_tp: bool = False
         supports_cp: bool = True
-        supports_pp: bool = False
+        supports_pp: bool = True
         supports_ep: bool = True
         supports_thd: bool = True
 
@@ -343,6 +360,36 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         embeddings[mask] = features.to(device=embeddings.device, dtype=embeddings.dtype)
         return embeddings
 
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Describe token ids ``[B,S]`` and local mHC activations ``[B,S/CP,M,H]``.
+
+        CP pads the global length to a multiple of its size. Only the last
+        stage emits collapsed hidden states ``[B,S/CP,H]`` or logits
+        ``[B,S/CP,V]``; the first stage still receives unsharded token ids.
+        """
+        config = self.config.text_config
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        local_length = (seq_len + (-seq_len) % cp_size) // cp_size
+        hidden_shape = (microbatch_size, local_length, config.hc_mult, config.hidden_size)
+        inputs = torch.empty(
+            (microbatch_size, seq_len) if is_first else hidden_shape,
+            device="meta",
+            dtype=torch.long if is_first else dtype,
+        )
+        if self.language_model.norm is None:
+            output_shape = hidden_shape
+        else:
+            width = config.hidden_size if self._pp_return_hidden_states else config.vocab_size
+            output_shape = (microbatch_size, local_length, width)
+        return (inputs,), (torch.empty(output_shape, device="meta", dtype=dtype),)
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -356,10 +403,30 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         pixel_values_videos: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
+        glm5_next_packed_context: Glm5NextPackedContext | tuple[torch.Tensor, int, int, int] | None = None,
         **kwargs: Any,
-    ) -> CausalLMOutputWithPast:
-        """Run image splice, contiguous CP slicing, text decoding and lm head."""
+    ) -> CausalLMOutputWithPast | torch.Tensor:
+        """Decode ids ``[B,S]`` or a PP activation ``[B,Slocal,hc_mult,H]``.
+
+        Vision splice and CP slicing run only on the embedding stage. Packed
+        metadata arrives as a chunkable tuple under multi-microbatch PP, then
+        gets a fresh per-microbatch boundary cache.
+        """
         del position_ids
+        first_stage = self.language_model.embed_tokens is not None
+        if not first_stage:
+            inputs_embeds, input_ids = input_ids if inputs_embeds is None else inputs_embeds, None
+        elif self._vlm_chunk_idx is not None:
+            index = self._vlm_chunk_idx
+            if self._vlm_pixel_values_chunks is not None:
+                pixels = self._vlm_pixel_values_chunks[index]
+                pixel_values = pixels if pixels.numel() else None
+                assert self._vlm_image_grid_hws_chunks is not None
+                image_grid_thw = self._vlm_image_grid_hws_chunks[index]
+            if self._vlm_pixel_values_videos_chunks is not None:
+                videos = self._vlm_pixel_values_videos_chunks[index]
+                pixel_values_videos = videos if videos.numel() else None
+            self._vlm_chunk_idx += 1
         if pixel_values_videos is not None:
             raise NotImplementedError("GLM-5.3 AutoModel onboarding currently supports images, not video training")
         is_thd = kwargs.get("qkv_format") == "thd"
@@ -372,7 +439,9 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         if input_ids is None and inputs_embeds is None:
             raise ValueError("input_ids or inputs_embeds is required")
 
-        context = kwargs.pop("glm5_next_packed_context", None)
+        context = glm5_next_packed_context
+        if isinstance(context, tuple):
+            context = Glm5NextPackedContext(*context)
         context_ids = input_ids
         if context_ids is None:
             context_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
@@ -385,20 +454,21 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
                 kwargs.get("_packed_seq_ids"),
             )
 
-        if inputs_embeds is None:
-            inputs_embeds = self._embed_and_splice(input_ids, pixel_values, image_grid_thw)
-        elif pixel_values is not None:
-            raise ValueError("pixel_values cannot be combined with precomputed inputs_embeds")
+        if first_stage:
+            if inputs_embeds is None:
+                inputs_embeds = self._embed_and_splice(input_ids, pixel_values, image_grid_thw)
+            elif pixel_values is not None:
+                raise ValueError("pixel_values cannot be combined with precomputed inputs_embeds")
 
-        padded_length = context.doc_ids.shape[1]
-        if inputs_embeds.shape[1] < padded_length:
-            pad = inputs_embeds.new_zeros(
-                inputs_embeds.shape[0], padded_length - inputs_embeds.shape[1], inputs_embeds.shape[2]
-            )
-            inputs_embeds = torch.cat((inputs_embeds, pad), dim=1)
-        local_length = context.local_seq_len
-        if inputs_embeds.shape[1] != local_length or context.seq_start:
-            inputs_embeds = inputs_embeds[:, context.seq_start : context.seq_start + local_length].contiguous()
+            padded_length = context.doc_ids.shape[1]
+            if inputs_embeds.shape[1] < padded_length:
+                pad = inputs_embeds.new_zeros(
+                    inputs_embeds.shape[0], padded_length - inputs_embeds.shape[1], inputs_embeds.shape[2]
+                )
+                inputs_embeds = torch.cat((inputs_embeds, pad), dim=1)
+            local_length = context.local_seq_len
+            if inputs_embeds.shape[1] != local_length or context.seq_start:
+                inputs_embeds = inputs_embeds[:, context.seq_start : context.seq_start + local_length].contiguous()
         if padding_mask is None:
             padding_mask = context.local_doc_ids <= 0
 
@@ -408,6 +478,8 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             padding_mask=padding_mask,
             **kwargs,
         )
+        if self._pp_return_hidden_states:
+            return hidden
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -423,10 +495,10 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
         """Install GLM's contiguous packed sharder while leaving media and ids global."""
-        del batch, num_chunks
+        del batch
         return {
             "cp_sharder": ContextParallelSharder(
-                shard_batch=partial(shard_batch_for_glm5_next_cp, shard_primary=False),
+                shard_batch=partial(shard_batch_for_glm5_next_cp, shard_primary=False, num_chunks=num_chunks),
                 local_token_global_indices=contiguous_local_indices,
             )
         }
@@ -446,10 +518,12 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
         )
         self.model.language_model.init_weights(buffer_device)
-        self.model.visual.init_weights(buffer_device, self.config.text_config.initializer_range)
+        if self.model.visual is not None:
+            self.model.visual.init_weights(buffer_device, self.config.text_config.initializer_range)
         final_std = self.config.text_config.hidden_size**-0.5
-        with buffer_device:
-            nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=final_std, a=-3 * final_std, b=3 * final_std)
+        if self.lm_head is not None:
+            with buffer_device:
+                nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=final_std, a=-3 * final_std, b=3 * final_std)
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 

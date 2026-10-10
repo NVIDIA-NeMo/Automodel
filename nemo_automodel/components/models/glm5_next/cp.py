@@ -145,7 +145,9 @@ def build_fla_cp_context(
 
     cu_seqlens, cu_seqlens_cpu = packed_context.row_cu_seqlens(row)
     return _build_cp_context(
-        cu_seqlens=cu_seqlens,
+        # Keep FLA's identity cache cold in forward and checkpoint replay,
+        # independent of which PP microbatch ran immediately before this one.
+        cu_seqlens=cu_seqlens.clone(),
         group=cp_group,
         conv1d_kernel_size=conv_kernel_size,
         cu_seqlens_cpu=cu_seqlens_cpu,
@@ -263,6 +265,7 @@ def shard_batch_for_glm5_next_cp(
     loss_mask=None,
     padding_token_id: int = 0,
     shard_primary: bool = False,
+    num_chunks: int = 1,
 ):
     """Contiguously shard packed GLM-5.3 token streams.
 
@@ -278,6 +281,8 @@ def shard_batch_for_glm5_next_cp(
         loss_mask: Optional loss mask ``[batch, sequence]``.
         padding_token_id: Fill value for padded token ids.
         shard_primary: Whether to shard ``input_ids`` in this function.
+        num_chunks: PP microbatches. With multiple chunks, expose the document
+            map as a tensor in a tuple so Torch splits its batch axis too.
 
     Returns:
         Context factory, mutated local batch, and the global shard layout.
@@ -319,11 +324,13 @@ def shard_batch_for_glm5_next_cp(
 
     batch.setdefault("padding_mask", doc_ids <= _PAD_DOC_ID)
     seq_start = 0 if cp_mesh is None else cp_mesh.get_local_rank() * (padded_seq_len // cp_size)
-    batch["glm5_next_packed_context"] = Glm5NextPackedContext(
-        doc_ids=doc_ids,
-        seq_start=seq_start,
-        cp_size=cp_size,
-        original_seq_len=seq_len,
+    # The PP kwargs splitter treats dataclasses as opaque (replicated) values.
+    # A tuple lets it split doc_ids alongside input_ids and labels, while the
+    # Python scalar offsets remain shared. Forward creates each chunk's cache.
+    batch["glm5_next_packed_context"] = (
+        (doc_ids, seq_start, cp_size, seq_len)
+        if num_chunks > 1
+        else Glm5NextPackedContext(doc_ids, seq_start, cp_size, seq_len)
     )
 
     local_seq_len = padded_seq_len // cp_size
