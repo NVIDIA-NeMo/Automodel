@@ -795,9 +795,7 @@ def test_ministral3_old_template_reexport_matches_training(
         inference = exported(text=[rendered], padding=False, return_tensors="pt")
         torch.testing.assert_close(inference["input_ids"], batch["input_ids"])
         torch.testing.assert_close(inference["attention_mask"], batch["attention_mask"])
-    restored = Mistral3BiEncoderProcessor.from_pretrained(
-        tmp_path / "export", use_prompt_template=use_prompt_template
-    )
+    restored = Mistral3BiEncoderProcessor.from_pretrained(tmp_path / "export", use_prompt_template=use_prompt_template)
     assert restored.chat_template == processor.chat_template == exported.chat_template
 
 
@@ -2117,7 +2115,9 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
                 "doc_image": Image.new("RGB", (16, 16), (255, 0, 0)),
             },
         ]
-        features.append({"question": "What is [IMG] shown?", "doc_text": "", "doc_image": Image.new("RGB", (16, 16), "blue")})
+        features.append(
+            {"question": "What is [IMG] shown?", "doc_text": "", "doc_image": Image.new("RGB", (16, 16), "blue")}
+        )
         batch = processor.process_queries_documents_crossencoder(features)
         model_inputs = {key: value for key, value in batch.items() if key != "labels"}
         with torch.no_grad():
@@ -2158,9 +2158,7 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
         from safetensors.torch import load_file
 
         dense_weight = load_file(export_dir / "2_Dense/model.safetensors")["linear.weight"]
-        torch.testing.assert_close(
-            dense_weight, encoder.model.score.weight.float(), rtol=0, atol=0
-        )
+        torch.testing.assert_close(dense_weight, encoder.model.score.weight.float(), rtol=0, atol=0)
         saved_config = json.loads((export_dir / "config.json").read_text())
         assert saved_config["model_type"] == "mistral3"
         assert saved_config["text_config"]["model_type"] == "ministral3"
@@ -2521,6 +2519,7 @@ def test_mistral3_reranker_resume_head_layouts(tmp_path, storage_format, is_init
     """Strict checkpoint readers accept old heads without relaxing missing-key checks."""
     from safetensors.torch import save_file
     from torch.distributed.checkpoint.api import CheckpointException
+
     from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 
     config = _tiny_mistral3_bidirectional_vlm_config()
@@ -2553,8 +2552,11 @@ def test_mistral3_reranker_resume_head_layouts(tmp_path, storage_format, is_init
         torch.distributed.checkpoint.save(state, checkpoint_id=str(checkpoint))
     restored = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config)).eval()
     checkpointer = CheckpointingConfig(
-        enabled=True, checkpoint_dir=str(tmp_path), model_save_format=storage_format,
-        save_consolidated=False, is_peft=False,
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format=storage_format,
+        save_consolidated=False,
+        is_peft=False,
     ).build(dp_rank=0, tp_rank=0, pp_rank=0)
     resumed_optimizer = torch.optim.SGD(restored.parameters(), lr=0.001, momentum=0.9)
     try:
