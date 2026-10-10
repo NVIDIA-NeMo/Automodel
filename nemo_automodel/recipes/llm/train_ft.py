@@ -1134,7 +1134,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         total_validation_tokens = 0
                         for val_name, val_dataloader in self.val_dataloaders.items():
                             val_log_data = self._run_validation_epoch(val_dataloader)
-                            val_losses[val_name] = val_log_data.metrics["val_loss"]
+                            # Route through best_metric_key so checkpoint promotion can track a
+                            # custom evaluator metric (e.g. tool_call_eval's tool_call/args_exact_match)
+                            # instead of always using raw val_loss. Falls back to val_loss when
+                            # best_metric_key isn't a key in this dataset's metrics, which also
+                            # safely covers the domain_mixture WEIGHTED_AGGREGATE_NAME default
+                            # without special-casing it here.
+                            val_losses[val_name] = val_log_data.metrics.get(
+                                self.best_metric_key, val_log_data.metrics["val_loss"]
+                            )
                             total_validation_tokens += val_log_data.metrics["num_label_tokens"]
                             self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                         if self.domain_mixture is not None and val_losses:

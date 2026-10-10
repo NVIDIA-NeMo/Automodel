@@ -1431,6 +1431,114 @@ def test_run_train_validation_loop_reports_weighted_domain_validation():
     assert saved_val_losses == {"web": 2.0, "code": 4.0, "weighted": pytest.approx(3.5)}
 
 
+def test_run_train_validation_loop_selects_configured_metric_key_over_val_loss():
+    """checkpoint.best_metric_key naming a key inside a single dataset's metrics
+    dict (e.g. a tool_call_eval metric like tool_call/args_exact_match) must drive
+    checkpoint promotion instead of the default val_loss -- the actual bug this
+    recipe's best_metric_key routing fixes. Distinct from the "weighted"
+    dataset-name selection covered by test_run_train_validation_loop_reports_weighted_domain_validation.
+    """
+
+    class _OneValidationStep:
+        step = 1
+        epoch = 0
+        epochs = [0]
+        is_val_step = True
+        is_ckpt_step = True
+        sigterm_flag = False
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            yield ["dummy-batch"]
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.model_parts = [MagicMock()]
+    trainer.step_scheduler = _OneValidationStep()
+    trainer.max_grad_norm = 1.0
+    trainer.partial_cuda_graph_manager = None
+    trainer._partial_cuda_graph_capture_pending = False
+    trainer._enable_qat_if_delayed = MagicMock()
+    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    trainer.optimizer = [SimpleNamespace(param_groups=[{"lr": 1.0e-4}])]
+    trainer._collect_moe_load_balance = MagicMock()
+    trainer._maybe_collect_garbage = MagicMock()
+    trainer.log_train_metrics = MagicMock()
+    trainer.log_val_metrics = MagicMock()
+    trainer.save_checkpoint = MagicMock()
+    trainer.domain_mixture = None
+    trainer.val_dataloaders = {"default": object()}
+    # val_loss and the configured metric deliberately disagree, so a test that
+    # passed before this fix (always picking val_loss) fails here.
+    trainer._run_validation_epoch = MagicMock(
+        return_value=SimpleNamespace(
+            metrics={"val_loss": 0.9, "tool_call/args_exact_match": 0.2, "num_label_tokens": 10}
+        )
+    )
+    trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
+    trainer.metric_logger_valid = {"default": SimpleNamespace(close=MagicMock())}
+    trainer.checkpointer = SimpleNamespace(finalize=MagicMock())
+    trainer.best_metric_key = "tool_call/args_exact_match"
+
+    trainer.run_train_validation_loop()
+
+    saved_val_losses = trainer.save_checkpoint.call_args.args[3]
+    assert saved_val_losses == {"default": pytest.approx(0.2)}
+    assert trainer.save_checkpoint.call_args.kwargs["best_metric_key"] == "tool_call/args_exact_match"
+
+
+def test_run_train_validation_loop_falls_back_to_val_loss_when_key_absent():
+    """checkpoint.best_metric_key naming a key that ISN'T present for a given
+    dataset's metrics (e.g. tool_call_eval not configured, or the unset
+    "default" sentinel) must still fall back to val_loss -- the backward-compat
+    half of the same fix.
+    """
+
+    class _OneValidationStep:
+        step = 1
+        epoch = 0
+        epochs = [0]
+        is_val_step = True
+        is_ckpt_step = True
+        sigterm_flag = False
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            yield ["dummy-batch"]
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.model_parts = [MagicMock()]
+    trainer.step_scheduler = _OneValidationStep()
+    trainer.max_grad_norm = 1.0
+    trainer.partial_cuda_graph_manager = None
+    trainer._partial_cuda_graph_capture_pending = False
+    trainer._enable_qat_if_delayed = MagicMock()
+    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    trainer.optimizer = [SimpleNamespace(param_groups=[{"lr": 1.0e-4}])]
+    trainer._collect_moe_load_balance = MagicMock()
+    trainer._maybe_collect_garbage = MagicMock()
+    trainer.log_train_metrics = MagicMock()
+    trainer.log_val_metrics = MagicMock()
+    trainer.save_checkpoint = MagicMock()
+    trainer.domain_mixture = None
+    trainer.val_dataloaders = {"default": object()}
+    trainer._run_validation_epoch = MagicMock(
+        return_value=SimpleNamespace(metrics={"val_loss": 0.9, "num_label_tokens": 10})
+    )
+    trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
+    trainer.metric_logger_valid = {"default": SimpleNamespace(close=MagicMock())}
+    trainer.checkpointer = SimpleNamespace(finalize=MagicMock())
+    trainer.best_metric_key = "default"
+
+    trainer.run_train_validation_loop()
+
+    saved_val_losses = trainer.save_checkpoint.call_args.args[3]
+    assert saved_val_losses == {"default": pytest.approx(0.9)}
+
+
 def test_compute_trust_remote_code_prefers_cfg_flag():
     cfg_model = ConfigNode({"trust_remote_code": False, "pretrained_model_name_or_path": "ignored"})
 

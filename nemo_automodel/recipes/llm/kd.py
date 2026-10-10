@@ -38,6 +38,7 @@ The file exposes ``KnowledgeDistillationRecipeForNextTokenPrediction`` and a
 
 from __future__ import annotations
 
+import gc
 import logging
 import time
 from contextlib import nullcontext
@@ -55,7 +56,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.config import DistributedSetup
+from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
@@ -1173,17 +1174,72 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
         val_ce_loss = total_ce_loss / max(total_num_label_tokens, 1e-8)
         val_kd_loss = total_kd_loss / max(total_num_label_tokens, 1e-8)
+        metrics = {
+            "val_loss": val_loss,
+            "ce_loss": val_ce_loss,
+            "kd_loss": val_kd_loss,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "num_label_tokens": total_num_label_tokens,
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+        }
+
+        # Ported from TrainFinetuneRecipeForNextTokenPrediction._run_validation_epoch
+        # (train_ft.py) -- this KD recipe overrides _run_validation_epoch entirely
+        # (needed for the teacher forward / ce+kd loss split above), so the parent's
+        # tool_call_evaluator invocation never ran for KD even when a tool_call_eval
+        # block was configured.
+        if getattr(self, "tool_call_evaluator", None) is not None:
+            prefix = self.tool_call_evaluator.metric_prefix
+            count_key = f"{prefix}/_count"
+            if isinstance(self.distributed_config, FSDP2Config) and not getattr(
+                self.tool_call_evaluator, "run_on_fsdp2", False
+            ):
+                if not self._warned_tool_call_eval_skipped:
+                    logging.warning(
+                        "Skipping tool_call_evaluator during FSDP2 training. "
+                        "Set tool_call_eval.run_on_fsdp2=true to force in-loop generation, "
+                        "or run the evaluator offline from a checkpoint."
+                    )
+                    self._warned_tool_call_eval_skipped = True
+                metrics[f"{prefix}/_disabled_fsdp2"] = 1.0
+            else:
+                sharded = self.tool_call_evaluator.sample_shard is not None
+                try:
+                    local_metrics = self.tool_call_evaluator.evaluate(self.model_parts[0], self.tokenizer)
+                except Exception as exc:
+                    logging.warning("tool_call_evaluator.evaluate failed: %s", exc)
+                    local_metrics = {}
+
+                metric_keys = list(self.tool_call_evaluator.METRIC_KEYS)
+                local_count = float(local_metrics.get(count_key, 0.0))
+                if sharded:
+                    packed = torch.tensor(
+                        [local_count]
+                        + [float(local_metrics.get(f"{prefix}/{k}", 0.0)) * local_count for k in metric_keys]
+                        + [float(local_metrics.get(f"{prefix}/_skipped", 0.0))],
+                        dtype=torch.float32,
+                        device=self.dist_env.device,
+                    )
+                    reduced = self._dp_allreduce(packed).tolist()
+                    total_count = reduced[0]
+                    for i, k in enumerate(metric_keys, start=1):
+                        metrics[f"{prefix}/{k}"] = reduced[i] / total_count if total_count > 0 else 0.0
+                    metrics[f"{prefix}/_skipped"] = reduced[-1]
+                    metrics[count_key] = total_count
+                else:
+                    for k in metric_keys:
+                        metrics[f"{prefix}/{k}"] = float(local_metrics.get(f"{prefix}/{k}", 0.0))
+                    metrics[f"{prefix}/_skipped"] = float(local_metrics.get(f"{prefix}/_skipped", 0.0))
+                    metrics[count_key] = local_count
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "val_loss": val_loss,
-                "ce_loss": val_ce_loss,
-                "kd_loss": val_kd_loss,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": total_num_label_tokens,
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            },
+            metrics=metrics,
         )
 
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
