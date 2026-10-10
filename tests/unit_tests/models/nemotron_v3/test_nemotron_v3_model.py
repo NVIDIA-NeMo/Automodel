@@ -1112,6 +1112,7 @@ def test_response_only_hidden_states_match_dense_logits_and_keep_mtp():
     assert all(parameter.grad is None for parameter in model.mtp.parameters())
 
 
+@skip_if_no_gpu
 def test_factory_materialization_and_checkpoint_load_preserve_selected_fp32(tmp_path):
     from safetensors.torch import save_file
     from transformers import PretrainedConfig

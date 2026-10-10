@@ -612,6 +612,10 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         return model_inputs
 
     @torch.no_grad()
+    def initialize_weights_preserving_dtypes(self) -> None:
+        """Initialize materialized parameters without a uniform storage cast."""
+        self.initialize_weights(dtype=None)
+
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,

@@ -14,7 +14,6 @@
 
 import gc
 import glob
-import inspect
 import logging
 import os
 import time
@@ -675,8 +674,8 @@ class Checkpointer:
                     module._is_hf_initialized = False
 
             if hasattr(model, "initialize_weights"):
-                if preserve_parameter_dtypes and "dtype" in inspect.signature(model.initialize_weights).parameters:
-                    model.initialize_weights(dtype=None)
+                if preserve_parameter_dtypes and hasattr(model, "initialize_weights_preserving_dtypes"):
+                    model.initialize_weights_preserving_dtypes()
                 else:
                     model.initialize_weights()
             else:
