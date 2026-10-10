@@ -45,6 +45,7 @@ from typing import Any, Iterable, Optional
 import torch
 from safetensors import SafetensorError, safe_open
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
@@ -509,6 +510,22 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 which = mtp_split_match.group(3)
                 if not state_dict_utils.should_load_expert_for_rank(expert_num, device_mesh, n_experts):
                     continue
+                scale_key = f"{key}_scale_inv"
+                if scale_key in hf_state_dict:
+                    dequantized = _dequantize_block_fp8(value, hf_state_dict[scale_key], self.dtype)
+                    if state_dict_utils.is_dtensor(value):
+                        # Keep residual DCP placements so the MTP packing path
+                        # does not slice an already-local ep_shard a second time.
+                        dequantized = DTensor.from_local(
+                            dequantized,
+                            device_mesh=value.device_mesh,
+                            placements=value.placements,
+                            shape=value.shape,
+                            stride=value.stride(),
+                        )
+                    value = dequantized
+                elif str(value.dtype).startswith("torch.float8_"):
+                    raise RuntimeError(f"Missing FP8 scale for MTP expert weight {key}")
                 parts = mtp_expert_parts.setdefault(layer_num, {"gate_proj": {}, "up_proj": {}, "down_proj": {}})
                 parts[which][expert_num] = value
                 continue
