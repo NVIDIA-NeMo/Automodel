@@ -33,6 +33,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import ConfigFieldValue, NeMoAutoDiffusionPipeline
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.diffusion.sampler import SequentialBucketSampler
 from nemo_automodel.components.distributed import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -867,7 +868,20 @@ class TrainDiffusionRecipe(BaseRecipe):
             self.val_dataloader = validation_build.dataloader
             self.val_sampler = validation_build.sampler
             if len(self.val_dataloader) == 0:
-                raise RuntimeError("Validation dataloader is empty; remove data.validation_dataloader or fix its path")
+                batch_sampler = self.val_dataloader.batch_sampler
+                drop_last = (
+                    batch_sampler.drop_last
+                    if isinstance(batch_sampler, SequentialBucketSampler)
+                    else self.val_dataloader.drop_last
+                )
+                raise RuntimeError(
+                    f"Validation dataloader is empty (dataset_size={len(self.val_dataloader.dataset)}, "
+                    f"local_batch_size={self.cfg.get('step_scheduler.local_batch_size')}, "
+                    f"dp_size={self._get_dp_group_size()}, drop_last={drop_last}). "
+                    "Check the validation cache path and contents. If drop_last is true, set "
+                    "data.validation_dataloader.drop_last: false to retain incomplete per-rank batches "
+                    "in each resolution bucket."
+                )
             if val_every_steps is None:
                 # is_val_step is also true on checkpoint steps, so validation is not dead here.
                 logging.warning(
@@ -981,12 +995,12 @@ class TrainDiffusionRecipe(BaseRecipe):
                 its periodic diagnostics.
 
         Returns:
-            Mean loss over the validation batches of the data-parallel group, comparable to the
-            logged ``train_loss``.
+            Sample-weighted mean loss over the data-parallel group, including any samples
+            repeated by distributed sampler padding.
         """
         self.model.eval()
         local_loss_sum = 0.0
-        local_num_batches = 0
+        local_num_samples = 0
         try:
             with (
                 ScopedRNG(seed=self.seed + self._get_dp_rank(), ranked=False),
@@ -1003,24 +1017,25 @@ class TrainDiffusionRecipe(BaseRecipe):
                         collect_metrics=False,
                         check_loss=False,
                     )
-                    local_loss_sum += float(average_weighted_loss.detach())
-                    local_num_batches += 1
+                    batch_size = _get_diffusion_microbatch_size(batch)
+                    local_loss_sum += float(average_weighted_loss.detach()) * batch_size
+                    local_num_samples += batch_size
         finally:
             self.model.train()
 
-        # Ranks can hold a different number of batches, so reduce sum and count and divide once.
+        # Weight short and dynamically sized batches by their actual sample counts.
         # CP peers all compute the same full-sequence loss, so the reduction excludes the cp axis.
         totals = torch.tensor(
-            [local_loss_sum, float(local_num_batches)],
+            [local_loss_sum, float(local_num_samples)],
             device=self._get_collective_device(),
             dtype=torch.float64,
         )
         if dist.is_initialized():
             dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=self._get_dp_group())
-        global_loss_sum, global_num_batches = totals.tolist()
-        if global_num_batches == 0:
-            raise RuntimeError("Validation produced no batches; cannot compute validation loss")
-        return global_loss_sum / global_num_batches
+        global_loss_sum, global_num_samples = totals.tolist()
+        if global_num_samples == 0:
+            raise RuntimeError("Validation produced no samples; cannot compute validation loss")
+        return global_loss_sum / global_num_samples
 
     def run_train_validation_loop(self):
         logging.info("[INFO] Starting T2V training with Flow Matching")

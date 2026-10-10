@@ -524,11 +524,14 @@ class RecipeConfig:
         )
 
     @staticmethod
-    def resolve_diffusion_dataloader(node: Any) -> "DiffusionDataloaderConfig":
+    def resolve_diffusion_dataloader(
+        node: Any, *, default_drop_last: bool | None = None
+    ) -> "DiffusionDataloaderConfig":
         """Resolve a diffusion dataloader YAML target to its typed config.
 
         Args:
-            node: ``data.dataloader`` config node containing a supported legacy builder target.
+            node: Training or validation config node containing a supported dataloader target.
+            default_drop_last: Override the loader default when the node omits ``drop_last``.
 
         Returns:
             Typed dataloader config whose ``build`` accepts runtime rank and batch-size values.
@@ -565,6 +568,8 @@ class RecipeConfig:
         unknown = sorted(set(kwargs) - valid)
         if unknown:
             raise TypeError(f"Unexpected diffusion dataloader config field(s): {', '.join(unknown)}")
+        if default_drop_last is not None and "drop_last" in valid:
+            kwargs.setdefault("drop_last", default_drop_last)
         if "base_resolution" in kwargs:
             kwargs["base_resolution"] = tuple(kwargs["base_resolution"])
         return config_type(**kwargs)
@@ -579,7 +584,7 @@ class RecipeConfig:
     def diffusion_validation_dataloader(self) -> "DiffusionDataloaderConfig" | None:
         """Typed diffusion validation dataloader config resolved from ``data.validation_dataloader``."""
         node = self._raw.get("data.validation_dataloader", None)
-        return self.resolve_diffusion_dataloader(node) if node is not None else None
+        return self.resolve_diffusion_dataloader(node, default_drop_last=False) if node is not None else None
 
     @cached_property
     def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:
