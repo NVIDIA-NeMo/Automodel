@@ -71,6 +71,7 @@ from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionG
 from nemo_automodel.components.models.deepseek_v41.attention import (
     DeepseekV41Attention,
     DeepseekV41AttentionState,
+    validate_attention_inputs,
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
@@ -166,6 +167,7 @@ class DeepseekV41Block(nn.Module):
         engram_hash_ids: torch.Tensor | None = None,
         cp_group: dist.ProcessGroup | None = None,
         packed_seq_ids: torch.Tensor | None = None,
+        inputs_validated: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, DeepseekV41AttentionState]:
         """Execute one block while retaining differentiable shared KV ownership.
 
@@ -206,6 +208,7 @@ class DeepseekV41Block(nn.Module):
             attention_mask=attention_mask,
             cp_group=cp_group,
             packed_seq_ids=packed_seq_ids,
+            inputs_validated=inputs_validated,
         )
         hidden_states = self.attn_hc.expand(attended.hidden_states, hidden_states, attn_mix)
         ffn_mix = self.ffn_hc(hidden_states)
@@ -385,6 +388,11 @@ class DeepseekV41Model(nn.Module):
             hashes = self.engram_hash(full_ids, token_mask=full_mask, sequence_ids=full_seq_ids)
             start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
             hashes = hashes[:, start : start + input_ids.shape[1]]
+        # The host-synchronising input checks run once here instead of in every attention layer (and again in
+        # every checkpoint recompute): with 40 layers that was 80+ launch-queue drains per step.
+        validate_attention_inputs(
+            position_ids, attention_mask, packed_seq_ids, sequence=input_ids.shape[1], cp_group=cp_group
+        )
         state = DeepseekV41AttentionState()
         captured = [] if output_hidden_states else None
         for layer in self.layers.values():
@@ -400,6 +408,7 @@ class DeepseekV41Model(nn.Module):
                 engram_hash_ids=None if layer.engram is None else hashes[:, :, layer.engram.layer_hash_index],
                 cp_group=cp_group,
                 packed_seq_ids=packed_seq_ids,
+                inputs_validated=True,
             )
         hidden_states = DeepseekV41HyperConnection.collapse(hidden_states, pre_mix)
         return self.norm(hidden_states), None if captured is None else tuple(captured)
