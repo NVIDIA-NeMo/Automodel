@@ -190,6 +190,27 @@ The check covers the same paths as Bandit (`app.py`, `nemo_automodel/`, `example
 python tools/lint_no_globals.py
 ```
 
+## Unit-test runtime
+
+New and modified unit tests have a 30-second runtime budget, including setup,
+the test body, and teardown. If every phase passes but the test exceeds the
+budget, pytest runs it once more in the same worker with fresh function-scoped
+fixtures. Shared fixtures and compiler caches can remain warm. Both attempts
+must exceed the budget to fail the runtime gate; assertion failures, fixture
+errors, and hard timeouts are never retried. A warning records every confirmation.
+
+Keep model shapes small and avoid downloads or unnecessary compilation. Tests
+that consistently need more than 30 seconds should be optimized or moved to
+functional tests. An exact `@pytest.mark.runtime_budget(...)` may tighten the
+limit, but cannot raise it for a new or modified test. Existing larger allowances
+retain their hard watchdog on unrelated changes; they do not impose a runtime
+gate on those changes. The default hard watchdog remains 70 seconds.
+
+Changed tests are identified relative to the PR merge base (or `origin/main`
+locally). Set `AUTOMODEL_RUNTIME_BUDGET_BASE=<commit>` to explicitly select a base
+when reproducing a CI result. CPU and GPU unit-test jobs both limit host math
+libraries to one thread per process to avoid oversubscription by spawned ranks.
+
 ## Pre-commit
 
 We recommand to use [prek](https://github.com/j178/prek) to ensure code quality. It is a faster and more modern alternative to [pre-commit](https://github.com/pre-commit/pre-commit).

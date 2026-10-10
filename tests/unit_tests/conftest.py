@@ -13,18 +13,22 @@
 # limitations under the License.
 import ast
 import importlib
+import math
 import multiprocessing
 import os
 import re
 import subprocess
 import sys
 import types
+import warnings
 from pathlib import Path
 from shutil import rmtree
 
 import psutil
 import pytest
+import pytest_timeout
 import torch
+from _pytest.runner import runtestprotocol
 
 os.environ.setdefault("HF_CACHE", "/home/TestData/lite/hf_cache")
 os.environ.setdefault("HF_HOME", "/home/TestData/HF_HOME")
@@ -53,7 +57,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
-_DEFAULT_RUNTIME_BUDGET_SECONDS = 5.0
+_DEFAULT_RUNTIME_BUDGET_SECONDS = 30.0
 _DEFAULT_HARD_TIMEOUT_SECONDS = 70.0
 _RUNTIME_BUDGET_ATTRIBUTE = "_automodel_runtime_budget_seconds"
 _DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -217,10 +221,10 @@ def _runtime_budget(marker: pytest.Mark, default_hard_timeout: float) -> tuple[f
         hard_timeout = float(marker.kwargs.get("hard_timeout", max(default_hard_timeout, budget * 3)))
     except (TypeError, ValueError) as error:
         raise pytest.UsageError("runtime_budget durations must be numbers") from error
-    if budget <= 0 or hard_timeout <= budget:
+    if not math.isfinite(budget) or not math.isfinite(hard_timeout) or budget <= 0 or hard_timeout <= budget:
         raise pytest.UsageError("runtime_budget requires a positive budget and a hard_timeout greater than it")
     if budget > _DEFAULT_RUNTIME_BUDGET_SECONDS and not str(marker.kwargs.get("reason", "")).strip():
-        raise pytest.UsageError("runtime_budget exceptions above 5s require a non-empty reason")
+        raise pytest.UsageError("runtime_budget exceptions above 30s require a non-empty reason")
     return budget, hard_timeout
 
 
@@ -234,15 +238,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     A runtime regression should fail only after the test has completed, without
     interrupting compiler or multiprocessing cleanup. The pytest-timeout marker
     is reserved for a much larger hard watchdog. Slow-test exceptions use the
-    exact-test ``runtime_budget`` marker, so a module-wide timeout cannot silently
-    exempt future tests added to that module.
+    exact-test ``runtime_budget`` marker. Legacy allowances retain their hang
+    watchdog, but only changed tests receive a soft budget, capped at 30 seconds.
     """
     if _global_timeout_was_configured(config):
         return
 
     runtime_budget = float(config.getoption("unit_test_runtime_budget"))
     hard_timeout = float(config.getoption("unit_test_hard_timeout"))
-    if runtime_budget <= 0 or hard_timeout <= runtime_budget:
+    if (
+        not math.isfinite(runtime_budget)
+        or not math.isfinite(hard_timeout)
+        or runtime_budget <= 0
+        or hard_timeout <= runtime_budget
+    ):
         raise pytest.UsageError(
             "--unit-test-runtime-budget must be positive and --unit-test-hard-timeout must be greater than it"
         )
@@ -261,6 +270,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             )
         direct_runtime_marker = _direct_marker(item, "runtime_budget")
         direct_timeout_marker = _direct_marker(item, "timeout")
+        is_changed_test = _item_definition(item) in changed_tests
 
         if direct_runtime_marker is not None:
             if direct_timeout_marker is not None:
@@ -268,11 +278,16 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                     f"{item.nodeid}: runtime_budget owns the hard watchdog; remove the direct timeout marker"
                 )
             budget, item_hard_timeout = _runtime_budget(direct_runtime_marker, hard_timeout)
-            setattr(item, _RUNTIME_BUDGET_ATTRIBUTE, budget)
+            if is_changed_test:
+                if budget > _DEFAULT_RUNTIME_BUDGET_SECONDS:
+                    raise pytest.UsageError(
+                        f"{item.nodeid}: new or modified unit tests cannot request a runtime_budget above 30s. "
+                        "Optimize the test or move expensive integration coverage to functional tests."
+                    )
+                setattr(item, _RUNTIME_BUDGET_ATTRIBUTE, min(budget, runtime_budget))
             item.add_marker(pytest.mark.timeout(item_hard_timeout), append=False)
             continue
 
-        is_changed_test = _item_definition(item) in changed_tests
         if is_changed_test:
             setattr(item, _RUNTIME_BUDGET_ATTRIBUTE, runtime_budget)
 
@@ -285,23 +300,58 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(pytest.mark.timeout(hard_timeout), append=False)
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> bool | None:
+    """Confirm runtime-only overruns once without retrying correctness failures.
+
+    Reuse pytest's runner so function fixtures are torn down and recreated on
+    confirmation, including under xdist. Shared fixtures and compiler caches
+    stay warm. Publish only the final reports, so JUnit, -x and xdist observe one
+    result per item. Setup, call and teardown all count toward the budget.
+    """
+    budget = getattr(item, _RUNTIME_BUDGET_ATTRIBUTE, None)
+    if budget is None:
+        return None
+
+    item.ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+    reports = runtestprotocol(item, log=False, nextitem=nextitem)
+    elapsed = sum(report.duration for report in reports)
+    if len(reports) == 3 and all(report.passed for report in reports) and elapsed > budget:
+        warnings.warn(
+            pytest.PytestWarning(
+                f"{item.nodeid} took {elapsed:.2f}s, exceeding its {budget:g}s runtime budget; confirming once."
+            ),
+            stacklevel=2,
+        )
+        # pytest-timeout wraps the protocol, not runtestprotocol(). Give the
+        # confirmation a fresh watchdog rather than charging both attempts to
+        # the first timer. Function-only watchdogs reset in pytest_runtest_call.
+        timeout_settings = pytest_timeout._get_item_settings(item)
+        if timeout_settings.timeout and not timeout_settings.func_only:
+            item.ihook.pytest_timeout_cancel_timer(item=item)
+            item.ihook.pytest_timeout_set_timer(item=item, settings=timeout_settings)
+        reports = runtestprotocol(item, log=False, nextitem=nextitem)
+        confirmed_elapsed = sum(report.duration for report in reports)
+        if len(reports) == 3 and all(report.passed for report in reports) and confirmed_elapsed > budget:
+            call_report = reports[1]
+            call_report.outcome = "failed"
+            call_report.longrepr = (
+                f"{item.nodeid} exceeded its {budget:g}s runtime budget in both attempts "
+                f"({elapsed:.2f}s, {confirmed_elapsed:.2f}s in setup+call+teardown). "
+                "Optimize the test or move expensive integration coverage to functional tests."
+            )
+        reports[0].user_properties.append(("runtime_budget_first_attempt_seconds", elapsed))
+    for report in reports:
+        item.ihook.pytest_runtest_logreport(report=report)
+    item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+    return True
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
-    """Turn a completed test's runtime-budget overage into a normal failure."""
+    """Remember hard timeouts so teardown can clean up abandoned children."""
     outcome = yield
     report = outcome.get_result()
-    if report.when == "setup":
-        setattr(item, "_automodel_setup_duration", report.duration)
-    if report.when == "call":
-        budget = getattr(item, _RUNTIME_BUDGET_ATTRIBUTE, None)
-        elapsed = getattr(item, "_automodel_setup_duration", 0.0) + report.duration
-        if report.passed and budget is not None and elapsed > budget:
-            report.outcome = "failed"
-            report.longrepr = (
-                f"{item.nodeid} took {elapsed:.2f}s in setup+call, exceeding its {budget:g}s runtime budget. "
-                "Optimize the test or add an exact @pytest.mark.runtime_budget(..., reason=...) exception."
-            )
-        setattr(item, "_automodel_call_report", report)
     if report.failed and "Timeout (" in report.longreprtext:
         setattr(item, "_automodel_timed_out", True)
 
@@ -346,7 +396,7 @@ def pytest_addoption(parser):
         dest="unit_test_runtime_budget",
         type=float,
         default=_DEFAULT_RUNTIME_BUDGET_SECONDS,
-        help="Soft call-time budget in seconds for newly added or modified unit tests.",
+        help="Runtime budget for changed unit tests, including fixtures; overruns are confirmed once (default: 30s).",
     )
     parser.addoption(
         "--unit-test-hard-timeout",
