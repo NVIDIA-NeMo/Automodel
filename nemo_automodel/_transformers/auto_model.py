@@ -486,6 +486,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             cache_dir=cache_dir,
             freeze_config=freeze_config,
             weights_already_loaded=weights_already_loaded,
+            preserve_parameter_dtypes=parameter_config is not None,
             inject_te_attention=inject_te_attention,
         )
 

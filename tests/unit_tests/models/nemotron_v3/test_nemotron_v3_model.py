@@ -1110,3 +1110,33 @@ def test_response_only_hidden_states_match_dense_logits_and_keep_mtp():
     native.hidden_states[-1].sum().backward()
     assert any(parameter.grad is not None for parameter in model.model.parameters())
     assert all(parameter.grad is None for parameter in model.mtp.parameters())
+
+
+def test_factory_materialization_and_checkpoint_load_preserve_selected_fp32(tmp_path):
+    from safetensors.torch import save_file
+    from transformers import PretrainedConfig
+    from nemo_automodel import NeMoAutoModelForCausalLM
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+    from nemo_automodel.components.utils.parameter_config import ParameterConfig
+
+    config = PretrainedConfig(**MockNemotronV3Config().to_dict())
+    config.architectures = ["NemotronHForCausalLM"]
+    config.name_or_path = str(tmp_path)
+    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False)
+    seed = NemotronHForCausalLM(config, backend=backend)
+    seed.initialize_weights()
+    selected = "model.layers.0.norm.weight"
+    assert selected in dict(seed.named_parameters())
+    weights = {name: value.detach().clone() for name, value in seed.state_dict().items()}
+    weights[selected] = torch.full_like(weights[selected], 0.1234567, dtype=torch.float32)
+    save_file(weights, tmp_path / "model.safetensors")
+    model = NeMoAutoModelForCausalLM.from_config(
+        config, backend=backend, torch_dtype=torch.bfloat16,
+        use_liger_kernel=False, use_sdpa_patching=False, attn_implementation="sdpa",
+        load_base_model=True, parameter_config=ParameterConfig((selected,), torch.float32, torch.bfloat16),
+    )
+    parameters = dict(model.named_parameters())
+    assert parameters[selected].dtype == torch.float32
+    assert parameters[selected].requires_grad
+    torch.testing.assert_close(parameters[selected], weights[selected], rtol=0, atol=0)
+    assert all(p.dtype == torch.bfloat16 and not p.requires_grad for name, p in parameters.items() if name != selected)

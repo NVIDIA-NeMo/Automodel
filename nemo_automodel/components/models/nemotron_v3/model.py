@@ -615,7 +615,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: Optional[torch.dtype] = torch.bfloat16,
     ) -> None:
         """Initialize model weights.
 
@@ -631,7 +631,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 for sublayer in self.mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
 
-        cast_model_to_dtype(self, dtype)
+        if dtype is not None:
+            cast_model_to_dtype(self, dtype)
 
 
 ModelClass = NemotronHForCausalLM

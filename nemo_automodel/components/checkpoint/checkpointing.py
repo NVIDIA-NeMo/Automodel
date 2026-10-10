@@ -14,6 +14,7 @@
 
 import gc
 import glob
+import inspect
 import logging
 import os
 import time
@@ -572,7 +573,10 @@ class Checkpointer:
 
     @staticmethod
     def initialize_model_weights(
-        model: torch.nn.Module, device: torch.device, peft_init_method: str | None = None
+        model: torch.nn.Module,
+        device: torch.device,
+        peft_init_method: str | None = None,
+        preserve_parameter_dtypes: bool = False,
     ) -> None:
         """
         Materialize meta-device parameters and initialize model weights.
@@ -585,12 +589,18 @@ class Checkpointer:
             model: Model whose weights should be initialized.
             device: Target device for materialized parameters.
             peft_init_method: Initialization method for PEFT adapters (e.g. "xavier").
+            preserve_parameter_dtypes: Skip a native initializer's final uniform cast
+                and verify configured storage survives materialization before loading.
         """
         # Only materialize parameters that are actually on the meta device.
         # When the caller sets is_meta_device=True but the model was already
         # constructed on a real device (e.g. ContextManagers was patched to
         # a no-op), calling to_empty_parameters_only would replace valid
         # weights with uninitialized CUDA memory.
+        expected_dtypes = (
+            {name: parameter.dtype for name, parameter in model.named_parameters()}
+            if preserve_parameter_dtypes else None
+        )
         has_meta_params = any(p.device.type == "meta" for p in model.parameters())
         if has_meta_params:
             to_empty_parameters_only(model, device=device)
@@ -665,7 +675,10 @@ class Checkpointer:
                     module._is_hf_initialized = False
 
             if hasattr(model, "initialize_weights"):
-                model.initialize_weights()
+                if preserve_parameter_dtypes and "dtype" in inspect.signature(model.initialize_weights).parameters:
+                    model.initialize_weights(dtype=None)
+                else:
+                    model.initialize_weights()
             else:
                 logging.warning(
                     "Warning: Model does not have initialize_weights method."
@@ -674,6 +687,10 @@ class Checkpointer:
 
         if peft_init_method is not None:
             _init_peft_adapters(model, peft_init_method)
+        if expected_dtypes is not None:
+            actual_dtypes = {name: parameter.dtype for name, parameter in model.named_parameters()}
+            if actual_dtypes != expected_dtypes:
+                raise ValueError("Configured parameter storage changed during materialization/initialization")
 
     def load_base_model(
         self,
