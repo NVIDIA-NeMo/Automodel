@@ -51,6 +51,12 @@ class MegatronPretrainingConfig:
     """Sequence length."""
     create_attention_mask: bool = False
     """Whether to generate attention masks (not supported with fused/flash attention)."""
+    reset_position_ids: bool = False
+    """Whether to reset position IDs at document boundaries (EOD tokens)."""
+    reset_attention_mask: bool = False
+    """Whether to reset the attention mask at document boundaries (EOD tokens)."""
+    eod_mask_loss: bool = False
+    """Whether to mask the loss on EOD tokens."""
     seed: int = 1234
     """Seed for generating the GPT dataset."""
     split: str = "900,50,50"
@@ -102,6 +108,9 @@ class MegatronPretrainingConfig:
             micro_batch_size=training_schedule.local_batch_size,
             global_batch_size=training_schedule.global_batch_size,
             create_attention_mask=self.create_attention_mask,
+            reset_position_ids=self.reset_position_ids,
+            reset_attention_mask=self.reset_attention_mask,
+            eod_mask_loss=self.eod_mask_loss,
             seed=self.seed,
             split=self.split,
             index_mapping_dir=self.index_mapping_dir,
@@ -134,6 +143,9 @@ class MegatronPretraining:
         micro_batch_size: int = 4,
         global_batch_size: int = 8,
         create_attention_mask: bool = False,
+        reset_position_ids: bool = False,
+        reset_attention_mask: bool = False,
+        eod_mask_loss: bool = False,
         seed: int = 1234,
         split: str = "900,50,50",
         index_mapping_dir: str | None = None,
@@ -188,6 +200,11 @@ class MegatronPretraining:
             global_batch_size (int): Global batch size.
             create_attention_mask (bool): Option to enable the attention masks generation.
                 Not supported with fused and flash attention.
+            reset_position_ids (bool): Option to reset position IDs at document boundaries
+                (EOD tokens).
+            reset_attention_mask (bool): Option to reset the attention mask at document
+                boundaries (EOD tokens).
+            eod_mask_loss (bool): Option to mask the loss on EOD tokens.
             seed (int): Seed for generating the GPT dataset.
             split (str): A string of 3 comma-separated integers denoting how much of the distribution
                 to allocate to train, validation, and test sets, respectively. Unused if ``paths`` is a dict.
@@ -252,6 +269,9 @@ class MegatronPretraining:
         self.global_batch_size = global_batch_size
         self.tokenizer = tokenizer
         self.create_attention_mask = create_attention_mask
+        self.reset_position_ids = reset_position_ids
+        self.reset_attention_mask = reset_attention_mask
+        self.eod_mask_loss = eod_mask_loss
         self.seed = seed
         self.split = split
         self.index_mapping_dir = index_mapping_dir
@@ -360,10 +380,10 @@ class MegatronPretraining:
             sequence_length=self.seq_length,
             tokenizer=self.tokenizer,
             path_to_cache=self.index_mapping_dir,
-            reset_position_ids=False,
+            reset_position_ids=self.reset_position_ids,
             create_attention_mask=self.create_attention_mask,
-            reset_attention_mask=False,
-            eod_mask_loss=False,
+            reset_attention_mask=self.reset_attention_mask,
+            eod_mask_loss=self.eod_mask_loss,
             num_dataset_builder_threads=self.num_dataset_builder_threads,
             object_storage_config=self.object_storage_config,
             **self.build_kwargs,

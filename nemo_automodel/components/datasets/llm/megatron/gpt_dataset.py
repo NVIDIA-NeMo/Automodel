@@ -324,6 +324,31 @@ class GPTDataset(torch.utils.data.Dataset):
                 self._eos_token_id,
             )
 
+        # Resolve the single EOD token id used for document-boundary features
+        # (reset_position_ids, reset_attention_mask, eod_mask_loss). Megatron's
+        # _get_ltor_masks_and_position_ids expects one int; when the tokenizer
+        # does not expose a usable EOS id we keep the historical -10000 sentinel
+        # (which never matches), preserving previous behavior.
+        eod_token_id = self._eos_token_id
+        if isinstance(eod_token_id, (list, tuple)):
+            eod_token_id = eod_token_id[0] if len(eod_token_id) > 0 else None
+        self._eod_token_id = eod_token_id if isinstance(eod_token_id, int) else None
+        if self._eod_token_id is None and any(
+            [
+                self.config.reset_position_ids,
+                self.config.reset_attention_mask,
+                self.config.eod_mask_loss,
+            ]
+        ):
+            logger.warning(
+                "Document-boundary features (reset_position_ids=%s, reset_attention_mask=%s, "
+                "eod_mask_loss=%s) are enabled but the tokenizer exposes no usable eos_token_id, "
+                "so no document boundaries will be detected.",
+                self.config.reset_position_ids,
+                self.config.reset_attention_mask,
+                self.config.eod_mask_loss,
+            )
+
         (self.document_index, self.sample_index, self.shuffle_index) = self._build_document_sample_shuffle_indices()
 
     @staticmethod
@@ -411,8 +436,7 @@ class GPTDataset(torch.utils.data.Dataset):
         if not self.masks_and_position_ids_are_cacheable or not self.masks_and_position_ids_are_cached:
             attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
                 tokens,
-                # eod loss mask is not supported for now
-                -10000,
+                self._eod_token_id if self._eod_token_id is not None else -10000,
                 self.config.reset_position_ids,
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
