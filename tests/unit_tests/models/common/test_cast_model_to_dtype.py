@@ -14,6 +14,7 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -608,6 +609,79 @@ class TestCastFrozenModulesToComputeDtype:
         assert model.vision.norm.weight.dtype == torch.bfloat16
         # Frozen buffer is always cast (never FSDP-managed) -- the actual fix.
         assert model.vision.pos.dtype == torch.bfloat16
+
+
+class _RouterUnderCheckpointWrapper(nn.Module):
+    """Frozen router inside an activation-checkpointed ``mlp`` with a trainable adapter beside it.
+
+    ``named_parameters()``/``named_buffers()`` report the router tensors as
+    ``mlp._checkpoint_wrapped_module.gate.*`` while fp32 keywords use the logical ``mlp.gate.*`` names.
+    """
+
+    def __init__(self, strict_fp32_keywords):
+        super().__init__()
+        self._keep_in_fp32_modules_strict = strict_fp32_keywords
+        gate = nn.Module()
+        # Values that bf16 rounding changes (bf16 spacing is 0.0078 near 1.5 and 0.0625 near 8).
+        gate.weight = nn.Parameter(torch.linspace(1.001, 2.003, 16).reshape(4, 4), requires_grad=False)
+        gate.register_buffer("e_score_correction_bias", torch.tensor([8.0013, 8.0027, 8.0041, 8.0055]))
+        inner = nn.Module()
+        inner.gate = gate
+        self.mlp = _CheckpointWrappedLeaf(inner)
+        self.adapter = nn.Linear(4, 2)
+
+    @property
+    def gate(self):
+        return self.mlp._checkpoint_wrapped_module.gate
+
+
+class TestFp32KeywordsThroughCheckpointWrapper:
+    """fp32 keywords written against logical FQNs must still match checkpoint-wrapped FQNs."""
+
+    @pytest.mark.parametrize(
+        "keyword",
+        ["mlp.gate.e_score_correction_bias", "gate.e_score_correction_bias", "e_score_correction_bias"],
+        ids=["qualified", "partial-path", "leaf-name"],
+    )
+    def test_cast_frozen_modules_keeps_pinned_buffer(self, keyword):
+        model = _RouterUnderCheckpointWrapper([keyword])
+        original = model.gate.e_score_correction_bias.clone()
+
+        cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
+
+        assert model.gate.e_score_correction_bias.dtype == torch.float32
+        assert torch.equal(model.gate.e_score_correction_bias, original)
+        assert model.gate.weight.dtype == torch.bfloat16
+
+    @pytest.mark.parametrize(
+        "keyword,tensor_name",
+        [("mlp.gate.e_score_correction_bias", "e_score_correction_bias"), ("mlp.gate.weight", "weight")],
+        ids=["buffer", "parameter"],
+    )
+    def test_cast_model_to_dtype_keeps_pinned_tensor(self, keyword, tensor_name):
+        model = _RouterUnderCheckpointWrapper([keyword])
+        original = getattr(model.gate, tensor_name).clone()
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        restored = getattr(model.gate, tensor_name)
+        assert restored.dtype == torch.float32
+        assert torch.equal(restored, original)
+        assert model.adapter.weight.dtype == torch.bfloat16
+
+    @pytest.mark.parametrize(
+        "restore_fn",
+        [_restore_fp32_modules, _restore_fp32_buffers],
+        ids=["restore-modules", "restore-buffers"],
+    )
+    def test_restore_helpers_match_logical_module_name(self, restore_fn):
+        model = _RouterUnderCheckpointWrapper([])
+        model.to(torch.bfloat16)
+
+        restore_fn(model, ["mlp.gate"])
+
+        assert model.gate.e_score_correction_bias.dtype == torch.float32
+        assert model.adapter.weight.dtype == torch.bfloat16
 
 
 class TestRopeBufferPreserved:

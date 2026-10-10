@@ -1948,3 +1948,56 @@ class TestSigmoidGateScoringPrecision:
         # HF reference's top_k_weights.to(router_logits.dtype).
         assert weights.dtype == x.dtype
         assert torch.equal(weights, ref_weights.to(x.dtype))
+
+
+class TestGatePrecisionUnderAutocast:
+    """``gate_precision`` must hold inside an enclosing bf16 autocast region.
+
+    Training loops commonly run the model forward under ``torch.autocast(dtype=torch.bfloat16)``,
+    which would otherwise run the fp32 router projection in bf16 and flip expert selection.
+    """
+
+    @pytest.mark.parametrize(
+        "score_func,with_correction_bias",
+        [("sigmoid", True), ("sigmoid", False), ("softmax", False)],
+        ids=["sigmoid-correction-bias", "sigmoid", "softmax"],
+    )
+    def test_fp32_gate_ignores_autocast(self, device, score_func, with_correction_bias):
+        config = MoEConfig(
+            n_routed_experts=16,
+            n_shared_experts=0,
+            n_activated_experts=4,
+            n_expert_groups=0,
+            n_limited_groups=0,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func=score_func,
+            route_scale=1.0,
+            dim=128,
+            inter_dim=256,
+            moe_inter_dim=256,
+            norm_topk_prob=True,
+            router_bias=False,
+            expert_bias=False,
+            expert_activation="swiglu",
+            force_e_score_correction_bias=with_correction_bias,
+            dtype=torch.float32,
+        )
+        torch.manual_seed(0)
+        gate = Gate(config, gate_precision=torch.float32).to(device)
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.05)
+            if with_correction_bias:
+                # Large-magnitude correction bias with fine spacing, as in sigmoid-router checkpoints.
+                gate.e_score_correction_bias.copy_(8.0 + torch.arange(16, device=device) * 1e-3)
+        gate.eval()
+        x = torch.randn(512, config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool, device=device)
+        expected_weights, expected_indices, _ = gate(x, token_mask, None)
+
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            weights, indices, _ = gate(x, token_mask, None)
+
+        assert torch.equal(indices, expected_indices)
+        assert torch.equal(weights, expected_weights)

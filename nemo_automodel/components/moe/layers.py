@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import warnings
 from functools import partial
 
@@ -555,7 +556,14 @@ class Gate(nn.Module):
             weight = self.weight.to(dtype=x.dtype)
             bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
 
-        scores = F.linear(x_compute, weight, bias=bias)
+        # An enclosing autocast region would run this linear in the autocast dtype and
+        # silently drop gate_precision, so autocast is disabled when a precision is set.
+        if self.gate_precision is not None:
+            precision_guard = torch.autocast(device_type=x_compute.device.type, enabled=False)
+        else:
+            precision_guard = contextlib.nullcontext()
+        with precision_guard:
+            scores = F.linear(x_compute, weight, bias=bias)
         if self.use_routing_core:
             weights, indices, original_scores = self.routing_core(scores, self)
         else:

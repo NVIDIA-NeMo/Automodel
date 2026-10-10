@@ -1170,6 +1170,26 @@ def _get_fp32_module_keywords(model: nn.Module) -> list[str]:
     return list(dict.fromkeys(keywords))
 
 
+def _matches_fp32_keyword(name: str, keywords: list[str]) -> bool:
+    """Return whether an fp32 keyword matches a module/tensor FQN or its logical name.
+
+    Activation checkpointing inserts ``_checkpoint_wrapped_module`` into
+    ``named_modules()``/``named_parameters()``/``named_buffers()`` FQNs, so a
+    qualified keyword such as ``mlp.gate.e_score_correction_bias`` does not occur in
+    ``mlp._checkpoint_wrapped_module.gate.e_score_correction_bias``. Matching the
+    wrapper-stripped name as well keeps such keywords effective.
+
+    Args:
+        name: Dot-separated module, parameter, or buffer FQN.
+        keywords: Substrings to match against ``name`` and its logical name.
+
+    Returns:
+        True if any keyword is a substring of either name.
+    """
+    logical_name = canonical_parameter_fqn(name)
+    return any(kw in name or kw in logical_name for kw in keywords)
+
+
 def _has_dtensor_params(model: nn.Module) -> bool:
     """Check if any model parameter is a DTensor (FSDP2 sharded)."""
     try:
@@ -1194,12 +1214,12 @@ def _snapshot_fp32_tensors(
     parameter_snapshots = {
         name: param.detach().to(torch.float32).clone()
         for name, param in model.named_parameters()
-        if param.is_floating_point() and any(keyword in name for keyword in parameter_keywords)
+        if param.is_floating_point() and _matches_fp32_keyword(name, parameter_keywords)
     }
     buffer_snapshots = {
         name: buf.detach().to(torch.float32).clone()
         for name, buf in model.named_buffers(remove_duplicate=False)
-        if buf.is_floating_point() and any(keyword in name for keyword in buffer_keywords)
+        if buf.is_floating_point() and _matches_fp32_keyword(name, buffer_keywords)
     }
     return parameter_snapshots, buffer_snapshots
 
@@ -1253,13 +1273,13 @@ def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:
         fp32_keywords: Substrings matched against dot-separated module names.
     """
     for name, module in model.named_modules():
-        if any(kw in name for kw in fp32_keywords):
+        if _matches_fp32_keyword(name, fp32_keywords):
             module.to(torch.float32)
     for name, param in model.named_parameters():
-        if any(kw in name for kw in fp32_keywords):
+        if _matches_fp32_keyword(name, fp32_keywords):
             param.data = param.data.to(torch.float32)
     for name, buf in model.named_buffers():
-        if any(kw in name for kw in fp32_keywords):
+        if _matches_fp32_keyword(name, fp32_keywords):
             module_name, _, buffer_name = name.rpartition(".")
             module = model.get_submodule(module_name) if module_name else model
             module._buffers[buffer_name] = buf.to(torch.float32)
@@ -1276,11 +1296,11 @@ def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
         fp32_keywords: Substrings matched against dot-separated module names.
     """
     for name, module in model.named_modules():
-        if any(kw in name for kw in fp32_keywords):
+        if _matches_fp32_keyword(name, fp32_keywords):
             for buf_name, buf in module.named_buffers(recurse=False):
                 module._buffers[buf_name] = buf.to(torch.float32)
     for name, buf in model.named_buffers():
-        if any(kw in name for kw in fp32_keywords):
+        if _matches_fp32_keyword(name, fp32_keywords):
             module_name, _, buffer_name = name.rpartition(".")
             module = model.get_submodule(module_name) if module_name else model
             module._buffers[buffer_name] = buf.to(torch.float32)
@@ -1422,7 +1442,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     fp32_keywords = _get_fp32_module_keywords(model)
 
     def _is_fp32_pinned(name: str) -> bool:
-        return any(kw in name for kw in fp32_keywords)
+        return _matches_fp32_keyword(name, fp32_keywords)
 
     # A LoRA-style module directly owns frozen base params and registers trainable adapter
     # descendants. On a one-rank run FSDP is skipped, so cast the whole mixed subtree to keep

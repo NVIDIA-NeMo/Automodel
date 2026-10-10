@@ -115,7 +115,9 @@ class RotaryEmbedding(torch.nn.Module):
     def _compute_cos_sin(self, num_tokens: int):
         concentration, inv_freq = self._compute_concentration_and_inv_freq()
         t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        # Broadcast product instead of einsum: CUDA autocast runs einsum in the autocast
+        # dtype, and bf16 cannot represent positions above 256.
+        freqs = t[:, None] * inv_freq[None, :]
         cos = freqs.cos() * concentration
         sin = freqs.sin() * concentration
         return cos, sin
@@ -202,8 +204,9 @@ def position_ids_to_freqs_cis(
 
     concentration, inv_freq = rotary_emb._compute_concentration_and_inv_freq()
     inv_freq = inv_freq.to(device=position_ids.device, dtype=torch.float32)
-    # angles: (B, T, D/2)
-    angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), inv_freq)
+    # angles: (B, T, D/2). Broadcast product instead of einsum: CUDA autocast runs einsum in the
+    # autocast dtype, and bf16 cannot represent positions above 256.
+    angles = position_ids.to(dtype=torch.float32)[..., None] * inv_freq
 
     if for_fused_rope:
         # TE fused rope expects [angles, angles]

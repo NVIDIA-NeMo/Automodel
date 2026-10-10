@@ -827,6 +827,49 @@ class TestPositionIdsToFreqsCis:
         torch.testing.assert_close(freqs_cis[1, 2], freqs_cis[1, 3])
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required: einsum is only on the CUDA autocast lower-precision op list"
+)
+class TestRopeAnglesUnderAutocast:
+    """Rotary angles must not depend on an enclosing bf16 autocast region.
+
+    Training loops commonly run the model forward under ``torch.autocast(dtype=torch.bfloat16)``.
+    CUDA autocast runs ``einsum`` in bf16, where positions above 256 are not representable, so an
+    einsum-based angle computation corrupts the rotary tables.
+    """
+
+    @pytest.mark.parametrize(
+        "qkv_format,for_fused_rope",
+        [("bshd", False), ("bshd", True), ("thd", False), ("thd", True)],
+        ids=["bshd-cos-sin", "bshd-fused", "thd-cos-sin", "thd-fused"],
+    )
+    def test_position_ids_to_freqs_cis(self, qkv_format, for_fused_rope):
+        device = torch.device("cuda")
+        rope = RotaryEmbedding(head_dim=64, base=10000, dtype=torch.float32, device=device)
+        position_ids = torch.arange(2048, device=device).unsqueeze(0)
+        expected = position_ids_to_freqs_cis(rope, position_ids, qkv_format=qkv_format, for_fused_rope=for_fused_rope)
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            actual = position_ids_to_freqs_cis(rope, position_ids, qkv_format=qkv_format, for_fused_rope=for_fused_rope)
+
+        assert actual.dtype == torch.float32
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("scaling_factor", [1.0, 32.0], ids=["no-scaling", "yarn"])
+    def test_compute_cos_sin(self, scaling_factor):
+        rope = RotaryEmbedding(
+            head_dim=64, base=10000, dtype=torch.float32, scaling_factor=scaling_factor, device=torch.device("cuda")
+        )
+        expected = rope._compute_cos_sin(2048)
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            actual = rope._compute_cos_sin(2048)
+
+        for a, e in zip(actual, expected):
+            assert a.dtype == torch.float32
+            torch.testing.assert_close(a, e, rtol=0, atol=0)
+
+
 class TestPositionIdsToFreqsCisWithContextParallel:
     """Tests for position_ids_to_freqs_cis with context parallelism"""
 
