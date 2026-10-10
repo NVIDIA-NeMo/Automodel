@@ -71,6 +71,12 @@ class NemotronHModelParallelizer(ModelParallelizer):
             raise ValueError("Sequence parallelism is not supported for NemotronHForCausalLM")
         logger.info("Using the Nemotron-H model-owned parallelization policy.")
 
+        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
+        if cp_mesh is not None and cp_mesh.size() > 1:
+            pp_size = device_mesh["pp"].size() if "pp" in device_mesh.mesh_dim_names else 1
+            reject_unsupported_mtp_cp_pp(model, pp_size=pp_size)
+            reject_unsupported_mtp_cp(model)
+
         block_container, layers = _decoder_blocks(model)
         tp_mesh = device_mesh[tp_mesh_name]
         if tp_mesh.size() > 1:
@@ -87,15 +93,12 @@ class NemotronHModelParallelizer(ModelParallelizer):
                 if layer.block_type == "mlp":
                     parallelize_module(layer, tp_mesh, mlp_plan)
 
-        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
         if cp_mesh is not None and cp_mesh.size() > 1:
             cp_group = cp_mesh.get_group()
             cp_global_ranks = torch.distributed.get_process_group_ranks(cp_group)
             cp_layers = list(layers)
             mtp_layers = getattr(getattr(model, "mtp", None), "layers", None)
             mtp_cp_enabled = model.supports.mtp_enabled
-            reject_unsupported_mtp_cp_pp(model)
-            reject_unsupported_mtp_cp(model)
             if mtp_cp_enabled and mtp_layers is None:
                 raise RuntimeError("MTP is enabled but model.mtp.layers is unavailable for context parallelism")
             if mtp_cp_enabled:

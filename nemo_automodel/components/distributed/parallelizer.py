@@ -298,6 +298,11 @@ class ModelParallelizer:
         reapply_trainability: Callable[[nn.Module], None] | None = None,
     ) -> nn.Module:
         """Apply the shared dense FSDP2 implementation."""
+        cp_enabled = "cp" in device_mesh.mesh_dim_names and device_mesh["cp"].size() > 1
+        # Bare nn.Module callers do not have AutoModel's capability interface.
+        if cp_enabled and hasattr(model, "supports"):
+            pp_size = device_mesh["pp"].size() if "pp" in device_mesh.mesh_dim_names else 1
+            parallelizer_utils.reject_unsupported_mtp_cp_pp(model, pp_size=pp_size)
         frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
         tp_mesh = device_mesh[tp_mesh_name]
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
@@ -496,7 +501,6 @@ class ModelParallelizer:
             root_kwargs["ignored_params"] = root_ignored_params
         model = self._fully_shard_module(model, **root_kwargs)
 
-        cp_enabled = "cp" in device_mesh.mesh_dim_names and device_mesh["cp"].size() > 1
         if cp_enabled:
             configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)
             logger.info(

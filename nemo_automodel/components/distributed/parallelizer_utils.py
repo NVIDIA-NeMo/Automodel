@@ -51,15 +51,20 @@ def reject_unsupported_mtp_cp(model: nn.Module) -> None:
         raise RuntimeError(f"{type(model).__name__} does not support MTP with context parallelism")
 
 
-def reject_unsupported_mtp_cp_pp(model: nn.Module) -> None:
-    """Reject MTP+CP on every trimmed pipeline stage before CP collectives."""
+def reject_unsupported_mtp_cp_pp(model: nn.Module, *, pp_size: int | None = None) -> None:
+    """Reject unsupported MTP+CP+PP before parallelizing the model.
+
+    Call only when context parallelism is active.
+
+    Args:
+        model: Model whose MTP capabilities are checked.
+        pp_size: Pipeline mesh size, when available. The legacy stage hook
+            also detects trimmed stages when the supplied mesh omits PP.
+    """
+    if not model.supports.mtp_enabled or model.supports.supports_mtp_cp_pp:
+        return
     is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
-    if (
-        model.supports.mtp_enabled
-        and not model.supports.supports_mtp_cp_pp
-        and callable(is_pp_stage_fn)
-        and is_pp_stage_fn()
-    ):
+    if (pp_size is not None and pp_size > 1) or (callable(is_pp_stage_fn) and is_pp_stage_fn()):
         raise NotImplementedError(
             "MTP with context and pipeline parallelism is not supported; use PP size 1 or CP size 1"
         )
