@@ -119,6 +119,8 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         - Rename norm_f → norm
         - Aggregate per-expert weights into grouped tensors
         - If device_mesh is provided, only load experts needed for the current rank
+        - Process MTP keys (``mtp.layers.{i}.*``) separately, reusing the
+          same MoE expert-merge logic for the MoE sublayer of each MTP depth.
 
         Args:
             hf_state_dict: HuggingFace format state dict
@@ -128,16 +130,28 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         Returns:
             Internal format state dict
         """
-        # Detect if HF checkpoint uses 'backbone' or 'model' prefix
-        for key in hf_state_dict.keys():
+        # Separate MTP keys; they live in their own top-level namespace and
+        # are not subject to the backbone/model rename.
+        mtp_state_dict: dict[str, Any] = {}
+        backbone_state_dict: dict[str, Any] = {}
+        for key in list(hf_state_dict.keys()):
+            value = hf_state_dict.pop(key)
+            if key.startswith("mtp."):
+                mtp_state_dict[key] = value
+            else:
+                backbone_state_dict[key] = value
+
+        # Detect if HF checkpoint uses 'backbone' or 'model' prefix. Only
+        # look at backbone keys; MTP keys never carry a backbone/model prefix.
+        for key in backbone_state_dict.keys():
             if ".mixer.experts." in key:
                 self._uses_model_prefix = not key.startswith("backbone.")
                 break
 
         # First, rename backbone → model and norm_f → norm
         renamed_state_dict = {}
-        for key in list(hf_state_dict.keys()):
-            value = hf_state_dict.pop(key)
+        for key in list(backbone_state_dict.keys()):
+            value = backbone_state_dict.pop(key)
             new_key = key
             if new_key.startswith("backbone."):
                 new_key = "model." + new_key[len("backbone.") :]
@@ -150,7 +164,19 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             renamed_state_dict[new_key] = value
 
         # Then merge experts using the mixin method
-        return self._from_hf_w_merged_experts(renamed_state_dict, device_mesh)
+        merged = self._from_hf_w_merged_experts(renamed_state_dict, device_mesh)
+
+        # Re-route MTP keys through the standard merge with prefix stripped.
+        if mtp_state_dict:
+            stripped: dict[str, Any] = {}
+            for key, value in mtp_state_dict.items():
+                stripped_key = key[len("mtp.") :] if key.startswith("mtp.") else key
+                stripped[stripped_key] = value
+            merged_mtp = self._from_hf_w_merged_experts(stripped, device_mesh)
+            for key, value in merged_mtp.items():
+                merged[f"mtp.{key}"] = value
+
+        return merged
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from internal format to HuggingFace format.
@@ -164,6 +190,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             List of (fqn, tensor) tuples in HuggingFace format
         """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
+
+        # MTP keys live in their own ``mtp.*`` namespace; route them through
+        # the standard expert-split path with the prefix overridden so
+        # emitted HF keys stay under ``mtp.`` instead of ``backbone.``.
+        if fqn.startswith("mtp."):
+            expert_split = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, prefix_override="mtp.")
+            result = expert_split if expert_split is not None else [(fqn, tensor)]
+            if exclude_key_regex:
+                result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
+            return result
 
         # Try to convert merged expert weights to split experts
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)

@@ -73,6 +73,28 @@ class ExpertParallel(ParallelStyle):
         )
 
 
+def _iter_moe_blocks(model_wrapper: nn.Module, backbone: nn.Module):
+    """Yield decoder blocks that may contain MoE sublayers.
+
+    Covers the main backbone (``backbone.layers``) plus an optional MTP
+    auxiliary head (``model_wrapper.mtp.layers``) when present. MTP sublayers
+    are not registered under ``backbone.layers`` but carry the same MoE
+    structure and must receive the same EP / FSDP treatment so their
+    state-dict round-trips cleanly.
+
+    Args:
+        model_wrapper: Outer model (e.g. ``NemotronHForCausalLM``) — the
+            attribute that may carry the MTP head.
+        backbone: Inner backbone (``model_wrapper.model``, possibly text-only
+            after VLM unwrapping) whose ``.layers`` holds the main decoder
+            stack.
+    """
+    yield from backbone.layers.children()
+    mtp_module = getattr(model_wrapper, "mtp", None)
+    if mtp_module is not None and hasattr(mtp_module, "layers"):
+        yield from mtp_module.layers.children()
+
+
 def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None):
     """Applies EP to MoE module."""
     assert ep_mesh.size() > 1
@@ -84,20 +106,21 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
     # Prefer nested text modules when present
     _model = get_text_module(_model)
 
-    for _, block in _model.layers.named_children():
+    for block in _iter_moe_blocks(model, _model):
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
-        if isinstance(moe_module, MoE):
-            # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
-            # local experts directly. It doesn't support DTensor wrapping, so we
-            # skip distribute_module entirely and just initialize token dispatcher.
-            if isinstance(moe_module.experts, GroupedExpertsTE):
-                moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
-            else:
-                parallelize_module(
-                    module=moe_module.experts,
-                    device_mesh=ep_mesh,
-                    parallelize_plan=ExpertParallel(),
-                )
+        if not isinstance(moe_module, MoE):
+            continue
+        # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
+        # local experts directly. It doesn't support DTensor wrapping, so we
+        # skip distribute_module entirely and just initialize token dispatcher.
+        if isinstance(moe_module.experts, GroupedExpertsTE):
+            moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+        else:
+            parallelize_module(
+                module=moe_module.experts,
+                device_mesh=ep_mesh,
+                parallelize_plan=ExpertParallel(),
+            )
 
 
 def apply_ac(
@@ -207,7 +230,7 @@ def apply_fsdp(
     # handle VLM
     _model = get_text_module(_model)
 
-    for _, block in _model.layers.named_children():
+    for block in _iter_moe_blocks(model, _model):
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
@@ -227,7 +250,6 @@ def apply_fsdp(
         ignored_params = None
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
-
         fully_shard_default(block, ignored_params=ignored_params)
 
     if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:

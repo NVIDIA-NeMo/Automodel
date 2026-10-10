@@ -57,6 +57,9 @@ class LayerContainer:
         self._blocks = blocks
         self.registered = {}
 
+    def children(self):
+        return iter(self._blocks)
+
     def named_children(self):
         return [(str(i), b) for i, b in enumerate(self._blocks)]
 
