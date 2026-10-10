@@ -24,7 +24,12 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
 
+from nemo_automodel._transformers.auto_model import (
+    NeMoAutoModelForCausalLM,
+    NeMoAutoModelForSequenceClassification,
+)
 from nemo_automodel._transformers.model_init import (
+    _absorb_config_attr_kwargs,
     _apply_backend_module_overrides,
     _consume_config_overrides,
     _get_bnb_modules_to_not_convert,
@@ -1024,6 +1029,203 @@ class TestDictConfigOverrideKeepsCustomPath:
         assert mock_download.call_args.kwargs["revision"] == "a" * 40
         assert mock_restore.call_args.kwargs["cache_dir"] == "/tmp/hub-cache"
         assert mock_restore.call_args.kwargs["revision"] == "a" * 40
+
+
+class _RemoteDLMConfig(PretrainedConfig):
+    model_type = "remote_dlm_test"
+
+    def __init__(self, dlm_paradigm="bidirectional", block_size=16, **kwargs):
+        self.dlm_paradigm = dlm_paradigm
+        self.block_size = block_size
+        super().__init__(**kwargs)
+
+
+class _RemoteDLMModel(nn.Module):
+    """Remote-code model whose ``__init__`` accepts no config-field kwargs."""
+
+    def __init__(self, config, extra_flag=None):
+        super().__init__()
+        self.config = config
+        self.extra_flag = extra_flag
+
+
+class _RemoteDLMForSequenceClassification(nn.Module):
+    """Remote-code head with a strict ``__init__(config)``."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.score = nn.Linear(4, config.num_labels)
+
+
+class TestRemoteCodeConfigOverridesReachModel:
+    """trust_remote_code HF fallback: yaml config kwargs (e.g. ``dlm_paradigm``) consumed onto
+    hf_config must reach the built model instead of being lost when HF re-reads config.json."""
+
+    AUTO_MAP = {"AutoConfig": "configuration_dlm.RemoteDLMConfig", "AutoModel": "modeling_dlm.RemoteDLMModel"}
+    SEQ_CLS_AUTO_MAP = {**AUTO_MAP, "AutoModelForSequenceClassification": "modeling_dlm.RemoteDLMForSeqCls"}
+
+    @staticmethod
+    def _disk_config(auto_map):
+        # What the checkpoint's config.json holds.
+        return _RemoteDLMConfig(auto_map=dict(auto_map), architectures=["RemoteDLMModel"], name_or_path="fake/remote")
+
+    def _load(self, nemo_cls, auto_map, model_cls, **kwargs):
+        """Run _init_model with HF's from_pretrained faked. Returns the model and (config, kwargs) per HF call."""
+        hf_calls = []
+
+        def fake_hf_from_pretrained(
+            cls_arg, path, *args, config=None, dtype=None, attn_implementation=None, trust_remote_code=None, **kwargs
+        ):
+            hf_calls.append((config, dict(kwargs)))
+            if config is None:
+                # HF rebuilds the config from config.json and applies the kwargs it has an attribute for.
+                config = self._disk_config(auto_map)
+                for key in [k for k in kwargs if hasattr(config, k)]:
+                    setattr(config, key, kwargs.pop(key))
+            if cls_arg.__name__ not in config.auto_map:
+                raise ValueError(f"Unrecognized configuration class {type(config)} for {cls_arg.__name__}.")
+            # Given a config, HF passes every leftover kwarg to the model __init__.
+            return model_cls(config, **kwargs)
+
+        with (
+            patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=self._disk_config(auto_map)),
+            patch("nemo_automodel._transformers.model_init._try_get_remote_code_model_cls", return_value=model_cls),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class", side_effect=lambda c: c),
+            # The auto_map alias retry re-reads config.json when kwargs carries no config.
+            patch(
+                "nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained",
+                side_effect=lambda *args, **kwargs: self._disk_config(auto_map),
+            ),
+            patch(
+                f"transformers.{nemo_cls.__name__.removeprefix('NeMo')}.from_pretrained",
+                classmethod(fake_hf_from_pretrained),
+            ),
+        ):
+            is_custom, model = _init_model(
+                nemo_cls,
+                "fake/remote",
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=False,
+                trust_remote_code=True,
+                _restore_loaded_dtype=False,
+                **kwargs,
+            )
+        assert is_custom is False
+        return model, hf_calls
+
+    @pytest.mark.parametrize(
+        "auto_map",
+        [AUTO_MAP, {**AUTO_MAP, "AutoModelForCausalLM": "modeling_dlm.RemoteDLMModel"}],
+        ids=["alias_retry", "direct"],
+    )
+    def test_from_pretrained_builds_model_with_overrides(self, auto_map):
+        model, hf_calls = self._load(
+            NeMoAutoModelForCausalLM,
+            auto_map,
+            _RemoteDLMModel,
+            dlm_paradigm="block_diff",
+            block_size=32,
+            extra_flag=True,
+        )
+
+        assert len(hf_calls) == (1 if "AutoModelForCausalLM" in auto_map else 2)
+        assert model.config.dlm_paradigm == "block_diff"
+        assert model.config.block_size == 32
+        # A model __init__ kwarg that is not a config field still reaches the model.
+        assert model.extra_flag is True
+
+    @pytest.mark.parametrize("auto_map", [AUTO_MAP, SEQ_CLS_AUTO_MAP], ids=["alias_retry", "direct"])
+    def test_config_attribute_kwargs_do_not_reach_strict_init(self, auto_map):
+        # num_labels is a config attribute missing from to_dict(), so _consume_config_overrides
+        # leaves it in kwargs. Once config= is forwarded, HF would hand it to __init__(config).
+        model, hf_calls = self._load(
+            NeMoAutoModelForSequenceClassification,
+            auto_map,
+            _RemoteDLMForSequenceClassification,
+            num_labels=3,
+            dlm_paradigm="block_diff",
+        )
+
+        assert model.config.dlm_paradigm == "block_diff"
+        assert model.config.num_labels == 3
+        assert model.score.out_features == 3
+        assert all("num_labels" not in hf_kwargs for _, hf_kwargs in hf_calls)
+
+    def test_no_consumed_override_leaves_hf_call_unchanged(self):
+        # Nothing was consumed onto hf_config, so no config= is forwarded and HF still loads
+        # the config itself and applies num_labels.
+        model, hf_calls = self._load(
+            NeMoAutoModelForSequenceClassification,
+            self.SEQ_CLS_AUTO_MAP,
+            _RemoteDLMForSequenceClassification,
+            num_labels=3,
+        )
+
+        assert hf_calls == [(None, {"num_labels": 3})]
+        assert model.config.num_labels == 3
+
+    def test_absorb_config_attr_kwargs_moves_only_config_attributes(self):
+        config = _RemoteDLMConfig()
+        config.quantization_config = {"quant_method": "fp8"}
+        user_quant = object()
+        kwargs = {
+            "num_labels": 3,
+            "name_or_path": "declared/by-init",
+            "extra_flag": True,
+            "quantization_config": user_quant,
+            "_commit_hash": "a" * 40,
+        }
+
+        _absorb_config_attr_kwargs(config, kwargs, init_param_names={"name_or_path"})
+
+        assert config.num_labels == 3
+        assert config.id2label == {0: "LABEL_0", 1: "LABEL_1", 2: "LABEL_2"}
+        assert config.quantization_config == {"quant_method": "fp8"}
+        assert kwargs == {
+            "name_or_path": "declared/by-init",
+            "extra_flag": True,
+            "quantization_config": user_quant,
+            "_commit_hash": "a" * 40,
+        }
+
+    def test_from_config_keeps_hf_config_positional(self):
+        hf_config = self._disk_config(self.AUTO_MAP)
+        cls = MagicMock()
+        cls.__name__ = "NeMoAutoModelForCausalLM"
+        cls._model_mapping = {}
+
+        def fake_from_config(config, *args, dtype=None, attn_implementation=None, trust_remote_code=None, **kwargs):
+            # A ``config`` kwarg as well would raise "got multiple values for argument 'config'".
+            return _RemoteDLMModel(config, **kwargs)
+
+        cls._from_config_parent_class = MagicMock(side_effect=fake_from_config)
+        with (
+            patch(
+                "nemo_automodel._transformers.model_init._try_get_remote_code_model_cls", return_value=_RemoteDLMModel
+            ),
+            patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class", side_effect=lambda c: c),
+        ):
+            is_custom, model = _init_model(
+                cls,
+                hf_config,
+                attn_implementation="eager",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=False,
+                trust_remote_code=True,
+                dlm_paradigm="block_diff",
+                block_size=32,
+                extra_flag=True,
+            )
+
+        assert is_custom is False
+        assert "config" not in cls._from_config_parent_class.call_args.kwargs
+        assert model.config is hf_config
+        assert model.config.dlm_paradigm == "block_diff"
+        assert model.extra_flag is True
 
 
 class TestSetupBnbLoadingKwargs:
