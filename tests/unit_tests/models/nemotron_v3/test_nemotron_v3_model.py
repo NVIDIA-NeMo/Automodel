@@ -1186,14 +1186,19 @@ def test_factory_preserves_intrinsic_fp32_without_a_trainable_surface(tmp_path):
     config.architectures = ["NemotronHForCausalLM"]
     config.name_or_path = str(tmp_path)
     backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False)
-    seed = NemotronHForCausalLM(config, backend=backend)
-    seed.initialize_weights()
+    from nemo_automodel._transformers.model_init import local_torch_dtype
+    with local_torch_dtype(torch.bfloat16, "NemotronHForCausalLM"):
+        seed = NemotronHForCausalLM(config, backend=backend)
+    seed.initialize_weights(dtype=None)
     weights = {name: value.detach().clone() for name, value in seed.state_dict().items()}
     intrinsic = "model.layers.0.mixer._fp32_params.A_log"
     assert weights[intrinsic].dtype == torch.float32
     weights[intrinsic].fill_(0.1234567)
     bias_name = next(name for name in weights if name.endswith("e_score_correction_bias"))
+    assert weights[bias_name].dtype == torch.float32
+    assert weights["model.layers.0.norm.weight"].dtype == torch.bfloat16
     weights[bias_name].fill_(0.2345678)
+    assert not torch.equal(weights[bias_name], weights[bias_name].bfloat16().float())
     save_file(weights, tmp_path / "model.safetensors")
     model = NeMoAutoModelForCausalLM.from_config(
         config, backend=backend, torch_dtype=torch.bfloat16,
