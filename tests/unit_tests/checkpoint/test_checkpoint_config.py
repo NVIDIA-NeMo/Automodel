@@ -76,6 +76,15 @@ class TestCheckpointingConfig:
         assert cfg.v4_compatible is True
         assert str(cfg.checkpoint_dir) == "/tmp/ckpt"
 
+    def test_save_optimizer_defaults_true(self):
+        # Backward-compatible default: existing configs keep saving optimizer state.
+        cfg = CheckpointingConfig(checkpoint_dir="/tmp/ckpt")
+        assert cfg.save_optimizer is True
+
+    def test_save_optimizer_can_be_disabled(self):
+        cfg = CheckpointingConfig(checkpoint_dir="/tmp/ckpt", save_optimizer=False)
+        assert cfg.save_optimizer is False
+
     def test_invalid_format_raises(self):
         with pytest.raises(AssertionError, match="Unsupported model save format"):
             CheckpointingConfig(
