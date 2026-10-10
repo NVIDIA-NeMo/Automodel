@@ -81,6 +81,10 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
+    # Before upgrading, recheck HF #49373 and nemo_automodel/components/models/pixtral/compat.py.
+    # Run tests/ci_tests/scripts/test_pixtral_compat.sh cpu <version> and gpu <version>:
+    # retrieval and ordinary Mistral VLMs need output/gradient parity and image isolation (FA2/FA3).
+    # Remove the backport and affected-release CI checks only after the upstream fix passes those tests.
     "transformers==5.18.0",
     # peft>=0.20 raises ImportError from get_peft_model() when an installed torchao is older than 0.16.0.
     "torchao>=0.16.0",
@@ -260,8 +264,10 @@ linting = [
 test = [
     "coverage",
     "pytest",
+    "pytest-cov>=7.0",
     "pytest-shard",
     "pytest-timeout",
+    "pytest-xdist>=3.8",
     "peft>=0.20.0",
     "ruamel.yaml",
     "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -305,7 +311,8 @@ constraint-dependencies = [
     "msgpack>=1.2.1", # Address CVE GHSA-6v7p-g79w-8964
     "pillow>=12.3.0", # Address the Pillow 12.3.0 security fixes
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
-    "pyarrow>=23.0.1", # Address CVE GHSA-rgxp-2hwp-jwgg
+    # PyArrow 26 requires NumPy 2; retain this cap while the build uses NumPy 1.26.
+    "pyarrow>=23.0.1,<26", # Address CVE GHSA-rgxp-2hwp-jwgg
     "pyasn1>=0.6.4", # Address GHSA-hm4w-wwcw-mr6r and GHSA-8ppf-4f7h-5ppj
     "ray>=2.56.0", # Address CVE-2026-57516
     "starlette>=1.3.1", # Address GHSA-wqp7-x3pw-xc5r and later Starlette security fixes

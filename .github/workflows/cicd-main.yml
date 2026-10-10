@@ -143,6 +143,11 @@ jobs:
           source ./venv/bin/activate
           uv run lint-imports --debug --verbose --no-cache
 
+      - name: Verify recipe import contract coverage
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tests/ci_tests/test_import_contracts.py
+
   type_checking:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
@@ -438,8 +443,8 @@ jobs:
           - test-name: L0_Unit_Tests_CPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: true
-            # The full CPU suite plus DSpark distributed tests exceeds 20 minutes.
-            timeout: 30
+            # The full CPU suite takes 28-30 minutes before teardown and coverage finish.
+            timeout: 40
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false

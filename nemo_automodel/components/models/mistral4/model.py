@@ -44,6 +44,7 @@ from nemo_automodel.components.models.mistral4.state_dict_adapter import (
     Mistral4MultimodalStateDictAdapter,
     Mistral4StateDictAdapter,
 )
+from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forward_backport
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
@@ -800,6 +801,7 @@ if _HF_MISTRAL3_AVAILABLE:
 
             # Build components: vision tower from HF, projector from HF, text from our backend
             vision_tower = AutoModel.from_config(config.vision_config)
+            apply_pixtral_forward_backport(vision_tower)
             multi_modal_projector = Mistral3MultiModalProjector(config)
             moe_overrides = kwargs.pop("moe_overrides", None)
             language_model = Mistral4TextModelBackend(

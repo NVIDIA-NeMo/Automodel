@@ -1129,6 +1129,43 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
         ms._vlm_chunk_idx = 0
         return ms
 
+    @pytest.mark.parametrize("qkv_format", ["bshd", "thd"])
+    @pytest.mark.parametrize("media_count", [1, 2])
+    @pytest.mark.parametrize("media_kind", ["image", "video", "both"])
+    def test_packed_forward_preserves_media_axes(self, qkv_format, media_count, media_kind):
+        ms = self._mock_self()
+        ms._vlm_pixel_values_videos_chunks = None
+        ms.lm_head = None
+        media = {}
+        tokens = []
+        for kind, pixels_key, token in (("image", "pixel_values", 151655), ("video", "pixel_values_videos", 151656)):
+            if media_kind in (kind, "both"):
+                media[pixels_key] = torch.randn(media_count, 12)
+                media[f"{kind}_grid_thw"] = torch.ones(media_count, 3, dtype=torch.long)
+                tokens.extend([token] * media_count)
+        tokens.append(9)
+        seq_len = len(tokens)
+        attn_kwargs = {"qkv_format": qkv_format}
+        if qkv_format == "thd":
+            attn_kwargs.update(
+                cu_seqlens=torch.tensor([[0, seq_len]], dtype=torch.int32), max_seqlen=torch.tensor(seq_len)
+            )
+
+        Qwen3VLMoeForConditionalGeneration.forward(
+            ms,
+            input_ids=torch.tensor([tokens]),
+            position_ids=torch.arange(seq_len).view(1, 1, seq_len).expand(3, 1, seq_len),
+            **attn_kwargs,
+            **media,
+        )
+
+        forwarded = ms.model.call_args.kwargs
+        for name, value in media.items():
+            torch.testing.assert_close(forwarded[name], value)
+        if qkv_format == "thd":
+            assert forwarded["input_ids"].shape == (seq_len,)
+            assert forwarded["cu_seqlens"].tolist() == [0, seq_len]
+
     def test_pp_attention_mask_dropped_on_seq_len_mismatch(self):
         ms = self._mock_self()
         hidden = 8

@@ -150,7 +150,7 @@ RUN if [ "$INSTALL_TE" = "True" ] || \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
+# Install HybridEP / DeepEP: nvshmem wheel 3.6.5.
 # The pinned hybrid-ep revision includes DeepEP #699, which inherits PyTorch's C++ standard
 # instead of forcing C++17 (PyTorch's Rubin builds require C++20).
 # deepep.patch also backports https://github.com/deepseek-ai/DeepEP/pull/564 for NVSHMEM 3.6.5 compatibility.
@@ -160,10 +160,7 @@ ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
-RUN apt-get update && apt-get install -y --allow-change-held-packages \
-        rdma-core libibverbs-dev && \
-    apt-get clean && \
-    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
+RUN ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
     test -f /usr/lib/${ARCH_LIB}/libmlx5.so || \
         ln -sf /usr/lib/${ARCH_LIB}/libmlx5.so.1 /usr/lib/${ARCH_LIB}/libmlx5.so && \
     mkdir -p ${RDMA_CORE_HOME} && \
@@ -326,6 +323,9 @@ ARG UV_SYNC_MAX_JOBS=8
 # Preserve locally built wheels for source-only CUDA packages such as flash-attn,
 # causal-conv1d and mamba-ssm across BuildKit builds. Separate GPU targets so
 # switching MOK_ARCH cannot reuse a wheel compiled for the other architecture.
+# Ray's runtime-env agent prepends thirdparty_files to sys.path, bypassing our
+# aiohttp CVE constraint. Remove the entire vendored HTTP dependency bundle so
+# the agent uses the coherent, patched dependency set installed by uv sync.
 # ray/jars/ray_dist.jar vendors a flagged jackson (GHSA-r7wm-3cxj-wff9) that upstream
 # has not bumped; Automodel uses Ray from Python only, so drop the Java worker jars.
 RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
@@ -341,6 +341,7 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         uv sync --extra $AUTOMODEL_INSTALL --extra msa --extra mok --extra ffpa --all-groups $UV_SYNC_ARGS && \
     python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
+    rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/_private/runtime_env/agent/thirdparty_files && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)

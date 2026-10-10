@@ -20,6 +20,8 @@ the Hyper-Connections weight builder, and the partial-RoPE helper).
 Full-model behaviour is covered by ``test_dsv4_model_smoke.py``.
 """
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -1362,6 +1364,68 @@ class TestDeepseekV4OptimizedKernels:
                 dim**-0.5,
                 backend="tilelang",
             ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
+
+    def test_sparse_attention_backward_threads_follow_head_count(self):
+        from nemo_automodel.components.models.deepseek_v4.kernels.tilelang_sparse_mla_bwd import _bwd_threads_for_heads
+
+        assert [_bwd_threads_for_heads(h) for h in (8, 16, 32, 64, 128)] == [128, 128, 256, 512, 512]
+
+    def test_sparse_attention_tilelang_runs_sixty_four_heads_in_one_backward_kernel(self, monkeypatch):
+        """TP=1 V4 shapes (64 heads, head_dim 512) no longer split the backward into 16-head kernels."""
+        import nemo_automodel.components.models.deepseek_v4.optimized_kernels as optimized_kernels
+
+        whole = Mock(side_effect=lambda q, *args, **kwargs: q.clone())
+        chunked = Mock(side_effect=lambda q, *args, **kwargs: q.clone())
+        monkeypatch.setattr(optimized_kernels, "_HAS_MILES_SPARSE_ATTN", True)
+        monkeypatch.setattr(optimized_kernels, "_HAS_MILES_SPARSE_ATTN_CHUNKED", True)
+        monkeypatch.setattr(optimized_kernels, "_miles_sparse_attn_tilelang", whole)
+        monkeypatch.setattr(optimized_kernels, "_miles_sparse_attn_tilelang_head_chunked", chunked)
+        monkeypatch.setattr(optimized_kernels, "_should_use_tilelang", lambda *args, **kwargs: True)
+        q = torch.randn(1, 4, 64, 512, dtype=torch.bfloat16)
+        kv = torch.randn(1, 8, 512, dtype=torch.bfloat16)
+        sinks = torch.randn(64)
+        topk = torch.zeros(1, 4, 32, dtype=torch.int32)
+
+        out = optimized_kernels.dsv4_sparse_attention(q, kv, sinks, topk, 512**-0.5, backend="tilelang")
+
+        assert out.shape == q.shape
+        whole.assert_called_once()
+        chunked.assert_not_called()
+
+    @pytest.mark.skipif(
+        not _can_run_tilelang_sparse_attn(),
+        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
+    )
+    @pytest.mark.runtime_budget(
+        90,
+        reason="compiles the 64-head, head_dim-512 TileLang forward and backward kernels once (tens of seconds cold)",
+    )
+    def test_sparse_attention_tilelang_backend_matches_torch_at_sixty_four_heads(self):
+        """The single 64-head backward kernel (512 threads) matches the torch reference at the V4 head shape."""
+        torch.manual_seed(7)
+        bsz, seq, heads, dim, key_len, topk_len = 1, 8, 64, 512, 64, 32
+        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(bsz, key_len, dim, device="cuda", dtype=torch.bfloat16)
+        sinks = torch.randn(heads, device="cuda")
+        topk = torch.stack(
+            [torch.stack([torch.randperm(key_len, device="cuda")[:topk_len] for _ in range(seq)]) for _ in range(bsz)]
+        ).to(torch.int32)
+        topk[:, :, -4:] = -1
+        grad = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=q.dtype)
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(q_, kv_, sinks_, topk, dim**-0.5, backend="sparse_torch"),
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(q_, kv_, sinks_, topk, dim**-0.5, backend="tilelang"),
             (q, kv, sinks),
             grad,
         )
