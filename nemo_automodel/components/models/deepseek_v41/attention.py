@@ -350,7 +350,8 @@ class _Indexer(nn.Module):
                 raise ValueError("Packed CSA2 state requires compressed document IDs")
             allowed = allowed & (packed_seq_ids.unsqueeze(-1) == state.compressed_seq_ids.unsqueeze(1))
             allowed = allowed & (packed_seq_ids.unsqueeze(-1) > 0)
-        if self.attn_backend == "tilelang":
+        if self.attn_backend in ("tilelang", "cudnn"):
+            # The cuDNN sparse backend keeps the TileLang indexer: cuDNN replaces the attention core only.
             scores = indexer_scores(queries, keys, weights, allowed)
         else:
             # Preserve the reference's BF16 matmul result and reduction boundaries.
@@ -447,10 +448,10 @@ class DeepseekV41Attention(nn.Module):
 
     def __init__(self, config: DeepseekV41TextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
-        if backend.attn not in ("eager", "sdpa", "tilelang"):
-            raise ValueError("DeepSeek V4.1 attention supports backend.attn='eager', 'sdpa', or 'tilelang'")
-        if backend.attn == "tilelang" and config.attention_dropout:
-            raise ValueError("The TileLang sparse attention backend requires attention_dropout=0")
+        if backend.attn not in ("eager", "sdpa", "tilelang", "cudnn"):
+            raise ValueError("DeepSeek V4.1 attention supports backend.attn='eager', 'sdpa', 'tilelang', or 'cudnn'")
+        if backend.attn in ("tilelang", "cudnn") and config.attention_dropout:
+            raise ValueError("The sparse attention kernels (tilelang, cudnn) require attention_dropout=0")
         if backend.linear != "torch" or backend.rms_norm not in ("torch_fp32", "te"):
             raise ValueError("DeepSeek V4.1 attention requires torch linear layers and torch_fp32 or te RMSNorm")
         self.backend = backend
@@ -648,9 +649,10 @@ class DeepseekV41Attention(nn.Module):
             ):
                 raise ValueError("CSA2 state belongs to a different batch or sequence")
             kv = torch.cat((kv, next_state.compressed_kv), dim=1)
-        if self.backend.attn == "tilelang":
+        if self.backend.attn in ("tilelang", "cudnn"):
             # Preserve the released sparse slot order and reuse V4's trainable
-            # online-softmax kernel, including its BF16 probability boundary.
+            # online-softmax kernel (TileLang), or the cuDNN Frontend DSA kernels
+            # with the same indices, sink and scale (backend.attn="cudnn").
             starts = (positions - self.window_size + 1).clamp_min(0).expand(batch, -1)
             if packed_seq_ids is not None:
                 starts = torch.maximum(starts, positions.unsqueeze(0) - position_ids)
@@ -673,8 +675,11 @@ class DeepseekV41Attention(nn.Module):
                 self.sinks_param(query),
                 indices,
                 self.head_dim**-0.5,
-                backend="tilelang",
+                backend=self.backend.attn,
                 reference_rounding=True,
+                # Without a padding mask every query sees at least its own slot; the cuDNN backward then skips
+                # its empty-row scan (a torch.nonzero, one host synchronisation per layer per step).
+                all_rows_nonempty=attention_mask is None,
             )
             return DeepseekV41AttentionOutput(self._project_output(attended, angles, valid_tokens), next_state)
         # Dense masks are needed only by the eager/SDPA fallback; TileLang uses sparse indices.
