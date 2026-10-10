@@ -78,7 +78,7 @@ jobs:
   ngc-cuda-test-uv:
     runs-on: linux-amd64-cpu16
     name: UV - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
-    needs: [pre-flight, setup-install-image]
+    needs: [pre-flight, setup-install-image, cuda-wheelhouse]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
@@ -115,6 +115,12 @@ jobs:
         with:
           version: 0.9.26
 
+      - name: Download cached CUDA wheelhouse
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: cuda-wheelhouse-py${{ matrix.python-version }}
+          path: /tmp/cuda-wheelhouse
+
       - name: Set up yq
         shell: bash
         run: |
@@ -141,6 +147,21 @@ jobs:
           source ./venv/bin/activate
 
           export PATH="./bin/:$PATH"
+
+          # Locked sync uses the recorded artifact URLs, not --find-links.
+          # Seed exact registry requirements so sync can reuse the installed wheels.
+          requirements="$(
+            python scripts/cuda_wheelhouse_lock.py \
+              --output wheels \
+              --torch-index "${TORCH_CU_INDEX}" \
+              --python-version "${{ matrix.python-version }}"
+          )"
+          mapfile -t wheel_requirements <<< "${requirements}"
+          # Require every exact wheel locally. Source-build settings (including
+          # match-runtime torch) do not apply to this wheel-only bootstrap.
+          uv pip install --no-config --python ./venv/bin/python \
+            --no-deps --no-index --only-binary :all: \
+            --find-links /tmp/cuda-wheelhouse "${wheel_requirements[@]}"
 
           uv sync --link-mode copy --locked --all-groups --no-group magi --extra all
 
