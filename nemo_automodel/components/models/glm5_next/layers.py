@@ -187,6 +187,7 @@ class _TorchShortConvolution(nn.Module):
         x: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
         """Convolve ``[batch, sequence, channels]`` and reset at packed boundaries."""
@@ -199,6 +200,7 @@ class _TorchShortConvolution(nn.Module):
                 output_final_state=kwargs.get("output_final_state", False),
                 activation="silu",
                 cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
                 cp_context=kwargs.get("cp_context"),
             )
         if cu_seqlens is None:
@@ -357,8 +359,10 @@ class Glm5NextLinearAttention(nn.Module):
         elif packed_context is not None:
             outputs = []
             for row in range(hidden_states.shape[0]):
-                cu_seqlens, _ = packed_context.row_cu_seqlens(row)
-                outputs.append(self._core(hidden_states[row : row + 1], cu_seqlens=cu_seqlens))
+                cu_seqlens, cu_seqlens_cpu = packed_context.row_cu_seqlens(row)
+                outputs.append(
+                    self._core(hidden_states[row : row + 1], cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu)
+                )
             output = torch.cat(outputs, dim=0)
         else:
             output = self._core(hidden_states)
@@ -371,6 +375,7 @@ class Glm5NextLinearAttention(nn.Module):
         hidden_states: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         cp_context: Any = None,
     ) -> torch.Tensor:
         """Project and execute KDA for one packed row or a regular batch."""
@@ -379,7 +384,10 @@ class Glm5NextLinearAttention(nn.Module):
             # so use a fresh identity on both forward and checkpoint recompute.
             cu_seqlens = cu_seqlens.clone()
         kernel_kwargs: dict[str, Any] = {} if cp_context is None else {"cp_context": cp_context}
-        conv_kwargs = dict(cache=None, output_final_state=False, cu_seqlens=cu_seqlens, **kernel_kwargs)
+        # Reuse the context's CPU boundaries so FLA need not synchronize for metadata.
+        conv_kwargs = dict(
+            cache=None, output_final_state=False, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, **kernel_kwargs
+        )
         q, _ = self.q_conv1d(x=self.q_proj(hidden_states), **conv_kwargs)
         k, _ = self.k_conv1d(x=self.k_proj(hidden_states), **conv_kwargs)
         v, _ = self.v_conv1d(x=self.v_proj(hidden_states), **conv_kwargs)
@@ -405,6 +413,7 @@ class Glm5NextLinearAttention(nn.Module):
                 initial_state=None,
                 output_final_state=cp_context is None,
                 cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
                 **kernel_options,
                 **kernel_kwargs,
             )

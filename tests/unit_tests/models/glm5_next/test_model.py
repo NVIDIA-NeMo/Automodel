@@ -549,3 +549,27 @@ def test_short_sequence_training_uses_chunk_kda_and_reaches_kda_parameters(monke
     assert calls == [32]
     missing = [name for name, param in layer.named_parameters() if param.grad is None]
     assert missing == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("boundaries", [[0, 4096], [0, 1, 64, 257, 2049, 4096]])
+@pytest.mark.parametrize("chunk_size", [64, 128])
+def test_fla_cpu_boundaries_preserve_chunk_indices(boundaries, chunk_size):
+    """Real FLA metadata agrees with independent integer indexing for packed 4K."""
+    prepare_chunk_indices = pytest.importorskip("fla.ops.utils.index").prepare_chunk_indices
+
+    cpu_boundaries = torch.tensor(boundaries, dtype=torch.long)
+    expected = torch.tensor(
+        [
+            [document, chunk]
+            for document, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True))
+            for chunk in range((end - start + chunk_size - 1) // chunk_size)
+        ],
+        device="cuda",
+    )
+    for _ in range(2):
+        device_boundaries = cpu_boundaries.cuda()
+        original = prepare_chunk_indices(device_boundaries, chunk_size)
+        cached = prepare_chunk_indices(device_boundaries, chunk_size, cpu_boundaries)
+        torch.testing.assert_close(original, expected, rtol=0, atol=0)
+        torch.testing.assert_close(cached, expected, rtol=0, atol=0)

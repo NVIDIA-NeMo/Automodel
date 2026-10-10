@@ -238,3 +238,32 @@ def test_kda_checkpoint_metadata_is_private_to_each_invocation():
     assert len({id(boundaries) for boundaries in invocations}) == 4
     for q, k, v in zip(seen[::3], seen[1::3], seen[2::3], strict=True):
         assert q is k and k is v
+
+
+def test_kda_reuses_packed_context_cpu_boundaries():
+    """Every convolution receives cached CPU boundaries and fresh device metadata."""
+    stage = split_stages(tiny_glm5_next_model(), 2)[0]
+    attention = stage.language_model.layers["0"].self_attn
+    context = Glm5NextPackedContext(torch.tensor([[1, 1, 1, 2, 2, 3]], dtype=torch.int32))
+    boundaries, boundaries_cpu = context.row_cu_seqlens(0)
+    seen = []
+    handles = [
+        conv.register_forward_pre_hook(
+            lambda _m, _a, kwargs: seen.append((kwargs["cu_seqlens"], kwargs["cu_seqlens_cpu"])),
+            with_kwargs=True,
+        )
+        for conv in (attention.q_conv1d, attention.k_conv1d, attention.v_conv1d)
+    ]
+    try:
+        for _ in range(2):
+            attention(torch.randn(1, 6, attention.hidden_size), packed_context=context)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert len(seen) == 6
+    assert seen[0][0] is not seen[3][0]
+    for device_copy, cpu_copy in seen:
+        assert device_copy is not boundaries
+        assert cpu_copy is boundaries_cpu
+        assert cpu_copy.device.type == "cpu"
+        torch.testing.assert_close(device_copy, torch.tensor([0, 3, 5, 6]))
