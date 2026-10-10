@@ -169,11 +169,7 @@ _DFLASH_LOSS_TYPES = ("dflash", "variable_prefix")
 
 
 class DFlashTrainerModule(nn.Module):
-    """DFlash online training wrapper with block-wise CE loss.
-
-    ``max_total_anchors`` optionally bounds rectangular anchor slots across the
-    local microbatch; ``None`` preserves the per-sequence ``num_anchors`` limit.
-    """
+    """DFlash online training wrapper with block-wise CE loss."""
 
     def __init__(
         self,
@@ -188,17 +184,12 @@ class DFlashTrainerModule(nn.Module):
         loss_type: str = "dflash",
         prefix_weight_base: float = 0.9,
         sliding_window: int | None = None,
-        *,
-        max_total_anchors: int | None = None,
     ):
         super().__init__()
         if loss_type not in _DFLASH_LOSS_TYPES:
             raise ValueError(f"loss_type must be one of {_DFLASH_LOSS_TYPES}, got {loss_type!r}")
         if prefix_weight_base <= 0:
             raise ValueError(f"prefix_weight_base must be > 0, got {prefix_weight_base}")
-        if max_total_anchors is not None and max_total_anchors <= 0:
-            raise ValueError(f"max_total_anchors must be > 0 or None, got {max_total_anchors}")
-        self.max_total_anchors = max_total_anchors
         self.draft_model = draft_model
         # Keep the frozen target lm_head / embed_tokens as NON-registered
         # references. Under tensor parallelism their weights are DTensors; a
@@ -272,13 +263,6 @@ class DFlashTrainerModule(nn.Module):
         # by ``keep_mask`` below); no -1, which would spuriously raise when the
         # richest sample has exactly one valid anchor and always drop one otherwise.
         max_n = min(self.num_anchors, int(valid_counts.max().item()))
-        if self.max_total_anchors is not None:
-            if self.max_total_anchors < bsz:
-                raise ValueError(
-                    f"max_total_anchors ({self.max_total_anchors}) must be at least the local batch size ({bsz})"
-                )
-            # Include padded slots in the rectangular [B, N, ...] allocation.
-            max_n = min(max_n, self.max_total_anchors // bsz)
         if max_n <= 0:
             doc_note = " with block_size-1 further real tokens in its document" if doc_remaining is not None else ""
             raise NoValidAnchorsError(

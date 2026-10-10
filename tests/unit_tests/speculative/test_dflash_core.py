@@ -41,7 +41,6 @@ def _build_trainer(
     attention_backend="sdpa",
     sliding_window=None,
     input_embedding_scale=1.0,
-    max_total_anchors=None,
 ):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
@@ -75,7 +74,6 @@ def _build_trainer(
         block_size=BLOCK_SIZE,
         attention_backend=attention_backend,
         num_anchors=num_anchors,
-        max_total_anchors=max_total_anchors,
         loss_decay_gamma=loss_decay_gamma,
         sliding_window=sliding_window,
     )
@@ -441,7 +439,6 @@ def test_constructor_preserves_historical_positional_prefix():
     assert positional.loss_decay_gamma == 4.0
     assert positional.loss_type == "dflash"
     assert positional.prefix_weight_base == 0.9
-    assert positional.max_total_anchors is None
 
 
 def _fix_anchors(monkeypatch, trainer, anchors):
@@ -508,25 +505,6 @@ def test_label_ids_must_match_input_shape_dtype_and_device():
         trainer(input_ids, hidden, loss_mask, label_ids=input_ids.float())
     with pytest.raises(ValueError, match="must be on"):
         trainer(input_ids, hidden, loss_mask, label_ids=input_ids.to("meta"))
-
-
-@pytest.mark.parametrize("budget", [1, 3, 8])
-def test_total_anchor_budget_bounds_rectangular_slots(budget):
-    trainer = _build_trainer(num_anchors=16, max_total_anchors=budget)
-    loss_mask = torch.ones(1, 24)
-    anchors, keep = trainer._sample_anchor_positions(24, loss_mask, loss_mask.device)
-    assert anchors.numel() == budget
-    assert keep.all()
-    # A microbatch with unequal supervision still pays for every padded slot.
-    trainer.max_total_anchors = 7
-    loss_mask = torch.ones(3, 24)
-    loss_mask[1, 1:] = 0
-    anchors, keep = trainer._sample_anchor_positions(24, loss_mask, loss_mask.device)
-    assert anchors.shape == (3, 2)
-    assert keep.sum(1).tolist() == [2, 1, 2]
-    trainer.max_total_anchors = 2
-    with pytest.raises(ValueError, match="local batch size"):
-        trainer._sample_anchor_positions(24, loss_mask, loss_mask.device)
 
 
 def test_variable_prefix_label_ids_supervise_only_the_masked_tail(monkeypatch):

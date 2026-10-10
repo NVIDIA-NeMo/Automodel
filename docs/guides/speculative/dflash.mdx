@@ -142,10 +142,8 @@ JetSpec drafts serve on vLLM through its `dflash` method.
 These trainer-module arguments are for external callers such as SALM; the YAML
 recipes do not set them.
 
-The DFlash and DFlash2 trainer modules accept an optional `max_total_anchors`
-constructor argument to bound the rectangular anchor allocation across a local
-microbatch. `None` preserves the per-sequence `num_anchors` limit.
-Their `forward` methods accept optional `label_ids` (long `[batch, sequence]`,
+The DFlash and DFlash2 trainer modules' `forward` methods accept optional
+`label_ids` (long `[batch, sequence]`,
 same shape/dtype/device as `input_ids`), enabling external callers such as SALM
 to provide backbone-argmax supervision while retaining `input_ids` for context,
 clean anchors, and visible `variable_prefix` tokens. `None` retains

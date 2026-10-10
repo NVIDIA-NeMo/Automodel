@@ -70,7 +70,6 @@ def _build_trainer(
     attention_backend="sdpa",
     selector_loss_weight=1.0,
     selector_top_k=TOP_K,
-    max_total_anchors=None,
 ):
     torch.manual_seed(0)
     draft = Qwen3DFlash2DraftModel(_draft_cfg(attention_backend, selector_top_k))
@@ -82,7 +81,6 @@ def _build_trainer(
         block_size=BLOCK_SIZE,
         attention_backend=attention_backend,
         num_anchors=num_anchors,
-        max_total_anchors=max_total_anchors,
         loss_decay_gamma=loss_decay_gamma,
         selector_loss_weight=selector_loss_weight,
     )
@@ -314,19 +312,6 @@ def test_dflash2_exposes_separate_differentiable_loss_terms():
             assert actual is None
         else:
             torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.parametrize("budget", [0, -1])
-def test_total_anchor_budget_rejects_nonpositive(budget):
-    with pytest.raises(ValueError, match="max_total_anchors"):
-        _build_trainer(max_total_anchors=budget)
-
-
-def test_dflash2_total_anchor_budget_reaches_shared_sampler():
-    trainer = _build_trainer(max_total_anchors=4)
-    input_ids, hidden, mask = _inputs(bsz=2)
-    metrics = trainer(input_ids, hidden, mask)
-    assert metrics.valid_blocks == 4
 
 
 def _fix_anchors(monkeypatch, trainer, anchors):
