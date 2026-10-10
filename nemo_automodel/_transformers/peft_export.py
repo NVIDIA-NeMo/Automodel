@@ -34,6 +34,31 @@ def _is_lora_state_key(key: str) -> bool:
     return any(part.startswith("lora_") for part in key.split("."))
 
 
+def _to_host_preserving_sharing(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Copy state-dict storages to CPU while preserving tensor views.
+
+    Args:
+        state_dict: Mapping of names to dense tensors of arbitrary shape, dtype,
+            and stride. Tensors may share storage with different offsets.
+
+    Returns:
+        CPU tensors with the same shapes, dtypes, offsets, strides, and storage
+        sharing. CPU inputs remain aliased; other devices' storages are copied.
+        Input tensors are not mutated.
+    """
+    moved_storages: dict[tuple[int, torch.device], torch.UntypedStorage] = {}
+    host_state_dict = {}
+    for key, tensor in state_dict.items():
+        source_storage = tensor.untyped_storage()
+        storage_key = (source_storage.data_ptr(), tensor.device)
+        if storage_key not in moved_storages:
+            moved_storages[storage_key] = source_storage.cpu()
+        host_state_dict[key] = torch.empty(0, dtype=tensor.dtype, device="cpu").set_(
+            moved_storages[storage_key], tensor.storage_offset(), tensor.shape, tensor.stride()
+        )
+    return host_state_dict
+
+
 @torch.no_grad()
 def _merge_and_get_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     """Fold a model's LoRA updates and convert its state to canonical HF layout.
@@ -45,9 +70,9 @@ def _merge_and_get_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
             by ``model.state_dict_adapter``.
 
     Returns:
-        Canonical Hugging Face state mapping. Every tensor retains the dtype of
-        the corresponding model weight; model-family adapters may split grouped
-        tensors into canonical per-expert tensors.
+        Canonical Hugging Face state mapping on host memory. Every tensor
+        retains the dtype of the corresponding model weight; model-family
+        adapters may split grouped tensors into canonical per-expert tensors.
     """
     state_dict = dict(model.state_dict())
     dtensor_keys = [key for key, tensor in state_dict.items() if isinstance(tensor, DTensor)]
@@ -91,6 +116,16 @@ def _merge_and_get_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         for key, tensor in state_dict.items()
         if not _is_lora_state_key(key) and not key.endswith("_extra_state")
     }
+
+    # Move the merged tensors to host memory before the canonical-HF layout
+    # conversion. ``to_hf`` allocates a full copy of the state dict on the
+    # input device while the model stays resident for the whole export, so
+    # converting on the model's device needs ~2x the model bytes there: a
+    # 61 GiB bf16 model cannot export on a single 80 GiB GPU
+    # (torch.OutOfMemoryError at 78.45 GiB). Conversion and serialization
+    # are pure state-dict work; host memory is sized for the extra copy.
+    # Copy each storage once so tied weights remain shared for HF serialization.
+    state_dict = _to_host_preserving_sharing(state_dict)
 
     adapter = getattr(model, "state_dict_adapter", None)
     if adapter is not None:
