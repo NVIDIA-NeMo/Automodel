@@ -15,7 +15,7 @@
 """Unit, layout-simulation and gloo-parity tests for the pooled pipeline recv buffers.
 
 The parity test trains the same pp4 1F1B pipeline twice inside each spawned
-rank — first with stock recv buffers, then with the ring pool installed —
+rank — first with stock recv buffers, then with a ring pool on that stage —
 using identical seeds and data, and requires bitwise-identical loss
 trajectories and per-stage parameter sums. It catches ring-too-small
 corruption (a prefetch overwriting a buffer still needed by a chunk's
@@ -77,18 +77,42 @@ def test_negative_slack_is_rejected():
     from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
     with pytest.raises(ValueError):
-        install_recv_buffer_pool(slack=-1)
+        install_recv_buffer_pool(_FakeStage(4, 1), slack=-1)
     with pytest.raises(ValueError):
         PipelineConfig(pp_recv_buffer_pool=True, pp_recv_buffer_pool_slack=-1)
     assert PipelineConfig(pp_recv_buffer_pool=True).pp_recv_buffer_pool_slack == 2
 
 
-@pytest.fixture
-def fresh_install(monkeypatch):
-    """Reset the process-wide install flag around a test and restore it afterwards."""
-    monkeypatch.setattr(recv_buffer_pool, "_INSTALLED", False)
-    monkeypatch.setattr(recv_buffer_pool, "_INSTALLED_LAYOUT", None)
-    yield
+@pytest.mark.parametrize(
+    ("schedule", "csv", "enabled", "expected_installs"),
+    [
+        ("1f1b", None, True, 1),
+        ("1f1b", None, False, 0),
+        ("gpipe", None, True, 0),
+        ("1f1b", "custom.csv", True, 0),
+    ],
+)
+def test_autopipeline_only_configures_supported_stages(monkeypatch, schedule, csv, enabled, expected_installs):
+    from nemo_automodel.components.distributed.pipelining import autopipeline
+    from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
+
+    class Mesh:
+        def __getitem__(self, _axis):
+            return self
+
+    stage = object()
+    model = nn.Linear(1, 1)
+    model.config = object()
+    installs = []
+    monkeypatch.setattr(autopipeline, "validate_hf_model_for_pipeline_support", lambda _model: None)
+    monkeypatch.setattr(autopipeline, "pipeline_model", lambda *_args, **_kwargs: (object(), [], True, True, [stage]))
+    monkeypatch.setattr(recv_buffer_pool, "install_recv_buffer_pool", lambda target, *, slack: installs.append(target))
+    pipeline = autopipeline.AutoPipeline(
+        world_mesh=Mesh(), pp_schedule=schedule, pp_schedule_csv=csv, pp_recv_buffer_pool=enabled
+    )
+    pipeline.build(model, loss_fn=lambda *_args: None)
+    assert installs == [stage] * expected_installs
+    assert PipelineConfig().pp_recv_buffer_pool is True
 
 
 def _fake_stage_classes(layout: str):
@@ -152,13 +176,12 @@ def _distinct(d):
 
 
 @pytest.mark.parametrize("layout", ["per-direction-setup", "prepare-infra"])
-def test_both_layouts_pool_to_ring_and_restore_chunks(fresh_install, monkeypatch, layout):
+def test_both_layouts_pool_to_ring_and_restore_chunks(monkeypatch, layout):
     """Each known torch layout is bound: middle stage pools both directions to K sets, chunks stays true."""
     _base, manual = _install_on_fakes(monkeypatch, layout)
-    assert install_recv_buffer_pool(slack=2) is True
-    assert recv_buffer_pool._INSTALLED_LAYOUT == layout
-
     stage = manual(num_stages=4, stage_index=1)  # in-flight 3 + slack 2 = K 5
+    assert install_recv_buffer_pool(stage, slack=2) is True
+    assert install_recv_buffer_pool(stage, slack=2) is True
     if layout == "per-direction-setup":
         stage._setup_forward_recv_info(_MB, True)
         stage._setup_backward_recv_info(_MB)
@@ -170,6 +193,16 @@ def test_both_layouts_pool_to_ring_and_restore_chunks(fresh_install, monkeypatch
     assert stage.chunks == _MB
     # the ring wraps: chunk k reuses chunk 0's buffer set
     assert stage.args_recv_info[5] is stage.args_recv_info[0]
+
+    stock = manual(num_stages=4, stage_index=1)
+    if layout == "per-direction-setup":
+        stock._setup_forward_recv_info(_MB, True)
+        stock._setup_backward_recv_info(_MB)
+    else:
+        stock._prepare_forward_infra(_MB, (), None)
+        stock._prepare_backward_infra(_MB)
+    assert _distinct(stock.args_recv_info) == _MB
+    assert _distinct(stock.grad_recv_info) == _MB
 
     first = manual(num_stages=4, stage_index=0)
     last = manual(num_stages=4, stage_index=3)
@@ -184,7 +217,7 @@ def test_both_layouts_pool_to_ring_and_restore_chunks(fresh_install, monkeypatch
     assert _distinct(last.grad_recv_info) == _MB
 
 
-def test_install_fails_open_on_unknown_layout(fresh_install, monkeypatch):
+def test_install_fails_open_on_unknown_layout(monkeypatch):
     from torch.distributed.pipelining import stage as stage_mod
 
     class Bare:
@@ -192,8 +225,7 @@ def test_install_fails_open_on_unknown_layout(fresh_install, monkeypatch):
 
     monkeypatch.setattr(stage_mod, "_PipelineStageBase", Bare)
     monkeypatch.setattr(stage_mod, "PipelineStage", Bare)
-    assert install_recv_buffer_pool(slack=2) is False
-    assert recv_buffer_pool._INSTALLED is False and recv_buffer_pool._INSTALLED_LAYOUT is None
+    assert install_recv_buffer_pool(Bare(), slack=2) is False
 
 
 class _Block(nn.Module):
@@ -227,7 +259,7 @@ def _free_port() -> int:
     return port
 
 
-def _train_once(rank: int) -> tuple[list[float], float, object]:
+def _train_once(rank: int, *, pooled: bool = False) -> tuple[list[float], float, object]:
     """Build a fresh pp4 stage for this rank and train 1F1B for a few steps.
 
     Returns:
@@ -242,6 +274,8 @@ def _train_once(rank: int) -> tuple[list[float], float, object]:
     full = nn.Sequential(*[_Block() for _ in range(_PP)])
     stage_mod = full[rank]
     stage = PipelineStage(stage_mod, rank, _PP, torch.device("cpu"))
+    if pooled:
+        assert install_recv_buffer_pool(stage, slack=2)
 
     def loss_fn(out, tgt):
         return torch.nn.functional.mse_loss(out, tgt)
@@ -281,8 +315,7 @@ def _parity_worker(rank: int, world_size: int, port: int) -> None:
 
         stock_losses, stock_sum, _ = _train_once(rank)
 
-        assert install_recv_buffer_pool(slack=2)
-        pooled_losses, pooled_sum, stage = _train_once(rank)
+        pooled_losses, pooled_sum, stage = _train_once(rank, pooled=True)
 
         # The pool really aliased: only K distinct buffer sets remain per direction.
         k = _ring_size(stage, _MB, 2)
@@ -321,10 +354,9 @@ def _too_small_ring_worker(rank: int, world_size: int, port: int) -> None:
         # stage 1 has 3 chunks in flight; force a 2-set ring so a prefetch lands
         # on a buffer whose chunk is still waiting for its backward.
         recv_buffer_pool._ring_size = lambda stage, num_microbatches, slack: 2
-        assert install_recv_buffer_pool(slack=0)
         diverged = False
         try:
-            small_losses, small_sum, _ = _train_once(rank)
+            small_losses, small_sum, _ = _train_once(rank, pooled=True)
             diverged = (rank == world_size - 1 and small_losses != stock_losses) or small_sum != stock_sum
         except RuntimeError:
             diverged = True  # autograd may also refuse the overwritten saved input
