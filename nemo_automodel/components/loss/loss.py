@@ -173,7 +173,7 @@ class KDLossConfig(LossConfig):
         fp32_upcast: Cast logits to float32 for numerical stability.
         tp_group: Tensor-parallel process group the loss reduces over (runtime
             arg; usually left as ``None`` in YAML and supplied programmatically).
-        chunk_size: Vocab chunk size for the KD loss (0 = no chunking).
+        chunk_size: Number of valid tokens per KD loss chunk (0 = no chunking).
     """
 
     ignore_index: int = -100
