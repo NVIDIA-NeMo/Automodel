@@ -1,7 +1,6 @@
 ---
 name: parity-testing
-description: Verify numerical parity between NeMo AutoModel implementations and reference HuggingFace models, including state dict and forward-pass checks.
-when_to_use: Verifying numerical correctness of a new or modified model against its HuggingFace reference, debugging loss divergence or output mismatches, or validating state dict mappings.
+description: Verify numerical parity between NeMo AutoModel implementations and reference HuggingFace models, including state dict and forward-pass checks. Use when verifying numerical correctness of a new or modified model against its HuggingFace reference, debugging loss divergence or output mismatches, or validating state dict mappings.
 ---
 
 # Parity Testing Skill for NeMo AutoModel
