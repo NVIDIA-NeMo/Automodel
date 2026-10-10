@@ -231,7 +231,8 @@ class KDLoss(nn.Module):
             materializing the full ``[num_valid_tokens, vocab_size]`` probability matrix in fp32.
             With a Python scalar temperature, chunks are checkpointed to recompute fp32 intermediates
             during backward, trading computation for memory. Tensor-valued temperatures and
-            logits wider than 32 bits retain eager chunking. ``0`` (default) disables chunking.
+            logits wider than 32 bits retain eager chunking, as does a single chunk covering all
+            valid tokens. ``0`` (default) disables chunking.
             Ignored when using the TP path.
     """
 
@@ -313,7 +314,7 @@ class KDLoss(nn.Module):
 
         if (
             tp_group is None
-            and self.chunk_size > 0
+            and 0 < self.chunk_size < t_logits.shape[0]
             and not isinstance(self.temperature, torch.Tensor)
             and t_logits.element_size() <= 4
             and s_logits.element_size() <= 4

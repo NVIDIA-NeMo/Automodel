@@ -155,11 +155,13 @@ kd_loss_fn:
 
 Each chunk keeps the full vocabulary and recomputes its FP32 loss intermediates
 during backward. Smaller chunks reduce the temporary working set and increase
-the number of launches. Compare complete training-step memory and time when
-choosing a size; teacher and student output logits occupy memory throughout the loss.
+the number of launches. Full forward/backward peak memory also depends on the
+logit dtype and chunk size; large chunks can increase the peak. Compare complete
+training-step memory and time when choosing a size; teacher and student output
+logits occupy memory throughout the loss.
 The default `chunk_size: 0` disables chunking. Tensor-parallel loss ignores this
-setting. Tensor-valued temperatures and logits wider than 32 bits use eager
-chunking without recomputation.
+setting. Tensor-valued temperatures, logits wider than 32 bits, and a single chunk
+covering all valid tokens use eager chunking without recomputation.
 
 ### Current Constraints
 
