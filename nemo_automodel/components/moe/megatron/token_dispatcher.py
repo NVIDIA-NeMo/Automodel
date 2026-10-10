@@ -406,6 +406,7 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_num_blocks_permute: int | None = None,
         moe_hybridep_num_blocks_unpermute: int | None = None,
         benchmark_static_routing: bool = False,
+        moe_hybridep_token_capacity: int | None = None,
     ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
@@ -415,6 +416,11 @@ class _HybridEPManager(_DispatchManager):
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
         self.moe_hybridep_permute_fusion = moe_hybridep_permute_fusion
         self.moe_hybridep_compact_routing = moe_hybridep_compact_routing
+        if moe_hybridep_token_capacity is not None and (
+            moe_hybridep_token_capacity <= 0 or moe_hybridep_token_capacity % _HYBRIDEP_TOKEN_ALIGNMENT
+        ):
+            raise ValueError("HybridEP token capacity must be a positive multiple of four")
+        self.moe_hybridep_token_capacity = moe_hybridep_token_capacity
         self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
         self.moe_hybridep_num_blocks_permute = moe_hybridep_num_blocks_permute
         self.moe_hybridep_num_blocks_unpermute = moe_hybridep_num_blocks_unpermute
@@ -490,7 +496,9 @@ class _HybridEPManager(_DispatchManager):
         """Dispatch hidden states using compact top-k metadata when available.
 
         Args:
-            hidden_states: Hidden states with shape [tokens, hidden].
+            hidden_states: Per-rank hidden states with shape [tokens, hidden]. When a fixed
+                token capacity is configured, tokens must not exceed that capacity. All EP ranks
+                must configure the same capacity; shorter inputs are zero-padded and route nowhere.
             async_finish: Ignored because HybridEP does not expose asynchronous completion here.
             allocate_on_comm_stream: Ignored because HybridEP owns its communication stream.
 
@@ -517,8 +525,14 @@ class _HybridEPManager(_DispatchManager):
         # the aligned group-wide maximum: padded rows route to no expert (all-False
         # routing map), and combine() slices them back off.
         self.num_unpadded_tokens = None
-        if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
-            num_tokens = hidden_states.shape[0]
+        num_tokens = hidden_states.shape[0]
+        if self.moe_hybridep_token_capacity is not None:
+            target_tokens = self.moe_hybridep_token_capacity
+            if num_tokens > target_tokens:
+                raise ValueError(
+                    f"HybridEP received {num_tokens} tokens, exceeding configured token capacity {target_tokens}"
+                )
+        elif torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
             pin = self.benchmark_static_routing and _STATIC_ROUTING_PAD_PIN
             if pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
                 target_tokens = self._static_target_tokens
@@ -534,15 +548,17 @@ class _HybridEPManager(_DispatchManager):
                             "(per-dispatch EP-group max all-reduce + host sync skipped from now on)",
                             target_tokens,
                         )
-            pad_tokens = target_tokens - num_tokens
-            if pad_tokens > 0:
-                self.num_unpadded_tokens = num_tokens
-                hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_tokens))
-                if self.routing_map is not None:
-                    self.routing_map = nn.functional.pad(self.routing_map, (0, 0, 0, pad_tokens))
-                if self.token_indices is not None:
-                    self.token_indices = nn.functional.pad(self.token_indices, (0, 0, 0, pad_tokens), value=-1)
-                self.token_probs = nn.functional.pad(self.token_probs, (0, 0, 0, pad_tokens))
+        else:
+            target_tokens = num_tokens
+        pad_tokens = target_tokens - num_tokens
+        if pad_tokens > 0:
+            self.num_unpadded_tokens = num_tokens
+            hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_tokens))
+            if self.routing_map is not None:
+                self.routing_map = nn.functional.pad(self.routing_map, (0, 0, 0, pad_tokens))
+            if self.token_indices is not None:
+                self.token_indices = nn.functional.pad(self.token_indices, (0, 0, 0, pad_tokens), value=-1)
+            self.token_probs = nn.functional.pad(self.token_probs, (0, 0, 0, pad_tokens))
 
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
             x=hidden_states,
@@ -709,6 +725,7 @@ class HybridEPPipelineRuntimeInitializer:
             self.manager.router_topk,
             self.manager.moe_hybridep_num_sms,
             self.manager.moe_hybridep_compact_routing,
+            self.manager.moe_hybridep_token_capacity,
             self.manager.moe_hybridep_permute_fusion,
             self.manager.moe_hybridep_num_sms_preprocessing,
             self.manager.moe_hybridep_num_blocks_permute,
@@ -737,6 +754,13 @@ class HybridEPPipelineRuntimeInitializer:
 
     def _resolve_group_capacity(self, *, num_tokens: int, device: torch.device) -> int:
         """Return the EP-group maximum JIT capacity for this batch."""
+        token_capacity = self.manager.moe_hybridep_token_capacity
+        if token_capacity is not None:
+            if num_tokens > token_capacity:
+                raise ValueError(
+                    f"Pipeline microbatch has {num_tokens} tokens, exceeding HybridEP token capacity {token_capacity}"
+                )
+            num_tokens = token_capacity
         capacity = self.required_capacity(num_tokens)
         if not torch.distributed.is_initialized() or torch.distributed.get_world_size(self.manager.group) == 1:
             return capacity
@@ -776,7 +800,7 @@ class HybridEPPipelineRuntimeInitializer:
 
         try:
             self.manager.initialize_runtime(
-                num_tokens=required_capacity,
+                num_tokens=self.manager.moe_hybridep_token_capacity or required_capacity,
                 hidden_dim=self.hidden_dim,
                 dtype=self.dtype,
                 device=device,
@@ -860,6 +884,9 @@ class TokenDispatcherConfig:
     routing is forced-balanced with no noise, so every dispatch permutes the same token
     count. Persist num_permuted_tokens across dispatches to keep HybridEP on its
     non-blocking size path instead of waiting on a device-side count per microbatch."""
+
+    moe_hybridep_token_capacity: int | None = None
+    """Fixed per-rank token extent shared by the EP group; pads valid shorter inputs without a size collective."""
 
 
 class MoEFlexTokenDispatcher:
@@ -964,6 +991,7 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                         moe_hybridep_permute_fusion=self.config.moe_hybridep_permute_fusion,
                         moe_hybridep_compact_routing=self.config.moe_hybridep_compact_routing,
+                        moe_hybridep_token_capacity=self.config.moe_hybridep_token_capacity,
                         moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                         moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                         moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
@@ -972,12 +1000,14 @@ class MoEFlexTokenDispatcher:
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
                 if (
                     self._comm_manager.moe_hybridep_compact_routing,
+                    self._comm_manager.moe_hybridep_token_capacity,
                     self._comm_manager.moe_hybridep_permute_fusion,
                     self._comm_manager.moe_hybridep_num_sms_preprocessing,
                     self._comm_manager.moe_hybridep_num_blocks_permute,
                     self._comm_manager.moe_hybridep_num_blocks_unpermute,
                 ) != (
                     self.config.moe_hybridep_compact_routing,
+                    self.config.moe_hybridep_token_capacity,
                     self.config.moe_hybridep_permute_fusion,
                     self.config.moe_hybridep_num_sms_preprocessing,
                     self.config.moe_hybridep_num_blocks_permute,
@@ -996,6 +1026,7 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                     moe_hybridep_permute_fusion=self.config.moe_hybridep_permute_fusion,
                     moe_hybridep_compact_routing=self.config.moe_hybridep_compact_routing,
+                    moe_hybridep_token_capacity=self.config.moe_hybridep_token_capacity,
                     moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                     moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,

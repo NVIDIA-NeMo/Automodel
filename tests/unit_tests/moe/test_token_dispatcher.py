@@ -263,6 +263,7 @@ class TestHybridEPRuntimeInitialization:
         [
             ("moe_hybridep_permute_fusion", True),
             ("moe_hybridep_compact_routing", True),
+            ("moe_hybridep_token_capacity", 1024),
             ("moe_hybridep_num_sms_preprocessing", 12),
             ("moe_hybridep_num_blocks_permute", 16),
             ("moe_hybridep_num_blocks_unpermute", 16),
@@ -282,18 +283,27 @@ class TestHybridEPRuntimeInitialization:
 
 
 @pytest.mark.parametrize("compact", [False, True])
-@pytest.mark.parametrize("num_tokens,group_max", [(5, 5), (3, 5), (4, 4)])
+@pytest.mark.parametrize("num_tokens,group_max", [(5, 5), (3, 5), (4, 4), (0, 5)])
+@pytest.mark.parametrize("capacity", [None, 8])
 def test_hybridep_padding_preserves_routing_and_gradients(
-    hybrid_ep_manager, monkeypatch, compact, num_tokens, group_max
-):
+    hybrid_ep_manager: _HybridEPManager,
+    monkeypatch: pytest.MonkeyPatch,
+    compact: bool,
+    num_tokens: int,
+    group_max: int,
+    capacity: int | None,
+) -> None:
     """Padding must preserve real tokens and leave padded rows routed nowhere."""
     import nemo_automodel.components.moe.megatron.token_dispatcher as td
 
+    hybrid_ep_manager.moe_hybridep_token_capacity = capacity
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
 
     def group_max_reduce(tensor, op=None, group=None):
         """Set the scalar [ ] token count to the simulated group's maximum."""
+        if capacity is not None:
+            pytest.fail("Fixed token capacity must not exchange token counts")
         tensor.fill_(group_max)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", group_max_reduce)
@@ -306,7 +316,7 @@ def test_hybridep_padding_preserves_routing_and_gradients(
     dispatcher.hybridep_metadata_processor = _HybridEPMetadataProcessor(
         num_experts=8, permute_fusion=False, compact_routing=compact
     )
-    target_tokens = -(-group_max // 4) * 4
+    target_tokens = capacity if capacity is not None else -(-group_max // 4) * 4
 
     def dispatch(x, routing_map, probs, *, topk_idx, **kwargs):
         """Apply identity experts weighted by dense probabilities.
@@ -377,6 +387,7 @@ def test_hybridep_preprocess_records_cuda_graph_sample(hybrid_ep_manager, monkey
     [
         ("moe_hybridep_compact_routing", True),
         ("moe_hybridep_permute_fusion", True),
+        ("moe_hybridep_token_capacity", 1024),
         ("moe_hybridep_num_sms_preprocessing", 12),
         ("moe_hybridep_num_blocks_permute", 16),
         ("moe_hybridep_num_blocks_unpermute", 16),
@@ -732,3 +743,48 @@ class TestHybridEPStaticRoutingPadPin:
         assert calls == [4] and sizes == [12, 12]
         calls2, sizes2 = self._dispatch_n(m, monkeypatch, [16], group_max=16, pin=True)
         assert calls2 == [16] and sizes2 == [16] and m._static_target_tokens == 16
+
+
+@pytest.mark.parametrize("capacity", [-4, 0, 3, 6])
+def test_hybridep_rejects_invalid_token_capacity(capacity: int) -> None:
+    with pytest.raises(ValueError, match="positive multiple of four"):
+        _HybridEPManager(
+            group=None, num_local_experts=2, num_experts=8, router_topk=2, moe_hybridep_token_capacity=capacity
+        )
+
+
+def test_hybridep_token_capacity_rejects_oversized_input(
+    hybrid_ep_manager: _HybridEPManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hybrid_ep_manager.moe_hybridep_token_capacity = 4
+    hybrid_ep_manager.token_probs = torch.ones(5, 8)
+    dispatch = Mock()
+    reduce = Mock()
+    monkeypatch.setattr("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", dispatch)
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    with pytest.raises(ValueError, match="5 tokens.*capacity 4"):
+        hybrid_ep_manager.dispatch(torch.ones(5, 4))
+    dispatch.assert_not_called()
+    reduce.assert_not_called()
+
+
+@pytest.mark.parametrize("capacity,jit_capacity", [(8, 512), (1024, 1024)])
+def test_hybridep_runtime_prepares_configured_token_capacity(
+    hybrid_ep_manager: _HybridEPManager, monkeypatch: pytest.MonkeyPatch, capacity: int, jit_capacity: int
+) -> None:
+    hybrid_ep_manager.moe_hybridep_token_capacity = capacity
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    initialize = Mock()
+    monkeypatch.setattr(hybrid_ep_manager, "initialize_runtime", initialize)
+    initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 16, torch.bfloat16)
+    fused_a2a.reset_hybrid_ep_buffer()
+    try:
+        initializer.prepare(num_tokens=5, device=torch.device("cpu"))
+        initialize.assert_called_once_with(
+            num_tokens=capacity, hidden_dim=16, dtype=torch.bfloat16, device=torch.device("cpu")
+        )
+        assert fused_a2a._hybrid_ep_initialized_capacity == jit_capacity
+        with pytest.raises(ValueError, match="exceeding HybridEP token capacity"):
+            initializer.prepare(num_tokens=capacity + 1, device=torch.device("cpu"))
+    finally:
+        fused_a2a.reset_hybrid_ep_buffer()

@@ -456,6 +456,9 @@ class BackendConfig:
         dispatcher_hybridep_compact_routing: Send compact top-k expert indices to HybridEP
             instead of the dense Boolean routing map. This can reduce metadata traffic, but
             remains opt-in because its latency depends on topology and model shape.
+        dispatcher_hybridep_token_capacity: Optional fixed token extent shared by every EP rank.
+            Must be a positive multiple of four and at least the largest local microbatch token count.
+            Pads shorter inputs without a per-dispatch size collective; routing remains dynamic.
         dispatcher_hybridep_num_sms_preprocessing: Optional number of SMs used by HybridEP
             routing-metadata preprocessing.
         dispatcher_hybridep_num_blocks_permute: Optional number of dispatch permutation
@@ -535,6 +538,7 @@ class BackendConfig:
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     dispatcher_hybridep_permute_fusion: bool = False
     dispatcher_hybridep_compact_routing: bool = False
+    dispatcher_hybridep_token_capacity: int | None = None
     dispatcher_hybridep_num_sms_preprocessing: int | None = None
     dispatcher_hybridep_num_blocks_permute: int | None = None
     dispatcher_hybridep_num_blocks_unpermute: int | None = None
@@ -583,6 +587,12 @@ class BackendConfig:
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
     def __post_init__(self) -> None:
+        if self.dispatcher_hybridep_token_capacity is not None:
+            if self.dispatcher != "hybridep":
+                raise ValueError("dispatcher_hybridep_token_capacity requires dispatcher=hybridep")
+            if self.dispatcher_hybridep_token_capacity <= 0 or self.dispatcher_hybridep_token_capacity % 4:
+                raise ValueError("dispatcher_hybridep_token_capacity must be a positive multiple of four")
+
         # benchmark_static_routing caches routing metadata across microbatches, which is
         # only sound when routing is constant by construction (forced balance, no noise).
         if self.benchmark_static_routing and not (self.fake_balanced_gate and self.fake_gate_noise == 0.0):

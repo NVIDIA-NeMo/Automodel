@@ -30,7 +30,9 @@ all routing/fusion combinations. Each variant checks a local reference with
 different expert scales and compares equal and unequal token extents. Add
 --activation-checkpointing to compare checkpoint replay with the same unequal
 computation without checkpointing. The pytest launcher uses --all-variants to
-run the complete matrix in one worker launch and process group.
+run the complete matrix in one worker launch and process group. Use --token-capacity
+to exercise fixed-extent padding, including extra padding beyond the group maximum.
+HIDDEN_SIZE, NUM_EXPERTS, TOPK, FULL_TOKENS and SHORT_TOKENS configure larger component cases.
 """
 
 import argparse
@@ -50,9 +52,9 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
 
 # Match the MXFP4 EP fixture so both groups can reuse dispatch/combine kernels.
-HIDDEN = 512
-NUM_EXPERTS = 4
-TOPK = 2
+HIDDEN = int(os.environ.get("HIDDEN_SIZE", "512"))
+NUM_EXPERTS = int(os.environ.get("NUM_EXPERTS", "4"))
+TOPK = int(os.environ.get("TOPK", "2"))
 FULL_TOKENS = int(os.environ.get("FULL_TOKENS", "5"))
 SHORT_TOKENS = int(os.environ.get("SHORT_TOKENS", "3"))  # rank 1 in the unequal run
 
@@ -101,7 +103,8 @@ def run_dispatch_combine(
         dispatch_handles.append(dispatcher._comm_manager.handle)
         # Give expert e the scale e+1, so a wrong destination or expert grouping
         # changes the output rather than being hidden by identical experts.
-        expert_scales = torch.tensor(dispatcher.local_expert_indices, device=out.device, dtype=out.dtype) + 1
+        # Keep e+1 exact when NUM_EXPERTS exceeds BF16 integer precision (256).
+        expert_scales = torch.tensor(dispatcher.local_expert_indices, device=out.device, dtype=torch.float32) + 1
         row_scales = expert_scales.repeat_interleave(tokens_per_expert.to(device=out.device, dtype=torch.int64))
         return dispatcher.token_unpermutation(out * (permuted_probs * row_scales.float()).unsqueeze(-1).to(out.dtype))
 
@@ -128,7 +131,12 @@ def run_dispatch_combine(
 
 
 def _run_variant(
-    ep_group: dist.ProcessGroup, *, compact_routing: bool, permute_fusion: bool, activation_checkpointing: bool
+    ep_group: dist.ProcessGroup,
+    *,
+    compact_routing: bool,
+    permute_fusion: bool,
+    activation_checkpointing: bool,
+    token_capacity: int | None = None,
 ) -> None:
     """Check one routing/fusion variant using the existing two-rank process group."""
     rank = dist.get_rank()
@@ -140,6 +148,7 @@ def _run_variant(
         moe_share_token_dispatcher=False,
         moe_hybridep_compact_routing=compact_routing,
         moe_hybridep_permute_fusion=permute_fusion,
+        moe_hybridep_token_capacity=token_capacity,
     )
     num_local = NUM_EXPERTS // dist.get_world_size()
     dispatcher = MoEFlexTokenDispatcher(
@@ -195,6 +204,7 @@ def main() -> None:
     parser.add_argument("--permute-fusion", action="store_true")
     parser.add_argument("--activation-checkpointing", action="store_true")
     parser.add_argument("--all-variants", action="store_true")
+    parser.add_argument("--token-capacity", type=int, help="Fixed shared token extent; must cover FULL_TOKENS")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
@@ -212,6 +222,7 @@ def main() -> None:
                 compact_routing=compact,
                 permute_fusion=fusion,
                 activation_checkpointing=activation_checkpointing,
+                token_capacity=args.token_capacity,
             )
             # Reuse the buffer: routing/fusion are per-call options, and all variants share its shape.
             # Keep the native buffer and loaded kernels alive until all variants finish.
@@ -219,7 +230,8 @@ def main() -> None:
             dist.barrier(group=ep_group)
             store_hybrid_ep_jit_cache()
             print(
-                f"HybridEP parity: compact={compact} fusion={fusion} elapsed={time.perf_counter() - start:.2f}s",
+                f"HybridEP parity: compact={compact} fusion={fusion} capacity={args.token_capacity} "
+                f"elapsed={time.perf_counter() - start:.2f}s",
                 flush=True,
             )
     finally:
