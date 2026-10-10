@@ -1139,5 +1139,5 @@ def test_factory_materialization_and_checkpoint_load_preserve_selected_fp32(tmp_
     parameters = dict(model.named_parameters())
     assert parameters[selected].dtype == torch.float32
     assert parameters[selected].requires_grad
-    torch.testing.assert_close(parameters[selected], weights[selected], rtol=0, atol=0)
+    torch.testing.assert_close(parameters[selected].detach().cpu(), weights[selected], rtol=0, atol=0)
     assert all(p.dtype == torch.bfloat16 and not p.requires_grad for name, p in parameters.items() if name != selected)
