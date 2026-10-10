@@ -24,8 +24,10 @@ import pytest
 import torch
 from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
+from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 from nemo_automodel.components.distributed.activation_checkpointing import make_selective_checkpoint_context_fn
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.packing import configure_packing_for_models
 from nemo_automodel.components.models.common.utils import TEFp8Config
 from nemo_automodel.components.models.minimax_m3_vl import msa
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
@@ -348,6 +350,30 @@ def test_msa_with_dense_layers_requires_a_varlen_attention_backend() -> None:
         with pytest.raises(NotImplementedError, match="backend.attn='te'"):
             MiniMaxM3TextModel(_config(), _backend(attn="sdpa"))
         MiniMaxM3TextModel(_config(), _backend("generic", attn="sdpa"))
+
+
+def test_te_msa_packing_preserves_model_owned_document_boundaries() -> None:
+    # All-sparse construction exercises the real MSA model contract without CUDA kernels.
+    text = _config(sparse_attention_freq=[1, 1], sparse_disable_index_value=[1, 1])
+    with torch.device("meta"):
+        model = MiniMaxM3SparseForCausalLM(text, backend=_backend())
+        vlm = MiniMaxM3SparseForConditionalGeneration(
+            MiniMaxM3VLConfig(vision_config=dict(VISION_CONFIG), text_config=text), backend=_backend()
+        )
+    for consumer in (model, vlm, copy.deepcopy(vlm)):
+        contract = configure_packing_for_models([consumer])
+        sample = {
+            "input_ids": torch.tensor([1, 2, 3, 4, 5]),
+            "labels": torch.tensor([2, -100, 4, 5, -100]),
+            "position_ids": torch.tensor([0, 1, 0, 1, 2]),
+            "attention_mask": torch.tensor([1, 1, 2, 2, 2]),
+        }
+        batch = neat_packed_vlm_collater([sample], packing=contract)
+        microbatch = _build(torch.empty(1, 5, 8), attention_mask=batch["attention_mask"])
+
+        assert contract.packed_mask_type == "block_causal"
+        assert microbatch.cu_seqlens.tolist() == [0, 2, 5]
+        assert not microbatch.padding_mask.any()
 
 
 class _CpuSelectionPlan:
