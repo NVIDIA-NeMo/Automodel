@@ -738,6 +738,9 @@ class GroupedExperts(nn.Module):
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
 
+    # Grouped GEMMs store [..., input, output], unlike nn.Linear's [..., output, input].
+    _nemo_transposed_matrix_parameters: tuple[str, ...] = ("gate_and_up_projs", "down_projs")
+
     def __init__(self, config: MoEConfig, backend: Optional["BackendConfig"] = None):
         """
         Initializes the GroupedExperts module.
@@ -1417,6 +1420,9 @@ class GroupedExpertsDeepEP(nn.Module):
         gate_and_up_projs (nn.Parameter): Linear layer for gate+up (gated) or just up (non-gated).
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
+
+    # Grouped GEMMs store [..., input, output], unlike nn.Linear's [..., output, input].
+    _nemo_transposed_matrix_parameters: tuple[str, ...] = ("gate_and_up_projs", "down_projs")
 
     def __init__(
         self,

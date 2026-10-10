@@ -272,7 +272,7 @@ test = [
 dev = [
     "cut-cross-entropy",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+    "dion @ git+https://github.com/microsoft/dion.git@7452a5823cf9655b93c3f1d8020b4ebb2535239b; platform_machine == 'x86_64' and platform_system != 'Darwin'",
 ]
 magi = [
     "magi_attention",
@@ -657,6 +657,7 @@ allowed-unresolved-imports = [
     "deep_ep",
     "deep_ep.**",
     "dion",
+    "dion.**",
     "fast_hadamard_transform",
     "ffpa_attn",
     "ffpa_attn.**",
