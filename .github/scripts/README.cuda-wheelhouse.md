@@ -1,9 +1,11 @@
 # CUDA installation coverage and wheelhouse trust
 
 `install-test.yml` runs the CUDA UV installation in `wheelhouse` mode by
-default. Dependency and build changes also enable `source` mode. A weekly
-Monday 04:17 UTC run and the manual `source-build` input provide clean-build
-coverage even when the most recent commit only changes documentation.
+default. Dependency and build changes also enable `source` mode. A daily
+2:00 AM Pacific (`America/Los_Angeles`) run and the manual `source-build` input
+provide clean-build coverage even when the most recent commit only changes
+documentation. GitHub adjusts for daylight saving time; on the spring-forward
+day, the nonexistent 2:00 AM advances to 3:00 AM.
 
 The source mode uses the normal UV project build settings, disables UV's cache,
 and forbids prebuilt distributions for the wheelhouse packages selected by the

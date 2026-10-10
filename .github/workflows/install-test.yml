@@ -7,7 +7,8 @@ on:
       - "pull-request/[0-9]+"
       - "deploy-release/*"
   schedule:
-    - cron: "17 4 * * 1"
+    - cron: "0 2 * * *"
+      timezone: America/Los_Angeles
   workflow_dispatch:
     inputs:
       source-build:
