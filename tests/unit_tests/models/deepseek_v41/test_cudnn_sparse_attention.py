@@ -63,7 +63,7 @@ def test_cudnn_branch_flattens_batches_into_global_coordinates(monkeypatch: pyte
     seen: dict = {}
 
     def fake_helper(q, kv_latent, topk_indices, softmax_scale, *, attn_sink, **kwargs):
-        seen.update(q=q, kv=kv_latent, idx=topk_indices, scale=softmax_scale, sink=attn_sink)
+        seen.update(q=q, kv=kv_latent, idx=topk_indices, scale=softmax_scale, sink=attn_sink, kwargs=kwargs)
         return torch.zeros(q.shape[0], q.shape[1], 512, dtype=q.dtype)
 
     import nemo_automodel.components.models.common.cudnn_sparse_attention as shared_cudnn
@@ -83,6 +83,9 @@ def test_cudnn_branch_flattens_batches_into_global_coordinates(monkeypatch: pyte
     expected = idx.clone().to(torch.int64)
     expected[1] = torch.where(expected[1] >= 0, expected[1] + kv_sequence, expected[1])
     torch.testing.assert_close(seen["idx"], expected.reshape(batch * sequence, 1, -1).to(torch.int32))
+    assert seen["kwargs"].get("all_rows_nonempty") is False  # default: the helper scans for empty rows
+    kernels.dsv4_sparse_attention(q, kv, sinks, idx, 0.25, backend="cudnn", all_rows_nonempty=True)
+    assert seen["kwargs"].get("all_rows_nonempty") is True  # the V4.1 layer passes it when there is no padding mask
 
 
 def test_cudnn_backend_requires_the_optional_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,8 +116,11 @@ def test_attention_accepts_cudnn_rejects_dropout_and_matches_eager(monkeypatch: 
     eager.load_state_dict(layer.state_dict())
     calls: list[str] = []
 
-    def reference_kernel(q, kv, sinks, topk_idxs, sm_scale, *, backend, reference_rounding=False):
+    def reference_kernel(
+        q, kv, sinks, topk_idxs, sm_scale, *, backend, reference_rounding=False, all_rows_nonempty=False
+    ):
         calls.append(backend)
+        assert all_rows_nonempty is True  # no padding mask: the layer tells the cuDNN backward every row is nonempty
         return kernels.sparse_attention_torch(q.float(), kv.float(), sinks, topk_idxs.long(), sm_scale).to(q.dtype)
 
     monkeypatch.setattr(attention_mod, "dsv4_sparse_attention", reference_kernel)

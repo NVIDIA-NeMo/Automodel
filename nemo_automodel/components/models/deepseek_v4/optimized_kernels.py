@@ -369,6 +369,7 @@ def dsv4_sparse_attention(
     *,
     backend: Dsv4SparseAttentionBackend,
     reference_rounding: bool = False,
+    all_rows_nonempty: bool = False,
 ) -> torch.Tensor:
     """Run sparse attention with an optional original-inference rounding mode.
 
@@ -388,7 +389,7 @@ def dsv4_sparse_attention(
     if backend == "cudnn":
         # cuDNN Frontend DSA kernels (FlashMLA forward when installed): one flat token axis, global K/V coordinates.
         # The kernels have their own rounding, so ``reference_rounding`` does not apply here.
-        return _dsv4_sparse_attention_cudnn(q, kv, sinks, topk_idxs, sm_scale)
+        return _dsv4_sparse_attention_cudnn(q, kv, sinks, topk_idxs, sm_scale, all_rows_nonempty=all_rows_nonempty)
     use_tilelang = _should_use_tilelang(
         backend,
         available=_HAS_MILES_SPARSE_ATTN,
@@ -437,6 +438,7 @@ def _dsv4_sparse_attention_cudnn(
     sinks: torch.Tensor,
     topk_idxs: torch.Tensor,
     sm_scale: float,
+    all_rows_nonempty: bool = False,
 ) -> torch.Tensor:
     """Run the shared cuDNN sparse attention on batched DSV4 tensors.
 
@@ -473,6 +475,7 @@ def _dsv4_sparse_attention_cudnn(
         kv.reshape(batch * kv_sequence, 1, head_dim).contiguous(),
         flat_idx,
         softmax_scale=sm_scale,
+        all_rows_nonempty=all_rows_nonempty,
         attn_sink=sinks.to(torch.float32).contiguous(),
     )
     return output.reshape(batch, sequence, heads, -1)

@@ -677,6 +677,9 @@ class DeepseekV41Attention(nn.Module):
                 self.head_dim**-0.5,
                 backend=self.backend.attn,
                 reference_rounding=True,
+                # Without a padding mask every query sees at least its own slot; the cuDNN backward then skips
+                # its empty-row scan (a torch.nonzero, one host synchronisation per layer per step).
+                all_rows_nonempty=attention_mask is None,
             )
             return DeepseekV41AttentionOutput(self._project_output(attended, angles, valid_tokens), next_state)
         # Dense masks are needed only by the eager/SDPA fallback; TileLang uses sparse indices.
