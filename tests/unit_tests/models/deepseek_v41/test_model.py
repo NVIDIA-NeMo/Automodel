@@ -482,3 +482,15 @@ def test_fsdp_initialization_preserves_local_storage_dtype_and_checkpoint_values
     tmp_path: Path, storage_dtype: torch.dtype
 ) -> None:
     mp.spawn(_fsdp_initialization_worker, args=(str(tmp_path / "rendezvous"), storage_dtype), nprocs=2, join=True)
+
+
+def test_model_validates_attention_inputs_once_before_the_layers() -> None:
+    """The model runs the host-synchronising position / mask checks once per forward and the layers skip them."""
+    model = _model()
+    input_ids = torch.randint(0, 17, (1, 4))
+    with pytest.raises(ValueError, match="zero-based"):
+        model(input_ids, position_ids=torch.tensor([[0, 1, 0, 1]]))
+    with pytest.raises(ValueError, match="right padding"):
+        model(input_ids, position_ids=torch.arange(4)[None], attention_mask=torch.tensor([[0, 1, 1, 1]]))
+    logits = model(input_ids, position_ids=torch.arange(4)[None]).logits
+    assert logits.shape == (1, 4, 17)
