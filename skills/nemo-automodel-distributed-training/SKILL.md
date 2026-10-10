@@ -392,6 +392,11 @@ distributed:
     wrap_outer_model: true
 ```
 
+`activation_checkpointing: moe` (expert-parallel FSDP2 only, needs
+`ignore_router_for_ac: true`) checkpoints just each decoder block's MoE
+sub-block and keeps attention / linear-attention / residual-mixing
+activations: less recompute for more activation memory.
+
 The `moe` sub-section maps to `MoEParallelizerConfig` and is only
 instantiated when `ep_size > 1`.
 
