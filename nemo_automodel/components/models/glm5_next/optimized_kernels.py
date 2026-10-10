@@ -90,6 +90,12 @@ def norm_core(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> 
     return weight * states.to(hidden_states.dtype)
 
 
+def gated_norm_core(hidden_states: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Normalize and sigmoid-gate KDA output, preserving eager cast boundaries."""
+    return norm_core(hidden_states, weight, eps) * torch.sigmoid(gate.float()).to(hidden_states.dtype)
+
+
+GatedNormCore = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, float], torch.Tensor]
 ProjectionCore = Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]
 CollapseCore = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 ExpandCore = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
@@ -119,3 +125,11 @@ def rms_norm_core(compiled: bool) -> NormCore:
     if not compiled:
         return norm_core
     return torch.compile(norm_core, dynamic=False, options=_COMPILE_OPTIONS)
+
+
+@cache
+def rms_norm_gated_core(compiled: bool) -> GatedNormCore:
+    """Select the KDA gated norm core with the same cast policy as decoder norms."""
+    if not compiled:
+        return gated_norm_core
+    return torch.compile(gated_norm_core, dynamic=False, options=_COMPILE_OPTIONS)

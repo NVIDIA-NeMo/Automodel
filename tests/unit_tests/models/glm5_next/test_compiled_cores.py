@@ -111,7 +111,8 @@ def test_compile_dispatch_is_instance_local_and_preserves_state(
     """
     optimized_kernels.hc_cores.cache_clear()
     optimized_kernels.rms_norm_core.cache_clear()
-    calls = {name: 0 for name in ("project_core", "collapse_core", "expand_core", "norm_core")}
+    optimized_kernels.rms_norm_gated_core.cache_clear()
+    calls = {name: 0 for name in ("project_core", "collapse_core", "expand_core", "norm_core", "gated_norm_core")}
     compiled_names = []
 
     def fake_compile(function, **kwargs):
@@ -149,7 +150,7 @@ def test_compile_dispatch_is_instance_local_and_preserves_state(
         if compile_hc:
             expected_compiled.update(("project_core", "collapse_core", "expand_core"))
         if compile_norm:
-            expected_compiled.add("norm_core")
+            expected_compiled.update(("norm_core", "gated_norm_core"))
         assert set(compiled_names) == expected_compiled
         assert len(compiled_names) == len(expected_compiled)
         input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
@@ -170,6 +171,37 @@ def test_compile_dispatch_is_instance_local_and_preserves_state(
         assert calls["collapse_core"] == (8 if compile_hc else 0)
         assert calls["expand_core"] == (8 if compile_hc else 0)
         assert calls["norm_core"] == (9 if compile_norm else 0)
+        assert calls["gated_norm_core"] == (3 if compile_norm else 0)
     finally:
         optimized_kernels.hc_cores.cache_clear()
         optimized_kernels.rms_norm_core.cache_clear()
+        optimized_kernels.rms_norm_gated_core.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA compilation requires a GPU")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(1, 17, 4, 128), (1, 4096, 64, 128)])
+def test_compiled_gated_norm_cuda_forward_and_backward(dtype: torch.dtype, shape: tuple[int, ...]) -> None:
+    """Exercise the actual compiled core against independent eager arithmetic."""
+    torch.manual_seed(641)
+    hidden = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
+    gate = (torch.randn(shape, device="cuda", dtype=dtype) * 4).requires_grad_()
+    weight = (torch.rand(shape[-1], device="cuda", dtype=dtype) + 0.5).requires_grad_()
+    states = hidden.float()
+    normalized = (states * torch.rsqrt(states.square().mean(-1, keepdim=True) + 1e-5)).to(dtype)
+    expected = (weight * normalized) * torch.sigmoid(gate.float()).to(dtype)
+    actual = optimized_kernels.rms_norm_gated_core(True)(hidden, gate, weight, 1e-5)
+    upstream = torch.randn_like(hidden)
+    expected_grads = torch.autograd.grad(expected, (hidden, gate, weight), upstream)
+    actual_grads = torch.autograd.grad(actual, (hidden, gate, weight), upstream)
+    pairs = [(actual, expected), *zip(actual_grads, expected_grads)]
+    for observed, reference in pairs:
+        assert torch.isfinite(observed).all()
+        if dtype == torch.float32:
+            torch.testing.assert_close(observed, reference, rtol=1e-4, atol=2e-3)
+        else:
+            relative_rms = (
+                observed.float() - reference.float()
+            ).square().mean().sqrt() / reference.float().square().mean().sqrt().clamp_min(1e-7)
+            assert relative_rms < 0.005
+            torch.testing.assert_close(observed, reference, rtol=0.02, atol=0.02)

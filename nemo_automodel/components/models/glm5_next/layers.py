@@ -33,7 +33,7 @@ from nemo_automodel.components.models.glm5_next.cp import (
     all_gather_sequence,
     build_fla_cp_context,
 )
-from nemo_automodel.components.models.glm5_next.optimized_kernels import hc_cores, rms_norm_core
+from nemo_automodel.components.models.glm5_next.optimized_kernels import hc_cores, rms_norm_core, rms_norm_gated_core
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.shared.import_utils import safe_import_from
@@ -221,19 +221,23 @@ class _TorchShortConvolution(nn.Module):
 
 
 class _TorchRMSNormGated(Glm5NextRMSNorm):
-    """CPU fallback for FLA's gated per-head RMSNorm."""
+    """Gated per-head RMSNorm with optional model-owned compilation."""
+
+    def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype, *, compile_norm: bool = False) -> None:
+        super().__init__(hidden_size, eps, dtype)
+        self._gated_norm_core = rms_norm_gated_core(compile_norm)
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Normalize ``[batch, sequence, heads, head_dim]`` then sigmoid-gate it."""
-        return super().forward(hidden_states) * torch.sigmoid(gate.float()).to(hidden_states.dtype)
+        return self._gated_norm_core(hidden_states, gate, self.weight, self.variance_epsilon)
 
 
 def _short_conv(hidden_size: int, kernel_size: int, dtype: torch.dtype) -> nn.Module:
     return _TorchShortConvolution(hidden_size, kernel_size, dtype)
 
 
-def _rms_norm_gated(hidden_size: int, eps: float, dtype: torch.dtype) -> nn.Module:
-    return _TorchRMSNormGated(hidden_size, eps, dtype)
+def _rms_norm_gated(hidden_size: int, eps: float, dtype: torch.dtype, *, compile_norm: bool = False) -> nn.Module:
+    return _TorchRMSNormGated(hidden_size, eps, dtype, compile_norm=compile_norm)
 
 
 class Glm5NextKDAFp32Params(nn.Module):
@@ -295,7 +299,7 @@ def _torch_recurrent_kda(
 class Glm5NextLinearAttention(nn.Module):
     """Kimi Delta Attention with released GLM-5.3 checkpoint parameter names."""
 
-    def __init__(self, config: Glm5NextTextConfig, layer_idx: int) -> None:
+    def __init__(self, config: Glm5NextTextConfig, layer_idx: int, *, compile_norm: bool = False) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -317,7 +321,7 @@ class Glm5NextLinearAttention(nn.Module):
         self.b_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False, dtype=dtype)
         self.g_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=dtype)
         self.g_b_proj = nn.Linear(self.head_dim, self.projection_size, bias=False, dtype=dtype)
-        self.o_norm = _rms_norm_gated(self.head_dim, config.rms_norm_eps, dtype)
+        self.o_norm = _rms_norm_gated(self.head_dim, config.rms_norm_eps, dtype, compile_norm=compile_norm)
         self.o_proj = nn.Linear(self.projection_size, config.hidden_size, bias=False, dtype=dtype)
         self._cp_mesh = None
 
@@ -878,7 +882,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.is_linear_attn = self.block_type == "linear_attention"
         self.is_moe_layer = config.mlp_layer_types[layer_idx] == "sparse"
         self.self_attn = (
-            Glm5NextLinearAttention(config, layer_idx)
+            Glm5NextLinearAttention(config, layer_idx, compile_norm=backend.compile_norm)
             if self.is_linear_attn
             else Glm5NextSparseAttention(config, layer_idx, backend)
         )
