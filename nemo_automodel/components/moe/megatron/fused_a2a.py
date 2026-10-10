@@ -22,9 +22,9 @@ import logging
 import os
 import shutil
 import tempfile
-import threading
 import time
-from contextlib import contextmanager
+
+from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
 
 try:
     from deep_ep import Buffer
@@ -52,67 +52,12 @@ except ImportError:
 # Recording is scoped to one checkpoint frame: the AC wrapper builds a recorder
 # per checkpointed call, the forward appends each dispatch's handle and routing
 # metadata in call order, and the recompute consumes them in the same order.
-# Only the handle and the (small) per-token routing metadata are retained --
-# the dispatched activations themselves are still re-communicated, so the
-# memory that activation checkpointing saves is preserved.
-class DispatchReplayRecorder:
-    """Per-checkpoint-frame log of DeepEP dispatch results, replayed on recompute."""
-
-    def __init__(self) -> None:
-        self._records: list = []
-        self._cursor = 0
-        self.replay_misses = 0
-
-    def record(self, entry) -> None:
-        self._records.append(entry)
-
-    def take(self):
-        """Next recorded dispatch, or None when the replay outruns the log."""
-        if self._cursor >= len(self._records):
-            # Recompute issued more dispatches than the forward did. Fall back to
-            # a full dispatch rather than replaying a mismatched layout.
-            self.replay_misses += 1
-            return None
-        entry = self._records[self._cursor]
-        self._cursor += 1
-        return entry
-
-    def rewind(self) -> None:
-        self._cursor = 0
-
-
-class _DispatchReplayState(threading.local):
-    """Thread-local replay binding. ``threading.local`` runs ``__init__`` once per
-    thread, so both attributes always exist on every thread that touches it."""
-
-    def __init__(self) -> None:
-        self.recorder: DispatchReplayRecorder | None = None
-        self.mode: str | None = None
-
-
-_dispatch_replay_state = _DispatchReplayState()
-
-
-def _replay_mode() -> str | None:
-    return _dispatch_replay_state.mode
-
-
-def _active_recorder() -> "DispatchReplayRecorder | None":
-    return _dispatch_replay_state.recorder
-
-
-@contextmanager
-def dispatch_replay_scope(recorder: "DispatchReplayRecorder | None", mode: str):
-    """Bind ``recorder`` for the enclosed region. ``mode`` is 'record' or 'replay'."""
-    prev_recorder = _dispatch_replay_state.recorder
-    prev_mode = _dispatch_replay_state.mode
-    _dispatch_replay_state.recorder = recorder
-    _dispatch_replay_state.mode = mode if recorder is not None else None
-    try:
-        yield
-    finally:
-        _dispatch_replay_state.recorder = prev_recorder
-        _dispatch_replay_state.mode = prev_mode
+# Checkpoint-recompute replay of DeepEP dispatch layouts. Entries are
+# (handle, recv_token_indices, recv_token_probs, tokens_per_expert): only the
+# handle and the (small) per-token routing metadata are retained -- the
+# dispatched activations themselves are still re-communicated, so the memory
+# that activation checkpointing saves is preserved.
+deepep_dispatch_replay: RecomputeReplay[tuple] = RecomputeReplay("DeepEP dispatch")
 
 
 try:
@@ -139,64 +84,23 @@ _uccl_buffer = None
 logger = logging.getLogger(__name__)
 
 
-class HybridEPDispatchReplayRecorder:
-    """Record HybridEP layouts from checkpoint forward for deterministic replay."""
-
-    def __init__(self) -> None:
-        self._records: list = []
-        self._cursor = 0
-        self.replay_misses = 0
-
-    def record(self, handle, tokens_per_expert) -> None:
-        self._records.append([handle, tokens_per_expert, None])
-
-    def finalize(self) -> None:
-        """Cache each layout extent after the checkpoint-forward op context exits."""
-        for entry in self._records:
-            if entry[2] is None:
-                # HybridEP's sync-free replay API expects a host integer.  Do
-                # both the reduction and device-to-host scalar conversion only
-                # after the selective-checkpoint context exits; otherwise the
-                # replay-only conversion adds aten._local_scalar_dense to the
-                # recompute trace.
-                entry[2] = int(entry[1].sum().item())
-
-    def take(self):
-        """Return the next forward dispatch record, or ``None`` on divergence."""
-        if self._cursor >= len(self._records):
-            self.replay_misses += 1
-            return None
-        entry = self._records[self._cursor]
-        self._cursor += 1
-        return entry
-
-    def rewind(self) -> None:
-        self._cursor = 0
+# Checkpoint-recompute replay of HybridEP dispatch layouts. Entries are
+# [handle, tokens_per_expert, num_permuted_tokens]; the last slot is filled by
+# finalize_hybridep_dispatch_records after the checkpoint-forward op context exits.
+hybridep_dispatch_replay: RecomputeReplay[list] = RecomputeReplay("HybridEP dispatch")
 
 
-class _HybridEPDispatchReplayState(threading.local):
-    def __init__(self) -> None:
-        self.recorder: HybridEPDispatchReplayRecorder | None = None
-        self.mode: str | None = None
+def finalize_hybridep_dispatch_records(recorder: RecomputeReplayRecorder[list]) -> None:
+    """Cache each recorded layout's receive extent as a host integer.
 
-
-_hybridep_dispatch_replay_state = _HybridEPDispatchReplayState()
-
-
-@contextmanager
-def hybridep_dispatch_replay_scope(recorder: HybridEPDispatchReplayRecorder | None, mode: str):
-    """Bind a HybridEP dispatch recorder for checkpoint forward or recompute."""
-    if mode not in ("record", "replay"):
-        raise ValueError(f"Unsupported HybridEP dispatch replay mode: {mode}")
-    previous_recorder = _hybridep_dispatch_replay_state.recorder
-    previous_mode = _hybridep_dispatch_replay_state.mode
-    _hybridep_dispatch_replay_state.recorder = recorder
-    _hybridep_dispatch_replay_state.mode = mode if recorder is not None else None
-    try:
-        yield
-    finally:
-        _hybridep_dispatch_replay_state.recorder = previous_recorder
-        _hybridep_dispatch_replay_state.mode = previous_mode
+    HybridEP's sync-free replay API expects a host integer. Both the reduction and
+    the device-to-host scalar conversion run only after the selective-checkpoint
+    context exits; otherwise the replay-only conversion would add
+    ``aten._local_scalar_dense`` to the recompute trace.
+    """
+    for entry in recorder.records:
+        if entry[2] is None:
+            entry[2] = int(entry[1].sum().item())
 
 
 def _is_nvshmem_available() -> bool:
@@ -309,9 +213,9 @@ class FusedDispatch(torch.autograd.Function):
         # Activation-checkpoint replay: reuse the layout this dispatch computed
         # on the original forward instead of recomputing it. Cached-mode dispatch
         # returns only recv_x, so the routing metadata comes from the record.
-        recorder = _active_recorder()
-        if recorder is not None and _replay_mode() == "replay":
-            replayed = recorder.take()
+        replay = deepep_dispatch_replay.current()
+        if replay is not None and replay[1] == "replay":
+            replayed = replay[0].take()
             if replayed is not None:
                 cached_handle, recv_token_indices, recv_token_probs, tokens_per_expert = replayed
                 recv_x, _, _, _, _, after_event_overlap = buffer.dispatch(
@@ -378,10 +282,10 @@ class FusedDispatch(torch.autograd.Function):
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
 
-        if recorder is not None and _replay_mode() == "record":
+        if replay is not None and replay[1] == "record":
             # Keep the handle and routing metadata (small) so the recompute can
             # skip the layout exchange; recv_x is deliberately not retained.
-            recorder.record((handle, recv_token_indices, recv_token_probs, tokens_per_expert))
+            replay[0].record((handle, recv_token_indices, recv_token_probs, tokens_per_expert))
 
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
 
@@ -777,9 +681,9 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_unpermute,
             )
 
-        recorder = _hybridep_dispatch_replay_state.recorder
-        if recorder is not None and _hybridep_dispatch_replay_state.mode == "replay":
-            replayed = recorder.take()
+        replay = hybridep_dispatch_replay.current()
+        if replay is not None and replay[1] == "replay":
+            replayed = replay[0].take()
             if replayed is not None:
                 handle, tokens_per_expert, num_permuted_tokens = replayed
                 replayed_outputs = _hybrid_ep_buffer.dispatch_with_permute(
@@ -834,10 +738,11 @@ class HybridEPDispatch(torch.autograd.Function):
             logger.info(
                 "HybridEP first dispatch (buffer init + kernel JIT + call): %.1f s", time.perf_counter() - t_first
             )
-        if recorder is not None and _hybridep_dispatch_replay_state.mode == "record":
-            # Keep only the reusable layout and its output extent. Recomputed
-            # activations and probabilities are still redispatched through it.
-            recorder.record(handle, tokens_per_expert)
+        if replay is not None and replay[1] == "record":
+            # Keep only the reusable layout; its output extent is cached by
+            # finalize_hybridep_dispatch_records once the op context exits.
+            # Recomputed activations and probabilities are still redispatched through it.
+            replay[0].record([handle, tokens_per_expert, None])
         return (
             dispatched_hidden,
             dispatched_probs,

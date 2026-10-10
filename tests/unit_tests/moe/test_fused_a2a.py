@@ -31,8 +31,6 @@ def _restore_buffer():
     saved_hybridep = fused_a2a._hybrid_ep_buffer
     saved_hybridep_signature = fused_a2a._hybrid_ep_runtime_signature
     saved_hybridep_capacity = fused_a2a._hybrid_ep_initialized_capacity
-    saved_recorder = fused_a2a._hybridep_dispatch_replay_state.recorder
-    saved_mode = fused_a2a._hybridep_dispatch_replay_state.mode
     try:
         yield
     finally:
@@ -40,8 +38,6 @@ def _restore_buffer():
         fused_a2a._hybrid_ep_buffer = saved_hybridep
         fused_a2a._hybrid_ep_runtime_signature = saved_hybridep_signature
         fused_a2a._hybrid_ep_initialized_capacity = saved_hybridep_capacity
-        fused_a2a._hybridep_dispatch_replay_state.recorder = saved_recorder
-        fused_a2a._hybridep_dispatch_replay_state.mode = saved_mode
 
 
 def test_free_buffer_destroys_and_clears():

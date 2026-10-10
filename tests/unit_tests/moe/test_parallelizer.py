@@ -14,7 +14,7 @@
 
 import sys
 import types
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -500,25 +500,15 @@ def _import_parallelizer_with_stubs(monkeypatch):
         activation_checkpointing_stub,
     )
 
-    # apply_ac wraps each block's context in the DeepEP dispatch-replay recorder,
+    # apply_ac wraps each block's context in the DeepEP dispatch-replay channel,
     # which imports fused_a2a lazily. Stub it so this module does not depend on
     # some earlier test having imported it under the real torch.
+    from nemo_automodel.shared.recompute_replay import RecomputeReplay
+
     fused_a2a_stub = types.ModuleType("nemo_automodel.components.moe.megatron.fused_a2a")
-
-    class _StubDispatchReplayRecorder:
-        def __init__(self):
-            self.replay_misses = 0
-            self.rewind_count = 0
-
-        def rewind(self):
-            self.rewind_count += 1
-
-    @contextmanager
-    def _stub_dispatch_replay_scope(recorder, mode):
-        yield
-
-    fused_a2a_stub.DispatchReplayRecorder = _StubDispatchReplayRecorder
-    fused_a2a_stub.dispatch_replay_scope = _stub_dispatch_replay_scope
+    fused_a2a_stub.deepep_dispatch_replay = RecomputeReplay("DeepEP dispatch (stub)")
+    fused_a2a_stub.hybridep_dispatch_replay = RecomputeReplay("HybridEP dispatch (stub)")
+    fused_a2a_stub.finalize_hybridep_dispatch_records = lambda recorder: None
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.moe.megatron.fused_a2a",
