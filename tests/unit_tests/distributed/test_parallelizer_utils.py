@@ -311,3 +311,38 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
     # Expect all three subtrees to be individually sharded
     # Note: the 'b' subtree should be sharded as a whole since it is uniform float16
     assert set(sub_calls) == {model.a, model.b, model.c}
+
+
+def test_explicit_storage_compute_groups_preserve_master_and_holder_precision(monkeypatch):
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    model = nn.Module()
+    model.master = nn.Linear(2, 2, bias=False).float()
+    model.frozen = nn.Linear(2, 2, bias=False).bfloat16()
+    model.frozen.register_buffer("e_score_correction_bias", torch.ones(2, dtype=torch.float32))
+    model.holder = nn.Linear(2, 2, bias=False).float()
+    model.experts = nn.Linear(2, 2, bias=False).bfloat16()
+    ignored = set(model.experts.parameters())
+    holder_ids = {id(parameter) for parameter in model.holder.parameters()}
+    calls = []
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard",
+        lambda target, **kwargs: calls.append((target, kwargs)),
+    )
+    fully_shard_by_dtype(
+        model, mesh=object(),
+        mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
+        offload_policy=None, reshard_after_forward=True, ignored_params=ignored,
+        compute_dtype_of=lambda tensor: torch.float32 if id(tensor) in holder_ids else torch.bfloat16,
+    )
+    assert {id(target) for target, _ in calls} == {id(model.master), id(model.frozen), id(model.holder)}
+    for target, kwargs in calls:
+        expected = torch.float32 if target is model.holder else torch.bfloat16
+        assert kwargs["mp_policy"].param_dtype == expected
+        assert kwargs["mp_policy"].reduce_dtype == torch.float32
+        if target is model.holder:
+            assert kwargs["mp_policy"].output_dtype == torch.float32
+        assert kwargs["reshard_after_forward"] is True
+        assert kwargs["ignored_params"] == ignored
+    assert model.master.weight.dtype == torch.float32
+    assert model.frozen.weight.dtype == torch.bfloat16

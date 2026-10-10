@@ -30,6 +30,7 @@ from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
+from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
     MoE,
@@ -229,6 +230,27 @@ def apply_fsdp(
         _model = model
     # handle VLM
     _model = get_text_module(_model)
+
+    # Keep native Nemotron's intrinsic FP32 holders separate from selected
+    # FP32 masters (BF16 compute) and frozen BF16 parameters.
+    protected = tuple(getattr(model, "_keep_in_fp32_modules_strict", ()))
+    if "_fp32_params" in protected:
+        pinned_ids = {
+            id(tensor) for name, tensor in (*model.named_parameters(), *model.named_buffers())
+            if any(token in name for token in protected)
+        }
+        policy_dtype = mp_policy.param_dtype
+
+        def compute_dtype(tensor):
+            return torch.float32 if id(tensor) in pinned_ids else policy_dtype
+
+        def fully_shard_default(target, ignored_params=None):
+            fully_shard_by_dtype(
+                target, mesh=fsdp_mesh, mp_policy=mp_policy,
+                offload_policy=offload_policy, compute_dtype_of=compute_dtype,
+                ignored_params=ignored_params,
+                reshard_after_forward=reshard_after_forward,
+            )
 
     for block in _iter_moe_blocks(model, _model):
         moe_module = block.moe if hasattr(block, "moe") else block.mlp

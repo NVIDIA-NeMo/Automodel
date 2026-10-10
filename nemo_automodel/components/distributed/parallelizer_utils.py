@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import copy
+
 from typing import Callable, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
@@ -29,6 +31,7 @@ def iter_maximal_uniform_dtype_subtrees(
     include_buffers: bool = True,
     tensor_pred: Optional[Callable[[torch.Tensor], bool]] = None,
     return_paths: bool = False,
+    dtype_of: Optional[Callable[[torch.Tensor], object]] = None,
 ) -> Iterator[UniformSubtreeItem]:
     """
     Traverse `module` and yield maximal submodules whose entire subtree has a unified dtype.
@@ -45,15 +48,17 @@ def iter_maximal_uniform_dtype_subtrees(
     if tensor_pred is None:
         tensor_pred = lambda t: True
 
+    dtype_of = dtype_of or (lambda tensor: tensor.dtype)
+
     def _local_dtype_set(m: nn.Module) -> Set[torch.dtype]:
         ds: Set[torch.dtype] = set()
         for p in m.parameters(recurse=False):
             if tensor_pred(p):
-                ds.add(p.dtype)
+                ds.add(dtype_of(p))
         if include_buffers:
             for b in m.buffers(recurse=False):
                 if tensor_pred(b):
-                    ds.add(b.dtype)
+                    ds.add(dtype_of(b))
         return ds
 
     def _visit(m: nn.Module, path: Tuple[str, ...]) -> Tuple[Set[torch.dtype], List[UniformSubtreeItem]]:
@@ -109,7 +114,15 @@ def _fully_shard(module, mesh, mp_policy, offload_policy):
         fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
 
 
-def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
+def fully_shard_by_dtype(
+    module, mesh, mp_policy, offload_policy, *,
+    compute_dtype_of=None, ignored_params=None, reshard_after_forward=None,
+):
+    if compute_dtype_of is not None:
+        return _fully_shard_storage_and_compute_dtypes(
+            module, mesh, mp_policy, offload_policy, compute_dtype_of,
+            ignored_params, reshard_after_forward,
+        )
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.
     grouped_params = _group_params_by_dtype(module)
@@ -133,3 +146,50 @@ def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
                 )
         if len(grouped_params) == 2:
             fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+
+
+def _fully_shard_storage_and_compute_dtypes(
+    module, mesh, mp_policy, offload_policy, compute_dtype_of,
+    ignored_params, reshard_after_forward,
+):
+    """Separate storage and compute groups, following public upstream 4bdfc405.
+
+    Explicit compute resolution lets FP32 master parameters compute in BF16
+    while intrinsic FP32 holders compute in FP32. Expert-parallel parameters
+    already distributed outside FSDP remain excluded from every group.
+    """
+    ignored = set() if ignored_params is None else set(ignored_params)
+    predicate = lambda tensor: torch.is_floating_point(tensor) and tensor not in ignored
+    group_key = lambda tensor: (tensor.dtype, compute_dtype_of(tensor))
+    groups = {}
+    for parameter in module.parameters():
+        if parameter not in ignored:
+            groups.setdefault(group_key(parameter), []).append(parameter)
+    if not groups:
+        return
+
+    def shard(target, key):
+        policy = copy(mp_policy)
+        object.__setattr__(policy, "param_dtype", key[1])
+        if key[1] == torch.float32:
+            object.__setattr__(policy, "output_dtype", torch.float32)
+        fully_shard(
+            target, mesh=mesh, mp_policy=policy, offload_policy=offload_policy,
+            reshard_after_forward=reshard_after_forward, ignored_params=ignored,
+        )
+
+    if len(groups) == 1:
+        shard(module, next(iter(groups)))
+        return
+    minority = min(groups, key=lambda key: len(groups[key]))
+    for path, subtree, key in iter_maximal_uniform_dtype_subtrees(
+        module, tensor_pred=predicate, dtype_of=group_key, return_paths=True, include_buffers=False,
+    ):
+        if len(groups) > 2 or key == minority:
+            if isinstance(subtree, nn.ModuleList):
+                for layer in subtree:
+                    shard(layer, key)
+            else:
+                shard(subtree, key)
+    if len(groups) == 2:
+        shard(module, next(key for key in groups if key != minority))
