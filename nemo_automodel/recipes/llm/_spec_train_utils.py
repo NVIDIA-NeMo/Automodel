@@ -14,10 +14,11 @@
 
 """Shared training-loop utilities for the speculative-decoding recipes.
 
-EAGLE-1/2, EAGLE-3, and DFlash all hand-roll the same gradient-accumulation
-bookkeeping (ceil optimizer-steps-per-epoch and the DDP ``no_sync`` skip) and the
-same warmup + cosine LR schedule. Centralizing them here keeps the recipes from
-drifting apart when one is fixed and the others are missed.
+EAGLE-1/2, EAGLE-3, DFlash, and DSpark all hand-roll the same gradient-accumulation
+bookkeeping (ceil optimizer-steps-per-epoch and the DDP ``no_sync`` skip), the
+same warmup + cosine LR schedule, and the same sequence-packing and metric
+reduction helpers. Centralizing them here keeps the recipes from drifting apart
+when one is fixed and the others are missed.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ import math
 from collections.abc import Callable
 from typing import Any
 
+import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from nemo_automodel.components.distributed.activation_checkpointing import (
@@ -34,11 +37,91 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     apply_submodule_checkpointing,
     is_selective_activation_checkpointing,
 )
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.utils.compile_utils import build_compile_config, compile_module_inplace
 from nemo_automodel.recipes._dist_utils import _normalize_activation_checkpointing
 
 logger = logging.getLogger(__name__)
+
+
+def all_reduce_sum(value: torch.Tensor) -> torch.Tensor:
+    """Sum a metric tensor across all ranks in place (no-op without a process group)."""
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    return value
+
+
+def all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
+    """Average a metric tensor across all ranks (no-op without a process group)."""
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        value = value / dist.get_world_size()
+    return value
+
+
+def submesh_or_none(device_mesh, name: str):
+    """Return the named (flattened) submesh, or None if absent / no mesh.
+
+    Uses ``get_flat_mesh`` so ``_flatten()``-created axes ("dp") resolve across
+    torch versions. The "dp" axis excludes "tp", so keying the draft DDP group,
+    the dataloader sampler, and the checkpointer dp_rank on it replicates the
+    draft across tensor-parallel ranks (every TP rank in a draft replica sees the
+    same batch).
+    """
+    if device_mesh is None:
+        return None
+    try:
+        return get_flat_mesh(device_mesh, name)
+    except KeyError:
+        return None
+
+
+def packing_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Sequence-packing metadata from a dataloader batch (empty dict when unpacked).
+
+    The packed loader (``packed_sequence_size > 0``) emits ``position_ids`` /
+    ``seq_lens`` / ``doc_remaining`` alongside ``input_ids``; the default loader
+    does not. Keyed on ``seq_lens`` so the caller can splat the result into the
+    target wrapper's ``generate_batch`` unconditionally.
+    """
+    if "seq_lens" not in batch:
+        return {}
+    return {
+        "position_ids": batch["position_ids"],
+        "seq_lens": batch["seq_lens"],
+        "doc_remaining": batch["doc_remaining"],
+    }
+
+
+def validate_packing_gates(*, method: str, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
+    """Reject sequence-packing configs a draft recipe cannot honor (fail fast at setup).
+
+    - Context parallelism shards the sequence and strips the block-causal mask
+      packing relies on, so ``cp_size > 1`` with packing would silently train on
+      wrong supervision.
+    - A FlashAttention target infers document boundaries from per-document
+      ``position_ids``, which transformers packs only at batch size 1.
+
+    Args:
+        method: Recipe name echoed in the error message (e.g. ``"DFlash"``).
+        cp_size: Configured context-parallel size.
+        target_attn_impl: Attention implementation the target is loaded with.
+        micro_batch_size: Per-rank micro-batch size.
+    """
+    if cp_size > 1:
+        raise NotImplementedError(
+            "Sequence packing (packed_sequence_size>0) is not supported with context parallelism "
+            f"(distributed.cp_size>1) in {method}; CP shards the sequence and strips the block-causal mask "
+            "packing relies on. Set cp_size=1 or packed_sequence_size=0."
+        )
+    if "flash" in target_attn_impl and micro_batch_size > 1:
+        raise ValueError(
+            "Sequence packing with a FlashAttention target requires micro_batch_size=1 "
+            f"(got {micro_batch_size}); FlashAttention infers document boundaries from per-document "
+            "position_ids, which transformers packs only at batch size 1. Set micro_batch_size=1 or "
+            "load the target with attn_implementation='sdpa'."
+        )
 
 
 def apply_draft_fp8(draft_model: nn.Module, cfg_fp8: Any) -> None:
@@ -167,6 +250,56 @@ def should_sync_grads(
     closes_window = pending_micro_batches + 1 == grad_accumulation_steps
     is_last_batch = batch_idx == batches_per_epoch - 1
     return closes_window or is_last_batch
+
+
+def check_resumed_mask_token_id(meta: dict, mask_token_id: int, ckpt_dir: str) -> None:
+    """Fail loudly when a resume YAML's ``mask_token_id`` disagrees with the checkpoint's.
+
+    ``mask_token_id`` comes only from the resume YAML (it is not restored from the
+    checkpoint); the draft's ``embed_tokens`` row at that id is the learned
+    "predict here" signal and the inference runtime fills block slots with the
+    same id. A mismatch silently points the mask slots at an untrained embedding
+    row and degrades acceptance with no error. Legacy checkpoints saved before
+    this field existed (``None``) skip the check.
+    """
+    saved_mask_token_id = meta.get("mask_token_id", None)
+    if saved_mask_token_id is not None and int(saved_mask_token_id) != int(mask_token_id):
+        raise ValueError(
+            f"mask_token_id mismatch on resume: the checkpoint at {ckpt_dir} was trained with "
+            f"mask_token_id={int(saved_mask_token_id)}, but recipe_args.mask_token_id="
+            f"{int(mask_token_id)}. The draft's mask-slot embedding was learned at the "
+            f"checkpoint's id; set recipe_args.mask_token_id={int(saved_mask_token_id)} to resume."
+        )
+
+
+def resolve_wandb_kwargs(wandb_cfg: dict) -> dict | None:
+    """Convert a ``wandb:`` config block into ``wandb.init`` kwargs, or ``None``.
+
+    ``enable`` is the examples' documentation-only opt-in flag (W&B logging is
+    opt-in: example configs ship the block with ``enable: false`` so users start
+    logging by flipping it to ``true`` instead of commenting the block in/out);
+    it is not a real ``wandb.init`` kwarg, so strip it before forwarding the rest
+    (passing it through raises ``TypeError: init() got an unexpected keyword
+    argument 'enable'``). Returns ``None`` when ``enable`` is explicitly ``False``.
+    """
+    kwargs = dict(wandb_cfg)
+    if kwargs.pop("enable", True) is False:
+        return None
+    return kwargs
+
+
+def resolve_warmup_steps(warmup_ratio: float, total_optim_steps: int, min_warmup_steps: int = 1) -> int:
+    """Return the LR warmup length in optimizer steps.
+
+    ``warmup_ratio * total_optim_steps`` collapses to a handful of steps (or fewer)
+    on short / small-dataset runs, dropping a freshly-initialized draft to near-peak
+    LR within the first few optimizer steps, a reliable way to trigger an early loss
+    spike. Floor the ratio-derived step count at ``min_warmup_steps`` unless the
+    caller explicitly opts out of warmup with ``warmup_ratio<=0`` (e.g. a smoke config).
+    """
+    if warmup_ratio <= 0:
+        return 1
+    return max(min_warmup_steps, int(warmup_ratio * total_optim_steps))
 
 
 def make_warmup_cosine_schedule(
