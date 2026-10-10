@@ -576,3 +576,43 @@ jobs:
               gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
               exit 1
           fi
+
+  notify-scheduled-failure:
+    name: Notify teams of scheduled installation failure
+    needs: [install-test-summary]
+    if: ${{ always() && !cancelled() && github.event_name == 'schedule' && needs.install-test-summary.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the scheduled failure issue
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const marker = '<!-- automodel-scheduled-installation-failure -->';
+            const title = 'Daily CUDA installation test failed';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/attempts/${process.env.GITHUB_RUN_ATTEMPT}`;
+            const body = [
+              marker,
+              '@NVIDIA-NeMo/automation @NVIDIA-NeMo/core-am',
+              '',
+              `The daily Installation Test workflow failed: [view run and logs](${runUrl}).`,
+              `Commit: ${context.sha}`,
+              '',
+              'Inspect the failed jobs for source-build, wheelhouse verification, or installation errors. This alert does not invalidate the CUDA wheelhouse cache.'
+            ].join('\n');
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo,
+              state: 'open',
+              creator: 'github-actions[bot]',
+              per_page: 100
+            });
+            const existing = issues.find(issue => !issue.pull_request && issue.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: existing.number, body
+              });
+            } else {
+              await github.rest.issues.create({ ...context.repo, title, body });
+            }

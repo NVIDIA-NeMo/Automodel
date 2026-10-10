@@ -7,6 +7,14 @@ provide clean-build coverage even when the most recent commit only changes
 documentation. GitHub adjusts for daylight saving time; on the spring-forward
 day, the nonexistent 2:00 AM advances to 3:00 AM.
 
+If the scheduled workflow fails, a notification job opens a GitHub issue
+mentioning `@NVIDIA-NeMo/automation` and `@NVIDIA-NeMo/core-am`, with the failed
+run and commit. Further failures comment on the existing open alert issue;
+after it is closed, a later failure opens a new one. Successful, cancelled,
+push, and manual runs do not send these alerts. Team mention notifications
+must be enabled in each team's GitHub settings. Alerts do not delete or
+invalidate cached wheels.
+
 The source mode uses the normal UV project build settings, disables UV's cache,
 and forbids prebuilt distributions for the wheelhouse packages selected by the
 existing `all` extra. It also disables Mamba and causal-conv1d's own release-wheel
