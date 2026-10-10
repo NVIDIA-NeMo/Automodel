@@ -1096,7 +1096,7 @@ def test_response_only_hidden_states_match_dense_logits_and_keep_mtp():
 
     config = MockNemotronV3Config(torch_dtype="float32", num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*")
     backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False)
-    model = NemotronHForCausalLM(config, backend=backend)
+    model = NemotronHForCausalLM(config, backend=backend).float()
     model.train()
     ids = torch.tensor([[1, 2, 3, 4]])
     native_keys = set(model.state_dict())
