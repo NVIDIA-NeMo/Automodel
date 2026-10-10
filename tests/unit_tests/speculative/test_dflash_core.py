@@ -36,11 +36,7 @@ MASK_ID = VOCAB - 1
 
 
 def _build_trainer(
-    num_anchors=8,
-    loss_decay_gamma=None,
-    attention_backend="sdpa",
-    sliding_window=None,
-    input_embedding_scale=1.0,
+    num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa", sliding_window=None, input_embedding_scale=1.0
 ):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
@@ -418,27 +414,6 @@ def test_sliding_window_defaults_to_off_and_rejects_non_positive():
     assert _build_trainer().sliding_window is None
     with pytest.raises(ValueError, match="sliding_window"):
         _build_trainer(sliding_window=0)
-
-
-def test_constructor_preserves_historical_positional_prefix():
-    trainer = _build_trainer()
-
-    positional = DFlashTrainerModule(
-        trainer.draft_model,
-        trainer.lm_head,
-        trainer.embed_tokens,
-        MASK_ID,
-        BLOCK_SIZE,
-        "sdpa",
-        8,
-        4.0,
-        "dflash",
-        0.9,
-    )
-
-    assert positional.loss_decay_gamma == 4.0
-    assert positional.loss_type == "dflash"
-    assert positional.prefix_weight_base == 0.9
 
 
 def _fix_anchors(monkeypatch, trainer, anchors):

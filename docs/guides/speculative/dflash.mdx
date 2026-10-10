@@ -136,27 +136,3 @@ lengths at temperature 1.0, top-p 0.95, top-k 20.
 Supported targets: Qwen3 and Qwen3.5 (dense and MoE), including the multimodal
 `*ForConditionalGeneration` variants such as `Qwen/Qwen3.8-27B`. DFlash and
 JetSpec drafts serve on vLLM through its `dflash` method.
-
-## SALM Trainer Integration
-
-These trainer-module arguments are for external callers such as SALM; the YAML
-recipes do not set them.
-
-The DFlash and DFlash2 trainer modules' `forward` methods accept optional
-`label_ids` (long `[batch, sequence]`,
-same shape/dtype/device as `input_ids`), enabling external callers such as SALM
-to provide backbone-argmax supervision while retaining `input_ids` for context,
-clean anchors, and visible `variable_prefix` tokens. `None` retains
-reference-token supervision. `label_ids[:, t]` is the token expected at
-position `t`, unshifted and indexed like `input_ids`. Every entry must be a
-valid vocabulary id, including unsupervised positions, because DFlash2 embeds
-in-block labels as selector predecessors. Exclude positions with `loss_mask`,
-not `-100`.
-DFlash2 returns differentiable `base_loss` and `selector_loss` and a detached
-`selector_loss_denominator`, allowing a caller to normalize the two objectives
-separately over its draft data-parallel group: normalize `base_loss` with
-`loss_weight` and `selector_loss` with `selector_loss_denominator`. Each
-`term * denominator` product reconstructs that term's local weighted NLL sum up
-to floating-point rounding and the loss epsilon. The base loss retains main's
-BF16 reduction when its logits are BF16, so this reconstruction is approximate
-in BF16. The combined `loss` is unchanged.
