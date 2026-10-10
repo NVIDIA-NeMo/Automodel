@@ -88,7 +88,7 @@ from nemo_automodel.components.loss.utils import (
 )
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.model_output_utils import final_hidden_states_kwargs, get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
@@ -1040,7 +1040,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
+                    out = model(**{**batch, "logits_to_keep": 1, **final_hidden_states_kwargs(model)})
                     if "hidden_states" not in out:
                         raise ValueError(
                             f"{type(self.loss_fn).__name__} requires the model to output hidden states. "
@@ -1313,7 +1313,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, LinearCrossEntropy):
-                        out = self.model_parts[0](**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
+                        out = self.model_parts[0](
+                            **{**batch, "logits_to_keep": 1, **final_hidden_states_kwargs(self.model_parts[0])}
+                        )
                     else:
                         out = self.model_parts[0](**batch)
                     local_loss = calculate_loss(
