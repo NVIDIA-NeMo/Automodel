@@ -20,7 +20,7 @@ at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
 |---|---|
 | Architecture | `DeepseekV41ForCausalLM` |
 | Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
-| Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
+| Reference Revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
 | Configuration | `DeepseekV41Config` with typed `text_config` and `vision_config` |
 
 ## Fine-Tuning
@@ -74,6 +74,11 @@ HybridEP provides both token dispatch and expert-output combine. Router
 correction biases remain fixed during fine-tuning through
 `gate_bias_update_factor: 0`.
 
+Set `model.backend.rope: triton` to run the rotary embedding of the attention,
+key/value, and indexer projections through a fused Triton kernel (one launch for
+the forward and one for the backward); the default `torch` keeps the eager
+complex rotation, which stays the numerical reference.
+
 FSDP mixed precision must use `param_dtype: bfloat16`, `reduce_dtype: float32`,
 `output_dtype: null`, and `cast_forward_inputs: false`. Set
 `lm_head_precision: float32`. These settings preserve FP32 mHC coefficients
@@ -116,7 +121,6 @@ gradient-sized norm temporaries for contiguous CUDA owner shards. Set
 
 The GB200 recipes place 748B trainable parameters on 64 GPUs, about 117 GB per
 GPU for BF16 weights, BF16 gradients, BF16 moments, and int16 master
-remainders. On 80 GB H100 parts the same recipes need twice the ranks: with
 remainders. On 80 GB H100 parts, the same recipes need twice the ranks: with
 `ep_size: 64` on 128 or more GPUs, the mesh derives an additional `ep_shard`
 FSDP axis over the routed experts, which halves the per-rank expert state.
@@ -132,8 +136,9 @@ repository at `e2c47c5b` (torch 2.13, NCCL 2.30.5).
 | [Tulu3 packed CP8 32k, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) | 64 x 8 H100; EP64, ep_shard8, CP8; GBS 64, LBS 1, one microbatch | `moe.reshard_after_forward: false` | 62.5 GiB; validation 0.5853 / 0.5778; one checkpoint about 8.2 TB |
 
 The Tulu3 variants load `allenai/tulu-3-sft-mixture` from the Hugging Face Hub
-through `ChatDataset` with `tulu3_chat_template.jinja`: padded 4,096-token rows
-for CP8 and 32,768-token THD packs, built at startup, for the packed recipe.
+through `ChatDataset` with `tulu3_chat_template.jinja`. The CP8 recipe uses
+padded 4,096-token rows. The packed recipe uses 32,768-token THD packs built
+at startup.
 For offline runs,
 [prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py)
 writes the same padded and prepacked layouts to disk.
@@ -144,11 +149,11 @@ Three points apply to every H100 variant:
   multi-node InfiniBand systems. With the container's default NCCL network
   plugin and PXN both active, the Engram row-owner all-to-all received
   byte-shifted token IDs from the first node's ranks, and the recipe stopped in
-  `_validate_received_ids` during the first forward, with NCCL 2.30.5 and
-  2.30.7 alike, and with both HPC-X 2.50 plugins the image ships (the default
-  Spectrum-X `spcx` and IBext). Either switch alone avoids it: disabling PXN
-  with the plugin kept, or bypassing the plugin with PXN kept, both completed
-  100 updates with matching losses. See
+  `_validate_received_ids` during the first forward. This occurred with NCCL
+  2.30.5 and 2.30.7, and with both HPC-X 2.50 plugins that the image ships
+  (the default Spectrum-X `spcx` and IBext). Either switch alone avoids the
+  failure. Disabling PXN and keeping the plugin, or bypassing the plugin and
+  keeping PXN, both completed 100 updates with matching losses. See
   [issue #3959](https://github.com/NVIDIA-NeMo/Automodel/issues/3959).
 - **Gradient accumulation needs `defer_fsdp_grad_sync: false`.** The default
   keeps unsharded parameters and gradients of every FSDP unit resident across
@@ -161,7 +166,7 @@ Three points apply to every H100 variant:
   is merged.
 - **Point the JIT caches at node-local storage** (`HYBRID_EP_CACHE_DIR`,
   `TILELANG_CACHE_DIR`, `TRITON_CACHE_DIR`). HybridEP resolves its cache from
-  the passwd home directory rather than `$HOME`, and compiling into a parallel
+  the `passwd` home directory rather than `$HOME`, and compiling into a parallel
   file system can stretch the first step past the NCCL timeout.
 
 Checkpoint saving is enabled in the packed recipe, as on GB200. One
@@ -198,8 +203,9 @@ preserves released parameter names, required FP32 weights, and logical Engram
 rows while removing the original quantization metadata. Quantized re-export
 is not supported.
 
-Recipe initialization uses the NeMo AutoModel wrapper's internal Checkpointer and PyTorch Distributed Checkpoint (DCP)
-path to load the base checkpoint into the distributed model.
+Recipe initialization uses the NeMo AutoModel wrapper's internal Checkpointer and
+Distributed Checkpoint (DCP) path to load the base checkpoint into the distributed
+model.
 
 Text inputs use unpacked `input_ids [batch, sequence]`, right padding, and
 zero-based positions. The optional `labels [batch, sequence]` API computes
@@ -209,7 +215,8 @@ straight-through gradients; there is no quantization toggle.
 
 The released vision tower is enabled by the default model configuration and
 disabled by the HellaSwag recipe. `DeepseekV41Processor` supports ordinary
-text and image conversations and saving and reloading. Image inputs require unpacked
+text and image conversations, and it supports saving and reloading. Image
+inputs require unpacked
 `input_ids [batch, sequence]`, `pixel_values [all_patches, 3, patch_size, patch_size]`,
 `image_grid_hws [images, 2]`, and `vision_token_types [batch, sequence]`.
 The image encoder and projector reuse DeepSeek V4 modules; image delimiters
@@ -254,9 +261,9 @@ expert gradients. This check performed no clipping or optimizer updates and
 does not establish training behavior for native HybridEP combine.
 
 The historical streamed forward used a diagnostic direct-loading entry point
-that has since been removed. These records identify the tested commits; they
-do not claim a new GPU run after removing that loader or the custom combine
-code, or full-resident 40-layer PR training.
+that has since been removed. These records identify the tested commits. They
+do not claim a new GPU run after that loader or the custom combine code was
+removed, and they do not claim full-resident 40-layer PR training.
 
 ## Original Implementation Training Result
 

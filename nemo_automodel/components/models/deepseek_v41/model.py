@@ -71,6 +71,7 @@ from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionG
 from nemo_automodel.components.models.deepseek_v41.attention import (
     DeepseekV41Attention,
     DeepseekV41AttentionState,
+    use_triton_rope,
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
@@ -467,6 +468,10 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         self.backend = backend or BackendConfig(
             attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="hybridep"
         )
+        if self.backend.rope == "triton":
+            # Process-wide dispatch of the attention module's rotation (same once-per-process pattern as the
+            # compiled cores): modules built before this call pick it up too. Default "torch" leaves eager.
+            use_triton_rope(True)
         dtype = dtype_from_str(text.dtype, torch.bfloat16)
         if engram_process_group is None and dist.is_available() and dist.is_initialized():
             engram_process_group = dist.group.WORLD
