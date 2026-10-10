@@ -176,6 +176,7 @@ def _metrics(**overrides):
         valid_blocks=torch.tensor(2.0),
         base_loss=torch.tensor(2.3),
         selector_loss=torch.tensor(0.7),
+        selector_loss_denominator=torch.tensor(10.0),
         base_accuracy=torch.tensor(0.4),
         base_correct_tokens=torch.tensor(4.0),
         base_accept_len=torch.tensor(4.0),

@@ -528,6 +528,35 @@ class DFlashTrainerModule(nn.Module):
             )
         return anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, prefix_lengths
 
+    @staticmethod
+    def _resolve_supervision_ids(input_ids: torch.Tensor, label_ids: torch.Tensor | None) -> torch.Tensor:
+        """Validate the optional label stream and return the supervised token ids.
+
+        Args:
+            input_ids: Long tensor of shape ``[batch, sequence]``; the context tokens.
+            label_ids: Long tensor of shape ``[batch, sequence]`` on the same device
+                as ``input_ids``, indexed like ``input_ids`` (unshifted) and holding
+                valid vocabulary ids everywhere, or ``None`` to supervise ``input_ids``.
+                Values are not range-checked here, to avoid a device sync.
+
+        Returns:
+            ``label_ids`` when given, else ``input_ids``; shape ``[batch, sequence]``.
+
+        Raises:
+            ValueError: If ``label_ids`` differs from ``input_ids`` in shape, dtype, or device.
+        """
+        if label_ids is None:
+            return input_ids
+        if label_ids.shape != input_ids.shape:
+            raise ValueError(
+                f"label_ids must match input_ids shape {tuple(input_ids.shape)}, got {tuple(label_ids.shape)}"
+            )
+        if label_ids.dtype != input_ids.dtype:
+            raise ValueError(f"label_ids must have dtype {input_ids.dtype}, got {label_ids.dtype}")
+        if label_ids.device != input_ids.device:
+            raise ValueError(f"label_ids must be on {input_ids.device}, got {label_ids.device}")
+        return label_ids
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -536,6 +565,7 @@ class DFlashTrainerModule(nn.Module):
         position_ids: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
+        label_ids: torch.Tensor | None = None,
     ) -> DFlashStepMetrics:
         """Parallel block-wise training forward pass.
 
@@ -544,8 +574,30 @@ class DFlashTrainerModule(nn.Module):
         keeps every block inside one document: anchors are constrained so the block
         does not cross a boundary, the block's context prefix attends only within the
         anchor's document, and the draft's RoPE uses the per-document positions.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence]; the context tokens.
+            hidden_states: Tensor of shape [batch, sequence, layers * hidden]; the
+                captured target-model context features.
+            loss_mask: Tensor of shape [batch, sequence]; the supervised-token mask.
+            position_ids: Long tensor of shape [batch, sequence] with per-document
+                reset positions under packing, or ``None``.
+            seq_lens: Long tensor of shape [batch, max_docs] with packed document
+                lengths, or ``None`` when unpacked.
+            doc_remaining: Long tensor of shape [batch, sequence]; real tokens left
+                in each position's document, or ``None`` when unpacked.
+            label_ids: Optional long tensor with the shape, dtype and device of
+                ``input_ids``; ``label_ids[:, t]`` is the unshifted supervision
+                token for position ``t``. Every entry must be a valid vocabulary
+                id; exclude positions with ``loss_mask``, not ``-100``. Context,
+                clean anchors and visible ``variable_prefix`` tokens still use
+                ``input_ids``; ``None`` supervises ``input_ids``.
+
+        Returns:
+            DFlashStepMetrics for this micro-batch.
         """
         bsz, seq_len = input_ids.shape
+        supervision_ids = self._resolve_supervision_ids(input_ids, label_ids)
 
         anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, prefix_lengths = (
             self._prepare_block_inputs(
@@ -570,7 +622,7 @@ class DFlashTrainerModule(nn.Module):
 
         # Block position k predicts the token at anchor + k.
         _, target_ids, block_mask = self._build_block_targets(
-            input_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
+            supervision_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
         )
 
         if self.loss_type == "variable_prefix":
