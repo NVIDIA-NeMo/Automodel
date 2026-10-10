@@ -29,8 +29,13 @@ Repeat with --compact-routing, --permute-fusion, and both flags to exercise
 all routing/fusion combinations. Each variant checks a local reference with
 different expert scales and compares equal and unequal token extents. Add
 --activation-checkpointing to compare checkpoint replay with the same unequal
-computation without checkpointing. The pytest launcher uses --all-variants to
-run the complete matrix in one worker launch and process group.
+computation without checkpointing. Add --capacity-factor F to run HybridEP
+capacity mode: the equal-count run is the blocking calibration dispatch, the
+unequal run then dispatches non-blocking into capacity-sized buffers (rows
+past the routed count are padding), and the checkpoint replay reuses the host
+extent. The pytest launcher uses --all-variants to run the complete matrix,
+including dense and compact capacity-mode variants, in one worker launch and
+process group.
 """
 
 import argparse
@@ -103,6 +108,10 @@ def run_dispatch_combine(
         # changes the output rather than being hidden by identical experts.
         expert_scales = torch.tensor(dispatcher.local_expert_indices, device=out.device, dtype=out.dtype) + 1
         row_scales = expert_scales.repeat_interleave(tokens_per_expert.to(device=out.device, dtype=torch.int64))
+        # Capacity mode hands back capacity-sized buffers: rows past the routed count are padding that the
+        # combine never reads, so scale them by zero like a grouped GEMM that stops at offs[-1].
+        if row_scales.shape[0] < out.shape[0]:
+            row_scales = torch.nn.functional.pad(row_scales, (0, out.shape[0] - row_scales.shape[0]))
         return dispatcher.token_unpermutation(out * (permuted_probs * row_scales.float()).unsqueeze(-1).to(out.dtype))
 
     if activation_checkpointing:
@@ -128,9 +137,18 @@ def run_dispatch_combine(
 
 
 def _run_variant(
-    ep_group: dist.ProcessGroup, *, compact_routing: bool, permute_fusion: bool, activation_checkpointing: bool
+    ep_group: dist.ProcessGroup,
+    *,
+    compact_routing: bool,
+    permute_fusion: bool,
+    activation_checkpointing: bool,
+    capacity_factor: float | None = None,
 ) -> None:
-    """Check one routing/fusion variant using the existing two-rank process group."""
+    """Check one routing/fusion variant using the existing two-rank process group.
+
+    With ``capacity_factor`` the first (equal-count) run calibrates HybridEP capacity mode and the
+    unequal run dispatches non-blocking into buffers of that capacity.
+    """
     rank = dist.get_rank()
     torch.manual_seed(1234 + rank)
     config = TokenDispatcherConfig(
@@ -140,6 +158,7 @@ def _run_variant(
         moe_share_token_dispatcher=False,
         moe_hybridep_compact_routing=compact_routing,
         moe_hybridep_permute_fusion=permute_fusion,
+        moe_hybridep_capacity_factor=capacity_factor,
     )
     num_local = NUM_EXPERTS // dist.get_world_size()
     dispatcher = MoEFlexTokenDispatcher(
@@ -170,7 +189,7 @@ def _run_variant(
     torch.testing.assert_close(unequal_grad, reference_grad[:keep], rtol=0, atol=0)
     torch.testing.assert_close(unequal_prob_grad, reference_prob_grad[:keep], rtol=0, atol=0)
     print(
-        f"[rank {rank}] OK: compact={compact_routing}, fusion={permute_fusion}; "
+        f"[rank {rank}] OK: compact={compact_routing}, fusion={permute_fusion}, capacity={capacity_factor}; "
         "output, hidden gradient, and router gradient match the local oracle and equal-count run",
         flush=True,
     )
@@ -194,24 +213,34 @@ def main() -> None:
     parser.add_argument("--compact-routing", action="store_true")
     parser.add_argument("--permute-fusion", action="store_true")
     parser.add_argument("--activation-checkpointing", action="store_true")
+    parser.add_argument(
+        "--capacity-factor",
+        type=float,
+        default=None,
+        help="HybridEP capacity mode: calibrate on the first dispatch, then dispatch non-blocking at this factor",
+    )
     parser.add_argument("--all-variants", action="store_true")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     ep_group = dist.new_group(ranks=list(range(dist.get_world_size())))
-    variants = (
-        [(compact, fusion, compact and fusion) for compact in (False, True) for fusion in (False, True)]
-        if args.all_variants
-        else [(args.compact_routing, args.permute_fusion, args.activation_checkpointing)]
-    )
+    if args.all_variants:
+        variants = [
+            (compact, fusion, compact and fusion, None) for compact in (False, True) for fusion in (False, True)
+        ]
+        # Capacity mode, dense and compact routing, with checkpoint replay of the host extent.
+        variants += [(compact, False, True, 1.5) for compact in (False, True)]
+    else:
+        variants = [(args.compact_routing, args.permute_fusion, args.activation_checkpointing, args.capacity_factor)]
     try:
-        for compact, fusion, activation_checkpointing in variants:
+        for compact, fusion, activation_checkpointing, capacity_factor in variants:
             start = time.perf_counter()
             _run_variant(
                 ep_group,
                 compact_routing=compact,
                 permute_fusion=fusion,
                 activation_checkpointing=activation_checkpointing,
+                capacity_factor=capacity_factor,
             )
             # Reuse the buffer: routing/fusion are per-call options, and all variants share its shape.
             # Keep the native buffer and loaded kernels alive until all variants finish.
@@ -219,7 +248,8 @@ def main() -> None:
             dist.barrier(group=ep_group)
             store_hybrid_ep_jit_cache()
             print(
-                f"HybridEP parity: compact={compact} fusion={fusion} elapsed={time.perf_counter() - start:.2f}s",
+                f"HybridEP parity: compact={compact} fusion={fusion} capacity={capacity_factor} "
+                f"elapsed={time.perf_counter() - start:.2f}s",
                 flush=True,
             )
     finally:

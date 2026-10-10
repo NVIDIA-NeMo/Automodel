@@ -462,6 +462,20 @@ class BackendConfig:
             blocks. ``None`` preserves HybridEP's default.
         dispatcher_hybridep_num_blocks_unpermute: Optional number of combine
             unpermutation blocks. ``None`` preserves HybridEP's default.
+        dispatcher_capacity_factor: HybridEP only, dynamic routing. Run HybridEP dispatch in its
+            non-blocking mode with output buffers sized to the first microbatch's permuted row
+            count times this factor (EP-group max, 4-token aligned) instead of letting every
+            dispatch drain the compute stream to read the exact count. Overflow trips a
+            device-side assert. None (default) keeps the blocking reference path. The capacity is
+            calibrated once per communication manager from its first real batch and kept for the
+            run; with ``dispatcher_share_token_dispatcher=True`` (default) that is one calibration,
+            taken on the first local MoE layer's first microbatch, for every layer, so choose a factor
+            that covers the largest routing skew expected across layers and batches. Not supported
+            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination).
+        dispatcher_equal_token_counts: HybridEP only. Declare that every EP rank dispatches the
+            same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
+            that derives the pad size is skipped and the count is only aligned. Default False;
+            keep it False for variable-length or in-batch-packed inputs.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -531,6 +545,19 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
+    # HybridEP only, dynamic routing: after one blocking calibration dispatch per communication manager (one
+    # for all layers when the dispatcher is shared, the default), size every later dispatch's output buffers
+    # to ceil(calibrated rows x factor) (EP-group max, aligned) and run HybridEP in its non-blocking mode.
+    # Removes the per-dispatch compute-stream drain that HybridEP's blocking mode needs to learn the permuted
+    # row count (and the per-layer barrier it implies); an overflow of the capacity trips a device-side assert
+    # instead of silently truncating. None = blocking.
+    # Rejected by GroupedExpertsDeepEP for expert_bias experts (the bias add sizes itself from the buffer rows).
+    dispatcher_capacity_factor: float | None = None
+    # HybridEP only: every EP rank dispatches the same number of rows (fixed-shape batches, which is
+    # every batch that is not variable-length / in-batch packed), so the per-dispatch EP-group MAX
+    # all-reduce + int() host sync that derives the pad size is skipped and the local count is only
+    # aligned. Leave False for variable-length inputs: unequal counts abort the HybridEP collective.
+    dispatcher_equal_token_counts: bool = False
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     dispatcher_hybridep_permute_fusion: bool = False
     dispatcher_hybridep_compact_routing: bool = False
@@ -687,6 +714,19 @@ class BackendConfig:
             raise ValueError(
                 "te_fp8 requires at least one TE backend "
                 f"(linear='te' or experts='te'), but got linear='{self.linear}', experts='{self.experts}'"
+            )
+        # The sync-free knobs only mean something to the HybridEP dispatcher; elsewhere the capacity factor
+        # would silently switch off the empty-expert fallback the other dispatchers can hit.
+        sync_free_requested = self.dispatcher_capacity_factor is not None or self.dispatcher_equal_token_counts
+        if sync_free_requested and self.dispatcher != "hybridep":
+            raise ValueError(
+                "dispatcher_capacity_factor and dispatcher_equal_token_counts require dispatcher='hybridep', "
+                f"got dispatcher='{self.dispatcher}'"
+            )
+        if self.dispatcher_capacity_factor is not None and not self.dispatcher_capacity_factor >= 1.0:
+            raise ValueError(
+                f"dispatcher_capacity_factor must be >= 1.0 (a smaller buffer overflows on the first skewed batch), "
+                f"got {self.dispatcher_capacity_factor!r}"
             )
 
 
