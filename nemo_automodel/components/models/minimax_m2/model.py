@@ -169,12 +169,17 @@ class MiniMaxM2Model(nn.Module):
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
         if not hasattr(config, "rope_parameters") or config.rope_parameters is None:
-            rotary_dim = getattr(config, "rotary_dim", self.head_dim)
             config.rope_parameters = {
                 "rope_theta": getattr(config, "rope_theta", 5000000.0),
                 "rope_type": "default",
-                "partial_rotary_factor": rotary_dim / self.head_dim,
             }
+        # Some HF versions populate rope_parameters without converting the legacy
+        # rotary_dim. Fill the missing factor without overriding canonical settings.
+        if "partial_rotary_factor" not in config.rope_parameters:
+            rotary_dim = getattr(config, "rotary_dim", None)
+            config.rope_parameters["partial_rotary_factor"] = (
+                rotary_dim / self.head_dim if rotary_dim is not None else 1.0
+            )
 
         base, rope_scaling, partial_rotary_factor = get_rope_config(config)
         self.rotary_emb = RotaryEmbedding(
