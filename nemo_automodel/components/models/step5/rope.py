@@ -94,6 +94,37 @@ class Step5RotaryEmbedding(nn.Module):
         """
         if self.span == 0 or x.numel() == 0:
             return x
+        cos, sin = self._tables(x, positions)
+        apply = _apply_rotary_compiled if x.is_cuda else _apply_rotary
+        return apply(x, cos, sin, self.span)
+
+    def forward_pair(
+        self, query: torch.Tensor, key: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate local Q/K with one shared, identically rounded table pair.
+
+        Args:
+            query: Query tensor [batch, sequence, query_heads, head_dim].
+            key: Key tensor [batch, sequence, key_heads, head_dim], sharing
+                query's dtype and device. Noncontiguous key views are supported.
+            positions: Document-local positions [batch, sequence].
+
+        Returns:
+            Rotated query and key tensors, preserving their respective shapes.
+
+        Raises:
+            ValueError: Q/K have different batch/sequence extents, dtype or device.
+        """
+        if query.shape[:2] != key.shape[:2] or query.dtype != key.dtype or query.device != key.device:
+            raise ValueError("Paired Step5 RoPE requires matching Q/K batch, sequence, dtype and device")
+        if self.span == 0 or query.numel() == key.numel() == 0:
+            return query, key
+        cos, sin = self._tables(query, positions)
+        apply = _apply_rotary_compiled if query.is_cuda else _apply_rotary
+        return apply(query, cos, sin, self.span), apply(key, cos, sin, self.span)
+
+    def _tables(self, x: torch.Tensor, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build tables once per call; preserve eager frequency/trig rounding."""
         inv = 1.0 / self.theta ** (torch.arange(0, self.span, 2, device=x.device, dtype=torch.float32) / self.span)
         if self.scaling is not None and self.scaling.get("rope_type", "default") != "default":
             factor = self.scaling["factor"]
@@ -112,7 +143,6 @@ class Step5RotaryEmbedding(nn.Module):
         table_dtype = torch.bfloat16 if x.dtype == torch.bfloat16 else torch.float32
         cos = angles.cos().to(table_dtype).float().unsqueeze(-2)
         sin = angles.sin().to(table_dtype).float().unsqueeze(-2)
-        # Keep frequency construction and BF16 table materialization outside the
-        # compiled application; fusing trig would change checkpoint rounding.
-        apply = _apply_rotary_compiled if x.is_cuda else _apply_rotary
-        return apply(x, cos, sin, self.span)
+        # Frequency construction and BF16 table materialization stay eager;
+        # fusing trig would change checkpoint rounding. No cross-call cache.
+        return cos, sin

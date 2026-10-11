@@ -225,8 +225,7 @@ class Step5Attention(nn.Module):
         qkv = self.qkv_proj(hidden).view(batch, sequence, groups, heads + 2, dim)
         query = qkv[:, :, :, :heads].reshape(batch, sequence, self.num_heads, dim)
         key, value = qkv[:, :, :, heads], qkv[:, :, :, heads + 1]
-        query = self.rotary_emb(self.q_norm(query), positions)
-        key = self.rotary_emb(self.k_norm(key), positions)
+        query, key = self.rotary_emb.forward_pair(self.q_norm(query), self.k_norm(key), positions)
         query_start = 0 if self.cp_group is None else dist.get_rank(self.cp_group) * sequence
         key_positions, key_padding = global_positions, global_padding
         if self.cp_group is not None:
