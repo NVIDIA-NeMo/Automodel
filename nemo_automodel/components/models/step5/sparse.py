@@ -92,7 +92,7 @@ class RegionSelection:
             single-batch shards with contiguous document positions.
         causal_batch_layouts: Proven prefix or all-padding layout for both rows
             of a fully selected B2 shard; None if either row needs the fallback.
-        causal_row_layouts: Independent per-row prefix proofs for mixed indexed B2 dispatch.
+        causal_row_layouts: Independent per-row prefix proofs for opt-in mixed B2 dispatch.
         indexed_layout: Optional physical region bounds for long sparse shards.
         all_padding_key: The only allowed global key for a fully padded shard,
             after proving standard document positions and trailing padding.
@@ -143,7 +143,7 @@ class RegionMetadata:
             preceding keys. Independent of whether CSA selection is sparse.
         causal_batch_layouts: Prefix or all-padding layouts when both B2 rows
             satisfy native causal attention semantics.
-        causal_row_layouts: Independent per-row prefix proofs for mixed indexed B2 dispatch.
+        causal_row_layouts: Independent per-row prefix proofs for opt-in mixed B2 dispatch.
         indexed_layout: Optional shared physical bounds for indexed attention.
         all_padding_key: Singleton global key for a fully padded, fully selected
             local CSA shard, or None when the shortcut cannot be established.
@@ -221,8 +221,9 @@ def region_metadata(
         queries: Number of local queries.
         region_size: Tokens per region, reset at every document boundary.
         topk: Maximum number of selected historical regions.
-        indexed_csa: Prepare physical bounds only for regular sparse shards
-            whose query-weighted historical region span reaches 32K tokens.
+        indexed_csa: Preserve independent B2 prefix proofs; prepare physical
+            bounds only for regular sparse shards whose query-weighted
+            historical region span reaches 32K tokens.
         window: Optional native SWA layout width. A globally trailing padded
             suffix keeps its custom-mask path. No additional host synchronization.
 
@@ -420,7 +421,7 @@ def region_metadata(
                 )
             else:
                 row_layouts.append(None)
-        if indexed_layout is not None and batch == 2:
+        if indexed_csa and batch == 2:
             causal_row_layouts = tuple(row_layouts)
         if batch == 1 and row_layouts:
             causal_layout = row_layouts[0]

@@ -123,10 +123,11 @@ def test_indexed_layout_supports_batch_and_empty_query_fallback() -> None:
     assert empty.indexed_layout is None
 
 
+@pytest.mark.parametrize("keys,start,indexed", [(40960, 36864, True), (8192, 4096, False)])
 @pytest.mark.parametrize("long_row", [0, 1])
 @pytest.mark.parametrize("partner", ["prefix", "allpad", "partialpad"])
-def test_indexed_b2_preserves_row_proofs(long_row: int, partner: str) -> None:
-    keys, start, queries = 40960, 36864, 4096
+def test_indexed_b2_preserves_row_proofs(keys: int, start: int, indexed: bool, long_row: int, partner: str) -> None:
+    queries = 4096
     positions = torch.arange(keys)[None].expand(2, -1).clone()
     padding = torch.zeros_like(positions, dtype=torch.bool)
     short = 1 - long_row
@@ -144,14 +145,17 @@ def test_indexed_b2_preserves_row_proofs(long_row: int, partner: str) -> None:
         topk=512,
         indexed_csa=True,
     )
-    assert metadata.indexed_layout is not None
-    assert metadata.indexed_layout.row_eligible == tuple(row == long_row for row in range(2))
+    assert (metadata.indexed_layout is not None) == indexed
+    if indexed:
+        assert metadata.indexed_layout.row_eligible == tuple(row == long_row for row in range(2))
+    assert len(metadata.causal_row_layouts) == 2
     assert metadata.causal_row_layouts[long_row] is None
     proof = metadata.causal_row_layouts[short]
     assert proof is not None
     assert proof.valid_queries == {"prefix": 4096, "allpad": 0, "partialpad": 1317}[partner]
     assert metadata.causal_batch_layouts is None
-    assert metadata.region_count == metadata.indexed_layout.starts.shape[1]
+    if indexed:
+        assert metadata.region_count == metadata.indexed_layout.starts.shape[1]
     disabled = region_metadata(
         positions,
         padding,
@@ -162,3 +166,89 @@ def test_indexed_b2_preserves_row_proofs(long_row: int, partner: str) -> None:
     )
     assert disabled.indexed_layout is None
     assert disabled.causal_row_layouts == ()
+
+    # Keeping an already-computed proof cannot change score or selection input.
+    assert metadata.score_tiles == disabled.score_tiles
+    assert metadata.region_count == disabled.region_count
+    for actual, original in (
+        (metadata.token_regions, disabled.token_regions),
+        (metadata.documents, disabled.documents),
+        (metadata.dense_region_ids, disabled.dense_region_ids),
+        (metadata.sparse_queries, disabled.sparse_queries),
+    ):
+        torch.testing.assert_close(actual, original, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("long_row", [0, 1])
+@pytest.mark.parametrize("partner", ["prefix", "partialpad", "allpad"])
+def test_below_threshold_row_proof_matches_independent_document_mask(long_row: int, partner: str) -> None:
+    keys, start, queries = 32, 16, 16
+    positions = torch.arange(keys)[None].expand(2, -1).clone()
+    padding = torch.zeros_like(positions, dtype=torch.bool)
+    short = 1 - long_row
+    positions[short] %= 4
+    valid = {"prefix": keys, "partialpad": start + 7, "allpad": 7}[partner]
+    positions[short, valid:] = 0
+    padding[short, valid:] = True
+    metadata = region_metadata(
+        positions, padding, query_start=start, queries=queries, region_size=2, topk=2, indexed_csa=True
+    )
+    assert metadata.indexed_layout is None
+    assert len(metadata.causal_row_layouts) == 2
+    assert metadata.causal_row_layouts[long_row] is None
+    proof = metadata.causal_row_layouts[short]
+    assert proof is not None
+    # Scan the input document starts; do not derive the expected mask from
+    # production region IDs, sparse flags, or cumulative sequence lengths.
+    document = -1
+    documents = []
+    for position, padded in zip(positions[short].tolist(), padding[short].tolist(), strict=True):
+        if position == 0 and not padded:
+            document += 1
+        documents.append(document)
+    expected = torch.tensor(
+        [
+            [
+                not padding[short, k]
+                and documents[start + q] == documents[k]
+                and positions[short, k] <= positions[short, start + q]
+                for k in range(keys)
+            ]
+            for q in range(queries)
+        ]
+    )
+    actual = torch.zeros_like(expected)
+    qb, kb = proof.cu_seqlens_q.tolist(), proof.cu_seqlens_k.tolist()
+    for q0, q1, k0, k1 in zip(qb, qb[1:], kb, kb[1:]):
+        for q in range(q0, q1):
+            for k in range(k0, k1):
+                actual[q, proof.key_start + k] = k - k0 <= q - q0 + (k1 - k0) - (q1 - q0)
+    if proof.padding_key is not None:
+        actual[proof.valid_queries :, proof.padding_key] = True
+    torch.testing.assert_close(actual, expected)
+    assert metadata.sparse_queries[long_row].all()
+    assert not metadata.sparse_queries[short].any()
+    # A wrong document origin must be detected by the independent mask.
+    assert not torch.equal(actual.roll(1, dims=1), expected)
+
+
+@pytest.mark.parametrize("defect", ["empty", "internal_padding", "nonzero_padding", "sparse_final_document"])
+def test_mixed_row_proof_rejects_unproven_padding(defect: str) -> None:
+    positions = torch.arange(32)[None].expand(2, -1).clone()
+    padding = torch.zeros_like(positions, dtype=torch.bool)
+    if defect == "empty":
+        padding[1] = True
+        positions[1] = 0
+    elif defect == "internal_padding":
+        positions[1] %= 8
+        padding[1, 17] = True
+    elif defect == "nonzero_padding":
+        positions[1] %= 4
+        padding[1, 16:] = True
+        positions[1, 16:] = 1
+    else:
+        padding[1, 9:] = True
+        positions[1, 9:] = 0
+    metadata = region_metadata(positions, padding, query_start=16, queries=16, region_size=2, topk=2, indexed_csa=True)
+    assert metadata.indexed_layout is None
+    assert metadata.causal_row_layouts == (None, None)
