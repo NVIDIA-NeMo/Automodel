@@ -621,3 +621,41 @@ def test_indexer_uses_bf16_scores_and_returns_sorted_positions_with_empty_querie
     assert not actual.topk_indices[:, 0].ge(0).any()
     assert state.topk_indices is None
     assert all(not parameter.requires_grad for parameter in module.parameters())
+
+
+def test_validate_attention_inputs_runs_once_and_layers_skip_host_checks(monkeypatch) -> None:
+    """The host-synchronising checks live in validate_attention_inputs; a layer told inputs_validated=True does not
+    repeat them (no torch.equal / torch.all / torch.any on device tensors in its forward)."""
+    from nemo_automodel.components.models.deepseek_v41.attention import validate_attention_inputs
+
+    positions = torch.arange(4)[None]
+    validate_attention_inputs(positions, None, None, sequence=4)
+    validate_attention_inputs(positions, torch.tensor([[1, 1, 1, 0]]), None, sequence=4)
+    with pytest.raises(ValueError, match="zero-based"):
+        validate_attention_inputs(torch.tensor([[0, 1, 0, 1]]), None, None, sequence=4)
+    with pytest.raises(ValueError, match="right padding"):
+        validate_attention_inputs(positions, torch.tensor([[0, 1, 1, 1]]), None, sequence=4)
+    with pytest.raises(ValueError, match="zero and one"):
+        validate_attention_inputs(positions, torch.full((1, 4), 2), None, sequence=4)
+
+    hidden = torch.randn(1, 4, 16)
+    source = DeepseekV41Attention(_config(), 1, _backend())
+
+    def no_sync(*args, **kwargs):
+        raise AssertionError("host-synchronising comparison in the attention hot path")
+
+    monkeypatch.setattr(torch, "equal", no_sync)
+    monkeypatch.setattr(torch, "all", no_sync)
+    monkeypatch.setattr(torch, "any", no_sync)
+    out = source(hidden, position_ids=positions, state=DeepseekV41AttentionState(), inputs_validated=True)
+    assert out.hidden_states.shape == hidden.shape
+    out = source(
+        hidden,
+        position_ids=positions,
+        state=DeepseekV41AttentionState(),
+        attention_mask=torch.tensor([[1, 1, 1, 0]]),
+        inputs_validated=True,
+    )
+    assert out.hidden_states.shape == hidden.shape
+    with pytest.raises(AssertionError, match="host-synchronising"):
+        source(hidden, position_ids=positions, state=DeepseekV41AttentionState())
