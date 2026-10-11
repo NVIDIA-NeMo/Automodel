@@ -115,3 +115,12 @@ def test_norm_cuda_forward_backward_recompute(sequence: int, kind: str, record_p
             }
         ),
     )
+    peaks = {}
+    for name, call in [("baseline", baseline_step), ("compiled", candidate_step)]:
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        call()
+        torch.cuda.synchronize()
+        peaks[name] = torch.cuda.max_memory_allocated() - before
+    record_property("incremental_fwb_peak_bytes", json.dumps(peaks))

@@ -108,3 +108,24 @@ def test_rope_cuda_long_positions_packed_backward_recompute(sequence: int, span:
             }
         ),
     )
+    peaks = {}
+    for name, call in [("baseline", baseline_step), ("compiled", candidate_step)]:
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        call()
+        torch.cuda.synchronize()
+        peaks[name] = torch.cuda.max_memory_allocated() - before
+    record_property("incremental_fwb_peak_bytes", json.dumps(peaks))
+
+
+def test_rope_cuda_empty_indexer_projection() -> None:
+    config = Step5Config()
+    rope = Step5RotaryEmbedding(config, 3, span=32).cuda()
+    hidden = torch.empty(1, 0, 16, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    positions = torch.empty(1, 0, device="cuda", dtype=torch.long)
+    actual = rope(hidden, positions)
+    assert actual.shape == hidden.shape
+    assert actual.dtype == hidden.dtype
+    actual.sum().backward()
+    assert hidden.grad is not None and hidden.grad.shape == hidden.shape
