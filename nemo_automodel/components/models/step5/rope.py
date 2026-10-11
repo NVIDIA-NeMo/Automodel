@@ -22,6 +22,21 @@ from torch import nn
 from nemo_automodel.components.models.step5.configuration import Step5Config
 
 
+def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, span: int) -> torch.Tensor:
+    """Apply already-rounded tables using FP32 half-split arithmetic."""
+    half = span // 2
+    a, b = x[..., :half].float(), x[..., half:span].float()
+    return torch.cat(((a * cos - b * sin).to(x.dtype), (a * sin + b * cos).to(x.dtype), x[..., span:]), dim=-1)
+
+
+_apply_rotary_compiled = torch.compile(
+    _apply_rotary,
+    fullgraph=True,
+    dynamic=True,
+    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+)
+
+
 class Step5RotaryEmbedding(nn.Module):
     """Recompute FP32 frequencies from config; never cast a frequency buffer."""
 
@@ -63,8 +78,7 @@ class Step5RotaryEmbedding(nn.Module):
         table_dtype = torch.bfloat16 if x.dtype == torch.bfloat16 else torch.float32
         cos = angles.cos().to(table_dtype).float().unsqueeze(-2)
         sin = angles.sin().to(table_dtype).float().unsqueeze(-2)
-        half = self.span // 2
-        a, b = x[..., :half].float(), x[..., half : self.span].float()
-        return torch.cat(
-            ((a * cos - b * sin).to(x.dtype), (a * sin + b * cos).to(x.dtype), x[..., self.span :]), dim=-1
-        )
+        # Keep frequency construction and BF16 table materialization outside the
+        # compiled application; fusing trig would change checkpoint rounding.
+        apply = _apply_rotary_compiled if x.is_cuda else _apply_rotary
+        return apply(x, cos, sin, self.span)
