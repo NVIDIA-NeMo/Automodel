@@ -262,6 +262,8 @@ def build_model(
     cfg_freeze: ConfigNode | dict[str, Any] | FreezeConfig | None = None,
     sdpa_method: list[str] | None = None,
     device_mesh=None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -280,6 +282,7 @@ def build_model(
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
         device_mesh: Pre-created device mesh forwarded when ``distributed_setup`` is not provided.
     """
     with ScopedRNG(seed=seed, ranked=True):
@@ -290,6 +293,7 @@ def build_model(
             # plain mappings or typed FreezeConfig objects.
             "freeze_config": cfg_freeze.to_dict() if isinstance(cfg_freeze, ConfigNode) else cfg_freeze,
             "sdpa_method": sdpa_method,
+            "load_metadata_with_gloo": load_metadata_with_gloo,
         }
         if distributed_setup is not None:
             kwargs["distributed_setup"] = distributed_setup
@@ -373,6 +377,7 @@ def build_model(
                 freeze_config=kwargs.get("freeze_config"),
                 pretrained_model_name_or_path=None,
                 load_base_model=False,
+                load_metadata_with_gloo=load_metadata_with_gloo,
                 cache_dir=hf_constants.HF_HUB_CACHE,
             )
 
@@ -750,6 +755,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_freeze=self.cfg.get("freeze_config", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         self.embedding_row_repair_report = None
         embedding_row_repair = self.cfg.embedding_row_repair

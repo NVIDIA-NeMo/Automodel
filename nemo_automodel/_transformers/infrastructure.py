@@ -506,6 +506,7 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
+    load_metadata_with_gloo: bool = False,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -544,6 +545,7 @@ def apply_model_infrastructure(
         inject_te_attention: When True, inject TransformerEngine DotProductAttention
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
+        load_metadata_with_gloo: Use a CPU group for base-weight load planning. Default: False.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -563,6 +565,7 @@ def apply_model_infrastructure(
         model_repo_id=pretrained_model_name_or_path,
         save_consolidated=False,
         is_peft=peft_config is not None,
+        load_metadata_with_gloo=load_metadata_with_gloo,
     )
     checkpointer = Checkpointer(
         ckpt_config,
@@ -611,24 +614,29 @@ def apply_model_infrastructure(
 
     checkpoint_already_loaded = False
     if load_before_shard:
-        if weights_already_loaded:
-            # HF's from_pretrained already populated the weights during model init.
-            # Still call load_base_model with load_base_model=False to
-            # handle weight tying
-            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
-        else:
-            # Only meta-device models need their parameter shells materialized first.
-            if is_meta_device:
-                lora_a_init = getattr(peft_config, "lora_A_init", None)
-                checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
-            checkpointer.load_base_model(
-                model,
-                device,
-                cache_dir,
-                pretrained_model_name_or_path,
-                load_base_model=load_base_model,
-            )
-        checkpoint_already_loaded = True
+        try:
+            if weights_already_loaded:
+                # HF's from_pretrained already populated the weights during model init.
+                # Still call load_base_model with load_base_model=False to
+                # handle weight tying
+                checkpointer.load_base_model(
+                    model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False
+                )
+            else:
+                # Only meta-device models need their parameter shells materialized first.
+                if is_meta_device:
+                    lora_a_init = getattr(peft_config, "lora_A_init", None)
+                    checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+                checkpointer.load_base_model(
+                    model,
+                    device,
+                    cache_dir,
+                    pretrained_model_name_or_path,
+                    load_base_model=load_base_model,
+                )
+            checkpoint_already_loaded = True
+        finally:
+            checkpointer.close()
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     state_dict_adapter = getattr(model, "state_dict_adapter", None)
@@ -738,15 +746,18 @@ def apply_model_infrastructure(
     # decision so that changes to the meta-device policy cannot silently skip loading.
     should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and not weights_already_loaded
     if should_load_checkpoint:
-        model_parts = model.parts if hasattr(model, "parts") else [model]
-        for mp in model_parts:
-            checkpointer.load_base_model(
-                mp,
-                device,
-                cache_dir,
-                pretrained_model_name_or_path,
-                load_base_model=load_base_model,
-            )
+        try:
+            model_parts = model.parts if hasattr(model, "parts") else [model]
+            for mp in model_parts:
+                checkpointer.load_base_model(
+                    mp,
+                    device,
+                    cache_dir,
+                    pretrained_model_name_or_path,
+                    load_base_model=load_base_model,
+                )
+        finally:
+            checkpointer.close()
 
     _verify_safe_moe_tp_weights_loaded(
         model,
