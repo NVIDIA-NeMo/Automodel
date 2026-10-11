@@ -1314,16 +1314,20 @@ def _benchmark_dp_gradient_worker(rank: int, rendezvous: str) -> None:
         torch.distributed.destroy_process_group()
 
 
+@pytest.mark.runtime_budget(
+    90,
+    hard_timeout=300,
+    reason="Two spawned native-recipe workers require cold imports; spawn isolates prior parent autograd threads.",
+)
 def test_benchmark_global_mean_gradient_two_process(tmp_path: Path) -> None:
     """Native loss/loop plus actual DP averaging must equal the global mean oracle."""
-    # CPU-only workers can inherit imports; spawn spends tens of seconds importing
-    # the full native recipe in each child before any numerical check runs.
-    torch.multiprocessing.start_processes(
+    # Fork can inherit an initialized autograd thread pool from earlier model
+    # tests. Fresh interpreters preserve correctness for integrated suite order.
+    torch.multiprocessing.spawn(
         _benchmark_dp_gradient_worker,
         args=((tmp_path / "benchmark_dp_rendezvous").as_uri(),),
         nprocs=2,
         join=True,
-        start_method="fork",
     )
 
 
