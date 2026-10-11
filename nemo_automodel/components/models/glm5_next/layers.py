@@ -538,7 +538,12 @@ class Glm5NextKPoolIndexer(nn.Module):
         queries = self.wq_b(query_resid).view(1, -1, self.n_heads, self.head_dim)
         scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
         scores = F.relu(scores * self.softmax_scale)
-        weights = self.weights_proj(query_hidden).float() * (self.n_heads**-0.5)
+        # Keep the narrow BF16 projection at the validated query tile shape.
+        if query_hidden.shape[1] > 512:
+            weights = torch.cat([self.weights_proj(chunk) for chunk in query_hidden.split(512, dim=1)], dim=1)
+        else:
+            weights = self.weights_proj(query_hidden)
+        weights = weights.float() * (self.n_heads**-0.5)
         scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
         if complete_pools:
             pool_end = pool_indices[:, -1]
@@ -630,7 +635,7 @@ class Glm5NextSparseAttention(nn.Module):
     """NoPE MLA whose visibility is selected by the GLM KPool indexer."""
 
     query_chunk_size = 32
-    indexer_query_chunk_size = 512
+    indexer_query_chunk_size = 2048
 
     def __init__(self, config: Glm5NextTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
@@ -816,6 +821,9 @@ class Glm5NextSparseAttention(nn.Module):
         # At 256K/KPool4 this retains the original 32-query score workspace.
         bytes_per_query = max(1, pool_keys.shape[0]) * self.indexer.n_heads * 4
         indexer_chunk = min(self.indexer_query_chunk_size, max(1, (256 * 1024**2) // bytes_per_query))
+        # Keep larger query tiles aligned with the dense-prefix boundary.
+        if indexer_chunk > 512:
+            indexer_chunk = 1 << (indexer_chunk.bit_length() - 1)
         for start in range(query_start, query_end, indexer_chunk):
             end = min(start + indexer_chunk, query_end)
             positions = torch.arange(start, end, device=full_hidden.device)
