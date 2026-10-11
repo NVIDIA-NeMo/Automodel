@@ -28,11 +28,16 @@ class Glm5NextBackendConfig(BackendConfig):
         sinkhorn: ``"torch"`` preserves eager FP32 normalization. ``"tilelang"``
             requires CUDA and the optional TileKernels package; an unavailable
             kernel raises instead of silently falling back to PyTorch.
+        indexer: Score generation for KPool selection. The cuDNN option keeps
+            BF16 projections and PyTorch top-k, and requires CUDA and cuDNN DSA.
     """
 
     sinkhorn: Literal["torch", "tilelang"] = "torch"
+    indexer: Literal["torch", "cudnn"] = "torch"
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.indexer not in ("torch", "cudnn"):
+            raise ValueError(f"Unsupported indexer={self.indexer!r}; expected 'torch' or 'cudnn'.")
         if self.sinkhorn not in ("torch", "tilelang"):
             raise ValueError(f"Unsupported sinkhorn={self.sinkhorn!r}; expected 'torch' or 'tilelang'.")

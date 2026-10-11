@@ -21,6 +21,7 @@ from torch import nn
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.cudnn_sparse_attention import (
+    cudnn_indexer_scores,
     cudnn_sparse_attention,
     is_cudnn_sparse_attention_available,
 )
@@ -461,9 +462,17 @@ class Glm5NextLinearAttention(nn.Module):
 class Glm5NextKPoolIndexer(nn.Module):
     """KPool-compressed DSA indexer for training without a KV cache."""
 
-    def __init__(self, config: Glm5NextTextConfig, layer_idx: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        config: Glm5NextTextConfig,
+        layer_idx: int,
+        dtype: torch.dtype,
+        *,
+        backend: Literal["torch", "cudnn"] = "torch",
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.backend = backend
         self.n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.index_topk = config.index_topk
@@ -514,6 +523,8 @@ class Glm5NextKPoolIndexer(nn.Module):
         pool_keys: torch.Tensor,
         pool_indices: torch.Tensor,
         key_length: int,
+        *,
+        query_projection_chunk_size: int | None = None,
     ) -> torch.Tensor:
         """Select raw key indices for one query chunk.
 
@@ -527,6 +538,8 @@ class Glm5NextKPoolIndexer(nn.Module):
             pool_indices: Prepared raw token indices with shape
                 ``[complete_pools, index_kpool]``.
             key_length: Number of tokens in the unpadded document.
+            query_projection_chunk_size: Original projection tile size, preserved
+                when the cuDNN score kernel processes several tiles together.
 
         Returns:
             Int32 raw indices with shape
@@ -535,16 +548,32 @@ class Glm5NextKPoolIndexer(nn.Module):
         """
         complete_pools = pool_keys.shape[0]
 
-        queries = self.wq_b(query_resid).view(1, -1, self.n_heads, self.head_dim)
-        scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
-        scores = F.relu(scores * self.softmax_scale)
-        # Keep the narrow BF16 projection at the validated query tile shape.
-        if query_hidden.shape[1] > 512:
-            weights = torch.cat([self.weights_proj(chunk) for chunk in query_hidden.split(512, dim=1)], dim=1)
+        if self.backend == "cudnn":
+            projection_chunk = query_projection_chunk_size or query_hidden.shape[1]
+            queries = torch.cat([self.wq_b(chunk) for chunk in query_resid.split(projection_chunk, dim=1)], dim=1)
+            queries = queries.view(1, -1, self.n_heads, self.head_dim)
+            weights = torch.cat(
+                [self.weights_proj(chunk) for chunk in query_hidden.split(min(512, projection_chunk), dim=1)], dim=1
+            )
+            scores = cudnn_indexer_scores(
+                queries,
+                pool_keys,
+                weights,
+                query_positions,
+                self.index_kpool,
+                self.softmax_scale * (self.n_heads**-0.5),
+            )
         else:
-            weights = self.weights_proj(query_hidden)
-        weights = weights.float() * (self.n_heads**-0.5)
-        scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
+            queries = self.wq_b(query_resid).view(1, -1, self.n_heads, self.head_dim)
+            scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
+            scores = F.relu(scores * self.softmax_scale)
+            # Keep the narrow BF16 projection at the validated query tile shape.
+            if query_hidden.shape[1] > 512:
+                weights = torch.cat([self.weights_proj(chunk) for chunk in query_hidden.split(512, dim=1)], dim=1)
+            else:
+                weights = self.weights_proj(query_hidden)
+            weights = weights.float() * (self.n_heads**-0.5)
+            scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
         if complete_pools:
             pool_end = pool_indices[:, -1]
             visible = pool_end.view(1, 1, -1) <= query_positions.view(1, -1, 1)
@@ -670,7 +699,8 @@ class Glm5NextSparseAttention(nn.Module):
             dtype=dtype,
         )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False, dtype=dtype)
-        self.indexer = Glm5NextKPoolIndexer(config, layer_idx, dtype)
+        indexer_backend = backend.indexer if isinstance(backend, Glm5NextBackendConfig) else "torch"
+        self.indexer = Glm5NextKPoolIndexer(config, layer_idx, dtype, backend=indexer_backend)
         self._cp_mesh = None
 
     def setup_cp_attention(self, cp_mesh) -> None:
@@ -817,13 +847,18 @@ class Glm5NextSparseAttention(nn.Module):
         q_resid = self.q_a_layernorm(self.q_a_proj(full_hidden[:, query_start:query_end]))
         selected_indices = []
         length = full_hidden.shape[1]
+
         # Bound the FP32 [queries, index_heads, pools] score tensor to 256 MiB.
         # At 256K/KPool4 this retains the original 32-query score workspace.
-        bytes_per_query = max(1, pool_keys.shape[0]) * self.indexer.n_heads * 4
-        indexer_chunk = min(self.indexer_query_chunk_size, max(1, (256 * 1024**2) // bytes_per_query))
-        # Keep larger query tiles aligned with the dense-prefix boundary.
-        if indexer_chunk > 512:
-            indexer_chunk = 1 << (indexer_chunk.bit_length() - 1)
+        def chunk_size(score_heads: int) -> int:
+            bytes_per_query = max(1, pool_keys.shape[0]) * score_heads * 4
+            size = min(self.indexer_query_chunk_size, max(1, (256 * 1024**2) // bytes_per_query))
+            return 1 << (size.bit_length() - 1) if size > 512 else size
+
+        projection_chunk = chunk_size(self.indexer.n_heads)
+        indexer_chunk = projection_chunk
+        if self.indexer.backend == "cudnn":
+            indexer_chunk = (chunk_size(1) // projection_chunk) * projection_chunk
         for start in range(query_start, query_end, indexer_chunk):
             end = min(start + indexer_chunk, query_end)
             positions = torch.arange(start, end, device=full_hidden.device)
@@ -843,6 +878,7 @@ class Glm5NextSparseAttention(nn.Module):
                     pool_keys,
                     pool_indices,
                     length,
+                    query_projection_chunk_size=projection_chunk,
                 )
             selected_indices.append(indices.squeeze(0).unsqueeze(1))
 
