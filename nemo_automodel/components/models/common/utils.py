@@ -409,12 +409,21 @@ class MoKBackendConfig:
         )
 
 
+AttentionBackend = Literal["torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "magi"]
+
+
 @dataclass(kw_only=True)
 class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or "cudnn").
+        attn: Attention backend ("torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", or "magi").
+            "fa4" selects native FlashAttention-4 (CuTe) and requires an
+            INSTALL_FA4=true image. HF-dispatched models use "flash_attention_4". A rank-2 binary
+            padding mask is converted to varlen metadata, while dense/block masks and indexed
+            document masks without explicit packed metadata are rejected.
+            Inputs must use BSHD layout; pre-packed THD is unsupported. Packed
+            Qwen3Next and DeepSeek V3.2 sparse attention do not support FA4.
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
@@ -425,8 +434,9 @@ class BackendConfig:
             SM100 MSA kernels a model provides for its sparse layers only.
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
-        rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
-            integrated for Llama-family rotary embeddings.
+        rope: Rotary embedding backend ("torch", "quack" or "triton"). QuACK is currently
+            integrated for Llama-family rotary embeddings; "triton" selects the fused
+            Triton rotation of DeepSeek-V4.1 (other models keep the torch path).
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "torch_mm" uses torch._grouped_mm,
@@ -442,6 +452,17 @@ class BackendConfig:
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
             asynchronously and allocate their outputs on the communication stream.
+        dispatcher_hybridep_permute_fusion: Fuse HybridEP token permutation into dispatch and
+            unpermutation into combine. Has no effect for other dispatcher backends.
+        dispatcher_hybridep_compact_routing: Send compact top-k expert indices to HybridEP
+            instead of the dense Boolean routing map. This can reduce metadata traffic, but
+            remains opt-in because its latency depends on topology and model shape.
+        dispatcher_hybridep_num_sms_preprocessing: Optional number of SMs used by HybridEP
+            routing-metadata preprocessing.
+        dispatcher_hybridep_num_blocks_permute: Optional number of dispatch permutation
+            blocks. ``None`` preserves HybridEP's default.
+        dispatcher_hybridep_num_blocks_unpermute: Optional number of combine
+            unpermutation blocks. ``None`` preserves HybridEP's default.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -465,9 +486,14 @@ class BackendConfig:
             mixing chain is compiled as well. Compiled numerics are allclose to eager but
             not bitwise-identical.
         compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
-            (currently Kimi K3), fusing cast/pow/mean/rsqrt/mul into one kernel.
+            (currently Kimi K3 and DeepSeek V4.1), fusing cast/pow/mean/rsqrt/mul into one kernel.
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
             allclose to eager but not bitwise-identical.
+        compile_hc: torch.compile the mHC (hyper-connection) cores of models that opt in
+            (currently DeepSeek V4.1): coefficient projection, stream collapse and stream expand,
+            one fused kernel each, static shapes (a new sequence length compiles them again; past
+            dynamo's recompile limit a core runs eager). Same lazy once-per-process pattern as
+            ``compile_situ``; numerics are allclose to eager but not bitwise-identical.
         shared_expert_overlap: run the shared experts of opted-in MoE models (currently Kimi K3)
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
             communication of the routed path; numerics unchanged. Default False.
@@ -487,13 +513,11 @@ class BackendConfig:
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
-        "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
-    )
+    attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     sparse_attn: Literal["generic", "msa"] = "generic"
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
-    rope: Literal["torch", "quack"] = "torch"
+    rope: Literal["torch", "quack", "triton"] = "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
@@ -509,6 +533,11 @@ class BackendConfig:
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
+    dispatcher_hybridep_permute_fusion: bool = False
+    dispatcher_hybridep_compact_routing: bool = False
+    dispatcher_hybridep_num_sms_preprocessing: int | None = None
+    dispatcher_hybridep_num_blocks_permute: int | None = None
+    dispatcher_hybridep_num_blocks_unpermute: int | None = None
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -529,10 +558,14 @@ class BackendConfig:
     # Kimi K3): fused whole-tensor weighted-SiTU forward/backward, the dense SituAndMul core
     # and the attn-res chain. Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_situ: bool = False
-    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3),
-    # same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
+    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3 and
+    # DeepSeek V4.1), same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
     # not bitwise-identical. Default False.
     compile_norm: bool = False
+    # When True, torch.compile the mHC projection / collapse / expand cores of opted-in models
+    # (currently DeepSeek V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
+    # Numerics are allclose to eager, not bitwise-identical. Default False.
+    compile_hc: bool = False
     # When True, models that opt in (currently Kimi K3) run their shared experts on a side CUDA
     # stream, launched before the routed-expert path and joined after it, so the shared-expert
     # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's
@@ -1460,6 +1493,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
 
 
 __all__ = [
+    "AttentionBackend",
     "BackendConfig",
     "Float32RMSNorm",
     "TEFp8Config",

@@ -303,6 +303,35 @@ def test_padding_and_incomplete_groups_do_not_change_real_token_outputs() -> Non
     assert torch.count_nonzero(hidden.grad[~mask.bool()]) == 0
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_apply_rope_assembly_is_bitwise_the_concatenation(dtype: torch.dtype, inverse: bool) -> None:
+    """clone + slice write must equal torch.cat of the untouched channels and the rotated ones, values and grads."""
+    torch.manual_seed(7)
+    angles = torch.rand(2, 5, 4) * 6.28
+    frequencies = torch.polar(torch.ones_like(angles), angles)
+    if inverse:
+        frequencies = frequencies.conj()
+    for values in (
+        torch.randn(2, 5, 16, dtype=dtype),
+        torch.randn(2, 5, 3, 16, dtype=dtype),
+        torch.randn(2, 3, 5, 16, dtype=dtype).transpose(1, 2),  # non-contiguous, as the attention output arrives
+    ):
+        values = values.detach().requires_grad_(True)
+        reference_input = values.detach().clone().requires_grad_(True)
+        pairs = torch.view_as_complex(reference_input[..., -8:].float().unflatten(-1, (-1, 2)).contiguous())
+        rotation = frequencies.unsqueeze(2) if values.ndim == 4 else frequencies
+        rotated = torch.view_as_real(pairs * rotation).flatten(-2).to(dtype)
+        reference = torch.cat((reference_input[..., :-8], rotated), dim=-1)
+        actual = _apply_rope(values, angles, inverse=inverse)
+        assert actual.is_contiguous() and actual.data_ptr() != values.data_ptr()
+        assert torch.equal(actual, reference)
+        upstream = torch.randn_like(actual)
+        (actual * upstream).sum().backward()
+        (reference * upstream).sum().backward()
+        assert torch.equal(values.grad, reference_input.grad)
+
+
 def test_rotary_recomputes_exact_fp32_frequencies_after_bfloat16_cast() -> None:
     config = _config()
     rotary = _RotaryEmbedding(config, compressed=True)

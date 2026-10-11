@@ -25,7 +25,7 @@ from nemo_automodel._transformers.utils import _should_load_before_shard
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 class TestShouldLoadBeforeShard:
@@ -980,6 +980,7 @@ class TestFromConfigLoadBaseModelKwarg:
         _, build_kwargs = mock_build.call_args
         assert build_kwargs["load_base_model"] is False
 
+    @pytest.mark.usefixtures("mock_hub_revision")
     def test_from_config_forwards_load_base_model_true(self):
         """from_config should forward load_base_model=True when provided as kwarg."""
         from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass

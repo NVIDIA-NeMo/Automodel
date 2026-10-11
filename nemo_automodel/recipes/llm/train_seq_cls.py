@@ -385,14 +385,24 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 out = model(**batch)
                 logits = getattr(out, "logits", out)
                 loss = self.loss_fn(logits, labels.view(-1))
-            total_loss += loss.detach()
+            # Summed, not the batch mean: the last batch of a shard is usually
+            # short, so batch means cannot be averaged with equal weight. In FP32,
+            # so a half-precision loss cannot overflow while the sum grows.
+            total_loss += loss.detach().float() * labels.numel()
 
             # Collect predictions for accuracy
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds)
             all_labels.append(labels.view(-1))
-            count += 1
+            count += labels.numel()
 
+        # Each DP rank validates a disjoint shard; reduce like the accuracy below.
+        if self._get_dp_group_size(include_cp=True) > 1:
+            device = self.dist_env.device
+            total_loss = self._dp_allreduce(
+                torch.as_tensor(total_loss, dtype=torch.float32, device=device), include_cp=True
+            )
+            count = self._dp_allreduce(torch.tensor(count, dtype=torch.float32, device=device), include_cp=True).item()
         total_loss = total_loss if count == 0 else total_loss / count
 
         # Calculate accuracy

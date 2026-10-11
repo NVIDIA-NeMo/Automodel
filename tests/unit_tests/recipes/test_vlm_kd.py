@@ -118,6 +118,8 @@ def test_vlm_kd_teacher_forward_uses_scoped_offloading_when_enabled(monkeypatch)
 
 
 class _Cfg:
+    vlm_dataloader = None
+
     def __init__(self, **values):
         self._values = values
 
@@ -133,9 +135,7 @@ class _Cfg:
         ({"offload_teacher_model": True}, True, "cpu"),
     ],
 )
-def test_setup_sets_offload_flag_and_teacher_device(
-    monkeypatch, cfg_overrides, expected_offload, expected_device
-):
+def test_setup_sets_offload_flag_and_teacher_device(monkeypatch, cfg_overrides, expected_offload, expected_device):
     captured = {}
 
     def fake_build_teacher_model(**kwargs):

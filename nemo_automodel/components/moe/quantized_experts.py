@@ -304,6 +304,11 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
                 dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
                 dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
             )
+        self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
+        self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
+        self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
+        self.dispatcher_hybridep_num_blocks_permute = orig_module.dispatcher_hybridep_num_blocks_permute
+        self.dispatcher_hybridep_num_blocks_unpermute = orig_module.dispatcher_hybridep_num_blocks_unpermute
         # These fresh parameters have no autograd history or optimizer references.
         for name in self._MXFP4_BASE_NAMES:
             getattr(self, name).data = _to_local(getattr(orig_module, name)).clone()

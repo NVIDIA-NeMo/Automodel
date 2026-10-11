@@ -391,7 +391,7 @@ class BaseRecipe:
             scheduler,
             optimizer_part_ids=self._get_optimizer_checkpoint_part_ids(),
         )
-        save_config(config.raw_config, path)
+        save_config(config.to_yaml_dict(use_orig_values=True), path)
         if is_dist_initialized:
             _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
@@ -967,10 +967,11 @@ def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[
     Compare the checkpoint's saved ``config.yaml`` model signature to the
     current run's model signature.
 
-    Uses ``raw_config`` (when available) for comparison because
-    ``save_config`` serialises ``raw_config`` to YAML.  Round-tripping
-    through YAML preserves types, avoiding false mismatches that would
-    arise from using ``to_dict()`` (which may apply type conversions).
+    Uses the effective YAML-ready config (when available) for comparison so
+    runtime overrides are checked against the same representation saved in
+    the checkpoint. Round-tripping through YAML preserves types, avoiding
+    false mismatches that would arise from using ``to_dict()`` (which may
+    apply type conversions).
     """
     config_path = os.path.join(os.fspath(ckpt_dir), "config.yaml")
     if not os.path.exists(config_path):
@@ -981,10 +982,12 @@ def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[
     except (OSError, yaml.YAMLError) as e:
         return True, f"failed to read checkpoint config.yaml (cannot validate): {e}"
 
-    # Prefer raw_config (same representation that was saved) to avoid
-    # type-coercion mismatches between to_dict() and yaml.safe_load().
+    # Prefer the effective YAML-ready representation used by save_checkpoint
+    # to avoid stale pre-override values and type-coercion mismatches.
     try:
-        if hasattr(current_cfg, "raw_config"):
+        if hasattr(current_cfg, "to_yaml_dict"):
+            cur_cfg = current_cfg.to_yaml_dict(use_orig_values=True)
+        elif hasattr(current_cfg, "raw_config"):
             cur_cfg = current_cfg.raw_config
         elif hasattr(current_cfg, "to_dict"):
             cur_cfg = current_cfg.to_dict()

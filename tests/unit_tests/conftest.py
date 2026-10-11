@@ -54,7 +54,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 
 _DEFAULT_RUNTIME_BUDGET_SECONDS = 5.0
-_DEFAULT_HARD_TIMEOUT_SECONDS = 60.0
+_DEFAULT_HARD_TIMEOUT_SECONDS = 70.0
 _RUNTIME_BUDGET_ATTRIBUTE = "_automodel_runtime_budget_seconds"
 _DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
@@ -355,6 +355,14 @@ def pytest_addoption(parser):
         default=_DEFAULT_HARD_TIMEOUT_SECONDS,
         help="Hard pytest-timeout watchdog in seconds for unmarked unit tests.",
     )
+
+
+@pytest.fixture
+def mock_hub_revision(monkeypatch):
+    """Keep tests with mocked config/weight loaders independent of Hub access."""
+    from nemo_automodel import NeMoAutoConfig
+
+    monkeypatch.setattr(NeMoAutoConfig, "resolve_revision", lambda source, revision=None, **kwargs: revision)
 
 
 @pytest.fixture

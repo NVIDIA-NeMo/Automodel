@@ -69,7 +69,7 @@ def test_float32_rms_norm_forward_and_gradients(shape, dtype, trainable):
     ],
 )
 # opcheck includes AOTAutograd compilation, which exceeds the default 5 seconds.
-@pytest.mark.timeout(60)
+@pytest.mark.runtime_budget(60, hard_timeout=70, reason="opcheck includes AOTAutograd compilation")
 def test_float32_rms_norm_custom_op_contract(layout, device):
     x = torch.randn(3, 2, 14 if layout == "strided_hidden" else 7, device=device)
     if layout == "transposed":
@@ -82,7 +82,7 @@ def test_float32_rms_norm_custom_op_contract(layout, device):
 
 
 # The child process isolates registrations and reproduces the install import checker.
-@pytest.mark.timeout(60)
+@pytest.mark.runtime_budget(60, hard_timeout=70, reason="a fresh Python process imports torch and checks registrations")
 def test_float32_rms_norm_reimport():
     script = """
 import importlib
@@ -150,7 +150,7 @@ def _dtensor_worker(rank: int, world_size: int, init_file: str) -> None:
 
 @pytest.mark.parametrize("world_size", [1, 2])
 # Spawning PyTorch workers and initializing Gloo exceeds the default 5 seconds.
-@pytest.mark.timeout(60)
+@pytest.mark.runtime_budget(60, hard_timeout=70, reason="spawns PyTorch workers and initializes Gloo process groups")
 def test_float32_rms_norm_dtensor(world_size, tmp_path):
     mp.spawn(_dtensor_worker, args=(world_size, str(tmp_path / "init")), nprocs=world_size, join=True)
 
@@ -160,7 +160,7 @@ def test_float32_rms_norm_dtensor(world_size, tmp_path):
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 # This checks actual Inductor compilation, including activation recomputation.
-@pytest.mark.timeout(60)
+@pytest.mark.runtime_budget(60, hard_timeout=70, reason="runs Inductor compilation and activation recomputation")
 def test_float32_rms_norm_compiled_determinism(dtype, monkeypatch):
     from torch._dynamo.testing import CompileCounterWithBackend
 

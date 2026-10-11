@@ -149,6 +149,13 @@ class NemotronHModelParallelizer(ModelParallelizer):
                 fp32_compute_module_names=fp32_module_names,
                 reshard_after_forward=reshard_after_forward,
             )
+        self._fully_shard_untied_input_output_embeddings(
+            model,
+            mesh=dp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            input_reshard_after_forward=reshard_after_forward if reshard_after_forward is not None else True,
+        )
         return fully_shard(
             model,
             mesh=dp_mesh,

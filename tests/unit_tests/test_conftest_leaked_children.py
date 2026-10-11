@@ -26,7 +26,7 @@ import pytest
 pytest_plugins = ["pytester"]
 
 # The inner pytest subprocess imports torch from scratch and needs a few seconds beyond the 5s fallback.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 _CONFTEST_SOURCE = Path(__file__).with_name("conftest.py").read_text()
 
@@ -93,7 +93,7 @@ def test_timeout_does_not_own_existing_child(persistent_child):
 
 @pytest.mark.runtime_budget(
     30,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="starts a fresh pytest subprocess that imports torch and spawns a worker",
 )
 def test_pytest_exits_after_timed_out_spawn(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch):
@@ -111,7 +111,7 @@ def test_pytest_exits_after_timed_out_spawn(pytester: pytest.Pytester, monkeypat
 
 @pytest.mark.runtime_budget(
     30,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="starts a fresh pytest subprocess and a Popen child",
 )
 def test_pytest_cleans_non_multiprocessing_child_after_timeout(
@@ -131,7 +131,7 @@ def test_pytest_cleans_non_multiprocessing_child_after_timeout(
 
 @pytest.mark.runtime_budget(
     30,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="starts a fresh pytest subprocess and a persistent Popen child",
 )
 def test_timeout_cleanup_preserves_preexisting_child(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch):

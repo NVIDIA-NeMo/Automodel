@@ -39,7 +39,6 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 _FLA_MSG = "GLM-5.3 KDA requires the flash-linear-attention/fla extra for GPU training."
 _SHORT_CONV_OK, _fla_causal_conv1d = safe_import_from("fla.modules.conv", "causal_conv1d", msg=_FLA_MSG)
 _CHUNK_KDA_OK, _chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
-_RECURRENT_KDA_OK, _recurrent_kda = safe_import_from("fla.ops.kda", "fused_recurrent_kda", msg=_FLA_MSG)
 _KDA_GATE_OK, _fused_kda_gate = safe_import_from("fla.ops.kda.gate", "fused_kda_gate", msg=_FLA_MSG)
 
 
@@ -376,14 +375,14 @@ class Glm5NextLinearAttention(nn.Module):
         gate = self._fp32_params(gate, self.head_dim, self.config.linear_lower_bound).contiguous()
         beta = self.b_proj(hidden_states).float().sigmoid().contiguous()
         if _CHUNK_KDA_OK and hidden_states.is_cuda:
-            kernel = _chunk_kda if cp_context is not None or hidden_states.shape[1] > 64 else _recurrent_kda
+            # The chunk kernel runs at every sequence length: FLA's fused_recurrent_kda
+            # implements only the forward pass, so the KDA parameters would get no gradient.
             kernel_options: dict[str, Any] = {
                 "use_qk_l2norm_in_kernel": True,
                 "transpose_state_layout": True,
+                "safe_gate": self.config.linear_lower_bound is not None,
             }
-            if kernel is _chunk_kda:
-                kernel_options["safe_gate"] = self.config.linear_lower_bound is not None
-            output, _ = kernel(
+            output, _ = _chunk_kda(
                 q=q,
                 k=k,
                 v=v,

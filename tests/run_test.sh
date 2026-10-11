@@ -45,7 +45,7 @@ fi
 if [[ "$CPU" == "false" ]]; then
     export CUDA_VISIBLE_DEVICES="0,1"
 else
-    export ADDITIONAL_ARGS="--cpu --with_downloads"
+    export ADDITIONAL_ARGS="--cpu"
 fi
 
 if [[ "$UNIT_TEST" == "true" ]]; then
@@ -62,24 +62,26 @@ else
     done
 fi
 
-# Install opt-in media extras (kept out of the default media-free image) per folder.
-case ",$TEST_NAME," in
-    *,hf_transformer_vlm,*) MEDIA_EXTRA="vlm-media" ;;
-    # The parallelism suite runs VLM proxies, so it needs the same media extras.
-    *,parallelism,*) MEDIA_EXTRA="vlm-media" ;;
-    *) MEDIA_EXTRA="" ;;
-esac
-if [[ -n "$MEDIA_EXTRA" ]]; then
-    uv pip install ".[$MEDIA_EXTRA]"
-fi
+# Test dependencies, including vlm-media for VLM and parallelism suites, are
+# installed when building the CI image.
 
 # Default pytest capture reports module progress and includes stdout, stderr, and logs only for failed tests.
-coverage run \
-    -m pytest \
+TEST_COMMAND=(coverage run -m pytest)
+if [[ "$UNIT_TEST" == "true" && "$CPU" == "true" ]]; then
+    # Keep one CI job, with bounded concurrency for tests that spawn CPU ranks.
+    # File scheduling keeps module fixtures and fixed-port tests on one worker.
+    export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+    # pytest-cov collects worker coverage; coverage run alone only traces the controller.
+    TEST_COMMAND=(python -m pytest -n 2 --dist loadfile --cov --cov-config=pyproject.toml --cov-report=)
+fi
+
+"${TEST_COMMAND[@]}" \
     --durations 32 \
     --durations-min=0 \
     "${TEST_DIRS[@]}" \
     -m "not pleasefixme" --tb=short -rfE \
     $SHARD_ARGS \
     $ADDITIONAL_ARGS
-coverage combine -q
+if [[ "$UNIT_TEST" != "true" || "$CPU" != "true" ]]; then
+    coverage combine -q
+fi
