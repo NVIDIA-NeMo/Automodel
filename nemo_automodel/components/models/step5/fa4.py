@@ -266,6 +266,34 @@ def _selected_block_lists(
     return fc, fi, bc, bi
 
 
+def _all_padding_attention(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, padding_key: int
+) -> torch.Tensor:
+    """Copy singleton-key attention while retaining explicit zero Q/K gradients.
+
+    Args:
+        query: Tensor [batch, local_queries, query_heads, head_dim].
+        key: Tensor [batch, global_keys, kv_heads, head_dim].
+        value: Tensor shaped like key, potentially a noncontiguous KV-unbind view.
+        padding_key: The only allowed global key, proven by shared metadata.
+            query_heads must be divisible by kv_heads.
+
+    Returns:
+        Materialized tensor [batch, local_queries, query_heads, head_dim].
+        Each grouped query head copies the corresponding value head exactly.
+        Empty Q/K slices preserve backward hooks and CP collective dependencies
+        without reading their contents or changing signed zeros in V.
+    """
+    batch, queries, heads, dim = query.shape
+    groups = value.shape[2]
+    heads_per_group = heads // groups
+    padding_value = value[:, padding_key : padding_key + 1, :, None]
+    output = padding_value.expand(batch, queries, groups, heads_per_group, dim)
+    empty_query = query[:, :0].unflatten(2, (groups, heads_per_group))
+    empty_key = key[:, :0, :, None].expand(batch, 0, groups, heads_per_group, dim)
+    return torch.cat((output, empty_query, empty_key), dim=1).flatten(2, 3)
+
+
 def fa4_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -316,6 +344,16 @@ def fa4_attention(
     if torch.are_deterministic_algorithms_enabled():
         raise RuntimeError("Step5 FA4 uses nondeterministic attention backward")
     queries, keys, dim = query.shape[1], key.shape[1], query.shape[-1]
+    if (
+        capability == (9, 0)
+        and dim == 192
+        and query.shape[0] == 1
+        and window is None
+        and selection is not None
+        and selection.all_regions_selected
+        and selection.all_padding_key is not None
+    ):
+        return _all_padding_attention(query, key, value, selection.all_padding_key)
     if (
         capability == (9, 0)
         and dim == 192

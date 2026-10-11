@@ -62,6 +62,8 @@ class RouteBucket(TypedDict):
 class RouteMetrics(TypedDict):
     cp1_native_varlen: bool
     cp2_native_varlen: bool
+    cp1_all_padding_key: int | None
+    cp2_all_padding_key: int | None
     prefix: RouteBucket
     sparse: RouteBucket
 
@@ -70,6 +72,7 @@ class RouteMetrics(TypedDict):
 class RouteSnapshot:
     ids: torch.Tensor
     native_varlen: bool
+    all_padding_key: int | None
 
 
 class CPReport(TypedDict):
@@ -110,7 +113,7 @@ def compare_cp(
             _module: Step5SparseIndexer, _inputs: tuple[torch.Tensor | None, ...], output: RegionSelection
         ) -> None:
             route_records[phase][name] = RouteSnapshot(
-                output.region_ids.detach().cpu(), output.causal_layout is not None
+                output.region_ids.detach().cpu(), output.causal_layout is not None, output.all_padding_key
             )
 
         return record
@@ -239,6 +242,8 @@ def compare_cp(
         route_metrics[name] = {
             "cp1_native_varlen": cp1_routes.native_varlen,
             "cp2_native_varlen": cp2_routes.native_varlen,
+            "cp1_all_padding_key": cp1_routes.all_padding_key,
+            "cp2_all_padding_key": cp2_routes.all_padding_key,
             "prefix": buckets["prefix"],
             "sparse": buckets["sparse"],
         }

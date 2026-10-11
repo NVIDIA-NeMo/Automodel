@@ -71,6 +71,8 @@ class RegionSelection:
             regions in its own document; membership adds no restriction.
         causal_layout: Optional compact varlen layout for fully selected,
             single-batch shards with contiguous document positions.
+        all_padding_key: The only allowed global key for a fully padded shard,
+            after proving standard document positions and trailing padding.
     """
 
     region_ids: torch.Tensor
@@ -80,6 +82,7 @@ class RegionSelection:
     region_count: int
     all_regions_selected: bool = False
     causal_layout: CausalDocumentLayout | None = None
+    all_padding_key: int | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,8 @@ class RegionMetadata:
         causal_layout: Optional native varlen metadata for this query shard.
         window_layout: Optional native SWA layout, including at most window - 1
             preceding keys. Independent of whether CSA selection is sparse.
+        all_padding_key: Singleton global key for a fully padded, fully selected
+            local CSA shard, or None when the shortcut cannot be established.
     """
 
     token_regions: torch.Tensor
@@ -130,6 +135,7 @@ class RegionMetadata:
     score_range_indices: tuple[int, ...] = ()
     region_sources: torch.Tensor | None = None
     region_source_valid: torch.Tensor | None = None
+    all_padding_key: int | None = None
 
 
 def _summary_ranges(
@@ -205,7 +211,8 @@ def region_metadata(
     # The direct source map must have unique valid document slots. Preserve
     # the original scatter for irregular positions or internal padding.
     physical = torch.arange(keys, device=key_positions.device)[None]
-    trailing_padding = (key_padding == (physical >= (~key_padding).sum(1, keepdim=True))).all()
+    valid_key_counts = (~key_padding).sum(1, keepdim=True)
+    trailing_padding = (key_padding == (physical >= valid_key_counts)).all()
     consecutive_positions = (key_positions[:, 1:] == 0) | (key_positions[:, 1:] == key_positions[:, :-1] + 1)
     summary_layout_valid = (
         trailing_padding
@@ -223,6 +230,7 @@ def region_metadata(
     # attention mask. Guard the single-batch path conservatively and transfer
     # its local positions together with the existing allocation metadata.
     prefix_fields = key_positions.new_zeros(4)
+    all_padding_field = key_positions.new_full((), -1)
     if batch == 1 and queries:
         local_positions = key_positions[0, query_start : query_start + queries]
         local_valid = ~key_padding[0, query_start : query_start + queries]
@@ -237,6 +245,18 @@ def region_metadata(
         global_trailing_padding = trailing_padding
         padding_positions_zero = ((local_positions == 0) | local_valid).all()
         padding_key = torch.where(local_valid, local_physical - local_positions, -1).amax()
+        last_valid = (valid_key_counts[0] - 1).clamp_min(0)
+        last_document_start = last_valid[0] - key_positions[0].gather(0, last_valid)[0]
+        all_padding_valid = (
+            summary_layout_valid
+            & (key_positions[0, 0] == 0)
+            & (valid_queries == 0)
+            & padding_positions_zero
+            & (valid_key_counts[0, 0] > 0)
+            & (last_document_start >= 0)
+            & ~sparse_queries.any()
+        )
+        all_padding_field = torch.where(all_padding_valid, last_document_start, -1)
         prefix_valid = (
             ~sparse_queries.any()
             & (valid_queries > 0)
@@ -277,6 +297,7 @@ def region_metadata(
                 all_sparse.any().long().reshape(1),
                 bounds.reshape(-1),
                 prefix_fields,
+                all_padding_field.reshape(1),
                 summary_layout_valid.long().reshape(1),
             )
         )
@@ -284,6 +305,7 @@ def region_metadata(
         .tolist()
     )
     region_count, needs_projection = int(layout[0]), bool(layout[1])
+    all_padding_key = int(layout[-2]) if layout[-2] >= 0 else None
     tiles_per_batch = lower.shape[1]
     score_tiles = []
     for index in range(batch * tiles_per_batch):
@@ -375,6 +397,7 @@ def region_metadata(
         score_range_indices,
         region_sources,
         region_source_valid,
+        all_padding_key,
     )
 
 
@@ -513,6 +536,7 @@ class Step5SparseIndexer(nn.Module):
                 region_count,
                 all_regions_selected=True,
                 causal_layout=metadata.causal_layout,
+                all_padding_key=metadata.all_padding_key,
             )
         if keys is None or compression_logits is None:
             raise ValueError("Sparse CSA queries require the global indexer projections")
