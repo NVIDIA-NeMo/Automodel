@@ -343,6 +343,9 @@ def create_distributed_setup_from_config(
             ``DeviceMesh`` axes. If omitted and ``cfg`` is a top-level recipe
             config, ``dist_env.timeout_minutes`` is used.
         ranks: Optional ordered global ranks used by this setup's device mesh.
+            Overrides the ``distributed.ranks`` integer list from the config.
+            Mesh construction validates the rank count, uniqueness, and increasing
+            order along each axis, as required by DeviceMesh process groups.
         strategy: Distributed strategy name (``fsdp2``, ``megatron_fsdp``,
             ``megatron-fsdp``, ``mfsdp``, or ``ddp``).
         dp_size: Data-parallel size. If ``None``, inferred by mesh creation.
@@ -364,6 +367,11 @@ def create_distributed_setup_from_config(
         world_size = get_world_size_safe()
 
     cfg_dict = _distributed_cfg_to_dict(cfg)
+    configured_ranks: list[int] | None = cfg_dict.pop("ranks", None)
+    if ranks is None and configured_ranks is not None:
+        if not isinstance(configured_ranks, list) or any(type(rank) is not int for rank in configured_ranks):
+            raise TypeError("distributed.ranks must be a list of integers or None")
+        ranks = configured_ranks
 
     explicit_overrides = {
         "strategy": strategy,

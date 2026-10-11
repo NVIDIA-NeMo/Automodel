@@ -128,6 +128,13 @@ def _mesh_device_type() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _validate_axis_rank_order(rank_tensor: torch.Tensor, axes: tuple[str, ...]) -> None:
+    """Reject axis orders that DeviceMesh's sorted process groups cannot preserve."""
+    for dim, axis in enumerate(axes):
+        if torch.any(rank_tensor.diff(dim=dim) <= 0):
+            raise ValueError(f"Explicit mesh ranks must increase along the '{axis}' axis")
+
+
 def _init_named_mesh(
     spec: _MeshSpec,
     *,
@@ -152,9 +159,11 @@ def _init_named_mesh(
             raise ValueError(f"mesh ranks ({len(ranks)}) must match mesh size ({expected_size})")
         if len(set(ranks)) != len(ranks):
             raise ValueError("mesh ranks must be unique")
+        rank_tensor = torch.tensor(ranks, dtype=torch.int64).reshape(spec.shape)
+        _validate_axis_rank_order(rank_tensor, spec.axes)
         device_mesh = DeviceMesh(
             device_type=device_type,
-            mesh=torch.tensor(ranks, dtype=torch.int64).reshape(spec.shape),
+            mesh=rank_tensor,
             mesh_dim_names=spec.axes,
             backend_override=backend_override,
         )
@@ -268,7 +277,8 @@ def _register_flattened_axes_for_rank_subset(
                 index[axis_index] = coordinate
             subgroup_ranks = rank_tensor[tuple(index)].reshape(-1).tolist()
             first_ranks = first_ranks or subgroup_ranks
-            group = dist.new_group(ranks=subgroup_ranks)
+            # DTensor shard coordinates must match the supplied mesh order.
+            group = dist.new_group(ranks=subgroup_ranks, sort_ranks=False)
             if current_rank in subgroup_ranks:
                 local_ranks = subgroup_ranks
                 local_group = group
@@ -404,9 +414,11 @@ def _create_moe_mesh(
         first_mesh = None
         for stage in range(pp_size):
             stage_ranks = ranks[stage * ranks_per_stage : (stage + 1) * ranks_per_stage]
+            stage_rank_tensor = torch.tensor(stage_ranks, dtype=torch.int64).reshape(ep_shard_size, ep_size)
+            _validate_axis_rank_order(stage_rank_tensor, (MeshAxisName.EP_SHARD, MeshAxisName.EP))
             stage_mesh = DeviceMesh(
                 device_mesh.device_type,
-                mesh=torch.tensor(stage_ranks, dtype=torch.int64).reshape(ep_shard_size, ep_size),
+                mesh=stage_rank_tensor,
                 mesh_dim_names=(MeshAxisName.EP_SHARD, MeshAxisName.EP),
                 backend_override=backend_override,
             )
