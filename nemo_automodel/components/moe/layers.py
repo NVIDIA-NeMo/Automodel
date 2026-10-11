@@ -915,28 +915,21 @@ class MoE(nn.Module):
             # shared experts run on a side stream: they only depend on ``x``, and under expert
             # parallelism the routed path spends most of its time in dispatch / combine
             # communication, which leaves SMs free for the shared-expert GEMMs (Megatron-Core's
-            # moe_shared_expert_overlap; same construction as Kimi K3's MoE). Autograd replays each
+            # moe_shared_expert_overlap; Kimi K3's MoE reuses the same helpers). Autograd replays each
             # backward op on the stream its forward op used, so the overlap also covers the
             # recompute and backward passes.
             z = None
             shared_stream = None
             if self.shared_experts is not None:
                 if self.backend.shared_expert_overlap and x.is_cuda:
-                    shared_stream = _shared_expert_stream(x.device)
-                    shared_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(shared_stream):
-                        z = self._shared_expert_output(x)
-                    # ``x`` was allocated on the current stream; keep its block alive for the side stream.
-                    x.record_stream(shared_stream)
+                    z, shared_stream = self._shared_experts_on_side_stream(x)
                 else:
                     z = self._shared_expert_output(x)
 
             # Routed experts on the main stream.
             y = self.experts(x_latent, token_mask, weights, indices)
             if shared_stream is not None:
-                current = torch.cuda.current_stream()
-                current.wait_stream(shared_stream)
-                z.record_stream(current)
+                self._join_shared_experts(z, shared_stream)
 
         if self.fc2_latent_proj is not None:
             # ``self.experts`` is its own FSDP unit; an ``output_dtype`` in the FSDP
@@ -955,6 +948,28 @@ class MoE(nn.Module):
         if self.shared_expert_gate is not None:
             z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
         return z
+
+    def _shared_experts_on_side_stream(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.cuda.Stream]:
+        """Run the shared experts for ``x`` on the per-device side stream.
+
+        Returns the shared-expert output and the stream it was computed on; the caller runs the routed
+        path on the current stream and then joins with ``_join_shared_experts``. Subclasses with their
+        own ``forward`` (Kimi K3) reuse both helpers so the stream choreography lives in one place.
+        """
+        stream = _shared_expert_stream(x.device)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            z = self._shared_expert_output(x)
+        # ``x`` was allocated on the current stream; keep its block alive for the side stream.
+        x.record_stream(stream)
+        return z, stream
+
+    @staticmethod
+    def _join_shared_experts(z: torch.Tensor, stream: torch.cuda.Stream) -> None:
+        """Make the current stream wait for the side-stream shared-expert output ``z``."""
+        current = torch.cuda.current_stream()
+        current.wait_stream(stream)
+        z.record_stream(current)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
