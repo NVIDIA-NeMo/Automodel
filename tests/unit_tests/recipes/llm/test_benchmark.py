@@ -126,6 +126,7 @@ def mock_config(monkeypatch):
 @pytest.fixture
 def mock_recipe(mock_config, monkeypatch):
     """Create a mock benchmarking recipe instance."""
+    monkeypatch.setattr(torch.cuda, "set_device", MagicMock())
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", MagicMock())
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", MagicMock())
     with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
@@ -1622,3 +1623,25 @@ def test_benchmark_memory_peaks_use_precollective_snapshot(tmp_path: Path, world
         nprocs=world_size,
         join=True,
     )
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_setup_selects_local_device_before_cuda_timer(initialized: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fresh workers select their GPU; existing distributed contexts stay untouched."""
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: initialized)
+    select_device = MagicMock()
+    monkeypatch.setattr(torch.cuda, "set_device", select_device)
+    recipe = object.__new__(BenchmarkingRecipeForNextTokenPrediction)
+
+    def observe_timer(name: str, log_level: int) -> None:
+        assert name == "setup" and log_level == 1
+        if initialized:
+            select_device.assert_not_called()
+        else:
+            select_device.assert_called_once_with(3)
+        raise RuntimeError("observed setup timer")
+
+    recipe.timers = observe_timer
+    with pytest.raises(RuntimeError, match="observed setup timer"):
+        recipe.setup()

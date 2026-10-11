@@ -22,6 +22,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.loss.utils import _count_label_tokens, _get_loss_ignore_index
 from nemo_automodel.components.training.timers import Timers
@@ -204,6 +205,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         This method calls the parent's setup() but adapts it for benchmarking purposes.
         It skips validation dataloader, checkpointing, and other training-specific features.
         """
+        # The CUDA timer synchronizes its current device before parent setup
+        # initializes distributed state. Select this worker's GPU first so
+        # every local worker does not create an extra context on device zero.
+        if not torch.distributed.is_initialized():
+            torch.cuda.set_device(get_local_rank_preinit())
         with self.timers("setup", log_level=1):
             # Call parent setup
             super().setup()
