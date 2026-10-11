@@ -83,7 +83,7 @@ export LLAMA_BASE_URL=http://localhost:8080/v1
 
 Disable thinking on the server, as shown above. The generator registers the user model with `reasoning: false` and opens its session with `thinkingLevel: "off"`, so it never sends the control that would turn thinking off at inference time. The packaged GGUF build answers without thinking anyway, which is why llama.cpp needs no flag, but a stock Qwen checkpoint served directly has it enabled by default. Leave it on and every generated user turn arrives wrapped in `</think>` and runs to thousands of characters instead of a short question, which lands in the persisted trace and then in the training data. The thinking block also stays in the message content rather than in a separate reasoning field, because the provider registration declares no reasoning support and the server parses none, so `lastAssistantText()` picks it up along with the question. On SGLang, disable thinking through the equivalent server-side option. As an alternative to the server flag, register the user model with Qwen chat-template compatibility (`reasoning: true` plus `compat.thinkingFormat: "qwen-chat-template"`) and keep the session thinking level off.
 
-Keep the following two things aligned. `LOCAL_MODELS` ships GGUF repository ids, which vLLM supports only partially and SGLang does not serve, so replace `LOCAL_MODELS[0]` with the unquantized repository you actually serve. The generator sends that entry as the model id, so the served model name has to match it exactly. The placeholder `apiKey: "no-key"` in the provider registration is harmless, because neither server requires a key by default.
+Keep the following two things aligned. `LOCAL_MODELS` ships GGUF repository IDs, which vLLM supports only partially and SGLang does not serve, so replace `LOCAL_MODELS[0]` with the unquantized repository you actually serve. The generator sends that entry as the model ID, so the served model name has to match it exactly. The placeholder `apiKey: "no-key"` in the provider registration is harmless, because neither server requires a key by default.
 
 </Tip>
 
@@ -362,6 +362,7 @@ tool_call_eval:
 
 <Warning>
 The full-SFT and LoRA configurations train on `train` and validate on `train[:256]`. The full-SFT tool-call evaluator uses `train[:128]`, so these evaluation rows overlap the training data. For a held-out comparison, set `dataset.split: train[256:]` in the configuration before training, leaving the validation and evaluation slices unchanged. Scores from the unmodified configurations measure performance on training examples.
+
 </Warning>
 
 <Note>

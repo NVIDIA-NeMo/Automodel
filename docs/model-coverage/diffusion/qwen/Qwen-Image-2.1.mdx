@@ -20,7 +20,7 @@ uv run --extra all torchrun --nproc-per-node=8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | Prepared image-text cache; 1 node; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml) |
+| Full Fine-Tuning | Prepared image-text cache; one node; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml) |
 | LoRA Fine-Tuning | Prepared image-text cache; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow_lora.yaml) |
 | Image Generation | Text prompts | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_21.yaml) |
 
@@ -94,6 +94,5 @@ The `qwen_image_21` adapter supervises only the target-image tokens of the joint
 ## Related Resources
 
 - [Qwen-Image](/model-coverage/diffusion/qwen/Qwen-Image)
-- [Diffusion fine-tuning guide](/recipes-e2e-examples/diffusion-fine-tuning)
-
+- [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning)
 - [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/d26bb61231c349cf6b7896fa83353113880e1ba3/transformer/config.json)

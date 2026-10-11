@@ -15,7 +15,7 @@ straight-through gradient.
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation). Allocate 8 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+Follow the [installation instructions](/get-started/installation). Allocate eight nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
 
 ```bash
 uv run torchrun --nnodes 8 --nproc-per-node 8 \
@@ -27,7 +27,7 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | HellaSwag; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml) |
+| Full Fine-Tuning | HellaSwag; eight nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml) |
 
 ## Model Context
 
@@ -37,7 +37,7 @@ checkpoint's 4B-parameter multi-token prediction (MTP) head.
 
 | Property | Value |
 |---|---|
-| **Task** | Text generation (MoE, hybrid attention, Engram N-gram Embedding) |
+| **Task** | Text Generation (MoE, hybrid attention, Engram N-gram Embedding) |
 | **Architecture** | `Qwen3_8_FlashNextForConditionalGeneration` |
 | **Parameters** | 125B backbone with 6B activated per token, plus the 51.2B Engram table; the checkpoint's 4B MTP head is not loaded |
 | **Decoder** | 48 layers: 36 GatedDeltaNet and 12 QSA sparse-attention layers |
@@ -73,7 +73,7 @@ checkpoint's 4B-parameter multi-token prediction (MTP) head.
 | Context parallelism | CP1 and CP8 at world size 128; CP was disabled in the EP64 baseline run below |
 | Tensor / pipeline parallelism | Disabled |
 | Workload | Non-packed right-tail-padded HellaSwag; packed (THD) Tulu-3 full-token SFT |
-| Scale | 8 nodes / 64 H100 baseline; 16 nodes / 128 H100 CP comparison |
+| Scale | eight nodes / 64 H100 baseline; 16 nodes / 128 H100 CP comparison |
 | Duration | 100 optimizer steps |
 
 The 100-step run reduced training loss from 3.0734 at step 0 to 1.8195 at step
@@ -179,7 +179,7 @@ optimizer steps and saves distributed checkpoints under
    not included in the standard `all` extra. The
    [AutoModel container build](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile)
    configures HybridEP's multi-node dependencies.
-2. Allocate 8 nodes with 8 GPUs each for this EP64 recipe. Make the repository,
+2. Allocate eight nodes with 8 GPUs each for this EP64 recipe. Make the repository,
    checkpoint, and dataset available on every node. Run from the repository
    root, setting `NODE_RANK` to a unique value from 0 through 7 and `MASTER_ADDR`
    to the address of node 0 reachable from every node. See the
@@ -201,5 +201,4 @@ optimizer steps and saves distributed checkpoints under
 - [DeepSeek Engram repository](https://github.com/deepseek-ai/Engram)
 - [Engram paper](https://arxiv.org/abs/2601.07372)
 - [Megatron-LM-FL trainable Engram implementation](https://github.com/flagos-ai/Megatron-LM-FL/blob/main/megatron/core/transformer/engram.py)
-
 - [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/de4b8e4d43b917e7706784d8bb445c9af86a3540/config.json)

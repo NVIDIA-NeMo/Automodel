@@ -10,7 +10,7 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-Prepare the cache as described in [Model Context](#model-context), then replace `/path/to/wan22_cache` below. From the repository root, run the high-noise stage on eight GPUs:
+Prepare the cache as described in [Model Context](#model-context), then replace `/path/to/wan22_cache` below. From the repository root, run the high-noise stage on 8 GPUs:
 
 ```bash
 uv run --extra diffusion torchrun --nproc-per-node=8 \
@@ -26,7 +26,7 @@ uv run --extra diffusion torchrun --nproc-per-node=8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | Prepared video cache; eight data-parallel ranks | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_2_t2v_flow.yaml) |
+| Full Fine-Tuning | Prepared video cache; 8 data-parallel ranks | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_2_t2v_flow.yaml) |
 | Video Generation | Text prompts and stage checkpoints | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_wan22.yaml) |
 
 ## Model Context
@@ -92,8 +92,7 @@ NeMo AutoModel fine-tunes the transformers **one at a time**. Run these commands
    ```
 
 <Note>
-
-The recipe uses Fully Sharded Data Parallel (FSDP2) with eight data-parallel ranks and activation checkpointing. It retains only the active transformer before device placement and sharding. The examples enable `fsdp.cpu_offload` to keep sharded parameters and optimizer state in host RAM.
+The recipe uses Fully Sharded Data Parallel (FSDP2) with 8 data-parallel ranks and activation checkpointing. It retains only the active transformer before device placement and sharding. The examples enable `fsdp.cpu_offload` to keep sharded parameters and optimizer state in host RAM.
 
 </Note>
 

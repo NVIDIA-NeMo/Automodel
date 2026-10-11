@@ -9,7 +9,7 @@ The Hugging Face configuration declares the `GptOssForCausalLM` architecture.
 
 ## Quick Start
 
-Complete the prerequisites in Model Context, then run this command from the repository root on each of 8 nodes with 8 GPUs per node:
+Complete the prerequisites in Model Context, then run this command from the repository root on each of eight nodes with 8 GPUs per node:
 
 ```bash
 uv run torchrun --nnodes 8 --nproc-per-node 8 \
@@ -21,8 +21,8 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | Pretrained weights; HellaSwag; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml) |
-| Training Benchmark | Initialized from configuration; synthetic data; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml) |
+| Full Fine-Tuning | Pretrained weights; HellaSwag; eight nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml) |
+| Training Benchmark | Initialized from configuration; synthetic data; eight nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml) |
 
 ## Model Context
 
@@ -30,7 +30,7 @@ gpt-oss-120b is used for text generation. It has 117B total parameters, with 5.1
 
 | Property | Value |
 | --- | --- |
-| Task | Text generation |
+| Task | Text Generation |
 | **Architecture** | `GptOssForCausalLM` |
 | Decoder Layers | 36 |
 | Hidden Size | 2,880 |
@@ -70,5 +70,5 @@ Full fine-tuning loads pretrained weights and enables checkpoint saving. The ben
 
 ## Related Resources
 
-- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [Checkpoint Configuration](https://huggingface.co/openai/gpt-oss-120b/blob/b5c939de8f754692c1647ca79fbf85e8c1e70f8a/config.json)

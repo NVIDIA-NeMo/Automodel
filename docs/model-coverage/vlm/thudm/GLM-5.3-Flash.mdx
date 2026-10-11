@@ -24,7 +24,7 @@ uv run torchrun --nnodes 9 --nproc-per-node 8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Vision-Language Fine-Tuning | MedPix-VQA; 9 nodes; CP2; EP72 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; nine nodes; CP2; EP72 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) |
 
 ## Model Context
 
@@ -101,7 +101,7 @@ assistant span together with its end-of-turn token as the loss target.
 | Parallelism | TP1 / PP1 / EP72 / CP2; HybridEP dispatch; four routed experts per GPU |
 | Workload | `mmoukouba/MedPix-VQA`, packed THD sequences of 2,048 tokens |
 | Batch | Local batch size 1, global batch size 144, four gradient-accumulation microsteps |
-| Scale | 9 nodes / 72 H100 GPUs |
+| Scale | nine nodes / 72 H100 GPUs |
 | Duration | 100 optimizer steps |
 
 ### Numerical Validation
@@ -202,7 +202,7 @@ uv pip install --no-build-isolation /tmp/FlashMLA
 
 Use the [Quick Start](#quick-start) command on each of the nine allocated
 nodes. For Slurm submission, adapt `slurm.sub` using the
-[Slurm Launcher Guide](/job-launchers/slurm-cluster), with nine nodes, eight
+[Slurm Launcher Guide](/job-launchers/slurm-cluster), with nine nodes, 8
 GPUs per node, and `CONFIG` set to the recipe path shown above.
 
 <Note>
@@ -213,7 +213,7 @@ If FlashMLA or cuDNN Frontend is unavailable, change
 
 ### Workflow Notes
 
-Fine-tune zai-org/GLM-5.3-Flash: [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml). 9 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+Fine-tune zai-org/GLM-5.3-Flash: [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml). Use nine nodes with 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

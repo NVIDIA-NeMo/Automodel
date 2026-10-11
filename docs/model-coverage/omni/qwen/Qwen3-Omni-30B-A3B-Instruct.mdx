@@ -4,13 +4,13 @@ description: "Use Qwen/Qwen3-Omni-30B-A3B-Instruct with NeMo AutoModel for multi
 slug: model-coverage/omni/qwen/Qwen3-Omni-30B-A3B-Instruct
 ---
 
-[Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) accepts text, images, audio, and video through a mixture-of-experts (MoE) Thinker-Talker architecture. NeMo AutoModel fine-tunes its Thinker stack for vision-language tasks and automatic speech recognition (ASR).
+[Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) accepts text, images, audio, and video through a Mixture-of-Experts (MoE) Thinker-Talker architecture. NeMo AutoModel fine-tunes its Thinker stack for vision-language tasks and automatic speech recognition (ASR).
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-Fine-tune the pretrained Thinker language model on MedPix-VQA with eight GPUs and eight-way expert parallelism (EP8). Review the [recipe prerequisites](#recipe-prerequisites), then run from the repository root:
+Fine-tune the pretrained Thinker language model on MedPix-VQA with 8 GPUs and 8-way expert parallelism (EP8). Review the [recipe prerequisites](#recipe-prerequisites), then run from the repository root:
 
 ```bash
 uv run --extra all --extra moe --extra vlm-media automodel --nproc-per-node=8 examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml
@@ -52,8 +52,8 @@ For the English ASR mixture, accept the GigaSpeech and SPGISpeech dataset terms 
 
 ### Fine-Tuning
 
-See the [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) for the shared MedPix data workflow and the
-[Qwen3-Omni ASR Fine-Tuning Guide](/recipes-e2e-examples/qwen3-omni-asr).
+See the [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) for the shared MedPix data workflow. See the
+[Qwen3-Omni ASR Fine-Tuning Guide](/recipes-e2e-examples/qwen3-omni-asr) for dataset access and preparation.
 
 ## Available Models
 
@@ -64,6 +64,5 @@ See the [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) for the s
 ## Related Resources
 
 - [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
-
 - [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/26291f793822fb6be9555850f06dfe95f2d7e695/config.json)
 - [Checkpoint Parameter Metadata](https://huggingface.co/api/models/Qwen/Qwen3-Omni-30B-A3B-Instruct/revision/26291f793822fb6be9555850f06dfe95f2d7e695)

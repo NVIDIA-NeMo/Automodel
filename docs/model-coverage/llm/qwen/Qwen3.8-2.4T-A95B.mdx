@@ -24,7 +24,7 @@ uv run torchrun --nnodes 64 --nproc-per-node 4 \
 
 ## Model Context
 
-Qwen3.8-2.4T-A95B is a mixture-of-experts (MoE) text model with hybrid attention.
+Qwen3.8-2.4T-A95B is a Mixture-of-Experts (MoE) text model with hybrid attention.
 
 | Property | Value |
 |---|---|
@@ -53,7 +53,7 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for cluster setup a
 - The text entry point uses the native Qwen3.8-2.4T-A95B CausalLM path.
 - The decoder combines attention, GatedDeltaNet linear attention, routed experts, shared experts, and optional multi-token prediction.
 - The HF state-dict adapter handles both grouped BF16 expert checkpoints and split block-FP8 per-expert checkpoints.
-- GatedDeltaNet state tensors that require fp32 precision keep the expected checkpoint contract.
+- GatedDeltaNet state tensors that require FP32 precision keep the expected checkpoint contract.
 
 ### Validated Configuration
 
@@ -80,5 +80,4 @@ The recipe loads pretrained weights and trains on `Rowan/hellaswag`. It sets `ch
 
 - [Qwen3.8-2.4T-A95B model card](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B)
 - [Qwen3.8-2.4T-A95B announcement](https://qwen.ai/blog?id=qwen3.8)
-
 - [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/blob/207bd685a7e3696cfaff12ded7c6a7ea0f88c996/config.json)

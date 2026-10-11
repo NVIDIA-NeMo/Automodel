@@ -6,7 +6,7 @@ slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V4.1-Flash
 
 [DeepSeek-V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 uses a 40-layer causal encoder/decoder Mixture-of-Experts (MoE) backbone with
-384 routed experts, one shared expert, and six selected experts per token. Its CSA2 attention shares
+384 routed experts, 1 shared expert, and 6 selected experts per token. Its CSA2 attention shares
 compressed KV and index state between Full, Reuse, and Reindex layers.
 Single-pass mHC carries four residual streams, and two trainable Engram tables
 at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
@@ -29,7 +29,7 @@ uv run torchrun --nnodes 16 --nproc-per-node 4 \
 | Full Fine-Tuning | HellaSwag; 16 nodes; EP64; GB200 cluster | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) |
 | Full Fine-Tuning | HellaSwag; 16 nodes; EP64; H100 cluster | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) |
 | Full Fine-Tuning | Tulu-3; 16 nodes; CP8; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp.yaml) |
-| LoRA Fine-Tuning | HellaSwag; 8 nodes; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_lora_h100_8nodes.yaml) |
+| LoRA Fine-Tuning | HellaSwag; eight nodes; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_lora_h100_8nodes.yaml) |
 | Full Fine-Tuning | Tulu-3; 32 nodes; CP8; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp8_h100_32nodes.yaml) |
 | Full Fine-Tuning (Packed Sequences) | Tulu-3; 64 nodes; CP8; EP64; 32,768-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) |
 
@@ -42,7 +42,7 @@ DeepSeek-V4.1-Flash is used for text generation. Its native backbone has approxi
 | Task | Text Generation |
 | **Architecture** | `DeepseekV41ForCausalLM` |
 | Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
-| Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
+| Reference Revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
 | Configuration | `DeepseekV41Config` with typed `text_config` and `vision_config` |
 | Transformer Layers | 40: 20 causal encoder layers and 20 decoder layers |
 | Hidden Size | 5,120 |
@@ -325,5 +325,4 @@ Read [deepseek_v41_flash_hellaswag_ep64_16nodes.yaml](https://github.com/NVIDIA-
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
-
 - [Checkpoint Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/2cba9e42aa026125f3ed06c6d98c1db82f7ca027/config.json)

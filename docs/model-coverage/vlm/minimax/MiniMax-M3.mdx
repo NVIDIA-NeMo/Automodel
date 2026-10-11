@@ -4,7 +4,7 @@ description: "Fine-tune MiniMaxAI/MiniMax-M3 text-only on Tulu-3 or with MedPix 
 slug: model-coverage/vision-language-models/minimax/MiniMax-M3
 ---
 
-[MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) is a mixture-of-experts (MoE) vision-language model with approximately 428 billion total parameters and 23 billion active parameters. Use NeMo AutoModel to fine-tune it on MedPix image-question pairs or Tulu-3 text conversations.
+[MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) is a Mixture-of-Experts (MoE) vision-language model with approximately 428 billion total parameters and 23 billion active parameters. Use NeMo AutoModel to fine-tune it on MedPix image-question pairs or Tulu-3 text conversations.
 
 ## Quick Start
 
@@ -23,7 +23,7 @@ uv run --no-sync torchrun --nnodes 16 --nproc-per-node 8 \
 | Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) |
 | Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; CP2; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp2_medpix_2k.yaml) |
 | Text Fine-Tuning | Tulu-3; 16 nodes; PP4; CP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml) |
-| LoRA Fine-Tuning | MedPix-VQA; 8 nodes; PP4; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml) |
+| LoRA Fine-Tuning | MedPix-VQA; eight nodes; PP4; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml) |
 
 ## Model Context
 
@@ -32,7 +32,7 @@ MiniMax-M3 accepts text, images, and video as input and generates text. The chec
 | Property | Value |
 |---|---|
 | **Task** | Image-Text-to-Text and Video-Text-to-Text |
-| **Architecture** | `MiniMaxM3SparseForConditionalGeneration` - approximately 428B total and 23B active parameters |
+| **Architecture** | `MiniMaxM3SparseForConditionalGeneration`: approximately 428B total and 23B active parameters |
 | **Language Module** | MiniMax-M2.7 backbone, 60 layers, 128 experts, MiniMax Sparse Attention (MSA) |
 | **Vision Module** | CLIP-style vision transformer (ViT), 32 layers, image size 336x336 up to 2016x2016 |
 | **Recipe Precision** | BF16 |
@@ -81,5 +81,4 @@ See the [MiniMax-M3 fine-tuning guide](/recipes-e2e-examples/minimax-m3) for add
 ## Related Resources
 
 - [MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3)
-
 - [Checkpoint Configuration](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/config.json)

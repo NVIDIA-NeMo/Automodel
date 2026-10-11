@@ -24,9 +24,9 @@ uv run automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Text Fine-Tuning | Tulu-3; 4 nodes; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml) |
-| Packed Text Fine-Tuning | Tulu-3; 4 nodes; CP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_cp8_100steps.yaml) |
-| LoRA Fine-Tuning | CORD-v2; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml) |
+| Text Fine-Tuning | Tulu-3; four nodes; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml) |
+| Packed Text Fine-Tuning | Tulu-3; four nodes; CP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_cp8_100steps.yaml) |
+| LoRA Fine-Tuning | CORD-v2; one node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml) |
 
 ## Model Context
 
@@ -54,9 +54,9 @@ the vision implementation supplied by each checkpoint. It constructs `sound_enco
 (the same task as the [NemotronOmni CORD-v2 guide](/recipes-e2e-examples/nemotron-omni)) with LoRA adapters
 instead of full supervised fine-tuning (SFT). Freezing the base weights removes their FP32 master
 weights and optimizer states. The documented LoRA example uses one node with 8 H100 GPUs
-(`cp_size: 1`, `ep_size: 8`); the full SFT example uses 4 nodes. These are example configurations.
+(`cp_size: 1`, `ep_size: 8`); the full SFT example uses four nodes. These are example configurations.
 
-The following results are reported in the [Nemotron 3.5 Super VL fine-tuning guide](/recipes-e2e-examples/nemotron-3-5-super-vl).
+The following results are reported in the [Nemotron 3.5 Super VL fine-tuning guide](/recipes-e2e-examples/nemotron-3-5-super-vl):
 
 | Property | Value |
 | --- | --- |
@@ -70,7 +70,7 @@ The following results are reported in the [Nemotron 3.5 Super VL fine-tuning gui
 
 ### Launch the Multi-Node Text Example
 
-The Tulu-3 text example uses 4 nodes with 8 GPUs each. On every node, set `MASTER_ADDR` to
+The Tulu-3 text example uses four nodes with 8 GPUs each. On every node, set `MASTER_ADDR` to
 node 0's reachable hostname or IP address and `NODE_RANK` to that node's unique rank (0 through 3).
 Run from the same repository checkout and environment on all four nodes:
 
@@ -109,4 +109,4 @@ for its data, backend, and checkpoint settings. It saves adapters under
 
 ## Related Resources
 
-- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+[VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)

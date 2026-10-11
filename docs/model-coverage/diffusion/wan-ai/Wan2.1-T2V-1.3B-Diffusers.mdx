@@ -13,7 +13,7 @@ The 1.3B fine-tuning configuration uses 16 data-parallel ranks. Use the
 
 ## Quick Start
 
-Complete the prerequisites in [Model Context](#model-context). Allocate two nodes with eight GPUs each. Set `NODE_RANK` to `0` or `1` and `MASTER_ADDR` to node 0's reachable address. From the repository root, run this command on both nodes:
+Complete the prerequisites in [Model Context](#model-context). Allocate two nodes with 8 GPUs each. Set `NODE_RANK` to `0` or `1` and `MASTER_ADDR` to node 0's reachable address. From the repository root, run this command on both nodes:
 
 ```bash
 uv run torchrun --nnodes 2 --nproc-per-node 8 \

@@ -4,11 +4,11 @@ description: "Fine-tune tencent/HunyuanImage-3.0, an 80B MoE text-to-image trans
 slug: model-coverage/diffusion/tencent/HunyuanImage-3.0
 ---
 
-[HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0) is Tencent's text-to-image model with a multimodal mixture-of-experts (MoE) decoder. NeMo AutoModel provides recipes for low-rank adaptation (LoRA), full fine-tuning, and image generation using its native transformer implementation.
+[HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0) is Tencent's text-to-image model with a multimodal Mixture-of-Experts (MoE) decoder. NeMo AutoModel provides recipes for low-rank adaptation (LoRA), full fine-tuning, and image generation using its native transformer implementation.
 
 ## Quick Start
 
-Run text-to-image LoRA fine-tuning on your cached images and captions with eight GPUs on one node. Complete the installation and data preparation below, including Transformer Engine, then set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the YAML. From the repository root, launch one rank per GPU:
+Run text-to-image LoRA fine-tuning on your cached images and captions with 8 GPUs on one node. Complete the installation and data preparation below, including Transformer Engine, then set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the YAML. From the repository root, launch one rank per GPU:
 
 ```bash
 uv run torchrun --nproc-per-node=8 \
@@ -20,9 +20,9 @@ uv run torchrun --nproc-per-node=8 \
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Fine-Tuning | Cached images and captions; one node, eight GPUs, eight-way expert parallelism | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) |
-| Full Fine-Tuning | Cached images and captions; four nodes, eight GPUs each | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow.yaml) |
-| Text-to-Image Generation | Configured prompts; eight-GPU launch with eight-way expert parallelism | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_hunyuan_image3.yaml) |
+| LoRA Fine-Tuning | Cached images and captions; one node, 8 GPUs, 8-way expert parallelism | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) |
+| Full Fine-Tuning | Cached images and captions; four nodes, 8 GPUs each | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow.yaml) |
+| Text-to-Image Generation | Configured prompts; 8-GPU launch with 8-way expert parallelism | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_hunyuan_image3.yaml) |
 
 ## Model Context
 
@@ -78,7 +78,7 @@ Captions follow the image processors' JSONL convention: place `<stem>_internvl.j
 
 Each cache sample contains:
 
-- `latent`: `[32, height / 16, width / 16]` (fp32, scaled by the VAE scaling factor)
+- `latent`: `[32, height / 16, width / 16]` (FP32, scaled by the VAE scaling factor)
 - `prompt_input_ids`: token ids before the image span, ending in `<timestep>`
 - `uncond_prompt_input_ids`: the same with the prompt replaced by `<cfg>` tokens
 - `prompt_suffix_ids`: token ids after the image span (`<eoi>`)
@@ -88,9 +88,9 @@ The `hunyuan_image3` flow-matching adapter assembles `prefix + <img> * (h * w) +
 
 ### Train the Model
 
-Set `data.dataloader.cache_dir` to the preprocessing output and `checkpoint.checkpoint_dir` to your checkpoint destination. The LoRA recipe specifies one node with eight GPUs and eight-way expert parallelism; launch it with the Quick Start command. These are example topology settings, not a measured GPU memory requirement.
+Set `data.dataloader.cache_dir` to the preprocessing output and `checkpoint.checkpoint_dir` to your checkpoint destination. The LoRA recipe specifies one node with 8 GPUs and 8-way expert parallelism; launch it with the Quick Start command. These are example topology settings, not a measured GPU memory requirement.
 
-The full fine-tuning recipe specifies four nodes with eight GPUs each and eight-way expert parallelism. Its comments estimate about 1.1 TB of training state for all 80B parameters with FP32-precision master weights and Adam moments; this is not a measured peak-memory value.
+The full fine-tuning recipe specifies four nodes with 8 GPUs each and 8-way expert parallelism. Its comments estimate about 1.1 TB of training state for all 80B parameters with FP32-precision master weights and Adam moments; this is not a measured peak-memory value.
 
 Use the same checkout, configuration, and accessible data and checkpoint paths on all four nodes. Set `NODE_RANK` to a different value from `0` through `3` on each node and `MASTER_ADDR` to the hostname or IP address of node `0`. Run this command on every node:
 
@@ -105,7 +105,7 @@ Both recipes keep the router in FP32 (`gate_precision: float32`), train with `fl
 
 ### Generate Images
 
-`examples/diffusion/generate/generate.py` samples with the native transformer, sharded across the launched ranks as in training, and the release's VAE, prompt format and `flow_shift` from the checkpoint. Sampling follows the release pipeline: Euler steps on the shifted sigma schedule with classifier-free guidance over a `[prompt, <cfg>]` batch. Every rank samples the same prompts:
+`examples/diffusion/generate/generate.py` samples with the native transformer, sharded across the launched ranks as in training. It uses the release's VAE, prompt format, and `flow_shift` from the checkpoint. Sampling follows the release pipeline: Euler steps on the shifted sigma schedule with classifier-free guidance over a `[prompt, <cfg>]` batch. Every rank samples the same prompts:
 
 ```bash
 uv run torchrun --nproc-per-node=8 \

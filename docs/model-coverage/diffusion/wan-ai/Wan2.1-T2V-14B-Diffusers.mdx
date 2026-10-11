@@ -1,17 +1,17 @@
 ---
 title: "Wan-AI/Wan2.1-T2V-14B-Diffusers"
-description: "Use NeMo AutoModel to fine-tune Wan-AI/Wan2.1-T2V-14B-Diffusers for Diffusion workflows with checked-in text to video recipes and documented distributed settings."
+description: "Use NeMo AutoModel to fine-tune Wan-AI/Wan2.1-T2V-14B-Diffusers for diffusion workflows with checked-in text-to-video recipes and documented distributed settings."
 slug: model-coverage/diffusion/wan-ai/Wan2.1-T2V-14B-Diffusers
 ---
 
-[Wan2.1-T2V-14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) has a checked-in NeMo AutoModel recipe for text to video.
+[Wan2.1-T2V-14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) has a checked-in NeMo AutoModel recipe for text-to-video.
 
 ## Quick Start
 
 Follow the [installation instructions](/get-started/installation) and the
 [diffusion setup and data preparation guide](/recipes-e2e-examples/diffusion-fine-tuning).
 Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the recipe,
-then run from the repository root on eight GPUs:
+then run from the repository root on 8 GPUs:
 
 ```bash
 uv run torchrun --nproc-per-node=8 \
@@ -28,11 +28,11 @@ uv run torchrun --nproc-per-node=8 \
 
 ## Model Context
 
-Wan2.1-T2V-14B-Diffusers is used for text to video. Its model size is 14.29B checkpoint parameters.
+Wan2.1-T2V-14B-Diffusers is used for text-to-video. Its model size is 14.29B checkpoint parameters.
 
 | Property | Value |
 | --- | --- |
-| Task | Text to video |
+| Task | Text-to-Video |
 | Parameters | 14.29B checkpoint parameters |
 | Transformer Blocks | 40 |
 | Hidden Size | 5,120 |
@@ -49,7 +49,7 @@ adapters with rank 64 and requires Transformer Engine for its configured optimiz
 | --- | --- |
 | Hardware | GPU model and memory are not specified in these recipes. |
 | Strategy | Fully Sharded Data Parallel v2 (FSDP2); `dp_size: 8`, `dp_replicate_size: 1`; tensor, context, and pipeline parallel sizes are 1. |
-| Nodes | The Quick Start launches on one node with eight GPUs. |
+| Nodes | The Quick Start launches on one node with 8 GPUs. |
 | Features | Checkpoint saving and compilation enabled; activation checkpointing disabled. |
 | Advanced | Full fine-tuning: `float32` model storage and `bfloat16` compute. LoRA: `bfloat16` base weights and compute by default. Both recipes use `bfloat16` gradient reduction. |
 
@@ -65,6 +65,5 @@ adapters with rank 64 and requires Transformer Engine for its configured optimiz
 
 ## Related Resources
 
-- [Diffusion fine-tuning guide](/recipes-e2e-examples/diffusion-fine-tuning)
-
+- [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning)
 - [Checkpoint Configuration](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers/blob/38ec498cb3208fb688890f8cc7e94ede2cbd7f68/transformer/config.json)

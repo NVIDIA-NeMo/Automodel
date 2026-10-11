@@ -4,7 +4,7 @@ description: "Use google/diffusiongemma-26B-A4B-it with NeMo AutoModel for diffu
 slug: model-coverage/dllm/google/diffusiongemma-26B-A4B-it
 ---
 
-[DiffusionGemma](https://huggingface.co/google/diffusiongemma-26B-A4B-it) is a block-diffusion language model from Google. Instead of generating tokens left-to-right, it denoises a fixed-length canvas of tokens in parallel: a causal encoder reads the prompt and a bidirectional decoder iteratively refines the response canvas. The released checkpoint is a mixture-of-experts (MoE) model with 26B total parameters and ~4B active per token.
+[DiffusionGemma](https://huggingface.co/google/diffusiongemma-26B-A4B-it) is a block-diffusion language model from Google. Instead of generating tokens left-to-right, it denoises a fixed-length canvas of tokens in parallel: a causal encoder reads the prompt and a bidirectional decoder iteratively refines the response canvas. The released checkpoint is a Mixture-of-Experts (MoE) model with 26B total parameters and ~4B active per token.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
@@ -20,7 +20,7 @@ uv run automodel examples/dllm_sft/diffusion_gemma_sft.yaml --nproc-per-node 8
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | Prepared GSM8K chat data; 1 node; expert parallelism (EP=8) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) |
+| Full Fine-Tuning | Prepared GSM8K chat data; one node; expert parallelism (EP=8) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) |
 | LoRA Fine-Tuning | Prepared GSM8K chat data; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_lora.yaml) |
 
 ## Model Context
@@ -56,7 +56,6 @@ uv run python examples/dllm_sft/prep_gsm8k.py
 ```
 
 <Note>
-
 This recipe was validated with **Expert Parallelism (EP=8)** on a single 8xH100 node. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
 
 </Note>
@@ -73,7 +72,7 @@ uv run automodel examples/dllm_sft/diffusion_gemma_lora.yaml --nproc-per-node 8
 
 ### Workflow Notes
 
-Fine-tune `google/diffusiongemma-26B-A4B-it` with [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) on one node with eight GPUs. See [Recipe Setup](#recipe-setup).
+Fine-tune `google/diffusiongemma-26B-A4B-it` with [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) on one node with 8 GPUs. See [Recipe Setup](#recipe-setup).
 
 ## Available Models
 
@@ -84,5 +83,4 @@ Fine-tune `google/diffusiongemma-26B-A4B-it` with [diffusion_gemma_sft.yaml](htt
 ## Related Resources
 
 - [DiffusionGemma Fine-Tuning Guide](/recipes-e2e-examples/diffusiongemma)
-
 - [Checkpoint Configuration](https://huggingface.co/google/diffusiongemma-26B-A4B-it/blob/f7f5b7f5fa82ffc52addd066915886d497f5517b/config.json)

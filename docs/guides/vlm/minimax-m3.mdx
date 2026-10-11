@@ -5,7 +5,7 @@ description: "Prepare multimodal data and launch MiniMax-M3 supervised fine-tuni
 
 ## Introduction
 
-[MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) is MiniMaxAI's mixture-of-experts (MoE) vision-language model combining long-context reasoning, agentic workflows, and creative capabilities in a single platform. The [upstream model card](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/README.md) reports approximately 428B total parameters and 23B active parameters. The multimodal MoE model evolved from MiniMax M2 along three axes — width, attention, and visual grounding.
+[MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) is MiniMaxAI's Mixture-of-Experts (MoE) vision-language model combining long-context reasoning, agentic workflows, and creative capabilities in a single platform. The [upstream model card](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/README.md) reports approximately 428B total parameters and 23B active parameters. The multimodal MoE model evolved from MiniMax M2 along three axes: width, attention, and visual grounding.
 
 MiniMaxAI describes MiniMax-M3's long-horizon agentic coding and cowork capabilities in the [upstream model card](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/README.md).
 
@@ -17,7 +17,7 @@ To set up your environment to fine-tune this model with NeMo AutoModel, follow t
 
 - **Model type:** MoE vision-language model with approximately 428B total parameters and 23B active parameters.
 - **Language module:** MiniMax-M2.7 backbone with 60 layers (3 dense and 57 MoE), 64 attention heads, 128 experts, block-sparse attention on the MoE layers, and a 1M-token context window.
-- **Vision module:**  CLIP-style ViT with 32 layers and dynamic resolution image input from 336×336 up to 2016×2016
+- **Vision module:** CLIP-style ViT with 32 layers and dynamic resolution image input from 336×336 up to 2016×2016.
 - **Fine-tuning precision:** The recipes linked below load BF16 model weights (`model.torch_dtype: bfloat16`).
 
 The [upstream checkpoint configuration](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/config.json) sets `max_position_embeddings` to 1,048,576. The fine-tuning recipes linked below set the data collator's `max_length` to 2,048; the model's context window does not describe the sequence length used by these recipes.
@@ -28,10 +28,10 @@ The [upstream checkpoint configuration](https://huggingface.co/MiniMaxAI/MiniMax
 
 Use image and video instruction data that matches the target agent workflow. Good candidates include:
 
-- frontend mockup-to-project examples,
-- screenshot-debugging conversations,
-- structured data-processing tasks with visual context,
-- image and video question-answer pairs for bounded task execution.
+- Frontend mockup-to-project examples.
+- Screenshot-debugging conversations.
+- Structured data-processing tasks with visual context.
+- Image and video question-answer pairs for bounded task execution.
 
 For a full walkthrough of how multimodal datasets are preprocessed and integrated into NeMo AutoModel, including chat-template conversion and collate functions, see the [Multi-Modal Dataset Guide](/datasets/multi-modal-dataset).
 
@@ -39,8 +39,8 @@ For a full walkthrough of how multimodal datasets are preprocessed and integrate
 
 For Slurm batch jobs, multi-node configuration, and environment variables, follow the [Run on a Cluster](/job-launchers/slurm-cluster) guide. Choose one of the checked-in recipes:
 
-- The [full supervised fine-tuning (SFT) recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) provides an example topology of 16 nodes with eight H100 GPUs per node, pipeline parallelism of 4, and expert parallelism of 32.
-- The [low-rank adaptation (LoRA) recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml) uses eight nodes with eight GPUs per node, pipeline parallelism of 4, and expert parallelism of 8.
+- The [full supervised fine-tuning (SFT) recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) provides an example topology of 16 nodes with 8 H100 GPUs per node, pipeline parallelism of 4, and expert parallelism of 32.
+- The [low-rank adaptation (LoRA) recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml) uses eight nodes with 8 GPUs per node, pipeline parallelism of 4, and expert parallelism of 8.
 
 These are the supplied recipe configurations. Both use BF16 model weights and the HybridEP dispatcher.
 
@@ -56,7 +56,7 @@ The full SFT recipe enables checkpoint saving with `checkpoint.enabled: true`. T
 
 ### Launch From a Slurm Allocation
 
-Run this skeleton inside an existing allocation with 16 nodes and eight GPUs per node for the full SFT recipe. For LoRA, use the LoRA recipe and an allocation with eight nodes and eight GPUs per node. Replace the image and shared-directory placeholders with your cluster paths. The command starts one `torchrun` process per node, with all nodes joining the same rendezvous.
+Run this skeleton inside an existing allocation with 16 nodes and 8 GPUs per node for the full SFT recipe. For LoRA, use the LoRA recipe and an allocation with eight nodes and 8 GPUs per node. Replace the image and shared-directory placeholders with your cluster paths. The command starts one `torchrun` process per node, with all nodes joining the same rendezvous.
 
 ```bash
 export TRANSFORMERS_OFFLINE=1
