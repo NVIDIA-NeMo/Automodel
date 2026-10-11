@@ -27,6 +27,7 @@ from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScale
 from nemo_automodel.components.utils.flops_utils import llama2_flops
 from nemo_automodel.recipes.llm.benchmark import (
     BenchmarkingRecipeForNextTokenPrediction,
+    _CudaMemoryPeak,
     _infer_vocab_size,
     _IterationMetrics,
     main,
@@ -136,6 +137,14 @@ def mock_recipe(mock_config, monkeypatch):
         recipe.dist_env.world_size = 8
         recipe.dist_env.device = torch.device("cpu")
         recipe.dist_env.is_main = True
+        monkeypatch.setattr(
+            recipe,
+            "_collect_cuda_memory_peaks",
+            lambda: [
+                _CudaMemoryPeak(rank, (rank + 1) * 1024, (rank + 1) * 2048)
+                for rank in range(recipe.dist_env.world_size)
+            ],
+        )
         recipe.model_parts = [MagicMock()]
         recipe.model_parts[0].config = LlamaConfig(
             hidden_size=768,
@@ -815,6 +824,17 @@ class TestBenchmarkingRecipeJSONOutput:
         assert summary_data["seq_len"] == 2048
         assert "avg_iter_time_seconds" in summary_data
         assert "avg_mfu_percent" in summary_data
+        assert (
+            summary_data["cuda_memory_peak_scope"] == "setup_warmup_and_measured_iterations_before_summary_collectives"
+        )
+        assert len(summary_data["cuda_memory_peaks"]) == 8
+        assert summary_data["cuda_memory_peaks"][7] == {
+            "rank": 7,
+            "max_allocated_bytes": 8192,
+            "max_reserved_bytes": 16384,
+        }
+        assert summary_data["cuda_max_allocated_bytes"] == 8192
+        assert summary_data["cuda_max_reserved_bytes"] == 16384
 
     def test_log_benchmark_summary_skips_json_when_none(self, mock_recipe, tmp_path):
         """Test that JSON output is skipped when path is None."""
@@ -1374,9 +1394,7 @@ packed_sequence:
 
 
 @pytest.mark.parametrize("world_size", [1, 8, 128])
-def test_summary_uses_sum_of_actual_work_and_slowest_rank_times(
-    mock_recipe, tmp_path: Path, world_size: int
-) -> None:
+def test_summary_uses_sum_of_actual_work_and_slowest_rank_times(mock_recipe, tmp_path: Path, world_size: int) -> None:
     """Warmup, rank-zero active_time and the final pack's FLOPs cannot bias the summary."""
     import json
 
@@ -1402,11 +1420,11 @@ def test_summary_uses_sum_of_actual_work_and_slowest_rank_times(
     assert result["tflops_per_gpu"] == 3500.0 / world_size
     assert result["avg_mfu_percent"] == pytest.approx(7000 / (world_size * 10 * 989) * 100)
     assert result["all_token_head_mfu_percent"] == pytest.approx(7500 / (world_size * 10 * 989) * 100)
-    scalar_metrics = next(
-        call.args[0] for call in wandb_log.call_args_list if "summary/tflops_per_gpu" in call.args[0]
-    )
+    scalar_metrics = next(call.args[0] for call in wandb_log.call_args_list if "summary/tflops_per_gpu" in call.args[0])
     assert scalar_metrics["summary/mean_tflops_per_step"] == 3500.0
     assert scalar_metrics["summary/tflops_per_gpu"] == 3500.0 / world_size
+    assert scalar_metrics["summary/cuda_max_allocated_bytes"] == 1024 * world_size
+    assert scalar_metrics["summary/cuda_max_reserved_bytes"] == 2048 * world_size
     assert [item["seconds"] for item in result["iterations"]] == [100.0, 4.0, 6.0]
 
 
@@ -1554,3 +1572,45 @@ def test_loaded_model_audit_is_read_only_and_samples_noncontiguous_parameters(tm
     assert tensors["empty"]["sample_values"] == []
     for name, tensor in model.state_dict().items():
         torch.testing.assert_close(tensor, before[name])
+
+
+def _benchmark_memory_peak_worker(rank: int, rendezvous: str, world_size: int) -> None:
+    """Real Gloo collection with CUDA counters modeled before temporary allocation."""
+    torch.distributed.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    recipe = object.__new__(BenchmarkingRecipeForNextTokenPrediction)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=world_size)
+    peaks = [1024 * (rank + 1), 4096 * (rank + 1)]
+    tensor_factory = torch.tensor
+
+    def allocate_collective_buffer(data: list[int], *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        # The reporting buffers must not increase the snapshot being reported.
+        peaks[:] = [10**9, 2 * 10**9]
+        return tensor_factory(data, dtype=dtype, device=device)
+
+    try:
+        with (
+            patch.object(torch.cuda, "max_memory_allocated", side_effect=lambda device: peaks[0]),
+            patch.object(torch.cuda, "max_memory_reserved", side_effect=lambda device: peaks[1]),
+            patch.object(torch.cuda, "reset_peak_memory_stats", side_effect=AssertionError("must not reset peaks")),
+            patch.object(torch, "tensor", side_effect=allocate_collective_buffer),
+        ):
+            result = recipe._collect_cuda_memory_peaks()
+        assert result == [_CudaMemoryPeak(peer, 1024 * (peer + 1), 4096 * (peer + 1)) for peer in range(world_size)]
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+@pytest.mark.runtime_budget(
+    90, hard_timeout=300, reason="Spawned benchmark imports isolate distributed workers from prior autograd threads."
+)
+def test_benchmark_memory_peaks_use_precollective_snapshot(tmp_path: Path, world_size: int) -> None:
+    """Every global rank's bytes survive aggregation without counting reporting buffers."""
+    torch.multiprocessing.spawn(
+        _benchmark_memory_peak_worker,
+        args=((tmp_path / "memory_peaks_rendezvous").as_uri(), world_size),
+        nprocs=world_size,
+        join=True,
+    )
