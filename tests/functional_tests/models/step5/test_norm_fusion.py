@@ -51,13 +51,14 @@ def _time_cuda(call: Callable[[], object]) -> float:
 
 
 @pytest.mark.parametrize("sequence", [4096, 8192])
-@pytest.mark.parametrize("kind", ["residual", "query", "key", "final"])
+@pytest.mark.parametrize("kind", ["residual", "residual_cast", "query", "key", "final"])
 def test_norm_cuda_forward_backward_recompute(sequence: int, kind: str, record_property) -> None:
     torch.manual_seed(983)
     shape = (1, sequence, 64, 192) if kind == "query" else (1, sequence, 4096)
     if kind == "key":
         shape = (1, sequence, 4, 192)
-    dtype = torch.float32 if kind == "residual" else torch.bfloat16
+    dtype = torch.float32 if kind in ("residual", "residual_cast") else torch.bfloat16
+    output_dtype = torch.bfloat16 if kind == "residual_cast" else dtype
     reference = Step3p5RMSNorm(shape[-1]).cuda()
     candidate = Step5RMSNorm(shape[-1], compile_norm=True).cuda()
     with torch.no_grad():
@@ -67,11 +68,11 @@ def test_norm_cuda_forward_backward_recompute(sequence: int, kind: str, record_p
     if kind == "key":
         # Actual key projection is a strided slice of interleaved GQA QKV.
         original = torch.randn(1, sequence, 4, 18, 192, device="cuda", dtype=dtype)[..., 16, :]
-    upstream = torch.randn_like(original)
+    upstream = torch.randn_like(original, dtype=output_dtype)
     expected_input = original.detach().requires_grad_()
     actual_input = original.detach().requires_grad_()
-    expected = reference(expected_input)
-    actual = candidate(actual_input)
+    expected = reference(expected_input).to(output_dtype)
+    actual = candidate(actual_input, output_dtype=output_dtype)
     expected_grads = torch.autograd.grad(expected, (expected_input, reference.weight), upstream)
     actual_grads = torch.autograd.grad(actual, (actual_input, candidate.weight), upstream)
     rows = {}
@@ -83,11 +84,11 @@ def test_norm_cuda_forward_backward_recompute(sequence: int, kind: str, record_p
         assert rows[name]["relative_l2"] < 0.002, (name, rows[name])
         assert rows[name]["max_over_rms"] < 0.05, (name, rows[name])
     with torch.no_grad():
-        inference = candidate(original)
+        inference = candidate(original, output_dtype=output_dtype)
     rows["grad_no_grad"] = _metrics(inference, actual.detach())
     assert torch.equal(inference, actual.detach()), rows["grad_no_grad"]
     replay_input = original.detach().requires_grad_()
-    replay = checkpoint(candidate, replay_input, use_reentrant=False)
+    replay = checkpoint(candidate, replay_input, use_reentrant=False, output_dtype=output_dtype)
     replay_grads = torch.autograd.grad(replay, (replay_input, candidate.weight), upstream)
     for observed, control in zip((replay, *replay_grads), (actual, *actual_grads)):
         torch.testing.assert_close(observed, control, rtol=0, atol=0)
@@ -95,10 +96,14 @@ def test_norm_cuda_forward_backward_recompute(sequence: int, kind: str, record_p
 
     # Bracket the optimized call with the same eager control; never assert timing.
     def baseline_step() -> tuple[torch.Tensor, ...]:
-        return torch.autograd.grad(reference(expected_input), (expected_input, reference.weight), upstream)
+        return torch.autograd.grad(
+            reference(expected_input).to(output_dtype), (expected_input, reference.weight), upstream
+        )
 
     def candidate_step() -> tuple[torch.Tensor, ...]:
-        return torch.autograd.grad(candidate(actual_input), (actual_input, candidate.weight), upstream)
+        return torch.autograd.grad(
+            candidate(actual_input, output_dtype=output_dtype), (actual_input, candidate.weight), upstream
+        )
 
     record_property(
         "cuda_fwb_ms",

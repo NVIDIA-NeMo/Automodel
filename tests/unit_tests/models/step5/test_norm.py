@@ -56,3 +56,21 @@ def test_norm_preserves_fp32_weight_and_residual_boundaries() -> None:
     assert not torch.equal(correct, early_cast)
     assert not torch.equal(correct, rounded_weight)
     assert torch.equal(module(residual), Step3p5RMSNorm.forward(module, residual))
+
+
+def test_residual_norm_cast_keeps_input_and_parameter_gradients() -> None:
+    torch.manual_seed(986)
+    module = Step5RMSNorm(192, compile_norm=True)
+    with torch.no_grad():
+        module.weight.copy_(torch.linspace(-0.7, 0.7, 192) + 0.00123)
+    residual = torch.randn(2, 17, 192, requires_grad=True)
+    expected = Step3p5RMSNorm.forward(module, residual).bfloat16()
+    actual = module(residual, output_dtype=torch.bfloat16)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    upstream = torch.randn_like(actual)
+    expected_grads = torch.autograd.grad(expected, (residual, module.weight), upstream)
+    actual_grads = torch.autograd.grad(actual, (residual, module.weight), upstream)
+    for observed, reference in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(observed, reference, rtol=0, atol=0)
+    assert actual.dtype == torch.bfloat16
+    assert residual.dtype == module.weight.dtype == torch.float32

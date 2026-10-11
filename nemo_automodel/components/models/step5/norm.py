@@ -19,11 +19,11 @@ import torch
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 
 
-def _rms_norm(hidden: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Normalize [..., width] in FP32 before rounding once to the input dtype."""
+def _rms_norm(hidden: torch.Tensor, weight: torch.Tensor, eps: float, output_dtype: torch.dtype) -> torch.Tensor:
+    """Normalize [..., width] in FP32 before rounding once to the output dtype."""
     raw = hidden.float()
     normalized = raw * torch.rsqrt(raw.square().mean(-1, keepdim=True) + eps)
-    return (normalized * (weight.float() + 1)).to(hidden.dtype)
+    return (normalized * (weight.float() + 1)).to(output_dtype)
 
 
 _rms_norm_compiled = torch.compile(
@@ -50,7 +50,17 @@ class Step5RMSNorm(Step3p5RMSNorm):
         super().__init__(hidden_size, eps)
         self.compile_norm = compile_norm
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Normalize [..., hidden_size], preserving input shape and dtype."""
+    def forward(self, hidden: torch.Tensor, *, output_dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Normalize [..., hidden_size] before the optional projection-input cast.
+
+        Args:
+            hidden: Activations with the normalized feature axis last. Decoder
+                residual inputs remain FP32 through normalization.
+            output_dtype: Final output dtype; defaults to the input dtype.
+
+        Returns:
+            Normalized activations with the input shape. The learned FP32 scale
+            and every intermediate retain their original precision.
+        """
         core = _rms_norm_compiled if self.compile_norm and hidden.is_cuda else _rms_norm
-        return core(hidden, self.weight, self.variance_epsilon)
+        return core(hidden, self.weight, self.variance_epsilon, hidden.dtype if output_dtype is None else output_dtype)

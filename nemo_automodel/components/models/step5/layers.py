@@ -403,14 +403,14 @@ class Step5DecoderLayer(nn.Module):
         Returns:
             FP32 tensor of shape [batch, local_sequence, hidden].
         """
-        normed = self.input_layernorm(hidden).to(compute_dtype)
+        normed = self.input_layernorm(hidden, output_dtype=compute_dtype)
         hidden = (
             hidden
             + self.self_attn(
                 normed, positions, padding_mask, global_positions, global_padding, sparse_metadata=sparse_metadata
             ).float()
         )
-        normed = self.post_attention_layernorm(hidden).to(compute_dtype)
+        normed = self.post_attention_layernorm(hidden, output_dtype=compute_dtype)
         if self.moe is not None:
             combined = self.moe(normed, padding_mask).float() + self.share_expert(normed).float()
             return hidden + combined
