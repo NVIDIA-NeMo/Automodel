@@ -14,6 +14,8 @@
 
 """CUDA B2 causal-prefix attention, retaining each packed row's boundaries."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -112,12 +114,39 @@ def test_b2_native_varlen_matches_independent_packed_forward_and_gradients(
         & (documents[:, start : start + queries, None] == documents[:, None, :])
         & ~padding[:, None, :]
     )
-    reference = F.scaled_dot_product_attention(
+    sdpa_reference = F.scaled_dot_product_attention(
         ref_q.transpose(1, 2),
         ref_k.transpose(1, 2).repeat_interleave(heads // groups, dim=1),
         ref_v.transpose(1, 2).repeat_interleave(heads // groups, dim=1),
         attn_mask=allowed[:, None],
     ).transpose(1, 2)
+    reference_rows = []
+    for row, valid_lengths in enumerate(lengths):
+        if start >= sum(valid_lengths):
+            # Independently prove a singleton using CPU document math. A
+            # softmax implementation can leave tiny nonzero dQ/dK residuals,
+            # whereas a one-key probability is identically one.
+            cpu_positions = torch.cat(
+                [torch.arange(n) for n in valid_lengths]
+                + [torch.zeros(keys - sum(valid_lengths), dtype=torch.long)]
+            )
+            cpu_padding = torch.arange(keys) >= sum(valid_lengths)
+            cpu_documents = ((cpu_positions == 0) & ~cpu_padding).cumsum(0)
+            cpu_allowed = (
+                (cpu_positions[start : start + queries, None] >= cpu_positions[None])
+                & (cpu_documents[start : start + queries, None] == cpu_documents[None])
+                & ~cpu_padding[None]
+            )
+            assert torch.all(cpu_allowed.sum(-1) == 1)
+            singleton = torch.nonzero(cpu_allowed[0]).item()
+            assert torch.all(cpu_allowed[:, singleton])
+            one_value = ref_v[row, singleton].repeat_interleave(heads // groups, dim=0)
+            reference_rows.append(
+                one_value[None].expand(queries, -1, -1) + (ref_q[row].sum() + ref_k[row].sum()) * 0
+            )
+        else:
+            reference_rows.append(sdpa_reference[row])
+    reference = torch.stack(reference_rows)
     torch.testing.assert_close(output.float(), reference, atol=0.015, rtol=0.015)
     upstream = torch.randn_like(output)
     actual = torch.autograd.grad(output, (query, key, value), upstream)
@@ -137,6 +166,24 @@ def test_b2_native_varlen_matches_independent_packed_forward_and_gradients(
             assert torch.count_nonzero(actual[0][row]) == 0
             assert torch.count_nonzero(actual[1][row]) == 0
             assert actual[2][row].abs().sum() > 0
+    if all(start >= sum(row) for row in lengths) and len(lengths[1]) > 1:
+        # Deliberately reading the previous document must fail this oracle.
+        wrong_layout = replace(metadata.causal_batch_layouts[1], padding_key=0)
+        wrong_selection = replace(selection, causal_batch_layouts=(metadata.causal_batch_layouts[0], wrong_layout))
+        wrong_output = fa4.fa4_attention(
+            query,
+            key,
+            value,
+            positions[:, start : start + queries],
+            positions,
+            padding,
+            documents,
+            query_start=start,
+            window=None,
+            selection=wrong_selection,
+        )
+        with pytest.raises(AssertionError):
+            torch.testing.assert_close(wrong_output.float(), reference, atol=0.015, rtol=0.015)
 
 
 @pytest.mark.parametrize("defect", ["sparse_row", "invalid_row"])
