@@ -22,7 +22,7 @@ from torch.nn import functional as F
 
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 from nemo_automodel.components.models.step5.configuration import Step5Config
-from nemo_automodel.components.models.step5.kernels import indexer_score_tile
+from nemo_automodel.components.models.step5.kernels import gather_region_payload, indexer_score_tile
 from nemo_automodel.components.models.step5.rope import Step5RotaryEmbedding
 
 
@@ -99,6 +99,13 @@ class RegionMetadata:
         score_tiles: Host tuples (batch, query_start, query_stop, first_region,
             past_last_region), bounded to 128 local queries each. Only tiles
             containing a sparse query are included.
+        summary_ranges: Merged (batch, first_region, past_last_region) intervals
+            needed by score tiles. Empty on prefix-only or irregular layouts.
+        score_range_indices: Index into summary_ranges for each score tile.
+        region_sources: Optional int32 source token indices [batch, regions,
+            region_size], shared across layers. Missing slots contain -1.
+        region_source_valid: Boolean shape matching region_sources, excluding
+            padding tokens as well as missing slots.
         region_count: Number of global regions, also the unused-route sentinel.
         needs_projection: Whether any query on any CP rank needs learned scores.
             All ranks derive it from the same global layout before collectives.
@@ -119,6 +126,40 @@ class RegionMetadata:
     needs_projection: bool
     causal_layout: CausalDocumentLayout | None = None
     window_layout: CausalDocumentLayout | None = None
+    summary_ranges: tuple[tuple[int, int, int], ...] = ()
+    score_range_indices: tuple[int, ...] = ()
+    region_sources: torch.Tensor | None = None
+    region_source_valid: torch.Tensor | None = None
+
+
+def _summary_ranges(
+    score_tiles: list[tuple[int, int, int, int, int]],
+) -> tuple[tuple[tuple[int, int, int], ...], tuple[int, ...]]:
+    """Merge each batch's needed historical intervals without inspecting GPU data."""
+    ranges: list[tuple[int, int, int]] = []
+    for batch, first, stop in sorted((b, first, stop) for b, _, _, first, stop in score_tiles):
+        if ranges and batch == ranges[-1][0] and first <= ranges[-1][2]:
+            ranges[-1] = (batch, ranges[-1][1], max(stop, ranges[-1][2]))
+        else:
+            ranges.append((batch, first, stop))
+    indices = tuple(
+        next(i for i, (rb, lo, hi) in enumerate(ranges) if rb == b and lo <= first and stop <= hi)
+        for b, _, _, first, stop in score_tiles
+    )
+    return tuple(ranges), indices
+
+
+def _summarize_region_payload(packed_keys: torch.Tensor, packed_z: torch.Tensor) -> torch.Tensor:
+    """Preserve eager FP32 arithmetic and both required quantization roundings.
+
+    Inductor can remove the intermediate BF16 rounding when this arithmetic
+    is compiled. Even emulate_precision_casts changes a few FP8 summaries
+    through FP32 arithmetic, so only the integer gather is compiled.
+    """
+    shift = packed_z.float().amax(dim=(-1, -2), keepdim=True)
+    probabilities = torch.exp(packed_z.float() - shift).nan_to_num(0.0)
+    summary = (probabilities * packed_keys.float()).sum(2) / probabilities.sum(2).clamp_min(1e-20)
+    return summary.to(torch.bfloat16).to(torch.float8_e4m3fn).to(torch.bfloat16)
 
 
 def region_metadata(
@@ -161,6 +202,17 @@ def region_metadata(
     first = first_region[:, query_start : query_start + queries]
     sparse_queries = all_sparse[:, query_start : query_start + queries]
     batch, keys = key_positions.shape
+    # The direct source map must have unique valid document slots. Preserve
+    # the original scatter for irregular positions or internal padding.
+    physical = torch.arange(keys, device=key_positions.device)[None]
+    trailing_padding = (key_padding == (physical >= (~key_padding).sum(1, keepdim=True))).all()
+    consecutive_positions = (key_positions[:, 1:] == 0) | (key_positions[:, 1:] == key_positions[:, :-1] + 1)
+    summary_layout_valid = (
+        trailing_padding
+        & (consecutive_positions | key_padding[:, 1:]).all()
+        & (key_positions >= 0).all()
+        & ((key_positions == 0) | ~key_padding).all()
+    )
     padding = (-queries) % 128
     lower = F.pad(torch.where(sparse_queries, first, keys), (0, padding), value=keys)
     upper = F.pad(torch.where(sparse_queries, current, 0), (0, padding))
@@ -177,12 +229,12 @@ def region_metadata(
         valid_queries = local_valid.sum()
         key_start = query_start - local_positions[0]
         key_stop = query_start + valid_queries
-        physical_keys = torch.arange(keys, device=key_positions.device)
+        physical_keys = physical[0]
         local_physical = physical_keys[query_start : query_start + queries]
         in_prefix = (physical_keys >= key_start) & (physical_keys < key_stop)
-        consecutive = (key_positions[0, 1:] == 0) | (key_positions[0, 1:] == key_positions[0, :-1] + 1)
+        consecutive = consecutive_positions[0]
         query_prefix = (local_valid == (local_physical < key_stop)).all()
-        global_trailing_padding = (key_padding[0] == (physical_keys >= (~key_padding[0]).sum())).all()
+        global_trailing_padding = trailing_padding
         padding_positions_zero = ((local_positions == 0) | local_valid).all()
         padding_key = torch.where(local_valid, local_physical - local_positions, -1).amax()
         prefix_valid = (
@@ -225,6 +277,7 @@ def region_metadata(
                 all_sparse.any().long().reshape(1),
                 bounds.reshape(-1),
                 prefix_fields,
+                summary_layout_valid.long().reshape(1),
             )
         )
         .cpu()
@@ -238,6 +291,23 @@ def region_metadata(
         if lo < hi:
             start = (index % tiles_per_batch) * 128
             score_tiles.append((index // tiles_per_batch, start, min(start + 128, queries), lo, hi))
+    summary_ranges: tuple[tuple[int, int, int], ...] = ()
+    score_range_indices: tuple[int, ...] = ()
+    region_sources = None
+    region_source_valid = None
+    if score_tiles and bool(layout[-1]):
+        summary_ranges, score_range_indices = _summary_ranges(score_tiles)
+        # Shared integer metadata only; K/Z remain in their original global
+        # buffers. A trailing padded short document can collide at slot zero,
+        # but its region is never a sparse query's legal historical candidate.
+        region_sources = torch.full(
+            (batch, region_count, region_size), -1, dtype=torch.int32, device=key_positions.device
+        )
+        slots = token_regions * region_size + key_positions.remainder(region_size)
+        source_tokens = torch.arange(keys, dtype=torch.int32, device=key_positions.device).expand(batch, -1)
+        region_sources.view(batch, -1).scatter_(1, slots, source_tokens)
+        source_padding = key_padding.gather(1, region_sources.long().clamp_min(0).view(batch, -1))
+        region_source_valid = (region_sources >= 0) & ~source_padding.view_as(region_sources)
     causal_layout = None
     window_layout = None
     prefix_offset = 2 + 2 * batch * tiles_per_batch
@@ -301,6 +371,10 @@ def region_metadata(
         needs_projection,
         causal_layout,
         window_layout,
+        summary_ranges,
+        score_range_indices,
+        region_sources,
+        region_source_valid,
     )
 
 
@@ -442,26 +516,41 @@ class Step5SparseIndexer(nn.Module):
             )
         if keys is None or compression_logits is None:
             raise ValueError("Sparse CSA queries require the global indexer projections")
-        slot = key_positions % cfg.region_block_size
-        rows = torch.arange(batch, device=keys.device).unsqueeze(1)
-        packed_keys = keys.new_zeros(batch, region_count, cfg.region_block_size, dim)
-        packed_z = torch.full_like(packed_keys, float("-inf"))
-        packed_keys[rows, metadata.token_regions, slot] = keys
-        packed_z[rows, metadata.token_regions, slot] = compression_logits.masked_fill(
-            key_padding.unsqueeze(-1), float("-inf")
-        )
-        shift = packed_z.float().amax(dim=(-1, -2), keepdim=True)
-        probabilities = torch.exp(packed_z.float() - shift).nan_to_num(0.0)
-        summary = (probabilities * packed_keys.float()).sum(2) / probabilities.sum(2).clamp_min(1e-20)
-        summary = summary.to(torch.bfloat16).to(torch.float8_e4m3fn).to(torch.bfloat16)
+        if metadata.region_sources is None:
+            slot = key_positions % cfg.region_block_size
+            rows = torch.arange(batch, device=keys.device).unsqueeze(1)
+            packed_keys = keys.new_zeros(batch, region_count, cfg.region_block_size, dim)
+            packed_z = torch.full_like(packed_keys, float("-inf"))
+            packed_keys[rows, metadata.token_regions, slot] = keys
+            packed_z[rows, metadata.token_regions, slot] = compression_logits.masked_fill(
+                key_padding.unsqueeze(-1), float("-inf")
+            )
+            summaries = (_summarize_region_payload(packed_keys, packed_z),)
+        else:
+            assert metadata.region_source_valid is not None
+            summaries = tuple(
+                _summarize_region_payload(
+                    *gather_region_payload(
+                        keys[b : b + 1],
+                        compression_logits[b : b + 1],
+                        metadata.region_sources[b : b + 1, first:last],
+                        metadata.region_source_valid[b : b + 1, first:last],
+                    )
+                )
+                for b, first, last in metadata.summary_ranges
+            )
         query = query.to(torch.float8_e4m3fn).to(torch.bfloat16)
         budget = min(cfg.topk, region_count)
         region_ids = ids.clone()
-        for b, start, stop, first, last in metadata.score_tiles:
+        for tile, (b, start, stop, first, last) in enumerate(metadata.score_tiles):
             # Only this tile's documents and visible history can affect top-k.
-            scores = indexer_score_tile(
-                query[b : b + 1], weights[b : b + 1], summary[b : b + 1, first:last], start, stop
-            )
+            if metadata.region_sources is None:
+                summary = summaries[0][b : b + 1, first:last]
+            else:
+                range_index = metadata.score_range_indices[tile]
+                base = metadata.summary_ranges[range_index][1]
+                summary = summaries[range_index][:, first - base : last - base]
+            scores = indexer_score_tile(query[b : b + 1], weights[b : b + 1], summary, start, stop)
             region_range = torch.arange(first, last, device=hidden.device)
             current = metadata.current[b : b + 1, start:stop]
             candidates = (region_range < current.unsqueeze(-1)) & (

@@ -166,3 +166,39 @@ def indexer_score_tile(
             dots = torch.bmm(q.float(), summary.float().transpose(1, 2)).view(batch, groups, count, regions)
             scores.add_(dots.relu_() * weights[:, start:stop, :, head].transpose(1, 2).unsqueeze(-1))
     return scores
+
+
+def _gather_region_payload(
+    keys: torch.Tensor, logits: torch.Tensor, sources: torch.Tensor, valid: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather existing token values without performing floating-point arithmetic."""
+    rows = torch.arange(keys.shape[0], device=keys.device)[:, None, None]
+    indices = sources.clamp_min(0)
+    packed_keys = keys[rows, indices].masked_fill((sources < 0).unsqueeze(-1), 0)
+    packed_logits = logits[rows, indices].masked_fill(~valid.unsqueeze(-1), float("-inf"))
+    return packed_keys, packed_logits
+
+
+_compiled_gather_region_payload = torch.compile(_gather_region_payload, dynamic=True)
+
+
+def gather_region_payload(
+    keys: torch.Tensor, logits: torch.Tensor, sources: torch.Tensor, valid: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather only the historical regions needed by this rank's sparse queries.
+
+    Args:
+        keys: Original indexer keys [batch, global_tokens, proxy_dim].
+        logits: Compression logits, shaped like keys.
+        sources: Int32 token indices [batch, required_regions, region_size].
+            Missing slots contain -1.
+        valid: Boolean shape matching sources, excluding padding and missing slots.
+
+    Returns:
+        Key and logit tensors [batch, required_regions, region_size, proxy_dim]
+        in the input dtype. Missing keys are zero and invalid logits are -inf.
+        FP32 reductions and quantization intentionally remain outside compile.
+    """
+    if keys.is_cuda:
+        return _compiled_gather_region_payload(keys, logits, sources, valid)
+    return _gather_region_payload(keys, logits, sources, valid)
