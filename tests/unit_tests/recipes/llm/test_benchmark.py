@@ -1436,6 +1436,23 @@ def _batch_flops_mesh_worker(rank: int, rendezvous: str) -> None:
             assert recipe.tflops == pytest.approx(supervised / 1e12)
             assert recipe._bench_all_token_head_tflops == pytest.approx(full / 1e12)
             assert recipe._bench_step_tokens == 8 * dp_size
+            # Inspect real DTensor local shards without gathering or changing dtype.
+            import json
+
+            from torch.distributed.tensor import Shard, distribute_tensor
+
+            wrapped = distribute_tensor(torch.arange(16.0).reshape(8, 2), mesh["dp"], [Shard(0)])
+            recipe.model_parts[0].register_parameter("wrapped", torch.nn.Parameter(wrapped))
+            audit_dir = Path(rendezvous.removeprefix("file://")).parent / f"audit-pp{pp_size}"
+            recipe._bench_loaded_model_audit_path = str(audit_dir)
+            recipe._write_loaded_model_audit()
+            audit = json.loads((audit_dir / f"rank-{rank}.json").read_text())
+            record = next(item for item in audit["tensors"] if item["name"] == "wrapped")
+            assert record["global_shape"] == [8, 2]
+            assert record["local_shape"] == [8 // dp_size, 2]
+            assert record["dtype"] == "torch.float32"
+            assert record["placements"] == ["S(0)"]
+            torch.testing.assert_close(wrapped.to_local(), torch.arange(16.0).reshape(8, 2).chunk(dp_size)[dp_rank])
     finally:
         torch.distributed.destroy_process_group()
 
@@ -1460,3 +1477,65 @@ def test_model_owned_batch_flops_reject_unaccounted_peft(mock_recipe) -> None:
     with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.setup"):
         with pytest.raises(ValueError, match="without PEFT"):
             mock_recipe.setup()
+
+
+def test_native_benchmark_records_actual_batch_hashes_and_detects_changed_labels(tmp_path: Path) -> None:
+    """Actual CPU rows, including ignored labels and masks, determine the audit."""
+    import hashlib
+    import json
+
+    labels = torch.tensor([[-100, 2, 3, -7]])
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": labels,
+        "position_ids": torch.tensor([[0, 1, 0, 1]]),
+        "attention_mask": torch.tensor([[1, 1, 2, 2]]),
+    }
+    recipe = _gradient_recipe(_BenchmarkGradientModel(), [batch], ga_steps=1, ignore_index=-7)
+    recipe._bench_batch_metadata_path = str(tmp_path / "batches")
+    recipe.device_mesh = None
+    recipe.dataloader = SimpleNamespace(sampler=range(1))
+    expected = hashlib.sha256(b"".join(batch[key][0].numpy().tobytes() for key in batch)).hexdigest()
+    recipe._record_batch_metadata([batch], step=0)
+    batch["labels"][0, 1] = 7
+    recipe._record_batch_metadata([batch], step=1)
+    records = [json.loads(line) for line in (tmp_path / "batches/rank-0.jsonl").read_text().splitlines()]
+    assert records[0]["rows"][0]["sha256"] == expected
+    assert records[0]["rows"][0]["supervised_tokens"] == 2
+    assert records[0]["sampler"] == "range"
+    assert records[0]["rows"][0]["sha256"] != records[1]["rows"][0]["sha256"]
+    assert records[0]["rows"][0]["tensor_sha256"]["input_ids"] == records[1]["rows"][0]["tensor_sha256"]["input_ids"]
+
+
+def test_loaded_model_audit_is_read_only_and_samples_noncontiguous_parameters(tmp_path: Path) -> None:
+    """The native audit observes fp32 buffers, scalars and strided tensors without repair."""
+    import hashlib
+    import json
+
+    model = torch.nn.Module()
+    model.register_parameter("strided", torch.nn.Parameter(torch.arange(10000.0).reshape(100, 100).t()))
+    model.register_parameter("norm", torch.nn.Parameter(torch.arange(13.0)))
+    model.register_buffer("router_bias", torch.tensor([34.0625, 34.125], dtype=torch.float32))
+    model.register_buffer("scalar", torch.tensor(4.0))
+    model.register_buffer("empty", torch.empty(0))
+    labels = torch.tensor([[1, 2]])
+    recipe = _gradient_recipe(model, [{"input_ids": labels, "labels": labels}], ga_steps=1)
+    recipe.device_mesh = None
+    recipe._bench_loaded_model_audit_path = str(tmp_path / "loaded")
+    before = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+    recipe._write_loaded_model_audit()
+    audit = json.loads((tmp_path / "loaded/rank-0.json").read_text())
+    tensors = {item["name"]: item for item in audit["tensors"]}
+    assert tensors["router_bias"]["dtype"] == "torch.float32"
+    assert tensors["router_bias"]["sample_values"] == [34.0625, 34.125]
+    assert (
+        tensors["router_bias"]["full_local_sha256"] == hashlib.sha256(model.router_bias.numpy().tobytes()).hexdigest()
+    )
+    assert tensors["strided"]["hashed_elements"] == 16
+    assert tensors["strided"]["full_local_sha256"] is None
+    assert tensors["strided"]["sample_values"][0] == 0.0
+    assert tensors["strided"]["sample_values"][-1] == 9999.0
+    assert tensors["scalar"]["sample_values"] == [4.0]
+    assert tensors["empty"]["sample_values"] == []
+    for name, tensor in model.state_dict().items():
+        torch.testing.assert_close(tensor, before[name])

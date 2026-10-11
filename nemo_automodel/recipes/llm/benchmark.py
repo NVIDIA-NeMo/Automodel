@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import logging
 import pathlib
 from dataclasses import asdict, dataclass
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
@@ -164,6 +166,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_all_token_head_tflops = 0.0
         self._bench_step_tokens = 0
         self._bench_step_supervised_tokens = 0
+        self._bench_batch_metadata_path = cfg.get("benchmark.batch_metadata_path")
+        self._bench_loaded_model_audit_path = cfg.get("benchmark.loaded_model_audit_path")
 
         # Infer vocab_size from model config and inject it into dataset config
         if cfg.get("dataset.vocab_size") is not None and hasattr(cfg, "model"):
@@ -192,6 +196,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         with self.timers("setup", log_level=1):
             # Call parent setup
             super().setup()
+
+        self._write_loaded_model_audit()
 
         # Store wandb run object if initialized by parent
         import wandb
@@ -495,6 +501,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             # Count metadata after timing: batches are still global, pre-CP CPU tensors.
             self._record_batch_flops(batches, num_label_tokens=num_label_tokens)
+            self._record_batch_metadata(batches, step=i)
 
             # Calculate and log MFU
             self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
@@ -511,6 +518,131 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
+
+    def _mesh_coordinates(self) -> dict[str, int]:
+        """Describe this rank's logical mesh without any communication."""
+        if self.device_mesh is None:
+            return {}
+        return {name: self.device_mesh[name].get_local_rank() for name in self.device_mesh.mesh_dim_names}
+
+    def _record_batch_metadata(self, batches: list[dict[str, torch.Tensor]], *, step: int) -> None:
+        """Optionally hash actual CPU [batch, global_sequence] rows outside timing.
+
+        Each rank writes its own JSONL file, preserving CP/PP duplicates as
+        evidence instead of adding an all-gather to the benchmark. The hash
+        concatenates int64 bytes in input/label/position/mask order, matching
+        frozen packed-dataset provenance.
+        """
+        if self._bench_batch_metadata_path is None:
+            return
+        directory = pathlib.Path(self._bench_batch_metadata_path)
+        directory.mkdir(parents=True, exist_ok=True)
+        ignore_index = _get_loss_ignore_index(self.loss_fn)
+        records = []
+        for microbatch, batch in enumerate(batches):
+            keys = [key for key in ("input_ids", "labels", "position_ids", "attention_mask") if key in batch]
+            for key in keys:
+                if batch[key].device.type != "cpu" or batch[key].shape != batch["input_ids"].shape:
+                    raise ValueError("Batch metadata requires matching CPU tensors before context-parallel sharding")
+            for row in range(batch["input_ids"].shape[0]):
+                digest = hashlib.sha256()
+                hashes = {}
+                for key in keys:
+                    raw = batch[key][row].to(torch.int64).contiguous().numpy().tobytes()
+                    digest.update(raw)
+                    hashes[key] = hashlib.sha256(raw).hexdigest()
+                records.append(
+                    {
+                        "microbatch": microbatch,
+                        "row": row,
+                        "sha256": digest.hexdigest(),
+                        "tensor_sha256": hashes,
+                        "sequence_length": batch["input_ids"].shape[1],
+                        "supervised_tokens": _count_label_tokens(batch["labels"][row], ignore_index),
+                    }
+                )
+        payload = {
+            "step": step,
+            "rank": self.dist_env.rank,
+            "world_size": self.dist_env.world_size,
+            "mesh": self._mesh_coordinates(),
+            "dp_rank": self._get_dp_rank(),
+            "sampler": type(self.dataloader.sampler).__qualname__,
+            "shuffle": self.cfg.get("dataloader.shuffle"),
+            "seed": self.cfg.get("seed", 42),
+            "rows": records,
+        }
+        path = directory / f"rank-{self.dist_env.rank}.jsonl"
+        with path.open("x" if step == 0 else "a") as stream:
+            stream.write(json.dumps(payload) + "\n")
+
+    def _write_loaded_model_audit(self) -> None:
+        """Optionally inspect parameters and buffers after native distributed setup.
+
+        No tensor is unsharded, cast or repaired. Large tensors use 16 evenly
+        spaced local elements, avoiding a flatten that could copy a noncontiguous
+        expert tensor. Small tensors include an exact raw-byte hash. This audit
+        records loaded state, but does not itself compare against checkpoint
+        source values.
+        """
+        if self._bench_loaded_model_audit_path is None:
+            return
+        directory = pathlib.Path(self._bench_loaded_model_audit_path)
+        directory.mkdir(parents=True, exist_ok=True)
+        records = []
+        with torch.no_grad():
+            for part_index, model in enumerate(self.model_parts):
+                for kind, tensors in (("parameter", model.named_parameters()), ("buffer", model.named_buffers())):
+                    for name, tensor in tensors:
+                        local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+                        local = local.detach()
+                        if local.numel() <= 8192:
+                            sampled = local.cpu().contiguous()
+                            full_hash = hashlib.sha256(
+                                sampled.reshape(-1).view(torch.uint8).numpy().tobytes()
+                            ).hexdigest()
+                            values = sampled.reshape(-1)[:16].tolist()
+                            count = local.numel()
+                        else:
+                            indices = torch.linspace(0, local.numel() - 1, 16, dtype=torch.long, device=local.device)
+                            coordinates = torch.unravel_index(indices, local.shape)
+                            sampled = local[coordinates].cpu().contiguous()
+                            full_hash = None
+                            values = sampled.tolist()
+                            count = sampled.numel()
+                        records.append(
+                            {
+                                "part": part_index,
+                                "kind": kind,
+                                "name": name,
+                                "global_shape": list(tensor.shape),
+                                "local_shape": list(local.shape),
+                                "dtype": str(local.dtype),
+                                "device": str(local.device),
+                                "requires_grad": tensor.requires_grad,
+                                "placements": [str(item) for item in tensor.placements]
+                                if isinstance(tensor, DTensor)
+                                else [],
+                                "sample_values": values,
+                                "hashed_elements": count,
+                                "sample_sha256": hashlib.sha256(
+                                    sampled.reshape(-1).view(torch.uint8).numpy().tobytes()
+                                ).hexdigest(),
+                                "full_local_sha256": full_hash,
+                            }
+                        )
+        payload = {
+            "scope": "after_native_distributed_setup_before_first_forward",
+            "rank": self.dist_env.rank,
+            "world_size": self.dist_env.world_size,
+            "mesh": self._mesh_coordinates(),
+            "dp_rank": self._get_dp_rank(),
+            "checkpoint": self.cfg.get("model.pretrained_model_name_or_path"),
+            "tensors": records,
+        }
+        path = directory / f"rank-{self.dist_env.rank}.json"
+        with path.open("x") as stream:
+            json.dump(payload, stream, indent=2)
 
     def _record_batch_flops(self, batches: list[dict[str, torch.Tensor]], *, num_label_tokens: int) -> None:
         """Record one accumulation window without duplicating CP or PP work.
