@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Hashable
+from contextlib import AbstractContextManager
 from typing import Protocol
 
 import torch
@@ -43,6 +44,15 @@ class PipelineRuntimeInitializer(Protocol):
         Args:
             num_tokens: Maximum number of tokens in the upcoming pipeline microbatch.
             device: Device used by the pipeline stage.
+        """
+        ...
+
+    def step_context(self) -> AbstractContextManager[None]:
+        """Activate prepared state for one synchronous schedule step or eval.
+
+        Every participating rank must call ``prepare`` before entering. The
+        scope includes all microbatches and activation recomputation. Exiting
+        restores ordinary non-pipeline behavior, including on an exception.
         """
         ...
 

@@ -1538,6 +1538,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
             pp_batch_size=1,
             pp_microbatch_size=1,
             update_seq_len=lambda seq_len: None,
+            runtime_context=nullcontext,
         ),
     )
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
@@ -2339,6 +2340,7 @@ class TestRunTrainOptimStepSetsMoEScale:
                     pp_batch_size=pp_microbatches,
                     pp_microbatch_size=1,
                     update_seq_len=lambda seq_len: None,
+                    runtime_context=nullcontext,
                 ),
             )
             # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe
@@ -3908,6 +3910,7 @@ def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is
         pp_batch_size=1,
         pp_microbatch_size=1,
         update_seq_len=lambda seq_len: None,
+        runtime_context=nullcontext,
         info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=Schedule()),
     )
     recipe.tokenizer = None

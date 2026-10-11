@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import types
+from contextlib import contextmanager
 from unittest.mock import Mock
 
 import pytest
@@ -1161,3 +1162,45 @@ class TestAutoPipelineUpdateSeqLen:
             ("reset", 4),
             ("prepare", 8, torch.device("cpu")),
         ]
+
+
+@pytest.mark.parametrize("has_first_stage", [False, True])
+@pytest.mark.parametrize("schedule_raises", [False, True])
+def test_step_scopes_runtime_through_schedule_and_restores_on_error(has_first_stage, schedule_raises):
+    """Every pipeline stage enters its resources for the entire synchronous step."""
+    ap = AutoPipeline(
+        world_mesh=FakeDeviceMesh(),
+        pp_schedule="1f1b",
+        pp_microbatch_size=1,
+        pp_batch_size=2,
+        device=torch.device("cpu"),
+    )
+    events = []
+
+    class Initializer:
+        @contextmanager
+        def step_context(self):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+    def schedule_step(*args, **kwargs):
+        assert events == ["enter"]
+        assert len(args) == int(has_first_stage)
+        events.append("step")
+        if schedule_raises:
+            raise ValueError("schedule failed")
+        return "completed"
+
+    ap._runtime_initializers = [Initializer()]
+    ap._info.model_parts = [nn.Linear(2, 2)]
+    ap._info.has_first_stage = has_first_stage
+    ap._info.schedule = types.SimpleNamespace(step=schedule_step)
+    if schedule_raises:
+        with pytest.raises(ValueError, match="schedule failed"):
+            ap.step(torch.zeros(2, 4))
+    else:
+        assert ap.step(torch.zeros(2, 4)) == "completed"
+    assert events == ["enter", "step", "exit"]

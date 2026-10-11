@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import logging
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -256,6 +258,19 @@ class AutoPipeline:
                 device=self.device,
             )
 
+    @contextmanager
+    def runtime_context(self) -> Iterator[None]:
+        """Activate model-owned prepared resources during one schedule execution.
+
+        Call ``update_seq_len`` on every rank before entering. The context must
+        enclose the complete synchronous schedule, including backward and any
+        activation recomputation. State is released on both success and error.
+        """
+        with ExitStack() as stack:
+            for initializer in self._runtime_initializers:
+                stack.enter_context(initializer.step_context())
+            yield
+
     def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
         """Build pipeline microbatch chunking metadata for keyword inputs.
 
@@ -330,15 +345,16 @@ class AutoPipeline:
 
         schedule_args = (model_input,) if self._info.has_first_stage else ()
         kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
-        if kwargs_chunk_spec is None:
-            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+        with self.runtime_context():
+            if kwargs_chunk_spec is None:
+                return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
 
-        previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
-        schedule._kwargs_chunk_spec = kwargs_chunk_spec
-        try:
-            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
-        finally:
-            schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
+            previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
+            schedule._kwargs_chunk_spec = kwargs_chunk_spec
+            try:
+                return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+            finally:
+                schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
 
     @property
     def parts(self) -> list[nn.Module]:

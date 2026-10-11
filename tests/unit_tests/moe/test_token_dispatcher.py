@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -168,7 +169,7 @@ class TestHybridEPRuntimeInitialization:
         initializer.prepare(num_tokens=513, device=torch.device("cpu"))
         initializer.prepare(num_tokens=513, device=torch.device("cpu"))
 
-        assert reduce_calls == [640, 640]
+        assert reduce_calls == [513, 513]
         assert len(initialize_calls) == 1
         assert initialize_calls[0]["num_tokens"] == 1024
         assert fused_a2a._hybrid_ep_initialized_capacity == 1024
@@ -280,11 +281,76 @@ class TestHybridEPRuntimeInitialization:
             initializer.prepare(num_tokens=160, device=torch.device("cpu"))
         assert initialize.call_count == 1
 
+    def test_prepared_extent_renegotiates_remote_growth_and_shrink(self, hybrid_ep_manager, monkeypatch):
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        remote_extents = iter([5, 5, 13, 3])
+        inputs = []
 
+        def group_max(tensor: torch.Tensor, *, op, group) -> None:
+            """Replace scalar tensor [] with the simulated EP maximum."""
+            inputs.append(tensor.item())
+            tensor.fill_(next(remote_extents))
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", group_max)
+        initialize = Mock()
+        monkeypatch.setattr(hybrid_ep_manager, "initialize_runtime", initialize)
+        initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 4, torch.float32)
+        extents = []
+        for _ in range(4):
+            initializer.prepare(num_tokens=3, device=torch.device("cpu"))
+            assert hybrid_ep_manager._pipeline_extent is None
+            with initializer.step_context():
+                extents.append(hybrid_ep_manager._pipeline_extent.num_tokens)
+            assert hybrid_ep_manager._pipeline_extent is None
+        assert inputs == [3, 3, 3, 3]
+        assert extents == [8, 8, 16, 4]
+        initialize.assert_called_once()
+
+    def test_scope_requires_fresh_prepare_and_resets_on_error(self, hybrid_ep_manager, monkeypatch):
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.setattr(hybrid_ep_manager, "initialize_runtime", lambda **kwargs: None)
+        initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 4, torch.float32)
+        with pytest.raises(RuntimeError, match="prepare must run"):
+            with initializer.step_context():
+                pass
+        initializer.prepare(num_tokens=3, device=torch.device("cpu"))
+        with pytest.raises(ValueError, match="schedule failed"):
+            with initializer.step_context():
+                with pytest.raises(RuntimeError, match="cannot overlap"):
+                    with initializer.step_context():
+                        pass
+                with pytest.raises(RuntimeError, match="Cannot prepare"):
+                    initializer.prepare(num_tokens=7, device=torch.device("cpu"))
+                raise ValueError("schedule failed")
+        assert hybrid_ep_manager._pipeline_extent is None
+        with pytest.raises(RuntimeError, match="prepare must run"):
+            with initializer.step_context():
+                pass
+        initializer.prepare(num_tokens=9, device=torch.device("cpu"))
+        with initializer.step_context():
+            assert hybrid_ep_manager._pipeline_extent.num_tokens == 12
+
+    def test_prepared_extent_violation_never_enters_a_local_collective(self, hybrid_ep_manager, monkeypatch):
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        reduce = Mock()
+        monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+        monkeypatch.setattr(hybrid_ep_manager, "initialize_runtime", lambda **kwargs: None)
+        initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 4, torch.float32)
+        initializer.prepare(num_tokens=3, device=torch.device("cpu"))
+        hybrid_ep_manager.token_probs = torch.ones(5, 2)
+        with initializer.step_context(), pytest.raises(RuntimeError, match="prepared pipeline extent"):
+            hybrid_ep_manager.dispatch(torch.ones(5, 4))
+        assert reduce.call_count == 1
+        assert hybrid_ep_manager._pipeline_extent is None
+
+
+@pytest.mark.parametrize("prepared_scope", [False, True])
 @pytest.mark.parametrize("compact", [False, True])
-@pytest.mark.parametrize("num_tokens,group_max", [(5, 5), (3, 5), (4, 4)])
+@pytest.mark.parametrize("num_tokens,group_max", [(5, 5), (3, 5), (4, 4), (0, 5)])
 def test_hybridep_padding_preserves_routing_and_gradients(
-    hybrid_ep_manager, monkeypatch, compact, num_tokens, group_max
+    hybrid_ep_manager, monkeypatch, compact, num_tokens, group_max, prepared_scope
 ):
     """Padding must preserve real tokens and leave padded rows routed nowhere."""
     import nemo_automodel.components.moe.megatron.token_dispatcher as td
@@ -292,8 +358,11 @@ def test_hybridep_padding_preserves_routing_and_gradients(
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
 
+    collective_calls = []
+
     def group_max_reduce(tensor, op=None, group=None):
         """Set the scalar [ ] token count to the simulated group's maximum."""
+        collective_calls.append(int(tensor.item()))
         tensor.fill_(group_max)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", group_max_reduce)
@@ -338,7 +407,16 @@ def test_hybridep_padding_preserves_routing_and_gradients(
     monkeypatch.setattr(td, "hybrid_ep_dispatch", dispatch)
     monkeypatch.setattr(td, "hybrid_ep_combine", lambda x, **kwargs: x)
     prepared, _ = dispatcher.dispatch_preprocess2(hidden, num_tokens, probs, indices)
-    output = hybrid_ep_manager.combine(hybrid_ep_manager.dispatch(prepared))
+    initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 4, torch.float32)
+    if prepared_scope:
+        fused_a2a.reset_hybrid_ep_buffer()
+        monkeypatch.setattr(hybrid_ep_manager, "initialize_runtime", lambda **kwargs: None)
+        initializer.prepare(num_tokens=max(num_tokens, 1), device=torch.device("cpu"))
+    with initializer.step_context() if prepared_scope else nullcontext():
+        output = hybrid_ep_manager.combine(hybrid_ep_manager.dispatch(prepared))
+    assert len(collective_calls) == 1
+    assert hybrid_ep_manager._pipeline_extent is None
+    fused_a2a.reset_hybrid_ep_buffer()
     weights = torch.arange(output.numel(), dtype=output.dtype).reshape_as(output)
     (output * weights).sum().backward()
 

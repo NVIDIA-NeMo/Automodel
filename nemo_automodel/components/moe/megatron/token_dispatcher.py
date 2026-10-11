@@ -16,6 +16,8 @@
 import logging
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Literal, Tuple
 
@@ -377,6 +379,14 @@ _HYBRIDEP_TOKEN_ALIGNMENT = 4
 _STATIC_ROUTING_PAD_PIN = os.environ.get("NEMO_STATIC_ROUTING_PAD_PIN", "1") != "0"
 
 
+@dataclass(frozen=True)
+class _HybridEPDispatchExtent:
+    """EP-negotiated input extent valid only within one pipeline schedule."""
+
+    num_tokens: int
+    device: torch.device
+
+
 class _HybridEPManager(_DispatchManager):
     """
     A manager class to handle fused all-to-all communication processes for MoE models using
@@ -426,6 +436,7 @@ class _HybridEPManager(_DispatchManager):
         # routing every dispatch pads to the same size, so the per-dispatch MAX all-reduce + host sync
         # that computes it runs once. NEMO_STATIC_ROUTING_PAD_PIN=0 keeps the per-dispatch path (A/B).
         self._static_target_tokens: int | None = None
+        self._pipeline_extent: _HybridEPDispatchExtent | None = None
 
         # Metadata
         self.token_probs: torch.Tensor | None = None
@@ -520,7 +531,17 @@ class _HybridEPManager(_DispatchManager):
         if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
             num_tokens = hidden_states.shape[0]
             pin = self.benchmark_static_routing and _STATIC_ROUTING_PAD_PIN
-            if pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
+            if self._pipeline_extent is not None:
+                # Prepared on every EP rank before the schedule. Never fall back
+                # to a collective based on a rank-local shape check: peers would
+                # remain on the prepared path and deadlock.
+                target_tokens = self._pipeline_extent.num_tokens
+                if hidden_states.device != self._pipeline_extent.device or num_tokens > target_tokens:
+                    raise RuntimeError(
+                        f"HybridEP dispatch exceeds its prepared pipeline extent: got {num_tokens} tokens "
+                        f"on {hidden_states.device}, prepared {target_tokens} on {self._pipeline_extent.device}"
+                    )
+            elif pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
                 target_tokens = self._static_target_tokens
             else:
                 group_max = torch.tensor(num_tokens, device=hidden_states.device)
@@ -691,6 +712,7 @@ class HybridEPPipelineRuntimeInitializer:
         self.manager = manager
         self.hidden_dim = hidden_dim
         self.dtype = dtype
+        self._prepared_extent: _HybridEPDispatchExtent | None = None
 
     @property
     def resource_key(self) -> tuple[type["HybridEPPipelineRuntimeInitializer"], str]:
@@ -735,15 +757,14 @@ class HybridEPPipelineRuntimeInitializer:
         combine_chunk = int(os.environ.get("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "64"))
         return capacity if combine_chunk <= 0 else -(-capacity // combine_chunk) * combine_chunk
 
-    def _resolve_group_capacity(self, *, num_tokens: int, device: torch.device) -> int:
-        """Return the EP-group maximum JIT capacity for this batch."""
-        capacity = self.required_capacity(num_tokens)
+    def _resolve_group_tokens(self, *, num_tokens: int, device: torch.device) -> int:
+        """Negotiate raw input extent before deriving dispatch and JIT alignment."""
         if not torch.distributed.is_initialized() or torch.distributed.get_world_size(self.manager.group) == 1:
-            return capacity
+            return num_tokens
 
-        group_capacity = torch.tensor(capacity, dtype=torch.int64, device=device)
-        torch.distributed.all_reduce(group_capacity, op=torch.distributed.ReduceOp.MAX, group=self.manager.group)
-        return int(group_capacity.item())
+        group_tokens = torch.tensor(num_tokens, dtype=torch.int64, device=device)
+        torch.distributed.all_reduce(group_tokens, op=torch.distributed.ReduceOp.MAX, group=self.manager.group)
+        return int(group_tokens.item())
 
     def prepare(
         self,
@@ -751,7 +772,11 @@ class HybridEPPipelineRuntimeInitializer:
         num_tokens: int,
         device: torch.device,
     ) -> None:
-        """Initialize the group capacity when the upcoming pipeline shape grows.
+        """Negotiate this step's extent and initialize kernels when capacity grows.
+
+        Every EP rank participates on every step, even if its local shape did
+        not change. The pending extent is consumed once by ``step_context``;
+        dispatch outside that scope retains per-call collective negotiation.
 
         Args:
             num_tokens: Maximum number of tokens in the upcoming pipeline microbatch.
@@ -761,17 +786,26 @@ class HybridEPPipelineRuntimeInitializer:
             ValueError: If the token capacity is not positive.
             RuntimeError: If the process-global resource signature conflicts or initialization fails.
         """
+        if self.manager._pipeline_extent is not None:
+            raise RuntimeError("Cannot prepare HybridEP during an active pipeline schedule")
+        self._prepared_extent = None
         if num_tokens <= 0:
             raise ValueError(f"HybridEP runtime preparation requires a positive token capacity, got {num_tokens}")
 
         if device.type == "cuda" and device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
         active_signature = (*self.signature, device)
-        required_capacity = self._resolve_group_capacity(
+        group_tokens = self._resolve_group_tokens(
             num_tokens=num_tokens,
             device=device,
         )
+        required_capacity = self.required_capacity(group_tokens)
+        extent = _HybridEPDispatchExtent(
+            num_tokens=-(-group_tokens // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT,
+            device=device,
+        )
         if required_capacity <= get_hybrid_ep_initialized_capacity(active_signature):
+            self._prepared_extent = extent
             return
 
         try:
@@ -794,6 +828,29 @@ class HybridEPPipelineRuntimeInitializer:
                 self.hidden_dim,
                 self.dtype,
             )
+
+        self._prepared_extent = extent
+
+    @contextmanager
+    def step_context(self) -> Iterator[None]:
+        """Use the prepared input extent for one complete PP schedule execution.
+
+        All EP ranks must enter after ``prepare`` and dispatch at most the
+        prepared number of input tokens on its device. This includes backward
+        recomputation. Routing and dispatched expert row counts remain dynamic.
+        The manager and pending extent reset even when the schedule raises.
+        Other, unshared managers retain normal per-dispatch negotiation.
+        """
+        if self.manager._pipeline_extent is not None:
+            raise RuntimeError("HybridEP pipeline schedule scopes cannot overlap")
+        if self._prepared_extent is None:
+            raise RuntimeError("HybridEP prepare must run before each pipeline schedule scope")
+        self.manager._pipeline_extent = self._prepared_extent
+        self._prepared_extent = None
+        try:
+            yield
+        finally:
+            self.manager._pipeline_extent = None
 
 
 @dataclass

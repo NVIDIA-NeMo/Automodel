@@ -30,13 +30,16 @@ all routing/fusion combinations. Each variant checks a local reference with
 different expert scales and compares equal and unequal token extents. Add
 --activation-checkpointing to compare checkpoint replay with the same unequal
 computation without checkpointing. The pytest launcher uses --all-variants to
-run the complete matrix in one worker launch and process group.
+run the complete matrix in one worker launch and process group. Add
+--prepared-extent to exercise a PP-prepared dispatch bound with changing and
+empty rank extents, multiple microbatches, checkpoint replay, and scope reset.
 """
 
 import argparse
 import os
 import time
 from contextlib import nullcontext
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -188,6 +191,63 @@ def _run_variant(
         )
 
 
+def _run_prepared_extent(ep_group: dist.ProcessGroup) -> None:
+    """Exercise changing PP step bounds, empty ranks, and checkpoint recomputation."""
+    rank = dist.get_rank()
+    config = TokenDispatcherConfig(
+        moe_flex_dispatcher_backend="hybridep",
+        num_moe_experts=NUM_EXPERTS,
+        moe_router_topk=TOPK,
+        moe_share_token_dispatcher=False,
+        moe_hybridep_compact_routing=True,
+        moe_hybridep_permute_fusion=True,
+    )
+    num_local = NUM_EXPERTS // dist.get_world_size()
+    dispatcher = MoEFlexTokenDispatcher(
+        num_local_experts=num_local,
+        local_expert_indices=list(range(rank * num_local, (rank + 1) * num_local)),
+        config=config,
+        ep_group=ep_group,
+    )
+    (initializer,) = dispatcher.get_pipeline_runtime_initializers(hidden_dim=HIDDEN, dtype=torch.bfloat16)
+    torch.manual_seed(5678 + rank)
+    # Fixed local shape while the peer grows detects unsafe local-shape caching.
+    # Shrink must discard the previous step's extent; an empty rank still joins.
+    for step_index, rank_tokens in enumerate(((3, 5), (3, 13), (3, 3), (1, 0))):
+        count = rank_tokens[rank]
+        hidden = torch.randn(count, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        indices = torch.stack([torch.randperm(NUM_EXPERTS, device="cuda")[:TOPK] for _ in range(max(count, 1))])[:count]
+        probs = torch.rand(count, TOPK, device="cuda", dtype=torch.float32)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        reference = run_dispatch_combine(dispatcher, hidden, indices, probs)
+        with patch.object(dist, "all_reduce", wraps=dist.all_reduce) as collectives:
+            initializer.prepare(num_tokens=max(count, 1), device=torch.device("cuda", torch.cuda.current_device()))
+            assert collectives.call_count >= 1
+            calls_before_scope = collectives.call_count
+            with initializer.step_context():
+                actual = run_dispatch_combine(dispatcher, hidden, indices, probs, activation_checkpointing=True)
+                # A second microbatch has different routing probabilities and
+                # fewer valid tokens but uses the same pre-negotiated upper bound.
+                shorter = count // 2
+                run_dispatch_combine(
+                    dispatcher,
+                    hidden[:shorter],
+                    indices[:shorter],
+                    probs[:shorter] * 0.75,
+                    activation_checkpointing=True,
+                )
+            assert collectives.call_count == calls_before_scope
+        for result, expected in zip(actual, reference, strict=True):
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        # Exiting scope must restore the real dynamic all-reduce path.
+        with patch.object(dist, "all_reduce", wraps=dist.all_reduce) as collectives:
+            after = run_dispatch_combine(dispatcher, hidden, indices, probs)
+            assert collectives.call_count == 1
+        for result, expected in zip(after, reference, strict=True):
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        print(f"[rank {rank}] prepared extent step {step_index}: tokens={count}, parity/AC/reset OK", flush=True)
+
+
 def main() -> None:
     """Run individual diagnostics or the complete CI matrix in one worker launch."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -195,6 +255,7 @@ def main() -> None:
     parser.add_argument("--permute-fusion", action="store_true")
     parser.add_argument("--activation-checkpointing", action="store_true")
     parser.add_argument("--all-variants", action="store_true")
+    parser.add_argument("--prepared-extent", action="store_true")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
@@ -222,6 +283,10 @@ def main() -> None:
                 f"HybridEP parity: compact={compact} fusion={fusion} elapsed={time.perf_counter() - start:.2f}s",
                 flush=True,
             )
+        if args.prepared_extent:
+            _run_prepared_extent(ep_group)
+            torch.cuda.synchronize()
+            dist.barrier(group=ep_group)
     finally:
         reset_hybrid_ep_buffer()
         dist.destroy_process_group()

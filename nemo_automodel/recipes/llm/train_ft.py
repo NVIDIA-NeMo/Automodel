@@ -1330,18 +1330,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if isinstance(pp_loss_fn, PipelineCausalLMLoss):
                     pp_loss_fn.cu_seqlens = cu_seqlens
                     pp_loss_fn.is_packed = mtp_is_packed or mtp_seq_idx is not None
-                if is_train:
-                    # Use step for training (forward + backward)
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
+                with self.pp.runtime_context():
+                    if is_train:
+                        # Use step for training (forward + backward)
+                        if self.pp.info.has_first_stage:
+                            self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
+                        else:
+                            self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
                     else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
-                else:
-                    # Use eval for validation (forward only, no backward)
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
-                    else:
-                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
+                        # Use eval for validation (forward only, no backward)
+                        if self.pp.info.has_first_stage:
+                            self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
+                        else:
+                            self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
