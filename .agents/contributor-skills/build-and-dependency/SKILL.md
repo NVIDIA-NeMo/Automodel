@@ -109,6 +109,14 @@ package's core training dependencies, including PyTorch.
 
 Always use `uv`. Do not introduce `pip install` commands in scripts or docs.
 
+When upgrading dependencies, review compatibility backports and their version
+gates. Verify the candidate release contains the upstream fix before removing
+or bypassing a backport; never assume a future or patch release is fixed. If a
+backport remains necessary, validate it on the candidate release before extending
+its gate. Run the affected regression tests with the actual dependency and
+required backends; mocked version strings and skipped tests are not compatibility
+evidence. Record the release evidence and test results in the upgrade PR.
+
 | Task | Command |
 |---|---|
 | Install from lockfile | `uv sync --locked` |

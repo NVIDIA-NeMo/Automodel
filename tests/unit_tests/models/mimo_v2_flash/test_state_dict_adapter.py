@@ -838,3 +838,23 @@ class TestProCheckpointQKV:
             adapter.from_hf(
                 {key: torch.zeros(27136, 128, dtype=torch.float8_e4m3fn), f"{key}_scale_inv": torch.ones(216, 1)}
             )
+
+
+def test_checkpoint_tp_metadata_keeps_resolved_revision(tmp_path, monkeypatch, moe_config, backend_config):
+    from huggingface_hub import constants
+    from transformers.utils.hub import resolve_revision
+
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+    cache = tmp_path / "models--test--mimo"
+    for sha, tp_size in (("a" * 40, 4), ("b" * 40, 8)):
+        snapshot = cache / "snapshots" / sha
+        snapshot.mkdir(parents=True)
+        _write_index(snapshot, {"tp_size": tp_size})
+    ref = cache / "refs" / "main"
+    ref.parent.mkdir()
+    ref.write_text("b" * 40)
+    revision = resolve_revision("test/mimo", local_files_only=True)
+    config = _pro_full_attention_config(name_or_path="test/mimo")
+    adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, revision=revision)
+    ref.write_text("a" * 40)
+    assert adapter.checkpoint_tp_size == 8

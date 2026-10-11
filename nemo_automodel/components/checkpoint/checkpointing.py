@@ -1246,6 +1246,9 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
+        adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        checkpoint_key_aliases = dict(getattr(adapter, "checkpoint_key_aliases", {}))
+        applied_key_aliases: dict[str, str] = {}
         checkpoint_metadata = {}
         checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
@@ -1253,9 +1256,23 @@ class Checkpointer:
         shared_parameter_names = (
             _get_shared_parameter_names(model_state.model) if is_init_step and uses_standard_hf_state_dict else []
         )
-        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys or shared_parameter_names:
+        if (
+            should_try_tied_lm_head_compat
+            or allow_checkpoint_key_subset
+            or extra_state_keys
+            or shared_parameter_names
+            or checkpoint_key_aliases
+        ):
             checkpoint_metadata = _get_checkpoint_metadata(model_path, storage_reader).state_dict_metadata
             checkpoint_metadata_keys = set(checkpoint_metadata)
+        for current_key, legacy_key in checkpoint_key_aliases.items():
+            if (
+                current_key in state_dict
+                and current_key not in checkpoint_metadata_keys
+                and legacy_key in checkpoint_metadata_keys
+            ):
+                state_dict[legacy_key] = state_dict.pop(current_key)
+                applied_key_aliases[legacy_key] = current_key
         if extra_state_keys:
             # Serialized module metadata can grow after training (e.g. TE FP8 scaling history).
             # Allocate its saved representation; parameter and buffer destinations retain strict shape checks.
@@ -1371,6 +1388,10 @@ class Checkpointer:
         # It was needed for the read, but restore the original key set for installation and mismatch reporting.
         for source_name in set(shared_alias_sources.values()) - expected_keys:
             state_dict.pop(source_name)
+
+        for legacy_key, current_key in applied_key_aliases.items():
+            if legacy_key in state_dict:
+                state_dict[current_key] = state_dict.pop(legacy_key)
 
         state_dict = _maybe_adapt_state_dict_from_hf(
             model_state.model[0],
