@@ -304,7 +304,7 @@ def fa4_attention(
         token_regions = torch.empty((1, 2), dtype=torch.int64, device=query.device)
     else:
         membership, token_regions = selection.region_ids, selection.token_regions
-        regions = int(token_regions.max().item()) + 1
+        regions = selection.region_count
         slots = membership.shape[-1]
         bitmap = (regions + 31) // 32 <= slots
         if bitmap:

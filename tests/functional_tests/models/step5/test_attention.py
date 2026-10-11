@@ -49,7 +49,9 @@ def test_fused_attention_matches_independent_mask_and_gradients(
         # Independent selection: current region plus one group-specific old region.
         ids = torch.stack((torch.zeros_like(regions), regions), -1)[:, None].expand(-1, 2, -1, -1).clone().int()
         ids[:, 1, :, 0] = (regions - 2).clamp(min=0)
-        selection = RegionSelection(ids[:, :, query_start:].contiguous(), regions, docs[:, query_start:], docs)
+        selection = RegionSelection(
+            ids[:, :, query_start:].contiguous(), regions, docs[:, query_start:], docs, int(regions.max()) + 1
+        )
         chosen = (regions[:, None, None, :, None] == ids[:, :, :, None, :]).any(-1)
         mask = mask & chosen.repeat_interleave(2, dim=1)
     else:

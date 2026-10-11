@@ -29,7 +29,7 @@ from nemo_automodel.components.models.step5.configuration import Step5Config
 from nemo_automodel.components.models.step5.cp import gather_halo, gather_metadata, gather_sequence
 from nemo_automodel.components.models.step5.fa4 import fa4_attention
 from nemo_automodel.components.models.step5.rope import Step5RotaryEmbedding
-from nemo_automodel.components.models.step5.sparse import Step5SparseIndexer
+from nemo_automodel.components.models.step5.sparse import RegionMetadata, Step5SparseIndexer, region_metadata
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 
@@ -126,6 +126,8 @@ class Step5Attention(nn.Module):
         padding_mask: torch.Tensor,
         global_positions: torch.Tensor,
         global_padding: torch.Tensor,
+        *,
+        sparse_metadata: RegionMetadata | None = None,
     ) -> torch.Tensor:
         """Attend local queries to valid global keys, preserving document boundaries.
 
@@ -178,11 +180,36 @@ class Step5Attention(nn.Module):
             # Selection is discrete. No language-model-loss gradient crosses top-k;
             # differentiable K/V transport above carries attention gradients.
             with torch.no_grad():
-                index_k, index_z = self.indexer.project_keys(hidden, positions)
-                index_kz = gather_metadata(torch.stack((index_k, index_z), dim=2), self.cp_group)
-                index_k, index_z = index_kz.unbind(dim=2)
+                if sparse_metadata is None:
+                    sparse_metadata = region_metadata(
+                        key_positions,
+                        key_padding,
+                        query_start=query_start,
+                        queries=sequence,
+                        region_size=self.indexer.config.region_block_size,
+                        topk=self.indexer.config.topk,
+                    )
+                index_k, index_z = None, None
+                # This global predicate is identical across all CP ranks. A rank
+                # with only dense-prefix queries still contributes keys when
+                # another rank owns sparse queries.
+                if sparse_metadata.needs_projection:
+                    index_k, index_z = self.indexer.project_keys(hidden, positions)
+                    index_kz = gather_metadata(torch.stack((index_k, index_z), dim=2), self.cp_group)
+                    index_k, index_z = index_kz.unbind(dim=2)
+                else:
+                    # Keep FSDP norm hooks symmetric with DP peers that may own
+                    # long documents, while avoiding any nonempty projection.
+                    self.indexer.project_keys(hidden[:, :0], positions[:, :0])
                 selection = self.indexer(
-                    hidden, positions, index_k, index_z, key_positions, key_padding, query_start=query_start
+                    hidden,
+                    positions,
+                    index_k,
+                    index_z,
+                    key_positions,
+                    key_padding,
+                    query_start=query_start,
+                    metadata=sparse_metadata,
                 )
         if self.backend.attn == "fa4" and hidden.is_cuda:
             attended = fa4_attention(
@@ -287,6 +314,7 @@ class Step5DecoderLayer(nn.Module):
         global_padding: torch.Tensor,
         *,
         compute_dtype: torch.dtype,
+        sparse_metadata: RegionMetadata | None = None,
     ) -> torch.Tensor:
         """Apply attention and feed-forward residual branches.
 
@@ -297,12 +325,18 @@ class Step5DecoderLayer(nn.Module):
             global_positions: Int tensor [batch, global_sequence], gathered once per model call.
             global_padding: Boolean tensor [batch, global_sequence], true for padding.
             compute_dtype: Activation dtype from the completed embedding projection.
+            sparse_metadata: Shared global region layout and local query metadata.
 
         Returns:
             FP32 tensor of shape [batch, local_sequence, hidden].
         """
         normed = self.input_layernorm(hidden).to(compute_dtype)
-        hidden = hidden + self.self_attn(normed, positions, padding_mask, global_positions, global_padding).float()
+        hidden = (
+            hidden
+            + self.self_attn(
+                normed, positions, padding_mask, global_positions, global_padding, sparse_metadata=sparse_metadata
+            ).float()
+        )
         normed = self.post_attention_layernorm(hidden).to(compute_dtype)
         if self.moe is not None:
             combined = self.moe(normed, padding_mask).float() + self.share_expert(normed).float()

@@ -26,7 +26,7 @@ from nemo_automodel.components.models.step5.kernels import indexer_score_tile
 from nemo_automodel.components.models.step5.rope import Step5RotaryEmbedding
 
 
-@dataclass
+@dataclass(frozen=True)
 class RegionSelection:
     """Sparse selection tensors, all local to one CP rank's queries.
 
@@ -36,12 +36,124 @@ class RegionSelection:
         token_regions: Int64 tensor of shape [batch, global_keys].
         query_documents: Int64 tensor of shape [batch, local_queries].
         key_documents: Int64 tensor of shape [batch, global_keys].
+        region_count: Number of global regions; also the unused-route sentinel.
     """
 
     region_ids: torch.Tensor
     token_regions: torch.Tensor
     query_documents: torch.Tensor
     key_documents: torch.Tensor
+    region_count: int
+
+
+@dataclass(frozen=True)
+class RegionMetadata:
+    """Layer-independent CSA layout for one contiguous CP query shard.
+
+    Attributes:
+        token_regions: Int64 global region IDs [batch, global_keys].
+        documents: Int64 global document IDs [batch, global_keys].
+        region_documents: Int64 document IDs [batch, regions].
+        current: Int64 current region IDs [batch, local_queries].
+        query_documents: Int64 document IDs [batch, local_queries].
+        dense_region_ids: Int32 ascending full-prefix IDs [batch, local_queries,
+            min(topk, regions) + 1]; unused entries contain region_count.
+        sparse_queries: Boolean [batch, local_queries], true only when more than
+            topk historical regions in the same document are visible.
+        score_tiles: Host tuples (batch, query_start, query_stop, first_region,
+            past_last_region), bounded to 128 local queries each. Only tiles
+            containing a sparse query are included.
+        region_count: Number of global regions, also the unused-route sentinel.
+        needs_projection: Whether any query on any CP rank needs learned scores.
+            All ranks derive it from the same global layout before collectives.
+    """
+
+    token_regions: torch.Tensor
+    documents: torch.Tensor
+    region_documents: torch.Tensor
+    current: torch.Tensor
+    query_documents: torch.Tensor
+    dense_region_ids: torch.Tensor
+    sparse_queries: torch.Tensor
+    score_tiles: tuple[tuple[int, int, int, int, int], ...]
+    region_count: int
+    needs_projection: bool
+
+
+def region_metadata(
+    key_positions: torch.Tensor,
+    key_padding: torch.Tensor,
+    *,
+    query_start: int,
+    queries: int,
+    region_size: int,
+    topk: int,
+) -> RegionMetadata:
+    """Prepare document/region metadata once per model forward.
+
+    Args:
+        key_positions: Int64 document-local positions [batch, global_keys].
+        key_padding: Boolean padding flags [batch, global_keys].
+        query_start: Physical start of this rank's contiguous query shard.
+        queries: Number of local queries.
+        region_size: Tokens per region, reset at every document boundary.
+        topk: Maximum number of selected historical regions.
+
+    Returns:
+        Shared immutable metadata. Only linear token/region storage and a bounded
+        [batch, local_queries, topk + 1] integer prefix template are allocated.
+        One host transfer resolves allocation sizes and sparse tile extents.
+    """
+    documents = ((key_positions == 0) & ~key_padding).long().cumsum(1)
+    region_position = key_positions // region_size
+    new_region = torch.ones_like(key_positions, dtype=torch.bool)
+    new_region[:, 1:] = (region_position[:, 1:] != region_position[:, :-1]) | (documents[:, 1:] != documents[:, :-1])
+    token_regions = new_region.long().cumsum(1) - 1
+    starts = torch.ones_like(new_region)
+    starts[:, 1:] = documents[:, 1:] != documents[:, :-1]
+    first_region = torch.where(starts, token_regions, 0).cummax(1).values
+    all_sparse = token_regions - first_region > topk
+    current = token_regions[:, query_start : query_start + queries]
+    first = first_region[:, query_start : query_start + queries]
+    sparse_queries = all_sparse[:, query_start : query_start + queries]
+    batch, keys = key_positions.shape
+    padding = (-queries) % 128
+    lower = F.pad(torch.where(sparse_queries, first, keys), (0, padding), value=keys)
+    upper = F.pad(torch.where(sparse_queries, current, 0), (0, padding))
+    lower = lower.reshape(batch, -1, 128).amin(-1)
+    upper = upper.reshape(batch, -1, 128).amax(-1)
+    bounds = torch.stack((lower, upper), -1)
+    # One synchronization for the entire model call, never one per layer/tile.
+    layout = (
+        torch.cat(((token_regions.amax() + 1).reshape(1), all_sparse.any().long().reshape(1), bounds.reshape(-1)))
+        .cpu()
+        .tolist()
+    )
+    region_count, needs_projection = int(layout[0]), bool(layout[1])
+    tiles_per_batch = lower.shape[1]
+    score_tiles = []
+    for index in range(batch * tiles_per_batch):
+        lo, hi = int(layout[2 + 2 * index]), int(layout[3 + 2 * index])
+        if lo < hi:
+            start = (index % tiles_per_batch) * 128
+            score_tiles.append((index // tiles_per_batch, start, min(start + 128, queries), lo, hi))
+    region_documents = torch.zeros(batch, region_count, device=key_positions.device, dtype=torch.long)
+    region_documents.scatter_reduce_(1, token_regions, documents, reduce="amax")
+    budget = min(topk, region_count)
+    prefix = first.unsqueeze(-1) + torch.arange(budget + 1, device=key_positions.device)
+    dense_ids = torch.where(prefix <= current.unsqueeze(-1), prefix, region_count).to(torch.int32)
+    return RegionMetadata(
+        token_regions,
+        documents,
+        region_documents,
+        current,
+        documents[:, query_start : query_start + queries],
+        dense_ids,
+        sparse_queries,
+        tuple(score_tiles),
+        region_count,
+        needs_projection,
+    )
 
 
 class Step5IndexerRMSNorm(Step3p5RMSNorm):
@@ -116,91 +228,108 @@ class Step5SparseIndexer(nn.Module):
         self,
         hidden: torch.Tensor,
         positions: torch.Tensor,
-        keys: torch.Tensor,
-        compression_logits: torch.Tensor,
+        keys: torch.Tensor | None,
+        compression_logits: torch.Tensor | None,
         key_positions: torch.Tensor,
         key_padding: torch.Tensor,
         *,
         query_start: int = 0,
+        metadata: RegionMetadata | None = None,
     ) -> RegionSelection:
-        """Select historical CSA regions independently for each provider group.
+        """Select historical CSA regions, scoring only genuinely sparse queries.
 
         Args:
             hidden: Tensor of shape [batch, local_queries, hidden].
-            positions: Tensor of shape [batch, local_queries].
-            keys: Tensor of shape [batch, global_keys, proxy_dim].
-            compression_logits: Tensor of shape [batch, global_keys, proxy_dim].
-            key_positions: Tensor of shape [batch, global_keys], resetting at document starts.
-            key_padding: Boolean tensor of shape [batch, global_keys], true for padding.
-            query_start: Offset of the contiguous query shard in the global key sequence.
+            positions: Int64 document-local positions [batch, local_queries].
+            keys: Projected global index keys [batch, global_keys, proxy_dim], or
+                None when every global query sees at most topk historical regions.
+            compression_logits: Same shape as keys, or None on that full-prefix path.
+            key_positions: Int64 document-local positions [batch, global_keys].
+            key_padding: Boolean padding flags [batch, global_keys].
+            query_start: Physical start of the contiguous local query shard.
+            metadata: Shared document/region layout for the current model call.
+                Direct component callers may omit it.
 
         Returns:
-            Compact region ids and document metadata. Scores exist only for a query tile.
+            Ascending selected region IDs [batch, groups, local_queries, topk + 1]
+            with the shared global token/document mapping. Fully selected prefixes
+            do not depend on scores, signed head weights, or tie breaking.
         """
         cfg = self.config
         batch, queries = hidden.shape[:2]
         groups = cfg.num_provider_groups
         heads = cfg.sparse_indexer_num_heads // groups
         dim = cfg.proxy_dim
-        query = self.q_proj(hidden).view(batch, queries, groups * heads, dim)
+        if metadata is None:
+            metadata = region_metadata(
+                key_positions,
+                key_padding,
+                query_start=query_start,
+                queries=queries,
+                region_size=cfg.region_block_size,
+                topk=cfg.topk,
+            )
+        region_count = metadata.region_count
+        ids = metadata.dense_region_ids[:, None].expand(-1, groups, -1, -1)
+        # FP32 norm/projection modules can own FSDP collectives. Every rank
+        # invokes their hooks in the same order, including zero-token calls
+        # when this shard has no sparse queries; no projection GEMM is needed.
+        projected_hidden = hidden if metadata.score_tiles else hidden[:, :0]
+        projected_positions = positions if metadata.score_tiles else positions[:, :0]
+        projected_queries = projected_hidden.shape[1]
+        query = self.q_proj(projected_hidden).view(batch, projected_queries, groups * heads, dim)
         query = self.q_norm(query)
-        query = self.rotary_emb(query, positions).view(batch, queries, groups, heads, dim)
-        weights = self.w_proj(hidden).view(batch, queries, groups, heads)
+        query = self.rotary_emb(query, projected_positions).view(batch, projected_queries, groups, heads, dim)
+        weights = self.w_proj(projected_hidden).view(batch, projected_queries, groups, heads)
         weights = weights * heads**-0.5
-
-        documents = ((key_positions == 0) & ~key_padding).long().cumsum(1)
-        region_position = key_positions // cfg.region_block_size
-        new_region = torch.ones_like(key_positions, dtype=torch.bool)
-        new_region[:, 1:] = (region_position[:, 1:] != region_position[:, :-1]) | (
-            documents[:, 1:] != documents[:, :-1]
-        )
-        token_regions = new_region.long().cumsum(1) - 1
-        region_count = int(token_regions.max().item()) + 1
+        if not metadata.score_tiles:
+            return RegionSelection(
+                ids, metadata.token_regions, metadata.query_documents, metadata.documents, region_count
+            )
+        if keys is None or compression_logits is None:
+            raise ValueError("Sparse CSA queries require the global indexer projections")
         slot = key_positions % cfg.region_block_size
         rows = torch.arange(batch, device=keys.device).unsqueeze(1)
         packed_keys = keys.new_zeros(batch, region_count, cfg.region_block_size, dim)
         packed_z = torch.full_like(packed_keys, float("-inf"))
-        packed_keys[rows, token_regions, slot] = keys
-        packed_z[rows, token_regions, slot] = compression_logits.masked_fill(key_padding.unsqueeze(-1), float("-inf"))
+        packed_keys[rows, metadata.token_regions, slot] = keys
+        packed_z[rows, metadata.token_regions, slot] = compression_logits.masked_fill(
+            key_padding.unsqueeze(-1), float("-inf")
+        )
         shift = packed_z.float().amax(dim=(-1, -2), keepdim=True)
         probabilities = torch.exp(packed_z.float() - shift).nan_to_num(0.0)
         summary = (probabilities * packed_keys.float()).sum(2) / probabilities.sum(2).clamp_min(1e-20)
-        # Both the BF16 materialization and the subsequent E4M3 rounding are
-        # part of the released selector, independent of expert-weight precision.
         summary = summary.to(torch.bfloat16).to(torch.float8_e4m3fn).to(torch.bfloat16)
         query = query.to(torch.float8_e4m3fn).to(torch.bfloat16)
-        region_documents = torch.zeros(batch, region_count, device=hidden.device, dtype=torch.long)
-        region_documents.scatter_reduce_(1, token_regions, documents, reduce="amax")
-        current = token_regions[:, query_start : query_start + queries]
-        query_documents = documents[:, query_start : query_start + queries]
         budget = min(cfg.topk, region_count)
-        region_ids = torch.full(
-            (batch, groups, queries, budget + 1), region_count, device=hidden.device, dtype=torch.int32
-        )
-        region_range = torch.arange(region_count, device=hidden.device)
-        # Bound the FP32 score workspace by query tiles; never retain [Q, regions]
-        # scores or a [Q, K] token mask for the backward pass.
-        for start in range(0, queries, 128):
-            stop = min(start + 128, queries)
-            scores = indexer_score_tile(query, weights, summary, start, stop)
-            candidates = (region_range < current[:, start:stop, None]) & (
-                region_documents[:, None] == query_documents[:, start:stop, None]
+        region_ids = ids.clone()
+        for b, start, stop, first, last in metadata.score_tiles:
+            # Only this tile's documents and visible history can affect top-k.
+            scores = indexer_score_tile(
+                query[b : b + 1], weights[b : b + 1], summary[b : b + 1, first:last], start, stop
+            )
+            region_range = torch.arange(first, last, device=hidden.device)
+            current = metadata.current[b : b + 1, start:stop]
+            candidates = (region_range < current.unsqueeze(-1)) & (
+                metadata.region_documents[b : b + 1, None, first:last]
+                == metadata.query_documents[b : b + 1, start:stop, None]
             )
             scores.masked_fill_(~candidates[:, None], float("-inf"))
-            # topk finds a cutoff; an ascending prefix resolves exact ties without
-            # perturbing scores or sorting the entire history.
             cutoff = scores.topk(budget, dim=-1, sorted=False).values.amin(-1, keepdim=True)
             greater = (scores > cutoff) & candidates[:, None]
             tied = (scores == cutoff) & candidates[:, None]
             remaining = budget - greater.sum(-1, keepdim=True)
             selected = greater | (tied & (tied.cumsum(-1) <= remaining))
-            selected.scatter_(-1, current[:, None, start:stop, None].expand(-1, groups, -1, 1), True)
-            # Only selected ids survive beyond this tile. Sorting these bounded
-            # slots enables binary membership lookup inside fused attention.
-            ids = torch.where(selected, region_range, region_count)
-            if budget < region_count:
-                ids = ids.topk(budget + 1, dim=-1, largest=False, sorted=True).values
-            else:
-                ids = torch.cat((ids.sort(dim=-1).values, ids.new_full((*ids.shape[:-1], 1), region_count)), -1)
-            region_ids[:, :, start:stop].copy_(ids)
-        return RegionSelection(region_ids, token_regions, query_documents, documents)
+            selected_ids = torch.where(selected, region_range, region_count)
+            historical = selected_ids.topk(budget, dim=-1, largest=False, sorted=True).values
+            selected_ids = torch.cat((historical, current[:, None, :, None].expand(-1, groups, -1, -1)), -1)
+            # Sparse rows have exactly budget historical entries before current;
+            # dense rows retain the independently constructed prefix template.
+            region_ids[b : b + 1, :, start:stop] = torch.where(
+                metadata.sparse_queries[b : b + 1, None, start:stop, None],
+                selected_ids,
+                region_ids[b : b + 1, :, start:stop],
+            )
+        return RegionSelection(
+            region_ids, metadata.token_regions, metadata.query_documents, metadata.documents, region_count
+        )

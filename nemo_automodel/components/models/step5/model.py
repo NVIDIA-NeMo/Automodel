@@ -42,6 +42,7 @@ from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 from nemo_automodel.components.models.step5.configuration import ConfigValue, Step5Config, Step5VLConfig
 from nemo_automodel.components.models.step5.cp import gather_metadata
 from nemo_automodel.components.models.step5.layers import Step5DecoderLayer
+from nemo_automodel.components.models.step5.sparse import region_metadata
 from nemo_automodel.components.models.step5.state_dict_adapter import Step5StateDictAdapter
 from nemo_automodel.components.models.step5.vision import Step5VisionEncoder
 from nemo_automodel.components.moe.config import MoEConfig
@@ -110,10 +111,27 @@ class Step5TextModel(nn.Module):
             invalid[:, 1:] |= same_document & (global_positions[:, 1:] != global_positions[:, :-1] + 1)
             if invalid.any():
                 raise ValueError("Step5 packed document IDs, padding and position_ids disagree")
+        sparse_metadata = None
+        if self.config.sparse_config.enabled:
+            query_start = 0 if cp_group is None else dist.get_rank(cp_group) * positions.shape[1]
+            sparse_metadata = region_metadata(
+                global_positions,
+                global_padding,
+                query_start=query_start,
+                queries=positions.shape[1],
+                region_size=self.config.sparse_config.region_block_size,
+                topk=self.config.sparse_config.topk,
+            )
         residual = embeddings.float()
         for layer in self.layers.values():
             residual = layer(
-                residual, positions, padding_mask, global_positions, global_padding, compute_dtype=compute_dtype
+                residual,
+                positions,
+                padding_mask,
+                global_positions,
+                global_padding,
+                compute_dtype=compute_dtype,
+                sparse_metadata=sparse_metadata,
             )
         # Pipeline boundaries retain the original FP32 residual stream. Only
         # the final stage applies the output norm in the projection dtype.
