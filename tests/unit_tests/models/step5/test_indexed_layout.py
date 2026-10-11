@@ -121,3 +121,44 @@ def test_indexed_layout_supports_batch_and_empty_query_fallback() -> None:
     torch.testing.assert_close(metadata.indexed_layout.starts[0], metadata.indexed_layout.starts[1])
     empty = region_metadata(positions, padding, query_start=0, queries=0, region_size=8, topk=512, indexed_csa=True)
     assert empty.indexed_layout is None
+
+
+@pytest.mark.parametrize("long_row", [0, 1])
+@pytest.mark.parametrize("partner", ["prefix", "allpad", "partialpad"])
+def test_indexed_b2_preserves_row_proofs(long_row: int, partner: str) -> None:
+    keys, start, queries = 40960, 36864, 4096
+    positions = torch.arange(keys)[None].expand(2, -1).clone()
+    padding = torch.zeros_like(positions, dtype=torch.bool)
+    short = 1 - long_row
+    positions[short] = torch.arange(keys) % 1024
+    if partner != "prefix":
+        valid = 2048 if partner == "allpad" else start + 1317
+        padding[short, valid:] = True
+        positions[short, valid:] = 0
+    metadata = region_metadata(
+        positions,
+        padding,
+        query_start=start,
+        queries=queries,
+        region_size=8,
+        topk=512,
+        indexed_csa=True,
+    )
+    assert metadata.indexed_layout is not None
+    assert metadata.indexed_layout.row_eligible == tuple(row == long_row for row in range(2))
+    assert metadata.causal_row_layouts[long_row] is None
+    proof = metadata.causal_row_layouts[short]
+    assert proof is not None
+    assert proof.valid_queries == {"prefix": 4096, "allpad": 0, "partialpad": 1317}[partner]
+    assert metadata.causal_batch_layouts is None
+    assert metadata.region_count == metadata.indexed_layout.starts.shape[1]
+    disabled = region_metadata(
+        positions,
+        padding,
+        query_start=start,
+        queries=queries,
+        region_size=8,
+        topk=512,
+    )
+    assert disabled.indexed_layout is None
+    assert disabled.causal_row_layouts == ()

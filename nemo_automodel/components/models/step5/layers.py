@@ -290,7 +290,15 @@ class Step5Attention(nn.Module):
             and torch.cuda.get_device_capability(hidden.device) == (9, 0)
         ):
             attended = selected_attention(
-                query, key, value, positions, key_positions, key_padding, selection=selection, region_size=8
+                query,
+                key,
+                value,
+                positions,
+                key_positions,
+                key_padding,
+                selection=selection,
+                region_size=8,
+                query_start=query_start,
             )
         elif self.backend.attn == "fa4" and hidden.is_cuda:
             attended = fa4_attention(

@@ -64,6 +64,7 @@ class IndexedRegionLayout:
     Attributes:
         starts: Int32 tensor [batch, regions], first physical key in each region.
             Missing regions use global_keys. Allocated independently of Q/K/V.
+        row_eligible: CPU dispatch decisions per batch row; empty preserves legacy batched dispatch.
         ends: Int32 tensor [batch, regions], exclusive physical key endpoint.
             Missing regions use zero. Trailing padding may span more than eight
             physical keys, but contains no valid key beyond the first eight.
@@ -71,6 +72,7 @@ class IndexedRegionLayout:
 
     starts: torch.Tensor
     ends: torch.Tensor
+    row_eligible: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,7 @@ class RegionSelection:
             single-batch shards with contiguous document positions.
         causal_batch_layouts: Proven prefix or all-padding layout for both rows
             of a fully selected B2 shard; None if either row needs the fallback.
+        causal_row_layouts: Independent per-row prefix proofs for mixed indexed B2 dispatch.
         indexed_layout: Optional physical region bounds for long sparse shards.
         all_padding_key: The only allowed global key for a fully padded shard,
             after proving standard document positions and trailing padding.
@@ -105,6 +108,7 @@ class RegionSelection:
     all_padding_key: int | None = None
     indexed_layout: IndexedRegionLayout | None = None
     causal_batch_layouts: tuple[CausalDocumentLayout, ...] | None = None
+    causal_row_layouts: tuple[CausalDocumentLayout | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +143,7 @@ class RegionMetadata:
             preceding keys. Independent of whether CSA selection is sparse.
         causal_batch_layouts: Prefix or all-padding layouts when both B2 rows
             satisfy native causal attention semantics.
+        causal_row_layouts: Independent per-row prefix proofs for mixed indexed B2 dispatch.
         indexed_layout: Optional shared physical bounds for indexed attention.
         all_padding_key: Singleton global key for a fully padded, fully selected
             local CSA shard, or None when the shortcut cannot be established.
@@ -163,6 +168,7 @@ class RegionMetadata:
     all_padding_key: int | None = None
     indexed_layout: IndexedRegionLayout | None = None
     causal_batch_layouts: tuple[CausalDocumentLayout, ...] | None = None
+    causal_row_layouts: tuple[CausalDocumentLayout | None, ...] = ()
 
 
 def _summary_ranges(
@@ -352,17 +358,17 @@ def region_metadata(
         source_padding = key_padding.gather(1, region_sources.long().clamp_min(0).view(batch, -1))
         region_source_valid = (region_sources >= 0) & ~source_padding.view_as(region_sources)
     indexed_layout = None
-    history_work = (
-        sum((stop - start) * (last - first) * region_size for _, start, stop, first, last in score_tiles)
-        if indexed_csa
-        else 0
-    )
+    row_history = [0] * batch
+    if indexed_csa:
+        for row, start, stop, region_first, region_last in score_tiles:
+            row_history[row] += (stop - start) * (region_last - region_first) * region_size
+    row_eligible = tuple(work >= 32768 * queries for work in row_history)
     if (
         indexed_csa
         and score_tiles
         and bool(layout[-1])
         and region_size == 8
-        and history_work >= 32768 * batch * queries
+        and (any(row_eligible) if batch == 2 else sum(row_history) >= 32768 * batch * queries)
     ):
         # One integer map per model call, shared by every local CSA layer.
         # Unlike compression slots, physical bounds cannot lose a document's
@@ -372,13 +378,14 @@ def region_metadata(
         physical_indices = torch.arange(keys, device=key_positions.device, dtype=torch.int32).expand(batch, -1)
         region_starts.scatter_reduce_(1, token_regions, physical_indices, reduce="amin")
         region_ends.scatter_reduce_(1, token_regions, physical_indices + 1, reduce="amax")
-        indexed_layout = IndexedRegionLayout(region_starts, region_ends)
+        indexed_layout = IndexedRegionLayout(region_starts, region_ends, row_eligible if batch == 2 else ())
     causal_layout = None
     causal_batch_layouts = None
+    causal_row_layouts = ()
     window_layout = None
     prefix_offset = 2 + 2 * batch * tiles_per_batch
     if batch in (1, 2) and queries:
-        row_layouts: list[CausalDocumentLayout] = []
+        row_layouts: list[CausalDocumentLayout | None] = []
         for row in range(batch):
             offset = prefix_offset + row * prefix_fields.shape[1]
             if bool(layout[offset]):
@@ -411,10 +418,14 @@ def region_metadata(
                 row_layouts.append(
                     CausalDocumentLayout(padding_key, padding_key + 1, cu_q, cu_k, 0, 1, 0, padding_key=padding_key)
                 )
+            else:
+                row_layouts.append(None)
+        if indexed_layout is not None and batch == 2:
+            causal_row_layouts = tuple(row_layouts)
         if batch == 1 and row_layouts:
             causal_layout = row_layouts[0]
-        elif batch == 2 and len(row_layouts) == batch:
-            causal_batch_layouts = tuple(row_layouts)
+        elif batch == 2 and all(row is not None for row in row_layouts):
+            causal_batch_layouts = tuple(row for row in row_layouts if row is not None)
     if batch == 1 and window is not None and bool(layout[prefix_offset + 3]):
         valid_queries, padding_key = layout[prefix_offset + 1 : prefix_offset + 3]
         local_positions = layout[prefix_offset + 4 : prefix_offset + 4 + valid_queries]
@@ -465,6 +476,7 @@ def region_metadata(
         all_padding_key,
         indexed_layout,
         causal_batch_layouts,
+        causal_row_layouts,
     )
 
 
@@ -672,4 +684,5 @@ class Step5SparseIndexer(nn.Module):
             metadata.documents,
             region_count,
             indexed_layout=metadata.indexed_layout,
+            causal_row_layouts=metadata.causal_row_layouts,
         )

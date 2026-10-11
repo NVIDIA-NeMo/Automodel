@@ -23,7 +23,8 @@ sequence-squared membership tensor is allocated.
 import torch
 from torch.autograd.function import once_differentiable
 
-from nemo_automodel.components.models.step5.sparse import RegionSelection
+from nemo_automodel.components.models.step5.fa4 import fa4_attention
+from nemo_automodel.components.models.step5.sparse import IndexedRegionLayout, RegionSelection
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAVE_TRITON, triton = safe_import("triton")
@@ -540,8 +541,13 @@ def selected_attention(
     *,
     selection: RegionSelection,
     region_size: int,
+    query_start: int = 0,
 ) -> torch.Tensor:
-    """Attend directly to sorted selected regions using the Triton CUDA kernel.
+    """Attend to selected regions, with rowwise CSR/FA4 dispatch for mixed B2.
+
+    Eligible sparse rows use the Triton kernel; their noneligible partner uses
+    the established FA4 prefix, all-padding, or sparse implementation. Q/K/V
+    row views share input storage; autograd still assembles full-batch gradients.
 
     Args:
         query: BF16 CUDA tensor [batch, local_queries, query_heads, head_dim].
@@ -552,6 +558,7 @@ def selected_attention(
         key_padding: Boolean tensor [batch, global_keys], true for padding.
         selection: Sorted region IDs and document metadata described by RegionSelection.
             Adjacent duplicate IDs are deduplicated; sentinel IDs are ignored.
+        query_start: Physical global key offset of the first local query.
         region_size: Eight valid tokens per contiguous region. A trailing padded
             region can contain more physical keys, whose gradients stay zero.
 
@@ -588,6 +595,56 @@ def selected_attention(
         raise ValueError("Step5 indexed region bounds do not match batch and region count")
     if any(x.dtype != torch.int32 or x.device != query.device for x in (layout.starts, layout.ends)):
         raise ValueError("Step5 indexed region bounds must be CUDA int32 tensors")
+    if layout.row_eligible and len(layout.row_eligible) != query.shape[0]:
+        raise ValueError("Indexed row eligibility must match the batch")
+    if query.shape[0] == 2 and layout.row_eligible and not all(layout.row_eligible):
+        if len(selection.causal_row_layouts) != 2:
+            raise ValueError("Mixed indexed B2 dispatch requires two row proofs")
+        # Unbind differentiable buffers once: separate slices would each create
+        # a zero-filled full-batch K/V gradient before accumulating them.
+        query_rows, key_rows, value_rows = query.unbind(0), key.unbind(0), value.unbind(0)
+        outputs = []
+        for row, eligible in enumerate(layout.row_eligible):
+            proof = selection.causal_row_layouts[row]
+            row_selection = RegionSelection(
+                selection.region_ids[row : row + 1],
+                selection.token_regions[row : row + 1],
+                selection.query_documents[row : row + 1],
+                selection.key_documents[row : row + 1],
+                selection.region_count,
+                all_regions_selected=proof is not None,
+                causal_layout=proof if proof is not None and proof.valid_queries else None,
+                all_padding_key=proof.padding_key if proof is not None and not proof.valid_queries else None,
+                indexed_layout=IndexedRegionLayout(layout.starts[row : row + 1], layout.ends[row : row + 1]),
+            )
+            q, k, v = query_rows[row][None], key_rows[row][None], value_rows[row][None]
+            if eligible:
+                output = selected_attention(
+                    q,
+                    k,
+                    v,
+                    positions[row : row + 1],
+                    key_positions[row : row + 1],
+                    key_padding[row : row + 1],
+                    selection=row_selection,
+                    region_size=region_size,
+                    query_start=query_start,
+                )
+            else:
+                output = fa4_attention(
+                    q,
+                    k,
+                    v,
+                    positions[row : row + 1],
+                    key_positions[row : row + 1],
+                    key_padding[row : row + 1],
+                    selection.key_documents[row : row + 1],
+                    query_start=query_start,
+                    window=None,
+                    selection=row_selection,
+                )
+            outputs.append(output.squeeze(0))
+        return torch.stack(outputs, dim=0)
     return _SelectedAttention.apply(
         query,
         key,
