@@ -327,10 +327,11 @@ def fa4_attention(
         # bottom-right causality therefore matches document-local positions.
         # In particular, the final K segment ends at the final local query,
         # even if that document continues on the next CP rank.
+        value_prefix = value[0, layout.key_start : layout.key_stop]
         output, _ = _load_fa4_varlen()(
-            query[0],
+            query[0, : layout.valid_queries],
             key[0, layout.key_start : layout.key_stop],
-            value[0, layout.key_start : layout.key_stop],
+            value_prefix,
             cu_seqlens_q=layout.cu_seqlens_q,
             cu_seqlens_k=layout.cu_seqlens_k,
             max_seqlen_q=layout.max_seqlen_q,
@@ -339,7 +340,22 @@ def fa4_attention(
             causal=True,
             pack_gqa=False,
         )
-        return output.unsqueeze(0)
+        if layout.padding_key is None:
+            return output.unsqueeze(0)
+        # A padding query has position zero but retains the final document ID.
+        # The old mask therefore selects that document's first V, not zeros.
+        # Keep GQA expansion as a view and concatenate into one output buffer.
+        # The valid Q/K slices retain zero gradients for unused padding entries.
+        groups = value.shape[2]
+        heads_per_group = query.shape[2] // groups
+        # Share the compact V view so both branches accumulate before the
+        # single global slice backward allocates a full-length V gradient.
+        padding_offset = layout.padding_key - layout.key_start
+        padding_value = value_prefix[padding_offset : padding_offset + 1][None, :, :, None]
+        padding_output = padding_value.expand(1, queries - layout.valid_queries, groups, heads_per_group, dim)
+        return torch.cat(
+            (output.reshape(1, layout.valid_queries, groups, heads_per_group, dim), padding_output), dim=1
+        ).flatten(2, 3)
     bitmap = False
     slots = 0
     regions = 0 if selection is None else selection.region_count

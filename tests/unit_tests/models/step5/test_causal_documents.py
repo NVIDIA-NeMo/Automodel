@@ -31,22 +31,28 @@ def _native_mask(layout: CausalDocumentLayout, queries: int, keys: int) -> torch
         for query in range(q1 - q0):
             for key in range(k1 - k0):
                 mask[q0 + query, layout.key_start + k0 + key] = key <= query + (k1 - k0) - (q1 - q0)
+    if layout.padding_key is not None:
+        mask[layout.valid_queries :, layout.padding_key] = True
     return mask
 
 
-def _oracle(positions: torch.Tensor, start: int, queries: int) -> torch.Tensor:
+def _oracle(positions: torch.Tensor, start: int, queries: int, padding: torch.Tensor | None = None) -> torch.Tensor:
     """Build a mask from document resets and absolute positions, without cu data."""
+    if padding is None:
+        padding = torch.zeros_like(positions, dtype=torch.bool)
     docs = []
     document = -1
-    for position in positions[0].tolist():
-        if position == 0:
+    for position, padded in zip(positions[0].tolist(), padding[0].tolist()):
+        if position == 0 and not padded:
             document += 1
         docs.append(document)
     mask = torch.zeros(queries, positions.shape[1], dtype=torch.bool)
     for query in range(queries):
         physical = start + query
         for key in range(positions.shape[1]):
-            mask[query, key] = docs[key] == docs[physical] and positions[0, key] <= positions[0, physical]
+            mask[query, key] = (
+                not padding[0, key] and docs[key] == docs[physical] and positions[0, key] <= positions[0, physical]
+            )
     return mask
 
 
@@ -125,3 +131,52 @@ def test_document_mask_oracle_detects_wrong_bottom_right_alignment() -> None:
     for incorrect in (future, missing):
         with pytest.raises(AssertionError):
             torch.testing.assert_close(_native_mask(incorrect, 4, 9), expected)
+
+
+@pytest.mark.parametrize("lengths,start,padded", [((9, 7), 0, 3), ((9, 7), 5, 3), ((9, 7), 11, 3), ((3, 1), 3, 1)])
+def test_native_layout_trims_only_trailing_padding_and_keeps_singleton_value(
+    lengths: tuple[int, ...], start: int, padded: int
+) -> None:
+    positions = torch.cat([torch.arange(n) for n in lengths] + [torch.zeros(padded, dtype=torch.long)])[None]
+    padding = torch.arange(positions.shape[1])[None] >= sum(lengths)
+    queries = positions.shape[1] - start
+    meta = region_metadata(positions, padding, query_start=start, queries=queries, region_size=8, topk=512)
+    layout = meta.causal_layout
+    assert layout is not None
+    assert layout.valid_queries == sum(lengths) - start
+    assert layout.key_stop == sum(lengths)
+    assert layout.padding_key == sum(lengths[:-1])
+    expected = _oracle(positions, start, queries, padding)
+    torch.testing.assert_close(_native_mask(layout, queries, positions.shape[1]), expected)
+    # Neither zero outputs nor the first document's V preserve pad semantics.
+    incorrect = _native_mask(layout, queries, positions.shape[1])
+    incorrect[layout.valid_queries :] = False
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(incorrect, expected)
+    wrong_document = replace(layout, padding_key=0)
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(_native_mask(wrong_document, queries, positions.shape[1]), expected)
+
+
+@pytest.mark.parametrize(
+    "positions,padding,start,topk",
+    [
+        ([0, 1, 0, 2], [False, False, True, False], 0, 512),
+        ([0, 1, 2, 3], [False, False, False, True], 0, 512),
+        ([0, 1, 0, 0], [False, False, True, True], 2, 512),
+        ([0, 0, 0, 0], [True, True, True, True], 0, 512),
+        (list(range(9)) + [0, 0], [False] * 9 + [True] * 2, 0, 2),
+    ],
+)
+def test_native_padding_layout_rejects_holes_nonzero_positions_empty_queries_and_sparse_tail(
+    positions: list[int], padding: list[bool], start: int, topk: int
+) -> None:
+    meta = region_metadata(
+        torch.tensor([positions]),
+        torch.tensor([padding]),
+        query_start=start,
+        queries=len(positions) - start,
+        region_size=2,
+        topk=topk,
+    )
+    assert meta.causal_layout is None

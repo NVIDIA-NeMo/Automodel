@@ -81,10 +81,13 @@ class CPReport(TypedDict):
     gradients: dict[str, GradientMetrics]
     packed: NotRequired[bool]
     scenario: NotRequired[str]
+    padding_queries: NotRequired[int]
     routes: NotRequired[dict[str, RouteMetrics]]
 
 
-def compare_cp(model: Step5ForCausalLM, tokens: torch.Tensor, positions: torch.Tensor) -> CPReport:
+def compare_cp(
+    model: Step5ForCausalLM, tokens: torch.Tensor, positions: torch.Tensor, padding: torch.Tensor | None = None
+) -> CPReport:
     """Compare a replicated model before/after native CP setup on identical inputs."""
     rank = dist.get_rank()
     route_records: list[dict[str, RouteSnapshot]] = [{}, {}]
@@ -111,10 +114,12 @@ def compare_cp(model: Step5ForCausalLM, tokens: torch.Tensor, positions: torch.T
     labels = tokens.roll(-1, dims=1)
     labels[:, -1] = -100
     labels[:, :-1].masked_fill_(positions[:, 1:] == 0, -100)
+    if padding is not None:
+        labels.masked_fill_(padding, -100)
     count = (labels != -100).sum()
     model.train()
     torch.cuda.reset_peak_memory_stats()
-    baseline_logits = model(tokens, position_ids=positions).logits
+    baseline_logits = model(tokens, position_ids=positions, padding_mask=padding).logits
     baseline_loss = F.cross_entropy(baseline_logits.float().flatten(0, 1), labels.flatten(), reduction="sum") / count
     baseline_loss.backward()
     baseline_grads = {name: p.grad.detach().cpu() for name, p in model.named_parameters() if p.grad is not None}
@@ -130,6 +135,8 @@ def compare_cp(model: Step5ForCausalLM, tokens: torch.Tensor, positions: torch.T
     mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("cp",))
     apply_cp(model, mesh["cp"])
     batch = {"input_ids": tokens.clone(), "labels": labels.clone(), "position_ids": positions.clone()}
+    if padding is not None:
+        batch["padding_mask"] = padding.clone()
     sharder = ContextParallelSharder(model, mesh, batch)
     context, local = sharder.shard(batch)
     torch.cuda.reset_peak_memory_stats()
@@ -217,26 +224,41 @@ def main() -> None:
     parser.add_argument(
         "--scenario",
         action="append",
-        choices=("short", "packed4k", "long-packed", "long-crossing", "long-single"),
+        choices=(
+            "short",
+            "packed4k",
+            "long-packed",
+            "long-crossing",
+            "long-single",
+            "trailing4k",
+            "trailing8k",
+            "empty-tail8k",
+            "sparse-tail8k",
+        ),
         help="Repeat to select scenarios; default: original short single/packed sweep.",
     )
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     assert dist.get_world_size() == 2
-    scenarios: list[tuple[str, tuple[int, ...], int, int]] = []
+    scenarios: list[tuple[str, tuple[int, ...], int, int, int]] = []
     for scenario in args.scenario or ["short"]:
         if scenario == "short":
-            scenarios.extend((("short-single", (263,), 4, 65), ("short-packed", (19, 244), 4, 65)))
+            scenarios.extend((("short-single", (263,), 4, 65, 0), ("short-packed", (19, 244), 4, 65, 0)))
         else:
             lengths = {
                 "packed4k": (1031, 3065),
                 "long-packed": (4096, 4096),
                 "long-crossing": (2051, 4096, 2045),
                 "long-single": (8192,),
+                "trailing4k": (1031, 3058),
+                "trailing8k": (2051, 4096, 2038),
+                "empty-tail8k": (3000,),
+                "sparse-tail8k": (8185,),
             }[scenario]
-            scenarios.append((scenario, lengths, 512, 512))
-    for scenario, lengths, topk, window in scenarios:
+            padded = {"trailing4k": 7, "trailing8k": 7, "empty-tail8k": 5192, "sparse-tail8k": 7}.get(scenario, 0)
+            scenarios.append((scenario, lengths, 512, 512, padded))
+    for scenario, lengths, topk, window, padded in scenarios:
         torch.manual_seed(73)
         config = Step5Config(
             hidden_size=64,
@@ -265,9 +287,13 @@ def main() -> None:
         )
         backend = BackendConfig(attn=args.backend, linear="torch", dispatcher="torch", experts="torch_mm")
         model = Step5ForCausalLM(config, backend=backend).cuda()
-        tokens = torch.randint(1, 127, (1, sum(lengths)), device="cuda")
-        positions = torch.cat([torch.arange(length) for length in lengths]).cuda()[None]
-        report = compare_cp(model, tokens, positions)
+        tokens = torch.randint(1, 127, (1, sum(lengths) + padded), device="cuda")
+        positions = torch.cat(
+            [torch.arange(length) for length in lengths] + [torch.zeros(padded, dtype=torch.long)]
+        ).cuda()[None]
+        padding = torch.arange(tokens.shape[1], device="cuda")[None] >= sum(lengths) if padded else None
+        report = compare_cp(model, tokens, positions, padding)
+        report["padding_queries"] = padded
         report["packed"] = len(lengths) > 1
         report["scenario"] = scenario
         print(json.dumps(report), flush=True)

@@ -397,3 +397,158 @@ def test_fa4_native_varlen_contiguous_cp_outputs_and_qkv_gradients(lengths: tupl
         }
         assert relative_rms < 0.012
     print({"lengths": lengths, "native_varlen_dispatch": dispatch, "cp1_cp2": metrics})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "lengths,padded,query_start", [((1031, 3058), 7, 0), ((2051, 4096, 2038), 7, 4096), ((3000,), 1096, 0)]
+)
+def test_fa4_native_varlen_trailing_padding_preserves_outputs_and_value_gradients(
+    monkeypatch: pytest.MonkeyPatch, lengths: tuple[int, ...], padded: int, query_start: int
+) -> None:
+    """Padding queries still read the final document's first V, including GQA."""
+    from dataclasses import replace
+
+    from nemo_automodel.components.models.step5 import fa4
+    from nemo_automodel.components.models.step5.sparse import region_metadata
+
+    torch.manual_seed(720)
+    keys, heads, groups, dim = sum(lengths) + padded, 4, 2, 192
+    positions = torch.cat(
+        [torch.arange(n, device="cuda") for n in lengths] + [torch.zeros(padded, device="cuda", dtype=torch.long)]
+    )[None]
+    padding = torch.arange(keys, device="cuda")[None] >= sum(lengths)
+    documents = ((positions == 0) & ~padding).cumsum(-1)
+    queries = keys - query_start
+    valid_queries = queries - padded
+    meta = region_metadata(positions, padding, query_start=query_start, queries=queries, region_size=8, topk=512)
+    assert meta.causal_layout is not None
+    assert meta.causal_layout.valid_queries == valid_queries
+    selection = RegionSelection(
+        meta.dense_region_ids[:, None].expand(-1, groups, -1, -1),
+        meta.token_regions,
+        meta.query_documents,
+        meta.documents,
+        meta.region_count,
+        all_regions_selected=True,
+        causal_layout=meta.causal_layout,
+    )
+    q = torch.randn(1, queries, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(1, keys, 2, groups, dim, device="cuda", dtype=torch.bfloat16)
+    k, v = (part.detach().requires_grad_() for part in kv.unbind(2))
+    native = fa4._load_fa4_varlen()
+    native_queries: list[int] = []
+
+    def invoke(*args, **kwargs):
+        native_queries.append(args[0].shape[0])
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(fa4, "_load_fa4_varlen", lambda: invoke)
+
+    def call(routes: RegionSelection) -> torch.Tensor:
+        return fa4.fa4_attention(
+            q,
+            k,
+            v,
+            positions[:, query_start:],
+            positions,
+            padding,
+            documents,
+            query_start=query_start,
+            window=None,
+            selection=routes,
+        )
+
+    output = call(selection)
+    original = call(replace(selection, causal_layout=None))
+    assert native_queries == [valid_queries]
+    allowed = (
+        (positions[:, query_start:, None] >= positions[:, None, :])
+        & (documents[:, query_start:, None] == documents[:, None, :])
+        & ~padding[:, None, :]
+    )
+    expected = F.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2).repeat_interleave(heads // groups, dim=1),
+        v.float().transpose(1, 2).repeat_interleave(heads // groups, dim=1),
+        attn_mask=allowed[:, None],
+    ).transpose(1, 2)
+    for actual in (output, original):
+        torch.testing.assert_close(actual.float(), expected, atol=0.015, rtol=0.015)
+    torch.testing.assert_close(output[:, valid_queries:], original[:, valid_queries:], atol=0, rtol=0)
+    upstream = torch.randn_like(output)
+    actual_grad = torch.autograd.grad(output, (q, k, v), upstream, retain_graph=True)
+    old_grad = torch.autograd.grad(original, (q, k, v), upstream)
+    reference_grad = torch.autograd.grad(expected, (q, k, v), upstream.float())
+    metrics: dict[str, list[float]] = {}
+    for name, actuals in (("trim", actual_grad), ("original", old_grad)):
+        metrics[name] = []
+        for actual, reference in zip(actuals, reference_grad):
+            relative = ((actual.float() - reference.float()).square().sum() / reference.float().square().sum()).sqrt()
+            assert relative < 0.012
+            metrics[name].append(float(relative))
+
+    # A label mask is not an attention mask. Exercise nonzero gradients from
+    # padded queries explicitly, rather than relying on SFT's ignored labels.
+    pad_upstream = upstream.clone()
+    pad_upstream[:, :valid_queries] = 0
+    dq, dk, dv = torch.autograd.grad(output, (q, k, v), pad_upstream)
+    assert torch.count_nonzero(dq) == torch.count_nonzero(dk) == 0
+    expected_dv = torch.zeros_like(v)
+    expected_dv[:, sum(lengths[:-1])] = (
+        upstream[:, valid_queries:].reshape(1, padded, groups, heads // groups, dim).float().sum((1, 3))
+    ).to(v.dtype)
+    torch.testing.assert_close(dv, expected_dv, rtol=0, atol=0)
+    assert torch.count_nonzero(dv) > 0
+    print({"lengths": lengths, "padding": padded, "query_start": query_start, "gradient_relative_rms": metrics})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fa4_zero_valid_query_shard_keeps_original_padding_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An entirely padded CP rank conservatively stays on the existing backend."""
+    from nemo_automodel.components.models.step5 import fa4
+    from nemo_automodel.components.models.step5.sparse import region_metadata
+
+    torch.manual_seed(721)
+    keys, start, valid, heads, groups, dim = 8192, 4096, 3000, 4, 2, 192
+    positions = torch.zeros(1, keys, device="cuda", dtype=torch.long)
+    positions[:, :valid] = torch.arange(valid, device="cuda")
+    padding = torch.arange(keys, device="cuda")[None] >= valid
+    meta = region_metadata(positions, padding, query_start=start, queries=keys - start, region_size=8, topk=512)
+    assert meta.causal_layout is None and not meta.score_tiles
+    selection = RegionSelection(
+        meta.dense_region_ids[:, None].expand(-1, groups, -1, -1),
+        meta.token_regions,
+        meta.query_documents,
+        meta.documents,
+        meta.region_count,
+        all_regions_selected=True,
+    )
+
+    def forbidden_varlen():
+        raise AssertionError("An empty valid query prefix must retain the original kernel")
+
+    monkeypatch.setattr(fa4, "_load_fa4_varlen", forbidden_varlen)
+    q = torch.randn(1, keys - start, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, keys, groups, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    output = fa4.fa4_attention(
+        q,
+        k,
+        v,
+        positions[:, start:],
+        positions,
+        padding,
+        meta.documents,
+        query_start=start,
+        window=None,
+        selection=selection,
+    )
+    expected = v[:, :1].repeat_interleave(heads // groups, dim=2).expand_as(output)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    gradient = torch.ones_like(output)
+    dq, dk, dv = torch.autograd.grad(output, (q, k, v), gradient)
+    assert torch.count_nonzero(dq) == torch.count_nonzero(dk) == 0
+    expected_dv = torch.zeros_like(v)
+    expected_dv[:, 0] = (keys - start) * (heads // groups)
+    torch.testing.assert_close(dv, expected_dv, rtol=0, atol=0)
