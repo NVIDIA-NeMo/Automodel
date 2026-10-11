@@ -51,10 +51,12 @@ def _time_cuda(call: Callable[[], object]) -> float:
 
 
 @pytest.mark.parametrize("sequence", [4096, 8192])
-@pytest.mark.parametrize("kind", ["residual", "query", "final"])
+@pytest.mark.parametrize("kind", ["residual", "query", "key", "final"])
 def test_norm_cuda_forward_backward_recompute(sequence: int, kind: str, record_property) -> None:
     torch.manual_seed(983)
     shape = (1, sequence, 64, 192) if kind == "query" else (1, sequence, 4096)
+    if kind == "key":
+        shape = (1, sequence, 4, 192)
     dtype = torch.float32 if kind == "residual" else torch.bfloat16
     reference = Step3p5RMSNorm(shape[-1]).cuda()
     candidate = Step5RMSNorm(shape[-1], compile_norm=True).cuda()
@@ -62,6 +64,9 @@ def test_norm_cuda_forward_backward_recompute(sequence: int, kind: str, record_p
         reference.weight.copy_(torch.linspace(-0.7, 0.7, shape[-1], device="cuda") + 0.00123)
         candidate.weight.copy_(reference.weight)
     original = torch.randn(shape, device="cuda", dtype=dtype)
+    if kind == "key":
+        # Actual key projection is a strided slice of interleaved GQA QKV.
+        original = torch.randn(1, sequence, 4, 18, 192, device="cuda", dtype=dtype)[..., 16, :]
     upstream = torch.randn_like(original)
     expected_input = original.detach().requires_grad_()
     actual_input = original.detach().requires_grad_()

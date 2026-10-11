@@ -41,15 +41,16 @@ def _time_cuda(call: Callable[[], object]) -> float:
 
 
 @pytest.mark.parametrize("sequence", [4096, 8192])
-@pytest.mark.parametrize("span", [64, 192])
+@pytest.mark.parametrize("span", [32, 64, 192])
 def test_rope_cuda_long_positions_packed_backward_recompute(sequence: int, span: int, record_property) -> None:
     torch.manual_seed(985)
     config = Step5Config()
     config.rope_theta = 10000.0 if span == 192 else 10000000.0
+    heads, dim = (16, 256) if span == 32 else (64, 192)
     rope = Step5RotaryEmbedding(config, 0, span=span).cuda()
     positions = torch.arange(sequence, device="cuda").unsqueeze(0) + 131072 - sequence
     positions[:, sequence // 2 :] = torch.arange(sequence - sequence // 2, device="cuda")
-    hidden = torch.randn(1, sequence, 64, 192, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    hidden = torch.randn(1, sequence, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     half = span // 2
     # Original inference arithmetic and explicit BF16 table, kept outside candidate helpers.
     inverse = 1.0 / config.rope_theta ** (torch.arange(0, span, 2, device="cuda", dtype=torch.float32) / span)

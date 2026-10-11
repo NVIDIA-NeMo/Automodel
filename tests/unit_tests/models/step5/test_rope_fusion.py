@@ -21,7 +21,7 @@ from nemo_automodel.components.models.step5.configuration import Step5Config
 from nemo_automodel.components.models.step5.rope import Step5RotaryEmbedding
 
 
-@pytest.mark.parametrize("span", [0, 64, 192])
+@pytest.mark.parametrize("span", [0, 32, 64, 192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_rope_complex_oracle_and_packed_resets(span: int, dtype: torch.dtype) -> None:
     torch.manual_seed(984)
