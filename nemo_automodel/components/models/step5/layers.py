@@ -27,11 +27,11 @@ from torch.utils._python_dispatch import _disable_current_modes
 
 from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
-from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 from nemo_automodel.components.models.step5.attention import fused_attention
 from nemo_automodel.components.models.step5.configuration import Step5Config
 from nemo_automodel.components.models.step5.cp import gather_halo, gather_metadata, gather_sequence
 from nemo_automodel.components.models.step5.fa4 import fa4_attention
+from nemo_automodel.components.models.step5.norm import Step5RMSNorm
 from nemo_automodel.components.models.step5.rope import Step5RotaryEmbedding
 from nemo_automodel.components.models.step5.sparse import (
     RegionMetadata,
@@ -117,8 +117,8 @@ class Step5Attention(nn.Module):
             if config.use_head_wise_attn_gate
             else None
         )
-        self.q_norm = Step3p5RMSNorm(self.head_dim, config.rms_norm_eps)
-        self.k_norm = Step3p5RMSNorm(self.head_dim, config.rms_norm_eps)
+        self.q_norm = Step5RMSNorm(self.head_dim, config.rms_norm_eps, compile_norm=backend.compile_norm)
+        self.k_norm = Step5RMSNorm(self.head_dim, config.rms_norm_eps, compile_norm=backend.compile_norm)
         span = int(self.head_dim * config.partial_rotary_factors[layer_idx])
         self.rotary_emb = Step5RotaryEmbedding(config, layer_idx, span=span)
         sparse = (
@@ -341,8 +341,10 @@ class Step5DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.self_attn = Step5Attention(config, layer_idx, backend, dtype=dtype)
-        self.input_layernorm = Step3p5RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = Step3p5RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = Step5RMSNorm(config.hidden_size, config.rms_norm_eps, compile_norm=backend.compile_norm)
+        self.post_attention_layernorm = Step5RMSNorm(
+            config.hidden_size, config.rms_norm_eps, compile_norm=backend.compile_norm
+        )
         limit = config.swiglu_limits[layer_idx]
         if config.use_moe and layer_idx in config.moe_layer_list:
             self.moe = MoE(replace(moe_config, swiglu_limit=limit), backend)

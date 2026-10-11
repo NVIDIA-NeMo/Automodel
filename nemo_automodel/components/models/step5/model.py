@@ -42,6 +42,7 @@ from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 from nemo_automodel.components.models.step5.configuration import ConfigValue, Step5Config, Step5VLConfig
 from nemo_automodel.components.models.step5.cp import gather_metadata
 from nemo_automodel.components.models.step5.layers import Step5DecoderLayer
+from nemo_automodel.components.models.step5.norm import Step5RMSNorm
 from nemo_automodel.components.models.step5.sparse import region_metadata
 from nemo_automodel.components.models.step5.state_dict_adapter import Step5StateDictAdapter
 from nemo_automodel.components.models.step5.vision import Step5VisionEncoder
@@ -66,7 +67,7 @@ class Step5TextModel(nn.Module):
                 for i in range(config.num_hidden_layers)
             }
         )
-        self.norm = Step3p5RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = Step5RMSNorm(config.hidden_size, config.rms_norm_eps, compile_norm=backend.compile_norm)
 
     def forward(
         self,
