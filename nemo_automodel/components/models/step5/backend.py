@@ -24,6 +24,9 @@ class Step5BackendConfig(BackendConfig):
     """Model-owned execution options, disabled by default.
 
     Attributes:
+        indexed_csa: Use native-D192 region-indexed attention on SM90 for
+            genuinely sparse shards with at least 32K effective history.
+            Shorter or irregular shards retain FA4. Requires attn="fa4".
         swa_varlen: Use native FA4 window attention for valid single-batch
             SM90 D192 query prefixes. Padding keeps its custom-mask path.
             Requires enabled sparse metadata; communication is unchanged.
@@ -35,11 +38,16 @@ class Step5BackendConfig(BackendConfig):
             not total CUDA memory, activations or collective workspaces.
     """
 
+    indexed_csa: bool = False
     swa_varlen: bool = False
     bf16_fsdp_retention_mib_per_part: int = 0
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if not isinstance(self.indexed_csa, bool):
+            raise TypeError("indexed_csa must be a bool")
+        if self.indexed_csa and self.attn != "fa4":
+            raise ValueError("indexed_csa requires attn=fa4")
         if not isinstance(self.swa_varlen, bool):
             raise TypeError("swa_varlen must be a bool")
         if isinstance(self.bf16_fsdp_retention_mib_per_part, bool) or not isinstance(

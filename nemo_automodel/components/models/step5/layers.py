@@ -28,9 +28,11 @@ from torch.utils._python_dispatch import _disable_current_modes
 from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.step5.attention import fused_attention
+from nemo_automodel.components.models.step5.backend import Step5BackendConfig
 from nemo_automodel.components.models.step5.configuration import Step5Config
 from nemo_automodel.components.models.step5.cp import gather_halo, gather_metadata, gather_sequence
 from nemo_automodel.components.models.step5.fa4 import fa4_attention
+from nemo_automodel.components.models.step5.indexed_attention import selected_attention
 from nemo_automodel.components.models.step5.norm import Step5RMSNorm
 from nemo_automodel.components.models.step5.rope import Step5RotaryEmbedding
 from nemo_automodel.components.models.step5.sparse import (
@@ -96,6 +98,7 @@ class Step5Attention(nn.Module):
         if backend.attn not in ("fa4", "flex", "sdpa", "eager", "torch"):
             raise ValueError("Step5 attention supports fa4, flex, sdpa and eager backends")
         self.backend = backend
+        self.indexed_csa = isinstance(backend, Step5BackendConfig) and backend.indexed_csa
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_attention_groups
         self.heads_per_group = self.num_heads // self.num_kv_heads
@@ -170,6 +173,7 @@ class Step5Attention(nn.Module):
                     queries=hidden.shape[1],
                     region_size=self.indexer.config.region_block_size,
                     topk=self.indexer.config.topk,
+                    indexed_csa=self.indexed_csa,
                 )
             index_k, index_z = None, None
             # This global predicate is identical across all CP ranks. A rank
@@ -274,7 +278,21 @@ class Step5Attention(nn.Module):
                 query_start=query_start,
                 sparse_metadata=sparse_metadata,
             )
-        if self.backend.attn == "fa4" and hidden.is_cuda:
+        if (
+            self.indexed_csa
+            and self.window is None
+            and selection is not None
+            and selection.indexed_layout is not None
+            and dim == 192
+            and query.dtype == torch.bfloat16
+            and heads == 16
+            and hidden.is_cuda
+            and torch.cuda.get_device_capability(hidden.device) == (9, 0)
+        ):
+            attended = selected_attention(
+                query, key, value, positions, key_positions, key_padding, selection=selection, region_size=8
+            )
+        elif self.backend.attn == "fa4" and hidden.is_cuda:
             attended = fa4_attention(
                 query,
                 key,

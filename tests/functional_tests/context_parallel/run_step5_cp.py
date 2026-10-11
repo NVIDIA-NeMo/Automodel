@@ -18,7 +18,9 @@ Launch with torchrun --standalone --nproc_per_node=2. The small four-layer model
 covers dense FFN, routed/shared experts, SWA, CSA, padding and packed documents.
 The default is the original short sweep. Opt in to --scenario long-packed,
 --scenario long-crossing, or --scenario long-single to exercise 8K native-varlen
-and truly sparse shards. This random-weight component test is not a checkpoint
+and truly sparse shards. Use --indexed-csa with --scenario indexed-single96k or
+--scenario indexed-packed128k for native-D192/GQA16 indexed/FA4 mixed CP dispatch.
+This random-weight component test is not a checkpoint
 loading validation.
 """
 
@@ -26,7 +28,8 @@ import argparse
 import gc
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
@@ -62,6 +65,8 @@ class RouteBucket(TypedDict):
 class RouteMetrics(TypedDict):
     cp1_native_varlen: bool
     cp2_native_varlen: bool
+    cp1_indexed_layout: bool
+    cp2_indexed_layout: bool
     cp1_all_padding_key: int | None
     cp2_all_padding_key: int | None
     prefix: RouteBucket
@@ -70,9 +75,19 @@ class RouteMetrics(TypedDict):
 
 @dataclass
 class RouteSnapshot:
+    """Selected IDs [batch, provider_groups, local_queries, slots] and dispatch metadata."""
+
     ids: torch.Tensor
     native_varlen: bool
+    indexed_layout: bool
     all_padding_key: int | None
+
+
+class LogitBucket(TypedDict):
+    queries: int
+    max_abs: float
+    rms: float
+    kl: float
 
 
 class CPReport(TypedDict):
@@ -89,8 +104,35 @@ class CPReport(TypedDict):
     packed: NotRequired[bool]
     scenario: NotRequired[str]
     swa_varlen: NotRequired[bool]
+    indexed_csa: NotRequired[bool]
+    indexed_kernel_calls: NotRequired[dict[str, dict[str, int]]]
+    position_buckets: NotRequired[dict[str, LogitBucket]]
     padding_queries: NotRequired[int]
     routes: NotRequired[dict[str, RouteMetrics]]
+
+
+@contextmanager
+def indexed_kernel_calls(enabled: bool) -> Iterator[dict[str, int]]:
+    """Count completed CUDA kernel events for the optional indexed attention gate.
+
+    Args:
+        enabled: Enable the CUDA profiler for this functional-test phase.
+
+    Yields:
+        Kernel-name counts populated after the forward/backward scope completes.
+    """
+    counts: dict[str, int] = {}
+    if not enabled:
+        yield counts
+        return
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as profiler:
+        yield counts
+    names = ("_attention", "_region_backward", "_edge_counts", "_edge_scatter")
+    for event in profiler.events():
+        if event.device_type == torch.autograd.DeviceType.CUDA and event.name.startswith(names):
+            counts[event.name] = counts.get(event.name, 0) + 1
 
 
 def compare_cp(
@@ -100,8 +142,21 @@ def compare_cp(
     padding: torch.Tensor | None = None,
     *,
     stage_output: Path | None = None,
+    profile_indexed: bool = False,
 ) -> CPReport:
-    """Compare a replicated model before/after native CP setup on identical inputs."""
+    """Compare a replicated model before/after native CP setup on identical inputs.
+
+    Args:
+        model: Small random-weight model; no checkpoint-loading validation is claimed.
+        tokens: Global token IDs of shape [batch, sequence].
+        positions: Global document-local positions of shape [batch, sequence].
+        padding: Optional global Boolean mask [batch, sequence], true for padding.
+        stage_output: Optional directory for downstream attention and routing diagnostics.
+        profile_indexed: Record actual indexed CUDA kernel events for each FWB phase.
+
+    Returns:
+        Logit, loss, route, gradient, memory and optional executed-kernel measurements.
+    """
     rank = dist.get_rank()
     route_records: list[dict[str, RouteSnapshot]] = [{}, {}]
     phase = 0
@@ -112,8 +167,22 @@ def compare_cp(
         def record(
             _module: Step5SparseIndexer, _inputs: tuple[torch.Tensor | None, ...], output: RegionSelection
         ) -> None:
+            """Retain selected routes independently of CUDA execution counters.
+
+            Args:
+                _module: Indexer whose output is recorded.
+                _inputs: Indexer inputs: local hidden [batch, local_queries, hidden],
+                    local positions [batch, local_queries], optional global projected
+                    K/Z [batch, global_keys, groups, proxy_dim] and global position/
+                    padding metadata [batch, global_keys].
+                output: RegionSelection with IDs [batch, provider_groups, local_queries,
+                    slots] and global key-region/document metadata.
+            """
             route_records[phase][name] = RouteSnapshot(
-                output.region_ids.detach().cpu(), output.causal_layout is not None, output.all_padding_key
+                output.region_ids.detach().cpu(),
+                output.causal_layout is not None,
+                output.indexed_layout is not None,
+                output.all_padding_key,
             )
 
         return record
@@ -172,9 +241,12 @@ def compare_cp(
     count = (labels != -100).sum()
     model.train()
     torch.cuda.reset_peak_memory_stats()
-    baseline_logits = model(tokens, position_ids=positions, padding_mask=padding).logits
-    baseline_loss = F.cross_entropy(baseline_logits.float().flatten(0, 1), labels.flatten(), reduction="sum") / count
-    baseline_loss.backward()
+    with indexed_kernel_calls(profile_indexed) as cp1_kernel_calls:
+        baseline_logits = model(tokens, position_ids=positions, padding_mask=padding).logits
+        baseline_loss = (
+            F.cross_entropy(baseline_logits.float().flatten(0, 1), labels.flatten(), reduction="sum") / count
+        )
+        baseline_loss.backward()
     baseline_grads = {name: p.grad.detach().cpu() for name, p in model.named_parameters() if p.grad is not None}
     baseline_cpu = baseline_logits.detach().cpu()
     reference_loss = baseline_loss.detach().item()
@@ -193,7 +265,7 @@ def compare_cp(
     sharder = ContextParallelSharder(model, mesh, batch)
     context, local = sharder.shard(batch)
     torch.cuda.reset_peak_memory_stats()
-    with context():
+    with indexed_kernel_calls(profile_indexed) as cp2_kernel_calls, context():
         logits = model(
             local["input_ids"], position_ids=local["position_ids"], padding_mask=local["padding_mask"]
         ).logits
@@ -221,10 +293,32 @@ def compare_cp(
         "cp1_peak_bytes": cp1_peak,
         "cp2_peak_bytes": cp2_peak,
         "gradients": {},
+        "indexed_kernel_calls": {"cp1": cp1_kernel_calls, "cp2": cp2_kernel_calls},
     }
     route_metrics: dict[str, RouteMetrics] = {}
     local_positions = positions[:, start : start + valid].cpu()
     boundary = (model.config.sparse_config.topk + 1) * model.config.sparse_config.region_block_size
+    position_buckets: dict[str, LogitBucket] = {}
+    for bucket, cpu_mask in (("prefix", local_positions < boundary), ("sparse", local_positions >= boundary)):
+        mask = cpu_mask.to(actual.device)
+        queries = int(cpu_mask.sum())
+        if queries:
+            bucket_reference, bucket_actual = reference[mask], actual[mask]
+            position_buckets[bucket] = {
+                "queries": queries,
+                "max_abs": (bucket_reference - bucket_actual).abs().max().item(),
+                "rms": (bucket_reference - bucket_actual).square().mean().sqrt().item(),
+                "kl": (
+                    bucket_reference.log_softmax(-1).exp()
+                    * (bucket_reference.log_softmax(-1) - bucket_actual.log_softmax(-1))
+                )
+                .sum(-1)
+                .mean()
+                .item(),
+            }
+        else:
+            position_buckets[bucket] = {"queries": 0, "max_abs": 0.0, "rms": 0.0, "kl": 0.0}
+    report["position_buckets"] = position_buckets
     for name, cp2_routes in route_records[1].items():
         cp1_routes = route_records[0][name]
         expected_ids = cp1_routes.ids[:, :, start : start + valid]
@@ -242,6 +336,8 @@ def compare_cp(
         route_metrics[name] = {
             "cp1_native_varlen": cp1_routes.native_varlen,
             "cp2_native_varlen": cp2_routes.native_varlen,
+            "cp1_indexed_layout": cp1_routes.indexed_layout,
+            "cp2_indexed_layout": cp2_routes.indexed_layout,
             "cp1_all_padding_key": cp1_routes.all_padding_key,
             "cp2_all_padding_key": cp2_routes.all_padding_key,
             "prefix": buckets["prefix"],
@@ -281,6 +377,9 @@ def main() -> None:
     parser.add_argument("--backend", choices=("flex", "fa4"), default="fa4")
     parser.add_argument("--swa-varlen", action="store_true", help="Exercise opt-in native SWA window kernels")
     parser.add_argument(
+        "--indexed-csa", action="store_true", help="Enable indexed CSA and count actual CUDA FWB kernel events"
+    )
+    parser.add_argument(
         "--stage-output", type=Path, help="Optional attention/router diagnostic tensors, before parity gates"
     )
     parser.add_argument(
@@ -296,6 +395,8 @@ def main() -> None:
             "trailing8k",
             "empty-tail8k",
             "sparse-tail8k",
+            "indexed-single96k",
+            "indexed-packed128k",
         ),
         help="Repeat to select scenarios; default: original short single/packed sweep.",
     )
@@ -317,6 +418,8 @@ def main() -> None:
                 "trailing8k": (2051, 4096, 2038),
                 "empty-tail8k": (3000,),
                 "sparse-tail8k": (8185,),
+                "indexed-single96k": (98304,),
+                "indexed-packed128k": (98304, 32768),
             }[scenario]
             padded = {"trailing4k": 7, "trailing8k": 7, "empty-tail8k": 5192, "sparse-tail8k": 7}.get(scenario, 0)
             scenarios.append((scenario, lengths, 512, 512, padded))
@@ -326,7 +429,7 @@ def main() -> None:
             hidden_size=64,
             intermediate_size=128,
             num_hidden_layers=4,
-            num_attention_heads=4,
+            num_attention_heads=32 if scenario.startswith("indexed-") else 4,
             num_attention_groups=2,
             head_dim=192,
             vocab_size=128,
@@ -349,9 +452,14 @@ def main() -> None:
         )
         backend = (
             Step5BackendConfig(
-                attn=args.backend, linear="torch", dispatcher="torch", experts="torch_mm", swa_varlen=True
+                attn=args.backend,
+                linear="torch",
+                dispatcher="torch",
+                experts="torch_mm",
+                swa_varlen=args.swa_varlen,
+                indexed_csa=args.indexed_csa,
             )
-            if args.swa_varlen
+            if args.swa_varlen or args.indexed_csa
             else BackendConfig(attn=args.backend, linear="torch", dispatcher="torch", experts="torch_mm")
         )
         model = Step5ForCausalLM(config, backend=backend).cuda()
@@ -366,12 +474,23 @@ def main() -> None:
             positions,
             padding,
             stage_output=None if args.stage_output is None else args.stage_output / scenario,
+            profile_indexed=args.indexed_csa,
         )
         report["padding_queries"] = padded
         report["packed"] = len(lengths) > 1
         report["scenario"] = scenario
         report["swa_varlen"] = args.swa_varlen
+        report["indexed_csa"] = args.indexed_csa
         print(json.dumps(report), flush=True)
+        if args.indexed_csa and scenario.startswith("indexed-"):
+            # These long scenarios make CP1 use indexed CSA. Under CP2, only
+            # rank1 clears the weighted historical-span threshold; rank0 uses FA4.
+            for phase, expected in (("cp1", True), ("cp2", dist.get_rank() == 1)):
+                kernels = report["indexed_kernel_calls"][phase]
+                forward_dq = sum(count for name, count in kernels.items() if name.startswith("_attention"))
+                dkv = sum(count for name, count in kernels.items() if name.startswith("_region_backward"))
+                assert bool(dkv) == expected, (scenario, phase, kernels)
+                assert (forward_dq >= 2) == expected, (scenario, phase, kernels)
         del model
         gc.collect()
         torch.cuda.empty_cache()

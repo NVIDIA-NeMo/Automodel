@@ -57,6 +57,22 @@ class CausalDocumentLayout:
 
 
 @dataclass(frozen=True)
+class IndexedRegionLayout:
+    """Physical bounds shared across indexed CSA layers in one model call.
+
+    Attributes:
+        starts: Int32 tensor [batch, regions], first physical key in each region.
+            Missing regions use global_keys. Allocated independently of Q/K/V.
+        ends: Int32 tensor [batch, regions], exclusive physical key endpoint.
+            Missing regions use zero. Trailing padding may span more than eight
+            physical keys, but contains no valid key beyond the first eight.
+    """
+
+    starts: torch.Tensor
+    ends: torch.Tensor
+
+
+@dataclass(frozen=True)
 class RegionSelection:
     """Sparse selection tensors, all local to one CP rank's queries.
 
@@ -71,6 +87,7 @@ class RegionSelection:
             regions in its own document; membership adds no restriction.
         causal_layout: Optional compact varlen layout for fully selected,
             single-batch shards with contiguous document positions.
+        indexed_layout: Optional physical region bounds for long sparse shards.
         all_padding_key: The only allowed global key for a fully padded shard,
             after proving standard document positions and trailing padding.
     """
@@ -83,6 +100,7 @@ class RegionSelection:
     all_regions_selected: bool = False
     causal_layout: CausalDocumentLayout | None = None
     all_padding_key: int | None = None
+    indexed_layout: IndexedRegionLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +133,7 @@ class RegionMetadata:
         causal_layout: Optional native varlen metadata for this query shard.
         window_layout: Optional native SWA layout, including at most window - 1
             preceding keys. Independent of whether CSA selection is sparse.
+        indexed_layout: Optional shared physical bounds for indexed attention.
         all_padding_key: Singleton global key for a fully padded, fully selected
             local CSA shard, or None when the shortcut cannot be established.
     """
@@ -136,6 +155,7 @@ class RegionMetadata:
     region_sources: torch.Tensor | None = None
     region_source_valid: torch.Tensor | None = None
     all_padding_key: int | None = None
+    indexed_layout: IndexedRegionLayout | None = None
 
 
 def _summary_ranges(
@@ -177,6 +197,7 @@ def region_metadata(
     region_size: int,
     topk: int,
     window: int | None = None,
+    indexed_csa: bool = False,
 ) -> RegionMetadata:
     """Prepare document/region metadata once per model forward.
 
@@ -187,6 +208,8 @@ def region_metadata(
         queries: Number of local queries.
         region_size: Tokens per region, reset at every document boundary.
         topk: Maximum number of selected historical regions.
+        indexed_csa: Prepare physical bounds only for regular sparse shards
+            whose query-weighted historical region span reaches 32K tokens.
         window: Optional native SWA layout width. A globally trailing padded
             suffix keeps its custom-mask path. No additional host synchronization.
 
@@ -330,6 +353,28 @@ def region_metadata(
         region_sources.view(batch, -1).scatter_(1, slots, source_tokens)
         source_padding = key_padding.gather(1, region_sources.long().clamp_min(0).view(batch, -1))
         region_source_valid = (region_sources >= 0) & ~source_padding.view_as(region_sources)
+    indexed_layout = None
+    history_work = (
+        sum((stop - start) * (last - first) * region_size for _, start, stop, first, last in score_tiles)
+        if indexed_csa
+        else 0
+    )
+    if (
+        indexed_csa
+        and score_tiles
+        and bool(layout[-1])
+        and region_size == 8
+        and history_work >= 32768 * batch * queries
+    ):
+        # One integer map per model call, shared by every local CSA layer.
+        # Unlike compression slots, physical bounds cannot lose a document's
+        # first valid key when trailing padding also has position zero.
+        region_starts = torch.full((batch, region_count), keys, device=key_positions.device, dtype=torch.int32)
+        region_ends = torch.zeros_like(region_starts)
+        physical_indices = torch.arange(keys, device=key_positions.device, dtype=torch.int32).expand(batch, -1)
+        region_starts.scatter_reduce_(1, token_regions, physical_indices, reduce="amin")
+        region_ends.scatter_reduce_(1, token_regions, physical_indices + 1, reduce="amax")
+        indexed_layout = IndexedRegionLayout(region_starts, region_ends)
     causal_layout = None
     window_layout = None
     prefix_offset = 2 + 2 * batch * tiles_per_batch
@@ -398,6 +443,7 @@ def region_metadata(
         region_sources,
         region_source_valid,
         all_padding_key,
+        indexed_layout,
     )
 
 
@@ -598,5 +644,10 @@ class Step5SparseIndexer(nn.Module):
                 region_ids[b : b + 1, :, start:stop],
             )
         return RegionSelection(
-            region_ids, metadata.token_regions, metadata.query_documents, metadata.documents, region_count
+            region_ids,
+            metadata.token_regions,
+            metadata.query_documents,
+            metadata.documents,
+            region_count,
+            indexed_layout=metadata.indexed_layout,
         )
