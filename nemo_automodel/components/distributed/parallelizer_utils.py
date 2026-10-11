@@ -298,6 +298,7 @@ def _make_compute_dtype_fn(
     mp_policy: MixedPrecisionPolicy | None,
     fp32_compute_module_names: Tuple[str, ...],
     ignored_params: set[nn.Parameter] | None = None,
+    parameter_name_prefix: str = "",
 ) -> Callable[[torch.Tensor], torch.dtype]:
     """Build the per-parameter *compute* dtype resolver used to group FSDP units.
 
@@ -329,7 +330,7 @@ def _make_compute_dtype_fn(
     pinned_ids: Set[int] = set()
     if fp32_compute_module_names:
         for name, tensor in (*module.named_parameters(), *module.named_buffers()):
-            name = canonical_parameter_fqn(name)
+            name = canonical_parameter_fqn(f"{parameter_name_prefix}.{name}" if parameter_name_prefix else name)
             if id(tensor) not in ignored_param_ids and any(token in name for token in fp32_compute_module_names):
                 pinned_ids.add(id(tensor))
 
@@ -350,6 +351,69 @@ def _make_compute_dtype_fn(
     return compute_dtype_of
 
 
+def fully_shard_root_by_dtype(
+    module: nn.Module,
+    *,
+    root_model: nn.Module,
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy | None,
+    offload_policy: OffloadPolicy | None,
+    fp32_compute_module_names: tuple[str, ...] = (),
+    reshard_after_forward: bool | int | None = None,
+    ignored_params: set[nn.Parameter] | None = None,
+    model_parallelizer: "ModelParallelizer | None" = None,
+) -> nn.Module:
+    """Wrap remaining root-owned parameters using their original compute contract.
+
+    Existing child FSDP units keep their ownership and policies. Strict names
+    are matched against ``root_model`` names even for a nested text root, and
+    parameterless roots still receive their FSDP hooks.
+
+    Args:
+        module: Inner or outer root to wrap after its child units.
+        root_model: Original model that defines fully qualified parameter names.
+        mesh: Mesh for the remaining root-owned parameters.
+        mp_policy: Requested outer mixed-precision boundary.
+        offload_policy: Parameter offloading policy.
+        fp32_compute_module_names: Strict FP32 name substrings from the model.
+        reshard_after_forward: Boolean or integer post-forward sharding policy.
+        ignored_params: Parameters owned by another parallelism mechanism.
+        model_parallelizer: Optional owner of the FSDP primitive.
+
+    Returns:
+        The same module with its root FSDP hooks installed.
+    """
+    prefix = next(name for name, child in root_model.named_modules() if child is module)
+    excluded = set(ignored_params or ())
+    for child in module.modules():
+        if child is not module and isinstance(child, FSDPModule):
+            excluded.update(child.parameters())
+    if any(parameter not in excluded for parameter in module.parameters()):
+        fully_shard_by_dtype(
+            module,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            fp32_compute_module_names=fp32_compute_module_names,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=excluded or None,
+            model_parallelizer=model_parallelizer,
+            parameter_name_prefix=prefix,
+        )
+    else:
+        shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
+        _call_fully_shard(
+            module,
+            mesh,
+            mp_policy,
+            offload_policy,
+            reshard_after_forward,
+            excluded or None,
+            shard_module=shard_module,
+        )
+    return module
+
+
 def fully_shard_by_dtype(
     module: nn.Module,
     mesh: DeviceMesh,
@@ -359,6 +423,7 @@ def fully_shard_by_dtype(
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
     model_parallelizer: "ModelParallelizer | None" = None,
+    parameter_name_prefix: str = "",
 ) -> None:
     """Fully shard a module so every parameter computes in its required dtype.
 
@@ -396,15 +461,25 @@ def fully_shard_by_dtype(
             enclosing FSDP unit.
         model_parallelizer: Optional model sidecar that owns the
             FSDP primitive.
+        parameter_name_prefix: Original model path of this module, used to
+            match fully qualified strict-compute names at nested roots.
     """
     shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
     ignored_params = set(ignored_params or ())
+    ignored_buffer_ids: set[int] = set()
+    # Match FSDP ownership: descendants already wrapped by FSDP cannot affect
+    # this unit's dtype grouping, including their non-parameter buffers.
+    for child in module.modules():
+        if child is not module and isinstance(child, FSDPModule):
+            ignored_params.update(child.parameters())
+            ignored_buffer_ids.update(id(buffer) for buffer in child.buffers())
     ignored_param_ids = {id(param) for param in ignored_params}
     compute_dtype_of = _make_compute_dtype_fn(
         module,
         mp_policy,
         fp32_compute_module_names,
         ignored_params=ignored_params,
+        parameter_name_prefix=parameter_name_prefix,
     )
 
     # FSDP2 requires every param group to be uniform in *storage* (original) dtype
@@ -451,7 +526,11 @@ def fully_shard_by_dtype(
         uniform_subtrees = list(
             iter_maximal_uniform_dtype_subtrees(
                 module,
-                tensor_pred=lambda tensor: torch.is_floating_point(tensor) and id(tensor) not in ignored_param_ids,
+                tensor_pred=lambda tensor: (
+                    torch.is_floating_point(tensor)
+                    and id(tensor) not in ignored_param_ids
+                    and id(tensor) not in ignored_buffer_ids
+                ),
                 dtype_of=group_key_of,
                 return_paths=True,
             )

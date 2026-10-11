@@ -494,7 +494,13 @@ class ModelParallelizer:
         }
         if root_ignored_params is not None:
             root_kwargs["ignored_params"] = root_ignored_params
-        model = self._fully_shard_module(model, **root_kwargs)
+        model = parallelizer_utils.fully_shard_root_by_dtype(
+            model,
+            root_model=model,
+            fp32_compute_module_names=tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ()),
+            model_parallelizer=self,
+            **root_kwargs,
+        )
 
         cp_enabled = "cp" in device_mesh.mesh_dim_names and device_mesh["cp"].size() > 1
         if cp_enabled:

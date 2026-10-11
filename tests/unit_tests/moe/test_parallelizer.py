@@ -444,6 +444,11 @@ def _import_parallelizer_with_stubs(monkeypatch):
         )
         shard_module(module, **kwargs)
 
+    def fully_shard_root_by_dtype(module, *, root_model, **kwargs):
+        fully_shard_by_dtype(module, **kwargs)
+        return module
+
+    parallelizer_utils_stub.fully_shard_root_by_dtype = fully_shard_root_by_dtype
     parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
     parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0

@@ -1070,12 +1070,32 @@ def apply_fsdp(
                 "Use wrap_outer_model=True or untie the embeddings explicitly."
             )
         inner_ignored_params = ignored_multimodal_params | externally_sharded_params
-        fully_shard_default(_model, ignored_params=ignored_params_for_root(_model, inner_ignored_params))
+        parallelizer_utils.fully_shard_root_by_dtype(
+            _model,
+            root_model=model,
+            mesh=fsdp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            fp32_compute_module_names=fp32_compute_module_names,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=ignored_params_for_root(_model, inner_ignored_params),
+            model_parallelizer=model_parallelizer,
+        )
 
     # If model has a nested structure (outer model wrapping inner _model), wrap the outer model if requested.
     if wrap_outer_model and model is not _model:
         outer_ignored_params = ignored_multimodal_params | externally_sharded_params
-        fully_shard_default(model, ignored_params=ignored_params_for_root(model, outer_ignored_params))
+        parallelizer_utils.fully_shard_root_by_dtype(
+            model,
+            root_model=model,
+            mesh=fsdp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            fp32_compute_module_names=fp32_compute_module_names,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=ignored_params_for_root(model, outer_ignored_params),
+            model_parallelizer=model_parallelizer,
+        )
 
 
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
