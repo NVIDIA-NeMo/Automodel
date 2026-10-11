@@ -26,11 +26,21 @@ from nemo_automodel.components.models.step5.sparse import RegionSelection, regio
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-@pytest.mark.parametrize("long_row,partner", [(0, "prefix"), (1, "prefix"), (1, "allpad"), (0, "partialpad")])
-def test_mixed_rows_preserve_independent_forward_and_gradients(long_row: int, partner: str) -> None:
+@pytest.mark.parametrize(
+    "long_row,partner,start",
+    [
+        (0, "prefix", 38912),
+        (1, "prefix", 38912),
+        (1, "allpad", 38912),
+        (0, "partialpad", 38912),
+        (1, "prefix", 38900),
+        (0, "partialpad", 38900),
+    ],
+)
+def test_mixed_rows_preserve_independent_forward_and_gradients(long_row: int, partner: str, start: int) -> None:
     """Exercise real 32K dispatch, shifted CP queries, doc resets and padded partners."""
     torch.manual_seed(6713)
-    keys, start, queries, groups, heads, dim = 40960, 38912, 64, 1, 16, 192
+    keys, queries, groups, heads, dim = 40960, 64, 1, 16, 192
     cpu_positions = torch.arange(keys)[None].expand(2, -1).clone()
     cpu_padding = torch.zeros_like(cpu_positions, dtype=torch.bool)
     short = 1 - long_row
