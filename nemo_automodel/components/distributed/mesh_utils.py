@@ -165,7 +165,7 @@ def _init_named_mesh(
             device_type=device_type,
             mesh=rank_tensor,
             mesh_dim_names=spec.axes,
-            backend_override=backend_override,
+            backend_override=tuple(backend_override[axis] for axis in spec.axes) if backend_override else None,
         )
     if ranks is None:
         _register_flattened_axes(device_mesh, spec.flattened_axes, timeout_minutes=timeout_minutes)
@@ -420,7 +420,11 @@ def _create_moe_mesh(
                 device_mesh.device_type,
                 mesh=stage_rank_tensor,
                 mesh_dim_names=(MeshAxisName.EP_SHARD, MeshAxisName.EP),
-                backend_override=backend_override,
+                backend_override=(
+                    tuple(backend_override[axis] for axis in (MeshAxisName.EP_SHARD, MeshAxisName.EP))
+                    if backend_override
+                    else None
+                ),
             )
             if first_mesh is None:
                 first_mesh = stage_mesh

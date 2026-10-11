@@ -974,3 +974,31 @@ def test_configured_rank_order_builds_real_meshes(tmp_path: Path) -> None:
         nprocs=4,
         join=True,
     )
+
+
+def _configured_backend_mesh_worker(rank: int, rendezvous: str) -> None:
+    from unittest.mock import patch
+
+    def explicit_gloo_backend(
+        axes: tuple[str, ...], *, device_type: str, timeout_minutes: int | None
+    ) -> dict[str, tuple[str, None]]:
+        # NCCL timeouts populate this mapping in production. Use actual Gloo
+        # groups to exercise the same public constructor shape on CPU.
+        return {axis: ("gloo", None) for axis in axes}
+
+    with patch(
+        "nemo_automodel.components.distributed.mesh_utils._nccl_backend_override", side_effect=explicit_gloo_backend
+    ):
+        _configured_rank_mesh_worker(rank, rendezvous)
+
+
+@pytest.mark.runtime_budget(
+    90, hard_timeout=300, reason="Four fresh Gloo workers exercise explicit backend options with real DeviceMesh."
+)
+def test_configured_rank_order_accepts_explicit_backend(tmp_path: Path) -> None:
+    torch.multiprocessing.spawn(
+        _configured_backend_mesh_worker,
+        args=((tmp_path / "rank_backend_rendezvous").as_uri(),),
+        nprocs=4,
+        join=True,
+    )
