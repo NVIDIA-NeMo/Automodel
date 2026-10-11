@@ -243,6 +243,16 @@ class Step5Attention(nn.Module):
                     else (112 if self.head_dim == 192 else 80)
                 )
                 left_padding = first_key % tile_width if self.backend.attn == "fa4" else 0
+                if (
+                    tile_width == 112
+                    and hidden.is_cuda
+                    and sparse_metadata is not None
+                    and sparse_metadata.window_layout is not None
+                ):
+                    # Reuse the existing single padded-halo concatenation. The
+                    # 511 communicated tokens are unchanged; these extra zeros
+                    # align native FA4's document-relative 96-token K tiles.
+                    left_padding = max(left_padding, sparse_metadata.window_layout.leading_padding)
                 exchanged = gather_halo(local_kv, self.cp_group, self.window - 1, left_padding=left_padding)
                 key_positions = F.pad(global_positions[:, first_key : query_start + sequence], (left_padding, 0))
                 key_padding = F.pad(
@@ -276,6 +286,7 @@ class Step5Attention(nn.Module):
                 query_start=query_start,
                 window=self.window,
                 selection=selection,
+                window_layout=None if sparse_metadata is None else sparse_metadata.window_layout,
             )
         elif self.backend.attn == "flex" and hidden.is_cuda:
             attended = fused_attention(

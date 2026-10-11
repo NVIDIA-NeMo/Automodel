@@ -35,6 +35,7 @@ from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _build_packe
 from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.packing import configure_packing_for_models
+from nemo_automodel.components.models.step5.backend import Step5BackendConfig
 from nemo_automodel.components.models.step5.configuration import Step5Config, Step5VLConfig
 from nemo_automodel.components.models.step5.model import Step5ForConditionalGeneration
 from nemo_automodel.components.moe.parallelizer import apply_cp
@@ -69,7 +70,7 @@ def metrics(reference: torch.Tensor, actual: torch.Tensor) -> dict[str, float]:
     )
 
 
-def build_model(topk: int) -> Step5ForConditionalGeneration:
+def build_model(topk: int, *, swa_varlen: bool = False, window: int = 65) -> Step5ForConditionalGeneration:
     torch.manual_seed(73)
     text = Step5Config(
         hidden_size=64,
@@ -86,7 +87,7 @@ def build_model(topk: int) -> Step5ForConditionalGeneration:
         moe_layer_list=[3],
         dtype="bfloat16",
         num_nextn_predict_layers=0,
-        sliding_window=65,
+        sliding_window=window,
         sparse_config=dict(
             proxy_dim=32,
             sparse_indexer_rope_dim=8,
@@ -102,7 +103,11 @@ def build_model(topk: int) -> Step5ForConditionalGeneration:
             vision_config=dict(width=16, layers=2, heads=2, image_size=112, patch_size=14, mlp_ratio=2),
             image_token_id=127,
         ),
-        backend=BackendConfig(attn="fa4", linear="torch", dispatcher="torch", experts="torch_mm"),
+        backend=(
+            Step5BackendConfig(attn="fa4", linear="torch", dispatcher="torch", experts="torch_mm", swa_varlen=True)
+            if swa_varlen
+            else BackendConfig(attn="fa4", linear="torch", dispatcher="torch", experts="torch_mm")
+        ),
     )
     return model.cuda().train()
 
@@ -121,10 +126,17 @@ def forward(model: Step5ForConditionalGeneration, batch: dict[str, torch.Tensor]
 
 
 def check_case(
-    name: str, rows: list[list[dict[str, torch.Tensor]]], topk: int, output: Path, max_length: int | None = None
+    name: str,
+    rows: list[list[dict[str, torch.Tensor]]],
+    topk: int,
+    output: Path,
+    max_length: int | None = None,
+    *,
+    swa_varlen: bool = False,
+    window: int = 65,
 ) -> None:
     rank = dist.get_rank()
-    model = build_model(topk)
+    model = build_model(topk, swa_varlen=swa_varlen, window=window)
     batch = collate(rows, model, max_length)
     labels = batch["labels"]
     count = (labels != -100).sum()
@@ -149,6 +161,8 @@ def check_case(
     report = dict(
         name=name,
         rank=rank,
+        swa_varlen=swa_varlen,
+        window=window,
         doc_lengths=[[s["input_ids"].numel() - 1 for s in row] for row in rows],
         input_hash=hashlib.sha256(batch["input_ids"].cpu().numpy().tobytes()).hexdigest(),
         cp1_loss=reference_loss,
@@ -265,9 +279,9 @@ def check_case(
     dist.barrier()
 
 
-def check_metadata_attacks(output: Path) -> None:
+def check_metadata_attacks(output: Path, *, swa_varlen: bool = False, window: int = 65) -> None:
     """Reject contradictory boundaries on every CP rank and isolate image gradients."""
-    model = build_model(4)
+    model = build_model(4, swa_varlen=swa_varlen, window=window)
     rows = [[sample(132, 1, 1, 10), sample(131, 1, 0, 20)]]
     base = collate(rows, model)
     mesh = init_device_mesh("cuda", (2,), mesh_dim_names=("cp",))
@@ -336,14 +350,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--long", action="store_true")
+    parser.add_argument("--swa-varlen", action="store_true")
+    parser.add_argument("--window", type=int, default=65)
     parser.add_argument("--adversarial", action="store_true")
     parser.add_argument("--metadata-attacks", action="store_true")
     args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=True)
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     assert dist.get_world_size() == 2
     if args.metadata_attacks:
-        check_metadata_attacks(args.output)
+        check_metadata_attacks(args.output, swa_varlen=args.swa_varlen, window=args.window)
         dist.destroy_process_group()
         return
     cases = {
@@ -410,7 +427,15 @@ def main() -> None:
         cases["adversarial_short_documents"] = [[*[sample(1, None, 0, i) for i in range(8)], sample(255, 1, 2, 20)]]
         cases["adversarial_empty_rank"] = [[sample(7, 1, 0, 1), sample(12, 1, 1, 2)]]
     for name, rows in cases.items():
-        check_case(name, rows, 512 if args.long else 4, args.output, 264 if name == "adversarial_empty_rank" else None)
+        check_case(
+            name,
+            rows,
+            512 if args.long else 4,
+            args.output,
+            264 if name == "adversarial_empty_rank" else None,
+            swa_varlen=args.swa_varlen,
+            window=args.window,
+        )
     dist.destroy_process_group()
 
 

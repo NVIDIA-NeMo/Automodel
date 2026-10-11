@@ -39,6 +39,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
+from nemo_automodel.components.models.step5.backend import Step5BackendConfig
 from nemo_automodel.components.models.step5.configuration import ConfigValue, Step5Config, Step5VLConfig
 from nemo_automodel.components.models.step5.cp import gather_metadata
 from nemo_automodel.components.models.step5.layers import Step5DecoderLayer
@@ -60,6 +61,7 @@ class Step5TextModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.swa_varlen = isinstance(backend, Step5BackendConfig) and backend.swa_varlen and backend.attn == "fa4"
         self.moe_config = moe_config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
         self.layers = nn.ModuleDict(
@@ -123,6 +125,7 @@ class Step5TextModel(nn.Module):
                 queries=positions.shape[1],
                 region_size=self.config.sparse_config.region_block_size,
                 topk=self.config.sparse_config.topk,
+                window=self.config.sliding_window if self.swa_varlen else None,
             )
         residual = embeddings.float()
         for layer in self.layers.values():

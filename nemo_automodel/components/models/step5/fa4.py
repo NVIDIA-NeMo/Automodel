@@ -21,7 +21,7 @@ import torch
 from torch.nn import functional as F
 
 from nemo_automodel.components.models.step5.kernels import pack_region_bitmap
-from nemo_automodel.components.models.step5.sparse import RegionSelection
+from nemo_automodel.components.models.step5.sparse import CausalDocumentLayout, RegionSelection
 from nemo_automodel.shared.import_utils import safe_import
 
 
@@ -278,6 +278,7 @@ def fa4_attention(
     query_start: int,
     window: int | None,
     selection: RegionSelection | None,
+    window_layout: CausalDocumentLayout | None = None,
 ) -> torch.Tensor:
     """Run FA4 forward/backward with compact CSA metadata on SM90 or SM100.
 
@@ -292,6 +293,8 @@ def fa4_attention(
         query_start: Physical global offset of the contiguous query shard.
         window: Sliding window size, or None for CSA.
         selection: Compact sorted region metadata, or None for sliding attention.
+        window_layout: Opt-in valid SWA document segments in global token
+            coordinates. The existing halo may contain local alignment padding.
 
     Returns:
         BF16 tensor [batch, local_queries, query_heads, head_dim].
@@ -313,6 +316,61 @@ def fa4_attention(
     if torch.are_deterministic_algorithms_enabled():
         raise RuntimeError("Step5 FA4 uses nondeterministic attention backward")
     queries, keys, dim = query.shape[1], key.shape[1], query.shape[-1]
+    if (
+        capability == (9, 0)
+        and dim == 192
+        and query.shape[0] == 1
+        and window is not None
+        and selection is None
+        and window_layout is not None
+    ):
+        # Translate global layout coordinates into the existing, locally padded
+        # halo. Transport is unchanged; only irrelevant document/alignment keys
+        # are omitted from this native window-attention call.
+        offset = window_layout.key_stop - window_layout.valid_queries - query_start
+        first_key = window_layout.key_start - offset
+        last_key = window_layout.key_stop - offset
+        if not 0 <= first_key < last_key <= keys:
+            raise ValueError("Step5 native SWA layout extends outside the received halo")
+        output, _ = _load_fa4_varlen()(
+            query[0, : window_layout.valid_queries],
+            key[0, first_key:last_key],
+            value[0, first_key:last_key],
+            cu_seqlens_q=window_layout.cu_seqlens_q,
+            cu_seqlens_k=window_layout.cu_seqlens_k,
+            max_seqlen_q=window_layout.max_seqlen_q,
+            max_seqlen_k=window_layout.max_seqlen_k,
+            softmax_scale=dim**-0.5,
+            causal=True,
+            window_size=(window - 1, 0),
+            pack_gqa=False,
+        )
+        if window_layout.padding_key is None:
+            return output.unsqueeze(0)
+        # Keep padded-query semantics from the original custom-mask kernel.
+        # Its physical block lists can prune the document's first V even
+        # though padding positions reset to zero, so a singleton-V shortcut
+        # is not equivalent. Replay only the final partial Q tile and padding,
+        # with the old halo origin; outputs for repeated valid Q are discarded.
+        global_start = window_layout.key_stop - window_layout.valid_queries
+        halo_first = max(0, global_start - window + 1)
+        original_padding = halo_first % 112
+        original_query_start = global_start - halo_first + original_padding
+        trim = query_start - original_query_start
+        tail_start = (window_layout.valid_queries // 128) * 128
+        padding_output = fa4_attention(
+            query[:, tail_start:],
+            key[:, trim:],
+            value[:, trim:],
+            positions[:, tail_start:],
+            key_positions[:, trim:],
+            key_padding[:, trim:],
+            documents[:, trim:],
+            query_start=original_query_start + tail_start,
+            window=window,
+            selection=None,
+        )
+        return torch.cat((output.unsqueeze(0), padding_output[:, window_layout.valid_queries - tail_start :]), dim=1)
     if (
         capability == (9, 0)
         and dim == 192

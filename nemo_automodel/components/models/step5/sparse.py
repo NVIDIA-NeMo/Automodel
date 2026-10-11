@@ -40,6 +40,9 @@ class CausalDocumentLayout:
         valid_queries: Query prefix evaluated by the native varlen kernel.
         padding_key: Last document's first token, if a trailing padding-query
             suffix must retain the original singleton-key attention semantics.
+        leading_padding: Native SWA dummy keys before the received halo, used
+            to keep document-relative 96-token K tile origins aligned across CP.
+            They are outside every valid query window.
     """
 
     key_start: int
@@ -50,6 +53,7 @@ class CausalDocumentLayout:
     max_seqlen_k: int
     valid_queries: int
     padding_key: int | None = None
+    leading_padding: int = 0
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,8 @@ class RegionMetadata:
         needs_projection: Whether any query on any CP rank needs learned scores.
             All ranks derive it from the same global layout before collectives.
         causal_layout: Optional native varlen metadata for this query shard.
+        window_layout: Optional native SWA layout, including at most window - 1
+            preceding keys. Independent of whether CSA selection is sparse.
     """
 
     token_regions: torch.Tensor
@@ -112,6 +118,7 @@ class RegionMetadata:
     region_count: int
     needs_projection: bool
     causal_layout: CausalDocumentLayout | None = None
+    window_layout: CausalDocumentLayout | None = None
 
 
 def region_metadata(
@@ -122,6 +129,7 @@ def region_metadata(
     queries: int,
     region_size: int,
     topk: int,
+    window: int | None = None,
 ) -> RegionMetadata:
     """Prepare document/region metadata once per model forward.
 
@@ -132,6 +140,8 @@ def region_metadata(
         queries: Number of local queries.
         region_size: Tokens per region, reset at every document boundary.
         topk: Maximum number of selected historical regions.
+        window: Optional native SWA layout width. A globally trailing padded
+            suffix keeps its custom-mask path. No additional host synchronization.
 
     Returns:
         Shared immutable metadata. Only linear token/region storage and a bounded
@@ -160,7 +170,7 @@ def region_metadata(
     # Native varlen needs compact query/document boundaries, not a global
     # attention mask. Guard the single-batch path conservatively and transfer
     # its local positions together with the existing allocation metadata.
-    prefix_fields = key_positions.new_zeros(3)
+    prefix_fields = key_positions.new_zeros(4)
     if batch == 1 and queries:
         local_positions = key_positions[0, query_start : query_start + queries]
         local_valid = ~key_padding[0, query_start : query_start + queries]
@@ -185,8 +195,27 @@ def region_metadata(
             & ~(key_padding[0] & in_prefix).any()
             & (consecutive | ~in_prefix[1:]).all()
         )
+        window_valid = key_positions.new_zeros(())
+        if window is not None:
+            window_start = torch.maximum(key_start, key_start.new_tensor(max(0, query_start - window + 1)))
+            in_window = (physical_keys >= window_start) & (physical_keys < key_stop)
+            window_valid = (
+                (valid_queries > 0)
+                & query_prefix
+                & ((valid_queries == queries) | (global_trailing_padding & padding_positions_zero))
+                & (local_positions[0] >= 0)
+                & (key_start >= 0)
+                & ~(key_padding[0] & in_window).any()
+                & (consecutive | ~in_window[1:]).all()
+            ).long()
         prefix_fields = torch.cat(
-            (prefix_valid.long().reshape(1), valid_queries.reshape(1), padding_key.reshape(1), local_positions)
+            (
+                prefix_valid.long().reshape(1),
+                valid_queries.reshape(1),
+                padding_key.reshape(1),
+                window_valid.reshape(1),
+                local_positions,
+            )
         )
     # One synchronization for the entire model call, never one per layer/tile.
     layout = (
@@ -210,10 +239,11 @@ def region_metadata(
             start = (index % tiles_per_batch) * 128
             score_tiles.append((index // tiles_per_batch, start, min(start + 128, queries), lo, hi))
     causal_layout = None
+    window_layout = None
     prefix_offset = 2 + 2 * batch * tiles_per_batch
     if bool(layout[prefix_offset]):
         valid_queries, padding_key = layout[prefix_offset + 1 : prefix_offset + 3]
-        local_positions = layout[prefix_offset + 3 : prefix_offset + 3 + valid_queries]
+        local_positions = layout[prefix_offset + 4 : prefix_offset + 4 + valid_queries]
         query_boundaries = [0] + [i for i in range(1, valid_queries) if local_positions[i] == 0] + [valid_queries]
         key_boundaries = [0] + [end + local_positions[0] for end in query_boundaries[1:]]
         cumulative = torch.tensor(query_boundaries + key_boundaries, dtype=torch.int32, device=key_positions.device)
@@ -227,6 +257,31 @@ def region_metadata(
             max(stop - start for start, stop in zip(key_boundaries, key_boundaries[1:])),
             valid_queries,
             padding_key if valid_queries < queries else None,
+        )
+    if window is not None and bool(layout[prefix_offset + 3]):
+        valid_queries, padding_key = layout[prefix_offset + 1 : prefix_offset + 3]
+        local_positions = layout[prefix_offset + 4 : prefix_offset + 4 + valid_queries]
+        prefix_keys = min(local_positions[0], window - 1)
+        # FA4 SM90 D192 uses 96-token K tiles for native local attention.
+        # Its first segment can start mid-document on a CP rank. Dummy keys
+        # before the halo restore the same tile origins as CP1; bottom-right
+        # window masking excludes them from every real query.
+        leading_padding = (local_positions[0] - prefix_keys) % 96
+        prefix_keys += leading_padding
+        query_boundaries = [0] + [i for i in range(1, valid_queries) if local_positions[i] == 0] + [valid_queries]
+        key_boundaries = [0] + [end + prefix_keys for end in query_boundaries[1:]]
+        cumulative = torch.tensor(query_boundaries + key_boundaries, dtype=torch.int32, device=key_positions.device)
+        cu_q, cu_k = cumulative.chunk(2)
+        window_layout = CausalDocumentLayout(
+            query_start - prefix_keys,
+            query_start + valid_queries,
+            cu_q,
+            cu_k,
+            max(stop - start for start, stop in zip(query_boundaries, query_boundaries[1:])),
+            max(stop - start for start, stop in zip(key_boundaries, key_boundaries[1:])),
+            valid_queries,
+            padding_key=padding_key if valid_queries < queries else None,
+            leading_padding=leading_padding,
         )
     region_documents = torch.zeros(batch, region_count, device=key_positions.device, dtype=torch.long)
     region_documents.scatter_reduce_(1, token_regions, documents, reduce="amax")
@@ -245,6 +300,7 @@ def region_metadata(
         region_count,
         needs_projection,
         causal_layout,
+        window_layout,
     )
 
 

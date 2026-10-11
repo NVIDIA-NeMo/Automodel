@@ -28,19 +28,23 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TypedDict
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.nn import functional as F
 from typing_extensions import NotRequired
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.step5.backend import Step5BackendConfig
 from nemo_automodel.components.models.step5.configuration import Step5Config
+from nemo_automodel.components.models.step5.layers import Step5Attention
 from nemo_automodel.components.models.step5.model import Step5ForCausalLM
 from nemo_automodel.components.models.step5.sparse import RegionSelection, Step5SparseIndexer
+from nemo_automodel.components.moe.layers import Gate
 from nemo_automodel.components.moe.parallelizer import apply_cp
 
 
@@ -81,12 +85,18 @@ class CPReport(TypedDict):
     gradients: dict[str, GradientMetrics]
     packed: NotRequired[bool]
     scenario: NotRequired[str]
+    swa_varlen: NotRequired[bool]
     padding_queries: NotRequired[int]
     routes: NotRequired[dict[str, RouteMetrics]]
 
 
 def compare_cp(
-    model: Step5ForCausalLM, tokens: torch.Tensor, positions: torch.Tensor, padding: torch.Tensor | None = None
+    model: Step5ForCausalLM,
+    tokens: torch.Tensor,
+    positions: torch.Tensor,
+    padding: torch.Tensor | None = None,
+    *,
+    stage_output: Path | None = None,
 ) -> CPReport:
     """Compare a replicated model before/after native CP setup on identical inputs."""
     rank = dist.get_rank()
@@ -110,6 +120,46 @@ def compare_cp(
         for name, module in model.named_modules()
         if isinstance(module, Step5SparseIndexer)
     ]
+    stage_records: list[dict[str, torch.Tensor]] = [{}, {}]
+
+    def attention_hook(name: str) -> Callable[[Step5Attention, tuple[torch.Tensor, ...], torch.Tensor], None]:
+        def record(module: Step5Attention, inputs: tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
+            stage_records[phase][name + ".input"] = inputs[0].detach().cpu()
+            stage_records[phase][name + ".output"] = output.detach().cpu()
+
+        return record
+
+    def gate_hook(
+        name: str,
+    ) -> Callable[
+        [
+            Gate,
+            tuple[torch.Tensor, torch.Tensor, DeviceMesh | None],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+        ],
+        None,
+    ]:
+        def record(
+            module: Gate,
+            inputs: tuple[torch.Tensor, torch.Tensor, DeviceMesh | None],
+            output: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+        ) -> None:
+            stage_records[phase][name + ".input"] = inputs[0].detach().cpu()
+            stage_records[phase][name + ".weights"] = output[0].detach().cpu()
+            stage_records[phase][name + ".indices"] = output[1].detach().cpu()
+            with torch.no_grad():
+                scores = F.linear(inputs[0].float(), module.weight.float(), module.bias).sigmoid()
+                scores = scores + module.e_score_correction_bias
+            stage_records[phase][name + ".choice_scores"] = scores.cpu()
+
+        return record
+
+    if stage_output is not None:
+        for name, module in model.named_modules():
+            if isinstance(module, Step5Attention):
+                handles.append(module.register_forward_hook(attention_hook(name)))
+            elif isinstance(module, Gate):
+                handles.append(module.register_forward_hook(gate_hook(name)))
     length = tokens.shape[1]
     labels = tokens.roll(-1, dims=1)
     labels[:, -1] = -100
@@ -195,6 +245,9 @@ def compare_cp(
     report["routes"] = route_metrics
     for handle in handles:
         handle.remove()
+    if stage_output is not None:
+        stage_output.mkdir(parents=True, exist_ok=True)
+        torch.save({"cp1": stage_records[0], "cp2": stage_records[1]}, stage_output / f"rank{rank}.pt")
     assert abs(reference_loss - loss.item()) < 0.003, report
     assert report["logit_kl"] < 1e-4, report
     assert {name for name, p in model.named_parameters() if p.grad is not None} == set(baseline_grads)
@@ -221,6 +274,10 @@ def compare_cp(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("flex", "fa4"), default="fa4")
+    parser.add_argument("--swa-varlen", action="store_true", help="Exercise opt-in native SWA window kernels")
+    parser.add_argument(
+        "--stage-output", type=Path, help="Optional attention/router diagnostic tensors, before parity gates"
+    )
     parser.add_argument(
         "--scenario",
         action="append",
@@ -285,17 +342,30 @@ def main() -> None:
                 region_block_size=8,
             ),
         )
-        backend = BackendConfig(attn=args.backend, linear="torch", dispatcher="torch", experts="torch_mm")
+        backend = (
+            Step5BackendConfig(
+                attn=args.backend, linear="torch", dispatcher="torch", experts="torch_mm", swa_varlen=True
+            )
+            if args.swa_varlen
+            else BackendConfig(attn=args.backend, linear="torch", dispatcher="torch", experts="torch_mm")
+        )
         model = Step5ForCausalLM(config, backend=backend).cuda()
         tokens = torch.randint(1, 127, (1, sum(lengths) + padded), device="cuda")
         positions = torch.cat(
             [torch.arange(length) for length in lengths] + [torch.zeros(padded, dtype=torch.long)]
         ).cuda()[None]
         padding = torch.arange(tokens.shape[1], device="cuda")[None] >= sum(lengths) if padded else None
-        report = compare_cp(model, tokens, positions, padding)
+        report = compare_cp(
+            model,
+            tokens,
+            positions,
+            padding,
+            stage_output=None if args.stage_output is None else args.stage_output / scenario,
+        )
         report["padding_queries"] = padded
         report["packed"] = len(lengths) > 1
         report["scenario"] = scenario
+        report["swa_varlen"] = args.swa_varlen
         print(json.dumps(report), flush=True)
         del model
         gc.collect()
