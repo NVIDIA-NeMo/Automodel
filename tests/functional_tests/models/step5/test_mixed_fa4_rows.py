@@ -80,6 +80,11 @@ def test_below_threshold_mixed_rows_keep_views_and_independent_math(
     key, value = joint.transpose(0, 1).unbind(2)
     key, value = key.detach().requires_grad_(), value.detach().requires_grad_()
     assert not key.is_contiguous() and not value.is_contiguous()
+    original_storage = (
+        query.untyped_storage().data_ptr(),
+        joint.untyped_storage().data_ptr(),
+        joint.untyped_storage().data_ptr(),
+    )
     custom_calls = []
     load = fa4._load_fa4
 
@@ -98,10 +103,10 @@ def test_below_threshold_mixed_rows_keep_views_and_independent_math(
             Returns:
                 Native output [groups, queries, heads_per_group, dim] and LSE.
             """
-            assert q.untyped_storage().data_ptr() == query.untyped_storage().data_ptr()
-            assert k.untyped_storage().data_ptr() == joint.untyped_storage().data_ptr()
-            assert v.untyped_storage().data_ptr() == joint.untyped_storage().data_ptr()
-            assert q.shape[0] == groups
+            storage = tuple(t.untyped_storage().data_ptr() for t in (q, k, v))
+            provider_batches = q.shape[0]
+            assert storage == original_storage, "provider folding copied Q/K/V storage"
+            assert provider_batches == groups, "custom attention must receive one batch row"
             custom_calls.append(q.shape)
             return attention(q, k, v, **kwargs)
 
@@ -178,7 +183,7 @@ def test_below_threshold_mixed_rows_keep_views_and_independent_math(
     assert torch.equal(selection.region_ids, original_ids)
     # Keeping the old B2 fallback must fail the no-copy contract before the
     # kernel launch; this is an allocation-path negative control, not a math pass.
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="provider folding copied"):
         fa4.fa4_attention(
             query,
             key,
