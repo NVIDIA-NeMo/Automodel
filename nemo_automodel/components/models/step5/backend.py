@@ -30,6 +30,11 @@ class Step5BackendConfig(BackendConfig):
         swa_varlen: Use native FA4 window attention for valid single-batch
             SM90 D192 query prefixes. Padding keeps its custom-mask path.
             Requires enabled sparse metadata; communication is unchanged.
+        prepare_hybridep_extent: Negotiate a shared HybridEP input-token bound
+            once per CP batch, covering forward and backward recomputation.
+            Requires the shared HybridEP dispatcher. Only PP1 with CP>1 and
+            EP>1 uses this scope; other layouts keep their existing behavior.
+            Routed expert row counts remain dynamic.
         bf16_fsdp_retention_mib_per_part: Maximum padded unsharded parameter
             payload retained until backward in each local pipeline part, in
             MiB. Zero disables retention. With two local parts the combined
@@ -40,6 +45,7 @@ class Step5BackendConfig(BackendConfig):
 
     indexed_csa: bool = False
     swa_varlen: bool = False
+    prepare_hybridep_extent: bool = False
     bf16_fsdp_retention_mib_per_part: int = 0
 
     def __post_init__(self) -> None:
@@ -50,6 +56,12 @@ class Step5BackendConfig(BackendConfig):
             raise ValueError("indexed_csa requires attn=fa4")
         if not isinstance(self.swa_varlen, bool):
             raise TypeError("swa_varlen must be a bool")
+        if not isinstance(self.prepare_hybridep_extent, bool):
+            raise TypeError("prepare_hybridep_extent must be a bool")
+        if self.prepare_hybridep_extent and (
+            self.dispatcher != "hybridep" or not self.dispatcher_share_token_dispatcher
+        ):
+            raise ValueError("prepare_hybridep_extent requires a shared HybridEP dispatcher")
         if isinstance(self.bf16_fsdp_retention_mib_per_part, bool) or not isinstance(
             self.bf16_fsdp_retention_mib_per_part, int
         ):

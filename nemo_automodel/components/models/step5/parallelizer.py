@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Budgeted BF16 retention for existing decoder-owned FSDP units."""
+"""Model-owned FSDP weight retention and HybridEP batch runtime preparation."""
 
 import logging
 import math
@@ -25,6 +25,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+from nemo_automodel.components.distributed.pipelining.runtime import collect_pipeline_runtime_initializers
 from nemo_automodel.components.models.step5.backend import Step5BackendConfig
 from nemo_automodel.components.models.step5.layers import Step5DecoderLayer
 
@@ -112,11 +113,18 @@ def _retain_bf16_fsdp_units(text_model: "Step5TextModel", *, budget_mib: int) ->
 
 
 class Step5Parallelizer(ModelParallelizer):
-    """Apply the shared parallelizer, then the opt-in decoder retention budget."""
+    """Apply shared wrapping, then model-owned opt-in memory and runtime policies."""
 
     def parallelize(self, model: nn.Module, mesh_context: MeshContext, /) -> nn.Module:
         """Preserve shared wrapping, precision, expert ownership and gradient sync."""
         model = cast("Step5ForCausalLM", super().parallelize(model, mesh_context))
         if isinstance(model.backend, Step5BackendConfig):
             _retain_bf16_fsdp_units(model.model, budget_mib=model.backend.bf16_fsdp_retention_mib_per_part)
+            if (
+                model.backend.prepare_hybridep_extent
+                and mesh_context.pp_size == 1
+                and mesh_context.cp_size > 1
+                and mesh_context.ep_size > 1
+            ):
+                model.cp_runtime_initializers = tuple(collect_pipeline_runtime_initializers([model]))
         return model
