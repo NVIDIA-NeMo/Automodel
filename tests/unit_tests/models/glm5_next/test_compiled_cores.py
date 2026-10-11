@@ -112,7 +112,10 @@ def test_compile_dispatch_is_instance_local_and_preserves_state(
     optimized_kernels.hc_cores.cache_clear()
     optimized_kernels.rms_norm_core.cache_clear()
     optimized_kernels.rms_norm_gated_core.cache_clear()
-    calls = {name: 0 for name in ("project_core", "collapse_core", "expand_core", "norm_core", "gated_norm_core")}
+    calls = {
+        name: 0
+        for name in ("project_core", "collapse_core", "_expand_core_four_streams", "norm_core", "gated_norm_core")
+    }
     compiled_names = []
 
     def fake_compile(function, **kwargs):
@@ -148,7 +151,7 @@ def test_compile_dispatch_is_instance_local_and_preserves_state(
             assert layer.attn_hc.scale.dtype == torch.float32
         expected_compiled = set()
         if compile_hc:
-            expected_compiled.update(("project_core", "collapse_core", "expand_core"))
+            expected_compiled.update(("project_core", "collapse_core", "_expand_core_four_streams"))
         if compile_norm:
             expected_compiled.update(("norm_core", "gated_norm_core"))
         assert set(compiled_names) == expected_compiled
@@ -169,7 +172,7 @@ def test_compile_dispatch_is_instance_local_and_preserves_state(
                 torch.testing.assert_close(observed.grad, reference.grad, rtol=0, atol=0)
         assert calls["project_core"] == (8 if compile_hc else 0)
         assert calls["collapse_core"] == (8 if compile_hc else 0)
-        assert calls["expand_core"] == (8 if compile_hc else 0)
+        assert calls["_expand_core_four_streams"] == (8 if compile_hc else 0)
         assert calls["norm_core"] == (9 if compile_norm else 0)
         assert calls["gated_norm_core"] == (3 if compile_norm else 0)
     finally:
@@ -205,3 +208,40 @@ def test_compiled_gated_norm_cuda_forward_and_backward(dtype: torch.dtype, shape
             ).square().mean().sqrt() / reference.float().square().mean().sqrt().clamp_min(1e-7)
             assert relative_rms < 0.005
             torch.testing.assert_close(observed, reference, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("streams", [2, 4])
+def test_four_stream_expand_preserves_output_and_all_input_gradients(dtype: torch.dtype, streams: int) -> None:
+    """Check the asymmetric stream mixing and all VJPs, including fallback cases."""
+    torch.manual_seed(647)
+    residual = torch.randn(2, 7, streams, 32, dtype=dtype).requires_grad_()
+    update = torch.randn(2, 7, 32, dtype=dtype).requires_grad_()
+    post = torch.rand(2, 7, streams, requires_grad=True)
+    comb = torch.rand(2, 7, streams, streams, requires_grad=True)
+    args = (update, residual, post, comb)
+    # Independent unchanged GLM arithmetic; asymmetric coefficients expose a
+    # mistaken source/destination transpose. The oracle is not the new helper.
+    mixed = torch.matmul(comb.to(dtype).transpose(-1, -2), residual)
+    expected = post.to(dtype).unsqueeze(-1) * update.unsqueeze(-2) + mixed
+    actual = optimized_kernels._expand_core_four_streams(*args)
+    upstream = torch.randn(2, 7, 32, streams, dtype=dtype).transpose(-1, -2)
+    assert not upstream.is_contiguous()
+    pairs = [
+        (actual, expected),
+        *zip(
+            torch.autograd.grad(actual, args, upstream),
+            torch.autograd.grad(expected, args, upstream),
+        ),
+    ]
+    for observed, reference in pairs:
+        assert torch.isfinite(observed).all()
+        if dtype == torch.float32 or streams != 4:
+            torch.testing.assert_close(observed, reference, rtol=0, atol=0)
+        else:
+            scale = reference.double().square().mean().sqrt().clamp_min(1e-12)
+            error = observed.double() - reference.double()
+            assert error.square().mean().sqrt() / scale <= 0.002
+            assert error.abs().max() / scale <= 0.05
+    wrong_orientation = post.to(dtype).unsqueeze(-1) * update.unsqueeze(-2) + torch.matmul(comb.to(dtype), residual)
+    assert not torch.allclose(wrong_orientation, expected, rtol=0.002, atol=0.002)

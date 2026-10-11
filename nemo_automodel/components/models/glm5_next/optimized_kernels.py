@@ -74,6 +74,32 @@ def expand_core(update: torch.Tensor, residual: torch.Tensor, post: torch.Tensor
     )
 
 
+def _expand_core_four_streams(
+    update: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
+) -> torch.Tensor:
+    """Fuse four-stream BF16 mixing with the expansion's existing cast boundaries.
+
+    Args:
+        update: BF16 sublayer output of shape [batch, sequence, hidden].
+        residual: BF16 streams of shape [batch, sequence, streams, hidden].
+        post: FP32 coefficients of shape [batch, sequence, streams].
+        comb: FP32 combinations of shape [batch, sequence, source_stream, destination_stream].
+
+    Returns:
+        Updated streams of shape [batch, sequence, streams, hidden], in the
+        residual dtype. Other dtypes or stream counts use the original core.
+    """
+    if residual.dtype != torch.bfloat16 or residual.shape[-2] != 4:
+        return expand_core(update, residual, post, comb)
+    mixing = comb.to(residual.dtype).float()
+    streams = residual.float()
+    mixed = torch.stack(
+        tuple((mixing[..., :, destination].unsqueeze(-1) * streams).sum(dim=-2) for destination in range(4)),
+        dim=-2,
+    ).to(residual.dtype)
+    return post.to(residual.dtype).unsqueeze(-1) * update.unsqueeze(-2) + mixed
+
+
 def norm_core(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Round normalized values before multiplying the norm weight, as GLM does.
 
@@ -115,7 +141,7 @@ def hc_cores(compiled: bool) -> tuple[ProjectionCore, CollapseCore, ExpandCore]:
     return (
         torch.compile(project_core, dynamic=False, options=_COMPILE_OPTIONS),
         torch.compile(collapse_core, dynamic=False, options=_COMPILE_OPTIONS),
-        torch.compile(expand_core, dynamic=False, options=_COMPILE_OPTIONS),
+        torch.compile(_expand_core_four_streams, dynamic=False, options=_COMPILE_OPTIONS),
     )
 
 
