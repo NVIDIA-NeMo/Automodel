@@ -37,7 +37,8 @@ class CausalDocumentLayout:
         cu_seqlens_k: Int32 cumulative key counts for those same documents.
         max_seqlen_q: Largest local document query segment.
         max_seqlen_k: Largest causal key prefix for one queried document.
-        valid_queries: Query prefix evaluated by the native varlen kernel.
+        valid_queries: Query prefix evaluated by the native varlen kernel. Zero
+            identifies a fully padded batch row with a proven padding_key.
         padding_key: Last document's first token, if a trailing padding-query
             suffix must retain the original singleton-key attention semantics.
         leading_padding: Native SWA dummy keys before the received halo, used
@@ -87,6 +88,8 @@ class RegionSelection:
             regions in its own document; membership adds no restriction.
         causal_layout: Optional compact varlen layout for fully selected,
             single-batch shards with contiguous document positions.
+        causal_batch_layouts: Proven prefix or all-padding layout for both rows
+            of a fully selected B2 shard; None if either row needs the fallback.
         indexed_layout: Optional physical region bounds for long sparse shards.
         all_padding_key: The only allowed global key for a fully padded shard,
             after proving standard document positions and trailing padding.
@@ -101,6 +104,7 @@ class RegionSelection:
     causal_layout: CausalDocumentLayout | None = None
     all_padding_key: int | None = None
     indexed_layout: IndexedRegionLayout | None = None
+    causal_batch_layouts: tuple[CausalDocumentLayout, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +137,8 @@ class RegionMetadata:
         causal_layout: Optional native varlen metadata for this query shard.
         window_layout: Optional native SWA layout, including at most window - 1
             preceding keys. Independent of whether CSA selection is sparse.
+        causal_batch_layouts: Prefix or all-padding layouts when both B2 rows
+            satisfy native causal attention semantics.
         indexed_layout: Optional shared physical bounds for indexed attention.
         all_padding_key: Singleton global key for a fully padded, fully selected
             local CSA shard, or None when the shortcut cannot be established.
@@ -156,6 +162,7 @@ class RegionMetadata:
     region_source_valid: torch.Tensor | None = None
     all_padding_key: int | None = None
     indexed_layout: IndexedRegionLayout | None = None
+    causal_batch_layouts: tuple[CausalDocumentLayout, ...] | None = None
 
 
 def _summary_ranges(
@@ -249,68 +256,59 @@ def region_metadata(
     lower = lower.reshape(batch, -1, 128).amin(-1)
     upper = upper.reshape(batch, -1, 128).amax(-1)
     bounds = torch.stack((lower, upper), -1)
-    # Native varlen needs compact query/document boundaries, not a global
-    # attention mask. Guard the single-batch path conservatively and transfer
-    # its local positions together with the existing allocation metadata.
-    prefix_fields = key_positions.new_zeros(4)
-    all_padding_field = key_positions.new_full((), -1)
-    if batch == 1 and queries:
-        local_positions = key_positions[0, query_start : query_start + queries]
-        local_valid = ~key_padding[0, query_start : query_start + queries]
-        valid_queries = local_valid.sum()
-        key_start = query_start - local_positions[0]
+    # Transfer both B2 rows in the same metadata synchronization as B1.
+    # Larger batches retain the existing conservative fallback.
+    prefix_fields = key_positions.new_zeros((batch, 4))
+    all_padding_fields = key_positions.new_full((batch,), -1)
+    if batch in (1, 2) and queries:
+        local_positions = key_positions[:, query_start : query_start + queries]
+        local_valid = ~key_padding[:, query_start : query_start + queries]
+        valid_queries = local_valid.sum(1)
+        key_start = query_start - local_positions[:, 0]
         key_stop = query_start + valid_queries
-        physical_keys = physical[0]
-        local_physical = physical_keys[query_start : query_start + queries]
-        in_prefix = (physical_keys >= key_start) & (physical_keys < key_stop)
-        consecutive = consecutive_positions[0]
-        query_prefix = (local_valid == (local_physical < key_stop)).all()
-        global_trailing_padding = trailing_padding
-        padding_positions_zero = ((local_positions == 0) | local_valid).all()
-        padding_key = torch.where(local_valid, local_physical - local_positions, -1).amax()
-        last_valid = (valid_key_counts[0] - 1).clamp_min(0)
-        last_document_start = last_valid[0] - key_positions[0].gather(0, last_valid)[0]
+        local_physical = physical[:, query_start : query_start + queries]
+        in_prefix = (physical >= key_start[:, None]) & (physical < key_stop[:, None])
+        query_prefix = (local_valid == (local_physical < key_stop[:, None])).all(1)
+        padding_positions_zero = ((local_positions == 0) | local_valid).all(1)
+        padding_key = torch.where(local_valid, local_physical - local_positions, -1).amax(1)
+        last_valid = (valid_key_counts - 1).clamp_min(0)
+        last_document_start = (last_valid - key_positions.gather(1, last_valid))[:, 0]
         all_padding_valid = (
             summary_layout_valid
-            & (key_positions[0, 0] == 0)
+            & (key_positions[:, 0] == 0)
             & (valid_queries == 0)
             & padding_positions_zero
-            & (valid_key_counts[0, 0] > 0)
+            & (valid_key_counts[:, 0] > 0)
             & (last_document_start >= 0)
-            & ~sparse_queries.any()
+            & ~sparse_queries.any(1)
         )
-        all_padding_field = torch.where(all_padding_valid, last_document_start, -1)
+        all_padding_fields = torch.where(all_padding_valid, last_document_start, -1)
         prefix_valid = (
-            ~sparse_queries.any()
+            ~sparse_queries.any(1)
             & (valid_queries > 0)
             & query_prefix
-            & ((valid_queries == queries) | (global_trailing_padding & padding_positions_zero))
-            & (local_positions[0] >= 0)
+            & ((valid_queries == queries) | (trailing_padding & padding_positions_zero))
+            & (local_positions[:, 0] >= 0)
             & (key_start >= 0)
-            & ~(key_padding[0] & in_prefix).any()
-            & (consecutive | ~in_prefix[1:]).all()
+            & ~(key_padding & in_prefix).any(1)
+            & (consecutive_positions | ~in_prefix[:, 1:]).all(1)
         )
-        window_valid = key_positions.new_zeros(())
-        if window is not None:
+        window_valid = key_positions.new_zeros(batch)
+        if window is not None and batch == 1:
             window_start = torch.maximum(key_start, key_start.new_tensor(max(0, query_start - window + 1)))
-            in_window = (physical_keys >= window_start) & (physical_keys < key_stop)
+            in_window = (physical >= window_start[:, None]) & (physical < key_stop[:, None])
             window_valid = (
                 (valid_queries > 0)
                 & query_prefix
-                & ((valid_queries == queries) | (global_trailing_padding & padding_positions_zero))
-                & (local_positions[0] >= 0)
+                & ((valid_queries == queries) | (trailing_padding & padding_positions_zero))
+                & (local_positions[:, 0] >= 0)
                 & (key_start >= 0)
-                & ~(key_padding[0] & in_window).any()
-                & (consecutive | ~in_window[1:]).all()
+                & ~(key_padding & in_window).any(1)
+                & (consecutive_positions | ~in_window[:, 1:]).all(1)
             ).long()
         prefix_fields = torch.cat(
-            (
-                prefix_valid.long().reshape(1),
-                valid_queries.reshape(1),
-                padding_key.reshape(1),
-                window_valid.reshape(1),
-                local_positions,
-            )
+            (torch.stack((prefix_valid.long(), valid_queries, padding_key, window_valid), dim=1), local_positions),
+            dim=1,
         )
     # One synchronization for the entire model call, never one per layer/tile.
     layout = (
@@ -319,8 +317,8 @@ def region_metadata(
                 (token_regions.amax() + 1).reshape(1),
                 all_sparse.any().long().reshape(1),
                 bounds.reshape(-1),
-                prefix_fields,
-                all_padding_field.reshape(1),
+                prefix_fields.reshape(-1),
+                all_padding_fields,
                 summary_layout_valid.long().reshape(1),
             )
         )
@@ -328,7 +326,7 @@ def region_metadata(
         .tolist()
     )
     region_count, needs_projection = int(layout[0]), bool(layout[1])
-    all_padding_key = int(layout[-2]) if layout[-2] >= 0 else None
+    all_padding_key = int(layout[-2]) if batch == 1 and layout[-2] >= 0 else None
     tiles_per_batch = lower.shape[1]
     score_tiles = []
     for index in range(batch * tiles_per_batch):
@@ -376,26 +374,48 @@ def region_metadata(
         region_ends.scatter_reduce_(1, token_regions, physical_indices + 1, reduce="amax")
         indexed_layout = IndexedRegionLayout(region_starts, region_ends)
     causal_layout = None
+    causal_batch_layouts = None
     window_layout = None
     prefix_offset = 2 + 2 * batch * tiles_per_batch
-    if bool(layout[prefix_offset]):
-        valid_queries, padding_key = layout[prefix_offset + 1 : prefix_offset + 3]
-        local_positions = layout[prefix_offset + 4 : prefix_offset + 4 + valid_queries]
-        query_boundaries = [0] + [i for i in range(1, valid_queries) if local_positions[i] == 0] + [valid_queries]
-        key_boundaries = [0] + [end + local_positions[0] for end in query_boundaries[1:]]
-        cumulative = torch.tensor(query_boundaries + key_boundaries, dtype=torch.int32, device=key_positions.device)
-        cu_q, cu_k = cumulative.chunk(2)
-        causal_layout = CausalDocumentLayout(
-            query_start - local_positions[0],
-            query_start + valid_queries,
-            cu_q,
-            cu_k,
-            max(stop - start for start, stop in zip(query_boundaries, query_boundaries[1:])),
-            max(stop - start for start, stop in zip(key_boundaries, key_boundaries[1:])),
-            valid_queries,
-            padding_key if valid_queries < queries else None,
-        )
-    if window is not None and bool(layout[prefix_offset + 3]):
+    if batch in (1, 2) and queries:
+        row_layouts: list[CausalDocumentLayout] = []
+        for row in range(batch):
+            offset = prefix_offset + row * prefix_fields.shape[1]
+            if bool(layout[offset]):
+                valid_queries, padding_key = layout[offset + 1 : offset + 3]
+                local_positions = layout[offset + 4 : offset + 4 + valid_queries]
+                query_boundaries = (
+                    [0] + [i for i in range(1, valid_queries) if local_positions[i] == 0] + [valid_queries]
+                )
+                key_boundaries = [0] + [end + local_positions[0] for end in query_boundaries[1:]]
+                cumulative = torch.tensor(
+                    query_boundaries + key_boundaries, dtype=torch.int32, device=key_positions.device
+                )
+                cu_q, cu_k = cumulative.chunk(2)
+                row_layouts.append(
+                    CausalDocumentLayout(
+                        query_start - local_positions[0],
+                        query_start + valid_queries,
+                        cu_q,
+                        cu_k,
+                        max(stop - start for start, stop in zip(query_boundaries, query_boundaries[1:])),
+                        max(stop - start for start, stop in zip(key_boundaries, key_boundaries[1:])),
+                        valid_queries,
+                        padding_key if valid_queries < queries else None,
+                    )
+                )
+            elif batch == 2 and layout[-batch - 1 + row] >= 0:
+                padding_key = int(layout[-batch - 1 + row])
+                cumulative = torch.tensor([0, 0, 0, 1], dtype=torch.int32, device=key_positions.device)
+                cu_q, cu_k = cumulative.chunk(2)
+                row_layouts.append(
+                    CausalDocumentLayout(padding_key, padding_key + 1, cu_q, cu_k, 0, 1, 0, padding_key=padding_key)
+                )
+        if batch == 1 and row_layouts:
+            causal_layout = row_layouts[0]
+        elif batch == 2 and len(row_layouts) == batch:
+            causal_batch_layouts = tuple(row_layouts)
+    if batch == 1 and window is not None and bool(layout[prefix_offset + 3]):
         valid_queries, padding_key = layout[prefix_offset + 1 : prefix_offset + 3]
         local_positions = layout[prefix_offset + 4 : prefix_offset + 4 + valid_queries]
         prefix_keys = min(local_positions[0], window - 1)
@@ -444,6 +464,7 @@ def region_metadata(
         region_source_valid,
         all_padding_key,
         indexed_layout,
+        causal_batch_layouts,
     )
 
 
@@ -582,6 +603,7 @@ class Step5SparseIndexer(nn.Module):
                 region_count,
                 all_regions_selected=True,
                 causal_layout=metadata.causal_layout,
+                causal_batch_layouts=metadata.causal_batch_layouts,
                 all_padding_key=metadata.all_padding_key,
             )
         if keys is None or compression_logits is None:

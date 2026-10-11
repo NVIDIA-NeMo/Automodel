@@ -141,3 +141,35 @@ def test_singleton_key_negative_control_detects_wrong_document() -> None:
     correct = _all_padding_attention(query, key, value, 3)
     wrong = _all_padding_attention(query, key, value, 0)
     assert not torch.equal(correct, wrong)
+
+
+def test_indexer_preserves_proven_b2_prefix_and_all_padding_rows() -> None:
+    config = tiny_config(
+        sparse_config=dict(
+            proxy_dim=16,
+            sparse_indexer_rope_dim=4,
+            sparse_indexer_num_heads=4,
+            num_provider_groups=2,
+            topk=512,
+            region_block_size=8,
+        )
+    )
+    module = Step5SparseIndexer(config, 3, dtype=torch.float32)
+    positions = torch.tensor([[0, 1, 2, 0, 1, 0, 0], [0, 1, 0, 0, 0, 0, 0]])
+    padding = torch.tensor([[False] * 5 + [True] * 2, [False] * 2 + [True] * 5])
+    metadata = region_metadata(positions, padding, query_start=3, queries=4, region_size=8, topk=512)
+    assert metadata.causal_batch_layouts is not None
+    assert [layout.valid_queries for layout in metadata.causal_batch_layouts] == [2, 0]
+    selected = module(
+        torch.zeros(2, 4, config.hidden_size),
+        positions[:, 3:],
+        None,
+        None,
+        positions,
+        padding,
+        query_start=3,
+        metadata=metadata,
+    )
+    assert selected.all_regions_selected
+    assert selected.causal_batch_layouts is metadata.causal_batch_layouts
+    assert selected.causal_layout is None and selected.all_padding_key is None

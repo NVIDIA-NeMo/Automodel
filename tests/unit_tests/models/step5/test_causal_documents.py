@@ -180,3 +180,121 @@ def test_native_padding_layout_rejects_holes_nonzero_positions_empty_queries_and
         topk=topk,
     )
     assert meta.causal_layout is None
+
+
+@pytest.mark.parametrize(
+    "lengths,start,queries",
+    [
+        (((9, 3, 7), (3, 5, 11)), 5, 16),
+        (((3,), (9, 7)), 5, 16),
+        (((3, 5), (4,)), 11, 10),
+        (((9, 3, 7), (3, 5, 11)), 3, 9),
+    ],
+)
+def test_b2_layouts_match_independent_masks_and_single_batch_fields(
+    lengths: tuple[tuple[int, ...], tuple[int, ...]], start: int, queries: int
+) -> None:
+    """Each row has different boundaries and may be a proven all-padding shard."""
+    keys = 21
+    positions = torch.stack(
+        [
+            torch.cat([torch.arange(n) for n in row] + [torch.zeros(keys - sum(row), dtype=torch.long)])
+            for row in lengths
+        ]
+    )
+    padding = torch.stack([torch.arange(keys) >= sum(row) for row in lengths])
+    metadata = region_metadata(positions, padding, query_start=start, queries=queries, region_size=8, topk=512)
+    assert metadata.causal_layout is None and metadata.all_padding_key is None
+    assert metadata.causal_batch_layouts is not None and len(metadata.causal_batch_layouts) == 2
+    for row, layout in enumerate(metadata.causal_batch_layouts):
+        singleton = region_metadata(
+            positions[row : row + 1],
+            padding[row : row + 1],
+            query_start=start,
+            queries=queries,
+            region_size=8,
+            topk=512,
+        )
+        assert singleton.causal_batch_layouts is None
+        expected = _oracle(positions[row : row + 1], start, queries, padding[row : row + 1])
+        torch.testing.assert_close(_native_mask(layout, queries, keys), expected, rtol=0, atol=0)
+        if singleton.all_padding_key is not None:
+            assert layout.valid_queries == 0
+            assert layout.padding_key == singleton.all_padding_key
+        else:
+            old = singleton.causal_layout
+            assert old is not None
+            for field in (
+                "key_start",
+                "key_stop",
+                "max_seqlen_q",
+                "max_seqlen_k",
+                "valid_queries",
+                "padding_key",
+                "leading_padding",
+            ):
+                assert vars(layout)[field] == vars(old)[field]
+            torch.testing.assert_close(layout.cu_seqlens_q, old.cu_seqlens_q, rtol=0, atol=0)
+            torch.testing.assert_close(layout.cu_seqlens_k, old.cu_seqlens_k, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "defect", ["internal_padding", "duplicate_position", "nonzero_padding", "no_valid_key", "sparse"]
+)
+def test_b2_layout_falls_back_when_either_row_is_unproven(defect: str) -> None:
+    positions = torch.cat((torch.arange(24), torch.zeros(8, dtype=torch.long)))[None].expand(2, -1).clone()
+    padding = torch.arange(32)[None].expand(2, -1) >= 24
+    topk = 512
+    if defect == "internal_padding":
+        padding[1, 10] = True
+    elif defect == "duplicate_position":
+        positions[1, 10] = 9
+    elif defect == "nonzero_padding":
+        positions[1, 24:] = 1
+    elif defect == "no_valid_key":
+        positions[1] = 0
+        padding[1] = True
+    else:
+        topk = 1
+        positions[0, :24] = torch.arange(24) % 4
+    metadata = region_metadata(positions, padding, query_start=8, queries=24, region_size=8, topk=topk)
+    assert metadata.causal_batch_layouts is None
+    assert metadata.causal_layout is None
+
+
+def test_b2_layout_uses_one_metadata_host_transfer_and_leaves_swa_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    original = torch.Tensor.cpu
+
+    def observed_cpu(tensor: torch.Tensor, memory_format: torch.memory_format = torch.preserve_format) -> torch.Tensor:
+        """Observe the existing host transfer.
+
+        Args:
+            tensor: Tensor of arbitrary metadata shape.
+            memory_format: Unchanged torch transfer option.
+
+        Returns:
+            CPU tensor with the same shape and values.
+        """
+        calls.append(tensor.shape)
+        return original(tensor, memory_format=memory_format)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", observed_cpu)
+    positions = torch.arange(17)[None].expand(2, -1)
+    metadata = region_metadata(
+        positions,
+        torch.zeros_like(positions, dtype=torch.bool),
+        query_start=3,
+        queries=11,
+        region_size=8,
+        topk=512,
+        window=5,
+    )
+    assert len(calls) == 1
+    assert metadata.causal_batch_layouts is not None
+    assert metadata.window_layout is None
+    three = positions[:1].expand(3, -1)
+    metadata = region_metadata(
+        three, torch.zeros_like(three, dtype=torch.bool), query_start=3, queries=11, region_size=8, topk=512
+    )
+    assert metadata.causal_batch_layouts is None and metadata.causal_layout is None

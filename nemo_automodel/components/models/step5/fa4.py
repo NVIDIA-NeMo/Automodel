@@ -294,6 +294,64 @@ def _all_padding_attention(
     return torch.cat((output, empty_query, empty_key), dim=1).flatten(2, 3)
 
 
+def _causal_document_attention(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, layout: CausalDocumentLayout
+) -> torch.Tensor:
+    """Run the existing B1 causal prefix or proven singleton-padding operation.
+
+    Args:
+        query: BF16 tensor [1, local_queries, query_heads, head_dim].
+        key: BF16 tensor [1, global_keys, kv_heads, head_dim], possibly strided.
+        value: Tensor with the same shape/dtype as key; global storage is shared.
+        layout: Proven prefix metadata for this one batch row. A zero query
+            count denotes a fully padded row with a valid singleton padding key.
+
+    Returns:
+        Tensor [1, local_queries, query_heads, head_dim], preserving B1 arithmetic.
+    """
+    queries, dim = query.shape[1], query.shape[-1]
+    if layout.valid_queries == 0:
+        if layout.padding_key is None:
+            raise ValueError("A fully padded Step5 causal layout requires its singleton key")
+        return _all_padding_attention(query, key, value, layout.padding_key)
+    # Each query segment is the suffix of its document's K prefix. Native
+    # bottom-right causality therefore matches document-local positions.
+    # In particular, the final K segment ends at the final local query,
+    # even if that document continues on the next CP rank.
+    value_prefix = value[0, layout.key_start : layout.key_stop]
+    output, _ = _load_fa4_varlen()(
+        query[0, : layout.valid_queries],
+        key[0, layout.key_start : layout.key_stop],
+        value_prefix,
+        cu_seqlens_q=layout.cu_seqlens_q,
+        cu_seqlens_k=layout.cu_seqlens_k,
+        # These are scheduling upper bounds, not document boundaries.
+        # Keep short-document packs on the shard's ordinary kernel variant;
+        # cu_seqlens still defines every valid query/key and causal offset.
+        max_seqlen_q=queries,
+        max_seqlen_k=max(layout.max_seqlen_k, queries),
+        softmax_scale=dim**-0.5,
+        causal=True,
+        pack_gqa=False,
+    )
+    if layout.padding_key is None:
+        return output.unsqueeze(0)
+    # A padding query has position zero but retains the final document ID.
+    # The old mask therefore selects that document's first V, not zeros.
+    # Keep GQA expansion as a view and concatenate into one output buffer.
+    # The valid Q/K slices retain zero gradients for unused padding entries.
+    groups = value.shape[2]
+    heads_per_group = query.shape[2] // groups
+    # Share the compact V view so both branches accumulate before the
+    # single global slice backward allocates a full-length V gradient.
+    padding_offset = layout.padding_key - layout.key_start
+    padding_value = value_prefix[padding_offset : padding_offset + 1][None, :, :, None]
+    padding_output = padding_value.expand(1, queries - layout.valid_queries, groups, heads_per_group, dim)
+    return torch.cat(
+        (output.reshape(1, layout.valid_queries, groups, heads_per_group, dim), padding_output), dim=1
+    ).flatten(2, 3)
+
+
 def fa4_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -420,43 +478,26 @@ def fa4_attention(
         and selection.all_regions_selected
         and selection.causal_layout is not None
     ):
-        layout = selection.causal_layout
-        # Each query segment is the suffix of its document's K prefix. Native
-        # bottom-right causality therefore matches document-local positions.
-        # In particular, the final K segment ends at the final local query,
-        # even if that document continues on the next CP rank.
-        value_prefix = value[0, layout.key_start : layout.key_stop]
-        output, _ = _load_fa4_varlen()(
-            query[0, : layout.valid_queries],
-            key[0, layout.key_start : layout.key_stop],
-            value_prefix,
-            cu_seqlens_q=layout.cu_seqlens_q,
-            cu_seqlens_k=layout.cu_seqlens_k,
-            # These are scheduling upper bounds, not document boundaries.
-            # Keep short-document packs on the shard's ordinary kernel variant;
-            # cu_seqlens still defines every valid query/key and causal offset.
-            max_seqlen_q=queries,
-            max_seqlen_k=max(layout.max_seqlen_k, queries),
-            softmax_scale=dim**-0.5,
-            causal=True,
-            pack_gqa=False,
-        )
-        if layout.padding_key is None:
-            return output.unsqueeze(0)
-        # A padding query has position zero but retains the final document ID.
-        # The old mask therefore selects that document's first V, not zeros.
-        # Keep GQA expansion as a view and concatenate into one output buffer.
-        # The valid Q/K slices retain zero gradients for unused padding entries.
-        groups = value.shape[2]
-        heads_per_group = query.shape[2] // groups
-        # Share the compact V view so both branches accumulate before the
-        # single global slice backward allocates a full-length V gradient.
-        padding_offset = layout.padding_key - layout.key_start
-        padding_value = value_prefix[padding_offset : padding_offset + 1][None, :, :, None]
-        padding_output = padding_value.expand(1, queries - layout.valid_queries, groups, heads_per_group, dim)
-        return torch.cat(
-            (output.reshape(1, layout.valid_queries, groups, heads_per_group, dim), padding_output), dim=1
-        ).flatten(2, 3)
+        return _causal_document_attention(query, key, value, selection.causal_layout)
+    if (
+        capability == (9, 0)
+        and dim == 192
+        and query.shape[0] == 2
+        and window is None
+        and selection is not None
+        and selection.all_regions_selected
+        and selection.causal_batch_layouts is not None
+    ):
+        # Unbind once: repeated key[b] would create a full-B select_backward
+        # allocation for every row. Prefix slices share the existing CP buffers.
+        # CP's existing gradient-layout reorder remains unchanged.
+        outputs = [
+            _causal_document_attention(q[None], k[None], v[None], layout).squeeze(0)
+            for q, k, v, layout in zip(
+                query.unbind(0), key.unbind(0), value.unbind(0), selection.causal_batch_layouts, strict=True
+            )
+        ]
+        return torch.stack(outputs, dim=0)
     bitmap = False
     slots = 0
     regions = 0 if selection is None else selection.region_count
