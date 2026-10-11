@@ -43,6 +43,7 @@ from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
 from nemo_automodel.components.models.deepseek_v41.indexer import indexer_scores
 from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41RMSNorm
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
+from nemo_automodel.components.models.deepseek_v41.rope_triton import apply_rope_triton
 from nemo_automodel.shared.utils import dtype_from_str
 
 
@@ -140,6 +141,21 @@ class _RotaryEmbedding(nn.Module):
         return positions.float().unsqueeze(-1) * frequencies
 
 
+_ROPE_IMPL = "torch"
+
+
+def use_triton_rope(enabled: bool) -> None:
+    """Route ``_apply_rope`` through the fused Triton kernel.
+
+    The Triton path is opt-in and off by default; the eager path stays the reference.
+
+    Args:
+        enabled: Use :func:`apply_rope_triton` when True, the eager implementation when False.
+    """
+    global _ROPE_IMPL
+    _ROPE_IMPL = "triton" if enabled else "torch"
+
+
 def _apply_rope(values: torch.Tensor, angles: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
     """Rotate the final channels without changing the input storage.
 
@@ -153,6 +169,8 @@ def _apply_rope(values: torch.Tensor, angles: torch.Tensor, *, inverse: bool = F
     Returns:
         Tensor with the shape and dtype of values, in independent storage.
     """
+    if _ROPE_IMPL == "triton":
+        return apply_rope_triton(values, angles, inverse=inverse)
     rotary_dim = angles.shape[-1] * 2
     pairs = torch.view_as_complex(values[..., -rotary_dim:].float().unflatten(-1, (-1, 2)).contiguous())
     # Preserve the released complex-multiply rounding. Separate real-valued
