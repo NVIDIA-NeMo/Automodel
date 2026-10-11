@@ -25,7 +25,12 @@ from transformers import LlamaConfig, PretrainedConfig
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.utils.flops_utils import llama2_flops
-from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
+from nemo_automodel.recipes.llm.benchmark import (
+    BenchmarkingRecipeForNextTokenPrediction,
+    _infer_vocab_size,
+    _IterationMetrics,
+    main,
+)
 
 
 class ConfigNamespace(SimpleNamespace):
@@ -132,7 +137,7 @@ def mock_recipe(mock_config, monkeypatch):
         recipe.dist_env.device = torch.device("cpu")
         recipe.dist_env.is_main = True
         recipe.model_parts = [MagicMock()]
-        recipe.model_parts[0].config = SimpleNamespace(
+        recipe.model_parts[0].config = LlamaConfig(
             hidden_size=768,
             num_hidden_layers=12,
             vocab_size=50257,
@@ -144,6 +149,8 @@ def mock_recipe(mock_config, monkeypatch):
         recipe.val_dataloader = None
         recipe.pp_enabled = False
         recipe.tflops = 1000.0
+        recipe._bench_all_token_head_tflops = 1000.0
+        recipe._bench_iterations = [_IterationMetrics(i, 0.5, 1000.0, 1000.0, 0, 0) for i in range(30)]
         # Set benchmark-specific attributes
         recipe._bench_steps = 30
         recipe._bench_warmup_steps = 10
@@ -1127,6 +1134,7 @@ def _gradient_recipe(
     with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
         recipe = BenchmarkingRecipeForNextTokenPrediction(config)
     recipe.cfg = config
+    recipe.tflops = 1.0
     recipe.dist_env = SimpleNamespace(rank=rank, world_size=world_size, device=torch.device("cpu"), is_main=rank == 0)
     recipe.model_parts = [model]
     recipe.optimizer = [torch.optim.SGD(model.parameters(), lr=0.07)]
@@ -1317,3 +1325,138 @@ def test_benchmark_global_mean_gradient_two_process(tmp_path: Path) -> None:
         join=True,
         start_method="fork",
     )
+
+
+def test_prepacked_from_pretrained_config_keeps_dataset_factory_arguments(tmp_path: Path) -> None:
+    """A real native YAML parser and load_from_disk factory accept no mock-dataset keys."""
+    from datasets import Dataset
+
+    from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+
+    dataset_path = tmp_path / "packed"
+    Dataset.from_dict({"input_ids": [[1, 2, 3, 4]], "labels": [[-100, 2, 3, 4]]}).save_to_disk(dataset_path)
+    config_path = tmp_path / "benchmark.yaml"
+    config_path.write_text(
+        f"""recipe: BenchmarkingRecipeForNextTokenPrediction
+benchmark:
+  warmup_steps: 1
+  peak_tflops: 989
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+step_scheduler:
+  max_steps: 3
+  local_batch_size: 1
+  global_batch_size: 1
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /unused/pretrained-checkpoint
+dataset:
+  _target_: datasets.load_from_disk
+  dataset_path: {dataset_path}
+packed_sequence:
+  prepacked: true
+  packed_sequence_size: 4
+"""
+    )
+    config = parse_args_and_load_config(str(config_path), argv=[])
+    with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
+        recipe = BenchmarkingRecipeForNextTokenPrediction(config)
+    assert recipe._bench_seq_len == 4
+    assert config.get("dataset.seq_len") is None
+    assert config.get("dataset.batch_size") is None
+    assert config.get("dataset.vocab_size") is None
+    assert config.dataset.instantiate()[0]["input_ids"] == [1, 2, 3, 4]
+
+
+def test_summary_uses_sum_of_actual_work_and_slowest_rank_times(mock_recipe, tmp_path: Path) -> None:
+    """Warmup, rank-zero active_time and the final pack's FLOPs cannot bias the summary."""
+    import json
+
+    mock_recipe._bench_json_output_path = str(tmp_path / "summary.json")
+    mock_recipe._bench_iterations = [
+        _IterationMetrics(0, 100.0, 90000.0, 99000.0, 100, 20),
+        _IterationMetrics(1, 4.0, 2000.0, 2100.0, 100, 40),
+        _IterationMetrics(2, 6.0, 5000.0, 5400.0, 100, 50),
+    ]
+    mock_recipe.tflops = 5000.0
+    timer = MagicMock()
+    timer.active_time.return_value = 0.01
+    mock_recipe.timers._timers = {"setup": timer, "iteration": timer, "iteration_warmup": timer}
+    with patch("torch.distributed.barrier"):
+        mock_recipe._log_benchmark_summary(steps=3, warmup_steps=1, peak_tflops=989, rank=0)
+    result = json.loads(Path(mock_recipe._bench_json_output_path).read_text())
+    assert result["training_time_seconds"] == 10.0
+    assert result["warmup_time_seconds"] == 100.0
+    assert result["avg_iter_time_seconds"] == 5.0
+    assert result["mean_tflops_per_step"] == 3500.0
+    assert result["avg_mfu_percent"] == pytest.approx(7000 / (8 * 10 * 989) * 100)
+    assert result["all_token_head_mfu_percent"] == pytest.approx(7500 / (8 * 10 * 989) * 100)
+    assert [item["seconds"] for item in result["iterations"]] == [100.0, 4.0, 6.0]
+
+
+def test_iteration_retains_cross_rank_maximum(mock_recipe) -> None:
+    mock_recipe._bench_iterations = []
+    mock_recipe.timers._get_global_min_max_time.return_value = {"iteration": (1.0, 4.0)}
+    mock_recipe._log_iteration_metrics("iteration", ga_steps=1, peak_tflops=989, rank=0, iteration=10)
+    assert len(mock_recipe._bench_iterations) == 1
+    assert mock_recipe._bench_iterations[0].seconds == 4.0
+
+
+def _batch_flops_mesh_worker(rank: int, rendezvous: str) -> None:
+    """Use real Gloo DP, CP and PP groups to expose duplicated logical-batch counts."""
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from nemo_automodel.components.models.step5.configuration import Step5Config
+    from nemo_automodel.components.models.step5.flops import step5_flops
+    from nemo_automodel.components.utils.flops_utils import get_batch_flops_counter
+
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60)
+    )
+    try:
+        model_config = Step5Config(num_nextn_predict_layers=0)
+        for pp_size, dp_size, cp_size in ((1, 2, 2), (2, 1, 2)):
+            mesh = init_device_mesh("cpu", (pp_size, dp_size, cp_size), mesh_dim_names=("pp", "dp", "cp"))
+            mesh["dp", "cp"]._flatten(mesh_dim_name="dp_cp")
+            dp_rank = mesh["dp"].get_local_rank()
+            lengths = [3, 5] if dp_rank == 0 else [8]
+            positions = torch.cat([torch.arange(length) for length in lengths]).unsqueeze(0)
+            labels = torch.zeros_like(positions)
+            labels[:, 0] = -100
+            batch = {"input_ids": torch.zeros_like(positions), "labels": labels, "position_ids": positions}
+            recipe = _gradient_recipe(_BenchmarkGradientModel(), [batch], ga_steps=1, rank=rank, world_size=4)
+            recipe.device_mesh = mesh
+            recipe._batch_flops_counter = get_batch_flops_counter(model_config)
+            recipe._record_batch_flops([batch], num_label_tokens=7 * dp_size)
+            documents = [3, 5] if dp_size == 1 else [3, 5, 8]
+            full = sum(step5_flops(model_config, seq_len=length) for length in documents)
+            supervised = full - dp_size * 6 * model_config.hidden_size * model_config.vocab_size
+            assert recipe.tflops == pytest.approx(supervised / 1e12)
+            assert recipe._bench_all_token_head_tflops == pytest.approx(full / 1e12)
+            assert recipe._bench_step_tokens == 8 * dp_size
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_batch_flops_sum_dp_without_cp_or_pp_duplication(tmp_path: Path) -> None:
+    """Four actual ranks exercise DP2×CP2 and PP2×CP2 with the native DP reducer."""
+    torch.multiprocessing.start_processes(
+        _batch_flops_mesh_worker,
+        args=((tmp_path / "batch_flops_mesh").as_uri(),),
+        nprocs=4,
+        join=True,
+        start_method="fork",
+    )
+
+
+def test_model_owned_batch_flops_reject_unaccounted_peft(mock_recipe) -> None:
+    """A full-training model formula must never overwrite a PEFT-adjusted numerator."""
+    from nemo_automodel.components.models.step5.configuration import Step5Config
+
+    mock_recipe.model_parts[0].config = Step5Config(num_nextn_predict_layers=0)
+    mock_recipe.cfg.peft = SimpleNamespace(rank=8)
+    with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.setup"):
+        with pytest.raises(ValueError, match="without PEFT"):
+            mock_recipe.setup()

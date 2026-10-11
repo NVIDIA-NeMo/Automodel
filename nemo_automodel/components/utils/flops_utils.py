@@ -13,7 +13,12 @@
 # limitations under the License.
 
 import warnings
+from functools import partial
 from typing import Any, Callable
+
+from transformers import PretrainedConfig
+
+from nemo_automodel.shared.flops import BatchFlopsCounter
 
 
 def calculate_mfu(
@@ -1985,6 +1990,10 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
     """
     # Get config class name
     config_class_name = config.__class__.__name__
+    if config_class_name == "Step5Config":
+        from nemo_automodel.components.models.step5.flops import step5_flops
+
+        return step5_flops
 
     # Map config class names to FLOPs formulas
     class_name_to_formula = {
@@ -2065,3 +2074,19 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         formula = transformer_flops
 
     return formula
+
+
+def get_batch_flops_counter(config: PretrainedConfig) -> BatchFlopsCounter | None:
+    """Look up a model-owned counter for actual pre-CP CPU batches.
+
+    Args:
+        config: Complete model config, before pipeline layer partitioning.
+
+    Returns:
+        A configured batch counter, or None when only shape-based FLOPs are available.
+    """
+    if config.model_type == "step5":
+        from nemo_automodel.components.models.step5.flops import step5_batch_flops
+
+        return partial(step5_batch_flops, config)
+    return None

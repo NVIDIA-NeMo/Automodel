@@ -15,6 +15,7 @@
 import json
 import logging
 import pathlib
+from dataclasses import asdict, dataclass
 
 import torch
 
@@ -29,10 +30,27 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
+from nemo_automodel.components.utils.flops_utils import (
+    calculate_mfu,
+    get_batch_flops_counter,
+    get_flops_formula_for_hf_config,
+)
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+from nemo_automodel.shared.flops import BatchFlopsCounter
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _IterationMetrics:
+    """One global optimizer window, timed by its slowest rank."""
+
+    step: int
+    seconds: float
+    tflops: float
+    all_token_head_tflops: float
+    num_tokens: int
+    num_supervised_tokens: int
 
 
 def _infer_vocab_size(model_cfg):
@@ -137,11 +155,18 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Infer max_steps from step_scheduler
         self._bench_steps = cfg.step_scheduler.max_steps
 
-        # Get seq_len from dataset config
-        self._bench_seq_len = cfg.dataset.seq_len
+        # Prepacked dataset factories do not accept synthetic-data constructor keys.
+        self._bench_seq_len = cfg.get("packed_sequence.packed_sequence_size", cfg.get("dataset.seq_len"))
+        if self._bench_seq_len is None:
+            raise ValueError("Benchmark requires dataset.seq_len or packed_sequence.packed_sequence_size")
+        self._batch_flops_counter: BatchFlopsCounter | None = None
+        self._bench_iterations: list[_IterationMetrics] = []
+        self._bench_all_token_head_tflops = 0.0
+        self._bench_step_tokens = 0
+        self._bench_step_supervised_tokens = 0
 
         # Infer vocab_size from model config and inject it into dataset config
-        if hasattr(cfg, "dataset") and hasattr(cfg, "model"):
+        if cfg.get("dataset.vocab_size") is not None and hasattr(cfg, "model"):
             if hasattr(cfg.model, "config") and hasattr(cfg.model.config, "pretrained_model_name_or_path"):
                 vocab_size = _infer_vocab_size(cfg.model)
                 cfg.dataset.vocab_size = vocab_size
@@ -149,8 +174,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     logger.info(f"Inferred vocab_size={vocab_size} from model config")
 
         # Inject batch_size from step_scheduler into dataset config
-        if hasattr(cfg, "dataset") and hasattr(cfg, "step_scheduler"):
-            local_batch_size = getattr(cfg.step_scheduler, "local_batch_size", 1)
+        if cfg.get("dataset.batch_size") is not None:
+            local_batch_size = cfg.get("step_scheduler.local_batch_size", 1)
             cfg.dataset.batch_size = local_batch_size
             if logger.isEnabledFor(logging.INFO):
                 logger.info(f"Using batch_size={local_batch_size} from step_scheduler.local_batch_size")
@@ -186,6 +211,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             get_text_config = getattr(flops_config, "get_text_config", None)
             if callable(get_text_config):
                 flops_config = get_text_config()
+        self._batch_flops_counter = get_batch_flops_counter(flops_config)
+        if self._batch_flops_counter is not None and self.cfg.get("peft") is not None:
+            raise ValueError("Model-owned batch FLOPs currently require full-parameter training, without PEFT")
         flops_formula = get_flops_formula_for_hf_config(flops_config)
         if flops_formula is None:
             raise ValueError(
@@ -237,8 +265,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 )
                 logger.info(f"TFLOPS multiplier for PEFT: (2 + {param_ratio:.4f}) / 3 = {tflops_multiplier:.4f}")
 
+        self._bench_all_token_head_tflops = self.tflops
         if self.dist_env.is_main:
-            logger.info(f"TFLOPs/GPU: {self.tflops:.6f} | FLOPs scope: {self._bench_flops_scope}")
+            logger.info(
+                f"Shape-estimated global step TFLOPs: {self.tflops:.6f} | FLOPs scope: {self._bench_flops_scope}"
+            )
+            if self._batch_flops_counter is not None:
+                logger.info("Per-step MFU uses CPU document boundaries and supervised LM-head rows.")
 
         # Log setup time to wandb
         if self._wandb_enabled:
@@ -460,6 +493,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if self._wandb_enabled and self.wandb_run is not None:
                 self._log_moe_metrics(i, self.wandb_run.log)
 
+            # Count metadata after timing: batches are still global, pre-CP CPU tensors.
+            self._record_batch_flops(batches, num_label_tokens=num_label_tokens)
+
             # Calculate and log MFU
             self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
 
@@ -476,11 +512,54 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
 
+    def _record_batch_flops(self, batches: list[dict[str, torch.Tensor]], *, num_label_tokens: int) -> None:
+        """Record one accumulation window without duplicating CP or PP work.
+
+        Args:
+            batches: Original CPU input/label/position/mask tensors, each with
+                shape [local_batch, global_sequence], before CP sharding.
+            num_label_tokens: Supervised-token count already reduced over DP.
+        """
+        self._bench_step_supervised_tokens = num_label_tokens
+        if self._batch_flops_counter is None:
+            self._bench_all_token_head_tflops = self.tflops
+            self._bench_step_tokens = self.cfg.step_scheduler.global_batch_size * self._bench_seq_len
+            return
+        ignore_index = _get_loss_ignore_index(self.loss_fn)
+        counts = [self._batch_flops_counter(batch, ignore_index=ignore_index) for batch in batches]
+        totals = torch.tensor(
+            [
+                sum(count.flops for count in counts) / 1e12,
+                sum(count.all_token_head_flops for count in counts) / 1e12,
+                sum(count.num_tokens for count in counts),
+                sum(count.num_supervised_tokens for count in counts),
+            ],
+            dtype=torch.float64,
+            device=self.dist_env.device,
+        )
+        # Each CP rank and PP stage sees the same logical batch. Only DP owns
+        # additional independent examples; the numerator must count them once.
+        totals = self._dp_allreduce(totals, include_cp=False).tolist()
+        self.tflops, self._bench_all_token_head_tflops = totals[:2]
+        self._bench_step_tokens = int(totals[2])
+        if int(totals[3]) != num_label_tokens:
+            raise ValueError("Batch FLOPs supervision count disagrees with the native global loss count")
+
     def _log_iteration_metrics(self, iter_timer, ga_steps, peak_tflops, rank, iteration):
         max_iter_time = self.timers._get_global_min_max_time([iter_timer], reset=False, barrier=False, normalizer=1.0)[
             iter_timer
         ][1]
 
+        self._bench_iterations.append(
+            _IterationMetrics(
+                iteration,
+                max_iter_time,
+                self.tflops,
+                self._bench_all_token_head_tflops,
+                self._bench_step_tokens,
+                self._bench_step_supervised_tokens,
+            )
+        )
         if rank == 0:
             mfu = calculate_mfu(
                 self.tflops,
@@ -490,6 +569,23 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             )
             logger.info(f"Max iter time: {max_iter_time:.6f} seconds")
             logger.info(f"MFU: {mfu:.6f}% | FLOPs scope: {self._bench_flops_scope}")
+            if self._wandb_enabled and self.wandb_run is not None:
+                self.wandb_run.log(
+                    {
+                        "benchmark/mfu_percent": mfu,
+                        "benchmark/iteration_seconds": max_iter_time,
+                        "benchmark/tflops_per_step": self.tflops,
+                        "benchmark/all_token_head_mfu_percent": calculate_mfu(
+                            self._bench_all_token_head_tflops,
+                            self.dist_env.world_size,
+                            max_iter_time,
+                            reference_mfu=peak_tflops,
+                        ),
+                        "benchmark/valid_tokens": self._bench_step_tokens,
+                        "benchmark/supervised_tokens": self._bench_step_supervised_tokens,
+                    },
+                    step=iteration,
+                )
 
         # Log detailed timers
         timer_names = [iter_timer, "optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)]
@@ -521,21 +617,22 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Get active times for summary
         setup_time = self.timers._timers["setup"].active_time() if "setup" in self.timers._timers else 0
-        iter_time = self.timers._timers["iteration"].active_time() if "iteration" in self.timers._timers else 0
-        warmup_time = (
-            self.timers._timers["iteration_warmup"].active_time() if "iteration_warmup" in self.timers._timers else 0
-        )
+        measured = [item for item in self._bench_iterations if item.step >= warmup_steps]
+        if not measured:
+            raise ValueError("Benchmark needs at least one measured iteration after warmup")
+        iter_time = sum(item.seconds for item in measured)
+        warmup_time = sum(item.seconds for item in self._bench_iterations if item.step < warmup_steps)
+        measured_tflops = sum(item.tflops for item in measured)
+        all_token_head_tflops = sum(item.all_token_head_tflops for item in measured)
+        mean_step_tflops = measured_tflops / len(measured)
 
         if rank == 0:
             logger.info(f"Total setup time: {setup_time:.2f} seconds")
             logger.info(f"Total warmup time ({warmup_steps} steps): {warmup_time:.2f} seconds")
             logger.info(f"Total iteration time ({steps - warmup_steps} steps): {iter_time:.2f} seconds")
 
-            # Calculate average iteration time
-            if steps > warmup_steps:
-                avg_iter_time = iter_time / (steps - warmup_steps)
-            else:
-                avg_iter_time = iter_time / steps
+            # Aggregate useful work over the sum of per-step slowest-rank times.
+            avg_iter_time = iter_time / len(measured)
 
             logger.info(
                 f"Average iteration time: {avg_iter_time:.3f} seconds"
@@ -546,7 +643,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 )
             )
 
-            mfu = calculate_mfu(self.tflops, self.dist_env.world_size, avg_iter_time, reference_mfu=peak_tflops)
+            mfu = calculate_mfu(measured_tflops, self.dist_env.world_size, iter_time, reference_mfu=peak_tflops)
             logger.info(
                 f"Average MFU: {mfu:.6f}% | FLOPs scope: {self._bench_flops_scope}"
                 + (
@@ -568,7 +665,19 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "avg_iter_time_seconds": avg_iter_time,
                 "avg_mfu_percent": mfu,
                 "flops_scope": self._bench_flops_scope,
-                "tflops_per_gpu": self.tflops,
+                "tflops_per_gpu": mean_step_tflops,  # Historical key stores global step work.
+                "mean_tflops_per_step": mean_step_tflops,
+                "all_token_head_mfu_percent": calculate_mfu(
+                    all_token_head_tflops,
+                    self.dist_env.world_size,
+                    iter_time,
+                    reference_mfu=peak_tflops,
+                ),
+                "flops_accounting": "actual_documents_supervised_head"
+                if self._batch_flops_counter is not None
+                else "shape_formula",
+                "timing_accounting": "sum_of_per_step_max_rank_seconds",
+                "iterations": [asdict(item) for item in self._bench_iterations],
                 "peak_tflops": peak_tflops,
                 "world_size": self.dist_env.world_size,
                 "global_batch_size": self.cfg.step_scheduler.global_batch_size,
@@ -609,7 +718,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         "summary/avg_mfu_percent": mfu,
                         "summary/flops_scope": self._bench_flops_scope,
                         "summary/training_time_seconds": iter_time,
-                        "summary/tflops_per_gpu": self.tflops,
+                        "summary/tflops_per_gpu": mean_step_tflops,
+                        "summary/mean_tflops_per_step": mean_step_tflops,
                     }
                 )
 
