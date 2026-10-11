@@ -16,8 +16,10 @@ must be enabled in each team's GitHub settings. Alerts do not delete or
 invalidate cached wheels.
 
 The source mode uses the normal UV project build settings, disables UV's cache,
-and forbids prebuilt distributions for the wheelhouse packages selected by the
-existing `all` extra. It also disables Mamba and causal-conv1d's own release-wheel
+and forbids prebuilt distributions for the native wheelhouse packages selected by
+the existing `all` extra. The wheel-only `transformer-engine` Python wrapper is
+allowed; `transformer-engine-torch` still builds its native extension from source.
+It also disables Mamba and causal-conv1d's own release-wheel
 downloads. Both modes run the existing import checks. Source mode does not add
 extras that the normal UV job does not test.
 

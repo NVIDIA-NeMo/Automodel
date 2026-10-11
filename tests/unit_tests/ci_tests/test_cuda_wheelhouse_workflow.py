@@ -16,12 +16,97 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 _MODE_SCRIPT = Path(".github/scripts/select-uv-install-modes.sh").resolve()
 _VERIFY_SCRIPT = Path(".github/scripts/verify-cuda-wheelhouse-provenance.sh").resolve()
+
+
+@pytest.mark.parametrize("mode", ["source", "wheelhouse"])
+def test_uv_install_keeps_wheel_only_wrapper_and_builds_native_extensions(tmp_path: Path, mode: str) -> None:
+    workflow = yaml.safe_load(Path(".github/workflows/install-test.yml").read_text())
+    step = next(step for step in workflow["jobs"]["ngc-cuda-test-uv"]["steps"] if step["name"] == "Install project")
+    script = step["run"]
+    script = script[script.index('requirements="$(') : script.index("\nuv pip install --no-deps -e .")]
+    script = script.replace("${{ matrix.python-version }}", "3.12")
+    requirements = [
+        "causal-conv1d==1.6.0",
+        "flash-attn==2.8.3",
+        "mamba-ssm==2.3.0",
+        "transformer-engine[pytorch]==2.19.0",
+        "transformer-engine-torch==2.19.0",
+    ]
+    python = tmp_path / "python"
+    python.write_text(f"#!{sys.executable}\nprint({chr(10).join(requirements)!r})\n")
+    python.chmod(0o755)
+    calls = tmp_path / "calls.jsonl"
+    uv = tmp_path / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\n"
+        "with open(os.environ['UV_CALLS'], 'a') as output:\n"
+        "    output.write(json.dumps({'args': sys.argv[1:], 'mamba': os.getenv('MAMBA_FORCE_BUILD'), "
+        "'causal': os.getenv('CAUSAL_CONV1D_FORCE_BUILD')}) + '\\n')\n"
+    )
+    uv.chmod(0o755)
+    subprocess.run(
+        ["bash", "-eu", "-o", "pipefail", "-c", script],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "INSTALL_MODE": mode,
+            "TORCH_CU_INDEX": "https://download.pytorch.org/whl/cu130",
+            "UV_CALLS": str(calls),
+        },
+        check=True,
+    )
+    invocations = [json.loads(line) for line in calls.read_text().splitlines()]
+    sync = invocations[-1]
+    assert sync["args"][:8] == [
+        "sync",
+        "--link-mode",
+        "copy",
+        "--locked",
+        "--all-groups",
+        "--no-group",
+        "magi",
+        "--extra",
+    ]
+    if mode == "source":
+        assert len(invocations) == 1
+        assert sync["args"][8:] == [
+            "all",
+            "--no-cache",
+            "--no-binary-package",
+            "causal-conv1d",
+            "--no-binary-package",
+            "flash-attn",
+            "--no-binary-package",
+            "mamba-ssm",
+            "--no-binary-package",
+            "transformer-engine-torch",
+        ]
+        assert sync["mamba"] == sync["causal"] == "TRUE"
+    else:
+        assert len(invocations) == 2
+        assert invocations[0]["args"] == [
+            "pip",
+            "install",
+            "--no-config",
+            "--python",
+            "./venv/bin/python",
+            "--no-deps",
+            "--no-index",
+            "--only-binary",
+            ":all:",
+            "--find-links",
+            "/tmp/cuda-wheelhouse",
+            *requirements,
+        ]
+        assert sync["args"][8:] == ["all"]
 
 
 def _git(directory: Path, *args: str) -> str:

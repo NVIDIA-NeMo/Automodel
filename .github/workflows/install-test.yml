@@ -201,7 +201,11 @@ jobs:
             sync_args+=(--no-cache)
             for requirement in "${wheel_requirements[@]}"; do
               package="${requirement%%==*}"
-              sync_args+=(--no-binary-package "${package%%\[*}")
+              package="${package%%\[*}"
+              # TE's Python wrapper is wheel-only. Its native PyTorch extension
+              # remains source-built through transformer-engine-torch below.
+              [[ ${package} == transformer-engine ]] && continue
+              sync_args+=(--no-binary-package "${package}")
             done
             # These backends otherwise download release wheels during a source build.
             export MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE
