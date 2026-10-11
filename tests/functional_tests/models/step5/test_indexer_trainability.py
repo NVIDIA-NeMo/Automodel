@@ -44,12 +44,22 @@ pytestmark = pytest.mark.skipif(
 
 
 class Fixture(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.indexer = Step5SparseIndexer(tiny_config(), 3, dtype=torch.float32)
         self.output = nn.Linear(32, 32, bias=False, dtype=torch.float32)
 
     def forward(self, hidden: torch.Tensor, empty: bool) -> torch.Tensor:
+        """Exercise the frozen selector and return differentiable projections.
+
+        Args:
+            hidden: FP32 activations shaped ``[batch, sequence, 32]``.
+            empty: Whether the selector receives an empty sequence while the
+                trainable projection still receives all input tokens.
+
+        Returns:
+            FP32 projected activations shaped ``[batch, sequence, 32]``.
+        """
         positions = torch.arange(hidden.shape[1], device=hidden.device).unsqueeze(0)
         padding = torch.zeros_like(positions, dtype=torch.bool)
         with torch.no_grad():
