@@ -311,3 +311,67 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
     # Expect all three subtrees to be individually sharded
     # Note: the 'b' subtree should be sharded as a whole since it is uniform float16
     assert set(sub_calls) == {model.a, model.b, model.c}
+
+
+def test_explicit_storage_compute_groups_preserve_master_and_holder_precision(monkeypatch):
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    model = nn.Module()
+    model.master = nn.Linear(2, 2, bias=False).float()
+    model.frozen = nn.Linear(2, 2, bias=False).bfloat16()
+    model.frozen.register_buffer("e_score_correction_bias", torch.ones(2, dtype=torch.float32))
+    model.holder = nn.Linear(2, 2, bias=False).float()
+    model.experts = nn.Linear(2, 2, bias=False).bfloat16()
+    ignored = set(model.experts.parameters())
+    holder_ids = {id(parameter) for parameter in model.holder.parameters()}
+    calls = []
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard",
+        lambda target, **kwargs: calls.append((target, kwargs)),
+    )
+    fully_shard_by_dtype(
+        model, mesh=object(),
+        mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
+        offload_policy=None, reshard_after_forward=True, ignored_params=ignored,
+        compute_dtype_of=lambda tensor: torch.float32 if id(tensor) in holder_ids else torch.bfloat16,
+    )
+    assert {id(target) for target, _ in calls} == {id(model), id(model.master), id(model.frozen), id(model.holder)}
+    for target, kwargs in calls:
+        expected = torch.float32 if target is model.holder else torch.bfloat16
+        assert kwargs["mp_policy"].param_dtype == expected
+        assert kwargs["mp_policy"].reduce_dtype == torch.float32
+        if target is model.holder:
+            assert kwargs["mp_policy"].output_dtype == torch.float32
+        assert kwargs["reshard_after_forward"] is True
+        assert kwargs["ignored_params"] == ignored
+    assert model.master.weight.dtype == torch.float32
+    assert model.frozen.weight.dtype == torch.bfloat16
+
+
+def test_explicit_sharding_skips_managed_children_and_keeps_parent_hooks(monkeypatch):
+    from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
+
+    outer = nn.Module()
+    outer.model = nn.Module()
+    outer.model.layer = nn.Module()
+    outer.model.layer.master = nn.Linear(2, 2, bias=False).float()
+    outer.model.layer.frozen = nn.Linear(2, 2, bias=False).bfloat16()
+    calls = []
+
+    def fake_shard(target, **kwargs):
+        assert not isinstance(target, FSDPModule), "already managed subtree wrapped twice"
+        calls.append(target)
+        cls = target.__class__
+        target.__class__ = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
+
+    monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_shard)
+    for target in (outer.model.layer, outer.model, outer):
+        fully_shard_by_dtype(
+            target, mesh=object(),
+            mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+            offload_policy=None, compute_dtype_of=lambda tensor: torch.bfloat16,
+            reshard_after_forward=True,
+        )
+    assert calls[-2:] == [outer.model, outer]
+    assert calls.count(outer.model.layer) == 1
+    assert len(calls) == 4

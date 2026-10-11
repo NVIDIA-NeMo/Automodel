@@ -354,6 +354,7 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
+    preserve_parameter_dtypes: bool = False,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -392,6 +393,8 @@ def apply_model_infrastructure(
         inject_te_attention: When True, inject TransformerEngine DotProductAttention
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
+        preserve_parameter_dtypes: Keep explicitly configured mixed parameter storage
+            during materialization and initialization, before any checkpoint load.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -464,7 +467,9 @@ def apply_model_infrastructure(
     if load_before_shard:
         if is_meta_device:
             lora_a_init = getattr(peft_config, "lora_A_init", None)
-            checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+            checkpointer.initialize_model_weights(
+                model, device, peft_init_method=lora_a_init, preserve_parameter_dtypes=preserve_parameter_dtypes
+            )
             checkpointer.load_base_model(
                 model,
                 device,
@@ -535,7 +540,9 @@ def apply_model_infrastructure(
         model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
         for mp in model_parts:
-            checkpointer.initialize_model_weights(mp, device, peft_init_method=lora_a_init)
+            checkpointer.initialize_model_weights(
+                mp, device, peft_init_method=lora_a_init, preserve_parameter_dtypes=preserve_parameter_dtypes
+            )
 
     # Load the checkpoint if pretrained weights are needed and weren't already loaded
     # (e.g., by HF's from_pretrained on a real device, which also handles BnB

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
@@ -28,6 +29,10 @@ from nemo_automodel.components.models.common import (
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
+from nemo_automodel.components.models.nemotron_v3.mtp import (
+    build_mtp_config_from_hf,
+    build_nemotron_v3_mtp,
+)
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -35,11 +40,27 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
+@dataclass
+class NemotronHCausalLMOutputWithPast(CausalLMOutputWithPast):
+    """``CausalLMOutputWithPast`` plus declared MTP fields.
+
+    The MTP per-depth hidden states and scaling factor must be regular
+    dataclass fields (rather than dynamically-set attributes) so they survive
+    output-restructuring layers like FSDP2's mixed-precision output cast,
+    which rebuild ``ModelOutput`` instances from declared fields only.
+    """
+
+    mtp_per_depth_h: Optional[list[torch.Tensor]] = None
+    mtp_loss_scaling_factor: Optional[float] = None
+
+
 class NemotronV3Model(nn.Module):
     """NemotronV3 base model (without LM head).
 
     This is a hybrid architecture with Mamba2, Attention, MLP, and MoE layers.
     """
+
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
 
     def __init__(
         self,
@@ -210,6 +231,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     _is_stateful: bool = True
     main_input_name: str = "input_ids"
 
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
+
     @classmethod
     def from_config(
         cls,
@@ -253,14 +276,31 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         self,
         config,
         backend: BackendConfig | None = None,
+        *,
+        mtp_loss_scaling_factor: float = 0.1,
+        num_nextn_predict_layers: int | None = None,
+        mtp_use_repeated_layer: bool = False,
         **kwargs,
     ):
         """Initialize NemotronV3ForCausalLM.
 
         Args:
-            config: NemotronH config
-            backend: Backend configuration
-            **kwargs: Additional arguments
+            config: NemotronH config.
+            backend: Backend configuration.
+            mtp_loss_scaling_factor: Auxiliary-loss weight for the MTP head
+                (default ``0.1``). Programmatic override only — not exposed
+                as a YAML knob to keep recipe configs auto-detected.
+            num_nextn_predict_layers: Optional override for the HF config's
+                ``num_nextn_predict_layers`` field (i.e. the MTP forward
+                iteration count). When ``None``, the value from ``config`` is
+                used. Set explicitly when the trained model used weight-tied
+                MTP (``mtp_use_repeated_layer=True``) and the HF export only
+                retains the physical depth count.
+            mtp_use_repeated_layer: When ``True``, build a single physical
+                MTP depth and reuse it across all iterations. Mirrors
+                Megatron's ``--mtp-use-repeated-layer``. Defaults to ``False``.
+            **kwargs: Additional arguments. Recognized keys:
+                ``moe_config``, ``moe_overrides``.
         """
         super().__init__()
         self.config = config
@@ -286,6 +326,24 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             bias=False,
             dtype=dtype,
         )
+
+        # self.mtp is None when num_nextn_predict_layers is absent or 0.
+        self.mtp_config = build_mtp_config_from_hf(
+            config,
+            loss_scaling_factor=mtp_loss_scaling_factor,
+            num_nextn_predict_layers=num_nextn_predict_layers,
+            use_repeated_layer=mtp_use_repeated_layer,
+        )
+        if self.mtp_config.enabled:
+            self.mtp = build_nemotron_v3_mtp(
+                config,
+                mtp_config=self.mtp_config,
+                backend=self.backend,
+                moe_config=self.model.moe_config,
+                dtype=dtype,
+            )
+        else:
+            self.mtp = None
 
         # Create state_dict_adapter if enabled (needed to convert HF checkpoints)
         if self.backend.enable_hf_state_dict_adapter:
@@ -334,6 +392,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         position_ids: Optional[torch.LongTensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        compute_logits: bool = True,
+        compute_mtp: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs: Any,
@@ -358,6 +418,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             padding_mask: Padding mask ``[B, S]`` used by THD squeeze helper.
             logits_to_keep: If > 0, only compute logits for the last ``logits_to_keep``
                 token positions (avoids materialising the full logit matrix during generation).
+            compute_logits: Materialize LM-head logits; disable for response-only projection.
+            compute_mtp: Override auxiliary MTP computation while preserving checkpoint weights.
             output_hidden_states: Whether to return hidden states.
             return_dict: Accepted for API compatibility (always returns CausalLMOutputWithPast).
             **kwargs: Additional arguments forwarded to the base model
@@ -368,6 +430,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             ``logits`` (float32), optional ``loss``, ``past_key_values``, and
             ``hidden_states``.
         """
+        if not compute_logits and labels is not None:
+            raise ValueError("compute_logits=False cannot compute a label loss")
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -397,17 +461,18 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if past_key_values is not None:
             past_key_values.has_previous_state = True
 
-        # Optionally restrict logit computation to the last few positions.
-        # When logits_to_keep == 0 we compute all positions (training default).
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            if hidden_states.dim() == 2:
-                logits = self.lm_head(hidden_states[slice_indices, :])
+        logits = None
+        if compute_logits:
+            # Optionally restrict logit computation to the last few positions.
+            # When logits_to_keep == 0 we compute all positions (training default).
+            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+                logits = self.lm_head(hidden_states)
             else:
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
-
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                if hidden_states.dim() == 2:
+                    logits = self.lm_head(hidden_states[slice_indices, :])
+                else:
+                    logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         if labels is not None:
             # Shift for next-token prediction
@@ -418,15 +483,39 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 shift_labels.view(-1),
             )
 
-        if is_thd:
+        # Per-depth hidden states for the MTP auxiliary head; the recipe
+        # dispatches CE per depth via the configured loss class.
+        mtp_per_depth_h = None
+        run_mtp = self.training if compute_mtp is None else compute_mtp
+        if self.mtp is not None and run_mtp:
+            mtp_per_depth_h = self.mtp(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                embed_fn=self.model.embed_tokens,
+                position_ids=position_ids,
+                attention_mask=causal_mask_mapping.get("full_attention")
+                if causal_mask_mapping is not None
+                else attention_mask,
+            )
+
+        # Restore the batch dim for THD only when the inner forward returned
+        # 2D logits.  When the caller feeds the model via ``inputs_embeds``
+        # (shape ``[1, T, H]``), ``NemotronHModel.forward`` squeezes to
+        # ``[T, H]`` for the layer stack and unsqueezes back to ``[1, T, H]``
+        # before returning (see the ``squeezed_for_thd`` branch); the lm_head
+        # then yields ``[1, T, V]`` already and a second unsqueeze here would
+        # produce a spurious ``[1, 1, T, V]``.
+        if is_thd and logits is not None and logits.dim() == 2:
             logits = logits.unsqueeze(0)
 
-        return CausalLMOutputWithPast(
+        return NemotronHCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=(hidden_states,) if output_hidden_states else None,
             attentions=None,
+            mtp_per_depth_h=mtp_per_depth_h,
+            mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
         )
 
     @staticmethod
@@ -527,10 +616,15 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         return model_inputs
 
     @torch.no_grad()
+    def initialize_weights_preserving_dtypes(self) -> None:
+        """Initialize materialized parameters without a uniform storage cast."""
+        self.initialize_weights(dtype=None)
+
+    @torch.no_grad()
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: Optional[torch.dtype] = torch.bfloat16,
     ) -> None:
         """Initialize model weights.
 
@@ -542,8 +636,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         with buffer_device:
             self.model.initialize_weights(buffer_device=buffer_device)
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
+            if self.mtp is not None:
+                for sublayer in self.mtp.layers:
+                    sublayer.init_weights(buffer_device=buffer_device)
 
-        cast_model_to_dtype(self, dtype)
+        if dtype is not None:
+            cast_model_to_dtype(self, dtype)
 
 
 ModelClass = NemotronHForCausalLM
