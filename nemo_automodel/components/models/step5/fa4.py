@@ -334,8 +334,11 @@ def fa4_attention(
             value_prefix,
             cu_seqlens_q=layout.cu_seqlens_q,
             cu_seqlens_k=layout.cu_seqlens_k,
-            max_seqlen_q=layout.max_seqlen_q,
-            max_seqlen_k=layout.max_seqlen_k,
+            # These are scheduling upper bounds, not document boundaries.
+            # Keep short-document packs on the shard's ordinary kernel variant;
+            # cu_seqlens still defines every valid query/key and causal offset.
+            max_seqlen_q=queries,
+            max_seqlen_k=max(layout.max_seqlen_k, queries),
             softmax_scale=dim**-0.5,
             causal=True,
             pack_gqa=False,

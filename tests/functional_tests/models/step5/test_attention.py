@@ -552,3 +552,96 @@ def test_fa4_zero_valid_query_shard_keeps_original_padding_semantics(monkeypatch
     expected_dv = torch.zeros_like(v)
     expected_dv[:, 0] = (keys - start) * (heads // groups)
     torch.testing.assert_close(dv, expected_dv, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("spans", [(256, 128, 96, 64, 1), (1, 64, 96, 128, 256)])
+@pytest.mark.parametrize("queries,heads,groups", [(4096, 4, 2), (4096, 64, 4), (8192, 64, 4)])
+def test_varlen_shard_bounds_reuse_kernels_for_short_documents(
+    spans: tuple[int, ...], queries: int, heads: int, groups: int
+) -> None:
+    """Document lengths cannot introduce late single-block kernel variants."""
+    from flash_attn.cute import interface
+
+    from nemo_automodel.components.models.step5.sparse import region_metadata
+
+    torch.manual_seed(812)
+    dim, documents_count = 192, 16
+    caches = (interface._flash_attn_fwd.compile_cache, interface._flash_attn_bwd.compile_cache)
+    for case, span in enumerate(spans):
+        valid = documents_count * span
+        positions = torch.cat(
+            (
+                torch.arange(span, device="cuda").repeat(documents_count),
+                torch.zeros(queries - valid, device="cuda", dtype=torch.long),
+            )
+        )[None]
+        padding = torch.arange(queries, device="cuda")[None] >= valid
+        meta = region_metadata(positions, padding, query_start=0, queries=queries, region_size=8, topk=512)
+        selection = RegionSelection(
+            meta.dense_region_ids[:, None].expand(-1, groups, -1, -1),
+            meta.token_regions,
+            meta.query_documents,
+            meta.documents,
+            meta.region_count,
+            all_regions_selected=True,
+            causal_layout=meta.causal_layout,
+        )
+        q = torch.randn(1, queries, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        # The production stack/unbind layout has a noncontiguous token stride.
+        kv = torch.randn(1, queries, 2, groups, dim, device="cuda", dtype=torch.bfloat16)
+        k, v = (item.detach().requires_grad_() for item in kv.unbind(2))
+        before = [set(cache.cache) for cache in caches]
+        actual = fa4_attention(
+            q,
+            k,
+            v,
+            positions,
+            positions,
+            padding,
+            meta.documents,
+            query_start=0,
+            window=None,
+            selection=selection,
+        )
+        upstream = torch.randn_like(actual)
+        actual_grads = torch.autograd.grad(actual, (q, k, v), upstream)
+        torch.cuda.synchronize()
+        if case:
+            assert [set(cache.cache) for cache in caches] == before, "Short documents compiled another kernel variant"
+        # Independent per-document FP32 math, including the existing padding
+        # convention: each padded query attends the final document's first V.
+        reference_q, reference_k, reference_v = (tensor.detach().float().requires_grad_() for tensor in (q, k, v))
+        document_outputs = []
+        for start in range(0, valid, span):
+            stop = start + span
+            document_outputs.append(
+                F.scaled_dot_product_attention(
+                    reference_q[:, start:stop].transpose(1, 2),
+                    reference_k[:, start:stop].repeat_interleave(heads // groups, dim=2).transpose(1, 2),
+                    reference_v[:, start:stop].repeat_interleave(heads // groups, dim=2).transpose(1, 2),
+                    is_causal=True,
+                ).transpose(1, 2)
+            )
+        if valid < queries:
+            document_outputs.append(
+                reference_v[:, valid - span : valid - span + 1]
+                .repeat_interleave(heads // groups, dim=2)
+                .expand(-1, queries - valid, -1, -1)
+            )
+        expected = torch.cat(document_outputs, dim=1)
+        torch.testing.assert_close(actual.float(), expected, atol=0.015, rtol=0.015)
+        expected_grads = torch.autograd.grad(expected, (reference_q, reference_k, reference_v), upstream.float())
+        for index, (observed, oracle) in enumerate(zip(actual_grads, expected_grads)):
+            if span == 1 and index < 2:
+                # A singleton softmax is constant: both Q/K derivatives are
+                # mathematically zero. FP32 SDPA also has tiny cancellation
+                # residuals, so a relative-to-zero comparison is undefined.
+                torch.testing.assert_close(observed.float(), torch.zeros_like(oracle), atol=1e-5, rtol=0)
+                torch.testing.assert_close(oracle, torch.zeros_like(oracle), atol=1e-5, rtol=0)
+            else:
+                relative = (observed.float() - oracle).norm() / oracle.norm()
+                assert relative < 0.012, (case, span, index, relative.item())
+            assert torch.isfinite(observed).all()
+        assert torch.count_nonzero(actual_grads[0][:, valid:]) == 0
+        assert torch.count_nonzero(actual_grads[1][:, valid:]) == 0
