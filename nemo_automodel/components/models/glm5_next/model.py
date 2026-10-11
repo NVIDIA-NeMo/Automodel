@@ -106,6 +106,17 @@ def _packed_context_from_inputs(
         doc_ids = torch.ones(input_ids.shape[:2], dtype=torch.int32, device=input_ids.device)
         if padding_mask is not None:
             doc_ids.masked_fill_(padding_mask.bool(), 0)
+        else:
+            # Unmasked rows each contain one document; their boundaries depend
+            # only on shape and never require a device-to-host value read.
+            cpu_boundaries = torch.tensor([0, sequence] if sequence else [0], dtype=torch.long, device="cpu")
+            device_boundaries = cpu_boundaries.to(input_ids.device, non_blocking=True)
+            return Glm5NextPackedContext(
+                doc_ids=doc_ids,
+                original_seq_len=sequence,
+                _cu_seqlens={row: (device_boundaries, cpu_boundaries) for row in range(input_ids.shape[0])},
+                _document_ranges={row: ((0, sequence),) if sequence else () for row in range(input_ids.shape[0])},
+            )
     return Glm5NextPackedContext(doc_ids=doc_ids, original_seq_len=sequence)
 
 
@@ -163,7 +174,7 @@ class Glm5NextTextModel(nn.Module):
             hidden = hidden.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         # Boundary caches must be populated before checkpointed decoder calls.
         for row in range(hidden.shape[0]):
-            glm5_next_packed_context.row_cu_seqlens(row)
+            glm5_next_packed_context.row_document_ranges(row)
         for layer in self.layers.values():
             hidden = layer(
                 hidden,

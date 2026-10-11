@@ -693,12 +693,7 @@ class Glm5NextSparseAttention(nn.Module):
         local_start = packed_context.seq_start
         local_end = local_start + hidden_states.shape[1]
         for row in range(hidden_states.shape[0]):
-            doc_ids = packed_context.doc_ids[row]
-            starts = torch.nonzero(doc_ids[1:] != doc_ids[:-1], as_tuple=False).flatten().add(1).tolist()
-            boundaries = [0, *starts, doc_ids.numel()]
-            for doc_start, doc_end in zip(boundaries[:-1], boundaries[1:]):
-                if int(doc_ids[doc_start]) <= 0:
-                    continue
+            for doc_start, doc_end in packed_context.row_document_ranges(row):
                 query_start, query_end = max(doc_start, local_start), min(doc_end, local_end)
                 if query_end <= query_start:
                     continue

@@ -54,6 +54,31 @@ class Glm5NextPackedContext:
         compare=False,
     )
 
+    _document_ranges: dict[int, tuple[tuple[int, int], ...]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+
+    def row_document_ranges(self, row: int) -> tuple[tuple[int, int], ...]:
+        """Return cached non-padding document ranges in global row coordinates.
+
+        Document ids are immutable for the lifetime of this per-step context.
+        Materialize the cache before decoder FSDP hooks rebuild the dataclass.
+        """
+        cached = self._document_ranges.get(row)
+        if cached is None:
+            device_boundaries, cpu_boundaries = self.row_cu_seqlens(row)
+            boundaries = cpu_boundaries.tolist()
+            document_ids = self.doc_ids[row].index_select(0, device_boundaries[:-1]).cpu().tolist()
+            cached = tuple(
+                (start, end)
+                for start, end, document_id in zip(boundaries[:-1], boundaries[1:], document_ids, strict=True)
+                if document_id > 0
+            )
+            self._document_ranges[row] = cached
+        return cached
+
     @property
     def cp_enabled(self) -> bool:
         """Return whether the sequence is split across more than one rank."""
