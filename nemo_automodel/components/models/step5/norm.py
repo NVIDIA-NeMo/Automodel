@@ -19,19 +19,47 @@ import torch
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 
 
+def _rms_norm_with_rstd(
+    hidden: torch.Tensor, weight: torch.Tensor, eps: float, output_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize in FP32 and retain the row statistic needed by backward."""
+    raw = hidden.float()
+    rstd = torch.rsqrt(raw.square().mean(-1, keepdim=True) + eps)
+    normalized = raw * rstd
+    return (normalized * (weight.float() + 1)).to(output_dtype), rstd
+
+
 def _rms_norm(hidden: torch.Tensor, weight: torch.Tensor, eps: float, output_dtype: torch.dtype) -> torch.Tensor:
     """Normalize [..., width] in FP32 before rounding once to the output dtype."""
-    raw = hidden.float()
-    normalized = raw * torch.rsqrt(raw.square().mean(-1, keepdim=True) + eps)
-    return (normalized * (weight.float() + 1)).to(output_dtype)
+    return _rms_norm_with_rstd(hidden, weight, eps, output_dtype)[0]
 
 
-_rms_norm_compiled = torch.compile(
-    _rms_norm,
+# Residual and activation inputs have different precision and layout families.
+# Give them separate Dynamo entries: mixing FP32/BF16, grad/no_grad, output
+# casts, and strided QKV in one entry exhausts the default specialization cache.
+@torch.compile(
     fullgraph=True,
     dynamic=True,
     options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
 )
+def _residual_rms_norm(
+    hidden: torch.Tensor, weight: torch.Tensor, eps: float, output_dtype: torch.dtype
+) -> torch.Tensor:
+    return _rms_norm(hidden, weight, eps, output_dtype)
+
+
+@torch.compile(
+    fullgraph=True,
+    dynamic=True,
+    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+)
+def _activation_rms_norm(
+    hidden: torch.Tensor, weight: torch.Tensor, eps: float, output_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Keep the same reduction outputs in grad/no_grad. Otherwise Inductor can
+    # pick a different summation tree when the backward statistic is dead,
+    # changing BF16 rounding at the final norm during checkpoint replay.
+    return _rms_norm_with_rstd(hidden, weight, eps, output_dtype)
 
 
 class Step5RMSNorm(Step3p5RMSNorm):
@@ -62,5 +90,15 @@ class Step5RMSNorm(Step3p5RMSNorm):
             Normalized activations with the input shape. The learned FP32 scale
             and every intermediate retain their original precision.
         """
-        core = _rms_norm_compiled if self.compile_norm and hidden.is_cuda else _rms_norm
-        return core(hidden, self.weight, self.variance_epsilon, hidden.dtype if output_dtype is None else output_dtype)
+        dtype = hidden.dtype if output_dtype is None else output_dtype
+        if self.compile_norm and hidden.is_cuda:
+            # Normalize the leading layout so decoder, Q/K, and final norms
+            # share a compiled rank. Interleaved key projections stay strided
+            # views: only the normalized feature axis must remain last.
+            rows = hidden.reshape(-1, hidden.shape[-1])
+            if hidden.dtype == torch.float32:
+                output = _residual_rms_norm(rows, self.weight, self.variance_epsilon, dtype)
+            else:
+                output, _ = _activation_rms_norm(rows, self.weight, self.variance_epsilon, dtype)
+            return output.reshape(hidden.shape)
+        return _rms_norm(hidden, self.weight, self.variance_epsilon, dtype)

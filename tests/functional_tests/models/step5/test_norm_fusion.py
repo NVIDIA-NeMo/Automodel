@@ -34,6 +34,8 @@ def _metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
         "relative_l2": (error.square().mean().sqrt() / scale).item(),
         "max_over_rms": (error.abs().max() / scale).item(),
         "max_abs": error.abs().max().item(),
+        "different_fraction": (actual != expected).float().mean().item(),
+        "over_1pct_rms_fraction": (error.abs() > 0.01 * scale).float().mean().item(),
     }
 
 
