@@ -147,8 +147,23 @@ class HybridEPDispatchReplayRecorder:
         self._cursor = 0
         self.replay_misses = 0
 
-    def record(self, handle, tokens_per_expert) -> None:
-        self._records.append([handle, tokens_per_expert, None])
+    def record(
+        self,
+        handle: object,
+        tokens_per_expert: torch.Tensor,
+        num_permuted_tokens: int | torch.Tensor | None = None,
+    ) -> None:
+        """Record the dispatch layout and any exact host-known output extent.
+
+        Args:
+            handle: Opaque HybridEP dispatch handle retained for recomputation.
+            tokens_per_expert: Integer counts with shape [local_experts].
+            num_permuted_tokens: Exact host integer for static routing, or a scalar
+                tensor with shape [] or None when finalization must derive the
+                count from metadata.
+        """
+        extent = num_permuted_tokens if isinstance(num_permuted_tokens, int) else None
+        self._records.append([handle, tokens_per_expert, extent])
 
     def finalize(self) -> None:
         """Cache each layout extent after the checkpoint-forward op context exits."""
@@ -837,7 +852,7 @@ class HybridEPDispatch(torch.autograd.Function):
         if recorder is not None and _hybridep_dispatch_replay_state.mode == "record":
             # Keep only the reusable layout and its output extent. Recomputed
             # activations and probabilities are still redispatched through it.
-            recorder.record(handle, tokens_per_expert)
+            recorder.record(handle, tokens_per_expert, num_permuted_tokens)
         return (
             dispatched_hidden,
             dispatched_probs,

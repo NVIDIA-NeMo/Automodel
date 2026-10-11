@@ -436,6 +436,7 @@ class _HybridEPManager(_DispatchManager):
         # routing every dispatch pads to the same size, so the per-dispatch MAX all-reduce + host sync
         # that computes it runs once. NEMO_STATIC_ROUTING_PAD_PIN=0 keeps the per-dispatch path (A/B).
         self._static_target_tokens: int | None = None
+        self._static_num_permuted_tokens: int | None = None
         self._pipeline_extent: _HybridEPDispatchExtent | None = None
 
         # Metadata
@@ -513,7 +514,7 @@ class _HybridEPManager(_DispatchManager):
         # Benchmark-only exception: with static routing every dispatch permutes the same
         # count, so reusing the first dispatch's value keeps hybrid_ep_dispatch on its
         # non-blocking path and removes a per-microbatch host wait on a device-side flag.
-        if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is not None:
+        if self.benchmark_static_routing and self._static_num_permuted_tokens is not None:
             self.num_permuted_tokens = self._static_num_permuted_tokens
         else:
             self.num_permuted_tokens = None
@@ -584,9 +585,15 @@ class _HybridEPManager(_DispatchManager):
         )
 
         self.tokens_per_expert = tokens_per_expert
-        self.num_permuted_tokens = self.tokens_per_expert.sum()
-        if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is None:
-            self._static_num_permuted_tokens = self.num_permuted_tokens
+        if self.benchmark_static_routing:
+            if self._static_num_permuted_tokens is None:
+                # The first blocking dispatch already sized this output exactly.
+                # Its host-known extent avoids a GPU count read in combine backward
+                # and does not add scalar tensor operations inside checkpointing.
+                self._static_num_permuted_tokens = dispatched_hidden.shape[0]
+            self.num_permuted_tokens = self._static_num_permuted_tokens
+        else:
+            self.num_permuted_tokens = self.tokens_per_expert.sum()
 
         return dispatched_hidden
 
