@@ -14,6 +14,8 @@
 
 """Trainable Step-5 decoder layers and context-parallel attention."""
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import replace
 
 import torch
@@ -21,7 +23,9 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
+from torch.utils._python_dispatch import _disable_current_modes
 
+from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 from nemo_automodel.components.models.step5.attention import fused_attention
@@ -29,9 +33,16 @@ from nemo_automodel.components.models.step5.configuration import Step5Config
 from nemo_automodel.components.models.step5.cp import gather_halo, gather_metadata, gather_sequence
 from nemo_automodel.components.models.step5.fa4 import fa4_attention
 from nemo_automodel.components.models.step5.rope import Step5RotaryEmbedding
-from nemo_automodel.components.models.step5.sparse import RegionMetadata, Step5SparseIndexer, region_metadata
+from nemo_automodel.components.models.step5.sparse import (
+    RegionMetadata,
+    RegionSelection,
+    Step5SparseIndexer,
+    region_metadata,
+)
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
+
+region_replay: RecomputeReplay[RegionSelection] = RecomputeReplay("Step5 CSA route")
 
 
 @torch.compile(fullgraph=True)
@@ -119,6 +130,73 @@ class Step5Attention(nn.Module):
         """Attach the CP group through AutoModel's model-owned attention hook."""
         self.cp_group = cp_mesh.get_group() if cp_mesh.size() > 1 else None
 
+    def _select_regions(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        key_positions: torch.Tensor,
+        key_padding: torch.Tensor,
+        *,
+        query_start: int,
+        sparse_metadata: RegionMetadata | None,
+    ) -> RegionSelection:
+        """Select once or replay integer routes during activation recomputation.
+
+        Args:
+            hidden: Local normalized states [batch, local_queries, hidden].
+            positions: Int64 local document positions [batch, local_queries].
+            key_positions: Int64 global document positions [batch, global_keys].
+            key_padding: Boolean global padding flags [batch, global_keys].
+            query_start: Physical start of the local query shard.
+            sparse_metadata: Layer-independent global/local region layout.
+
+        Returns:
+            Integer-only region selection; no projected K/V or activations are
+            retained. The native checkpoint context owns the record lifetime.
+        """
+        replay = region_replay.current()
+        if replay is not None and replay[1] == "replay":
+            cached = replay[0].take()
+            if cached is not None:
+                return cached
+        # The entire no-grad decision is invisible to selective checkpointing,
+        # so its omitted recompute cannot shift MoE's per-op replay indexes.
+        with _disable_current_modes(), torch.no_grad():
+            if sparse_metadata is None:
+                sparse_metadata = region_metadata(
+                    key_positions,
+                    key_padding,
+                    query_start=query_start,
+                    queries=hidden.shape[1],
+                    region_size=self.indexer.config.region_block_size,
+                    topk=self.indexer.config.topk,
+                )
+            index_k, index_z = None, None
+            # This global predicate is identical across all CP ranks. A rank
+            # with only dense-prefix queries still contributes keys when
+            # another rank owns sparse queries.
+            if sparse_metadata.needs_projection:
+                index_k, index_z = self.indexer.project_keys(hidden, positions)
+                index_kz = gather_metadata(torch.stack((index_k, index_z), dim=2), self.cp_group)
+                index_k, index_z = index_kz.unbind(dim=2)
+            else:
+                # Keep FSDP norm hooks symmetric with DP peers that may own
+                # long documents, while avoiding any nonempty projection.
+                self.indexer.project_keys(hidden[:, :0], positions[:, :0])
+            selection = self.indexer(
+                hidden,
+                positions,
+                index_k,
+                index_z,
+                key_positions,
+                key_padding,
+                query_start=query_start,
+                metadata=sparse_metadata,
+            )
+        if replay is not None and replay[1] == "record":
+            replay[0].record(selection)
+        return selection
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -179,38 +257,14 @@ class Step5Attention(nn.Module):
         if self.indexer is not None:
             # Selection is discrete. No language-model-loss gradient crosses top-k;
             # differentiable K/V transport above carries attention gradients.
-            with torch.no_grad():
-                if sparse_metadata is None:
-                    sparse_metadata = region_metadata(
-                        key_positions,
-                        key_padding,
-                        query_start=query_start,
-                        queries=sequence,
-                        region_size=self.indexer.config.region_block_size,
-                        topk=self.indexer.config.topk,
-                    )
-                index_k, index_z = None, None
-                # This global predicate is identical across all CP ranks. A rank
-                # with only dense-prefix queries still contributes keys when
-                # another rank owns sparse queries.
-                if sparse_metadata.needs_projection:
-                    index_k, index_z = self.indexer.project_keys(hidden, positions)
-                    index_kz = gather_metadata(torch.stack((index_k, index_z), dim=2), self.cp_group)
-                    index_k, index_z = index_kz.unbind(dim=2)
-                else:
-                    # Keep FSDP norm hooks symmetric with DP peers that may own
-                    # long documents, while avoiding any nonempty projection.
-                    self.indexer.project_keys(hidden[:, :0], positions[:, :0])
-                selection = self.indexer(
-                    hidden,
-                    positions,
-                    index_k,
-                    index_z,
-                    key_positions,
-                    key_padding,
-                    query_start=query_start,
-                    metadata=sparse_metadata,
-                )
+            selection = self._select_regions(
+                hidden,
+                positions,
+                key_positions,
+                key_padding,
+                query_start=query_start,
+                sparse_metadata=sparse_metadata,
+            )
         if self.backend.attn == "fa4" and hidden.is_cuda:
             attended = fa4_attention(
                 query,
@@ -304,6 +358,23 @@ class Step5DecoderLayer(nn.Module):
             self.moe = None
             self.share_expert = None
             self.mlp = Step5MLP(config, backend, width=config.intermediate_size, limit=limit, dtype=dtype)
+
+    def nemo_checkpoint_context_fn(
+        self,
+        context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Compose the native AC context with one integer-route log per call.
+
+        Args:
+            context_fn: Existing plain/selective checkpoint context factory.
+
+        Returns:
+            A factory with a distinct recorder for each live pipeline microbatch,
+            or the unchanged factory for a layer without CSA.
+        """
+        if self.self_attn.indexer is None:
+            return context_fn
+        return region_replay.checkpoint_context_fn(context_fn)
 
     def forward(
         self,
