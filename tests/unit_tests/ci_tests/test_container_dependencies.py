@@ -47,7 +47,9 @@ def checkout(tmp_path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("dependency input\n")
     (tmp_path / "docker/Dockerfile").write_text("ARG PYTORCH_IMAGE=example/pytorch:base\n")
-    (tmp_path / ".github/container-build-args.env").write_text("BASE_IMAGE=pytorch\nUV_SYNC_ARGS=--locked\n")
+    (tmp_path / ".github/container-build-args.env").write_text("""BASE_IMAGE=pytorch
+UV_SYNC_ARGS=--locked
+""")
     subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
     docker = tmp_path / "bin/docker"
     docker.parent.mkdir()
