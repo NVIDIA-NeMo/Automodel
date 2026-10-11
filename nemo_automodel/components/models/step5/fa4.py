@@ -338,8 +338,10 @@ def fa4_attention(
             value[0, first_key:last_key],
             cu_seqlens_q=window_layout.cu_seqlens_q,
             cu_seqlens_k=window_layout.cu_seqlens_k,
-            max_seqlen_q=window_layout.max_seqlen_q,
-            max_seqlen_k=window_layout.max_seqlen_k,
+            # Scheduling bounds stay on the ordinary shard variant even for
+            # short-document packs; cu_seqlens retains exact window boundaries.
+            max_seqlen_q=queries,
+            max_seqlen_k=max(window_layout.max_seqlen_k, queries),
             softmax_scale=dim**-0.5,
             causal=True,
             window_size=(window - 1, 0),
