@@ -35,7 +35,7 @@
 # attention does not penalize longer rows. The PP bubble at this point is 9.9%
 # (64 microbatches).
 #
-# This shape REQUIRES distributed.pipeline.pp_recv_buffer_pool: without it,
+# This shape relies on automatic 1F1B receive buffer pooling: without it,
 # torch pre-allocates recv buffers for all 64 microbatches x both directions
 # (~52 GiB on middle stages at 2k) and the run OOMs during step 1. The ring
 # pool sizes buffers to the 1F1B in-flight depth instead, saving ~45 GiB.
@@ -122,7 +122,6 @@ distributed:
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    pp_recv_buffer_pool: true   # required for this shape — see header
   moe:
     reshard_after_forward: false
     wrap_outer_model: false

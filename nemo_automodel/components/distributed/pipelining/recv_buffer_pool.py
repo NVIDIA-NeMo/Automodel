@@ -32,8 +32,8 @@ Gradient accumulation on reused leaf buffers is already impossible upstream:
 ``stage_backward()`` harvests input grads and sets ``val.grad = None`` per
 chunk.
 
-Opt-in via :func:`install_recv_buffer_pool` (wired to
-``PipelineConfig.pp_recv_buffer_pool``); it is a no-op that logs a warning
+Enabled by default for 1F1B via :func:`install_recv_buffer_pool` on each
+constructed stage; it is a no-op that logs a warning
 and leaves stock behavior when the torch internals it adapts are not
 recognized. Only schedules with bounded in-flight depth are safe — see
 :func:`schedule_supports_recv_pool`; schedules with unbounded in-flight
@@ -42,14 +42,11 @@ CPU parity harness in the unit tests).
 """
 
 import logging
+import types
+
+from torch.distributed.pipelining.stage import PipelineStage
 
 logger = logging.getLogger(__name__)
-
-_INSTALLED = False
-# Which torch PipelineStage layout the patch bound to ("per-direction-setup" or
-# "prepare-infra"); None until installed. Logged at install time so a run's log
-# states which code path it exercised.
-_INSTALLED_LAYOUT: str | None = None
 
 # Schedules whose in-flight microbatch count per stage is bounded by
 # num_stages - stage_index, making the ring size proof valid. Interleaved /
@@ -82,14 +79,11 @@ def _ring_size(stage, num_microbatches: int, slack: int) -> int:
     return max(2, min(num_microbatches, inflight + slack))
 
 
-def install_recv_buffer_pool(slack: int = 2) -> bool:
-    """Monkeypatch pipeline-stage recv-buffer setup with ring pooling.
-
-    Must run before pipeline schedule/stage infra preparation. Installs
-    process-wide (class-level) and is idempotent; the first call's ``slack``
-    wins.
+def install_recv_buffer_pool(stage: PipelineStage, *, slack: int = 2) -> bool:
+    """Pool recv buffers on one pipeline stage before its first schedule step.
 
     Args:
+        stage: Constructed torch pipeline stage to configure.
         slack: Extra buffer sets beyond the 1F1B in-flight depth, absorbing
             transient recv-ahead (default 2).
 
@@ -101,10 +95,9 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         ValueError: if ``slack`` is negative (a ring smaller than the 1F1B
             in-flight depth would silently corrupt gradients).
     """
-    global _INSTALLED, _INSTALLED_LAYOUT
     if slack < 0:
         raise ValueError(f"recv_buffer_pool: slack must be >= 0, got {slack}")
-    if _INSTALLED:
+    if getattr(stage, "_recv_buffer_pool_installed", False):
         return True
 
     try:
@@ -142,7 +135,11 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
             num_microbatches,
         )
 
-    if hasattr(manual_cls, "_setup_forward_recv_info"):
+    if not isinstance(stage, manual_cls):
+        logger.warning("recv_buffer_pool: unsupported stage type %s", type(stage).__name__)
+        return False
+
+    if hasattr(manual_cls, "_setup_forward_recv_info") and hasattr(base_cls, "_setup_backward_recv_info"):
         # Layout "per-direction-setup" (torch release/2.12 and later): the
         # manual PipelineStage allocates in _setup_forward_recv_info(
         # num_microbatches, has_backward) and the base class in
@@ -159,7 +156,7 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
             _alias_fwd_ring(self, k, num_microbatches)
 
         def pooled_setup_backward_recv_info(self, num_microbatches):
-            if not isinstance(self, manual_cls) or self.is_last:
+            if self.is_last:
                 return orig_bwd(self, num_microbatches)
             k = _ring_size(self, num_microbatches, slack)
             if k >= num_microbatches:
@@ -167,9 +164,9 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
             orig_bwd(self, k)
             _alias_bwd_ring(self, k, num_microbatches)
 
-        manual_cls._setup_forward_recv_info = pooled_setup_forward_recv_info
-        base_cls._setup_backward_recv_info = pooled_setup_backward_recv_info
-    elif hasattr(manual_cls, "_prepare_forward_infra"):
+        stage._setup_forward_recv_info = types.MethodType(pooled_setup_forward_recv_info, stage)
+        stage._setup_backward_recv_info = types.MethodType(pooled_setup_backward_recv_info, stage)
+    elif hasattr(manual_cls, "_prepare_forward_infra") and hasattr(base_cls, "_prepare_backward_infra"):
         # Layout "prepare-infra" (torch <= 2.11 and the pre-refactor 2.12
         # nightlies, e.g. the NGC 26.06 container): allocation inside
         # _prepare_forward_infra(num_microbatches, args, kwargs) and the base
@@ -187,7 +184,7 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
             return outputs
 
         def pooled_prepare_backward_infra(self, num_microbatches):
-            if not isinstance(self, manual_cls) or self.is_last:
+            if self.is_last:
                 return orig_bwd(self, num_microbatches)
             k = _ring_size(self, num_microbatches, slack)
             if k >= num_microbatches:
@@ -196,13 +193,12 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
             _alias_bwd_ring(self, k, num_microbatches)
             return result
 
-        manual_cls._prepare_forward_infra = pooled_prepare_forward_infra
-        base_cls._prepare_backward_infra = pooled_prepare_backward_infra
+        stage._prepare_forward_infra = types.MethodType(pooled_prepare_forward_infra, stage)
+        stage._prepare_backward_infra = types.MethodType(pooled_prepare_backward_infra, stage)
     else:
         logger.warning("recv_buffer_pool: no known recv-infra entry points on PipelineStage; not installing")
         return False
-    _INSTALLED = True
-    _INSTALLED_LAYOUT = layout
+    stage._recv_buffer_pool_installed = True
     if _is_rank_zero():
         logger.info("recv_buffer_pool: installed (slack=%d, layout=%s)", slack, layout)
     return True
