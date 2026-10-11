@@ -109,3 +109,71 @@ def test_cuda_indexer_scores_and_region_bitmap() -> None:
     unpacked = ((bitmap[..., regions // 32] >> (regions % 32)) & 1).bool()
     oracle = (ids[..., None] == regions).any(-2)
     torch.testing.assert_close(unpacked, oracle, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("region_count,expected_bitmap", [(16386, True), (16539, False), (33025, False)])
+def test_fa4_membership_crossover_preserves_native_192_outputs_and_gradients(
+    monkeypatch: pytest.MonkeyPatch, region_count: int, expected_bitmap: bool
+) -> None:
+    """Check exact-route attention across the packed-region bitmap crossover."""
+    from nemo_automodel.components.models.step5 import fa4
+
+    torch.manual_seed(419)
+    keys, queries, heads, dim = region_count * 8, 4, 16, 192
+    start = keys - queries
+    q = torch.zeros(1, queries, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.zeros(1, keys, 1, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    positions = torch.arange(keys, device="cuda")[None]
+    documents = torch.ones_like(positions)
+    routes = (
+        torch.cat(
+            (
+                torch.arange(512, device="cuda", dtype=torch.int32),
+                torch.tensor([region_count - 1], device="cuda", dtype=torch.int32),
+            )
+        )[None, None, None]
+        .expand(1, 1, queries, -1)
+        .contiguous()
+    )
+    selection = RegionSelection(routes, positions // 8, documents[:, start:], documents, region_count)
+    calls = []
+    original = fa4._load_fa4
+
+    def load(window, bitmap, slots, provider_groups):
+        calls.append(bitmap)
+        return original(window, bitmap, slots, provider_groups)
+
+    monkeypatch.setattr(fa4, "_load_fa4", load)
+    output = fa4.fa4_attention(
+        q,
+        k,
+        v,
+        positions[:, start:],
+        positions,
+        torch.zeros_like(positions, dtype=torch.bool),
+        documents,
+        query_start=start,
+        window=None,
+        selection=selection,
+    )
+    assert calls == [expected_bitmap]
+    # Every QK score is zero. The independent answer is the mean of precisely
+    # the selected historical tokens plus the causal prefix of the last region.
+    key_ids = torch.cat((torch.arange(4096, device="cuda"), torch.arange(keys - 8, keys, device="cuda")))
+    ref_q = q.detach().float().requires_grad_()
+    ref_k = k.detach().float().requires_grad_()
+    ref_v = v.detach().float().requires_grad_()
+    selected_k = ref_k[0, key_ids, 0]
+    selected_v = ref_v[0, key_ids, 0]
+    scores = torch.einsum("qhd,kd->hqk", ref_q[0], selected_k) * dim**-0.5
+    allowed = key_ids[None] <= positions[0, start:, None]
+    probabilities = scores.masked_fill(~allowed[None], -torch.inf).softmax(-1)
+    expected = torch.einsum("hqk,kd->qhd", probabilities, selected_v)[None]
+    gradient = torch.randn_like(output)
+    output.backward(gradient)
+    expected.backward(gradient.float())
+    torch.testing.assert_close(output.float(), expected, atol=3e-4, rtol=5e-3)
+    for actual, reference in ((q.grad, ref_q.grad), (k.grad, ref_k.grad), (v.grad, ref_v.grad)):
+        torch.testing.assert_close(actual.float(), reference, atol=5e-5, rtol=2e-2)

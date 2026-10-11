@@ -198,7 +198,14 @@ def _compact_selected_tiles(present: torch.Tensor) -> tuple[torch.Tensor, torch.
     indices = torch.where(present, columns, present.shape[-1]).sort(-1).values
     # Provider groups become independent attention batches, so block metadata is
     # shared across that group's query heads without copying it for every head.
-    return counts.flatten(0, 1).unsqueeze(1).contiguous(), indices.flatten(0, 1).unsqueeze(1).contiguous()
+    counts = counts.flatten(0, 1).unsqueeze(1).contiguous()
+    indices = indices.flatten(0, 1).unsqueeze(1).contiguous()
+    if indices.shape[-1] == 1:
+        # A contiguous singleton axis may retain its pre-sort stride. CuTe
+        # requires the explicitly selected last axis to have unit stride.
+        # Changing a size-one axis stride preserves every storage address.
+        indices = indices.as_strided(indices.shape, (*indices.stride()[:-1], 1))
+    return counts, indices
 
 
 def _selected_block_lists(
