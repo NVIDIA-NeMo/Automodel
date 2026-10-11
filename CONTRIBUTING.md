@@ -202,7 +202,9 @@ errors, and hard timeouts are never retried. A warning records every confirmatio
 Keep model shapes small and avoid downloads or unnecessary compilation. Tests
 that consistently need more than 30 seconds should be optimized or moved to
 functional tests. An exact `@pytest.mark.runtime_budget(...)` may tighten the
-limit, but cannot raise it for a new or modified test. Existing larger allowances
+limit, but cannot raise it for a new or modified test. A changed test with a
+marker above 30 seconds stops collection with a usage error; update its marker
+and optimize the test, or move it to functional coverage. Existing larger allowances
 retain their hard watchdog on unrelated changes; they do not impose a runtime
 gate on those changes. The default hard watchdog remains 70 seconds.
 

@@ -318,12 +318,15 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     reports = runtestprotocol(item, log=False, nextitem=nextitem)
     elapsed = sum(report.duration for report in reports)
     if len(reports) == 3 and all(report.passed for report in reports) and elapsed > budget:
-        warnings.warn(
-            pytest.PytestWarning(
-                f"{item.nodeid} took {elapsed:.2f}s, exceeding its {budget:g}s runtime budget; confirming once."
-            ),
-            stacklevel=2,
-        )
+        # This protocol diagnostic must not abort the session under -W error.
+        with warnings.catch_warnings():
+            warnings.simplefilter("always", pytest.PytestWarning)
+            warnings.warn(
+                pytest.PytestWarning(
+                    f"{item.nodeid} took {elapsed:.2f}s, exceeding its {budget:g}s runtime budget; confirming once."
+                ),
+                stacklevel=2,
+            )
         # pytest-timeout wraps the protocol, not runtestprotocol(). Give the
         # confirmation a fresh watchdog rather than charging both attempts to
         # the first timer. Function-only watchdogs reset in pytest_runtest_call.

@@ -191,7 +191,10 @@ attempts.write_text(str(count))
 """
 
 
-def test_transient_overrun_passes_after_one_confirmation(pytester: pytest.Pytester) -> None:
+@pytest.mark.parametrize("warning_args", [(), ("-W", "error")])
+def test_transient_overrun_passes_after_one_confirmation(
+    pytester: pytest.Pytester, warning_args: tuple[str, ...]
+) -> None:
     # Leave room for pytest/coverage fixture overhead in the fast attempt.
     result, _ = _run_sleeper(
         pytester,
@@ -200,6 +203,7 @@ def test_transient_overrun_passes_after_one_confirmation(pytester: pytest.Pytest
         "--junitxml=results.xml",
         "--unit-test-runtime-budget=0.5",
         "--unit-test-hard-timeout=2",
+        *warning_args,
         body=_COUNT_ATTEMPTS + "time.sleep(1 if count == 1 else 0)",
     )
     result.assert_outcomes(passed=1)
