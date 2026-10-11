@@ -45,7 +45,7 @@ fi
 if [[ "$CPU" == "false" ]]; then
     export CUDA_VISIBLE_DEVICES="0,1"
 else
-    export ADDITIONAL_ARGS="--cpu --with_downloads"
+    export ADDITIONAL_ARGS="--cpu"
 fi
 
 if [[ "$UNIT_TEST" == "true" ]]; then
