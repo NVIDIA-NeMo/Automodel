@@ -31,7 +31,9 @@ pytest_plugins = ["pytester"]
 pytestmark = pytest.mark.timeout(70)
 
 _CONFTEST_SOURCE = Path(__file__).with_name("conftest.py").read_text()
-_POLICY_ARGS = ("--unit-test-runtime-budget=0.05", "--unit-test-hard-timeout=0.5")
+# The short soft budget exercises confirmation without making traceback
+# formatting race a subsecond hard watchdog on loaded CI workers.
+_POLICY_ARGS = ("--unit-test-runtime-budget=0.05", "--unit-test-hard-timeout=10")
 _TEST_MODULE = """
 import time
 from pathlib import Path
@@ -223,14 +225,21 @@ def test_persistent_overrun_fails_after_exactly_two_attempts(pytester: pytest.Py
 
 
 def test_hard_timeout_is_not_retried(pytester: pytest.Pytester) -> None:
-    result, _ = _run_sleeper(pytester, 0, run_in_subprocess=True, body=_COUNT_ATTEMPTS + "time.sleep(2)")
+    result, _ = _run_sleeper(
+        pytester,
+        0,
+        "--unit-test-hard-timeout=0.5",
+        run_in_subprocess=True,
+        body=_COUNT_ATTEMPTS + "time.sleep(2)",
+    )
     result.assert_outcomes(failed=1)
     assert (pytester.path / "attempts").read_text() == "1"
     result.stdout.fnmatch_lines(["*Timeout (>0.5s) from pytest-timeout*"])
 
 
 def test_confirmation_has_its_own_hard_watchdog(pytester: pytest.Pytester) -> None:
-    result, _ = _run_sleeper(pytester, 0.3, run_in_subprocess=True)
+    # Each attempt fits its watchdog, but their combined duration does not.
+    result, _ = _run_sleeper(pytester, 1.2, "--unit-test-hard-timeout=2", run_in_subprocess=True)
     result.assert_outcomes(failed=1)
     result.stdout.fnmatch_lines(["*exceeded its 0.05s runtime budget in both attempts*"])
     assert "Timeout (" not in result.stdout.str()
