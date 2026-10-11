@@ -4,11 +4,11 @@ description: "Fine-tune moonshotai/Kimi-K3 for text generation with NeMo AutoMod
 slug: model-coverage/large-language-models/moonshotai/Kimi-K3
 ---
 
-[Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) is Moonshot AI's 2.8T-parameter, 104B-active Mixture-of-Experts model. NeMo AutoModel provides a native implementation of the text model and loads its public checkpoint without `trust_remote_code`.
+[Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) is Moonshot AI's 2.8T-parameter, 104B-active Mixture-of-Experts (MoE) model. NeMo AutoModel provides a native implementation of the text model and loads its public checkpoint without `trust_remote_code`.
 
 ## Quick Start
 
-Fine-tune on HellaSwag using the recipe's 64-node NVIDIA GB200 setup with four GPUs per node. Complete the prerequisites in [Model Context](#model-context), then run this command from the repository root on every node:
+Fine-tune on HellaSwag using the recipe's 64-node NVIDIA GB200 setup with 4 GPUs per node. Complete the prerequisites in [Model Context](#model-context), then run this command from the repository root on every node:
 
 ```bash
 uv run torchrun --nnodes 64 --nproc-per-node 4 \
@@ -24,7 +24,7 @@ uv run torchrun --nnodes 64 --nproc-per-node 4 \
 
 ## Model Context
 
-The recipe fine-tunes Kimi-K3's text decoder for text generation. Its mixture-of-experts (MoE) architecture combines Kimi Delta Attention with Gated Multi-head Latent Attention.
+The recipe fine-tunes Kimi-K3's text decoder for text generation. Its MoE architecture combines Kimi Delta Attention with Gated Multi-head Latent Attention.
 
 | Property | Value |
 |---|---|

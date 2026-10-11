@@ -1,6 +1,6 @@
 ---
 title: "zai-org/GLM-5"
-description: "Fine-tune zai-org/GLM-5 through GLM-5.3 mixture-of-experts checkpoints with NeMo AutoModel using checked-in MLA and DSA recipes."
+description: "Fine-tune zai-org/GLM-5 through GLM-5.3 Mixture-of-Experts checkpoints with NeMo AutoModel using checked-in MLA and DSA recipes."
 slug: model-coverage/large-language-models/thudm/GLM-5
 ---
 
@@ -75,7 +75,7 @@ GLM-5 family models in NeMo AutoModel support:
 
 ### Validated GLM-5.3 Configuration
 
-| Area | Validated configuration |
+| Area | Validated Configuration |
 |---|---|
 | Training | Full-parameter supervised fine-tuning (SFT) with FSDP2 and activation checkpointing |
 | Distributed setup | EP64 / CP1 with HybridEP dispatch and expert `reshard_after_forward: true` |
@@ -126,8 +126,8 @@ Throughput statistics exclude the first 10 warmup steps.
 |---|---:|
 | Step 0 loss | 1.33347 |
 | Step 99 loss | 0.53756 |
-| Mean loss, steps 10-99 | 0.55548 |
-| Mean throughput, steps 10-99 | 41,664 tokens/s |
+| Mean loss, steps 10 to 99 | 0.55548 |
+| Mean throughput, steps 10 to 99 | 41,664 tokens/s |
 
 The run completed without non-finite metrics or critical rank errors.
 
@@ -194,7 +194,7 @@ The GLM-5.3 command enables Weights & Biases logging. Authenticate and set the r
 
 ### Workflow Notes
 
-Fine-tune zai-org/GLM-5: [glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml). 32 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+Fine-tune zai-org/GLM-5: [glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml). Use 32 nodes with 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 
@@ -220,5 +220,4 @@ Fine-tune zai-org/GLM-5: [glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeM
 - [zai-org/GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)
 - [GLM-5 technical report](https://arxiv.org/abs/2602.15763)
 - [FlashMLA](https://github.com/deepseek-ai/FlashMLA)
-
 - [Checkpoint Configuration](https://huggingface.co/zai-org/GLM-5/blob/c183ef8c61faee82855eca1ed9bb3a9a7ce3b0b2/config.json)

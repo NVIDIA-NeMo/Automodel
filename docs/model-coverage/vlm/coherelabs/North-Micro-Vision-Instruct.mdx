@@ -1,14 +1,14 @@
 ---
 title: "CohereLabs/North-Micro-Vision-Instruct"
-description: "Fine-tune CohereLabs/North-Micro-Vision-Instruct for image-text tasks with NeMo AutoModel using the checked-in two-GPU LoRA recipe."
+description: "Fine-tune CohereLabs/North-Micro-Vision-Instruct for image-text tasks with NeMo AutoModel using the checked-in 2-GPU LoRA recipe."
 slug: model-coverage/vision-language-models/coherelabs/North-Micro-Vision-Instruct
 ---
 
-[North Micro Vision](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct) is Cohere Labs' 2.4B-parameter vision language model with native-resolution image support. NeMo AutoModel provides low-rank adaptation (LoRA) fine-tuning recipes through `NeMoAutoModelForImageTextToText`.
+[North Micro Vision](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct) is Cohere Labs' 2.4B-parameter vision-language model with native-resolution image support. NeMo AutoModel provides low-rank adaptation (LoRA) fine-tuning recipes through `NeMoAutoModelForImageTextToText`.
 
 ## Quick Start
 
-Complete the [installation](/get-started/installation) and [model setup](#setup-and-additional-examples). From the repository root, run LoRA fine-tuning on RDR Items using two GPUs:
+Complete the [installation](/get-started/installation) and [model setup](#setup-and-additional-examples). From the repository root, run LoRA fine-tuning on RDR Items using 2 GPUs:
 
 ```bash
 uv run --with transformers==5.16.0 automodel --nproc-per-node=2 examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml
@@ -18,10 +18,10 @@ uv run --with transformers==5.16.0 automodel --nproc-per-node=2 examples/vlm_fin
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Fine-Tuning | RDR Items; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml) |
-| LoRA Fine-Tuning | Shopify product catalogue; 1 node; full training split | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_full.yaml) |
-| LoRA Fine-Tuning | Shopify product catalogue; 1 node; 2,000 training samples | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_lora.yaml) |
-| Resume LoRA Fine-Tuning | Shopify product catalogue; 1 node; 2,000 samples; existing checkpoint | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_resume.yaml) |
+| LoRA Fine-Tuning | RDR Items; one node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml) |
+| LoRA Fine-Tuning | Shopify product catalogue; one node; full training split | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_full.yaml) |
+| LoRA Fine-Tuning | Shopify product catalogue; one node; 2,000 training samples | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_lora.yaml) |
+| Resume LoRA Fine-Tuning | Shopify product catalogue; one node; 2,000 samples; existing checkpoint | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_resume.yaml) |
 
 ## Model Context
 
@@ -51,11 +51,12 @@ North-Micro-Vision-Instruct is used for image-text-to-text (native resolution). 
 
 <Warning>
 The [pinned upstream model card](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct/blob/fa548d9aa62c1220bfd21fc6cfc465f1bd2a1a40/README.md) requires Transformers 5.16.0, which includes `CohereCompass` support. This repository pins Transformers 5.15.1. The Quick Start uses [`uv run --with`](https://docs.astral.sh/uv/concepts/projects/run/#requesting-additional-dependencies) to select 5.16.0 for that invocation; use the same override when launching the other recipes.
+
 </Warning>
 
 Use a CUDA development image with a C compiler for the recipe's Triton LoRA kernels (`use_triton: true`). The RDR recipe loads pretrained weights from Hugging Face and saves checkpoints under `checkpoints_rdr/`, relative to the working directory.
 
-The RDR recipe is 18 optimizer steps and exists to prove the pipeline. A full epoch of the Shopify recipe is 2,415 steps, completes in about an hour on two RTX PRO 6000 GPUs, and takes validation loss from 0.90 to 0.43.
+The RDR recipe is 18 optimizer steps and exists to prove the pipeline. A full epoch of the Shopify recipe is 2,415 steps, completes in about an hour on 2 RTX PRO 6000 GPUs, and takes validation loss from 0.90 to 0.43.
 
 The listed recipes explicitly select `default_collate_fn`. Leave `max_length` unset for dynamic padding because visual token counts vary with image dimensions. Setting `max_length` enables fixed-length padding and truncation; also setting `drop_overlong: true` filters samples estimated to exceed the cap before processing.
 
@@ -65,7 +66,7 @@ Read [north_micro_vision_rdr.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob
 
 ### Workflow Notes
 
-Fine-tune CohereLabs/North-Micro-Vision-Instruct: [north_micro_vision_rdr.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml). 1 node, 2 GPUs per node; see [Recipe Setup](#recipe-setup).
+Fine-tune CohereLabs/North-Micro-Vision-Instruct: [north_micro_vision_rdr.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml). Use one node with 2 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 Before using the resume recipe, run `north_micro_vision_shopify_lora.yaml` and set `checkpoint.restore_from` to a checkpoint it produced.
 

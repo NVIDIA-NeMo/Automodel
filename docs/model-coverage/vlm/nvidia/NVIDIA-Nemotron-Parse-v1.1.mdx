@@ -24,7 +24,7 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/nemotron/nemotron_pars
 
 ## Model Context
 
-The example uses eight GPUs with fully sharded data parallelism (FSDP2). It fine-tunes the language model on CORD-v2 while keeping the vision encoder frozen, and saves checkpoints to `vlm_checkpoints/`.
+The example uses 8 GPUs with fully sharded data parallelism (FSDP2). It fine-tunes the language model on CORD-v2 while keeping the vision encoder frozen, and saves checkpoints to `vlm_checkpoints/`.
 
 | Property | Value |
 | --- | --- |
@@ -53,5 +53,4 @@ See also the [tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/m
 ## Related Resources
 
 - [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
-
 - [Checkpoint Configuration](https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-v1.1/blob/fd1e3c6ba0b61a6dcab5a905f0ff92c5b19f14a4/config.json)

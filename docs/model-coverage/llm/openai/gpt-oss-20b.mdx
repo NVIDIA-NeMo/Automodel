@@ -12,7 +12,8 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-This example uses eight GPUs. From the repository root, run:
+This example uses 8 GPUs. From the repository root, run:
+
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml
@@ -22,7 +23,7 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.ya
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Full Fine-Tuning | HellaSwag; eight-way expert parallelism (EP8) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml) |
+| Full Fine-Tuning | HellaSwag; 8-way expert parallelism (EP8) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml) |
 | LoRA Fine-Tuning | HellaSwag; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_peft.yaml) |
 | Full Fine-Tuning (Packed Sequences) | HellaSwag; EP8; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml) |
 | LoRA Fine-Tuning | HellaSwag; DGX Spark | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_single_gpu_peft.yaml) |
@@ -55,5 +56,4 @@ The recipes load pretrained `openai/gpt-oss-20b` weights and train on HellaSwag.
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
-
 - [Checkpoint Configuration](https://huggingface.co/openai/gpt-oss-20b/blob/6cee5e81ee83917806bbde320786a8fb61efebee/config.json)
