@@ -57,11 +57,13 @@ class _IterationMetrics:
 
 @dataclass(frozen=True)
 class _CudaMemoryPeak:
-    """One rank's allocator high-water marks, in bytes."""
+    """One rank's allocator peaks in bytes and process-lifetime pressure counters."""
 
     rank: int
     max_allocated_bytes: int
     max_reserved_bytes: int
+    num_alloc_retries: int
+    num_ooms: int
 
 
 def _infer_vocab_size(model_cfg):
@@ -752,16 +754,23 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
     def _collect_cuda_memory_peaks(self) -> list[_CudaMemoryPeak]:
         """Collect allocator peaks after timing, before allocating collective buffers.
 
-        Parent setup resets these counters before constructing the model. They
-        include setup, warmup and measured iterations, with no benchmark reset.
+        Parent setup resets the peak statistics before constructing the model.
+        Peaks include setup, warmup and measured iterations, with no benchmark reset.
         CUDA allocations outside the PyTorch allocator are not represented.
+        Retry/OOM counters cover the process lifetime; resetting peak memory
+        statistics does not reset these accumulated counters.
         """
         allocated = torch.cuda.max_memory_allocated(self.dist_env.device)
         reserved = torch.cuda.max_memory_reserved(self.dist_env.device)
-        local = torch.tensor([allocated, reserved], dtype=torch.int64, device=self.dist_env.device)
-        gathered = torch.empty(2 * self.dist_env.world_size, dtype=torch.int64, device=self.dist_env.device)
+        stats = torch.cuda.memory_stats(self.dist_env.device)
+        local = torch.tensor(
+            [allocated, reserved, stats["num_alloc_retries"], stats["num_ooms"]],
+            dtype=torch.int64,
+            device=self.dist_env.device,
+        )
+        gathered = torch.empty(4 * self.dist_env.world_size, dtype=torch.int64, device=self.dist_env.device)
         torch.distributed.all_gather_into_tensor(gathered, local)
-        return [_CudaMemoryPeak(rank, *peaks) for rank, peaks in enumerate(gathered.view(-1, 2).cpu().tolist())]
+        return [_CudaMemoryPeak(rank, *peaks) for rank, peaks in enumerate(gathered.view(-1, 4).cpu().tolist())]
 
     def _log_benchmark_summary(self, steps, warmup_steps, peak_tflops, rank):
         memory_peaks = self._collect_cuda_memory_peaks()
@@ -836,6 +845,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "iterations": [asdict(item) for item in self._bench_iterations],
                 "cuda_memory_peak_scope": "setup_warmup_and_measured_iterations_before_summary_collectives",
                 "cuda_memory_peaks": [asdict(item) for item in memory_peaks],
+                "cuda_allocator_counter_scope": "process_lifetime_before_summary_collectives",
                 "cuda_max_allocated_bytes": max(item.max_allocated_bytes for item in memory_peaks),
                 "cuda_max_reserved_bytes": max(item.max_reserved_bytes for item in memory_peaks),
                 "peak_tflops": peak_tflops,

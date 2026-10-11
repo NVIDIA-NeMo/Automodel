@@ -141,7 +141,7 @@ def mock_recipe(mock_config, monkeypatch):
             recipe,
             "_collect_cuda_memory_peaks",
             lambda: [
-                _CudaMemoryPeak(rank, (rank + 1) * 1024, (rank + 1) * 2048)
+                _CudaMemoryPeak(rank, (rank + 1) * 1024, (rank + 1) * 2048, rank, 0)
                 for rank in range(recipe.dist_env.world_size)
             ],
         )
@@ -832,7 +832,10 @@ class TestBenchmarkingRecipeJSONOutput:
             "rank": 7,
             "max_allocated_bytes": 8192,
             "max_reserved_bytes": 16384,
+            "num_alloc_retries": 7,
+            "num_ooms": 0,
         }
+        assert summary_data["cuda_allocator_counter_scope"] == "process_lifetime_before_summary_collectives"
         assert summary_data["cuda_max_allocated_bytes"] == 8192
         assert summary_data["cuda_max_reserved_bytes"] == 16384
 
@@ -1582,22 +1585,27 @@ def _benchmark_memory_peak_worker(rank: int, rendezvous: str, world_size: int) -
     recipe = object.__new__(BenchmarkingRecipeForNextTokenPrediction)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=world_size)
     peaks = [1024 * (rank + 1), 4096 * (rank + 1)]
+    counters = {"num_alloc_retries": rank + 3, "num_ooms": rank}
     tensor_factory = torch.tensor
 
     def allocate_collective_buffer(data: list[int], *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         # The reporting buffers must not increase the snapshot being reported.
         peaks[:] = [10**9, 2 * 10**9]
+        counters.update(num_alloc_retries=10**9, num_ooms=10**9)
         return tensor_factory(data, dtype=dtype, device=device)
 
     try:
         with (
             patch.object(torch.cuda, "max_memory_allocated", side_effect=lambda device: peaks[0]),
             patch.object(torch.cuda, "max_memory_reserved", side_effect=lambda device: peaks[1]),
+            patch.object(torch.cuda, "memory_stats", side_effect=lambda device: counters.copy()),
             patch.object(torch.cuda, "reset_peak_memory_stats", side_effect=AssertionError("must not reset peaks")),
             patch.object(torch, "tensor", side_effect=allocate_collective_buffer),
         ):
             result = recipe._collect_cuda_memory_peaks()
-        assert result == [_CudaMemoryPeak(peer, 1024 * (peer + 1), 4096 * (peer + 1)) for peer in range(world_size)]
+        assert result == [
+            _CudaMemoryPeak(peer, 1024 * (peer + 1), 4096 * (peer + 1), peer + 3, peer) for peer in range(world_size)
+        ]
     finally:
         torch.distributed.destroy_process_group()
 
