@@ -69,7 +69,7 @@ def test_mixed_rotary_shapes_share_bounded_compile_entries(
     """
     from nemo_automodel.components.models.step5 import rope as implementation
 
-    counts = {"full": 0, "partial": 0}
+    counts = {"full": 0, "partial": 0, "single_head": 0}
 
     def full_backend(graph: torch.fx.GraphModule, inputs: list[torch.Tensor | torch.SymInt]) -> Callable:
         counts["full"] += 1
@@ -79,7 +79,11 @@ def test_mixed_rotary_shapes_share_bounded_compile_entries(
         counts["partial"] += 1
         return graph.forward
 
-    for name, backend in [("full", full_backend), ("partial", partial_backend)]:
+    def single_head_backend(graph: torch.fx.GraphModule, inputs: list[torch.Tensor | torch.SymInt]) -> Callable:
+        counts["single_head"] += 1
+        return graph.forward
+
+    for name, backend in [("full", full_backend), ("partial", partial_backend), ("single_head", single_head_backend)]:
         attribute = f"_apply_{name}_rotary_compiled"
         original = getattr(implementation, attribute)._torchdynamo_orig_callable
         monkeypatch.setattr(
@@ -104,4 +108,5 @@ def test_mixed_rotary_shapes_share_bounded_compile_entries(
                     assert output is hidden
     assert 0 < counts["full"] <= 8
     assert 0 < counts["partial"] <= 8
+    assert 0 < counts["single_head"] <= 8
     record_property("compile_entries", json.dumps(counts))

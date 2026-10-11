@@ -47,13 +47,27 @@ def _apply_partial_rotary_compiled(x: torch.Tensor, cos: torch.Tensor, sin: torc
     return _apply_rotary(x, cos, sin, span)
 
 
+@torch.compile(
+    fullgraph=True,
+    dynamic=True,
+    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+)
+def _apply_single_head_rotary_compiled(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, span: int
+) -> torch.Tensor:
+    return _apply_rotary(x, cos, sin, span)
+
+
 def _apply_rotary_compiled(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, span: int) -> torch.Tensor:
-    # Full and partial rotation have different slice guards. Separate entries
-    # keep mixed Q/K, indexer, and grad/no_grad shapes below Dynamo's cache cap.
+    # Full/partial slices and singleton-head broadcasting have different
+    # shape guards. Separate entries keep mixed main/indexer Q/K, singleton
+    # token, and grad/no_grad shapes below Dynamo's specialization cache cap.
     if x.numel() == 0:
         return x
     if span == x.shape[-1]:
         return _apply_full_rotary_compiled(x, cos, sin)
+    if x.shape[-2] == 1:
+        return _apply_single_head_rotary_compiled(x, cos, sin, span)
     return _apply_partial_rotary_compiled(x, cos, sin, span)
 
 
