@@ -531,6 +531,9 @@ class Step5SparseIndexer(nn.Module):
         self.register_buffer("ssmax_s", torch.zeros(config.num_attention_heads, dtype=torch.float32))
         span = self.config.sparse_indexer_rope_dim if self.config.sparse_indexer_use_rope else 0
         self.rotary_emb = Step5RotaryEmbedding(config, layer_idx, span=span)
+        # The selector only emits discrete region IDs. Exclude it from the
+        # optimizer even when distributed gradient buckets materialize zeros.
+        self.requires_grad_(False)
 
     def project_keys(self, hidden: torch.Tensor, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute normalized index keys and per-dimension compression logits.
@@ -686,3 +689,18 @@ class Step5SparseIndexer(nn.Module):
             indexed_layout=metadata.indexed_layout,
             causal_row_layouts=metadata.causal_row_layouts,
         )
+
+
+def freeze_step5_indexer_params(model: nn.Module) -> None:
+    """Preserve the discrete selector's frozen state after model surgery.
+
+    PEFT injection and user trainability policies may introduce or re-enable
+    parameters below an indexer. Its projections still execute without a
+    differentiable loss, so those parameters must remain outside the optimizer.
+
+    Args:
+        model: Model or pipeline part whose current parameters are being bound.
+    """
+    for module in model.modules():
+        if isinstance(module, Step5SparseIndexer):
+            module.requires_grad_(False)

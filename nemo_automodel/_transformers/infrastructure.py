@@ -66,6 +66,7 @@ from nemo_automodel.components.distributed.pipelining.config import PipelineConf
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
+from nemo_automodel.components.models.step5.sparse import freeze_step5_indexer_params
 from nemo_automodel.components.moe.quantized_experts import apply_mxfp4_to_moe_experts
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
@@ -476,6 +477,7 @@ def _apply_trainability_policy(
     freeze_unused_kv_sharing_params(model)
     freeze_deepseek_v4_indexer_params(model)
     freeze_minimax_m3_indexer_params(model)
+    freeze_step5_indexer_params(model)
 
 
 def _get_strategy_config(model_wrapper) -> DistributedStrategyConfig | None:
