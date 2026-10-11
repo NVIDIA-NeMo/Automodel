@@ -980,6 +980,7 @@ class TestFromConfigLoadBaseModelKwarg:
         _, build_kwargs = mock_build.call_args
         assert build_kwargs["load_base_model"] is False
 
+    @pytest.mark.usefixtures("mock_hub_revision")
     def test_from_config_forwards_load_base_model_true(self):
         """from_config should forward load_base_model=True when provided as kwarg."""
         from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass

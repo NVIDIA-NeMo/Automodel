@@ -90,8 +90,9 @@ class TestModelsAlias:
     ``nemo_automodel.components.models``."""
 
     def test_alias_package_is_same_object(self):
-        import nemo_automodel.components.models as real
         import nemo_automodel.models as alias
+
+        import nemo_automodel.components.models as real
 
         assert alias is real
 
@@ -140,6 +141,7 @@ _HF_UNRECOGNIZED_ERROR = ValueError(
 )
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestGetHfConfigUnrecognizedModelType:
     """get_hf_config should wrap HF's ValueError with upgrade instructions."""
 
@@ -398,6 +400,7 @@ class TestCheckpointDtypeRestoration:
         assert model.embed_tokens.weight.dtype == torch.bfloat16
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestFromConfigUnrecognizedModelType:
     """from_config(string_config) should surface the same helpful message."""
 

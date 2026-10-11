@@ -42,6 +42,7 @@ from nemo_automodel.components.models.qwen3_5.model import (
     Qwen3_5DenseTextBackbone,
 )
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
+    CPAwareGatedDeltaNet,
     SSMGate,
     _resolve_ssm_dtype,
     _SSMGateParam,
@@ -301,6 +302,45 @@ class TestDenseTextBackbone:
         out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=device))
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
 
+    def test_linear_attention_torch_convolution_fallback_forward_backward(self):
+        """HF's convolution fallback matches the local grouped-convolution path."""
+        import copy
+        import inspect
+
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_modeling
+
+        torch.manual_seed(42)
+        cfg = _tiny_config(
+            layer_types=("linear_attention",),
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        actual = CPAwareGatedDeltaNet(cfg, layer_idx=0).float()
+        with torch.no_grad():
+            actual._fp32_params.A_log.zero_()
+            actual._fp32_params.dt_bias.zero_()
+        # Exercise the CPU references even when optional CUDA kernels are installed.
+        actual.causal_conv1d_fn = inspect.unwrap(hf_modeling.causal_conv1d_fn)
+        actual.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
+        reference = copy.deepcopy(actual)
+        reference.causal_conv1d_fn = None
+        hidden = torch.randn(2, 7, cfg.hidden_size, requires_grad=True)
+        reference_hidden = hidden.detach().clone().requires_grad_()
+
+        actual_output = actual(hidden)
+        reference_output = reference(reference_hidden)
+        torch.testing.assert_close(actual_output, reference_output, rtol=1e-5, atol=1e-6)
+        gradient = torch.randn_like(actual_output)
+        actual_output.backward(gradient)
+        reference_output.backward(gradient)
+        torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=1e-5, atol=1e-6)
+        for name, parameter in actual.named_parameters():
+            expected = reference.get_parameter(name).grad
+            assert parameter.grad is not None and expected is not None, name
+            torch.testing.assert_close(parameter.grad, expected, rtol=1e-5, atol=1e-6)
+
     def test_forward_accepts_inputs_embeds(self):
         cfg = _tiny_config(layer_types=("full_attention",))
         backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
@@ -322,7 +362,7 @@ class TestDenseTextBackbone:
 
         chunk_gated_delta_rule = MagicMock(side_effect=lambda *args, **_kwargs: (args[2], None))
         for linear_attn in linear_attn_modules:
-            linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda **kwargs: kwargs["x"])
+            linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda x, **kwargs: x)
             linear_attn.chunk_gated_delta_rule = chunk_gated_delta_rule
             linear_attn.norm.forward = MagicMock(side_effect=torch.add)
 
