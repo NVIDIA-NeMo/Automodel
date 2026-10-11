@@ -181,6 +181,35 @@ def test_below_threshold_mixed_rows_keep_views_and_independent_math(
     for grad in actual[1:]:
         assert torch.count_nonzero(grad[short][padding[short]]) == 0
     assert torch.equal(selection.region_ids, original_ids)
+    # Independently catch a semantic defect: use another document's padding
+    # key, or another row's selected regions. Neither perturbation changes QKV.
+    if partner == "prefix":
+        incorrect = replace(selection, region_ids=ids.flip(0))
+        checked_row = long_row
+    else:
+        proof = selection.causal_row_layouts[short]
+        wrong_key = 0 if partner == "allpad" else proof.key_start
+        assert wrong_key != proof.padding_key
+        row_proofs = list(selection.causal_row_layouts)
+        row_proofs[short] = replace(proof, padding_key=wrong_key)
+        incorrect = replace(selection, causal_row_layouts=tuple(row_proofs))
+        checked_row = short
+    incorrect_output = fa4.fa4_attention(
+        query,
+        key,
+        value,
+        positions[:, start : start + queries],
+        positions,
+        padding,
+        metadata.documents,
+        query_start=start,
+        window=None,
+        selection=incorrect,
+    )
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(
+            incorrect_output[checked_row].float(), reference[checked_row], atol=0.015, rtol=0.015
+        )
     # Keeping the old B2 fallback must fail the no-copy contract before the
     # kernel launch; this is an allocation-path negative control, not a math pass.
     with pytest.raises(AssertionError, match="provider folding copied"):
