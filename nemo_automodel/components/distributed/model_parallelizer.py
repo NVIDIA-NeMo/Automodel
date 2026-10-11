@@ -169,7 +169,12 @@ def _parallelize_ddp(model: nn.Module, mesh_context: MeshContext) -> nn.Module:
 
     config = mesh_context.strategy_config
     assert isinstance(config, DDPConfig)
-    return parallelize_ddp(model, config, reapply_trainability=mesh_context.reapply_trainability)
+    return parallelize_ddp(
+        model,
+        config,
+        device=mesh_context.ddp_device,
+        reapply_trainability=mesh_context.reapply_trainability,
+    )
 
 
 def _parallelize_megatron_fsdp(model: nn.Module, mesh_context: MeshContext) -> nn.Module:

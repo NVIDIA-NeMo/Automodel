@@ -37,7 +37,7 @@ from nemo_automodel.components.distributed.config import ActivationCheckpointing
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
 if TYPE_CHECKING:
-    from torch import nn
+    from torch import device, nn
     from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -120,6 +120,7 @@ class MeshContext:
         cp_ring_degree: Ring-attention factor of the context-parallel axis.
         cp_ulysses_degree: Ulysses factor of the context-parallel axis. ``None``
             lets the consumer use the full context-parallel axis.
+        ddp_device: Explicit DDP placement override. None uses the distributed device resolver.
     """
 
     # Runtime topology.
@@ -138,6 +139,7 @@ class MeshContext:
     # and Ulysses dimensions. ``None`` means pure Ulysses over the full CP axis.
     cp_ring_degree: int = 1
     cp_ulysses_degree: int | None = None
+    ddp_device: "device | None" = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         _validate_mesh_axis_names(self)
