@@ -119,6 +119,10 @@ def test_dependency_input_changes_invalidate_image(checkout: Path, path: str) ->
     assert after["image"] != before["image"]
 
 
+@pytest.mark.runtime_budget(
+    15,
+    reason="Runs two real Git/Bash dependency lookups and stages a source change; comparable CI cases exceed 5s",
+)
 def test_source_only_changes_reuse_key(checkout: Path) -> None:
     result, before = _prepare(checkout)
     assert result.returncode == 0, result.stderr
@@ -131,6 +135,10 @@ def test_source_only_changes_reuse_key(checkout: Path) -> None:
 
 
 @pytest.mark.parametrize("override", [{"PLATFORM": "linux/amd64"}, {"BASE_DIGEST": "sha256:" + "c" * 64}])
+@pytest.mark.runtime_budget(
+    15,
+    reason="Runs the real Git/Bash dependency lookup twice; CPU CI measured 5.03s under suite load",
+)
 def test_abi_changes_invalidate_image(checkout: Path, override: dict[str, str]) -> None:
     _, before = _prepare(checkout)
     result, after = _prepare(checkout, **override)
