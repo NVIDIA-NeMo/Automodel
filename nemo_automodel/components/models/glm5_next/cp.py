@@ -185,13 +185,13 @@ class _AllGatherSequence(torch.autograd.Function):
     @staticmethod
     def forward(ctx, local_tensor: torch.Tensor, group: Any, dim: int) -> torch.Tensor:
         dim = dim if dim >= 0 else local_tensor.ndim + dim
-        gathered = [torch.empty_like(local_tensor) for _ in range(dist.get_world_size(group))]
-        dist.all_gather(gathered, local_tensor.contiguous(), group=group)
+        gathered = local_tensor.new_empty((dist.get_world_size(group), *local_tensor.shape))
+        dist.all_gather_into_tensor(gathered.flatten(0, 1), local_tensor.contiguous(), group=group)
         ctx.group = group
         ctx.dim = dim
         ctx.rank = dist.get_rank(group)
         ctx.local_size = local_tensor.shape[dim]
-        return torch.cat(gathered, dim=dim)
+        return gathered.movedim(0, dim).flatten(dim, dim + 1).contiguous()
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
