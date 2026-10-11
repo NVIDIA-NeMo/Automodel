@@ -41,12 +41,15 @@ def _time_cuda(call: Callable[[], object]) -> float:
 
 
 @pytest.mark.parametrize("sequence", [4096, 8192])
-@pytest.mark.parametrize("span", [32, 64, 192])
-def test_rope_cuda_long_positions_packed_backward_recompute(sequence: int, span: int, record_property) -> None:
+@pytest.mark.parametrize(
+    "span,heads,dim", [(32, 16, 256), (32, 1, 256), (64, 64, 192), (64, 4, 192), (192, 64, 192), (192, 4, 192)]
+)
+def test_rope_cuda_long_positions_packed_backward_recompute(
+    sequence: int, span: int, heads: int, dim: int, record_property
+) -> None:
     torch.manual_seed(985)
     config = Step5Config()
     config.rope_theta = 10000.0 if span == 192 else 10000000.0
-    heads, dim = (16, 256) if span == 32 else (64, 192)
     rope = Step5RotaryEmbedding(config, 0, span=span).cuda()
     positions = torch.arange(sequence, device="cuda").unsqueeze(0) + 131072 - sequence
     positions[:, sequence // 2 :] = torch.arange(sequence - sequence // 2, device="cuda")
@@ -119,13 +122,24 @@ def test_rope_cuda_long_positions_packed_backward_recompute(sequence: int, span:
     record_property("incremental_fwb_peak_bytes", json.dumps(peaks))
 
 
-def test_rope_cuda_empty_indexer_projection() -> None:
+@pytest.mark.parametrize("heads", [1, 16])
+@pytest.mark.parametrize("sequence", [0, 1])
+def test_rope_cuda_short_indexer_projection(heads: int, sequence: int) -> None:
     config = Step5Config()
     rope = Step5RotaryEmbedding(config, 3, span=32).cuda()
-    hidden = torch.empty(1, 0, 16, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    positions = torch.empty(1, 0, device="cuda", dtype=torch.long)
+    hidden = torch.randn(1, sequence, heads, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    positions = torch.arange(sequence, device="cuda").unsqueeze(0) + 131071
     actual = rope(hidden, positions)
     assert actual.shape == hidden.shape
     assert actual.dtype == hidden.dtype
-    actual.sum().backward()
-    assert hidden.grad is not None and hidden.grad.shape == hidden.shape
+    if sequence == 0:
+        assert actual is hidden
+    upstream = torch.randn_like(hidden)
+    actual_grad = torch.autograd.grad(actual, hidden, upstream)[0]
+    with torch.no_grad():
+        no_grad = rope(hidden, positions)
+    torch.testing.assert_close(no_grad, actual, rtol=0, atol=0)
+    replay = checkpoint(rope, hidden, positions, use_reentrant=False)
+    replay_grad = torch.autograd.grad(replay, hidden, upstream)[0]
+    torch.testing.assert_close(replay, actual, rtol=0, atol=0)
+    torch.testing.assert_close(replay_grad, actual_grad, rtol=0, atol=0)

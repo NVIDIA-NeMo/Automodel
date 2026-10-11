@@ -14,6 +14,9 @@
 
 """Rotary precision, partial-subspace and packed-position mathematical controls."""
 
+import json
+from collections.abc import Callable
+
 import pytest
 import torch
 
@@ -54,3 +57,51 @@ def test_rope_complex_oracle_and_packed_resets(span: int, dtype: torch.dtype) ->
     observed_grad = torch.autograd.grad(actual, hidden, upstream)[0]
     expected_grad = torch.autograd.grad(expected, hidden, upstream)[0]
     torch.testing.assert_close(observed_grad, expected_grad, rtol=0.005, atol=tolerance)
+
+
+def test_mixed_rotary_shapes_share_bounded_compile_entries(
+    monkeypatch: pytest.MonkeyPatch, record_property: Callable[[str, str], None]
+) -> None:
+    """Count Dynamo shape guards on metadata tensors without requiring CUDA.
+
+    No reset occurs between cases. This catches compiler-cache exhaustion but
+    does not replace the matching functional test using actual CUDA kernels.
+    """
+    from nemo_automodel.components.models.step5 import rope as implementation
+
+    counts = {"full": 0, "partial": 0}
+
+    def full_backend(graph: torch.fx.GraphModule, inputs: list[torch.Tensor | torch.SymInt]) -> Callable:
+        counts["full"] += 1
+        return graph.forward
+
+    def partial_backend(graph: torch.fx.GraphModule, inputs: list[torch.Tensor | torch.SymInt]) -> Callable:
+        counts["partial"] += 1
+        return graph.forward
+
+    for name, backend in [("full", full_backend), ("partial", partial_backend)]:
+        attribute = f"_apply_{name}_rotary_compiled"
+        original = getattr(implementation, attribute)._torchdynamo_orig_callable
+        monkeypatch.setattr(
+            implementation, attribute, torch.compile(original, backend=backend, fullgraph=True, dynamic=True)
+        )
+    for sequence in [4096, 8192, 0, 1]:
+        for span, heads, dim in [
+            (64, 64, 192),
+            (64, 4, 192),
+            (192, 64, 192),
+            (192, 4, 192),
+            (32, 16, 256),
+            (32, 1, 256),
+        ]:
+            for grad in [True, False]:
+                hidden = torch.empty(1, sequence, heads, dim, device="meta", dtype=torch.bfloat16, requires_grad=grad)
+                cos = torch.empty(1, sequence, 1, span // 2, device="meta", dtype=torch.float32)
+                with torch.set_grad_enabled(grad):
+                    output = implementation._apply_rotary_compiled(hidden, cos, cos, span)
+                assert output.shape == hidden.shape
+                if sequence == 0:
+                    assert output is hidden
+    assert 0 < counts["full"] <= 8
+    assert 0 < counts["partial"] <= 8
+    record_property("compile_entries", json.dumps(counts))

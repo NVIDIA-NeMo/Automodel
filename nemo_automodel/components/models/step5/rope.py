@@ -29,12 +29,32 @@ def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, span: i
     return torch.cat(((a * cos - b * sin).to(x.dtype), (a * sin + b * cos).to(x.dtype), x[..., span:]), dim=-1)
 
 
-_apply_rotary_compiled = torch.compile(
-    _apply_rotary,
+@torch.compile(
     fullgraph=True,
     dynamic=True,
     options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
 )
+def _apply_full_rotary_compiled(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return _apply_rotary(x, cos, sin, x.shape[-1])
+
+
+@torch.compile(
+    fullgraph=True,
+    dynamic=True,
+    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+)
+def _apply_partial_rotary_compiled(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, span: int) -> torch.Tensor:
+    return _apply_rotary(x, cos, sin, span)
+
+
+def _apply_rotary_compiled(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, span: int) -> torch.Tensor:
+    # Full and partial rotation have different slice guards. Separate entries
+    # keep mixed Q/K, indexer, and grad/no_grad shapes below Dynamo's cache cap.
+    if x.numel() == 0:
+        return x
+    if span == x.shape[-1]:
+        return _apply_full_rotary_compiled(x, cos, sin)
+    return _apply_partial_rotary_compiled(x, cos, sin, span)
 
 
 class Step5RotaryEmbedding(nn.Module):
@@ -58,7 +78,7 @@ class Step5RotaryEmbedding(nn.Module):
         Returns:
             Tensor of shape [batch, sequence, heads, head_dim] in the input dtype.
         """
-        if self.span == 0:
+        if self.span == 0 or x.numel() == 0:
             return x
         inv = 1.0 / self.theta ** (torch.arange(0, self.span, 2, device=x.device, dtype=torch.float32) / self.span)
         if self.scaling is not None and self.scaling.get("rope_type", "default") != "default":
