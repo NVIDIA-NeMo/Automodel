@@ -37,6 +37,8 @@ class RegionSelection:
         query_documents: Int64 tensor of shape [batch, local_queries].
         key_documents: Int64 tensor of shape [batch, global_keys].
         region_count: Number of global regions; also the unused-route sentinel.
+        all_regions_selected: Every query in this local shard selects all causal
+            regions in its own document; membership adds no restriction.
     """
 
     region_ids: torch.Tensor
@@ -44,6 +46,7 @@ class RegionSelection:
     query_documents: torch.Tensor
     key_documents: torch.Tensor
     region_count: int
+    all_regions_selected: bool = False
 
 
 @dataclass(frozen=True)
@@ -284,7 +287,12 @@ class Step5SparseIndexer(nn.Module):
         weights = weights * heads**-0.5
         if not metadata.score_tiles:
             return RegionSelection(
-                ids, metadata.token_regions, metadata.query_documents, metadata.documents, region_count
+                ids,
+                metadata.token_regions,
+                metadata.query_documents,
+                metadata.documents,
+                region_count,
+                all_regions_selected=True,
             )
         if keys is None or compression_logits is None:
             raise ValueError("Sparse CSA queries require the global indexer projections")

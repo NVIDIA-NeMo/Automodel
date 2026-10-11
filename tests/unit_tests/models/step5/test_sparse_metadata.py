@@ -160,6 +160,7 @@ def test_dense_prefix_skips_projection_scoring_and_preserves_partial_documents()
     assert actual.region_ids[0, 0, 8].tolist() == [4, 5, 9]
     assert actual.region_ids[0, 0, 14].tolist() == [6, 7, 8]
     assert actual.region_ids.stride(1) == 0
+    assert actual.all_regions_selected
 
 
 def test_global_projection_decision_is_identical_for_asymmetric_cp_shards() -> None:

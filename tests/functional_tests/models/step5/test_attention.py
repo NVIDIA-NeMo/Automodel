@@ -177,3 +177,71 @@ def test_fa4_membership_crossover_preserves_native_192_outputs_and_gradients(
     torch.testing.assert_close(output.float(), expected, atol=3e-4, rtol=5e-3)
     for actual, reference in ((q.grad, ref_q.grad), (k.grad, ref_k.grad), (v.grad, ref_v.grad)):
         torch.testing.assert_close(actual.float(), reference, atol=5e-5, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lengths,query_start", [((1031, 17, 3048), 0), ((2051, 4096, 2045), 4000)])
+def test_fa4_fully_selected_packed_prefix_skips_membership(
+    monkeypatch: pytest.MonkeyPatch, lengths: tuple[int, ...], query_start: int
+) -> None:
+    """Check document-causal forward/backward on irregular 4K/8K packed shards."""
+    from nemo_automodel.components.models.step5 import fa4
+    from nemo_automodel.components.models.step5.sparse import region_metadata
+
+    torch.manual_seed(516)
+    length, heads, groups, dim = sum(lengths), 4, 2, 192
+    positions = torch.cat([torch.arange(n, device="cuda") for n in lengths])[None]
+    documents = (positions == 0).cumsum(-1)
+    padding = torch.zeros_like(positions, dtype=torch.bool)
+    padding[:, -3:] = True
+    local = length - query_start
+    q = torch.randn(1, local, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, length, groups, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    meta = region_metadata(positions, padding, query_start=query_start, queries=local, region_size=8, topk=512)
+    assert not meta.score_tiles
+    selection = RegionSelection(
+        meta.dense_region_ids[:, None].expand(-1, groups, -1, -1),
+        meta.token_regions,
+        meta.query_documents,
+        meta.documents,
+        meta.region_count,
+        all_regions_selected=True,
+    )
+
+    def forbidden_bitmap(*args):
+        raise AssertionError("Fully selected document prefixes must not build membership bitmaps")
+
+    monkeypatch.setattr(fa4, "pack_region_bitmap", forbidden_bitmap)
+    output = fa4.fa4_attention(
+        q,
+        k,
+        v,
+        positions[:, query_start:],
+        positions,
+        padding,
+        documents,
+        query_start=query_start,
+        window=None,
+        selection=selection,
+    )
+    allowed = (
+        (positions[:, query_start:, None] >= positions[:, None, :])
+        & (documents[:, query_start:, None] == documents[:, None, :])
+        & ~padding[:, None, :]
+    )
+    expected = F.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2).repeat_interleave(heads // groups, dim=1),
+        v.float().transpose(1, 2).repeat_interleave(heads // groups, dim=1),
+        attn_mask=allowed[:, None],
+    ).transpose(1, 2)
+    torch.testing.assert_close(output.float(), expected, atol=0.015, rtol=0.015)
+    gradient = torch.randn_like(output)
+    actual_grad = torch.autograd.grad(output, (q, k, v), gradient)
+    expected_grad = torch.autograd.grad(expected, (q, k, v), gradient.float())
+    for actual, reference in zip(actual_grad, expected_grad):
+        relative_rms = (
+            actual.float() - reference.float()
+        ).square().sum().sqrt() / reference.float().square().sum().sqrt()
+        assert relative_rms < 0.012

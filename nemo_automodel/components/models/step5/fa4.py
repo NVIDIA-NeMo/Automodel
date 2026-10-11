@@ -306,12 +306,14 @@ def fa4_attention(
     queries, keys, dim = query.shape[1], key.shape[1], query.shape[-1]
     bitmap = False
     slots = 0
-    if selection is None:
+    regions = 0 if selection is None else selection.region_count
+    if selection is None or selection.all_regions_selected:
+        # Fully selected prefixes are exactly document-causal attention. Keep
+        # their selected block lists, but skip bitmap creation and membership.
         membership = torch.empty((1, 1, 1, 2), dtype=torch.int32, device=query.device)
         token_regions = torch.empty((1, 2), dtype=torch.int64, device=query.device)
     else:
         membership, token_regions = selection.region_ids, selection.token_regions
-        regions = selection.region_count
         slots = membership.shape[-1]
         bitmap = (regions + 31) // 32 <= slots
         if bitmap:
