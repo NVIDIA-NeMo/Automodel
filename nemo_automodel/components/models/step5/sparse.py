@@ -27,6 +27,27 @@ from nemo_automodel.components.models.step5.rope import Step5RotaryEmbedding
 
 
 @dataclass(frozen=True)
+class CausalDocumentLayout:
+    """Native varlen layout for a padding-free single-batch query shard.
+
+    Attributes:
+        key_start: Physical start of the first queried document's keys.
+        key_stop: Exclusive last queried token; future keys must be omitted.
+        cu_seqlens_q: Int32 cumulative query counts for the intersected documents.
+        cu_seqlens_k: Int32 cumulative key counts for those same documents.
+        max_seqlen_q: Largest local document query segment.
+        max_seqlen_k: Largest causal key prefix for one queried document.
+    """
+
+    key_start: int
+    key_stop: int
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+
+
+@dataclass(frozen=True)
 class RegionSelection:
     """Sparse selection tensors, all local to one CP rank's queries.
 
@@ -39,6 +60,8 @@ class RegionSelection:
         region_count: Number of global regions; also the unused-route sentinel.
         all_regions_selected: Every query in this local shard selects all causal
             regions in its own document; membership adds no restriction.
+        causal_layout: Optional compact varlen layout for fully selected,
+            padding-free, single-batch shards with contiguous document positions.
     """
 
     region_ids: torch.Tensor
@@ -47,6 +70,7 @@ class RegionSelection:
     key_documents: torch.Tensor
     region_count: int
     all_regions_selected: bool = False
+    causal_layout: CausalDocumentLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +93,7 @@ class RegionMetadata:
         region_count: Number of global regions, also the unused-route sentinel.
         needs_projection: Whether any query on any CP rank needs learned scores.
             All ranks derive it from the same global layout before collectives.
+        causal_layout: Optional native varlen metadata for this query shard.
     """
 
     token_regions: torch.Tensor
@@ -81,6 +106,7 @@ class RegionMetadata:
     score_tiles: tuple[tuple[int, int, int, int, int], ...]
     region_count: int
     needs_projection: bool
+    causal_layout: CausalDocumentLayout | None = None
 
 
 def region_metadata(
@@ -126,9 +152,34 @@ def region_metadata(
     lower = lower.reshape(batch, -1, 128).amin(-1)
     upper = upper.reshape(batch, -1, 128).amax(-1)
     bounds = torch.stack((lower, upper), -1)
+    # Native varlen needs compact query/document boundaries, not a global
+    # attention mask. Guard the single-batch path conservatively and transfer
+    # its local positions together with the existing allocation metadata.
+    prefix_fields = key_positions.new_zeros(1)
+    if batch == 1 and queries:
+        local_positions = key_positions[0, query_start : query_start + queries]
+        key_start = query_start - local_positions[0]
+        physical_keys = torch.arange(keys, device=key_positions.device)
+        in_prefix = (physical_keys >= key_start) & (physical_keys < query_start + queries)
+        consecutive = (key_positions[0, 1:] == 0) | (key_positions[0, 1:] == key_positions[0, :-1] + 1)
+        prefix_valid = (
+            ~sparse_queries.any()
+            & (local_positions[0] >= 0)
+            & (key_start >= 0)
+            & ~(key_padding[0] & in_prefix).any()
+            & (consecutive | ~in_prefix[1:]).all()
+        )
+        prefix_fields = torch.cat((prefix_valid.long().reshape(1), local_positions))
     # One synchronization for the entire model call, never one per layer/tile.
     layout = (
-        torch.cat(((token_regions.amax() + 1).reshape(1), all_sparse.any().long().reshape(1), bounds.reshape(-1)))
+        torch.cat(
+            (
+                (token_regions.amax() + 1).reshape(1),
+                all_sparse.any().long().reshape(1),
+                bounds.reshape(-1),
+                prefix_fields,
+            )
+        )
         .cpu()
         .tolist()
     )
@@ -140,6 +191,22 @@ def region_metadata(
         if lo < hi:
             start = (index % tiles_per_batch) * 128
             score_tiles.append((index // tiles_per_batch, start, min(start + 128, queries), lo, hi))
+    causal_layout = None
+    prefix_offset = 2 + 2 * batch * tiles_per_batch
+    if bool(layout[prefix_offset]):
+        local_positions = layout[prefix_offset + 1 :]
+        query_boundaries = [0] + [i for i in range(1, queries) if local_positions[i] == 0] + [queries]
+        key_boundaries = [0] + [end + local_positions[0] for end in query_boundaries[1:]]
+        cumulative = torch.tensor(query_boundaries + key_boundaries, dtype=torch.int32, device=key_positions.device)
+        cu_q, cu_k = cumulative.chunk(2)
+        causal_layout = CausalDocumentLayout(
+            query_start - local_positions[0],
+            query_start + queries,
+            cu_q,
+            cu_k,
+            max(stop - start for start, stop in zip(query_boundaries, query_boundaries[1:])),
+            max(stop - start for start, stop in zip(key_boundaries, key_boundaries[1:])),
+        )
     region_documents = torch.zeros(batch, region_count, device=key_positions.device, dtype=torch.long)
     region_documents.scatter_reduce_(1, token_regions, documents, reduce="amax")
     budget = min(topk, region_count)
@@ -156,6 +223,7 @@ def region_metadata(
         tuple(score_tiles),
         region_count,
         needs_projection,
+        causal_layout,
     )
 
 
@@ -293,6 +361,7 @@ class Step5SparseIndexer(nn.Module):
                 metadata.documents,
                 region_count,
                 all_regions_selected=True,
+                causal_layout=metadata.causal_layout,
             )
         if keys is None or compression_logits is None:
             raise ValueError("Sparse CSA queries require the global indexer projections")

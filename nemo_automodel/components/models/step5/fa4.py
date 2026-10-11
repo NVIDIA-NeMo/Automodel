@@ -94,6 +94,15 @@ def _load_fa4(window: int | None, bitmap: bool, slots: int, provider_groups: int
     return interface.flash_attn_func, sparsity.BlockSparseTensorsTorch, mask_mod
 
 
+@functools.cache
+def _load_fa4_varlen() -> Callable:
+    """Load native FA4 causal varlen attention without a custom mask."""
+    available, interface = safe_import("flash_attn.cute.interface")
+    if not available:
+        raise ImportError("Step5 FA4 requires the AutoModel INSTALL_FA4 image")
+    return interface.flash_attn_varlen_func
+
+
 def _block_lists(
     queries: int,
     keys: int,
@@ -304,6 +313,33 @@ def fa4_attention(
     if torch.are_deterministic_algorithms_enabled():
         raise RuntimeError("Step5 FA4 uses nondeterministic attention backward")
     queries, keys, dim = query.shape[1], key.shape[1], query.shape[-1]
+    if (
+        capability == (9, 0)
+        and dim == 192
+        and query.shape[0] == 1
+        and window is None
+        and selection is not None
+        and selection.all_regions_selected
+        and selection.causal_layout is not None
+    ):
+        layout = selection.causal_layout
+        # Each query segment is the suffix of its document's K prefix. Native
+        # bottom-right causality therefore matches document-local positions.
+        # In particular, the final K segment ends at the final local query,
+        # even if that document continues on the next CP rank.
+        output, _ = _load_fa4_varlen()(
+            query[0],
+            key[0, layout.key_start : layout.key_stop],
+            value[0, layout.key_start : layout.key_stop],
+            cu_seqlens_q=layout.cu_seqlens_q,
+            cu_seqlens_k=layout.cu_seqlens_k,
+            max_seqlen_q=layout.max_seqlen_q,
+            max_seqlen_k=layout.max_seqlen_k,
+            softmax_scale=dim**-0.5,
+            causal=True,
+            pack_gqa=False,
+        )
+        return output.unsqueeze(0)
     bitmap = False
     slots = 0
     regions = 0 if selection is None else selection.region_count

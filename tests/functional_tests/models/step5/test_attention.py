@@ -245,3 +245,85 @@ def test_fa4_fully_selected_packed_prefix_skips_membership(
             actual.float() - reference.float()
         ).square().sum().sqrt() / reference.float().square().sum().sqrt()
         assert relative_rms < 0.012
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "lengths,query_start,queries",
+    [((1031, 17, 3048), 137, 3800), ((2051, 4096, 2045), 4000, 4096), ((8192,), 2000, 2000), ((1, 2, 1, 3), 1, 5)],
+)
+def test_fa4_native_varlen_prefix_matches_packed_document_mask(
+    monkeypatch: pytest.MonkeyPatch, lengths: tuple[int, ...], query_start: int, queries: int
+) -> None:
+    """Exercise document-prefix K, truncated final K, and a shard inside one doc."""
+    from nemo_automodel.components.models.step5 import fa4
+    from nemo_automodel.components.models.step5.sparse import region_metadata
+
+    torch.manual_seed(716)
+    keys, heads, groups, dim = sum(lengths), 4, 2, 192
+    positions = torch.cat([torch.arange(n, device="cuda") for n in lengths])[None]
+    documents = (positions == 0).cumsum(-1)
+    padding = torch.zeros_like(positions, dtype=torch.bool)
+    if keys > 32:
+        padding[:, -3:] = True
+    meta = region_metadata(positions, padding, query_start=query_start, queries=queries, region_size=8, topk=512)
+    assert meta.causal_layout is not None
+    selection = RegionSelection(
+        meta.dense_region_ids[:, None].expand(-1, groups, -1, -1),
+        meta.token_regions,
+        meta.query_documents,
+        meta.documents,
+        meta.region_count,
+        all_regions_selected=True,
+        causal_layout=meta.causal_layout,
+    )
+    q = torch.randn(1, queries, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    # CP transport stacks K/V before gathering, then unbinds them. Preserve
+    # that non-contiguous sequence stride when exercising native varlen.
+    kv = torch.randn(1, keys, 2, groups, dim, device="cuda", dtype=torch.bfloat16)
+    k, v = (part.detach().requires_grad_() for part in kv.unbind(2))
+    calls = []
+    native = fa4._load_fa4_varlen()
+
+    def invoke(*args, **kwargs):
+        calls.append((args[0].shape, args[1].shape, kwargs["causal"]))
+        return native(*args, **kwargs)
+
+    def forbidden_blocks(*args, **kwargs):
+        raise AssertionError("Native document-causal prefixes must not build sparse block lists")
+
+    monkeypatch.setattr(fa4, "_load_fa4_varlen", lambda: invoke)
+    monkeypatch.setattr(fa4, "_selected_block_lists", forbidden_blocks)
+    output = fa4.fa4_attention(
+        q,
+        k,
+        v,
+        positions[:, query_start : query_start + queries],
+        positions,
+        padding,
+        documents,
+        query_start=query_start,
+        window=None,
+        selection=selection,
+    )
+    assert len(calls) == 1 and calls[0][2]
+    allowed = (
+        (positions[:, query_start : query_start + queries, None] >= positions[:, None, :])
+        & (documents[:, query_start : query_start + queries, None] == documents[:, None, :])
+        & ~padding[:, None, :]
+    )
+    expected = F.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2).repeat_interleave(heads // groups, dim=1),
+        v.float().transpose(1, 2).repeat_interleave(heads // groups, dim=1),
+        attn_mask=allowed[:, None],
+    ).transpose(1, 2)
+    torch.testing.assert_close(output.float(), expected, atol=0.015, rtol=0.015)
+    gradient = torch.randn_like(output)
+    actual_grad = torch.autograd.grad(output, (q, k, v), gradient)
+    expected_grad = torch.autograd.grad(expected, (q, k, v), gradient.float())
+    for actual, reference in zip(actual_grad, expected_grad):
+        relative_rms = (
+            actual.float() - reference.float()
+        ).square().sum().sqrt() / reference.float().square().sum().sqrt()
+        assert relative_rms < 0.012
