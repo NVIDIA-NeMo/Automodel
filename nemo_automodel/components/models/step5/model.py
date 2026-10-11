@@ -84,9 +84,12 @@ class Step5TextModel(nn.Module):
                 positive for real tokens and zero for padding.
 
         Returns:
-            Final normalized tensor of shape [batch, local_sequence, hidden].
+            Tensor of shape [batch, local_sequence, hidden]: FP32 residuals on
+            intermediate pipeline stages, or normalized output on the final stage.
         """
-        cp_group = self.layers["0"].self_attn.cp_group
+        first_layer = next(iter(self.layers.values()))
+        cp_group = first_layer.self_attn.cp_group
+        compute_dtype = first_layer.self_attn.qkv_proj.weight.dtype
         fields = (positions, padding_mask.to(positions.dtype))
         if packed_documents is not None:
             if packed_documents.shape != positions.shape:
@@ -110,9 +113,11 @@ class Step5TextModel(nn.Module):
         residual = embeddings.float()
         for layer in self.layers.values():
             residual = layer(
-                residual, positions, padding_mask, global_positions, global_padding, compute_dtype=embeddings.dtype
+                residual, positions, padding_mask, global_positions, global_padding, compute_dtype=compute_dtype
             )
-        return self.norm(residual.to(embeddings.dtype))
+        # Pipeline boundaries retain the original FP32 residual stream. Only
+        # the final stage applies the output norm in the projection dtype.
+        return residual if self.norm is None else self.norm(residual.to(compute_dtype))
 
 
 class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
@@ -120,6 +125,9 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
 
     config_class = Step5Config
     base_model_prefix = "model"
+    _pp_keep_self_forward: bool = True
+    _pp_return_hidden_states_supported: bool = True
+    _pp_return_hidden_states: bool = False
     _owns_cp_attention = True
     _owns_packed_attention = True
     packed_mask_type = "document_ids"
@@ -143,7 +151,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
 
         supports_tp: bool = False
         supports_cp: bool = True
-        supports_pp: bool = False
+        supports_pp: bool = True
         supports_ep: bool = True
 
     def __init__(
@@ -223,7 +231,8 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         for name, parameter in self.model.named_parameters():
             if parameter.ndim >= 2 and ".moe." not in name:
                 nn.init.normal_(parameter, std=0.02)
-        nn.init.normal_(self.lm_head.weight, std=0.02)
+        if self.lm_head is not None:
+            nn.init.normal_(self.lm_head.weight, std=0.02)
         for module in self.model.modules():
             if isinstance(module, (Step3p5RMSNorm, nn.LayerNorm)):
                 module.reset_parameters()
@@ -251,6 +260,47 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         """Return the untied language-model head."""
         return self.lm_head
 
+    def _is_pipeline_parallel_stage(self) -> bool:
+        """Identify a stage after AutoPipeline removes modules owned by other stages."""
+        return self.model.embed_tokens is None or self.lm_head is None
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Declare stage I/O without rounding the FP32 residual at a pipeline boundary.
+
+        Args:
+            is_first: Whether this stage receives token IDs.
+            microbatch_size: Number of sequences in each pipeline microbatch.
+            seq_len: Local sequence length after any context-parallel sharding.
+            dtype: Compute dtype for the final normalized hidden states or logits.
+
+        Returns:
+            Input and output metadata tuples. First-stage input IDs have shape
+            [microbatch_size, seq_len] and dtype int64. Intermediate residuals
+            have shape [microbatch_size, seq_len, hidden] and dtype float32.
+            Final outputs use the compute dtype with shape
+            [microbatch_size, seq_len, hidden] for fused loss, or
+            [microbatch_size, seq_len, vocab] for projected logits.
+        """
+        hidden = self.config.hidden_size
+        if is_first:
+            inputs = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        else:
+            inputs = (torch.empty(microbatch_size, seq_len, hidden, device="meta", dtype=torch.float32),)
+        if self.lm_head is None:
+            width, output_dtype = hidden, torch.float32
+        else:
+            width = hidden if self._pp_return_hidden_states else self.config.vocab_size
+            output_dtype = dtype
+        outputs = (torch.empty(microbatch_size, seq_len, width, device="meta", dtype=output_dtype),)
+        return inputs, outputs
+
     def prepare_model_inputs_for_cp(
         self,
         batch: dict[str, torch.Tensor],
@@ -262,7 +312,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         Args:
             batch: Mapping with [batch, global_sequence] token and label tensors,
                 optional [batch, global_sequence, hidden] embeddings and image tensors.
-            num_chunks: Number of pipeline chunks (pipeline parallelism is unsupported).
+            num_chunks: Number of pipeline microbatches; each uses the same sequence sharder.
 
         Returns:
             Mapping containing the model's ContextParallelSharder.
@@ -301,11 +351,12 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         labels: torch.Tensor | None = None,
         _packed_seq_ids: torch.Tensor | None = None,
         **kwargs: ConfigValue | torch.Tensor,
-    ) -> CausalLMOutputWithPast:
+    ) -> CausalLMOutputWithPast | torch.Tensor:
         """Evaluate all local query positions.
 
         Args:
-            input_ids: Int64 tensor of shape [batch, local_sequence].
+            input_ids: Int64 tensor of shape [batch, local_sequence], or the FP32
+                residual tensor [batch, local_sequence, hidden] on later pipeline stages.
             inputs_embeds: Optional tensor of shape [batch, local_sequence, hidden].
             position_ids: Optional tensor of shape [batch, local_sequence], resetting at document starts.
             attention_mask: Optional tensor of shape [batch, local_sequence], one for valid tokens.
@@ -319,6 +370,8 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         Returns:
             Output with logits [batch, selected_sequence, vocab], optional final
             hidden states [batch, local_sequence, hidden], and scalar loss.
+            Intermediate stages put FP32 residuals in the logits field; the
+            final stage returns a hidden-state tensor when fused PP loss is enabled.
         """
         if kwargs.get("qkv_format", "bshd") != "bshd":
             raise ValueError("Step5 uses BSHD with position resets for packing; qkv_format must be 'bshd'")
@@ -331,7 +384,13 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("Step5 requires input_ids or inputs_embeds")
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            inputs_embeds = input_ids if self.model.embed_tokens is None else self.model.embed_tokens(input_ids)
+        if self.model.embed_tokens is None and (
+            inputs_embeds.dtype != torch.float32
+            or inputs_embeds.ndim != 3
+            or inputs_embeds.shape[-1] != self.config.hidden_size
+        ):
+            raise ValueError("Step5 pipeline stages require FP32 residuals of shape [batch, sequence, hidden]")
         batch, sequence = inputs_embeds.shape[:2]
         if position_ids is None:
             offset = 0 if self.cp_mesh is None else self.cp_mesh.get_local_rank() * sequence
@@ -343,6 +402,10 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
                 else ~attention_mask.bool()
             )
         hidden = self.model(inputs_embeds, position_ids, padding_mask, _packed_seq_ids)
+        if self._pp_return_hidden_states:
+            return hidden
+        if self.lm_head is None:
+            return CausalLMOutputWithPast(logits=hidden)
         out = compute_lm_head_logits(
             self.lm_head, hidden, logits_to_keep, is_thd=False, output_hidden_states=output_hidden_states
         )
@@ -363,6 +426,12 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
     """Step-5 language model with the compatible Step perception encoder."""
 
     config_class = Step5VLConfig
+
+    @dataclass(frozen=True)
+    class ModelCapabilities(Step5ForCausalLM.ModelCapabilities):
+        """Vision preprocessing and pipeline microbatching are not yet integrated."""
+
+        supports_pp: bool = False
 
     def __init__(
         self, config: Step5VLConfig, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None

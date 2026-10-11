@@ -22,11 +22,9 @@ _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TL, tl = safe_import("triton.language")
 
 if _HAVE_TRITON and _HAVE_TL:
-
-    @triton.jit
-    def _pack_regions(
-        ids, bitmap, total, slots: tl.constexpr, regions: tl.constexpr, words: tl.constexpr, BLOCK: tl.constexpr
-    ):
+    # Packed boundaries change both counts; keep them as runtime scalars.
+    @triton.jit(do_not_specialize=["regions", "words"])
+    def _pack_regions(ids, bitmap, total, slots: tl.constexpr, regions, words, BLOCK: tl.constexpr):
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         region = tl.load(ids + offsets, offsets < total, other=regions)
         word = (offsets // slots) * words + region // 32

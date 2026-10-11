@@ -149,7 +149,8 @@ def _block_lists(
     return count[None, None], indices[None, None]
 
 
-@torch.compile(dynamic=False)
+# Packed document boundaries change the number of regions between microbatches.
+@torch.compile(dynamic=True)
 def _region_tiles(
     ids: torch.Tensor,
     token_regions: torch.Tensor,
@@ -173,7 +174,9 @@ def _region_tiles(
     """
     batch, groups, queries, slots = ids.shape
     rows = (queries + 127) // 128
-    ids = F.pad(ids, (0, 0, 0, rows * 128 - queries), value=regions)
+    # F.pad specializes its scalar fill value; tensor arithmetic keeps regions symbolic.
+    padding = ids.new_zeros((batch, groups, rows * 128 - queries, slots)) + regions
+    ids = torch.cat((ids, padding), dim=2)
     union = torch.zeros((batch, groups, rows, regions + 1), dtype=torch.bool, device=ids.device)
     union.scatter_(-1, ids.reshape(batch, groups, rows, 128 * slots).long(), True)
     prefix = F.pad(union.cumsum(-1, dtype=torch.int32), (1, 0))
