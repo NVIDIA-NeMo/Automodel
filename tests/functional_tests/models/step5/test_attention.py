@@ -327,3 +327,73 @@ def test_fa4_native_varlen_prefix_matches_packed_document_mask(
             actual.float() - reference.float()
         ).square().sum().sqrt() / reference.float().square().sum().sqrt()
         assert relative_rms < 0.012
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lengths", [(1031, 3065), (2051, 4096, 2045), (8192,)])
+def test_fa4_native_varlen_contiguous_cp_outputs_and_qkv_gradients(lengths: tuple[int, ...]) -> None:
+    """Compare identical routes on full Q versus two contiguous Q shards.
+
+    Static routes choose the first 512 historical regions and the current
+    region. The single-document 8K case therefore genuinely drops keys; its
+    full-Q call uses sparse FA4 while only the first CP shard uses varlen.
+    """
+    from nemo_automodel.components.models.step5.sparse import region_metadata
+
+    torch.manual_seed(718)
+    length, heads, groups, dim = sum(lengths), 4, 2, 192
+    positions = torch.cat([torch.arange(n, device="cuda") for n in lengths])[None]
+    padding = torch.zeros_like(positions, dtype=torch.bool)
+    full_meta = region_metadata(positions, padding, query_start=0, queries=length, region_size=8, topk=512)
+    current = full_meta.token_regions
+    first = current - positions // 8
+    historical = first.unsqueeze(-1) + torch.arange(512, device="cuda")
+    historical = torch.where(historical < current.unsqueeze(-1), historical, full_meta.region_count)
+    ids = torch.cat((historical, current.unsqueeze(-1)), dim=-1).sort(dim=-1).values.int()
+    ids = ids[:, None].expand(-1, groups, -1, -1).contiguous()
+    q = torch.randn(1, length, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(1, length, 2, groups, dim, device="cuda", dtype=torch.bfloat16)
+    k, v = (part.detach().requires_grad_() for part in kv.unbind(2))
+    dispatch: list[bool] = []
+
+    def call(start: int, stop: int) -> torch.Tensor:
+        meta = region_metadata(positions, padding, query_start=start, queries=stop - start, region_size=8, topk=512)
+        dispatch.append(meta.causal_layout is not None)
+        selection = RegionSelection(
+            ids[:, :, start:stop].contiguous(),
+            meta.token_regions,
+            meta.query_documents,
+            meta.documents,
+            meta.region_count,
+            all_regions_selected=not meta.score_tiles,
+            causal_layout=meta.causal_layout,
+        )
+        return fa4_attention(
+            q[:, start:stop],
+            k,
+            v,
+            positions[:, start:stop],
+            positions,
+            padding,
+            meta.documents,
+            query_start=start,
+            window=None,
+            selection=selection,
+        )
+
+    cp1 = call(0, length)
+    cp2 = torch.cat((call(0, length // 2), call(length // 2, length)), dim=1)
+    assert dispatch == ([False, True, False] if lengths == (8192,) else [True, True, True])
+    torch.testing.assert_close(cp1, cp2, atol=0.015, rtol=0.015)
+    upstream = torch.randn_like(cp1)
+    grad1 = torch.autograd.grad(cp1, (q, k, v), upstream)
+    grad2 = torch.autograd.grad(cp2, (q, k, v), upstream)
+    metrics = {}
+    for name, expected, actual in zip(("output", "dq", "dk", "dv"), (cp1, *grad1), (cp2, *grad2)):
+        relative_rms = ((actual.float() - expected.float()).square().sum() / expected.float().square().sum()).sqrt()
+        metrics[name] = {
+            "relative_rms": float(relative_rms),
+            "max_abs": float((actual.float() - expected.float()).abs().max()),
+        }
+        assert relative_rms < 0.012
+    print({"lengths": lengths, "native_varlen_dispatch": dispatch, "cp1_cp2": metrics})

@@ -16,12 +16,18 @@
 
 Launch with torchrun --standalone --nproc_per_node=2. The small four-layer model
 covers dense FFN, routed/shared experts, SWA, CSA, padding and packed documents.
+The default is the original short sweep. Opt in to --scenario long-packed,
+--scenario long-crossing, or --scenario long-single to exercise 8K native-varlen
+and truly sparse shards. This random-weight component test is not a checkpoint
+loading validation.
 """
 
 import argparse
 import gc
 import json
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TypedDict
 
 import torch
@@ -34,12 +40,32 @@ from nemo_automodel.components.distributed.context_parallel.sharder import Conte
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.step5.configuration import Step5Config
 from nemo_automodel.components.models.step5.model import Step5ForCausalLM
+from nemo_automodel.components.models.step5.sparse import RegionSelection, Step5SparseIndexer
 from nemo_automodel.components.moe.parallelizer import apply_cp
 
 
 class GradientMetrics(TypedDict):
     relative_rms: float
     max_abs: float
+
+
+class RouteBucket(TypedDict):
+    queries: int
+    exact_set_queries: int
+    selected_id_agreement: float
+
+
+class RouteMetrics(TypedDict):
+    cp1_native_varlen: bool
+    cp2_native_varlen: bool
+    prefix: RouteBucket
+    sparse: RouteBucket
+
+
+@dataclass
+class RouteSnapshot:
+    ids: torch.Tensor
+    native_varlen: bool
 
 
 class CPReport(TypedDict):
@@ -54,11 +80,33 @@ class CPReport(TypedDict):
     cp2_peak_bytes: int
     gradients: dict[str, GradientMetrics]
     packed: NotRequired[bool]
+    scenario: NotRequired[str]
+    routes: NotRequired[dict[str, RouteMetrics]]
 
 
 def compare_cp(model: Step5ForCausalLM, tokens: torch.Tensor, positions: torch.Tensor) -> CPReport:
     """Compare a replicated model before/after native CP setup on identical inputs."""
     rank = dist.get_rank()
+    route_records: list[dict[str, RouteSnapshot]] = [{}, {}]
+    phase = 0
+
+    def route_hook(
+        name: str,
+    ) -> Callable[[Step5SparseIndexer, tuple[torch.Tensor | None, ...], RegionSelection], None]:
+        def record(
+            _module: Step5SparseIndexer, _inputs: tuple[torch.Tensor | None, ...], output: RegionSelection
+        ) -> None:
+            route_records[phase][name] = RouteSnapshot(
+                output.region_ids.detach().cpu(), output.causal_layout is not None
+            )
+
+        return record
+
+    handles = [
+        module.register_forward_hook(route_hook(name))
+        for name, module in model.named_modules()
+        if isinstance(module, Step5SparseIndexer)
+    ]
     length = tokens.shape[1]
     labels = tokens.roll(-1, dims=1)
     labels[:, -1] = -100
@@ -78,6 +126,7 @@ def compare_cp(model: Step5ForCausalLM, tokens: torch.Tensor, positions: torch.T
     gc.collect()
     torch.cuda.empty_cache()
 
+    phase = 1
     mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("cp",))
     apply_cp(model, mesh["cp"])
     batch = {"input_ids": tokens.clone(), "labels": labels.clone(), "position_ids": positions.clone()}
@@ -113,6 +162,32 @@ def compare_cp(model: Step5ForCausalLM, tokens: torch.Tensor, positions: torch.T
         "cp2_peak_bytes": cp2_peak,
         "gradients": {},
     }
+    route_metrics: dict[str, RouteMetrics] = {}
+    local_positions = positions[:, start : start + valid].cpu()
+    boundary = (model.config.sparse_config.topk + 1) * model.config.sparse_config.region_block_size
+    for name, cp2_routes in route_records[1].items():
+        cp1_routes = route_records[0][name]
+        expected_ids = cp1_routes.ids[:, :, start : start + valid]
+        actual_ids = cp2_routes.ids[:, :, :valid]
+        agreement = expected_ids == actual_ids
+        per_query = agreement.all(dim=-1).all(dim=1)
+        buckets: dict[str, RouteBucket] = {}
+        for bucket, mask in (("prefix", local_positions < boundary), ("sparse", local_positions >= boundary)):
+            queries = int(mask.sum())
+            buckets[bucket] = {
+                "queries": queries,
+                "exact_set_queries": int((per_query & mask).sum()),
+                "selected_id_agreement": float(agreement.permute(0, 2, 1, 3)[mask].float().mean()) if queries else 1.0,
+            }
+        route_metrics[name] = {
+            "cp1_native_varlen": cp1_routes.native_varlen,
+            "cp2_native_varlen": cp2_routes.native_varlen,
+            "prefix": buckets["prefix"],
+            "sparse": buckets["sparse"],
+        }
+    report["routes"] = route_metrics
+    for handle in handles:
+        handle.remove()
     assert abs(reference_loss - loss.item()) < 0.003, report
     assert report["logit_kl"] < 1e-4, report
     assert {name for name, p in model.named_parameters() if p.grad is not None} == set(baseline_grads)
@@ -139,11 +214,29 @@ def compare_cp(model: Step5ForCausalLM, tokens: torch.Tensor, positions: torch.T
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("flex", "fa4"), default="fa4")
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        choices=("short", "packed4k", "long-packed", "long-crossing", "long-single"),
+        help="Repeat to select scenarios; default: original short single/packed sweep.",
+    )
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     assert dist.get_world_size() == 2
-    for packed in (False, True):
+    scenarios: list[tuple[str, tuple[int, ...], int, int]] = []
+    for scenario in args.scenario or ["short"]:
+        if scenario == "short":
+            scenarios.extend((("short-single", (263,), 4, 65), ("short-packed", (19, 244), 4, 65)))
+        else:
+            lengths = {
+                "packed4k": (1031, 3065),
+                "long-packed": (4096, 4096),
+                "long-crossing": (2051, 4096, 2045),
+                "long-single": (8192,),
+            }[scenario]
+            scenarios.append((scenario, lengths, 512, 512))
+    for scenario, lengths, topk, window in scenarios:
         torch.manual_seed(73)
         config = Step5Config(
             hidden_size=64,
@@ -160,22 +253,23 @@ def main() -> None:
             moe_layer_list=[3],
             dtype="bfloat16",
             num_nextn_predict_layers=0,
-            sliding_window=65,
+            sliding_window=window,
             sparse_config=dict(
                 proxy_dim=32,
                 sparse_indexer_rope_dim=8,
                 sparse_indexer_num_heads=4,
                 num_provider_groups=2,
-                topk=4,
+                topk=topk,
                 region_block_size=8,
             ),
         )
         backend = BackendConfig(attn=args.backend, linear="torch", dispatcher="torch", experts="torch_mm")
         model = Step5ForCausalLM(config, backend=backend).cuda()
-        tokens = torch.randint(1, 127, (1, 263), device="cuda")
-        positions = (torch.cat((torch.arange(19), torch.arange(244))) if packed else torch.arange(263)).cuda()[None]
+        tokens = torch.randint(1, 127, (1, sum(lengths)), device="cuda")
+        positions = torch.cat([torch.arange(length) for length in lengths]).cuda()[None]
         report = compare_cp(model, tokens, positions)
-        report["packed"] = packed
+        report["packed"] = len(lengths) > 1
+        report["scenario"] = scenario
         print(json.dumps(report), flush=True)
         del model
         gc.collect()
