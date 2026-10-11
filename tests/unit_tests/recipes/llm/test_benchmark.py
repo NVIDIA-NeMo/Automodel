@@ -1373,11 +1373,16 @@ packed_sequence:
     assert config.dataset.instantiate()[0]["input_ids"] == [1, 2, 3, 4]
 
 
-def test_summary_uses_sum_of_actual_work_and_slowest_rank_times(mock_recipe, tmp_path: Path) -> None:
+@pytest.mark.parametrize("world_size", [1, 8, 128])
+def test_summary_uses_sum_of_actual_work_and_slowest_rank_times(
+    mock_recipe, tmp_path: Path, world_size: int
+) -> None:
     """Warmup, rank-zero active_time and the final pack's FLOPs cannot bias the summary."""
     import json
 
     mock_recipe._bench_json_output_path = str(tmp_path / "summary.json")
+    mock_recipe.dist_env.world_size = world_size
+    mock_recipe.wandb_run = MagicMock()
     mock_recipe._bench_iterations = [
         _IterationMetrics(0, 100.0, 90000.0, 99000.0, 100, 20),
         _IterationMetrics(1, 4.0, 2000.0, 2100.0, 100, 40),
@@ -1387,15 +1392,21 @@ def test_summary_uses_sum_of_actual_work_and_slowest_rank_times(mock_recipe, tmp
     timer = MagicMock()
     timer.active_time.return_value = 0.01
     mock_recipe.timers._timers = {"setup": timer, "iteration": timer, "iteration_warmup": timer}
-    with patch("torch.distributed.barrier"):
+    with patch("torch.distributed.barrier"), patch("wandb.log") as wandb_log, patch("wandb.Table"):
         mock_recipe._log_benchmark_summary(steps=3, warmup_steps=1, peak_tflops=989, rank=0)
     result = json.loads(Path(mock_recipe._bench_json_output_path).read_text())
     assert result["training_time_seconds"] == 10.0
     assert result["warmup_time_seconds"] == 100.0
     assert result["avg_iter_time_seconds"] == 5.0
     assert result["mean_tflops_per_step"] == 3500.0
-    assert result["avg_mfu_percent"] == pytest.approx(7000 / (8 * 10 * 989) * 100)
-    assert result["all_token_head_mfu_percent"] == pytest.approx(7500 / (8 * 10 * 989) * 100)
+    assert result["tflops_per_gpu"] == 3500.0 / world_size
+    assert result["avg_mfu_percent"] == pytest.approx(7000 / (world_size * 10 * 989) * 100)
+    assert result["all_token_head_mfu_percent"] == pytest.approx(7500 / (world_size * 10 * 989) * 100)
+    scalar_metrics = next(
+        call.args[0] for call in wandb_log.call_args_list if "summary/tflops_per_gpu" in call.args[0]
+    )
+    assert scalar_metrics["summary/mean_tflops_per_step"] == 3500.0
+    assert scalar_metrics["summary/tflops_per_gpu"] == 3500.0 / world_size
     assert [item["seconds"] for item in result["iterations"]] == [100.0, 4.0, 6.0]
 
 

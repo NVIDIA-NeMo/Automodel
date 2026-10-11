@@ -797,7 +797,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "avg_iter_time_seconds": avg_iter_time,
                 "avg_mfu_percent": mfu,
                 "flops_scope": self._bench_flops_scope,
-                "tflops_per_gpu": mean_step_tflops,  # Historical key stores global step work.
+                "tflops_per_gpu": mean_step_tflops / self.dist_env.world_size,
                 "mean_tflops_per_step": mean_step_tflops,
                 "all_token_head_mfu_percent": calculate_mfu(
                     all_token_head_tflops,
@@ -850,7 +850,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         "summary/avg_mfu_percent": mfu,
                         "summary/flops_scope": self._bench_flops_scope,
                         "summary/training_time_seconds": iter_time,
-                        "summary/tflops_per_gpu": mean_step_tflops,
+                        "summary/tflops_per_gpu": mean_step_tflops / self.dist_env.world_size,
                         "summary/mean_tflops_per_step": mean_step_tflops,
                     }
                 )
