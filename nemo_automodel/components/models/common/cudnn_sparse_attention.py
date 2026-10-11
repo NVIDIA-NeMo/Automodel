@@ -92,18 +92,10 @@ def _compact_and_sort_indices(indices: torch.Tensor, key_count: int) -> tuple[to
     """
     valid = (indices >= 0) & (indices < key_count)
     topk_length = valid.sum(dim=-1, dtype=torch.int32)
-    positions = torch.arange(indices.size(-1), device=indices.device).view(1, -1)
-    compact_order = torch.where(valid, positions, torch.full_like(positions, indices.size(-1))).argsort(dim=-1)
-    indices = torch.gather(indices, -1, compact_order)
-    compact_valid = torch.gather(valid, -1, compact_order)
-    indices = indices.masked_fill(~compact_valid, -1)
-
-    prefix = positions < topk_length.unsqueeze(-1)
-    sort_key = torch.where(prefix, indices, torch.full_like(indices, key_count))
-    sort_order = sort_key.argsort(dim=-1)
-    indices = torch.gather(indices, -1, sort_order)
-    sorted_valid = torch.gather(prefix.expand_as(indices), -1, sort_order)
-    return indices.masked_fill(~sorted_valid, -1).to(torch.int32).contiguous(), topk_length.contiguous()
+    # Sorting valid keys with an out-of-range sentinel also compacts them.
+    sort_keys = torch.where(valid, indices, key_count)
+    ordered = sort_keys.sort(dim=-1).values
+    return ordered.masked_fill(ordered == key_count, -1).to(torch.int32).contiguous(), topk_length.contiguous()
 
 
 def _padded_head_count(num_heads: int, major: int) -> int:
