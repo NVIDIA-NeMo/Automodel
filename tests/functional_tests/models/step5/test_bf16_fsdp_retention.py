@@ -151,3 +151,75 @@ def test_shard_padding_is_charged_to_budget(mesh):
     assert fully_shard.state(projection)._fsdp_param_group.post_forward_mesh_info is not None
     _retain_bf16_fsdp_units(model.model, budget_mib=2)
     assert fully_shard.state(projection)._fsdp_param_group.post_forward_mesh_info is None
+
+
+class _UnusedProjectionHarness(nn.Module):
+    """Call one no-grad FSDP child between two differentiable projection units."""
+
+    def __init__(self, mlp: nn.Module):
+        super().__init__()
+        self.gate_proj = mlp.gate_proj
+        self.up_proj = mlp.up_proj
+        self.down_proj = mlp.down_proj
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Exercise one unused projection between trainable units.
+
+        Args:
+            hidden: BF16 tensor of shape [tokens, hidden=32].
+
+        Returns:
+            BF16 tensor of shape [tokens, hidden=32].
+        """
+        hidden_live = self.gate_proj(hidden)
+        with torch.no_grad():
+            self.up_proj(hidden)
+        return self.down_proj(hidden_live)
+
+
+@pytest.mark.parametrize("all_forwards_first", [False, True])
+def test_unused_no_grad_child_cleanup_and_collectives(mesh, all_forwards_first):
+    counts, results = [], []
+    for retain in (False, True):
+        model = _model()
+        mlp = model.model.layers["0"].mlp
+        policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+        for unit in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+            fully_shard(unit, mesh=mesh, mp_policy=policy, reshard_after_forward=True)
+        harness = _UnusedProjectionHarness(mlp)
+        fully_shard(harness, mesh=mesh, mp_policy=policy, reshard_after_forward=True)
+        harness.set_reduce_scatter_unused_params(True)
+        _retain_bf16_fsdp_units(model.model, budget_mib=1 if retain else 0)
+        unused_original = mlp.up_proj.weight.full_tensor().clone()
+        losses = []
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+            for microbatch in range(2):
+                hidden = _input(dist.get_rank(), microbatch).requires_grad_()
+                output = harness(hidden)
+                denominator = sum(_input(rank, microbatch).numel() for rank in range(2))
+                loss = output.float().square().sum() * (2 / denominator)
+                if all_forwards_first:
+                    losses.append(loss)
+                else:
+                    loss.backward()
+                    assert all(isinstance(p.weight, DTensor) for p in (mlp.gate_proj, mlp.up_proj, mlp.down_proj))
+            for loss in losses:
+                loss.backward()
+            torch.cuda.synchronize()
+        assert all(isinstance(p.weight, DTensor) for p in (mlp.gate_proj, mlp.up_proj, mlp.down_proj))
+        counts.append(sum(event.count for event in profile.key_averages() if event.key == "c10d::_allgather_base_"))
+        assert mlp.up_proj.weight.grad is None or not torch.count_nonzero(mlp.up_proj.weight.grad.to_local())
+        gradients = {name: p.grad.full_tensor().clone() for name, p in harness.named_parameters() if p.grad is not None}
+        torch.optim.SGD(harness.parameters(), lr=0.125).step()
+        torch.testing.assert_close(mlp.up_proj.weight.full_tensor(), unused_original, rtol=0, atol=0)
+        parameters = {name: p.full_tensor().clone() for name, p in harness.named_parameters() if "up_proj" not in name}
+        results.append((gradients, parameters))
+    # The unused child is prefetched in backward and cleaned up by the root.
+    assert counts == [12, 6]
+    print(
+        f"UNUSED_AG_COUNTS all_forwards_first={all_forwards_first} baseline={counts[0]} retained={counts[1]}",
+        flush=True,
+    )
+    for baseline, retained in zip(results[0], results[1]):
+        for name in baseline:
+            torch.testing.assert_close(baseline[name], retained[name], rtol=0, atol=0)
