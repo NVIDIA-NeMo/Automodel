@@ -105,6 +105,10 @@ def _prepare(checkout: Path, **overrides: str) -> tuple[subprocess.CompletedProc
 
 
 @pytest.mark.parametrize("path", _INPUTS)
+@pytest.mark.runtime_budget(
+    15,
+    reason="Runs the real Git/Bash dependency lookup twice; GPU CI measured 5.71s under suite load",
+)
 def test_dependency_input_changes_invalidate_image(checkout: Path, path: str) -> None:
     result, before = _prepare(checkout)
     assert result.returncode == 0, result.stderr
@@ -155,6 +159,10 @@ def test_main_never_consumes_branch_images(checkout: Path) -> None:
     assert "deps-branch-" not in (checkout / "lookups").read_text()
 
 
+@pytest.mark.runtime_budget(
+    15,
+    reason="Runs the real Git/Bash dependency lookup three times; CI measured up to 8.43s under suite load",
+)
 def test_release_builds_keep_a_stable_separate_image_scope(checkout: Path) -> None:
     _, pr = _prepare(checkout)
     result, release = _prepare(checkout, CACHE_KEY="deploy-release-r0.7.0")
