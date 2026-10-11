@@ -296,10 +296,10 @@ RUN pip install "aiohttp>=3.14.3" \
         "mistune>=3.3.0" \
         "nbconvert>=7.17.0" \
         "notebook>=7.5.6" \
-        "onnx>=1.21.0" \
+        "onnx>=1.22.0" \
         "pillow>=12.3.0" \
         "protobuf>=6.33.5" \
-        "setuptools>=80.10.2" \
+        "setuptools>=83.0.0" \
         "tornado>=6.5.5" \
         "urllib3>=2.7.0" && \
     pip uninstall -y nvidia-dali-cuda130 wandb && \
