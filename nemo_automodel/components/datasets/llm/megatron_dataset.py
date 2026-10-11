@@ -18,7 +18,7 @@ import glob
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Dict, List, Union
 
@@ -51,11 +51,11 @@ class MegatronPretrainingConfig:
     """Sequence length."""
     create_attention_mask: bool = False
     """Whether to generate attention masks (not supported with fused/flash attention)."""
-    reset_position_ids: bool = False
+    reset_position_ids: bool = field(default=False, kw_only=True)
     """Whether to reset position IDs at document boundaries (EOD tokens)."""
-    reset_attention_mask: bool = False
+    reset_attention_mask: bool = field(default=False, kw_only=True)
     """Whether to reset the attention mask at document boundaries (EOD tokens)."""
-    eod_mask_loss: bool = False
+    eod_mask_loss: bool = field(default=False, kw_only=True)
     """Whether to mask the loss on EOD tokens."""
     seed: int = 1234
     """Seed for generating the GPT dataset."""
@@ -143,9 +143,6 @@ class MegatronPretraining:
         micro_batch_size: int = 4,
         global_batch_size: int = 8,
         create_attention_mask: bool = False,
-        reset_position_ids: bool = False,
-        reset_attention_mask: bool = False,
-        eod_mask_loss: bool = False,
         seed: int = 1234,
         split: str = "900,50,50",
         index_mapping_dir: str | None = None,
@@ -160,6 +157,10 @@ class MegatronPretraining:
         mmap_bin_files: bool = True,
         splits_to_build: Union[str, List[str]] | None = None,
         object_storage_config: Union[Dict, "ObjectStorageConfig"] | None = None,
+        *,
+        reset_position_ids: bool = False,
+        reset_attention_mask: bool = False,
+        eod_mask_loss: bool = False,
     ) -> None:
         """Pretraining dataset class for Megatron-LM datasets.
         Args:
