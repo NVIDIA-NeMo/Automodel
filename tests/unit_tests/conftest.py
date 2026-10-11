@@ -305,9 +305,10 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     """Confirm runtime-only overruns once without retrying correctness failures.
 
     Reuse pytest's runner so function fixtures are torn down and recreated on
-    confirmation, including under xdist. Shared fixtures and compiler caches
-    stay warm. Publish only the final reports, so JUnit, -x and xdist observe one
-    result per item. Setup, call and teardown all count toward the budget.
+    confirmation, including under xdist. Shared fixtures follow pytest's normal
+    next-item teardown rules and can be recreated at scope boundaries. Compiler
+    caches can remain warm. Publish only the final reports, so JUnit, -x and
+    xdist observe one result per item. All three phases count toward the budget.
     """
     budget = getattr(item, _RUNTIME_BUDGET_ATTRIBUTE, None)
     if budget is None:
@@ -340,7 +341,8 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
                 f"({elapsed:.2f}s, {confirmed_elapsed:.2f}s in setup+call+teardown). "
                 "Optimize the test or move expensive integration coverage to functional tests."
             )
-        reports[0].user_properties.append(("runtime_budget_first_attempt_seconds", elapsed))
+        # JUnit collects user properties from the final teardown report.
+        reports[-1].user_properties.append(("runtime_budget_first_attempt_seconds", elapsed))
     for report in reports:
         item.ihook.pytest_runtest_logreport(report=report)
     item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)

@@ -207,6 +207,9 @@ def test_transient_overrun_passes_after_one_confirmation(pytester: pytest.Pytest
     cases = ET.parse(pytester.path / "results.xml").findall(".//testcase")
     assert len(cases) == 1
     assert cases[0].find("failure") is None
+    first_attempt = cases[0].find("properties/property[@name='runtime_budget_first_attempt_seconds']")
+    assert first_attempt is not None
+    assert float(first_attempt.attrib["value"]) > 0.5
 
 
 def test_persistent_overrun_fails_after_exactly_two_attempts(pytester: pytest.Pytester) -> None:
