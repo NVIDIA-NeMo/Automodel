@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import pathlib
+import time
 from dataclasses import asdict, dataclass
 
 import torch
@@ -65,6 +66,27 @@ class _CudaMemoryPeak:
     max_reserved_bytes: int
     num_alloc_retries: int
     num_ooms: int
+
+
+@dataclass(frozen=True)
+class _CudaAllocatorStats:
+    """One rank's public allocator counters, sampled outside iteration timing."""
+
+    step: int
+    rank: int
+    timestamp_ns: int
+    allocated_bytes: int | None
+    peak_allocated_bytes: int | None
+    reserved_bytes: int | None
+    peak_reserved_bytes: int | None
+    num_alloc_retries: int | None
+    num_ooms: int | None
+    num_device_alloc: int | None
+    num_device_free: int | None
+    num_sync_all_streams: int | None
+    phase: str = "after_iteration_timer_before_metrics"
+    peak_scope: str = "since_parent_setup_reset_before_model_construction"
+    counter_scope: str = "process_lifetime_no_benchmark_reset"
 
 
 def _infer_vocab_size(model_cfg):
@@ -180,6 +202,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_step_supervised_tokens = 0
         self._bench_batch_metadata_path = cfg.get("benchmark.batch_metadata_path")
         self._bench_loaded_model_audit_path = cfg.get("benchmark.loaded_model_audit_path")
+        self._bench_allocator_stats_path: str | None = cfg.get("benchmark.allocator_stats_path")
 
         # Infer vocab_size from model config and inject it into dataset config
         if cfg.get("dataset.vocab_size") is not None and hasattr(cfg, "model"):
@@ -477,6 +500,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         opt.step()
                     logger.debug("Optimizer step")
 
+            self._record_allocator_stats(step=i)
+
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
             if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
@@ -756,6 +781,39 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             reset=True,
             barrier=True,
         )
+
+    def _record_allocator_stats(self, *, step: int) -> None:
+        """Append this rank's counters after the native iteration timer stops.
+
+        ``benchmark.allocator_stats_path`` opts into one JSONL file per rank.
+        This reads public host counters without allocating CUDA tensors, changing
+        allocator policy, resetting statistics, or adding collectives. Missing
+        backend/version-specific counters are JSON null, never fabricated zeros.
+
+        Args:
+            step: Zero-based native optimizer iteration, including warmup.
+        """
+        if self._bench_allocator_stats_path is None:
+            return
+        stats = torch.cuda.memory_stats(self.dist_env.device)
+        record = _CudaAllocatorStats(
+            step=step,
+            rank=self.dist_env.rank,
+            timestamp_ns=time.time_ns(),
+            allocated_bytes=stats.get("allocated_bytes.all.current"),
+            peak_allocated_bytes=stats.get("allocated_bytes.all.peak"),
+            reserved_bytes=stats.get("reserved_bytes.all.current"),
+            peak_reserved_bytes=stats.get("reserved_bytes.all.peak"),
+            num_alloc_retries=stats.get("num_alloc_retries"),
+            num_ooms=stats.get("num_ooms"),
+            num_device_alloc=stats.get("num_device_alloc"),
+            num_device_free=stats.get("num_device_free"),
+            num_sync_all_streams=stats.get("num_sync_all_streams"),
+        )
+        directory = pathlib.Path(self._bench_allocator_stats_path)
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / f"rank-{self.dist_env.rank}.jsonl").open("x" if step == 0 else "a") as stream:
+            stream.write(json.dumps(asdict(record)) + "\n")
 
     def _collect_cuda_memory_peaks(self) -> list[_CudaMemoryPeak]:
         """Collect allocator peaks after timing, before allocating collective buffers.

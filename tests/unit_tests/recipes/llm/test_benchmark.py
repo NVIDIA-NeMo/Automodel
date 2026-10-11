@@ -1645,3 +1645,101 @@ def test_setup_selects_local_device_before_cuda_timer(initialized: bool, monkeyp
     recipe.timers = observe_timer
     with pytest.raises(RuntimeError, match="observed setup timer"):
         recipe.setup()
+
+
+def test_allocator_stats_disabled_has_no_cuda_or_filesystem_effects(tmp_path: Path) -> None:
+    recipe = object.__new__(BenchmarkingRecipeForNextTokenPrediction)
+    recipe._bench_allocator_stats_path = None
+    with (
+        patch.object(torch.cuda, "memory_stats", side_effect=AssertionError("disabled diagnostics must not sample")),
+        patch.object(Path, "mkdir", side_effect=AssertionError("disabled diagnostics must not create paths")),
+    ):
+        recipe._record_allocator_stats(step=0)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_allocator_stats_preserve_counters_and_report_missing_as_null(tmp_path: Path) -> None:
+    import json
+
+    recipe = object.__new__(BenchmarkingRecipeForNextTokenPrediction)
+    recipe._bench_allocator_stats_path = str(tmp_path / "allocator")
+    recipe.dist_env = SimpleNamespace(rank=7, device=torch.device("cuda:3"))
+    stats = {
+        "allocated_bytes.all.current": 13,
+        "allocated_bytes.all.peak": 29,
+        "reserved_bytes.all.current": 47,
+        "reserved_bytes.all.peak": 59,
+        "num_alloc_retries": 3,
+        "num_ooms": 0,
+        "num_device_alloc": 11,
+        "num_device_free": 5,
+        # This installed-backend/version-specific key is deliberately absent.
+    }
+    original = stats.copy()
+    with (
+        patch.object(torch.cuda, "memory_stats", return_value=stats) as sample,
+        patch.object(torch.cuda, "empty_cache", side_effect=AssertionError("must not change allocator behavior")),
+        patch.object(torch.cuda, "reset_peak_memory_stats", side_effect=AssertionError("must not reset peaks")),
+        patch.object(
+            torch.cuda, "reset_accumulated_memory_stats", side_effect=AssertionError("must not reset counters")
+        ),
+        patch.object(torch.distributed, "all_gather_into_tensor", side_effect=AssertionError("must not gather")),
+        patch.object(torch, "tensor", side_effect=AssertionError("must not create reporting tensors")),
+    ):
+        recipe._record_allocator_stats(step=0)
+        stats["num_alloc_retries"] = 4
+        recipe._record_allocator_stats(step=1)
+    assert stats == {**original, "num_alloc_retries": 4}
+    assert sample.call_count == 2
+    sample.assert_called_with(torch.device("cuda:3"))
+    rows = [json.loads(line) for line in (tmp_path / "allocator/rank-7.jsonl").read_text().splitlines()]
+    assert [row["step"] for row in rows] == [0, 1]
+    assert [row["num_alloc_retries"] for row in rows] == [3, 4]
+    for row in rows:
+        assert row["rank"] == 7
+        assert row["allocated_bytes"] == 13 and row["peak_allocated_bytes"] == 29
+        assert row["reserved_bytes"] == 47 and row["peak_reserved_bytes"] == 59
+        assert row["num_device_alloc"] == 11 and row["num_device_free"] == 5
+        assert row["num_ooms"] == 0
+        assert row["num_sync_all_streams"] is None
+        assert row["timestamp_ns"] > 0
+        assert row["phase"] == "after_iteration_timer_before_metrics"
+        assert "no_benchmark_reset" in row["counter_scope"]
+    with patch.object(torch.cuda, "memory_stats", return_value=stats), pytest.raises(FileExistsError):
+        recipe._record_allocator_stats(step=0)
+
+
+def test_native_allocator_sample_is_outside_timers_and_preserves_update(tmp_path: Path) -> None:
+    import json
+    from contextlib import contextmanager
+
+    batches = _gradient_batches(rank=0, ga_steps=1, ignore_index=-100)
+    model = _BenchmarkGradientModel()
+    recipe = _gradient_recipe(model, batches, ga_steps=1)
+    recipe._bench_allocator_stats_path = str(tmp_path / "allocator")
+    expected = _mean_gradient_oracle(batches, ignore_index=-100, max_grad_norm=None)
+    active_timers: list[str] = []
+    completed_timers: list[str] = []
+
+    @contextmanager
+    def timer(name: str, log_level: int):
+        active_timers.append(name)
+        yield
+        assert active_timers.pop() == name
+        completed_timers.append(name)
+
+    def sample(device: torch.device) -> dict[str, int]:
+        assert not active_timers, "allocator sampling must be outside the measured region"
+        assert completed_timers[-1] == "iteration"
+        torch.testing.assert_close(model.weight, expected[1]["weight"])
+        return {"num_alloc_retries": 9}
+
+    recipe.timers.side_effect = timer
+    with patch.object(torch.cuda, "memory_stats", side_effect=sample):
+        _run_gradient_recipe(recipe)
+    report = tmp_path / "allocator/rank-0.jsonl"
+    assert report.exists(), "the native optimizer loop must write an enabled allocator record"
+    rows = [json.loads(line) for line in report.read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["step"] == 0 and rows[0]["num_alloc_retries"] == 9
+    assert rows[0]["allocated_bytes"] is None
+    _assert_gradient_result(model, recipe, expected)
