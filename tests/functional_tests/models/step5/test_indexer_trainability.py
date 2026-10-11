@@ -80,7 +80,7 @@ def test_indexer_stays_immutable_across_updates_and_distributed_layouts(world, h
     model = copy.deepcopy(reference)
     initial = {name: value.detach().clone() for name, value in model.indexer.named_parameters()}
     shape = (2, world // 2) if hsdp else (world,)
-    mesh = init_device_mesh("cuda", shape)
+    mesh = init_device_mesh("cuda", shape, mesh_dim_names=("replicate", "shard") if hsdp else ("shard",))
     # A real FP32 group contains both frozen selector and trainable output
     # parameters, which exercises the mixed-requires-grad storage contract.
     fully_shard_by_dtype(
