@@ -15,8 +15,11 @@
 """Tests for mirroring the W&B logger to SwanLab (``wandb.swanlab:``)."""
 
 import logging
+import os
+import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +27,8 @@ from nemo_automodel.components.loggers import loggers
 from nemo_automodel.components.loggers.loggers import SwanLabConfig, WandbConfig
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run
 from nemo_automodel.shared.import_utils import UnavailableError
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture
@@ -164,3 +169,46 @@ def test_wandb_config_rejects_non_mapping_swanlab(value):
 def test_wandb_config_accepts_swanlab_config_instance():
     cfg = SwanLabConfig(mode="local")
     assert WandbConfig.from_kwargs(swanlab=cfg).swanlab is cfg
+
+
+_REAL_SDK_PROBE = """
+import sys
+
+import torch
+
+from nemo_automodel.components.loggers.loggers import WandbConfig
+
+out = sys.argv[1]
+swanlab = {"mode": "offline", "upload_to_wandb": False, "log_dir": out}
+run = WandbConfig.from_kwargs(project="probe", name="probe", dir=out, swanlab=swanlab).build(run_config={"lr": 0.1})
+run.log({"loss": 1.5, "grad_norm": torch.tensor(2.0), "timestamp": "2026-10-11T00:00:00Z"}, step=1)
+run.finish()
+"""
+
+
+def test_mirror_initializes_and_logs_with_real_sdks_offline(tmp_path):
+    """Run the real swanlab and wandb SDKs offline; the mirror patches them process-wide, so use a subprocess."""
+    pytest.importorskip("swanlab")
+    pytest.importorskip("wandb")
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(filter(None, [str(_REPO_ROOT), os.environ.get("PYTHONPATH")])),
+        "WANDB_SILENT": "true",
+        "WANDB_CONFIG_DIR": str(tmp_path / "wandb_config"),
+        "WANDB_CACHE_DIR": str(tmp_path / "wandb_cache"),
+        "WANDB_DATA_DIR": str(tmp_path / "wandb_data"),
+    }
+    env.pop("SWANLAB_API_KEY", None)
+    probe = subprocess.run(
+        [sys.executable, "-c", _REAL_SDK_PROBE, str(tmp_path)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert probe.returncode == 0, probe.stderr[-4000:]
+
+    (record,) = tmp_path.glob("run-*/run-*.swanlab")
+    content = record.read_bytes()
+    for key in (b"loss", b"grad_norm", b"timestamp"):
+        assert key in content
