@@ -2054,6 +2054,11 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         "FalconConfig": transformer_flops,
     }
 
+    if config_class_name == "MiniMaxM3VLTextConfig":
+        from nemo_automodel.components.models.minimax_m3_vl.flops import model_flops
+
+        class_name_to_formula[config_class_name] = model_flops
+
     # Try exact match first
     formula = class_name_to_formula.get(config_class_name)
 
