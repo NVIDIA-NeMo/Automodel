@@ -630,7 +630,7 @@ class Glm5NextSparseAttention(nn.Module):
     """NoPE MLA whose visibility is selected by the GLM KPool indexer."""
 
     query_chunk_size = 32
-    indexer_query_chunk_size = 256
+    indexer_query_chunk_size = 512
 
     def __init__(self, config: Glm5NextTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
