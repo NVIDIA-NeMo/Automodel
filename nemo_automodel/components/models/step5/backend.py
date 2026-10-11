@@ -27,6 +27,10 @@ class Step5BackendConfig(BackendConfig):
         indexed_csa: Use native-D192 region-indexed attention on SM90 for
             genuinely sparse shards with at least 32K effective history.
             Shorter or irregular shards retain FA4. Requires attn="fa4".
+        csa_forward_full_blocks: Skip custom masks on proven fully selected
+            forward blocks for single-document, unpadded B1 CP1 inputs on SM90
+            with head dimension 192. Backward block lists stay unchanged.
+            Requires attn="fa4".
         swa_varlen: Use native FA4 window attention for valid single-batch
             SM90 D192 query prefixes. Padding keeps its custom-mask path.
             Requires enabled sparse metadata; communication is unchanged.
@@ -44,6 +48,7 @@ class Step5BackendConfig(BackendConfig):
     """
 
     indexed_csa: bool = False
+    csa_forward_full_blocks: bool = False
     swa_varlen: bool = False
     prepare_hybridep_extent: bool = False
     bf16_fsdp_retention_mib_per_part: int = 0
@@ -54,6 +59,10 @@ class Step5BackendConfig(BackendConfig):
             raise TypeError("indexed_csa must be a bool")
         if self.indexed_csa and self.attn != "fa4":
             raise ValueError("indexed_csa requires attn=fa4")
+        if not isinstance(self.csa_forward_full_blocks, bool):
+            raise TypeError("csa_forward_full_blocks must be a bool")
+        if self.csa_forward_full_blocks and self.attn != "fa4":
+            raise ValueError("csa_forward_full_blocks requires attn=fa4")
         if not isinstance(self.swa_varlen, bool):
             raise TypeError("swa_varlen must be a bool")
         if not isinstance(self.prepare_hybridep_extent, bool):

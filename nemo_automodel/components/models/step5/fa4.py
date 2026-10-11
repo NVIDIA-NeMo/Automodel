@@ -217,6 +217,38 @@ def _compact_selected_tiles(present: torch.Tensor) -> tuple[torch.Tensor, torch.
     return counts, indices
 
 
+@torch.compile(dynamic=False)
+def _split_forward_full_blocks(
+    counts: torch.Tensor, indices: torch.Tensor, *, prefix_length: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Separate a low contiguous full-block prefix without changing K order.
+
+    Args:
+        counts: Int32 selected K-block counts [providers, 1, query_tiles].
+        indices: Sorted unique nonnegative K-block indices
+            [providers, 1, query_tiles, key_tiles], with ignored trailing slots.
+            Both tensors use SM90 D192 tiles: 128 queries and 112 keys.
+        prefix_length: Proven all-selected initial query count in a single
+            unpadded CP1 document with physical positions starting at zero.
+
+    Returns:
+        Partial-block counts, shifted partial-block indices, and full-block
+        counts, shaped like counts, indices, and counts respectively. Inputs
+        are never modified. The original indices alias the full-block list:
+        FA4 processes partial indices descending, then full indices descending.
+    """
+    starts = torch.arange(counts.shape[-1], dtype=torch.int32, device=counts.device) * 128
+    proposed = torch.where(starts + 128 <= prefix_length, starts // 112, 0).expand_as(counts)
+    # Sorted unique nonnegative indices end at n-1 iff their first n values
+    # are exactly 0..n-1. This device-only check preserves a low prefix.
+    endpoint = indices.gather(-1, (proposed - 1).clamp_min(0).long().unsqueeze(-1)).squeeze(-1)
+    full_counts = torch.where((proposed <= counts) & (endpoint == proposed - 1), proposed, 0)
+    columns = torch.arange(indices.shape[-1], device=indices.device)
+    shifted = (columns + full_counts.long().unsqueeze(-1)).clamp_max(indices.shape[-1] - 1)
+    partial_indices = indices.gather(-1, shifted)
+    return counts - full_counts, partial_indices, full_counts
+
+
 def _selected_block_lists(
     selection: RegionSelection,
     regions: int,
@@ -575,9 +607,23 @@ def fa4_attention(
         query = query.unflatten(2, (groups, heads_per_group)).permute(0, 2, 1, 3, 4).flatten(0, 1)
         key = key.unflatten(2, (groups, key.shape[2] // groups)).permute(0, 2, 1, 3, 4).flatten(0, 1)
         value = value.unflatten(2, (groups, value.shape[2] // groups)).permute(0, 2, 1, 3, 4).flatten(0, 1)
-    # This FA4 revision requires tensor full-block lists even when every tile
-    # uses the custom predicate. Zero counts make the aliased indices unused.
-    forward = block_lists(fc, fi, torch.zeros_like(fc), fi, block_size=(fwd_q, fwd_k))
+    # This FA4 revision requires full-block tensors even for the default path.
+    # Zero counts leave its aliased indices unused.
+    full_indices = fi
+    if (
+        capability == (9, 0)
+        and dim == 192
+        and batch == 1
+        and window is None
+        and selection is not None
+        and selection.forward_full_block_prefix >= 256
+        and query_start == 0
+        and queries == keys
+    ):
+        fc, fi, full_counts = _split_forward_full_blocks(fc, fi, prefix_length=selection.forward_full_block_prefix)
+    else:
+        full_counts = torch.zeros_like(fc)
+    forward = block_lists(fc, fi, full_counts, full_indices, block_size=(fwd_q, fwd_k))
     backward = block_lists(bc, bi, torch.zeros_like(bc), bi, block_size=(128, bwd_k))
     # SM100 provides native (192, 128) kernels. V-channel splitting preserves
     # the 192-dimensional Q/K scale and avoids padding Q/K to 256. Autograd

@@ -105,6 +105,7 @@ class CPReport(TypedDict):
     scenario: NotRequired[str]
     swa_varlen: NotRequired[bool]
     indexed_csa: NotRequired[bool]
+    csa_forward_full_blocks: NotRequired[bool]
     indexed_kernel_calls: NotRequired[dict[str, dict[str, int]]]
     position_buckets: NotRequired[dict[str, LogitBucket]]
     padding_queries: NotRequired[int]
@@ -377,6 +378,9 @@ def main() -> None:
     parser.add_argument("--backend", choices=("flex", "fa4"), default="fa4")
     parser.add_argument("--swa-varlen", action="store_true", help="Exercise opt-in native SWA window kernels")
     parser.add_argument(
+        "--csa-forward-full-blocks", action="store_true", help="Exercise opt-in CSA forward mask skipping"
+    )
+    parser.add_argument(
         "--indexed-csa", action="store_true", help="Enable indexed CSA and count actual CUDA FWB kernel events"
     )
     parser.add_argument(
@@ -458,8 +462,9 @@ def main() -> None:
                 experts="torch_mm",
                 swa_varlen=args.swa_varlen,
                 indexed_csa=args.indexed_csa,
+                csa_forward_full_blocks=args.csa_forward_full_blocks,
             )
-            if args.swa_varlen or args.indexed_csa
+            if args.swa_varlen or args.indexed_csa or args.csa_forward_full_blocks
             else BackendConfig(attn=args.backend, linear="torch", dispatcher="torch", experts="torch_mm")
         )
         model = Step5ForCausalLM(config, backend=backend).cuda()
@@ -481,6 +486,7 @@ def main() -> None:
         report["scenario"] = scenario
         report["swa_varlen"] = args.swa_varlen
         report["indexed_csa"] = args.indexed_csa
+        report["csa_forward_full_blocks"] = args.csa_forward_full_blocks
         print(json.dumps(report), flush=True)
         if args.indexed_csa and scenario.startswith("indexed-"):
             # These long scenarios make CP1 use indexed CSA. Under CP2, only

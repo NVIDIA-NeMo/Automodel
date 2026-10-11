@@ -94,6 +94,9 @@ class RegionSelection:
             of a fully selected B2 shard; None if either row needs the fallback.
         causal_row_layouts: Independent per-row prefix proofs for opt-in mixed B2 dispatch.
         indexed_layout: Optional physical region bounds for long sparse shards.
+        forward_full_block_prefix: Number of initial queries proven to select
+            every causal key in one unpadded global B1 document, with CP1 and
+            canonical positions starting at zero. Zero disables the proof.
         all_padding_key: The only allowed global key for a fully padded shard,
             after proving standard document positions and trailing padding.
     """
@@ -109,6 +112,7 @@ class RegionSelection:
     indexed_layout: IndexedRegionLayout | None = None
     causal_batch_layouts: tuple[CausalDocumentLayout, ...] | None = None
     causal_row_layouts: tuple[CausalDocumentLayout | None, ...] = ()
+    forward_full_block_prefix: int = 0
 
 
 @dataclass(frozen=True)
@@ -145,6 +149,9 @@ class RegionMetadata:
             satisfy native causal attention semantics.
         causal_row_layouts: Independent per-row prefix proofs for opt-in mixed B2 dispatch.
         indexed_layout: Optional shared physical bounds for indexed attention.
+        forward_full_block_prefix: Initial all-selected query count for opt-in
+            forward full blocks, proven only for unpadded B1 CP1 inputs with
+            positions exactly equal to global token indices. Zero is fallback.
         all_padding_key: Singleton global key for a fully padded, fully selected
             local CSA shard, or None when the shortcut cannot be established.
     """
@@ -169,6 +176,7 @@ class RegionMetadata:
     indexed_layout: IndexedRegionLayout | None = None
     causal_batch_layouts: tuple[CausalDocumentLayout, ...] | None = None
     causal_row_layouts: tuple[CausalDocumentLayout | None, ...] = ()
+    forward_full_block_prefix: int = 0
 
 
 def _summary_ranges(
@@ -211,6 +219,7 @@ def region_metadata(
     topk: int,
     window: int | None = None,
     indexed_csa: bool = False,
+    csa_forward_full_blocks: bool = False,
 ) -> RegionMetadata:
     """Prepare document/region metadata once per model forward.
 
@@ -224,6 +233,8 @@ def region_metadata(
         indexed_csa: Preserve independent B2 prefix proofs; prepare physical
             bounds only for regular sparse shards whose query-weighted
             historical region span reaches 32K tokens.
+        csa_forward_full_blocks: Retain a single-document CP1 proof for FA4
+            forward mask skipping, using this call's existing host metadata.
         window: Optional native SWA layout width. A globally trailing padded
             suffix keeps its custom-mask path. No additional host synchronization.
 
@@ -385,6 +396,14 @@ def region_metadata(
     causal_row_layouts = ()
     window_layout = None
     prefix_offset = 2 + 2 * batch * tiles_per_batch
+    forward_full_block_prefix = 0
+    if csa_forward_full_blocks and batch == 1 and query_start == 0 and queries == keys and queries:
+        # The positions and valid count are already in the shared host transfer.
+        # Repeated/reset/missing positions or any padding keep the old lists.
+        valid_queries = layout[prefix_offset + 1]
+        local_positions = layout[prefix_offset + 4 : prefix_offset + 4 + queries]
+        if valid_queries == queries and all(position == index for index, position in enumerate(local_positions)):
+            forward_full_block_prefix = min(queries, (topk + 1) * region_size)
     if batch in (1, 2) and queries:
         row_layouts: list[CausalDocumentLayout | None] = []
         for row in range(batch):
@@ -478,6 +497,7 @@ def region_metadata(
         indexed_layout,
         causal_batch_layouts,
         causal_row_layouts,
+        forward_full_block_prefix,
     )
 
 
@@ -621,6 +641,7 @@ class Step5SparseIndexer(nn.Module):
                 causal_layout=metadata.causal_layout,
                 causal_batch_layouts=metadata.causal_batch_layouts,
                 all_padding_key=metadata.all_padding_key,
+                forward_full_block_prefix=metadata.forward_full_block_prefix,
             )
         if keys is None or compression_logits is None:
             raise ValueError("Sparse CSA queries require the global indexer projections")
@@ -689,6 +710,7 @@ class Step5SparseIndexer(nn.Module):
             region_count,
             indexed_layout=metadata.indexed_layout,
             causal_row_layouts=metadata.causal_row_layouts,
+            forward_full_block_prefix=metadata.forward_full_block_prefix,
         )
 
 
