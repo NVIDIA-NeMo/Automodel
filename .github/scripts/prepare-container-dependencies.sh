@@ -27,8 +27,8 @@ fingerprint=$(
 )
 fingerprint=${fingerprint%% *}
 
-# Only main publishes the canonical scope. PRs/releases may reuse main or their
-# own previous build, but never another PR's dependency image.
+# PRs publish only their own scope. A cherry-pick may also read its release
+# target's compatible image; main never consumes a PR or release image.
 scope=main
 if [[ $CACHE_KEY != main ]]; then
   scope=$(printf '%s' "$CACHE_KEY" | sha256sum)
@@ -36,10 +36,17 @@ if [[ $CACHE_KEY != main ]]; then
 fi
 image="${REGISTRY}/automodel:deps-${scope}-${PLATFORM##*/}-${fingerprint}"
 baseline="${REGISTRY}/automodel:deps-main-${PLATFORM##*/}-${fingerprint}"
+candidates=("$image")
+if [[ $CACHE_KEY != main && -n ${RELEASE_BRANCH:-} ]]; then
+  [[ $RELEASE_BRANCH =~ ^r0\.[0-9]+\.0$ ]]
+  release_scope=$(printf '%s' "$RELEASE_BRANCH" | sha256sum)
+  candidates+=("${REGISTRY}/automodel:deps-branch-${release_scope:0:16}-${PLATFORM##*/}-${fingerprint}")
+fi
+candidates+=("$baseline")
 digest=
 error_file=$(mktemp)
 trap 'rm -f "$error_file"' EXIT
-for candidate in "$image" "$baseline"; do
+for candidate in "${candidates[@]}"; do
   if candidate_digest=$(docker buildx imagetools inspect "$candidate" --format '{{.Manifest.Digest}}' 2>"$error_file"); then
     [[ $candidate_digest =~ ^sha256:[0-9a-f]{64}$ ]]
     image=$candidate
