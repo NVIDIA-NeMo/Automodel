@@ -872,14 +872,17 @@ def apply_fsdp(
     # fp32 parameter holders whose forward ignores its input (DeepSeek-V4 attention sinks) share one FSDP
     # unit across all blocks instead of one per block: FSDP2 can only run their post-backward in the root
     # callback after the whole backward, serially — see fully_shard_across_blocks.
-    cross_block_params = parallelizer_utils.fully_shard_across_blocks(
-        list(_iter_moe_blocks(model, _model)),
-        tuple(getattr(model, "_fsdp_shard_across_blocks", None) or ()),
-        mesh=fsdp_mesh,
-        mp_policy=mp_policy,
-        offload_policy=offload_policy,
-        shard_module=shard_module,
-    )
+    cross_block_names = tuple(getattr(model, "_fsdp_shard_across_blocks", None) or ())
+    cross_block_params: set[nn.Parameter] = set()
+    if cross_block_names:
+        cross_block_params = parallelizer_utils.fully_shard_across_blocks(
+            list(_iter_moe_blocks(model, _model)),
+            cross_block_names,
+            mesh=fsdp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            shard_module=shard_module,
+        )
 
     multimodal_modules: list[tuple[str, nn.Module, set[nn.Parameter], bool]] = []
     for module_name, module in iter_multimodal_modules(model):
