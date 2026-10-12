@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tiny Nemotron PP/FSDP regressions on dedicated four/eight-GPU runners."""
+"""Tiny PP/FSDP and PP/TP/CP regressions on dedicated four/eight-GPU runners."""
 
 from pathlib import Path
 
 import pytest
 
 from tests.functional_tests.parallelism_multigpu.gpu_workers import GPUWorkers
+from tests.functional_tests.parallelism_multigpu.recipe_parity import run_recipe_pair
 
 
 @pytest.mark.parametrize("pp_size", [2, 4])
@@ -47,4 +48,18 @@ def test_pp_fsdp_mixed_dtypes(
             "mtp_depth": mtp_depth,
         },
         tmp_path,
+    )
+
+
+def test_pp_tp_cp_recipe(parallelism_gpu_workers: GPUWorkers, tmp_path: Path) -> None:
+    """Compare PP2/TP2 (four GPUs) or PP2/TP2/CP2 (eight GPUs) to a no-PP reference."""
+    count = parallelism_gpu_workers.ranks
+    run_recipe_pair(
+        workers=parallelism_gpu_workers,
+        pp_size=2,
+        config=Path(__file__).with_name("llama.yaml"),
+        overrides=["--distributed.cp_size", str(count // 4), "--model.backend.attn", "te" if count == 8 else "sdpa"],
+        output=tmp_path,
+        loss_tol=0.05,
+        grad_norm_rtol=0.05,
     )

@@ -18,9 +18,9 @@ All use one attempt.
 
 | Runner | Suites | Topologies |
 | --- | --- | --- |
-| `nemo-ci-aws-gpu-x4` | `parallelism_multigpu,moe_multigpu` | PP2/FSDP2, PP4, PP2/EP2 |
-| `nemo-ci-aws-gpu-x8` | `parallelism_multigpu,moe_multigpu` | PP2/FSDP4, PP4/FSDP2, PP4/EP2, PP2/EP2/FSDP4 |
-| `nemo-ci-gcp-gpu-x4` | `parallelism_multigpu` | PP2/FSDP2, PP4 |
+| `nemo-ci-aws-gpu-x4` | `parallelism_multigpu,moe_multigpu` | PP2/FSDP2, PP4, PP2/TP2, PP2/EP2 |
+| `nemo-ci-aws-gpu-x8` | `parallelism_multigpu,moe_multigpu` | PP2/FSDP4, PP4/FSDP2, PP2/TP2/CP2, PP4/EP2, PP2/EP2/FSDP4 |
+| `nemo-ci-gcp-gpu-x4` | `parallelism_multigpu` | PP2/FSDP2, PP4, PP2/TP2 |
 
 EP shares the data-parallel ranks; its size does not multiply the GPU count.
 The larger member pools retain the workflow's contributor trust checks. The
@@ -45,12 +45,18 @@ dtypes. Final MTP states stay on the last stage and follow the unpartitioned
 model's dtype: CUDA autocast may promote their final Torch RMSNorm to FP32
 even with BF16 residuals.
 
-The Nemotron MoE recipe uses 32-token sequences and vocabulary 128. It retains
-width 512 and latent width 256 to exercise the
+The tiny Llama recipe adds tensor parallelism and context parallelism, using
+TE attention when CP is enabled. Sequence parallelism is disabled: the PP2/TP2
+control with SP enabled hangs in NCCL RECV with full-sequence receive metadata
+on the tested PyTorch 2.13 image. This is a separate coverage gap; enabling SP
+in `llama.yaml` retains a small reproduction.
+The recipes use 32-token sequences and vocabulary 128. Llama has two layers,
+width 64 and global batch two, the smallest batch for its PP2 schedule;
+the Nemotron MoE recipe retains width 512 and latent width 256 to exercise the
 latent projection, with four experts, expert intermediate width 128 and top-2
 routing to exercise HybridEP with both Torch and Transformer Engine experts.
-The MoE cases compare three optimizer steps and final validation against a run
-with PP disabled and the same EP degree. The reference uses the same workers,
+Both compare three optimizer steps and final validation against a run with PP
+disabled and the same TP/CP/EP degrees. The reference uses the same workers,
 increasing DP size and decreasing the local batch by the PP size to preserve
 the global batch and accumulation count. After normal recipe setup, the test
 entrypoint assigns random weights seeded by parameter name and checks matching
@@ -59,7 +65,7 @@ initial weights when stages initialize different parameter subsets. Production
 setup still runs so stage-specific initialization hangs remain detectable.
 Every loss and gradient norm must be
 finite, every expected step must be present, and gradients must be nonzero.
-Loss tolerance is 0.10 for MoE; gradient-norm relative
+Loss tolerance is 0.05 for Llama and 0.10 for MoE; gradient-norm relative
 tolerance is 0.05. These account for BF16 reduction and GEMM ordering; the
 separate dense test provides per-parameter checks.
 
