@@ -94,7 +94,7 @@ def _relative_rms(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("length", [4096, 8192])
-@pytest.mark.parametrize("direction", ["forward", "backward", "both"])
+@pytest.mark.parametrize("direction", ["forward", "backward", "both", "canonical"])
 def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
     monkeypatch: pytest.MonkeyPatch,
     length: int,
@@ -176,9 +176,12 @@ def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
         chosen = replace(
             selection,
             forward_full_block_prefix=metadata.forward_full_block_prefix
-            if direction == "both" or (direction == "forward" and enabled)
+            if direction in ("both", "canonical") or (direction == "forward" and enabled)
             else 0,
-            backward_full_block_prefix=metadata.backward_full_block_prefix if direction != "forward" and enabled else 0,
+            canonical_region_size=metadata.canonical_region_size if direction == "canonical" and enabled else 0,
+            backward_full_block_prefix=metadata.backward_full_block_prefix
+            if direction == "canonical" or (direction != "forward" and enabled)
+            else 0,
         )
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
@@ -206,7 +209,7 @@ def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
             }
         )
         runs.append((output.detach(), gradients[0], gradients[1][:, :, 0], gradients[1][:, :, 1]))
-    assert len(full_block_counts) == 1 and full_block_counts[0].sum() > 0
+    assert len(full_block_counts) == (3 if direction == "canonical" else 1) and full_block_counts[0].sum() > 0
     assert full_block_counts[0].shape[:2] == ((1, providers * 16) if providers > 1 else (1, 1))
     aa_metrics = {}
     if direction != "forward":

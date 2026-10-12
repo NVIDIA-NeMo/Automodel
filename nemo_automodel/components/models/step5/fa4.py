@@ -28,9 +28,20 @@ from nemo_automodel.shared.import_utils import safe_import
 
 @functools.cache
 def _load_fa4(
-    window: int | None, bitmap: bool, slots: int, provider_groups: int, *, heads_per_group: int = 0
+    window: int | None,
+    bitmap: bool,
+    slots: int,
+    provider_groups: int,
+    *,
+    heads_per_group: int = 0,
+    canonical_region_size: int = 0,
 ) -> tuple[Callable, type, Callable]:
-    """Load optional FA4 dependencies and cache a shape-independent CuTe mask."""
+    """Load FA4 and cache a mask, optionally specializing a proven document.
+
+    canonical_region_size>0 requires one unpadded B1 CP1 document with Q=K,
+    zero query_start and positions exactly 0..K-1. Its token_regions are
+    physical_key // canonical_region_size; learned membership is unchanged.
+    """
     imported = [
         safe_import(name)
         for name in (
@@ -68,18 +79,24 @@ def _load_fa4(
         b = batch[0] if cutlass.const_expr(heads_per_group > 0) else batch[0] // provider_groups
         q = cutlass.min(query_idx[0], seqlen_info.seqlen_q - 1)
         k = cutlass.min(key_idx[0], seqlen_info.seqlen_k - 1)
-        distance = positions[b, q] - key_positions[b, k]
-        valid = (
-            (query_idx[0] < seqlen_info.seqlen_q)
-            & (key_idx[0] < seqlen_info.seqlen_k)
-            & (distance >= 0)
-            & (padding[b, k] == 0)
-            & (documents[b, q] == key_documents[b, k])
-        )
+        if cutlass.const_expr(canonical_region_size > 0):
+            distance = q - k
+            valid = (query_idx[0] < seqlen_info.seqlen_q) & (key_idx[0] < seqlen_info.seqlen_k) & (distance >= 0)
+        else:
+            distance = positions[b, q] - key_positions[b, k]
+            valid = (
+                (query_idx[0] < seqlen_info.seqlen_q)
+                & (key_idx[0] < seqlen_info.seqlen_k)
+                & (distance >= 0)
+                & (padding[b, k] == 0)
+                & (documents[b, q] == key_documents[b, k])
+            )
         if cutlass.const_expr(window is not None):
             valid = valid & (distance < window)
         elif cutlass.const_expr(slots > 0):
-            target = token_regions[b, k]
+            target = (
+                k // canonical_region_size if cutlass.const_expr(canonical_region_size > 0) else token_regions[b, k]
+            )
             group = (
                 head[0] // heads_per_group if cutlass.const_expr(heads_per_group > 0) else batch[0] % provider_groups
             )
@@ -718,10 +735,36 @@ def fa4_attention(
             query = query.unflatten(2, (groups, heads_per_group)).permute(0, 2, 1, 3, 4).flatten(0, 1)
             key = key.unflatten(2, (groups, key.shape[2] // groups)).permute(0, 2, 1, 3, 4).flatten(0, 1)
             value = value.unflatten(2, (groups, value.shape[2] // groups)).permute(0, 2, 1, 3, 4).flatten(0, 1)
+    canonical_region_size = (
+        selection.canonical_region_size
+        if (
+            capability == (9, 0)
+            and dim == 192
+            and batch == 1
+            and window is None
+            and selection is not None
+            and query_start == 0
+            and queries == keys
+        )
+        else 0
+    )
     if head_layout:
-        attention, block_lists, mask_mod = _load_fa4(window, bitmap, slots, groups, heads_per_group=heads_per_group)
+        attention, block_lists, mask_mod = _load_fa4(
+            window,
+            bitmap,
+            slots,
+            groups,
+            heads_per_group=heads_per_group,
+            canonical_region_size=canonical_region_size,
+        )
     else:
-        attention, block_lists, mask_mod = _load_fa4(window, bitmap, slots, groups)
+        attention, block_lists, mask_mod = _load_fa4(
+            window,
+            bitmap,
+            slots,
+            groups,
+            canonical_region_size=canonical_region_size,
+        )
     # This FA4 revision requires full-block tensors even for the default path.
     # Zero counts leave its aliased indices unused.
     full_indices = fi

@@ -99,6 +99,9 @@ class RegionSelection:
             canonical positions starting at zero. Zero disables the proof.
         backward_full_block_prefix: The same proof as forward_full_block_prefix,
             independently enabled for backward mask skipping. Zero is fallback.
+        canonical_region_size: Region width when the full-block proof also
+            establishes canonical global token coordinates; zero disables the
+            optional arithmetic mask specialization.
         all_padding_key: The only allowed global key for a fully padded shard,
             after proving standard document positions and trailing padding.
     """
@@ -116,6 +119,7 @@ class RegionSelection:
     causal_row_layouts: tuple[CausalDocumentLayout | None, ...] = ()
     forward_full_block_prefix: int = 0
     backward_full_block_prefix: int = 0
+    canonical_region_size: int = 0
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,9 @@ class RegionMetadata:
             positions exactly equal to global token indices. Zero is fallback.
         backward_full_block_prefix: The same proof as forward_full_block_prefix,
             independently enabled for backward mask skipping. Zero is fallback.
+        canonical_region_size: Region width when the full-block proof also
+            establishes canonical global token coordinates; zero disables the
+            optional arithmetic mask specialization.
         all_padding_key: Singleton global key for a fully padded, fully selected
             local CSA shard, or None when the shortcut cannot be established.
     """
@@ -183,6 +190,7 @@ class RegionMetadata:
     causal_row_layouts: tuple[CausalDocumentLayout | None, ...] = ()
     forward_full_block_prefix: int = 0
     backward_full_block_prefix: int = 0
+    canonical_region_size: int = 0
 
 
 def _summary_ranges(
@@ -407,6 +415,7 @@ def region_metadata(
     prefix_offset = 2 + 2 * batch * tiles_per_batch
     forward_full_block_prefix = 0
     backward_full_block_prefix = 0
+    canonical_region_size = 0
     if (
         (csa_forward_full_blocks or csa_backward_full_blocks)
         and batch == 1
@@ -419,6 +428,7 @@ def region_metadata(
         valid_queries = layout[prefix_offset + 1]
         local_positions = layout[prefix_offset + 4 : prefix_offset + 4 + queries]
         if valid_queries == queries and all(position == index for index, position in enumerate(local_positions)):
+            canonical_region_size = region_size
             proven_prefix = min(queries, (topk + 1) * region_size)
             if csa_forward_full_blocks:
                 forward_full_block_prefix = proven_prefix
@@ -519,6 +529,7 @@ def region_metadata(
         causal_row_layouts,
         forward_full_block_prefix,
         backward_full_block_prefix,
+        canonical_region_size,
     )
 
 
@@ -664,6 +675,7 @@ class Step5SparseIndexer(nn.Module):
                 all_padding_key=metadata.all_padding_key,
                 forward_full_block_prefix=metadata.forward_full_block_prefix,
                 backward_full_block_prefix=metadata.backward_full_block_prefix,
+                canonical_region_size=metadata.canonical_region_size,
             )
         if keys is None or compression_logits is None:
             raise ValueError("Sparse CSA queries require the global indexer projections")
@@ -736,6 +748,7 @@ class Step5SparseIndexer(nn.Module):
             causal_row_layouts=metadata.causal_row_layouts,
             forward_full_block_prefix=metadata.forward_full_block_prefix,
             backward_full_block_prefix=metadata.backward_full_block_prefix,
+            canonical_region_size=metadata.canonical_region_size,
         )
 
 

@@ -87,7 +87,7 @@ def _assert_existing_fields_equal(first: RegionMetadata, second: RegionMetadata)
                 equal(a.__dict__[field.name], b.__dict__[field.name])
 
     for field in fields(first):
-        if field.name != "forward_full_block_prefix":
+        if field.name not in ("forward_full_block_prefix", "canonical_region_size"):
             equal(first.__dict__[field.name], second.__dict__[field.name])
 
 

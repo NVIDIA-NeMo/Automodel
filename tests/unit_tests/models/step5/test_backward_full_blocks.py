@@ -158,7 +158,8 @@ def test_backward_proof_is_independent_and_conservative(case: str) -> None:
     )
     assert new.backward_full_block_prefix == (264 if case == "single" else 0)
     assert new.forward_full_block_prefix == 0
-    _assert_existing_fields_equal(old, replace(new, backward_full_block_prefix=0))
+    assert new.canonical_region_size == (8 if case == "single" else 0)
+    _assert_existing_fields_equal(old, replace(new, backward_full_block_prefix=0, canonical_region_size=0))
 
 
 @pytest.mark.parametrize("value", [1, "true", None])
