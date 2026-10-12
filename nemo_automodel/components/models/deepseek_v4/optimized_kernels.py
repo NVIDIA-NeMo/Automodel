@@ -42,7 +42,7 @@ import torch
 from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.shared.import_utils import safe_import_from
 
-Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "auto"]
+Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "cudnn", "auto"]
 Dsv4IndexerBackend = Literal["torch", "tilelang", "auto"]
 Dsv4SinkhornBackend = Literal["torch", "tilelang", "auto"]
 
@@ -369,6 +369,7 @@ def dsv4_sparse_attention(
     *,
     backend: Dsv4SparseAttentionBackend,
     reference_rounding: bool = False,
+    all_rows_nonempty: bool = False,
 ) -> torch.Tensor:
     """Run sparse attention with an optional original-inference rounding mode.
 
@@ -385,6 +386,10 @@ def dsv4_sparse_attention(
     Returns:
         Attention output [batch, sequence, heads, head_dim], with q's dtype.
     """
+    if backend == "cudnn":
+        # cuDNN Frontend DSA kernels (FlashMLA forward when installed): one flat token axis, global K/V coordinates.
+        # The kernels have their own rounding, so ``reference_rounding`` does not apply here.
+        return _dsv4_sparse_attention_cudnn(q, kv, sinks, topk_idxs, sm_scale, all_rows_nonempty=all_rows_nonempty)
     use_tilelang = _should_use_tilelang(
         backend,
         available=_HAS_MILES_SPARSE_ATTN,
@@ -425,6 +430,55 @@ def dsv4_sparse_attention(
     if reference_rounding:
         raise ValueError("Original-inference sparse attention rounding requires the TileLang backend")
     return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
+
+
+def _dsv4_sparse_attention_cudnn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    sinks: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    sm_scale: float,
+    all_rows_nonempty: bool = False,
+) -> torch.Tensor:
+    """Run the shared cuDNN sparse attention on batched DSV4 tensors.
+
+    Args:
+        q: BF16 queries ``[batch, sequence, heads, head_dim]``.
+        kv: BF16 shared keys/values ``[batch, kv_sequence, head_dim]``.
+        sinks: FP32 per-head sink logits ``[heads]``.
+        topk_idxs: Per-batch sparse indices ``[batch, sequence, slots]`` with ``-1`` masked.
+        sm_scale: Softmax scale.
+
+    Returns:
+        BF16 output ``[batch, sequence, heads, head_dim]``.
+    """
+    from nemo_automodel.components.models.common.cudnn_sparse_attention import (
+        cudnn_sparse_attention,
+        is_cudnn_sparse_attention_available,
+    )
+
+    if not is_cudnn_sparse_attention_available():
+        raise RuntimeError(
+            "backend.attn='cudnn' requires nvidia-cudnn-frontend[cutedsl] >= 1.29 (or FlashMLA for the forward)."
+        )
+    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+        raise RuntimeError("dsv4 cuDNN sparse attention requires bfloat16 q and kv.")
+    batch, sequence, heads, head_dim = q.shape
+    kv_sequence = kv.shape[1]
+    offsets = (torch.arange(batch, device=topk_idxs.device, dtype=torch.int64) * kv_sequence).view(batch, 1, 1)
+    flat_idx = torch.where(
+        topk_idxs >= 0, topk_idxs.to(torch.int64) + offsets, torch.full_like(topk_idxs, -1, dtype=torch.int64)
+    )
+    flat_idx = flat_idx.reshape(batch * sequence, 1, -1).to(torch.int32).contiguous()
+    output = cudnn_sparse_attention(
+        q.reshape(batch * sequence, heads, head_dim).contiguous(),
+        kv.reshape(batch * kv_sequence, 1, head_dim).contiguous(),
+        flat_idx,
+        softmax_scale=sm_scale,
+        all_rows_nonempty=all_rows_nonempty,
+        attn_sink=sinks.to(torch.float32).contiguous(),
+    )
+    return output.reshape(batch, sequence, heads, -1)
 
 
 def indexer_scores_torch(
