@@ -133,6 +133,8 @@ The following advanced settings apply only when `dispatcher: hybridep`:
 | `dispatcher_hybridep_num_sms_preprocessing` | `null` | Override the number of SMs used for routing-metadata preprocessing. |
 | `dispatcher_hybridep_num_blocks_permute` | `null` | Override the number of dispatch permutation blocks. |
 | `dispatcher_hybridep_num_blocks_unpermute` | `null` | Override the number of combine unpermutation blocks. |
+| `dispatcher_capacity_factor` | `null` | Capacity mode for dynamic routing: size the dispatch buffers once from the first real batch times this factor and run later dispatches non-blocking; an overflow trips a device-side assert. Not for experts with `expert_bias`. |
+| `dispatcher_equal_token_counts` | `false` | Declare that every EP rank dispatches the same row count, so the per-dispatch pad-size all-reduce and its host sync are skipped. Keep `false` for variable-length or packed inputs. |
 
 Leave the numeric tuning settings unset to use HybridEP defaults unless a matched benchmark demonstrates an improvement. A value that improves performance on one GPU architecture or topology might reduce performance on another.
 

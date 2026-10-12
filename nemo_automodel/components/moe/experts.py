@@ -1463,9 +1463,6 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_hybridep_compact_routing = (
             backend.dispatcher_hybridep_compact_routing if backend is not None else False
         )
-        self.dispatcher_hybridep_token_capacity = (
-            backend.dispatcher_hybridep_token_capacity if backend is not None else None
-        )
         self.dispatcher_hybridep_num_sms_preprocessing = (
             backend.dispatcher_hybridep_num_sms_preprocessing if backend is not None else None
         )
@@ -1475,6 +1472,23 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
         )
+        # HybridEP capacity mode (BackendConfig.dispatcher_capacity_factor): the dispatcher returns
+        # device-side tokens_per_expert and buffers of a fixed capacity, so the per-microbatch
+        # count_nonzero host read below is skipped as well (rows are never empty).
+        self.dispatcher_capacity_factor = (
+            getattr(backend, "dispatcher_capacity_factor", None) if backend is not None else None
+        )
+        self.dispatcher_equal_token_counts = (
+            bool(getattr(backend, "dispatcher_equal_token_counts", False)) if backend is not None else False
+        )
+        if self.dispatcher_capacity_factor is not None and self.expert_bias:
+            # Capacity mode pads the dispatched buffer past the routed row count while tokens_per_expert
+            # still sums to the routed rows; _apply_bias sizes its repeat_interleave from the buffer rows,
+            # so the bias add would trip a device-side size assert. Keep such models on the blocking path.
+            raise ValueError(
+                "dispatcher_capacity_factor is not supported for experts with expert_bias=True; "
+                "leave it at None (blocking HybridEP dispatch) for this model."
+            )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -1510,10 +1524,11 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
             moe_hybridep_permute_fusion=self.dispatcher_hybridep_permute_fusion,
             moe_hybridep_compact_routing=self.dispatcher_hybridep_compact_routing,
-            moe_hybridep_token_capacity=self.dispatcher_hybridep_token_capacity,
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
+            moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -1635,7 +1650,11 @@ class GroupedExpertsDeepEP(nn.Module):
         # construction, so the count_nonzero device-to-host read (one per microbatch, and
         # again per activation-checkpoint recompute) can be skipped.
         router_weight_already_applied = False
-        if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
+        if (
+            self.static_routing
+            or self.dispatcher_capacity_factor is not None
+            or torch.count_nonzero(tokens_per_expert) > 0
+        ):
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             gate_up_output_bytes = (
                 permuted_local_hidden_states.shape[0]
@@ -1815,9 +1834,6 @@ class GroupedExpertsTE(nn.Module):
         )
         self.dispatcher_hybridep_compact_routing = (
             backend.dispatcher_hybridep_compact_routing if backend is not None else False
-        )
-        self.dispatcher_hybridep_token_capacity = (
-            backend.dispatcher_hybridep_token_capacity if backend is not None else None
         )
         self.dispatcher_hybridep_num_sms_preprocessing = (
             backend.dispatcher_hybridep_num_sms_preprocessing if backend is not None else None
@@ -2140,7 +2156,6 @@ class GroupedExpertsTE(nn.Module):
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
             moe_hybridep_permute_fusion=self.dispatcher_hybridep_permute_fusion,
             moe_hybridep_compact_routing=self.dispatcher_hybridep_compact_routing,
-            moe_hybridep_token_capacity=self.dispatcher_hybridep_token_capacity,
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
