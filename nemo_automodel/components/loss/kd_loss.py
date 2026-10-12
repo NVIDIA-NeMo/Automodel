@@ -314,6 +314,8 @@ class KDLoss(nn.Module):
         t_logits = teacher_logits[valid_mask]
         s_logits = student_logits[valid_mask]
 
+        # Tensor temperatures retain the original gradient-reduction order.
+        # Wider logits keep full-token preprocessing to release raw FP64 gathers before chunking.
         if (
             tp_group is None
             and 0 < self.chunk_size < t_logits.shape[0]
