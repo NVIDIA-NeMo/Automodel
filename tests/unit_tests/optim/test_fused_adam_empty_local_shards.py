@@ -29,14 +29,17 @@ import functools
 import logging
 import sys
 import types
+from copy import deepcopy
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
+from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
 from nemo_automodel.components.optim.optimizer import (
     FusedAdamConfig,
     OptimizerFromFactoryConfig,
@@ -80,6 +83,32 @@ class _RecordingFusedAdam(torch.optim.Optimizer):
         """
         assert zero_buffer
         self.state[parameter][state_name] = torch.zeros_like(parameter, dtype=torch.float32)
+
+    def step(self, closure=None):
+        """Model TE's lazy state and group-step lifecycle without CUDA kernels."""
+        for group in self.param_groups:
+            group["step"] = group.get("step", 0) + 1
+            for parameter in group["params"]:
+                if not self.state[parameter]:
+                    self._initialize_state(parameter, "exp_avg", True)
+                    self._initialize_state(parameter, "exp_avg_sq", True)
+                    if self.master_weights:
+                        self.state[parameter]["master_param"] = parameter.detach().float().clone()
+
+    def load_state_dict(self, state_dict):
+        """Restore original moment dtypes as TE does after the PyTorch load pass.
+
+        Args:
+            state_dict: Native checkpoint whose state tensors match the arbitrary
+                parameter shapes and DTensor placements and remain FP32 on load.
+        """
+        super().load_state_dict(state_dict)
+        for group, saved_group in zip(self.param_groups, state_dict["param_groups"]):
+            for parameter, saved_id in zip(group["params"], saved_group["params"]):
+                if saved_id in state_dict["state"]:
+                    self.state[parameter] = {
+                        name: value.detach().clone() for name, value in state_dict["state"][saved_id].items()
+                    }
 
 
 def _te_stub_modules() -> dict[str, types.ModuleType]:
@@ -267,6 +296,8 @@ class TestOptimizerFromFactoryConfig:
 
         optimizer = cfg.build(_TinyModel())[0]
 
+        assert not optimizer.state
+        optimizer.step()
         assert all(set(optimizer.state[param]) == {"exp_avg", "exp_avg_sq"} for param in stub_te_fused_adam.last_params)
 
     def test_non_te_factory_is_not_filtered(self):
@@ -315,8 +346,7 @@ def test_fused_adam_cuda_omits_fp32_master_before_and_after_resume():
     bf16_param = nn.Parameter(torch.tensor([3.0, -4.0], device=device, dtype=torch.bfloat16))
     optimizer = FusedAdamConfig(lr=1e-2)._build_optimizer([fp32_param, bf16_param])
 
-    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
-    assert optimizer.state[bf16_param] == {}
+    assert not optimizer.state
 
     fp32_param.grad = torch.tensor([0.25, -0.5], device=device, dtype=torch.float32)
     bf16_param.grad = torch.tensor([0.5, -0.25], device=device, dtype=torch.bfloat16)
@@ -333,3 +363,92 @@ def test_fused_adam_cuda_omits_fp32_master_before_and_after_resume():
 
     assert "master_param" not in optimizer.state[fp32_param]
     assert "master_param" in optimizer.state[bf16_param]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("factory", [False, True])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "stub",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA for real TE update parity"),
+        ),
+    ],
+)
+def test_fresh_optimizer_dcp_restore(tmp_path, request, mixed, factory, backend):
+    """Fresh DCP restore preserves group steps, moments, and the next update.
+
+    The CPU fixture checks the TE initialization/load lifecycle. The CUDA cases
+    run real TE kernels and require exact resumed-versus-uninterrupted parity.
+    """
+    if backend == "stub":
+        fused_adam = request.getfixturevalue("stub_te_fused_adam")
+        device = "cpu"
+    else:
+        pytest.importorskip("transformer_engine.pytorch")
+        from transformer_engine.pytorch.optimizers import FusedAdam
+
+        fused_adam = FusedAdam
+        device = "cuda"
+
+    def make_model():
+        model = nn.Module()
+        model.fp32 = nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.float32, device=device))
+        if mixed:
+            model.bf16 = nn.Parameter(torch.tensor([3.0, -4.0], dtype=torch.bfloat16, device=device))
+        return model
+
+    def step(model, optimizer, index):
+        """Apply deterministic gradients to plain FP32/BF16 parameters of shape [2].
+
+        Args:
+            model: Module with parameters of shape [2] on the selected test device.
+            optimizer: TE or recording optimizer owning those parameters.
+            index: Update index used to vary gradients between steps.
+        """
+        for position, parameter in enumerate(model.parameters()):
+            parameter.grad = torch.full_like(parameter, (index + 1) * (position + 1) / 8)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    config = (
+        OptimizerFromFactoryConfig(factory=fused_adam, kwargs={"lr": 0.01, "master_weights": True})
+        if factory
+        else FusedAdamConfig(lr=0.01)
+    )
+    model = make_model()
+    optimizer = config.build(model)[0]
+    assert not optimizer.state
+    for index in range(3):
+        step(model, optimizer, index)
+    if backend == "stub":
+        # Give the recording-only state nonzero values so loading is observable.
+        for parameter in model.parameters():
+            optimizer.state[parameter]["exp_avg"].fill_(0.25)
+            optimizer.state[parameter]["exp_avg_sq"].fill_(0.125)
+    model_state = deepcopy(model.state_dict())
+    dcp.save({"optimizer": OptimizerState(model, optimizer)}, checkpoint_id=tmp_path)
+    resumed_model = make_model()
+    resumed_model.load_state_dict(model_state)
+    resumed = config.build(resumed_model)[0]
+    assert not resumed.state
+    dcp.load({"optimizer": OptimizerState(resumed_model, resumed)}, checkpoint_id=tmp_path)
+
+    assert resumed.param_groups[0]["step"] == optimizer.param_groups[0]["step"] == 3
+    for source, target in zip(model.parameters(), resumed_model.parameters()):
+        assert set(resumed.state[target]) == set(optimizer.state[source])
+        for key, value in optimizer.state[source].items():
+            torch.testing.assert_close(resumed.state[target][key], value, rtol=0, atol=0)
+    assert "master_param" not in resumed.state[resumed_model.fp32]
+    if mixed:
+        assert "master_param" in resumed.state[resumed_model.bf16]
+
+    step(model, optimizer, 3)
+    step(resumed_model, resumed, 3)
+    assert resumed.param_groups[0]["step"] == optimizer.param_groups[0]["step"] == 4
+    for source, target in zip(model.parameters(), resumed_model.parameters()):
+        torch.testing.assert_close(target, source, rtol=0, atol=0)
+        for key, value in optimizer.state[source].items():
+            torch.testing.assert_close(resumed.state[target][key], value, rtol=0, atol=0)

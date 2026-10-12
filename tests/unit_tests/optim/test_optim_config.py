@@ -163,7 +163,12 @@ def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(
             self.state[parameter][state_name] = torch.zeros_like(parameter, dtype=torch.float32)
 
         def load_state_dict(self, state_dict):
-            """Mimic TE's second state rebuild after PyTorch load hooks run."""
+            """Mimic TE's second state rebuild after PyTorch load hooks run.
+
+            Args:
+                state_dict: Checkpoint mapping parameter IDs to FP32 moment and
+                    optional master tensors of shape [4], in optimizer group order.
+            """
             super().load_state_dict(state_dict)
             saved_ids = [saved_id for group in state_dict["param_groups"] for saved_id in group["params"]]
             current_params = [parameter for group in self.param_groups for parameter in group["params"]]
@@ -172,11 +177,15 @@ def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(
                 parameter = id_map[saved_id]
                 self.state[parameter] = {name: value.detach().clone() for name, value in saved_state.items()}
 
+        def step(self, closure=None):
+            """Expose the state created by the step hook without running kernels."""
+            assert set(self.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
+
     optimizer = FakeFusedAdam()
     _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
 
-    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
-    assert optimizer.state[bf16_param] == {}
+    assert not optimizer.state
+    optimizer.step()
 
     optimizer.state[bf16_param]["exp_avg"] = torch.zeros_like(bf16_param, dtype=torch.float32)
     optimizer.state[bf16_param]["exp_avg_sq"] = torch.zeros_like(bf16_param, dtype=torch.float32)
@@ -192,8 +201,9 @@ def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(
     pre_step_checkpoint["state"] = {}
     optimizer.load_state_dict(pre_step_checkpoint)
 
+    assert not optimizer.state
+    optimizer.step()
     assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
-    assert optimizer.state[bf16_param] == {}
 
 
 # ---------------------------------------------------------------------------

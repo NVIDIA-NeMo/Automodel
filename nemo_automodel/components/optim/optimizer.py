@@ -172,8 +172,7 @@ def _trainable_params_or_groups(part: torch.nn.Module, overrides: list[ParamGrou
     named_params = [(name, p) for name, p in part.named_parameters() if p.requires_grad]
     if not named_params:
         raise ValueError("optimizer received no trainable parameters")
-    params_or_groups = _build_param_groups(named_params, overrides) if overrides else [p for _, p in named_params]
-    return _split_dtensor_and_plain_params(params_or_groups)
+    return _build_param_groups(named_params, overrides) if overrides else [p for _, p in named_params]
 
 
 def _split_dtensor_and_plain_params(
@@ -212,8 +211,16 @@ def _split_dtensor_and_plain_params(
         sharded = [param for param in params if isinstance(param, DTensor)]
         if not plain or not sharded:
             return [group]
-        options = {key: value for key, value in group.items() if key != "params"}
-        return [{"params": sharded, **options}, {"params": plain, **options}]
+        options = {key: value for key, value in group.items() if key not in {"params", "param_names"}}
+        result = [{"params": sharded, **options}, {"params": plain, **options}]
+        if "param_names" in group:
+            for split, is_dtensor in zip(result, (True, False)):
+                split["param_names"] = [
+                    name
+                    for name, param in zip(group["param_names"], params)
+                    if isinstance(param, DTensor) == is_dtensor
+                ]
+        return result
 
     is_groups = bool(params_or_groups) and isinstance(params_or_groups[0], dict)
     groups = cast(list[dict[str, Any]], params_or_groups) if is_groups else [{"params": params_or_groups}]
@@ -221,6 +228,63 @@ def _split_dtensor_and_plain_params(
     if is_groups or len(split_groups) > 1:
         return split_groups
     return split_groups[0]["params"]
+
+
+def _register_unsplit_checkpoint_load(
+    optimizer: torch.optim.Optimizer,
+    original_params: list[torch.nn.Parameter] | list[dict[str, Any]],
+) -> None:
+    """Map native checkpoints from the original groups into their split layout.
+
+    Args:
+        optimizer: Optimizer built from homogeneous DTensor/plain groups.
+        original_params: Parameters of arbitrary shape, or group dicts containing
+            them, in their pre-split order. DTensor meshes and placements are
+            preserved. Only integer positions are retained by the load hook.
+    """
+    groups = (
+        cast(list[dict[str, Any]], original_params)
+        if original_params and isinstance(original_params[0], dict)
+        else [{"params": original_params}]
+    )
+    layouts = [[isinstance(param, DTensor) for param in group["params"]] for group in groups]
+    if not any(any(layout) and not all(layout) for layout in layouts):
+        return
+
+    def load_unsplit_groups(
+        loaded_optimizer: torch.optim.Optimizer, state_dict: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Partition saved IDs before PyTorch maps them to live parameters.
+
+        Args:
+            loaded_optimizer: Optimizer with homogeneous parameter groups.
+            state_dict: Native checkpoint containing per-parameter state tensors
+                of the same arbitrary shapes/DTensor layouts as the parameters.
+
+        Returns:
+            A shallow checkpoint copy with split groups for a legacy layout, or
+            None for current/invalid layouts handled by the native loader. State
+            tensors are shared with the input; no checkpoint entries are mutated.
+        """
+        saved_groups = state_dict["param_groups"]
+        if len(saved_groups) == len(loaded_optimizer.param_groups) or len(saved_groups) != len(layouts):
+            return None
+        if any(len(group["params"]) != len(layout) for group, layout in zip(saved_groups, layouts)):
+            return None
+        migrated = []
+        for group, layout in zip(saved_groups, layouts):
+            if all(layout) or not any(layout):
+                migrated.append(group)
+                continue
+            for is_dtensor in (True, False):
+                indices = [index for index, sharded in enumerate(layout) if sharded == is_dtensor]
+                split = {**group, "params": [group["params"][index] for index in indices]}
+                if "param_names" in group:
+                    split["param_names"] = [group["param_names"][index] for index in indices]
+                migrated.append(split)
+        return {**state_dict, "param_groups": migrated}
+
+    optimizer.register_load_state_dict_pre_hook(load_unsplit_groups)
 
 
 @dataclass
@@ -240,6 +304,10 @@ class OptimizerConfig:
     # Whether this optimizer can be sharded for Megatron-FSDP. The recipe layer
     # reads this to decide whether to shard the built optimizers.
     supports_megatron_fsdp_sharding: ClassVar[bool] = True
+
+    # TE handles mixed tensor layouts internally; preserve its groups before
+    # filtering locally empty shards. Torch foreach needs homogeneous groups.
+    _split_dtensor_groups: ClassVar[bool] = True
 
     # Per-group LR/WD overrides matched by parameter name. Empty = single group
     # (unchanged behavior). Honored by the standard torch optimizers (typed configs
@@ -278,7 +346,11 @@ class OptimizerConfig:
         optimizers: list[torch.optim.Optimizer] = []
         for part in getattr(model, "parts", [model]):
             params = _trainable_params_or_groups(part, self.param_group_overrides)
-            optimizers.append(self._build_optimizer(params, foreach=foreach))
+            grouped = _split_dtensor_and_plain_params(params) if self._split_dtensor_groups else params
+            optimizer = self._build_optimizer(grouped, foreach=foreach)
+            if self._split_dtensor_groups:
+                _register_unsplit_checkpoint_load(optimizer, params)
+            optimizers.append(optimizer)
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
@@ -296,9 +368,22 @@ class OptimizerConfig:
         *,
         device_mesh: DeviceMesh | None = None,
     ) -> torch.optim.Optimizer:
-        """Build one optimizer from caller-defined parameter groups."""
+        """Build one optimizer from caller-defined parameter groups.
+
+        Args:
+            param_groups: Groups containing parameters of arbitrary shape, either
+                ordinary tensors or DTensors with their existing mesh/placements.
+            device_mesh: Mesh used to select tensor-parallel foreach behavior.
+
+        Returns:
+            Optimizer retaining group options and native checkpoint compatibility.
+        """
         foreach = _foreach_for_mesh(device_mesh)
-        return self._build_optimizer(param_groups, foreach=foreach)
+        grouped = _split_dtensor_and_plain_params(param_groups) if self._split_dtensor_groups else param_groups
+        optimizer = self._build_optimizer(grouped, foreach=foreach)
+        if self._split_dtensor_groups:
+            _register_unsplit_checkpoint_load(optimizer, param_groups)
+        return optimizer
 
 
 @dataclass
@@ -345,10 +430,11 @@ def _avoid_redundant_te_master_weights_for_fp32_params(optimizer: torch.optim.Op
     Transformer Engine's FusedAdam has one optimizer-wide ``master_weights``
     switch. Mixed BF16/FP32 models need it for BF16 parameters, but its FP32
     update path operates directly on the resident parameter and never consumes
-    ``master_param``. Pre-initializing only the two moments for resident FP32
-    parameters makes TE skip its generic three-state initializer. Load hooks
-    remove redundant state from old checkpoints and restore moment-only state
-    for checkpoints saved before the first optimizer step.
+    ``master_param``. Initializing only the two moments immediately before a
+    step makes TE skip its generic three-state initializer for FP32 parameters.
+    Fresh optimizers must remain empty: DCP uses that to decide whether to run
+    TE's full initializer, including group steps and non-FP32 state. The load
+    hook removes redundant masters from old checkpoints before TE rebuilds state.
 
     Args:
         optimizer: Transformer Engine FusedAdam instance whose parameter groups
@@ -365,8 +451,17 @@ def _avoid_redundant_te_master_weights_for_fp32_params(optimizer: torch.optim.Op
             "Transformer Engine FusedAdam master-weight ownership requires its _initialize_state integration API"
         )
 
-    def enforce_fp32_ownership(loaded_optimizer: torch.optim.Optimizer) -> None:
-        """Initialize moments and remove FP32 master copies from a live optimizer."""
+    def enforce_fp32_ownership(
+        loaded_optimizer: torch.optim.Optimizer, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> None:
+        """Initialize FP32 moments before TE's step, including DCP's dummy step.
+
+        Args:
+            loaded_optimizer: TE optimizer whose parameters and moment tensors
+                have matching arbitrary shapes and DTensor mesh/placements.
+            args: Unchanged positional arguments to the optimizer step.
+            kwargs: Unchanged keyword arguments to the optimizer step.
+        """
         for group in loaded_optimizer.param_groups:
             for parameter in group["params"]:
                 local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
@@ -405,25 +500,22 @@ def _avoid_redundant_te_master_weights_for_fp32_params(optimizer: torch.optim.Op
                 saved_state.pop("master_param", None)
                 if not {"exp_avg", "exp_avg_sq"}.issubset(saved_state):
                     # Treat an incomplete legacy entry like an uninitialized state.
-                    # The post-hook below restores both moments; removing the entry
-                    # keeps TE's second load pass from replacing them with a partial
-                    # state that would trigger generic master-weight initialization.
+                    # The step hook restores both moments before TE initializes
+                    # parameters, including DCP's first-step materialization.
                     state_dict["state"].pop(saved_id)
 
-    enforce_fp32_ownership(optimizer)
     # TE FusedAdam calls ``super().load_state_dict`` and then rebuilds its state a
     # second time. A PyTorch post-hook therefore runs too early; normalize the
     # nested checkpoint state in place so TE's second pass sees the same ownership.
     optimizer.register_load_state_dict_pre_hook(normalize_checkpoint_fp32_ownership)
-    # A pre-step legacy checkpoint may have no state entry at all. In that case
-    # TE's second pass has nothing to rebuild, so restoring moments in PyTorch's
-    # post-hook remains effective and prevents generic initialization on the next step.
-    optimizer.register_load_state_dict_post_hook(enforce_fp32_ownership)
+    optimizer.register_step_pre_hook(enforce_fp32_ownership)
 
 
 @dataclass
 class FusedAdamConfig(OptimizerConfig):
     """``transformer_engine.pytorch.optimizers.FusedAdam``."""
+
+    _split_dtensor_groups: ClassVar[bool] = False
 
     lr: float = 1e-4
     weight_decay: float = 0.01
@@ -661,10 +753,14 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             # per-group dicts.
             params = _trainable_params_or_groups(part, overrides)
             if is_te_fused_adam:
-                params = _drop_empty_local_shards(params)
-            optimizer = self.factory(params=params, **kwargs)
+                grouped = _drop_empty_local_shards(params)
+            else:
+                grouped = _split_dtensor_and_plain_params(params)
+            optimizer = self.factory(params=grouped, **kwargs)
             if is_te_fused_adam:
                 _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
+            else:
+                _register_unsplit_checkpoint_load(optimizer, params)
             optimizers.append(optimizer)
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
@@ -688,10 +784,14 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
 
         is_te_fused_adam = _is_te_fused_adam(self.factory)
         if is_te_fused_adam:
-            param_groups = _drop_empty_local_shards(param_groups)
-        optimizer = self.factory(params=param_groups, **kwargs)
+            grouped = _drop_empty_local_shards(param_groups)
+        else:
+            grouped = _split_dtensor_and_plain_params(param_groups)
+        optimizer = self.factory(params=grouped, **kwargs)
         if is_te_fused_adam:
             _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
+        else:
+            _register_unsplit_checkpoint_load(optimizer, param_groups)
         return optimizer
 
 

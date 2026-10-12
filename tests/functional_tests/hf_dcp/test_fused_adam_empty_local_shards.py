@@ -28,7 +28,11 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
 from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
-from nemo_automodel.components.optim.optimizer import FusedAdamConfig, _drop_empty_local_shards
+from nemo_automodel.components.optim.optimizer import (
+    FusedAdamConfig,
+    OptimizerFromFactoryConfig,
+    _drop_empty_local_shards,
+)
 from tests.unit_tests.optim.test_fused_adam_empty_local_shards import (
     _RecordingFusedAdam,
     _te_stub_modules,
@@ -113,3 +117,35 @@ def test_two_rank_asymmetric_shards_optimizer_state_roundtrip(tmp_path: Path) ->
         nprocs=2,
         join=True,
     )
+
+
+def _mixed_empty_shard_worker(rank: int, world_size: int, port: int) -> None:
+    """Build TE groups with a global [1] DTensor and a resident [2] parameter."""
+    try:
+        _init_gloo(rank, world_size, port)
+        mesh = init_device_mesh("cpu", (world_size,))
+        sys.modules.update(_te_stub_modules())
+        model = nn.Module()
+        model.plain = nn.Parameter(torch.ones(2))
+        model.tiny = nn.Parameter(distribute_tensor(torch.ones(1), mesh, [Shard(0)]))
+        for config in (
+            FusedAdamConfig(),
+            OptimizerFromFactoryConfig(factory=_RecordingFusedAdam, kwargs={"master_weights": True}),
+        ):
+            optimizer = config.build(model)[0]
+            assert len(optimizer.param_groups) == 1
+            params = optimizer.param_groups[0]["params"]
+            assert params[0] is model.plain
+            assert len(params) == (2 if rank == 0 else 1)
+            assert not optimizer.state
+            optimizer.step()
+            assert optimizer.param_groups[0]["step"] == 1
+            assert all(set(optimizer.state[param]) == {"exp_avg", "exp_avg_sq"} for param in params)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_two_rank_mixed_group_with_empty_local_shard() -> None:
+    """A tiny DTensor must not strand a valid plain parameter in another group."""
+    mp.spawn(_mixed_empty_shard_worker, args=(2, _free_port()), nprocs=2, join=True)
