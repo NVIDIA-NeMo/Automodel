@@ -44,7 +44,15 @@ def read_target_model_type(target_path: str, trust_remote_code: bool) -> str:
 def apply_target_chat_template(tokenizer, chat_template) -> None:
     """Attach or validate the chat template used to tokenize messages-format data."""
     if chat_template is not None:
-        tokenizer.chat_template = _resolve_chat_template(str(chat_template))
+        resolved = _resolve_chat_template(str(chat_template))
+        # A path that does not exist resolves to itself; using it as the template would
+        # render every sample as that string with nothing supervised.
+        if isinstance(resolved, str) and "{%" not in resolved and "{{" not in resolved:
+            raise ValueError(
+                f"chat_template {str(chat_template)!r} is neither an existing file nor a Jinja template; "
+                "relative paths resolve against the working directory."
+            )
+        tokenizer.chat_template = resolved
         return
     if not _has_chat_template(tokenizer):
         raise ValueError(

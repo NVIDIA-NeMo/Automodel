@@ -272,6 +272,14 @@ def test_chat_template_non_string_is_coerced(tmp_path):
     assert tok.chat_template == JINJA
 
 
+def test_chat_template_missing_path_raises(tmp_path):
+    # A missing path would otherwise become the template text and supervise nothing.
+    tok = _tok(chat_template="EXISTING")
+    with pytest.raises(ValueError, match="neither an existing file nor a Jinja template"):
+        _apply_target_chat_template(tok, str(tmp_path / "missing.jinja"))
+    assert tok.chat_template == "EXISTING"
+
+
 # ---------------------------------------------------------------------------
 # _resolve_reduced_target_layers
 # ---------------------------------------------------------------------------
