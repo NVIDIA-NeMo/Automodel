@@ -30,6 +30,13 @@ from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import install_interleaved_recv_pool
 
+# The implementation keeps native buffers on the older prepare-infra API.
+# Remove this gate when interleaved pooling supports that allocation layout.
+pytestmark = pytest.mark.skipif(
+    not all(hasattr(PipelineStage, name) for name in ("_setup_forward_recv_info", "_setup_backward_recv_info")),
+    reason="Interleaved pooling requires PyTorch per-direction stage setup",
+)
+
 
 class _Block(nn.Module):
     def __init__(self, activation_checkpointing: bool) -> None:
@@ -39,9 +46,25 @@ class _Block(nn.Module):
         self.activation_checkpointing = activation_checkpointing
 
     def _core(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the residual block.
+
+        Args:
+            x: Stage input of shape [microbatch, hidden].
+
+        Returns:
+            Stage output with the same shape and dtype as x.
+        """
         return x + self.linear2(torch.nn.functional.silu(self.linear1(x))) * 0.1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the block with optional activation recomputation.
+
+        Args:
+            x: Stage input of shape [microbatch, hidden].
+
+        Returns:
+            Stage output with the same shape and dtype as x.
+        """
         return checkpoint(self._core, x, use_reentrant=False) if self.activation_checkpointing else self._core(x)
 
 
@@ -70,6 +93,15 @@ def _run_pipeline(
     stages = [PipelineStage(block, index, world_size * virtual, device) for index, block in zip(local_indices, blocks)]
 
     def loss_fn(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute the microbatch mean squared error.
+
+        Args:
+            output: Predicted values of shape [microbatch, hidden].
+            target: Reference values of shape [microbatch, hidden].
+
+        Returns:
+            Scalar FP32 loss.
+        """
         return (output.float() - target.float()).square().mean()
 
     schedule = ScheduleInterleaved1F1B(stages, n_microbatches=num_microbatches, loss_fn=loss_fn, scale_grads=False)

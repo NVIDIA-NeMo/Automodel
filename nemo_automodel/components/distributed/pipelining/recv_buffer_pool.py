@@ -357,6 +357,11 @@ def install_interleaved_recv_pool(schedule: ScheduleInterleaved1F1B, slack: int 
         raise RuntimeError("Interleaved recv pooling cannot share the process-wide ordinary 1F1B pool")
     if type(schedule) is not ScheduleInterleaved1F1B:
         raise ValueError("Recv pooling requires the native interleaved 1F1B schedule")
+    # PyTorch's older prepare-infra layout does not expose the per-direction
+    # allocation seam used here. Keep native buffers on that third-party API.
+    if not all(hasattr(PipelineStage, name) for name in ("_setup_forward_recv_info", "_setup_backward_recv_info")):
+        logger.warning("interleaved recv pool requires per-direction stage setup; keeping stock buffers")
+        return
     forward_plans: list[tuple[PipelineStage, tuple[int, ...], int]] = []
     backward_plans: list[tuple[PipelineStage, tuple[int, ...], int]] = []
     for stage in schedule._stages:

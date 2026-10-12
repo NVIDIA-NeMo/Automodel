@@ -356,6 +356,47 @@ def test_hybridep_recorder_keeps_a_host_extent_without_reducing_tokens_per_exper
     tokens_per_expert.sum.assert_not_called()
 
 
+def test_hybridep_replay_recorder_reads_extents_lazily_and_once():
+    """finalize() only starts the extent read; take()/resolve() turn it into an int, idempotently."""
+    recorder = fused_a2a.HybridEPDispatchReplayRecorder()
+    recorder.record("layout-a", torch.tensor([2, 3]))
+    recorder.record("layout-b", torch.tensor([1, 2]))
+    recorder.finalize()
+    recorder.resolve()
+    recorder.resolve()  # a second resolve has nothing left to do
+    first = recorder.take()
+    assert first[0] == "layout-a" and first[2] == 5 and isinstance(first[2], int)
+    second = recorder.take()
+    assert second[0] == "layout-b" and second[2] == 3 and isinstance(second[2], int)
+    assert recorder.take() is None and recorder.replay_misses == 1
+    # take() without an explicit resolve() still yields a host integer
+    lazy = fused_a2a.HybridEPDispatchReplayRecorder()
+    lazy.record("layout-c", torch.tensor([4]))
+    lazy.finalize()
+    assert lazy.take()[2] == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.runtime_budget(15, reason="may create the process's CUDA context")
+def test_hybridep_replay_recorder_copies_cuda_extents_asynchronously():
+    """On CUDA, finalize() leaves a pinned scalar and an event in flight; resolve()/take() yield the int."""
+    recorder = fused_a2a.HybridEPDispatchReplayRecorder()
+    recorder.record("layout-a", torch.tensor([2, 3], device="cuda"))
+    recorder.finalize()
+    entry = recorder._records[0]
+    assert entry[2] is None
+    host, ready = recorder._copies[0]
+    assert host.device.type == "cpu" and host.is_pinned() and isinstance(ready, torch.cuda.Event)
+    recorder.resolve()
+    assert entry[2] == 5 and isinstance(entry[2], int)
+    assert recorder._copies[0] is None
+    # take() without an explicit resolve() still yields a host integer
+    lazy = fused_a2a.HybridEPDispatchReplayRecorder()
+    lazy.record("layout-b", torch.tensor([4], device="cuda"))
+    lazy.finalize()
+    assert lazy.take()[2] == 4
+
+
 def test_hybridep_checkpoint_replay_preserves_permute_fusion():
     from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
 

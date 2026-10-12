@@ -23,6 +23,7 @@ import torch
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B, _Action, _ComputationType
 
+import nemo_automodel.components.distributed.pipelining.recv_buffer_pool as recv_pool
 from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
     _pool_stage_backward_recvs,
     _pool_stage_forward_recvs,
@@ -38,6 +39,7 @@ def make_schedule(virtual: int, microbatches: int, physical: int = 4) -> Schedul
     schedule._n_microbatches = microbatches
     schedule._num_stages = physical * virtual
     schedule._stages = []
+    schedule.stage_index_to_group_rank = {stage: stage % physical for stage in range(physical * virtual)}
     schedule._defer_pp_recv = False
     schedule.number_of_rounds = max(1, microbatches // physical)
     schedule.microbatches_per_round = microbatches // schedule.number_of_rounds
@@ -178,3 +180,16 @@ def test_forward_inputs_are_independent_leaves_across_reused_slots() -> None:
         assert not torch.equal(stage.args_recv_info[0][0], activation)
     with pytest.raises(ValueError, match="microbatch count"):
         stage._setup_forward_recv_info(8, True)
+
+
+def test_unsupported_stage_api_keeps_stock_buffers(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An older PyTorch stage API must leave the schedule untouched."""
+    schedule = make_schedule(2, 16)
+    monkeypatch.setattr(recv_pool, "_INSTALLED", False)
+    monkeypatch.setattr(recv_pool, "PipelineStage", type("LegacyStage", (), {}))
+    before = dict(vars(schedule))
+    recv_pool.install_interleaved_recv_pool(schedule)
+    assert vars(schedule) == before
+    assert "keeping stock buffers" in caplog.text
