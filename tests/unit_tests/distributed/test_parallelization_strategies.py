@@ -26,6 +26,7 @@ from torch.distributed.tensor.parallel import ColwiseParallel
 
 from nemo_automodel._diffusers import parallelization as diffusers_parallelization
 from nemo_automodel._diffusers.parallelization import HunyuanModelParallelizer, WanModelParallelizer
+from nemo_automodel.components.distributed import FSDP2Config, MeshContext
 from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
 from nemo_automodel.components.distributed.activation_checkpointing import sdpa_backend_snapshot_context_fn
 
@@ -737,7 +738,7 @@ class TestNemotronHModelParallelizer:
         )
 
         with pytest.raises(NotImplementedError, match="MTP with context and pipeline parallelism"):
-            strategy._apply(model=nemotron_model, device_mesh=mesh)
+            strategy.parallelize(nemotron_model, MeshContext(device_mesh=mesh, strategy_config=FSDP2Config()))
 
     def test_cp_raises_when_enabled_mtp_layers_are_unavailable(
         self,
@@ -796,7 +797,7 @@ class TestNemotronHModelParallelizer:
         )
 
         with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
-            strategy._apply(model=nemotron_model, device_mesh=mesh)
+            strategy.parallelize(nemotron_model, MeshContext(device_mesh=mesh, strategy_config=FSDP2Config()))
 
     def test_sequence_parallel_not_supported(self, strategy, mock_device_mesh, nemotron_model):
         """Test that sequence parallelism raises assertion error."""
@@ -1072,38 +1073,6 @@ class TestQwen3_5ModelParallelizer:
         assert custom_fully_shard.call_args_list[-1].args[0] is model
 
 
-@pytest.mark.parametrize("strategy", [Qwen3_5ModelParallelizer(), NemotronHModelParallelizer()])
-@pytest.mark.parametrize("supports_mtp_cp", [True, False])
-def test_mtp_cp_pp_rejected_before_model_surgery(strategy, supports_mtp_cp, monkeypatch):
-    """Mesh topology protects models without a private pipeline-stage hook."""
-    model = nn.Module()
-    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=supports_mtp_cp, supports_mtp_cp_pp=False)
-    mesh = MagicMock(spec=DeviceMesh)
-    mesh.mesh_dim_names = ("pp", "cp", "tp")
-    mesh.__getitem__.return_value.size.return_value = 2
-    generic_apply = MagicMock(side_effect=AssertionError("model surgery reached"))
-    monkeypatch.setattr(ModelParallelizer, "_apply", generic_apply)
-    monkeypatch.setattr(nemotron_parallelization, "_decoder_blocks", generic_apply)
-
-    with pytest.raises(NotImplementedError, match="use PP size 1 or CP size 1"):
-        strategy._apply(model, mesh)
-
-    generic_apply.assert_not_called()
-    assert not hasattr(model, "cp_mesh")
-
-
-def test_default_parallelizer_rejects_mtp_cp_pp_without_expert_parallelism():
-    """MoE models with EP=1 use the default FSDP2 path, not the MoE path."""
-    model = nn.Module()
-    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True, supports_mtp_cp_pp=False)
-    mesh = MagicMock(spec=DeviceMesh)
-    mesh.mesh_dim_names = ("pp", "cp")
-    mesh.__getitem__.return_value.size.return_value = 2
-
-    with pytest.raises(NotImplementedError, match="use PP size 1 or CP size 1"):
-        ModelParallelizer()._apply(model, mesh)
-
-
 @pytest.mark.parametrize("pp_size, cp_size, mtp_enabled", [(1, 2, True), (2, 1, True), (2, 2, False)])
 def test_qwen35_mtp_allows_supported_topologies(pp_size, cp_size, mtp_enabled, monkeypatch):
     model = nn.Module()
@@ -1121,21 +1090,6 @@ def test_qwen35_mtp_allows_supported_topologies(pp_size, cp_size, mtp_enabled, m
         assert model.cp_mesh is submeshes["cp"]
     else:
         assert not hasattr(model, "cp_mesh")
-
-
-def test_qwen35_rejects_mtp_without_cp_capability(monkeypatch):
-    model = nn.Module()
-    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=False, supports_mtp_cp_pp=False)
-    mesh = MagicMock(spec=DeviceMesh)
-    mesh.mesh_dim_names = ("cp",)
-    mesh.__getitem__.return_value.size.return_value = 2
-    generic_apply = MagicMock(side_effect=AssertionError("model surgery reached"))
-    monkeypatch.setattr(ModelParallelizer, "_apply", generic_apply)
-
-    with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
-        Qwen3_5ModelParallelizer()._apply(model, mesh)
-
-    generic_apply.assert_not_called()
 
 
 class TestModelSidecars:

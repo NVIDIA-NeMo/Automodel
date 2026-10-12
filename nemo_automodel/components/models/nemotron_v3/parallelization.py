@@ -29,11 +29,7 @@ from torch.distributed.tensor.placement_types import Shard
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
-from nemo_automodel.components.distributed.parallelizer_utils import (
-    fully_shard_by_dtype,
-    reject_unsupported_mtp_cp,
-    reject_unsupported_mtp_cp_pp,
-)
+from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +67,6 @@ class NemotronHModelParallelizer(ModelParallelizer):
             raise ValueError("Sequence parallelism is not supported for NemotronHForCausalLM")
         logger.info("Using the Nemotron-H model-owned parallelization policy.")
 
-        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
-        if cp_mesh is not None and cp_mesh.size() > 1:
-            pp_size = device_mesh["pp"].size() if "pp" in device_mesh.mesh_dim_names else 1
-            reject_unsupported_mtp_cp_pp(model, pp_size=pp_size)
-            reject_unsupported_mtp_cp(model)
-
         block_container, layers = _decoder_blocks(model)
         tp_mesh = device_mesh[tp_mesh_name]
         if tp_mesh.size() > 1:
@@ -93,6 +83,7 @@ class NemotronHModelParallelizer(ModelParallelizer):
                 if layer.block_type == "mlp":
                     parallelize_module(layer, tp_mesh, mlp_plan)
 
+        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
         if cp_mesh is not None and cp_mesh.size() > 1:
             cp_group = cp_mesh.get_group()
             cp_global_ranks = torch.distributed.get_process_group_ranks(cp_group)
