@@ -19,6 +19,7 @@ import torch
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import (
+    _block_mask_from_membership,
     _routes_to_membership,
     build_flex_qsa_mask,
 )
@@ -98,3 +99,20 @@ def test_direct_block_mask_separates_full_and_partial_tiles() -> None:
     assert mask.kv_num_blocks.tolist() == [[[0, 1]]]
     assert mask.full_kv_indices[0, 0, 0, 0].item() == 0
     assert mask.kv_indices[0, 0, 1, 0].item() == 1
+
+
+def test_tile_reduction_allocates_no_integer_copy_of_the_table() -> None:
+    """Tile classification stays in bool: no step copies the membership table to an integer dtype.
+
+    A ``sum`` over the boolean tiles would first copy the whole table to int64 (8 bytes per (q, kv)
+    pair), which dominates the mask-build peak at long sequence lengths.
+    """
+    routes = _random_routes(1, 512, 512, width=160, seed=11)
+    membership, _ = _routes_to_membership(routes, 512)
+    table_bytes = membership.numel() * membership.element_size()
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], profile_memory=True) as prof:
+        _block_mask_from_membership(membership, lambda b, h, q_idx, kv_idx: membership[b, q_idx, kv_idx])
+
+    largest = max(event.self_cpu_memory_usage for event in prof.events())
+    assert largest < 2 * table_bytes, f"an op allocated {largest} bytes for a {table_bytes}-byte table"

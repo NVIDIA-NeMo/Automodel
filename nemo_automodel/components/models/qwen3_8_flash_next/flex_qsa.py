@@ -220,10 +220,10 @@ def _block_mask_from_membership(
     padded_kv = -(-kv_length // block_size) * block_size
     padded = torch.nn.functional.pad(membership, (0, padded_kv - kv_length, 0, padded_q - query_length))
     tiles = padded.view(batch_size, 1, padded_q // block_size, block_size, padded_kv // block_size, block_size)
-    tile_counts = tiles.permute(0, 1, 2, 4, 3, 5).sum(dim=(-2, -1))
-    full_tile = block_size * block_size
-    full_blocks = tile_counts == full_tile
-    partial_blocks = (tile_counts > 0) & ~full_blocks
+    # Reduce in bool: a sum would first copy the whole table to int64 (8 bytes per pair).
+    any_set = tiles.any(dim=-1).any(dim=-2)
+    full_blocks = tiles.all(dim=-1).all(dim=-2)
+    partial_blocks = any_set & ~full_blocks
     kv_num_blocks, kv_indices = _dense_blocks_to_ordered(partial_blocks)
     full_kv_num_blocks, full_kv_indices = _dense_blocks_to_ordered(full_blocks)
     return BlockMask.from_kv_blocks(
