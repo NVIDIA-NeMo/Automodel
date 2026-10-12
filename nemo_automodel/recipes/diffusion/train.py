@@ -33,7 +33,6 @@ from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import ConfigFieldValue, NeMoAutoDiffusionPipeline
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.datasets.diffusion.sampler import SequentialBucketSampler
 from nemo_automodel.components.distributed import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -868,16 +867,10 @@ class TrainDiffusionRecipe(BaseRecipe):
             self.val_dataloader = validation_build.dataloader
             self.val_sampler = validation_build.sampler
             if len(self.val_dataloader) == 0:
-                batch_sampler = self.val_dataloader.batch_sampler
-                drop_last = (
-                    batch_sampler.drop_last
-                    if isinstance(batch_sampler, SequentialBucketSampler)
-                    else self.val_dataloader.drop_last
-                )
                 raise RuntimeError(
                     f"Validation dataloader is empty (dataset_size={len(self.val_dataloader.dataset)}, "
                     f"local_batch_size={self.cfg.get('step_scheduler.local_batch_size')}, "
-                    f"dp_size={self._get_dp_group_size()}, drop_last={drop_last}). "
+                    f"dp_size={self._get_dp_group_size()}, drop_last={validation_build.drop_last}). "
                     "Check the validation cache path and contents. If drop_last is true, set "
                     "data.validation_dataloader.drop_last: false to retain incomplete per-rank batches "
                     "in each resolution bucket."

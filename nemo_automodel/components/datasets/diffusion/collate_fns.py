@@ -250,7 +250,7 @@ class TextToImageDataloaderConfig:
             prefetch_factor=self.prefetch_factor,
         )
         logger.info("Built text-to-image dataset with %d samples and %d batches", len(dataset), len(sampler))
-        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler)
+        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler, drop_last=self.drop_last)
 
 
 def build_text_to_image_multiresolution_dataloader(
@@ -382,7 +382,7 @@ class TextToVideoDataloaderConfig:
             prefetch_factor=self.prefetch_factor,
         )
         logger.info("Built text-to-video dataset with %d samples and %d batches", len(dataset), len(sampler))
-        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler)
+        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler, drop_last=self.drop_last)
 
 
 def build_video_multiresolution_dataloader(

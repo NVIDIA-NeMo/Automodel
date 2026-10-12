@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 import sys
 from datetime import timedelta
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderBuild
 from nemo_automodel.components.datasets.diffusion.sampler import SequentialBucketSampler
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.flow_matching.adapters.simple import SimpleAdapter
@@ -975,8 +977,9 @@ def _patch_setup_dataloaders(monkeypatch, *, validation_batches=1, with_validati
     if with_validation:
         validation_config = SimpleNamespace(
             build=MagicMock(
-                return_value=SimpleNamespace(
-                    dataloader=torch.utils.data.DataLoader(range(validation_batches)), sampler="val-sampler"
+                return_value=DiffusionDataloaderBuild(
+                    dataloader=torch.utils.data.DataLoader(range(validation_batches)),
+                    sampler=torch.utils.data.SequentialSampler(range(validation_batches)),
                 )
             )
         )
@@ -1018,7 +1021,7 @@ def test_setup_shards_the_validation_dataloader_like_the_training_one(monkeypatc
 
     # dist is not initialized in the harness, so the data-parallel group is rank 0 of 1.
     validation_config.build.assert_called_once_with(dp_rank=0, dp_world_size=1, batch_size=1)
-    assert recipe.val_sampler == "val-sampler"
+    assert recipe.val_sampler is validation_config.build.return_value.sampler
     assert len(recipe.val_dataloader) == 1
 
 
@@ -1046,7 +1049,7 @@ def test_setup_empty_validation_error_reports_bucket_batching(monkeypatch, bucke
         rank=0,
     )
     loader = torch.utils.data.DataLoader(range(offset), batch_sampler=sampler)
-    config.build.return_value = SimpleNamespace(dataloader=loader, sampler=sampler)
+    config.build.return_value = DiffusionDataloaderBuild(dataloader=loader, sampler=sampler, drop_last=drop_last)
     cfg = _setup_cfg(val_every_steps=5)
     cfg.set_by_dotted("step_scheduler.local_batch_size", 16)
     recipe = TrainDiffusionRecipe(cfg)
@@ -1308,6 +1311,7 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
 
 
 def _distributed_validation_worker(rank: int, rendezvous: str) -> None:
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     torch.distributed.init_process_group(
         "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30)
     )
@@ -1335,6 +1339,12 @@ def _distributed_validation_worker(rank: int, rendezvous: str) -> None:
         assert not torch.equal(recipe.model.module.projection.weight, torch.eye(2))
         assert recipe.model.module.training_modes == [False, False, True]
         assert recipe.model.module.grad_enabled == [False, False, True]
+
+        padded_recipe = _make_tiny_validation_recipe(num_samples=5, dp_rank=rank, dp_world_size=2)
+        # Padding repeats sample value 1: ranks score [1, 3, 5] and [2, 4, 1].
+        # 2 * (1 + 9 + 25 + 4 + 16 + 1) / 6 = 56 / 3, rather than 22 for unique samples.
+        assert padded_recipe._run_validation_epoch(global_step=0) == pytest.approx(56.0 / 3.0, rel=1e-6)
+        assert padded_recipe.model.module.batch_sizes == [3]
     finally:
         torch.distributed.destroy_process_group()
 

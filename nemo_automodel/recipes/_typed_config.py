@@ -584,6 +584,7 @@ class RecipeConfig:
     def diffusion_validation_dataloader(self) -> "DiffusionDataloaderConfig" | None:
         """Typed diffusion validation dataloader config resolved from ``data.validation_dataloader``."""
         node = self._raw.get("data.validation_dataloader", None)
+        # Validation retains bucket tails without changing existing training/component defaults.
         return self.resolve_diffusion_dataloader(node, default_drop_last=False) if node is not None else None
 
     @cached_property
