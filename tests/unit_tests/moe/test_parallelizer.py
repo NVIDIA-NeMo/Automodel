@@ -373,8 +373,13 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.distributed.mesh_utils",
         "nemo_automodel.components.distributed.parallelizer_utils",
     ]:
-        if mod in sys.modules:
-            sys.modules.pop(mod)
+        # Restore both import caches after the test. Otherwise later files keep
+        # collected classes while imports/patches resolve freshly loaded ones.
+        parent_name, _, attribute = mod.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            monkeypatch.delattr(parent, attribute, raising=False)
+        monkeypatch.delitem(sys.modules, mod, raising=False)
 
     _install_torch_and_layers_stubs(monkeypatch)
 
@@ -539,6 +544,24 @@ def _import_parallelizer_with_stubs(monkeypatch):
     )
 
     return importlib.import_module("nemo_automodel.components.moe.parallelizer")
+
+
+def test_stub_import_restores_real_module_identity() -> None:
+    import importlib
+
+    module_names = (
+        "nemo_automodel.components.moe.layers",
+        "nemo_automodel.components.distributed.pipelining.config",
+        "nemo_automodel.components.distributed.mesh_utils",
+    )
+    original_modules = {name: importlib.import_module(name) for name in module_names}
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _import_parallelizer_with_stubs(monkeypatch)
+
+    for name, module in original_modules.items():
+        assert importlib.import_module(name) is module
+        parent_name, _, attribute = name.rpartition(".")
+        assert getattr(importlib.import_module(parent_name), attribute) is module
 
 
 def test_expert_parallel_apply_calls_distribute_module(monkeypatch):

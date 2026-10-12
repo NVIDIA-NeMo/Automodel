@@ -127,7 +127,7 @@ def test_pytest_exits_after_timed_out_spawn(
     # Without the cleanup, interpreter shutdown blocks on the sleeping worker and this raises TimeoutExpired.
     result = pytester.runpytest_subprocess("-p", "no:cacheprovider", timeout=40)
     result.assert_outcomes(passed=1, failed=1, errors=1)
-    result.stdout.fnmatch_lines(["*Timeout (>1.0s) from pytest-timeout*"])
+    result.stdout.fnmatch_lines(["*Timeout (>3.0s) from pytest-timeout*"])
     result.stdout.fnmatch_lines(["*left * child process(es) running*"])
 
 
@@ -147,7 +147,7 @@ def test_pytest_cleans_non_multiprocessing_child_after_timeout(
     result = pytester.runpytest_subprocess("-p", "no:cacheprovider", timeout=40)
 
     result.assert_outcomes(failed=1, errors=1)
-    result.stdout.fnmatch_lines(["*Timeout (>1.0s) from pytest-timeout*"])
+    result.stdout.fnmatch_lines(["*Timeout (>3.0s) from pytest-timeout*"])
     result.stdout.fnmatch_lines(["*left 1 child process(es) running*"])
 
 
@@ -164,5 +164,5 @@ def test_timeout_cleanup_preserves_preexisting_child(pytester: pytest.Pytester, 
     result = pytester.runpytest_subprocess("-p", "no:cacheprovider", timeout=40)
 
     result.assert_outcomes(passed=1, failed=1)
-    result.stdout.fnmatch_lines(["*Timeout (>1.0s) from pytest-timeout*"])
+    result.stdout.fnmatch_lines(["*Timeout (>3.0s) from pytest-timeout*"])
     assert "the timeout cleanup killed a child owned by the session fixture" not in result.stdout.str()
