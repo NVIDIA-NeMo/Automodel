@@ -20,7 +20,7 @@ import shutil
 from dataclasses import dataclass
 from typing import Literal
 
-from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
+from huggingface_hub import ResolvedRevision, hf_hub_download, snapshot_download, try_to_load_from_cache
 from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
 from torch import nn
 from transformers import PretrainedConfig, ProcessorMixin
@@ -292,18 +292,19 @@ def _load_sentence_transformer_wrapper_options(
     )
 
 
-def _resolve_cached_source_model_path(model_name_or_path: str, config, hf_kwargs: dict) -> str | None:
+def _resolve_cached_source_model_path(model_name_or_path: str, hf_kwargs: dict) -> str | None:
     """Resolve the already-downloaded source snapshot without network access."""
     subfolder = hf_kwargs.get("subfolder")
     if os.path.isdir(model_name_or_path):
         source_path = os.path.join(model_name_or_path, subfolder) if subfolder else model_name_or_path
         return source_path if os.path.isdir(source_path) else None
     filename = os.path.join(subfolder, "config.json") if subfolder else "config.json"
+    revision = hf_kwargs.get("revision")
     cached_config = try_to_load_from_cache(
         model_name_or_path,
         filename,
         cache_dir=hf_kwargs.get("cache_dir"),
-        revision=getattr(config, "_commit_hash", None) or hf_kwargs.get("revision"),
+        revision=revision.resolved if isinstance(revision, ResolvedRevision) else revision,
     )
     if isinstance(cached_config, str) and os.path.isfile(cached_config):
         return os.path.dirname(cached_config)
@@ -331,7 +332,7 @@ def _resolve_cached_source_repository_path(
     return repository_path
 
 
-def _cache_hub_source_legal_assets(model_name_or_path: str, config, hf_kwargs: dict) -> str | None:
+def _cache_hub_source_legal_assets(model_name_or_path: str, hf_kwargs: dict) -> str | None:
     """Cache source legal assets while the Hub-backed model is being loaded."""
     if os.path.isdir(model_name_or_path):
         return None
@@ -341,7 +342,7 @@ def _cache_hub_source_legal_assets(model_name_or_path: str, config, hf_kwargs: d
     }
     if "token" not in download_kwargs and "use_auth_token" in hf_kwargs:
         download_kwargs["token"] = hf_kwargs["use_auth_token"]
-    revision = getattr(config, "_commit_hash", None) or hf_kwargs.get("revision")
+    revision = hf_kwargs.get("revision")
     if revision is not None:
         download_kwargs["revision"] = revision
     try:

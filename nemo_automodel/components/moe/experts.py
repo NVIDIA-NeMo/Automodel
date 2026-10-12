@@ -51,7 +51,7 @@ _BIAS_CHUNK_THRESHOLD = 12288
 # can exhaust memory even when bias additions themselves are bounded. Recompute
 # row chunks during backward instead of retaining full expert-MLP activations.
 # Bias-free experts retain whole-dispatch GEMMs for throughput.
-_EXPERT_MLP_CHUNK_BYTES = 256 * 1024 * 1024
+_EXPERT_MLP_CHUNK_BYTES = 512 * 1024 * 1024
 
 
 if _HAVE_TRITON and _HAVE_TRITON_LANGUAGE:

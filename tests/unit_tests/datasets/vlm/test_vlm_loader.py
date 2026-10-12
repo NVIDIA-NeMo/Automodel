@@ -13,9 +13,12 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
+import yaml
 from transformers import ProcessorMixin
 
 from nemo_automodel.components.config.loader import ConfigNode
@@ -34,6 +37,7 @@ from nemo_automodel.components.datasets.vlm.loader import (
 )
 from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
+from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
@@ -272,6 +276,35 @@ def test_vlm_dataloader_selects_thd_collater(monkeypatch):
     assert result.dataloader.collate_fn.func is packed_sequence_thd_vlm_collater
     assert result.dataloader.collate_fn.keywords == {"padding_idx": 0, "max_length": None}
     assert packing_kwargs["cp_size"] == 4
+
+
+def test_qwen3_vl_moe_recipe_preserves_te_document_boundaries(monkeypatch):
+    recipe_path = Path(__file__).resolve().parents[4] / "examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_neat_packing.yaml"
+    raw = yaml.safe_load(recipe_path.read_text())
+    config = RecipeConfig(
+        ConfigNode({key: raw[key] for key in ("dataset", "dataloader", "packed_sequence")})
+    ).vlm_dataloader
+    sample = {
+        "input_ids": torch.tensor([1, 2, 3, 4, 5]),
+        "labels": torch.tensor([2, -100, 4, 5, -100]),
+        "position_ids": torch.tensor([[0, 1, 0, 1, 2]] * 3),
+        "attention_mask": torch.tensor([1, 1, 2, 2, 2]),
+    }
+    # Replace media loading/tokenization/knapsack work with an already-packed sample.
+    # The recipe's typed configuration still selects and runs the real collator.
+    monkeypatch.setattr(type(config.dataset_config), "build", lambda self: [sample])
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
+    config.processor_config = VlmProcessorConfig(factory=DummyProcessor)
+
+    result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1)
+    batch = result.dataloader.collate_fn([sample])
+
+    assert "attention_mask" not in batch
+    assert batch["qkv_format"] == "thd"
+    thd = process_input_for_thd(batch)
+    assert thd["cu_seqlens"].tolist() == [0, 2, 5]
+    assert tuple(thd["position_ids"].shape) == (3, 1, 5)
 
 
 def test_vlm_dataloader_neat_packing_uses_default_contract(monkeypatch):

@@ -395,6 +395,7 @@ class TestCheckFp8DequantizeWillFit:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestForceHfBranchWiring:
     def test_force_hf_invokes_preflight_before_loader(self, monkeypatch):
         """Drive _init_model with force_hf=True and a sentinel-raising preflight.
