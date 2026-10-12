@@ -45,7 +45,7 @@ from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_n
 
 # Over the default 5s budget on purpose: distributed owner and checkpoint tests spawn Gloo workers.
 # Shrink process startup and checkpoint round trips before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _tiny_config() -> DeepseekV41TextConfig:

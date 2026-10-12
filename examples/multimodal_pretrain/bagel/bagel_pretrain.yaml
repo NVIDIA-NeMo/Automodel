@@ -63,8 +63,6 @@ distributed:
   mp_policy:
     param_dtype: bfloat16
     reduce_dtype: bfloat16
-    output_dtype: bfloat16
-    cast_forward_inputs: true
 
 dataset:
   # Replace these paths with prepared BAGEL-format data.

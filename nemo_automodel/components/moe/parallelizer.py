@@ -209,6 +209,23 @@ def _preserve_gate_load_during_recompute(
     return checkpoint_context_fn
 
 
+def _with_model_checkpoint_context(
+    block: nn.Module,
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+    """Let a block extend its own activation-checkpoint contexts.
+
+    Models that own state which must stay consistent between the checkpoint forward and
+    its recompute (for example a frozen router whose selection is replayed instead of
+    recomputed) expose ``nemo_checkpoint_context_fn(context_fn)`` on the block. The
+    parallelizer stays model-agnostic: it only composes that hook when present.
+    """
+    hook = getattr(block, "nemo_checkpoint_context_fn", None)
+    if not callable(hook):
+        return context_fn
+    return hook(context_fn)
+
+
 def _get_model_moe_config(model: nn.Module):
     """Return the model-level MoE config exposed by custom MoE architectures."""
     candidates = []
@@ -307,8 +324,13 @@ class ExpertParallel(ParallelStyle):
         assert device_mesh.ndim == 1
 
         for name, param in module.named_parameters(recurse=False):
-            dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
-            dist_param.requires_grad = param.requires_grad
+            # Pass requires_grad at construction: nn.Parameter defaults to
+            # requires_grad=True, which raises for non-floating dtypes (e.g. the
+            # int8 / e8m0 packed tensors of mxfp4-resident experts) before a
+            # later assignment could fix it.
+            dist_param = nn.Parameter(
+                distribute_tensor(param, device_mesh, [Shard(0)]), requires_grad=param.requires_grad
+            )
             module.register_parameter(name, dist_param)
 
         if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsMoK)):
@@ -639,10 +661,11 @@ def apply_ac(
                 if bool(getattr(block, "_nemo_disable_activation_checkpointing", False)):
                     logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
                     continue
+                block_context_fn = _preserve_gate_load_during_recompute(block, attention_context_fn)
                 block = ptd_checkpoint_wrapper(
                     block,
                     preserve_rng_state=True,
-                    context_fn=_preserve_gate_load_during_recompute(block, attention_context_fn),
+                    context_fn=_with_model_checkpoint_context(block, block_context_fn),
                 )
                 # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
                 # selective policy visible to the partitioner) instead of unwrapping and
@@ -747,13 +770,14 @@ def apply_ac(
                 block,
                 preserve_rng_state=True,
                 determinism_check=_register_moe_checkpoint_determinism_check(),
-                context_fn=block_context_fn,
+                context_fn=_with_model_checkpoint_context(block, block_context_fn),
             )
         else:
+            block_context_fn = _preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot())
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=_preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot()),
+                context_fn=_with_model_checkpoint_context(block, block_context_fn),
             )
 
         parent_layers.register_module(layer_id, block)
@@ -793,8 +817,8 @@ def apply_fsdp(
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
-            output_dtype=torch.bfloat16,
-            cast_forward_inputs=True,
+            output_dtype=None,
+            cast_forward_inputs=False,
         )
     experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
@@ -1212,8 +1236,6 @@ def parallelize_model(
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
-        parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
-        parallelizer_utils.reject_unsupported_mtp_cp(model)
         apply_cp(model, world_mesh[cp_axis_name])
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1

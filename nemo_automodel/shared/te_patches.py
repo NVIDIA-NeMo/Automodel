@@ -17,8 +17,7 @@ Transformer Engine compatibility patches.
 Runtime monkey-patches applied directly to TE classes in memory so they
 take effect immediately in the current process.
 
-Call `apply_te_patches()` early in the process, before TE optimizers are
-instantiated.
+Call `apply_te_patches()` early in the process, before TE optimizers are used.
 """
 
 from __future__ import annotations

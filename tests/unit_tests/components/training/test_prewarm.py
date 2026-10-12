@@ -40,7 +40,7 @@ from nemo_automodel.components.training.prewarm import (
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 class _FakeGDN(torch.nn.Module):

@@ -1,0 +1,136 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full 52-layer/full-parameter Nemotron 3.5 Lightning SFT on Tulu3, MTP disabled.
+# Single node with 8 H100 80GB GPUs: CP8, EP8, BF16 model weights, TE FusedAdam with FP32 master weights/moments,
+# BF16 compute and activation checkpointing. Each pack contains 65,536 tokens.
+# Global batch 8 counts packs: DP1, local batch 1, eight accumulation microbatches.
+# Document spans are padded to 2 * CP = 16 tokens for dual-chunk context parallelism.
+# The first 800 native packs provide 100 optimizer steps; weight checkpointing is disabled.
+#
+# Run from the repository root:
+#   OMP_NUM_THREADS=2 automodel \
+#     examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_tulu3_packed_cp8_64k.yaml \
+#     --nproc-per-node 8
+# W&B is disabled by default. After authenticating, add --wandb.enable true.
+# W&B uses your default entity; optionally add --wandb.entity <your_entity>.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  max_steps: 100
+  num_epochs: 1
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: false
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  dtype: bfloat16
+  num_nextn_predict_layers: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    experts: torch_mm
+    dispatcher: deepep
+    fake_balanced_gate: false
+  output_hidden_states: true
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/nemotron_lightning_tulu3_packed_cp8_64k
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 8
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: true
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: cce
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  seq_length: 65536
+  truncation: true
+  padding: do_not_pad
+  shuffle_seed: 42
+  # Use the checkpoint's original chat template; mask its generation-prompt tokens.
+  mask_generation_prompt: true
+packed_sequence:
+  packed_sequence_size: 65536
+  pad_to_multiple_of: 16
+  max_packs: 800
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: false
+  num_workers: 0
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  lr: 1.0e-05
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: false
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 10
+  min_lr: 1.0e-06
+compile:
+  enabled: false
+nvtx: false
+wandb:
+  enable: false  # Set true to log training to W&B.
+  project: nemotron-lightning-cp
+  name: lightning-tulu3-packed-cp8-64k-gbs8-bf16-te-original-template
+  mode: online
+  dir: wandb
+
+# Release CI runs a short smoke test on one 8-GPU node.
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:30:00"
+  nodes: 1
+  nproc_per_node: 8
+  max_steps: 2
+  env_vars:
+    REQUIRE_FINITE_METRICS: "true"
