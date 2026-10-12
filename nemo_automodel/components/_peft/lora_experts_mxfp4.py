@@ -246,6 +246,15 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
 
         Preserves the tensor and EP contract of GroupedExpertsDeepEP.forward, replacing the base
         grouped GEMMs with ``MXFP4GroupedMM`` over the packed weights.
+
+        Args:
+            x: Tensor of shape [local_tokens, hidden].
+            token_mask: Boolean tensor of shape [local_tokens], marking valid tokens.
+            weights: Routing probabilities of shape [local_tokens, top_k].
+            indices: Global expert IDs of shape [local_tokens, top_k].
+
+        Returns:
+            Combined expert output of shape [local_tokens, hidden].
         """
         assert not isinstance(x, DTensor)
         assert self.n_routed_experts % self.ep_size == 0
@@ -289,13 +298,14 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
             if self.expert_bias:
                 output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
         else:
-            # Dummy computation for gradient flow; dequantize only expert 0.
+            # Preserve the dispatch backward edge; dequantize only expert 0.
             gate_up_w0 = self._mxfp4_dequant_expert0("gate_and_up_projs", x.dtype)
             down_w0 = self._mxfp4_dequant_expert0("down_projs", x.dtype)
-            output1 = torch.matmul(x[0] * 0, gate_up_w0)
+            output1 = torch.matmul(permuted_local_hidden_states, gate_up_w0)
             output1 = (
                 output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
+                + torch.matmul(torch.matmul(permuted_local_hidden_states, lora_gate_and_up_A[0]), lora_gate_and_up_B[0])
+                * self.scale
             )
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, down_w0)
