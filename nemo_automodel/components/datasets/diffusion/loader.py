@@ -24,10 +24,11 @@ from torch.utils.data import DataLoader, Sampler
 
 @dataclass(frozen=True)
 class DiffusionDataloaderBuild:
-    """Materialized diffusion dataloader and its sampler."""
+    """Materialized diffusion dataloader, sampler, and effective batch-tail policy."""
 
     dataloader: DataLoader
     sampler: Sampler[object] | None
+    drop_last: bool = False
 
 
 class DiffusionDataloaderConfig(Protocol):
