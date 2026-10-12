@@ -851,6 +851,50 @@ class TestDeepseekV4GroupedLinear:
         torch.testing.assert_close(gx, ref_gx, **tol)
         torch.testing.assert_close(gw, ref_gw, **tol)
 
+    @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+    def test_autocast_with_fp32_parameters_matches_the_plain_bmm_path(self, input_dtype: torch.dtype):
+        """AMP training: FP32 parameters, BF16 (or FP32) activations under autocast. The out= path must behave like
+        the autocast bmm it replaces — BF16 output, gradients in the dtype of the tensor they belong to."""
+        torch.manual_seed(0)
+        n_groups, in_per, out_total = 4, 6, 20
+        proj = DeepseekV4GroupedLinear(in_per, out_total, n_groups=n_groups)  # FP32 weight
+        x = torch.randn(2, 3, n_groups, in_per, dtype=input_dtype, requires_grad=True)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            out = proj(x)
+        assert out.dtype == torch.bfloat16 and out.is_contiguous()
+        gx, gw = torch.autograd.grad(out.float().square().sum(), (x, proj.weight))
+        assert gx.dtype == input_dtype and gw.dtype == torch.float32
+        x_ref = x.detach().clone().requires_grad_()
+        w_ref = proj.weight.detach().clone().requires_grad_()
+        w_groups = w_ref.view(n_groups, out_total // n_groups, in_per)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            ref = torch.stack([x_ref[..., g, :] @ w_groups[g].t() for g in range(n_groups)], dim=-2)
+        ref_gx, ref_gw = torch.autograd.grad(ref.float().square().sum(), (x_ref, w_ref))
+        assert ref.dtype == torch.bfloat16
+        torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(gx, ref_gx, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(gw, ref_gw, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.runtime_budget(20, hard_timeout=90, reason="torch.compile tracing of the module")
+    def test_compiled_forward_backward_matches_eager_without_graph_breaks(self):
+        """Under the compiler the module traces the plain bmm (Dynamo cannot capture a strided out= buffer):
+        fullgraph compiles, no graph breaks, same values and gradients as eager."""
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        n_groups, in_per, out_total = 4, 6, 20
+        proj = DeepseekV4GroupedLinear(in_per, out_total, n_groups=n_groups)
+        x = torch.randn(2, 3, n_groups, in_per, requires_grad=True)
+        explanation = torch._dynamo.explain(proj)(x)
+        assert explanation.graph_break_count == 0 and explanation.graph_count == 1, explanation
+        compiled = torch.compile(proj, backend="eager", fullgraph=True)
+        out_c = compiled(x)
+        gx_c, gw_c = torch.autograd.grad(out_c.square().sum(), (x, proj.weight))
+        out_e = proj(x)
+        gx_e, gw_e = torch.autograd.grad(out_e.square().sum(), (x, proj.weight))
+        torch.testing.assert_close(out_c, out_e)
+        torch.testing.assert_close(gx_c, gx_e)
+        torch.testing.assert_close(gw_c, gw_e)
+
 
 class TestDeepseekV4HyperConnection:
     """``compute_weights`` returns the (pre, post, comb) tensors used at

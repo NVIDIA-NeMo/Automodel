@@ -291,23 +291,40 @@ class _GroupedLinearTokenMajor(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: object, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """Args: x ``[tokens, groups, d_in]`` (contiguous), w ``[groups, d_out, d_in]``. Returns ``[tokens, groups, d_out]``."""
-        ctx.save_for_backward(x, w)
-        y = x.new_empty(x.shape[0], w.shape[0], w.shape[1])
-        torch.bmm(x.permute(1, 0, 2), w.transpose(-1, -2), out=y.permute(1, 0, 2))
+        """Args: x ``[tokens, groups, d_in]`` (contiguous), w ``[groups, d_out, d_in]``. Returns ``[tokens, groups, d_out]``.
+
+        ``torch.bmm(..., out=)`` is not an autocast op, so the cast autocast would apply to a plain ``bmm`` is done
+        here: under autocast both operands and the output take the autocast dtype (an FP32 weight meets BF16
+        activations in AMP training, and an FP32 input returns BF16 as before); without autocast the dtypes are
+        used as given, so the same-dtype path costs no copy.
+        """
+        device_type = x.device.type
+        if torch.is_autocast_enabled(device_type):
+            compute_dtype = torch.get_autocast_dtype(device_type)
+            x_c, w_c = x.to(compute_dtype), w.to(compute_dtype)
+        else:
+            x_c, w_c = x, w
+        ctx.save_for_backward(x_c, w_c)
+        ctx.grad_dtypes = (x.dtype, w.dtype)
+        y = x_c.new_empty(x_c.shape[0], w_c.shape[0], w_c.shape[1])
+        torch.bmm(x_c.permute(1, 0, 2), w_c.transpose(-1, -2), out=y.permute(1, 0, 2))
         return y
 
     @staticmethod
     def backward(ctx: object, grad_y: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Input gradient written token-major; weight gradient as a grouped ``bmm`` over the token axis."""
+        """Input gradient written token-major; weight gradient as a grouped ``bmm`` over the token axis. Both are
+        computed in the forward's compute dtype and returned in the dtype of the tensor they belong to (what
+        autograd does for a plain autocast ``bmm`` whose operands were cast)."""
         x, w = ctx.saved_tensors
-        grad_y = grad_y.contiguous()
+        x_dtype, w_dtype = ctx.grad_dtypes
+        grad_y = grad_y.contiguous().to(x.dtype)
         grad_x = grad_w = None
         if ctx.needs_input_grad[0]:
             grad_x = torch.empty_like(x)
             torch.bmm(grad_y.permute(1, 0, 2), w, out=grad_x.permute(1, 0, 2))
+            grad_x = grad_x.to(x_dtype)
         if ctx.needs_input_grad[1]:
-            grad_w = torch.bmm(grad_y.permute(1, 2, 0), x.permute(1, 0, 2))
+            grad_w = torch.bmm(grad_y.permute(1, 2, 0), x.permute(1, 0, 2)).to(w_dtype)
         return grad_x, grad_w
 
 
@@ -329,6 +346,12 @@ class DeepseekV4GroupedLinear(nn.Linear):
         d_in = x.shape[-1]
         out_per_group = self.out_features // self.n_groups
         w = self.weight.view(self.n_groups, out_per_group, d_in)
+        if torch.compiler.is_compiling():
+            # Dynamo cannot capture a strided ``out=`` buffer (fullgraph fails, default mode breaks the graph); under
+            # the compiler the output layout is inductor's job, so the plain bmm is traced instead.
+            xg = x.reshape(-1, self.n_groups, d_in).permute(1, 0, 2)
+            y = torch.bmm(xg, w.transpose(-1, -2)).permute(1, 0, 2)
+            return y.reshape(*batch_shape, self.n_groups, out_per_group)
         y = _GroupedLinearTokenMajor.apply(x.reshape(-1, self.n_groups, d_in), w)
         return y.view(*batch_shape, self.n_groups, out_per_group)
 
