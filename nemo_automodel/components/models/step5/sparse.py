@@ -671,6 +671,8 @@ class Step5SparseIndexer(nn.Module):
         query = query.to(torch.float8_e4m3fn).to(torch.bfloat16)
         budget = min(cfg.topk, region_count)
         region_ids = ids.clone()
+        # Keep temporary canonical IDs narrow without overflowing the invalid-slot sentinel.
+        id_dtype = torch.int32 if region_count <= torch.iinfo(torch.int32).max else torch.int64
         for tile, (b, start, stop, first, last) in enumerate(metadata.score_tiles):
             # Only this tile's documents and visible history can affect top-k.
             if metadata.region_sources is None:
@@ -680,8 +682,8 @@ class Step5SparseIndexer(nn.Module):
                 base = metadata.summary_ranges[range_index][1]
                 summary = summaries[range_index][:, first - base : last - base]
             scores = indexer_score_tile(query[b : b + 1], weights[b : b + 1], summary, start, stop)
-            region_range = torch.arange(first, last, device=hidden.device)
-            current = metadata.current[b : b + 1, start:stop]
+            region_range = torch.arange(first, last, device=hidden.device, dtype=id_dtype)
+            current = metadata.current[b : b + 1, start:stop].to(id_dtype)
             candidates = (region_range < current.unsqueeze(-1)) & (
                 metadata.region_documents[b : b + 1, None, first:last]
                 == metadata.query_documents[b : b + 1, start:stop, None]
