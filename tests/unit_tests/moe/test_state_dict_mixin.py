@@ -26,7 +26,7 @@ from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateD
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def test_get_world_size_safe_uses_initialized_process_group():

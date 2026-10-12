@@ -81,7 +81,7 @@ def apply_draft_activation_checkpointing(draft_model: nn.Module, mode: bool | st
     used for the target (so ``"off"``/``"none"``/``"disabled"``/``"no"`` disable the
     draft too, not just a literal ``false``); no-op once normalized to ``False``.
     These recipes wrap the draft with plain ``DistributedDataParallel`` /
-    ``fully_shard`` instead of the FSDP2Manager/DDPManager path that applies AC
+    ``fully_shard`` instead of the ModelParallelizer path that applies AC
     automatically, so it must be requested explicitly here, before the draft is
     wrapped.
     """
@@ -96,7 +96,7 @@ def apply_draft_activation_checkpointing(draft_model: nn.Module, mode: bool | st
         apply_selective_checkpointing_to_layers(draft_model, layers, has_kv_sharing=False)
         logger.info("Enabled selective activation checkpointing on %d draft layers", len(layers))
     else:
-        # These recipes bypass the FSDP2Manager/DDPManager parallelize() path that
+        # These recipes bypass the ModelParallelizer path that
         # would otherwise pick HF-native gradient checkpointing automatically, so
         # wrap the submodules directly instead.
         apply_submodule_checkpointing(layers, has_kv_sharing=False)

@@ -129,6 +129,9 @@ ci:
     # Keep 2048-token forwards and full metrics; gate cross-framework comparisons
     # on this prefix. AutoModel reload keeps its standard full-sequence check.
     cross_framework_gate_sequence_length: 512
+    # AMINT-379 reports 0.340% later-step resume drift; match the full-finetuning
+    # resume profile while retaining exact restored-state checks.
+    resume_tolerance_profile: relaxed
     tokenizer_name: openai/gpt-oss-20b
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500

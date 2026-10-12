@@ -34,7 +34,7 @@ from nemo_automodel.components.attention.ffpa_attention import (
     _ffpa_varlen_fwd,
     _ffpa_varlen_ready,
 )
-from nemo_automodel.shared.torch_patches import (
+from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
 )
 

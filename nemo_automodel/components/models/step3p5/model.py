@@ -405,6 +405,8 @@ class Step3p5Model(nn.Module):
 class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Step3p5 model for causal language modeling."""
 
+    _uses_native_fa4: bool = True
+
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     _keep_in_fp32_modules = ["rotary_emb"]

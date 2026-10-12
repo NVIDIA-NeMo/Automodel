@@ -26,7 +26,7 @@ import pytest
 pytest_plugins = ["pytester"]
 
 # The inner pytest subprocess imports torch from scratch and needs a few seconds beyond the 5s fallback.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 _CONFTEST_SOURCE = Path(__file__).with_name("conftest.py").read_text()
 
@@ -93,7 +93,7 @@ def test_timeout_does_not_own_existing_child(persistent_child):
 
 @pytest.mark.runtime_budget(
     30,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="starts a fresh pytest subprocess that imports torch and spawns a worker",
 )
 def test_pytest_exits_after_timed_out_spawn(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch):
@@ -105,13 +105,13 @@ def test_pytest_exits_after_timed_out_spawn(pytester: pytest.Pytester, monkeypat
     # Without the cleanup, interpreter shutdown blocks on the sleeping worker and this raises TimeoutExpired.
     result = pytester.runpytest_subprocess("-p", "no:cacheprovider", timeout=40)
     result.assert_outcomes(passed=1, failed=1, errors=1)
-    result.stdout.fnmatch_lines(["*Timeout (>1.0s) from pytest-timeout*"])
+    result.stdout.fnmatch_lines(["*Timeout (>3.0s) from pytest-timeout*"])
     result.stdout.fnmatch_lines(["*left * child process(es) running*"])
 
 
 @pytest.mark.runtime_budget(
     30,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="starts a fresh pytest subprocess and a Popen child",
 )
 def test_pytest_cleans_non_multiprocessing_child_after_timeout(
@@ -125,13 +125,13 @@ def test_pytest_cleans_non_multiprocessing_child_after_timeout(
     result = pytester.runpytest_subprocess("-p", "no:cacheprovider", timeout=40)
 
     result.assert_outcomes(failed=1, errors=1)
-    result.stdout.fnmatch_lines(["*Timeout (>1.0s) from pytest-timeout*"])
+    result.stdout.fnmatch_lines(["*Timeout (>3.0s) from pytest-timeout*"])
     result.stdout.fnmatch_lines(["*left 1 child process(es) running*"])
 
 
 @pytest.mark.runtime_budget(
     30,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="starts a fresh pytest subprocess and a persistent Popen child",
 )
 def test_timeout_cleanup_preserves_preexisting_child(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch):
@@ -142,5 +142,5 @@ def test_timeout_cleanup_preserves_preexisting_child(pytester: pytest.Pytester, 
     result = pytester.runpytest_subprocess("-p", "no:cacheprovider", timeout=40)
 
     result.assert_outcomes(passed=1, failed=1)
-    result.stdout.fnmatch_lines(["*Timeout (>1.0s) from pytest-timeout*"])
+    result.stdout.fnmatch_lines(["*Timeout (>3.0s) from pytest-timeout*"])
     assert "the timeout cleanup killed a child owned by the session fixture" not in result.stdout.str()

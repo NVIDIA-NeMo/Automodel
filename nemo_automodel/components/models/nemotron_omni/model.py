@@ -868,13 +868,21 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         return torch.cat(out, dim=-2)
 
     def extract_video_feature(self, pixel_values_videos: torch.Tensor) -> torch.Tensor:
-        """Pack ``T = video_temporal_patch_dim`` frames into channels and run the ViT.
+        """Encode consecutive frame groups with the checkpoint's temporal projector.
 
-        Returns embeddings shaped like ``extract_feature`` output, but with
-        ``ceil(N_frames / T)`` rows instead of one row per frame.
+        Args:
+            pixel_values_videos: Tensor of shape [frames, channels, height, width].
+                Frames belong to one video and share a spatial grid. The final
+                frame is repeated to complete a temporal group when necessary.
+
+        Returns:
+            Tensor of shape [groups, image_tokens, llm_hidden], where groups is
+            ceil(frames / video_temporal_patch_dim) and image_tokens is the
+            spatial patch count after pixel shuffle.
         """
-        assert self.video_temporal_patch_dim is not None, "video_temporal_patch_size missing from config"
-        pg = self.vision_model.radio_model.model.patch_generator
+        if self.video_temporal_patch_dim is None:
+            raise ValueError("Video encoding requires video_temporal_patch_size in the model config.")
+        pixel_values_videos = pixel_values_videos.to(dtype=next(self.vision_model.parameters()).dtype)
         T = self.video_temporal_patch_dim
         N, C, H, W = pixel_values_videos.shape
 
@@ -884,23 +892,30 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             N = pixel_values_videos.shape[0]
         num_groups = N // T
 
-        # Per-patch feature order ends up `[t=0,c=0..C-1, t=1,c=0..C-1, ...]`, which is
-        # the layout the checkpoint's `video_embedder.weight` expects.
+        # Each spatial patch contains consecutive frames in [time, channel] order.
         x = pixel_values_videos.reshape(num_groups, T * C, H, W)
 
         was_training = self.vision_model.training
         self.vision_model.eval()
-        orig_embedder = pg.embedder
-        pg.embedder = pg.video_embedder
         try:
-            vit_embeds = self.vision_model(x).features
+            if hasattr(self.vision_model, "radio_model"):
+                # Legacy timm RADIO selects its temporal projection by swapping
+                # the patch embedder; native RADIO exposes a forward argument.
+                pg = self.vision_model.radio_model.model.patch_generator
+                patch_size = pg.patch_size
+                orig_embedder = pg.embedder
+                pg.embedder = pg.video_embedder
+                try:
+                    vit_embeds = self.vision_model(x).features
+                finally:
+                    pg.embedder = orig_embedder
+            else:
+                patch_size = self.vision_model.patch_size
+                vit_embeds = self.vision_model(x, use_video_patch_projection=True).features
         finally:
-            pg.embedder = orig_embedder
-            if was_training:
-                self.vision_model.train()
+            self.vision_model.train(was_training)
 
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
-        patch_size = pg.patch_size
         return self.vision_projector(
             vit_embeds, patch_grid_shapes=[(H // patch_size, W // patch_size)], ps_version=self.ps_version
         )

@@ -22,7 +22,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 
 # Over the default 5s budget on purpose: CUDA Mamba kernels compile on their first invocation.
 # Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 

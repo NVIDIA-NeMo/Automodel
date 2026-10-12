@@ -5,184 +5,92 @@
 
 from __future__ import annotations
 
-import importlib
-import inspect
-import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from nemo_automodel.components.models.common.packing import (
-    _passthrough_create_causal_mask,
-    _patch_preprocess_mask_arguments_for_packing,
     configure_packing,
-    get_attn_implementation,
-    get_seqlens_in_batch,
-    get_unpad_data,
+    flatten_packed_sequence_metadata,
+    get_model_attn_implementation,
+    get_packing_capabilities,
+    validate_flash_packing_support,
 )
+from nemo_automodel.components.models.common.utils import BackendConfig
 
 # ---------------------------------------------------------------------------
-# get_seqlens_in_batch
-# ---------------------------------------------------------------------------
-
-
-class TestGetSeqlensInBatch:
-    def test_single_sequence(self):
-        mask = torch.tensor([[1, 1, 1, 0, 0]])
-        result = get_seqlens_in_batch(mask)
-        assert result.tolist() == [3]
-
-    def test_packed_sequences(self):
-        mask = torch.tensor([[1, 1, 2, 2, 2, 0]])
-        result = get_seqlens_in_batch(mask)
-        assert sorted(result.tolist()) == [2, 3]
-
-    def test_no_padding(self):
-        mask = torch.tensor([[1, 1, 1]])
-        result = get_seqlens_in_batch(mask)
-        assert result.tolist() == [3]
-
-
-# ---------------------------------------------------------------------------
-# get_unpad_data
-# ---------------------------------------------------------------------------
-
-
-class TestGetUnpadData:
-    def test_basic(self):
-        mask = torch.tensor([[1, 1, 0]])
-        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
-        assert max_seqlen == 2
-        assert cu_seqlens.tolist() == [0, 2]
-
-    def test_packed(self):
-        mask = torch.tensor([[1, 1, 2, 2, 0]])
-        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
-        assert max_seqlen == 2
-        assert indices.tolist() == [0, 1, 2, 3]
-
-
-# ---------------------------------------------------------------------------
-# _passthrough_create_causal_mask
-# ---------------------------------------------------------------------------
-
-
-class TestPassthroughCreateCausalMask:
-    def test_passthrough_4d_mask(self):
-        """4D masks (already block-causal from sdpa collater) are returned as-is."""
-        mask = torch.ones(2, 1, 8, 8)
-        result = _passthrough_create_causal_mask(attention_mask=mask)
-        assert result is mask
-
-    def test_passthrough_indexed_packed_mask(self):
-        """Indexed masks with values > 1 (packed sequences) are returned as-is."""
-        mask = torch.tensor([[1, 1, 2, 2, 0]])
-        result = _passthrough_create_causal_mask(attention_mask=mask)
-        assert result is mask
-
-    def test_fa2_passthrough_for_normal_mask(self):
-        """FA2 config with normal 2D mask still passes through (FA2 handles masking)."""
-        config = SimpleNamespace(_attn_implementation="flash_attention_2")
-        mask = torch.tensor([[1, 1, 1, 0, 0]])
-        result = _passthrough_create_causal_mask(config=config, attention_mask=mask)
-        assert result is mask
-
-    def test_delegates_to_original_for_non_fa2(self):
-        """Non-FA2 config with normal 2D mask delegates to HF create_causal_mask."""
-        from unittest.mock import patch
-
-        config = SimpleNamespace(_attn_implementation="sdpa")
-        mask = torch.tensor([[1, 1, 1, 0, 0]])
-        with patch("transformers.masking_utils.create_causal_mask", return_value="delegated") as mock_cm:
-            result = _passthrough_create_causal_mask(
-                attention_mask=mask,
-                config=config,
-                inputs_embeds=torch.zeros(1, 5, 64),
-                cache_position=torch.arange(5),
-            )
-        assert result == "delegated"
-        mock_cm.assert_called_once()
-        assert "inputs_embeds" in mock_cm.call_args.kwargs
-        assert "input_embeds" not in mock_cm.call_args.kwargs
-
-    def test_handles_extra_kwargs(self):
-        """Extra kwargs don't break — indexed mask still passes through."""
-        mask = torch.tensor([[1, 1, 2, 2, 0]])
-        result = _passthrough_create_causal_mask(attention_mask=mask, or_mask_function=None, and_mask_function=None)
-        assert result is mask
-
-
-# ---------------------------------------------------------------------------
-# get_attn_implementation
+# model-derived packing and metadata
 # ---------------------------------------------------------------------------
 
 
 class TestGetAttnImplementation:
     def test_from_backend_config(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        assert get_attn_implementation(cfg) == "te"
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="te")
+        assert get_model_attn_implementation(model) == "te"
 
     def test_from_attn_implementation(self):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        assert get_attn_implementation(cfg) == "flash_attention_2"
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        assert get_model_attn_implementation(model) == "flash_attention_2"
 
     def test_default_sdpa(self):
-        assert get_attn_implementation(None) == "sdpa"
+        assert get_model_attn_implementation(torch.nn.Module()) == "sdpa"
 
     def test_backend_takes_precedence(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        cfg.get = MagicMock(return_value="flash_attention_2")
-        assert get_attn_implementation(cfg) == "te"
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="te")
+        model.config = SimpleNamespace(_attn_implementation="sdpa")
+        assert get_model_attn_implementation(model) == "te"
 
-    def test_built_model_wins_over_stale_config(self):
-        """A packed run force-switches the model to flash; the config keeps saying sdpa."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
-        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+    def test_declared_hf_fa4_dispatch_takes_precedence(self):
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
+        model._uses_hf_attention = True
 
-    def test_backend_config_wins_over_built_model(self):
-        """Custom models keep naming their backend; ``te`` inits through sdpa."""
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))
-        assert get_attn_implementation(cfg, model=model) == "te"
+        assert get_model_attn_implementation(model) == "flash_attention_4"
+
+    def test_declared_hf_dispatch_uses_live_hf_backend(self):
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="sdpa")
+        model._uses_hf_attention = True
+
+        assert get_model_attn_implementation(model) == "sdpa"
+
+    def test_native_fa4_consumer_uses_typed_backend(self):
+        model = torch.nn.Module()
+        model._uses_native_fa4 = True
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
+
+        assert get_model_attn_implementation(model) == "fa4"
 
     def test_reads_through_ddp_wrapper(self):
         """DDP holds the model as ``.module`` and does not proxy attribute access."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        inner = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
-        assert get_attn_implementation(cfg, model=SimpleNamespace(module=inner)) == "flash_attention_2"
+        inner = torch.nn.Module()
+        inner.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        wrapper = torch.nn.Module()
+        wrapper.module = inner
+        assert get_model_attn_implementation(wrapper) == "flash_attention_2"
 
     def test_kernels_hub_id_maps_back_to_mainline_flash(self):
         """Transformers records a kernels-hub id when only ``kernels`` provides FA2."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="kernels-community/flash-attn2"))
-        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation="kernels-community/flash-attn2")
+        assert get_model_attn_implementation(model) == "flash_attention_2"
 
-    @pytest.mark.parametrize(
-        "model",
-        [
-            SimpleNamespace(),
-            SimpleNamespace(config=SimpleNamespace()),
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation=None)),
-            # A dispatch key naming no layout packing knows about must not select one.
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation="some_future_backend")),
-        ],
-    )
-    def test_falls_back_to_config_when_model_names_no_known_backend(self, model):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "eager"
-        assert get_attn_implementation(cfg, model=model) == "eager"
+    @pytest.mark.parametrize("implementation", ["magi", "some_future_backend"])
+    def test_preserves_live_dispatch_key(self, implementation):
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation=implementation)
+        assert get_model_attn_implementation(model) == implementation
+
+    def test_requires_built_model(self):
+        with pytest.raises(TypeError, match="built torch.nn.Module"):
+            get_model_attn_implementation(SimpleNamespace())
 
 
 # ---------------------------------------------------------------------------
@@ -191,224 +99,214 @@ class TestGetAttnImplementation:
 
 
 class TestConfigurePacking:
-    @pytest.mark.parametrize("attn_implementation", ["sdpa", "eager"])
-    def test_noop_for_unsupported_backends(self, attn_implementation, monkeypatch):
-        """configure_packing should not install flash-attn shims for unsupported backends."""
-        patch_preprocess = MagicMock()
-        monkeypatch.setattr(
-            "nemo_automodel.components.models.common.packing._patch_preprocess_mask_arguments_for_packing",
-            patch_preprocess,
+    def test_model_semantics_select_document_ids_and_explicit_metadata(self):
+        model = SimpleNamespace(
+            packed_mask_type="document_ids",
+            requires_packed_sequence_metadata=True,
         )
 
-        configure_packing(attn_implementation)
+        capabilities = get_packing_capabilities("sdpa", model=model)
 
-        patch_preprocess.assert_not_called()
+        assert capabilities.packed_mask_type == "document_ids"
+        assert capabilities.requires_packed_sequence_metadata is True
 
-    @pytest.mark.parametrize("attn_implementation", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
-    def test_patches_flash_attention_utils(self, attn_implementation):
-        """configure_packing should patch _get_unpad_data for every flash-attention variant."""
-        import transformers.masking_utils as masking_utils
-        import transformers.modeling_flash_attention_utils as fa_utils
+    def test_fa4_requires_explicit_native_consumer_capability(self):
+        hf_dispatched_model = torch.nn.Module()
+        native_model = torch.nn.Module()
+        native_model._uses_native_fa4 = True
 
-        original = fa_utils._get_unpad_data
-        original_preprocess = masking_utils._preprocess_mask_arguments
-        original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
-        try:
-            configure_packing(attn_implementation)
-            assert fa_utils._get_unpad_data is get_unpad_data
-        finally:
-            fa_utils._get_unpad_data = original
-            masking_utils._preprocess_mask_arguments = original_preprocess
-            if original_flag is None:
-                if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
-                    delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
-            else:
-                masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
+        with pytest.raises(ValueError, match="declaring native FA4 support"):
+            get_packing_capabilities("fa4", model=hf_dispatched_model)
+        native_capabilities = get_packing_capabilities("fa4", model=native_model)
 
-    def test_patches_preprocess_mask_arguments_for_indexed_mask(self):
-        """configure_packing should preserve integer indexed masks for FA2."""
-        import transformers.masking_utils as masking_utils
-        import transformers.modeling_flash_attention_utils as fa_utils
+        assert native_capabilities.requires_packed_sequence_metadata is True
+        assert native_capabilities.uses_native_fa4 is True
 
-        original_unpad = fa_utils._get_unpad_data
-        pre_test_preprocess = masking_utils._preprocess_mask_arguments
-        original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
-        # Reload so the reference call below exercises the pristine installed
-        # Transformers implementation regardless of test order.
-        importlib.reload(masking_utils)
-        if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
-            delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
-        original_preprocess = masking_utils._preprocess_mask_arguments
+    def test_batch_major_metadata_flattens_after_microbatch_splitting(self):
+        indices, cu_seqlens = flatten_packed_sequence_metadata(
+            torch.tensor([[0, 1, 2, -1]]),
+            torch.tensor([[0, 1, 3]], dtype=torch.int32),
+            batch_size=1,
+            sequence_length=4,
+        )
 
-        config = SimpleNamespace(_attn_implementation="flash_attention_2")
-        input_embeds = torch.zeros(1, 5, 8)
+        assert indices.tolist() == [0, 1, 2]
+        assert cu_seqlens.tolist() == [0, 1, 3]
 
-        def build_args(attention_mask, cache_position):
-            """Build positional args matching the installed _preprocess_mask_arguments signature.
+    def test_native_fa4_flattens_metadata_once_per_model_forward(self):
+        class NativeFA4Model(torch.nn.Module):
+            _uses_native_fa4 = True
+
+            def forward(self, input_ids: torch.Tensor, **kwargs):
+                """Capture normalized packed metadata.
+
+                Args:
+                    input_ids: Token IDs of shape [batch, sequence].
+                    **kwargs: Model inputs containing packed token indices of
+                        shape [tokens] and cumulative lengths of shape
+                        [documents + 1].
+
+                Returns:
+                    The received keyword-input mapping with tensor layouts
+                    unchanged.
+                """
+                del input_ids
+                return kwargs
+
+        model = NativeFA4Model()
+        configure_packing("fa4", model=model)
+        configure_packing("fa4", model=model)
+        assert len(model._forward_pre_hooks) == 1
+        with pytest.raises(ValueError, match="pre-packed THD"):
+            model(torch.ones(2, 4, dtype=torch.long), qkv_format="thd")
+
+        output = model(
+            torch.ones(2, 4, dtype=torch.long),
+            packed_token_indices=torch.tensor([[0, 1, 2, -1], [0, 1, -1, -1]]),
+            cu_seqlens=torch.tensor([[0, 1, 3], [0, 2, -1]], dtype=torch.int32),
+            max_seqlen=2,
+        )
+
+        assert output["packed_token_indices"].tolist() == [0, 1, 2, 4, 5]
+        assert output["cu_seqlens"].tolist() == [0, 1, 3, 5]
+
+    def test_native_fa4_rejects_incomplete_metadata_at_model_entry(self):
+        class NativeFA4Model(torch.nn.Module):
+            _uses_native_fa4 = True
+
+            def forward(self, **kwargs):
+                """Return the received model inputs unchanged.
+
+                Args:
+                    **kwargs: Optional cu_seqlens of shape [documents + 1] or
+                        [batch, max_documents + 1], supplied without token indices.
+
+                Returns:
+                    The input mapping, unchanged; the entry hook rejects this call.
+                """
+                return kwargs
+
+        model = NativeFA4Model()
+        configure_packing("fa4", model=model)
+
+        with pytest.raises(ValueError, match="must be tensors supplied together"):
+            model(cu_seqlens=torch.tensor([0, 2], dtype=torch.int32))
+
+
+def test_non_metadata_consumer_preserves_legacy_thd_boundaries():
+    class LegacyModel(torch.nn.Module):
+        def forward(self, **kwargs):
+            """Return legacy THD boundaries unchanged.
 
             Args:
-                attention_mask: Tensor of shape [batch, sequence] containing
-                    indexed document IDs, or a boolean tensor of shape [batch,
-                    heads, query_sequence, key_sequence] for the reference call.
-                cache_position: Optional tensor of shape [sequence] containing
-                    absolute token positions.
+                **kwargs: ``cu_seqlens`` of shape [documents + 1] and scalar format options.
 
             Returns:
-                Positional argument list for the installed private Transformers
-                function. Tensor layouts are unchanged.
+                The original boundary tensor of shape [documents + 1].
             """
-            values = {
-                "config": config,
-                "input_embeds": input_embeds,
-                "inputs_embeds": input_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "layer_idx": 0,
-            }
-            args = []
-            for name, param in inspect.signature(original_preprocess).parameters.items():
-                if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                    continue
-                if name in values:
-                    args.append(values[name])
-                elif param.default is not inspect.Parameter.empty:
-                    args.append(param.default)
-                else:
-                    args.append(None)
-            return args
+            return kwargs["cu_seqlens"]
 
-        try:
-            configure_packing("flash_attention_2")
-            mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
-            probe_mask = torch.zeros(1, 1, 1, 1, dtype=torch.bool)
-            expected_template = original_preprocess(*build_args(probe_mask, torch.arange(5)))
-            for cache_position in (torch.arange(5), None):
-                result = masking_utils._preprocess_mask_arguments(*build_args(mask, cache_position))
-                assert result[0] is expected_template[0]
-                assert result[1] is mask
-                assert result[2:] == expected_template[2:]
+    model = LegacyModel()
+    configure_packing("sdpa", model=model)
+    boundaries = torch.tensor([0, 2, 5], dtype=torch.int32)
+    assert model(cu_seqlens=boundaries, qkv_format="thd") is boundaries
 
-            binary_mask = torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.long)
-            expected_binary = original_preprocess(*build_args(binary_mask, None))
-            result_binary = masking_utils._preprocess_mask_arguments(*build_args(binary_mask, None))
-            assert result_binary[0] is expected_binary[0]
-            assert result_binary[1].dtype == torch.bool
-            assert torch.equal(result_binary[1], expected_binary[1])
-            assert result_binary[2:] == expected_binary[2:]
-        finally:
-            fa_utils._get_unpad_data = original_unpad
-            masking_utils._preprocess_mask_arguments = pre_test_preprocess
-            if original_flag is None:
-                if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
-                    delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
-            else:
-                masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
 
-    def test_qwen3_preserves_indexed_mask(self):
-        """Qwen3 should preserve indexed masks after packing is configured."""
-        import transformers.masking_utils as masking_utils
-        import transformers.modeling_flash_attention_utils as fa_utils
-        import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
+class TestValidateFlashPackingSupport:
+    @pytest.mark.parametrize("attn_implementation", ["sdpa", "eager", "te"])
+    def test_noop_for_non_flash_backends(self, attn_implementation):
+        """Non-flash backends use the 4D block-causal mask and need no varlen contract."""
+        validate_flash_packing_support(attn_implementation)  # must not raise
 
-        original_unpad = fa_utils._get_unpad_data
-        original_preprocess = masking_utils._preprocess_mask_arguments
-        original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
-        try:
-            configure_packing("flash_attention_2")
-            mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
-            result = modeling_qwen3.create_causal_mask(
-                config=SimpleNamespace(_attn_implementation="flash_attention_2"),
-                inputs_embeds=torch.zeros(1, 5, 8),
-                attention_mask=mask,
-                past_key_values=None,
-                position_ids=torch.arange(5).unsqueeze(0),
-            )
+    @pytest.mark.parametrize("impl", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
+    def test_passes_when_varlen_kwargs_supported(self, impl):
+        """The installed transformers exposes the public FlashAttentionKwargs contract."""
+        validate_flash_packing_support(impl)  # must not raise
 
-            assert result is mask
-        finally:
-            fa_utils._get_unpad_data = original_unpad
-            masking_utils._preprocess_mask_arguments = original_preprocess
-            if original_flag is None:
-                if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
-                    delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
-            else:
-                masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
-
-    def test_fails_when_preprocess_shim_cannot_install(self, monkeypatch):
-        """A missing private hook must fail before training can mix packed documents."""
-        import transformers.masking_utils as masking_utils
-
-        monkeypatch.setattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False, raising=False)
-        monkeypatch.delattr(masking_utils, "_preprocess_mask_arguments", raising=False)
-
-        with pytest.raises(RuntimeError, match="Cannot enable FA2 neat packing.*_preprocess_mask_arguments"):
-            _patch_preprocess_mask_arguments_for_packing()
-
-    def test_fails_on_incompatible_preprocess_result(self, monkeypatch):
-        """An incompatible private return contract must fail instead of guessing tuple fields."""
-        import transformers.masking_utils as masking_utils
-
-        def incompatible_preprocess(**kwargs):
-            """Return a non-early-exit result for the 4D contract probe."""
-            return False, kwargs["attention_mask"]
-
-        monkeypatch.setattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False, raising=False)
-        monkeypatch.setattr(masking_utils, "_preprocess_mask_arguments", incompatible_preprocess)
-
-        with pytest.raises(RuntimeError, match="incompatible _preprocess_mask_arguments early-exit result"):
-            _patch_preprocess_mask_arguments_for_packing()
-
-    def test_patches_loaded_model_modules(self):
-        """configure_packing should patch create_causal_mask on loaded modules."""
-        import transformers.masking_utils as masking_utils
+    def test_installs_no_global_patch(self):
+        """Validation must be side-effect free: no monkeypatching of private functions."""
         import transformers.modeling_flash_attention_utils as fa_utils
 
         original_unpad = fa_utils._get_unpad_data
-        original_preprocess = masking_utils._preprocess_mask_arguments
-        original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
-        # Create a fake module with create_causal_mask
-        fake_mod = MagicMock()
-        fake_mod.create_causal_mask = MagicMock()
-        fake_mod_name = "transformers.models.qwen3_vl.modeling_qwen3_vl"
-        sys.modules[fake_mod_name] = fake_mod
-        try:
-            configure_packing("flash_attention_2")
-            assert fake_mod.create_causal_mask is _passthrough_create_causal_mask
-        finally:
-            fa_utils._get_unpad_data = original_unpad
-            masking_utils._preprocess_mask_arguments = original_preprocess
-            if original_flag is None:
-                if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
-                    delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
-            else:
-                masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
-            del sys.modules[fake_mod_name]
+        contract = configure_packing("flash_attention_2")
+        assert contract.packed_mask_type == "flash_varlen"
+        assert fa_utils._get_unpad_data is original_unpad
 
+    def test_raises_when_varlen_kwargs_missing(self, monkeypatch):
+        """A transformers build without the varlen kwargs must fail loudly, not silently pack."""
 
-class TestConfigurePackingFA3FA4:
-    """FA3/FA4 use the same transformers varlen wrapper as FA2 and must be patched alike."""
+        def _legacy_flash_attention_forward(query, key, value, attention_mask, **kwargs):
+            """Legacy signature lacking cu_seq_lens_q/max_length_q varlen kwargs."""
+            return query
 
-    @pytest.mark.parametrize("impl", ["flash_attention_3", "flash_attention_4"])
-    def test_patches_flash_attention_utils(self, impl):
-        import transformers.modeling_flash_attention_utils as fa_utils
+        monkeypatch.setattr(
+            "transformers.modeling_flash_attention_utils._flash_attention_forward",
+            _legacy_flash_attention_forward,
+        )
+        with pytest.raises(RuntimeError, match="varlen FlashAttention kwargs"):
+            validate_flash_packing_support("flash_attention_2")
 
-        original = fa_utils._get_unpad_data
-        try:
-            configure_packing(impl)
-            assert fa_utils._get_unpad_data is get_unpad_data
-        finally:
-            fa_utils._get_unpad_data = original
+    def test_accepts_model_with_varkwargs(self):
+        """An HF-style forward with **kwargs can receive the FlashAttentionKwargs."""
 
-    @pytest.mark.parametrize("impl", ["flash_attention_3", "flash_attention_4"])
-    def test_passthrough_mask_for_fa3_fa4_config(self, impl):
-        """_passthrough_create_causal_mask must pass the 2D mask through for any FA version."""
-        config = SimpleNamespace(_attn_implementation=impl)
-        mask = torch.tensor([[1, 1, 0]])
-        out = _passthrough_create_causal_mask(config=config, attention_mask=mask)
-        assert out is mask
+        class _Model:
+            def forward(self, input_ids, position_ids=None, **kwargs):
+                """Threads FlashAttentionKwargs through **kwargs."""
 
-    def test_llama_and_qwen3_in_patch_modules(self):
-        from nemo_automodel.components.models.common.packing import _PACKING_PATCH_MODULES
+        validate_flash_packing_support("flash_attention_2", model=_Model())  # must not raise
 
-        assert "transformers.models.llama.modeling_llama" in _PACKING_PATCH_MODULES
-        assert "transformers.models.qwen3.modeling_qwen3" in _PACKING_PATCH_MODULES
+    def test_accepts_model_with_packed_seq_ids_param(self):
+        """A custom-model forward that names _packed_seq_ids consumes the contract."""
+
+        class _CustomModel:
+            def forward(self, input_ids, position_ids=None, _packed_seq_ids=None):
+                """Custom model reads the per-document map explicitly."""
+
+        validate_flash_packing_support("flash_attention_2", model=_CustomModel())  # must not raise
+
+    def test_accepts_model_behind_ddp_wrapper(self):
+        """The check must unwrap DDP's .module, which does not proxy attribute access."""
+
+        class _Inner:
+            def forward(self, input_ids, **kwargs):
+                """Consumes via **kwargs."""
+
+        class _DDP:
+            def __init__(self, module):
+                self.module = module
+
+            def forward(self, *args, **kwargs):
+                """DDP's own forward is not the packing-consuming one."""
+
+        validate_flash_packing_support("flash_attention_2", model=_DDP(_Inner()))  # must not raise
+
+    def test_rejects_model_that_cannot_consume_contract(self):
+        """A forward with no **kwargs, no varlen params, no _packed_seq_ids must fail loudly."""
+
+        class _BlindModel:
+            def forward(self, input_ids, position_ids=None, attention_mask=None):
+                """Cannot receive the typed packing metadata."""
+
+        with pytest.raises(RuntimeError, match="_packed_seq_ids"):
+            validate_flash_packing_support("flash_attention_2", model=_BlindModel())
+
+    def test_accepts_model_with_all_four_varlen_kwargs(self):
+        """A forward naming all four cumulative-length kwargs consumes the contract."""
+
+        class _VarlenModel:
+            def forward(self, input_ids, cu_seq_lens_q=None, cu_seq_lens_k=None, max_length_q=None, max_length_k=None):
+                """Names the full varlen kwarg set explicitly."""
+
+        validate_flash_packing_support("flash_attention_2", model=_VarlenModel())  # must not raise
+
+    def test_rejects_model_with_partial_varlen_kwargs(self):
+        """A forward exposing only some varlen kwargs must be rejected: HF needs all four,
+        and filter_forward_kwargs would drop the rest, so the packing would silently break.
+        """
+
+        class _PartialModel:
+            def forward(self, input_ids, cu_seq_lens_q=None):
+                """Names one of four varlen kwargs; the other three would be dropped."""
+
+        with pytest.raises(RuntimeError, match="all four varlen"):
+            validate_flash_packing_support("flash_attention_2", model=_PartialModel())

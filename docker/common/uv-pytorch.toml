@@ -1,4 +1,6 @@
 override-dependencies = [
+    # leptonai (via nemo-run) caps anyio<=4.9.0; retain the security floor
+    "anyio>=4.14.2",
     "cuda-bindings; sys_platform == 'never'",
     "cuda-pathfinder; sys_platform == 'never'",
     "flash-attn; sys_platform == 'never'",
@@ -28,5 +30,5 @@ override-dependencies = [
     # leptonai pins 7.0.0, which caps Starlette below its security-fixed 1.x releases
     "prometheus-fastapi-instrumentator>=8.1.0",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
-    "urllib3>=2.6.3",
+    "urllib3>=2.8.0",
 ]

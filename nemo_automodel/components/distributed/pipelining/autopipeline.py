@@ -137,6 +137,7 @@ class AutoPipeline:
         )
         self._model_config = None
         self._pp_current_seq_len: int | None = None
+        self._pp_runtime_num_tokens: int = 0
         self._runtime_initializers: list[PipelineRuntimeInitializer] = []
 
     def build(
@@ -236,7 +237,7 @@ class AutoPipeline:
         if seq_len != self._pp_current_seq_len:
             if self._model_config is None:
                 raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
-            reset_pp_stage_shapes(
+            self._pp_runtime_num_tokens = reset_pp_stage_shapes(
                 self._info.schedule,
                 self._info.stages,
                 self._model_config,
@@ -249,7 +250,9 @@ class AutoPipeline:
 
         for initializer in self._runtime_initializers:
             initializer.prepare(
-                num_tokens=self.pp_microbatch_size * seq_len,
+                # Model-owned CP can keep input IDs global while stage activations
+                # and MoE dispatch are local. Reuse the stage metadata's token count.
+                num_tokens=self._pp_runtime_num_tokens,
                 device=self.device,
             )
 

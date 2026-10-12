@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Kimi K2 Te Deepep
+# Benchmarking config for Kimi K2 with TE and HybridEP
 
 # To run this recipe:
 #   automodel examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml --nproc-per-node 8
@@ -75,7 +75,7 @@ model:
     rms_norm: te
     rope_fusion: true
     experts: torch_mm
-    dispatcher: deepep
+    dispatcher: hybridep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
 

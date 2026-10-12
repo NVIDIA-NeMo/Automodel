@@ -52,8 +52,10 @@ from torch import nn
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 from torch.nn.parallel import DistributedDataParallel
+from torch.overrides import TorchFunctionMode
 from torch.serialization import MAP_LOCATION, FileLike
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
@@ -103,6 +105,48 @@ _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
+
+
+class _DTensorInitCopyMode(TorchFunctionMode):
+    """Adapt full-tensor initialization copies to an already-sharded destination."""
+
+    def __torch_function__(
+        self, func: Callable, types: tuple[type, ...], args: tuple = (), kwargs: dict | None = None
+    ) -> Any:
+        """Preserve ``copy_`` semantics while matching the destination's DTensor layout.
+
+        Args:
+            func: Intercepted torch operation.
+            types: Tensor types participating in the operation.
+            args: Operation arguments. For ``copy_``, the destination has arbitrary
+                global shape and the source is broadcastable to that shape. A plain
+                source is privately copied, broadcast from mesh rank zero, and
+                locally sharded to the destination's placements before the in-place
+                copy; existing DTensor sources and plain destinations keep their
+                normal behavior.
+            kwargs: Keyword arguments to the operation, including an optional
+                ``other`` source tensor with the same contract as above.
+
+        Returns:
+            The operation result; ``copy_`` returns and mutates the original
+            destination without replacing its parameter object or local storage.
+        """
+        kwargs = kwargs or {}
+        if func is torch.Tensor.copy_ and isinstance(args[0], DTensor):
+            destination = args[0]
+            source = args[1] if len(args) > 1 else kwargs["other"]
+            if isinstance(source, torch.Tensor) and not isinstance(source, DTensor):
+                # Broadcast then shard locally to avoid persistent NCCL scatter memory.
+                source = distribute_tensor(
+                    source.to(device=destination.device, copy=True).expand(destination.shape),
+                    destination.device_mesh,
+                    [Replicate()] * destination.device_mesh.ndim,
+                ).redistribute(placements=destination.placements)
+                if len(args) > 1:
+                    args = (destination, source, *args[2:])
+                else:
+                    kwargs = {**kwargs, "other": source}
+        return func(*args, **kwargs)
 
 
 def _format_restricted_load_error(f: FileLike) -> str:
@@ -1202,6 +1246,9 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
+        adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        checkpoint_key_aliases = dict(getattr(adapter, "checkpoint_key_aliases", {}))
+        applied_key_aliases: dict[str, str] = {}
         checkpoint_metadata = {}
         checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
@@ -1209,9 +1256,23 @@ class Checkpointer:
         shared_parameter_names = (
             _get_shared_parameter_names(model_state.model) if is_init_step and uses_standard_hf_state_dict else []
         )
-        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys or shared_parameter_names:
+        if (
+            should_try_tied_lm_head_compat
+            or allow_checkpoint_key_subset
+            or extra_state_keys
+            or shared_parameter_names
+            or checkpoint_key_aliases
+        ):
             checkpoint_metadata = _get_checkpoint_metadata(model_path, storage_reader).state_dict_metadata
             checkpoint_metadata_keys = set(checkpoint_metadata)
+        for current_key, legacy_key in checkpoint_key_aliases.items():
+            if (
+                current_key in state_dict
+                and current_key not in checkpoint_metadata_keys
+                and legacy_key in checkpoint_metadata_keys
+            ):
+                state_dict[legacy_key] = state_dict.pop(current_key)
+                applied_key_aliases[legacy_key] = current_key
         if extra_state_keys:
             # Serialized module metadata can grow after training (e.g. TE FP8 scaling history).
             # Allocate its saved representation; parameter and buffer destinations retain strict shape checks.
@@ -1327,6 +1388,10 @@ class Checkpointer:
         # It was needed for the read, but restore the original key set for installation and mismatch reporting.
         for source_name in set(shared_alias_sources.values()) - expected_keys:
             state_dict.pop(source_name)
+
+        for legacy_key, current_key in applied_key_aliases.items():
+            if legacy_key in state_dict:
+                state_dict[current_key] = state_dict.pop(legacy_key)
 
         state_dict = _maybe_adapt_state_dict_from_hf(
             model_state.model[0],
@@ -1507,16 +1572,30 @@ class Checkpointer:
                 saved_padding_idx = [(mod, mod.padding_idx) for mod in padded_embeddings]
                 for mod, _ in saved_padding_idx:
                     mod.padding_idx = None
+                # Newer HF versions classify FSDP's generated class as custom code
+                # and skip container initializers that populate child buffers.
+                # Bind the query to the original model class only during init.
+                bind_original_hf_class = (
+                    isinstance(model, FSDPModule)
+                    and hasattr(model, "is_custom_code")
+                    and "is_custom_code" not in vars(model)
+                )
                 try:
-                    try:
-                        if param_dtype is not None:
-                            model.initialize_weights(dtype=param_dtype)
-                        else:
+                    if bind_original_hf_class:
+                        original_class = next(cls for cls in type(model).__mro__ if not issubclass(cls, FSDPModule))
+                        model.is_custom_code = original_class.is_custom_code
+                    with _DTensorInitCopyMode():
+                        try:
+                            if param_dtype is not None:
+                                model.initialize_weights(dtype=param_dtype)
+                            else:
+                                model.initialize_weights()
+                        except TypeError:
+                            # Model's initialize_weights() does not accept a dtype kwarg.
                             model.initialize_weights()
-                    except TypeError:
-                        # Model's initialize_weights() does not accept a dtype kwarg.
-                        model.initialize_weights()
                 finally:
+                    if bind_original_hf_class:
+                        del model.is_custom_code
                     for mod, padding_idx in saved_padding_idx:
                         mod.padding_idx = padding_idx
                 for mod, padding_idx in saved_padding_idx:

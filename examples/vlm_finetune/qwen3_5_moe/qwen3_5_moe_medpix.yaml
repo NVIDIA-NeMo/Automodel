@@ -14,6 +14,7 @@
 
 
 # To run this recipe:
+#   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
@@ -127,6 +128,9 @@ ci:
   recipe_owner: HuiyingLi
   nodes: 32
   time: "00:45:00"
+  env_vars:
+    # AMINT-377: FSDP gradient reduction OOMs with large unused allocator reservations.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
 # Uncomment and configure for W&B logging
 # wandb:
