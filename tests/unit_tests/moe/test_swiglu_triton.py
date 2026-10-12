@@ -152,7 +152,7 @@ def test_autocast_with_fp32_parameters_matches_the_eager_reference(input_dtype):
 
 
 @requires_gpu_triton
-@pytest.mark.runtime_budget(120, hard_timeout=300, reason="inductor compiles the module with the Triton kernels")
+@pytest.mark.runtime_budget(30, hard_timeout=90, reason="inductor compiles the module with the Triton kernels")
 def test_compiled_module_keeps_one_graph_and_matches_eager_on_cuda():
     """torch.compile of a module around the Triton Function: no graph break, fullgraph compiles and runs forward +
     backward through inductor (the backward kernel's loop-carried accumulator must stay fp32 when inductor passes the
@@ -175,7 +175,7 @@ def test_compiled_module_keeps_one_graph_and_matches_eager_on_cuda():
     torch.testing.assert_close(gp_c, gp_e, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.runtime_budget(60, hard_timeout=180, reason="Dynamo traces the dispatcher on the CPU")
+@pytest.mark.runtime_budget(30, hard_timeout=90, reason="Dynamo traces the dispatcher on the CPU")
 def test_dispatcher_is_capturable_without_graph_breaks_on_cpu():
     """On CPU the dispatcher takes the compiled function; an outer torch.compile must see one graph (backend eager:
     capture only, no inductor build on the CI runner)."""

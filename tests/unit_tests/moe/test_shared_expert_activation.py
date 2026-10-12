@@ -55,20 +55,20 @@ def test_compiled_clamped_swiglu_matches_the_eager_chain(limit):
     assert torch.any(gate.grad.float()[~saturated_gate] != 0)
 
 
-@pytest.mark.runtime_budget(
-    240, hard_timeout=600, reason="two inductor graphs (static, then symbolic rows) compile on the CPU"
-)
+@pytest.mark.runtime_budget(30, hard_timeout=90, reason="Dynamo traces the island twice (static, then symbolic rows)")
 def test_distinct_row_counts_recompile_once_and_never_hit_the_recompile_limit():
     """Variable-length batches give the shared expert a new token count each step. Dynamo's default shape policy
     compiles a static graph, then one symbolic graph that every later shape reuses; `dynamic=False` with
-    `fullgraph=True` raised `FailOnRecompileLimitHit` after `recompile_limit` distinct shapes instead."""
+    `fullgraph=True` raised `FailOnRecompileLimitHit` after `recompile_limit` distinct shapes instead. The island's
+    own function is re-wrapped with the eager backend so the test measures the shape policy, not inductor's CPU
+    build (the one-GPU contract probe sweeps the production island itself)."""
     torch._dynamo.reset()
     torch.manual_seed(5)
-    limit = getattr(torch._dynamo.config, "recompile_limit", None) or getattr(
-        torch._dynamo.config, "cache_size_limit", 8
-    )
-    for rows in range(4, 4 + int(limit) + 3):  # more distinct shapes than the limit allows recompiles
-        gate = (torch.randn(rows, 8) * 3).to(torch.bfloat16)
-        up = (torch.randn(rows, 8) * 3).to(torch.bfloat16)
-        out = _clamped_swiglu_act(gate, up, 2.0)
-        torch.testing.assert_close(out, _eager(gate, up, 2.0), rtol=0, atol=0)
+    island = torch.compile(_clamped_swiglu_act._torchdynamo_orig_callable, fullgraph=True, backend="eager")
+    limit_name = "recompile_limit" if hasattr(torch._dynamo.config, "recompile_limit") else "cache_size_limit"
+    with torch._dynamo.config.patch(**{limit_name: 3}):
+        for rows in range(4, 4 + 8):  # eight distinct shapes against a limit of three recompiles
+            gate = (torch.randn(rows, 8) * 3).to(torch.bfloat16)
+            up = (torch.randn(rows, 8) * 3).to(torch.bfloat16)
+            out = island(gate, up, 2.0)
+            torch.testing.assert_close(out, _eager(gate, up, 2.0), rtol=0, atol=0)
