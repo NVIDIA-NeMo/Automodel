@@ -32,15 +32,16 @@ def _build_tiny_dataset():
 
 @pytest.fixture(autouse=True)
 def _patch_external_libs(monkeypatch):
-    # 1) Patch datasets.load_dataset everywhere
+    # Patch the consumer's bindings even when another test imported HellaSwag first.
+    import nemo_automodel.components.datasets.llm.hellaswag as hellaswag_mod
+
     def _fake_load_dataset(path_or_dataset, split=None, trust_remote_code=True):
         # We only check that the slice expression is propagated
         assert split in (None, "train", "train[:1]")
         return _build_tiny_dataset()
 
-    monkeypatch.setattr("datasets.load_dataset", _fake_load_dataset)
+    monkeypatch.setattr(hellaswag_mod, "load_dataset", _fake_load_dataset)
 
-    # 2) Patch the NeMo pre-processor on its real import path
     class _DummyPreprocessor:
         def __init__(self, tokenizer):
             self.tokenizer = tokenizer
@@ -50,11 +51,7 @@ def _patch_external_libs(monkeypatch):
             # Return dataset unchanged
             return ds
 
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.utils.SFTSingleTurnPreprocessor",
-        _DummyPreprocessor,
-        raising=False,
-    )
+    monkeypatch.setattr(hellaswag_mod, "SFTSingleTurnPreprocessor", _DummyPreprocessor)
 
     yield
 
