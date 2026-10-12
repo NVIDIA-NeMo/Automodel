@@ -14,6 +14,7 @@
 
 import copy
 import weakref
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -99,6 +100,7 @@ def test_recipe_releases_unused_outputs_before_backward(output_kind, dtype, reco
         te_fp8=None,
         cfg=SimpleNamespace(mtp=SimpleNamespace(scaling_factor=None)),
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
+        _autocast_context=nullcontext,
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: 1,
     )
