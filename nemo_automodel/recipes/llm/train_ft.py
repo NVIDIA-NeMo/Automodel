@@ -95,7 +95,7 @@ from nemo_automodel.components.loss.utils import (
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
-from nemo_automodel.components.training.model_output_utils import final_hidden_states_kwargs, get_final_hidden_states
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
@@ -114,6 +114,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
     filter_forward_kwargs,
+    final_hidden_states_kwargs,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp

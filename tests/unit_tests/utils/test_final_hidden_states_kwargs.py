@@ -15,7 +15,8 @@
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.training.model_output_utils import final_hidden_states_kwargs, get_final_hidden_states
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.utils.model_utils import final_hidden_states_kwargs
 
 
 class _HFStyle(nn.Module):
