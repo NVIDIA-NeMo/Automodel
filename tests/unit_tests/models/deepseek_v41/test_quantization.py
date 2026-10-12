@@ -121,11 +121,16 @@ def test_cache_quantization_zero_partial_group_and_straight_through_gradient(for
     torch.testing.assert_close(values.grad, upstream, rtol=0, atol=0)
 
 
-def test_compile_cache_quant_is_a_backend_knob_that_defaults_off() -> None:
+def test_compile_cache_quant_is_a_model_config_knob_that_defaults_off() -> None:
+    """Model-specific knobs live on the model's config class, not on the shared BackendConfig."""
     from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.deepseek_v41 import quantization as q
+    from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 
-    assert BackendConfig().compile_cache_quant is False
+    assert DeepseekV41TextConfig().compile_cache_quant is False
+    assert DeepseekV41TextConfig(compile_cache_quant=True).compile_cache_quant is True
+    assert DeepseekV41Config(text_config={"compile_cache_quant": True}).text_config.compile_cache_quant is True
+    assert not hasattr(BackendConfig(), "compile_cache_quant")
     assert q._quantize is q._cache_quantization_core and not q._QUANT_COMPILED
 
 

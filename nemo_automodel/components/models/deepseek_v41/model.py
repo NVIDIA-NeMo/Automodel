@@ -248,7 +248,7 @@ class DeepseekV41Model(nn.Module):
             compile_hc_cores()
         if backend.compile_norm and backend.rms_norm != "te":
             compile_norm_core()
-        if backend.compile_cache_quant:
+        if config.compile_cache_quant:
             compile_cache_quantization()
         dtype = dtype_from_str(config.dtype, torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)

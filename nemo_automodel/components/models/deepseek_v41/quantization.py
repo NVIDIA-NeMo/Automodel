@@ -81,7 +81,7 @@ _QUANT_COMPILED = False
 
 
 def compile_cache_quantization() -> None:
-    """Wrap the cache-quantization core with ``torch.compile`` (``BackendConfig.compile_cache_quant``).
+    """Wrap the cache-quantization core with ``torch.compile`` (``DeepseekV41TextConfig.compile_cache_quant``).
 
     Runs once per process; static shapes (``dynamic=False``): one specialization per call site shape and
     format (SWA KV fp8, index Q/K mxfp4, compressed KV nvfp4). No ``fullgraph``: past dynamo's recompile
