@@ -195,7 +195,19 @@ class _AllGatherSequence(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        grad_output = grad_output.contiguous()
+        """Reduce a private copy of the full-sequence gradient.
+
+        Args:
+            grad_output: Tensor of arbitrary rank with the global sequence on
+                ctx.dim. Its dtype matches the forward input, and its storage
+                may still be owned by the caller or another autograd branch.
+
+        Returns:
+            Local sequence-gradient tensor, followed by two None entries for
+            the process group and dimension. The gradient aliases a private
+            reduction buffer, never the caller's upstream-gradient storage.
+        """
+        grad_output = grad_output.clone(memory_format=torch.contiguous_format)
         dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
         start = ctx.rank * ctx.local_size
         return grad_output.narrow(ctx.dim, start, ctx.local_size).contiguous(), None, None

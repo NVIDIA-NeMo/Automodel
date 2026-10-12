@@ -136,12 +136,86 @@ def check_case(
     )
 
 
+def check_borrowed_gradient(
+    group: dist.ProcessGroup, device: torch.device, dtype: torch.dtype
+) -> dict[str, int | str | bool]:
+    """Require gather backward to preserve the caller's upstream-gradient buffer."""
+    rank, size = dist.get_rank(group), dist.get_world_size(group)
+    local = torch.zeros((2, 3, 4), device=device, dtype=dtype, requires_grad=True)
+    gathered = all_gather_sequence(local, group, dim=1)
+    upstream = coefficient(tuple(gathered.shape), rank, device).to(dtype)
+    before = upstream.clone()
+    gathered.backward(upstream)
+    expected = (
+        sum(coefficient(tuple(gathered.shape), other, device).double() for other in range(size))
+        .to(dtype)
+        .narrow(1, rank * 3, 3)
+    )
+    torch.testing.assert_close(local.grad, expected, rtol=0, atol=0)
+    torch.testing.assert_close(upstream, before, rtol=0, atol=0)
+    return dict(cp=size, rank=rank, dtype=str(dtype), borrowed_gradient_preserved=True)
+
+
+def check_live_gather_buffers(
+    group: dist.ProcessGroup, device: torch.device, *, batch_size: int, width: int, separate_stream: bool
+) -> dict[str, int | str | bool]:
+    """Keep eight gathered microbatches live while exercising allocator reuse."""
+    rank, size = dist.get_rank(group), dist.get_world_size(group)
+    local_length = 4096
+    default_stream = torch.cuda.current_stream(device)
+    stream = torch.cuda.Stream(device=device) if separate_stream else default_stream
+    stream.wait_stream(default_stream)
+    inputs = []
+    outputs = []
+    with torch.cuda.stream(stream):
+        rows = torch.arange(local_length, device=device) + rank * local_length
+        columns = torch.arange(width, device=device)
+        batches = torch.arange(batch_size, device=device)
+        for microbatch in range(8):
+            storage = torch.empty((batch_size, local_length, width * 2), device=device, dtype=torch.bfloat16)
+            local = storage[..., ::2]
+            values = ((batches[:, None, None] * 5 + rows[None, :, None] + columns + microbatch * 3) % 17 - 8) / 16
+            local.copy_(values)
+            local.requires_grad_()
+            gathered = all_gather_sequence(local, group, dim=1)
+            inputs.append(local)
+            outputs.append(gathered)
+            # Request the contiguous input-temporary allocation size after the
+            # gather call, while its GPU work may still be in flight.
+            for _ in range(2):
+                pressure = torch.empty((batch_size, local_length, width), device=device, dtype=torch.bfloat16)
+                pressure.fill_(float("nan"))
+                del pressure
+    default_stream.wait_stream(stream)
+    rows = torch.arange(local_length * size, device=device)
+    columns = torch.arange(width, device=device)
+    batches = torch.arange(batch_size, device=device)
+    for microbatch in reversed(range(8)):
+        expected = ((batches[:, None, None] * 5 + rows[None, :, None] + columns + microbatch * 3) % 17 - 8) / 16
+        torch.testing.assert_close(outputs[microbatch], expected.to(torch.bfloat16), rtol=0, atol=0)
+        upstream = torch.full_like(outputs[microbatch], (rank + 1) / 32)
+        gradient = torch.autograd.grad(outputs[microbatch], inputs[microbatch], upstream)[0]
+        torch.testing.assert_close(gradient, torch.full_like(gradient, size * (size + 1) / 64), rtol=0, atol=0)
+        torch.testing.assert_close(upstream, torch.full_like(upstream, (rank + 1) / 32), rtol=0, atol=0)
+    return dict(
+        cp=size,
+        rank=rank,
+        local_length=local_length,
+        width=width,
+        batch_size=batch_size,
+        microbatches=8,
+        separate_stream=separate_stream,
+        live_buffers_preserved=True,
+    )
+
+
 def main() -> None:
     """Run the real Gloo/NCCL process-group matrix and save bounded evidence."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=["gloo", "nccl"], default="nccl")
     parser.add_argument("--group-sizes", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--output", required=True)
+    parser.add_argument("--buffer-stress", action="store_true", help="Exercise eight live 4K microbatches on CUDA")
     args = parser.parse_args()
     if args.backend == "nccl":
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -162,8 +236,9 @@ def main() -> None:
             if rank in ranks:
                 own_group = group
         assert own_group is not None
-        dtypes = [torch.float32] if args.backend == "gloo" else [torch.float32, torch.bfloat16]
+        dtypes = [torch.float32] if args.backend == "gloo" else [torch.bfloat16, torch.float32]
         for dtype in dtypes:
+            records.append(check_borrowed_gradient(own_group, device, dtype))
             for dim in [0, 1, -1]:
                 for strided, empty, recompute in [
                     (False, False, False),
@@ -182,6 +257,17 @@ def main() -> None:
                             use_checkpoint=recompute,
                         )
                     )
+        if args.buffer_stress:
+            if args.backend != "nccl":
+                raise ValueError("--buffer-stress requires NCCL/CUDA")
+            for batch_size in (1, 2):
+                for width in (256, 512):
+                    for separate_stream in (False, True):
+                        records.append(
+                            check_live_gather_buffers(
+                                own_group, device, batch_size=batch_size, width=width, separate_stream=separate_stream
+                            )
+                        )
         dist.barrier()
     from nemo_automodel.components.models.glm5_next import cp
 
