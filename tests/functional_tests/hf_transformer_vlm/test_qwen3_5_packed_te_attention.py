@@ -19,7 +19,7 @@ import torch
 
 from tests.unit_tests.models.qwen3_5.test_packed_vision import check_packed_media_parity
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
 @pytest.mark.parametrize("media", ["image", "video", "both", "text"])
@@ -29,6 +29,13 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 def test_packed_te_attention(
     media: str, precomputed: bool, dtype: torch.dtype, pack_sizes: tuple[int, ...], hybrid: bool
 ) -> None:
+    pytest.importorskip("transformer_engine.pytorch")
+    # The vision module is constructed with FA2 even for text-only batches.
+    pytest.importorskip("flash_attn")
+    if hybrid:
+        # The HF fallbacks do not isolate packed documents in linear attention.
+        pytest.importorskip("fla.ops.gated_delta_rule")
+        pytest.importorskip("causal_conv1d")
     check_packed_media_parity(
         media, precomputed, attn="te", device="cuda", dtype=dtype, pack_sizes=pack_sizes, hybrid=hybrid
     )

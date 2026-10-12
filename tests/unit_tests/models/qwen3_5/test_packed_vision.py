@@ -19,11 +19,12 @@ import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.vision_utils import get_vision_attention_seqlens
 
+from nemo_automodel.components.datasets.utils import neat_packed_collater
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.packing import configure_packing_for_models
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
+from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 
 
 def _model(
@@ -141,6 +142,8 @@ def check_packed_media_parity(
     original_boundaries = batch["cu_seqlens"].clone()
     assert original_boundaries.ndim == 2
     if precomputed:
+        # Compatibility coverage: HF strips the media prefix and overwrites any
+        # leaked text boundaries. Only precomputed=False detects that collision.
         for kind in ("image", "video"):
             if media in (kind, "both"):
                 cu_seqlens, _ = get_vision_attention_seqlens(batch[f"{kind}_grid_thw"], model.config.vision_config)
@@ -183,9 +186,42 @@ def check_packed_media_parity(
                 atol=2e-6 if dtype == torch.float32 else atol,
                 msg=lambda message: f"{name}: {message}",
             )
+            # Elementwise atol alone can accept an entirely missing small gradient.
+            # Bound each tensor's relative L2 error without an absolute floor too.
+            grad_error = torch.linalg.vector_norm(param.grad.float() - reference_grad.float())
+            grad_scale = torch.linalg.vector_norm(reference_grad.float())
+            assert grad_error <= (1e-4 if dtype == torch.float32 else rtol) * grad_scale, (
+                f"{name}: gradient L2 error {grad_error.item()} exceeds relative tolerance "
+                f"for reference norm {grad_scale.item()}"
+            )
 
 
 @pytest.mark.parametrize("media", ["image", "video", "both", "text"])
 @pytest.mark.parametrize("precomputed", [False, True])
 def test_packed_media_matches_independent_documents(media: str, precomputed: bool) -> None:
     check_packed_media_parity(media, precomputed)
+
+
+@pytest.mark.parametrize("causal_lm", [False, True], ids=["vlm", "llm"])
+@pytest.mark.parametrize("attn", ["sdpa", "te"])
+def test_packing_contract_selects_collator_mask(causal_lm: bool, attn: str) -> None:
+    model = _model()
+    if causal_lm:
+        model = Qwen3_5ForCausalLM(model.config.text_config, backend=model.backend)
+    # Inspect the data contract without constructing optional TE kernels on CPU.
+    model.backend.attn = attn
+    contract = configure_packing_for_models([model])
+    assert contract.requires_packed_sequence_metadata
+    assert contract.packed_mask_type == ("document_ids" if attn == "te" else "block_causal")
+
+    pack = {
+        "input_ids": torch.tensor([3, 4, 5, 0]),
+        "labels": torch.tensor([3, 4, 5, -100]),
+        "position_ids": torch.tensor([0, 1, 0, 0]),
+        "attention_mask": torch.tensor([1, 1, 2, 0]),
+    }
+    batch = neat_packed_collater([pack], packing=contract)
+    assert batch["attention_mask"].shape == ((1, 4) if attn == "te" else (1, 1, 4, 4))
+    torch.testing.assert_close(batch["cu_seqlens"], torch.tensor([[0, 2, 3]], dtype=torch.int32))
+    if attn == "te":
+        torch.testing.assert_close(batch["attention_mask"], pack["attention_mask"].unsqueeze(0))

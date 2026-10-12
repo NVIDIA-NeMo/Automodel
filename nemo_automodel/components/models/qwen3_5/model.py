@@ -19,7 +19,7 @@ from __future__ import annotations
 import copy
 import inspect
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -57,7 +57,11 @@ from nemo_automodel.components.models.common.mtp import (
     prepare_mtp_context_parallel_inputs,
     roll_tensor,
 )
-from nemo_automodel.components.models.common.packing import flatten_packed_sequence_metadata, is_indexed_packed_mask
+from nemo_automodel.components.models.common.packing import (
+    PackedMaskType,
+    flatten_packed_sequence_metadata,
+    is_indexed_packed_mask,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -781,6 +785,11 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
+    @property
+    def packed_mask_type(self) -> PackedMaskType:
+        """Request compact NEAT document IDs when TE consumes packed offsets."""
+        return "document_ids" if self.backend.attn == "te" else "block_causal"
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -1049,7 +1058,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         supports_mtp_cp: bool = True
 
     @property
-    def packed_mask_type(self) -> Literal["document_ids", "block_causal"]:
+    def packed_mask_type(self) -> PackedMaskType:
         """Request compact NEAT document IDs when TE consumes packed offsets."""
         return "document_ids" if self.backend.attn == "te" else "block_causal"
 
