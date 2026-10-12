@@ -264,13 +264,18 @@ def preprocess_args_and_kwargs_for_attn(
             distinct value head dimension.
         attention_mask: Optional tensor of shape [batch, sequence] for padding
             or indexed packing, or [batch, 1, sequence, sequence] for an
-            explicit dense mask.
+            explicit dense mask. TE accepts only a binary [batch, sequence]
+            padding mask (1/True for valid tokens, 0/False for padding).
+            Packed TE inputs require None and THD sequence metadata instead.
         attn_impl: Attention backend name.
         **kwargs: Backend metadata. Packed FA4 accepts ``cu_seqlens`` of shape
             [documents + 1] and ``packed_token_indices`` of shape [tokens].
             For SDPA and FA4, a positive left ``window_size`` counts visible
             keys including the current token; negative/None means unbounded.
             The legacy TE branch forwards its backend-specific distances unchanged.
+            Packed TE accepts ``cu_seqlens`` of shape [documents + 1] and
+            optional ``cu_seqlens_padded`` with the same shape, both int32,
+            together with an integer ``max_seqlen``.
 
     Returns:
         Query, key, and value tensors in the backend layout plus its keyword
@@ -280,6 +285,9 @@ def preprocess_args_and_kwargs_for_attn(
         Packed BSHD FA4 tensors are unpadded to [tokens, heads,
         head_dim]; the FA4 callable restores its output to BSHD using the value
         head dimension.
+
+    Raises:
+        ValueError: If the selected backend cannot consume the input layout.
     """
     attn_kwargs: dict[str, Any]
     # Create attention kwargs based on backend
@@ -288,6 +296,12 @@ def preprocess_args_and_kwargs_for_attn(
             "window_size": kwargs.get("window_size", (-1, 0)),
         }
         if attention_mask is not None:
+            if attention_mask.ndim != 2:
+                raise ValueError(
+                    "attn_impl='te' expects a 2D [batch, sequence] padding mask; "
+                    f"got attention_mask with shape {tuple(attention_mask.shape)}. "
+                    "For packed sequences, use THD with cu_seqlens and attention_mask=None."
+                )
             padding_mask = attention_mask.logical_not()
             attn_kwargs.update(
                 {
