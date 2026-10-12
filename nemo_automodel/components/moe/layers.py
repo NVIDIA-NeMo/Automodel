@@ -945,7 +945,7 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
 
     with torch.device(buffer_device):
         if isinstance(module, Gate):
-            module.weight.normal_(mean=0.0, std=init_std)
+            to_local(module.weight).normal_(mean=0.0, std=init_std)
             if module.e_score_correction_bias is not None:
                 to_local(module.e_score_correction_bias).zero_()
             if module.bias is not None:
@@ -956,10 +956,10 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         elif isinstance(module, GroupedExpertsMoK):
             module.init_weights(buffer_device, init_std)
         elif isinstance(module, MLP):
-            module.down_proj.weight.normal_(mean=0.0, std=init_std)
-            module.up_proj.weight.normal_(mean=0.0, std=init_std)
+            to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
+            to_local(module.up_proj.weight).normal_(mean=0.0, std=init_std)
             if module.gate_proj is not None:
-                module.gate_proj.weight.normal_(mean=0.0, std=init_std)
+                to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)
         elif isinstance(module, MoE):
             if module.fc1_latent_proj is not None:
                 to_local(module.fc1_latent_proj.weight).normal_(mean=0.0, std=init_std)

@@ -40,7 +40,6 @@ from nemo_automodel.components.models.glm5_next.parallelization import PARALLELI
 from nemo_automodel.components.models.glm5_next.vision import Glm5NextVisionModel, Glm5NextVisionOutput
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -106,17 +105,6 @@ def _packed_context_from_inputs(
         doc_ids = torch.ones(input_ids.shape[:2], dtype=torch.int32, device=input_ids.device)
         if padding_mask is not None:
             doc_ids.masked_fill_(padding_mask.bool(), 0)
-        else:
-            # Unmasked rows each contain one document; their boundaries depend
-            # only on shape and never require a device-to-host value read.
-            cpu_boundaries = torch.tensor([0, sequence] if sequence else [0], dtype=torch.long, device="cpu")
-            device_boundaries = cpu_boundaries.to(input_ids.device, non_blocking=True)
-            return Glm5NextPackedContext(
-                doc_ids=doc_ids,
-                original_seq_len=sequence,
-                _cu_seqlens={row: (device_boundaries, cpu_boundaries) for row in range(input_ids.shape[0])},
-                _document_ranges={row: ((0, sequence),) if sequence else () for row in range(input_ids.shape[0])},
-            )
     return Glm5NextPackedContext(doc_ids=doc_ids, original_seq_len=sequence)
 
 
@@ -197,7 +185,7 @@ class Glm5NextTextModel(nn.Module):
             if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
                 if self.padding_idx is not None:
-                    zero_embedding_row_(self.embed_tokens.weight, self.padding_idx)
+                    self.embed_tokens.weight[self.padding_idx].zero_()
             if self.norm is not None:
                 self.norm.reset_parameters()
         for layer in self.layers.values():
@@ -233,6 +221,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
     """Trainable GLM-5.3 VLM with PP, EP and contiguous packed CP support."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _skip_init_weights_on_load = True
     _owns_cp_attention = True
     _owns_packed_attention = True
     _packed_cp_attn_backends = ("sdpa", "cudnn")

@@ -49,6 +49,30 @@ def _torch_sparse_latent_attention(
     return torch.stack(rows)
 
 
+def _packed_document_slice(
+    attention: Glm5NextSparseAttention,
+    hidden_states: torch.Tensor,
+    query_start: int,
+    query_end: int,
+) -> torch.Tensor:
+    """Exercise the production packed kernel path for one document interval.
+
+    Args:
+        attention: Sparse attention module using the cuDNN backend.
+        hidden_states: Full document states [1, document_tokens, hidden].
+        query_start: First document-local query position.
+        query_end: Exclusive final document-local query position.
+
+    Returns:
+        Attention output [1, query_end - query_start, hidden].
+    """
+    context = Glm5NextPackedContext(
+        doc_ids=torch.ones(hidden_states.shape[:2], dtype=torch.int32, device=hidden_states.device),
+        seq_start=query_start,
+    )
+    return attention._forward_packed_cudnn(hidden_states, context, query_end - query_start)
+
+
 def test_tiny_hybrid_packed_forward_backward_is_finite():
     torch.manual_seed(7)
     model = tiny_glm5_next_model().train()
@@ -153,7 +177,7 @@ def test_cudnn_sparse_attention_matches_sdpa_absorbed_math(monkeypatch, length, 
         patch.object(cudnn.q_b_proj, "forward", wraps=cudnn.q_b_proj.forward) as q_b_projection,
         patch.object(cudnn.indexer, "select", wraps=cudnn.indexer.select) as selections,
     ):
-        cudnn_output = cudnn._forward_document(cudnn_input, query_start, query_end)
+        cudnn_output = _packed_document_slice(cudnn, cudnn_input, query_start, query_end)
     upstream = torch.randn_like(sdpa_output)
     (sdpa_output * upstream).sum().backward()
     (cudnn_output * upstream).sum().backward()
@@ -238,12 +262,18 @@ def test_cudnn_sparse_attention_packed_documents_match_separate_execution(monkey
     selected.clear()
     separate_output = torch.cat(
         [
-            attention._forward_document(document, 0, document.shape[1])
+            _packed_document_slice(attention, document, 0, document.shape[1])
             for document in separate_input.split(lengths, dim=1)
         ],
         dim=1,
     )
-    separate_selected = torch.cat(selected, dim=1)
+    # Separate calls number keys within each document. Translate them using
+    # independently computed document offsets before comparing packed keys.
+    document_offsets = [sum(lengths[:index]) for index in range(len(lengths))]
+    separate_selected = torch.cat(
+        [torch.where(indices >= 0, indices + offset, indices) for indices, offset in zip(selected, document_offsets)],
+        dim=1,
+    )
     torch.testing.assert_close(packed_selected.sort(dim=-1).values, separate_selected.sort(dim=-1).values)
     local_positions = torch.cat([torch.arange(length) for length in lengths])
     assert ((packed_selected[0] >= 0).sum(-1) < local_positions + 1).any()
@@ -348,7 +378,7 @@ def test_cudnn_dense_prefix_matches_independent_integer_keys(
 
     monkeypatch.setattr(glm5_next_layers, "is_cudnn_sparse_attention_available", lambda: True)
     monkeypatch.setattr(glm5_next_layers, "cudnn_sparse_attention", check_keys)
-    attention._forward_document(torch.randn(1, length, config.hidden_size), query_start, length)
+    _packed_document_slice(attention, torch.randn(1, length, config.hidden_size), query_start, length)
     assert len(calls) == 1
 
 
@@ -378,7 +408,7 @@ def test_cudnn_dense_prefix_skips_only_complete_chunks(monkeypatch, query_start,
     monkeypatch.setattr(glm5_next_layers, "is_cudnn_sparse_attention_available", lambda: True)
     monkeypatch.setattr(glm5_next_layers, "cudnn_sparse_attention", _torch_sparse_latent_attention)
     with patch.object(attention.indexer, "select", wraps=attention.indexer.select) as selections:
-        result = attention._forward_document(hidden, query_start, query_end)
+        result = _packed_document_slice(attention, hidden, query_start, query_end)
     # Compare the non-cuDNN SDPA path before asserting the new dispatch contract.
     attention.backend.attn = "sdpa"
     expected = attention._forward_document(expected_input, query_start, query_end)

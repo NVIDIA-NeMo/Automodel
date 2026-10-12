@@ -20,14 +20,11 @@ import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
-from nemo_automodel.components.loss.utils import _count_label_tokens, _get_loss_ignore_index
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
-    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
-    scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -310,6 +307,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         with timers and profiling support, similar to the original benchmarking script.
         """
         rank = self.dist_env.rank
+        device = self.dist_env.device
+
         # Get benchmarking config
         steps = self._bench_steps
         warmup_steps = self._bench_warmup_steps
@@ -361,30 +360,28 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
-                # Normalize every microbatch by the whole window's global supervision.
-                batches = [next(dataloader_iter) for _ in range(ga_steps)]
-                ignore_index = _get_loss_ignore_index(self.loss_fn)
-                num_label_tokens = torch.tensor(
-                    sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
-                    dtype=torch.long,
-                )
-                num_label_tokens = self._dp_allreduce(num_label_tokens).item()
-                self._set_moe_aux_loss_backward_scale(num_batches=ga_steps, num_label_tokens=num_label_tokens)
+                # Gradient accumulation loop
+                num_label_tokens = 0
                 loss_buffer = []
                 prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
-                for ga_step_idx, batch in enumerate(batches):
+                for ga_step_idx in range(ga_steps):
                     if ga_step_idx == ga_steps - 1:
                         prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
+                    # Get batch from dataloader
+                    batch = next(dataloader_iter)
                     torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
+
+                    # Accumulate label tokens locally
+                    num_label_tokens += (batch["labels"] != -100).sum().item()
 
                     with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
                         self._forward_backward_step(
                             ga_step_idx,
                             batch,
                             loss_buffer=loss_buffer,
-                            num_label_tokens=num_label_tokens,
+                            num_label_tokens=None,
                             num_batches=ga_steps,
                             is_train=True,
                         )
@@ -397,30 +394,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
                     synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
-                    scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        self.model_parts,
-                        norm_type=2.0,
-                        pp_enabled=self.pp_enabled,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name="pp" if self.pp_enabled else None,
-                        foreach=True,
-                        num_label_tokens=num_label_tokens,
-                        dp_group_size=self._get_dp_group_size(include_cp=True),
-                        expert_tp_replication_factor=get_expert_tp_replication_factor(
-                            self.model_parts, self.device_mesh
-                        ),
-                        grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
-                    )
                     for opt in self.optimizer:
                         opt.step()
-                    if hasattr(self.model_parts[0], "update_moe_gate_bias"):
-                        for mp in self.model_parts:
-                            mp.update_moe_gate_bias()
                     logger.debug("Optimizer step")
 
             # Match the training-loop lifecycle: record one complete eager
@@ -429,12 +404,15 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 self.partial_cuda_graph_manager.capture()
                 self._partial_cuda_graph_capture_pending = False
 
-            # Non-pipeline losses were normalized before backward; PP returns sums.
+            # Synchronize num_label_tokens across DP ranks
+            num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
+            num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
+            num_label_tokens = num_label_tokens_tensor.item()
+
+            # Calculate loss - following exact train_ft.py:1059-1071 pattern
             reporting_loss = torch.sum(torch.stack(loss_buffer))
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-            reporting_loss = reporting_loss.to(torch.float32)
-            if self.pp_enabled and num_label_tokens > 0:
-                reporting_loss = reporting_loss / num_label_tokens
+            reporting_loss = reporting_loss.to(torch.float32) / num_label_tokens
 
             if self.pp_enabled:
                 reporting_loss = reporting_loss.to(self.dist_env.device)

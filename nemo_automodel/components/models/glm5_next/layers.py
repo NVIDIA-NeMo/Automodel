@@ -769,16 +769,6 @@ class Glm5NextSparseAttention(nn.Module):
         length = full_hidden.shape[1]
         latent = self.kv_a_layernorm(self.kv_a_proj_with_mqa(full_hidden))
         pool_keys, pool_indices = self.indexer.prepare_pools(full_hidden)
-        if self.backend.attn == "cudnn":
-            return self._forward_document_cudnn(
-                full_hidden,
-                latent,
-                pool_keys,
-                pool_indices,
-                query_start,
-                query_end,
-            )
-
         expanded = self.kv_b_proj(latent).view(1, length, self.num_heads, self.qk_head_dim + self.v_head_dim)
         key, value = expanded.split([self.qk_head_dim, self.v_head_dim], dim=-1)
         key, value = key.transpose(1, 2), value.transpose(1, 2)
@@ -812,94 +802,6 @@ class Glm5NextSparseAttention(nn.Module):
             )
             chunks.append(attn.transpose(1, 2).reshape(1, end - start, -1))
         return self.o_proj(torch.cat(chunks, dim=1))
-
-    def _forward_document_cudnn(
-        self,
-        full_hidden: torch.Tensor,
-        latent: torch.Tensor,
-        pool_keys: torch.Tensor,
-        pool_indices: torch.Tensor,
-        query_start: int,
-        query_end: int,
-    ) -> torch.Tensor:
-        """Run absorbed latent attention through FlashMLA/cuDNN for one document.
-
-        Args:
-            full_hidden: Unpadded document states with shape ``[1, key_tokens, hidden]``.
-            latent: Normalized shared latent K/V with shape
-                ``[1, key_tokens, 512]``.
-            pool_keys: KPool-compressed index keys with shape
-                ``[complete_pools, index_head_dim]``.
-            pool_indices: Document-local token indices with shape
-                ``[complete_pools, index_kpool]``.
-            query_start: Inclusive document-local index of the first local query.
-            query_end: Exclusive document-local index of the final local query.
-
-        Returns:
-            Projected attention output with shape
-            ``[1, query_end - query_start, hidden]``.
-        """
-        if not is_cudnn_sparse_attention_available():
-            raise RuntimeError(
-                "backend.attn='cudnn' requires the optional cuDNN sparse-attention "
-                "and FlashMLA runtimes, but they are unavailable in this environment."
-            )
-
-        weight = self.kv_b_proj.weight.view(
-            self.num_heads,
-            self.qk_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        w_kc, w_vc = weight.split([self.qk_head_dim, self.v_head_dim], dim=1)
-        q_resid = self.q_a_layernorm(self.q_a_proj(full_hidden[:, query_start:query_end]))
-        selected_indices = []
-        length = full_hidden.shape[1]
-
-        # Bound the FP32 [queries, index_heads, pools] score tensor to 256 MiB.
-        # At 256K/KPool4 this retains the original 32-query score workspace.
-        def chunk_size(score_heads: int) -> int:
-            bytes_per_query = max(1, pool_keys.shape[0]) * score_heads * 4
-            size = min(self.indexer_query_chunk_size, max(1, (256 * 1024**2) // bytes_per_query))
-            return 1 << (size.bit_length() - 1) if size > 512 else size
-
-        projection_chunk = chunk_size(self.indexer.n_heads)
-        indexer_chunk = projection_chunk
-        if self.indexer.backend == "cudnn":
-            indexer_chunk = (chunk_size(1) // projection_chunk) * projection_chunk
-        for start in range(query_start, query_end, indexer_chunk):
-            end = min(start + indexer_chunk, query_end)
-            positions = torch.arange(start, end, device=full_hidden.device)
-            # Skip only complete original chunks; sparse GEMM shapes stay unchanged.
-            if end // self.indexer.index_kpool <= self.indexer.index_topk // self.indexer.index_kpool:
-                indices = _dense_prefix_indices(
-                    positions,
-                    self.indexer.index_topk,
-                    self.indexer.index_kpool,
-                    self.indexer.always_select_tail,
-                )
-            else:
-                indices = self.indexer.select(
-                    full_hidden[:, start:end],
-                    q_resid[:, start - query_start : end - query_start],
-                    positions,
-                    pool_keys,
-                    pool_indices,
-                    length,
-                    query_projection_chunk_size=projection_chunk,
-                )
-            selected_indices.append(indices.squeeze(0).unsqueeze(1))
-
-        query = self.q_b_proj(q_resid).view(1, query_end - query_start, self.num_heads, self.qk_head_dim)
-        absorbed_query = torch.einsum("bqhd,hdc->bqhc", query, w_kc.to(query.dtype)).squeeze(0)
-        latent_output = cudnn_sparse_attention(
-            absorbed_query.contiguous(),
-            latent.squeeze(0).unsqueeze(1).contiguous(),
-            torch.cat(selected_indices, dim=0).contiguous(),
-            self.scaling,
-            all_rows_nonempty=self.indexer.always_select_tail,
-        )
-        attention_output = torch.einsum("qhc,hvc->qhv", latent_output, w_vc.to(latent_output.dtype))
-        return self.o_proj(attention_output.reshape(1, query_end - query_start, -1))
 
     def _forward_packed_cudnn(
         self,
