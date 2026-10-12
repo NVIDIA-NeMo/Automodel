@@ -20,7 +20,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.testing._internal.distributed.fake_pg import FakeStore
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, Qwen3Config
 
 from nemo_automodel.components.distributed.pipelining.functional import (
     generate_hf_model_fqn_per_model_part,
@@ -65,7 +65,6 @@ def setup_fake_distributed(pp_size: int, local_rank: int = 0):
         dist.init_process_group(backend="fake", rank=local_rank, world_size=pp_size, store=store)
 
     # Create device mesh with fake devices
-    devices = [torch.device("fake") for _ in range(pp_size)]
     mesh = DeviceMesh("fake", list(range(pp_size)), mesh_dim_names=("pp",))
     return mesh
 
@@ -277,25 +276,58 @@ class TestHFModelSplitting:
     """Test model splitting with HF models (end-to-end tests from original file)."""
 
     @pytest.mark.parametrize(
-        "model_id",
+        ("model_id", "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads"),
         [
-            "Qwen/Qwen3-0.6B-Base",
-            "Qwen/Qwen3-1.7B-Base",
-            "Qwen/Qwen3-4B-Base",
+            # Config snapshots: da87bfb608c14b7cf20ba1ce41287e8de496c0cd,
+            # ea980cb0a6c2ae4b936e82123acc929f1cec04c1, and 906bfd4b4dc7f14ee4320094d8b41684abff8539.
+            pytest.param("Qwen/Qwen3-0.6B-Base", 1024, 3072, 28, 16, id="Qwen3-0.6B-Base"),
+            pytest.param("Qwen/Qwen3-1.7B-Base", 2048, 6144, 28, 16, id="Qwen3-1.7B-Base"),
+            pytest.param("Qwen/Qwen3-4B-Base", 2560, 9728, 36, 32, id="Qwen3-4B-Base"),
         ],
     )
     @pytest.mark.parametrize("pp_size", [2, 4, 8])
     @pytest.mark.parametrize("local_rank", [0, 1, 2, 3, 4, 5, 6, 7])
-    def test_split_qwen3_models_on_meta(self, monkeypatch, model_id, pp_size, local_rank):
+    def test_split_qwen3_models_on_meta(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        model_id: str,
+        hidden_size: int,
+        intermediate_size: int,
+        num_hidden_layers: int,
+        num_attention_heads: int,
+        pp_size: int,
+        local_rank: int,
+    ) -> None:
         _patch_pipeline_stage(monkeypatch)
         if local_rank >= pp_size:
             pytest.skip("local_rank not part of this pp_size")
 
-        # Load actual Qwen3 config; skip if not available or offline
-        try:
-            cfg = AutoConfig.from_pretrained(model_id)
-        except Exception as e:  # pragma: no cover - network dependent
-            pytest.skip(f"Skipping {model_id}: {e}")
+        # Preserve the published model shapes without resolving configs from the Hub.
+        cfg = Qwen3Config(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=8,
+            head_dim=128,
+            vocab_size=151936,
+            max_position_embeddings=32768,
+            max_window_layers=num_hidden_layers,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_theta=1000000,
+            rope_scaling=None,
+            attention_bias=False,
+            attention_dropout=0.0,
+            initializer_range=0.02,
+            sliding_window=None,
+            use_sliding_window=False,
+            tie_word_embeddings=True,
+            bos_token_id=151643,
+            eos_token_id=151643,
+            use_cache=True,
+            dtype=torch.bfloat16,
+        )
 
         # Instantiate the model on meta to avoid memory use
         try:
