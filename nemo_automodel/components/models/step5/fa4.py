@@ -16,6 +16,7 @@
 
 import functools
 from collections.abc import Callable
+from typing import NamedTuple
 
 import torch
 from torch.nn import functional as F
@@ -271,6 +272,63 @@ def _split_forward_full_blocks(
     shifted = (columns + full_counts.long().unsqueeze(-1)).clamp_max(indices.shape[-1] - 1)
     partial_indices = indices.gather(-1, shifted)
     return counts - full_counts, partial_indices, full_counts
+
+
+class _BackwardBlockPartition(NamedTuple):
+    """Independent int32 lists in the original provider/head layout.
+
+    Attributes:
+        partial_counts: Tensor [provider_batches, heads, key_tiles].
+        partial_indices: Tensor [provider_batches, heads, key_tiles, query_tiles].
+        full_counts: Tensor with the partial_counts layout.
+        full_indices: Tensor with the partial_indices layout.
+    """
+
+    partial_counts: torch.Tensor
+    partial_indices: torch.Tensor
+    full_counts: torch.Tensor
+    full_indices: torch.Tensor
+
+
+@torch.compile(dynamic=False)
+def _split_backward_full_blocks(
+    counts: torch.Tensor, indices: torch.Tensor, *, prefix_length: int
+) -> _BackwardBlockPartition:
+    """Classify complete causal rectangles using SM90 D192 backward tiles.
+
+    Args:
+        counts: Int32 counts [provider_batches, heads, key_tiles].
+        indices: Ascending unique nonnegative query-block IDs of shape
+            [provider_batches, heads, key_tiles, query_tiles]. Entries beyond
+            counts are ignored. Provider-folded tensors have heads=1; native
+            layout has provider_batches=batch and heads=query_heads.
+        prefix_length: Proven all-selected query prefix in one unpadded B1
+            CP1 document whose positions equal physical token indices.
+
+    Returns:
+        Independent partial/full counts and index lists with the input layouts.
+        Each list preserves its original ascending order and their disjoint
+        union equals the input list. FA4 processes partial then full, changing
+        dK/dV FP32 accumulation order when full blocks were inside that list.
+        Inputs are not modified. Only existing block-grid-sized integer storage
+        is used; no query-token by key-token mask is created.
+    """
+    columns = torch.arange(indices.shape[-1], device=indices.device)
+    valid = columns < counts.unsqueeze(-1)
+    key_end = (torch.arange(counts.shape[-1], device=counts.device) + 1) * 96
+    # Entire Q128 tile must be inside the proven prefix. Every K96 token
+    # must precede its first query; the diagonal/mixed-prefix tiles stay partial.
+    first_full = (key_end - 1 + 127) // 128
+    past_full = prefix_length // 128
+    before = valid & (indices < first_full[:, None])
+    eligible = valid & (indices >= first_full[:, None]) & (indices < past_full)
+    pre_count = before.sum(-1, dtype=torch.int32)
+    full_count = eligible.sum(-1, dtype=torch.int32)
+    partial_source = columns + torch.where(columns >= pre_count.unsqueeze(-1), full_count.unsqueeze(-1), 0)
+    full_source = columns + pre_count.unsqueeze(-1)
+    partial_indices = indices.gather(-1, partial_source.clamp_max(indices.shape[-1] - 1).long())
+    full_indices = indices.gather(-1, full_source.clamp_max(indices.shape[-1] - 1).long())
+    return _BackwardBlockPartition(counts - full_count, partial_indices, full_count, full_indices)
 
 
 def _selected_block_lists(
@@ -617,6 +675,16 @@ def fa4_attention(
     fwd_k, bwd_k = (128, 256) if split_values else ((112, 96) if dim == 192 else (80, 64))
     fwd_q = 256 if split_values and queries > 128 else 128
     head_layout = False
+    backward_full_blocks = (
+        capability == (9, 0)
+        and dim == 192
+        and batch == 1
+        and window is None
+        and selection is not None
+        and selection.backward_full_block_prefix >= 256
+        and query_start == 0
+        and queries == keys
+    )
     if selection is None:
         fc, fi = _block_lists(
             queries, keys, query_start, window, block_q=fwd_q, block_k=fwd_k, reverse=False, device=query.device
@@ -629,10 +697,13 @@ def fa4_attention(
         # Native head layout avoids copying the full attention output back
         # from provider-major order. Bound the complete expanded sparse-list
         # storage (including full-block counts and a second forward index
-        # table) by that one eliminated BF16 output copy. This is a metadata
+        # table, plus a second backward table when enabled) by the eliminated
+        # BF16 output copy. This is a metadata
         # payload bound, not a bound on total CUDA peak memory.
         metadata_bytes = (
-            heads_per_group * (2 * fc.numel() + 2 * fi.numel() + 2 * bc.numel() + bi.numel()) * fc.element_size()
+            heads_per_group
+            * (2 * fc.numel() + 2 * fi.numel() + 2 * bc.numel() + (2 if backward_full_blocks else 1) * bi.numel())
+            * fc.element_size()
         )
         head_layout = (
             capability == (9, 0) and dim == 192 and groups > 1 and metadata_bytes < query.numel() * query.element_size()
@@ -668,7 +739,11 @@ def fa4_attention(
     else:
         full_counts = torch.zeros_like(fc)
     forward = block_lists(fc, fi, full_counts, full_indices, block_size=(fwd_q, fwd_k))
-    backward = block_lists(bc, bi, torch.zeros_like(bc), bi, block_size=(128, bwd_k))
+    if backward_full_blocks:
+        partition = _split_backward_full_blocks(bc, bi, prefix_length=selection.backward_full_block_prefix)
+        backward = block_lists(*partition, block_size=(128, bwd_k))
+    else:
+        backward = block_lists(bc, bi, torch.zeros_like(bc), bi, block_size=(128, bwd_k))
     # SM100 provides native (192, 128) kernels. V-channel splitting preserves
     # the 192-dimensional Q/K scale and avoids padding Q/K to 256. Autograd
     # sums both contributions to dQ/dK. The second call repeats QK work.

@@ -94,9 +94,11 @@ def _relative_rms(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("length", [4096, 8192])
+@pytest.mark.parametrize("direction", ["forward", "backward", "both"])
 def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
     monkeypatch: pytest.MonkeyPatch,
     length: int,
+    direction: str,
 ) -> None:
     """Exercise real D192/GQA16 FA4 with noncontiguous interleaved KV.
 
@@ -121,6 +123,7 @@ def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
         region_size=8,
         topk=512,
         csa_forward_full_blocks=True,
+        csa_backward_full_blocks=True,
     )
     current = positions // 8
     lower = (current - 512).clamp_min(0)[:, None] * torch.arange(providers, device="cuda")[None, :, None]
@@ -138,35 +141,45 @@ def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
     )
     upstream = torch.randn_like(query)
     full_block_counts = []
-    original = fa4._split_forward_full_blocks
+    original = fa4._split_forward_full_blocks if direction == "forward" else fa4._split_backward_full_blocks
 
     def record_split(
         counts: torch.Tensor,
         indices: torch.Tensor,
         *,
         prefix_length: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Observe forward metadata while preserving the real kernel call.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | fa4._BackwardBlockPartition:
+        """Observe forward or backward metadata while preserving the real kernel call.
 
         Args:
             counts: Int32 counts [provider_batches, heads, query_tiles];
                 either [groups, 1, query_tiles] or [1, query_heads, query_tiles].
-            indices: Int32 indices [provider_batches, heads, query_tiles, key_tiles].
+            indices: Int32 indices [provider_batches, heads, query_tiles, key_tiles];
+                backward swaps the query_tiles and key_tiles axes for both inputs.
             prefix_length: Proven initial all-selected query count.
 
         Returns:
             Partial counts, partial indices and full counts in their original
-            semantic layouts, unchanged from the production helper.
+            semantic layouts, unchanged from the production helper. Backward
+            also returns an independent full-index tensor matching indices.
         """
         result = original(counts, indices, prefix_length=prefix_length)
         full_block_counts.append(result[2].detach().cpu())
         return result
 
-    monkeypatch.setattr(fa4, "_split_forward_full_blocks", record_split)
+    monkeypatch.setattr(
+        fa4, "_split_forward_full_blocks" if direction == "forward" else "_split_backward_full_blocks", record_split
+    )
     runs = []
     memory = []
-    for enabled in (False, True):
-        chosen = replace(selection, forward_full_block_prefix=metadata.forward_full_block_prefix if enabled else 0)
+    for enabled in (False, True) if direction == "forward" else (False, False, True):
+        chosen = replace(
+            selection,
+            forward_full_block_prefix=metadata.forward_full_block_prefix
+            if direction == "both" or (direction == "forward" and enabled)
+            else 0,
+            backward_full_block_prefix=metadata.backward_full_block_prefix if direction != "forward" and enabled else 0,
+        )
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         allocated_before = torch.cuda.memory_allocated()
@@ -195,14 +208,24 @@ def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
         runs.append((output.detach(), gradients[0], gradients[1][:, :, 0], gradients[1][:, :, 1]))
     assert len(full_block_counts) == 1 and full_block_counts[0].sum() > 0
     assert full_block_counts[0].shape[:2] == ((1, providers * 16) if providers > 1 else (1, 1))
+    aa_metrics = {}
+    if direction != "forward":
+        for name, first, repeat in zip(("dQ", "dK", "dV"), runs[0][1:], runs[1][1:], strict=True):
+            aa_metrics[name] = {
+                "relative_rms": _relative_rms(repeat, first),
+                "maxabs": float((repeat.float() - first.float()).abs().max()),
+            }
+            assert aa_metrics[name]["relative_rms"] < 0.012
+    # Backward-only splitting leaves forward lists unchanged. Forward splitting
+    # also retains identical K traversal; this is a measured bitwise hypothesis.
     # Identical block traversal is a bitwise-forward hypothesis under test,
     # not an excuse to relax a mismatch.
-    assert torch.equal(runs[0][0].view(torch.uint8), runs[1][0].view(torch.uint8))
+    assert torch.equal(runs[0][0].view(torch.uint8), runs[-1][0].view(torch.uint8))
     torch.cuda.reset_peak_memory_stats()
     expected = _reference_vjp(query, key, value, upstream)
     oracle_peak = torch.cuda.max_memory_allocated()
     pair_metrics = {}
-    for name, baseline, candidate in zip(("dQ", "dK", "dV"), runs[0][1:], runs[1][1:], strict=True):
+    for name, baseline, candidate in zip(("dQ", "dK", "dV"), runs[0][1:], runs[-1][1:], strict=True):
         relative = _relative_rms(candidate, baseline)
         maximum = float((candidate.float() - baseline.float()).abs().max())
         assert relative < 0.012, (name, relative, maximum)
@@ -219,19 +242,21 @@ def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
     for label, start, stop in (("prefix", 0, min(length, 4104)), ("sparse", 4104, length)):
         if start < stop:
             torch.testing.assert_close(
-                runs[1][0][:, start:stop].float(), expected[0][:, start:stop], atol=0.015, rtol=0.015
+                runs[-1][0][:, start:stop].float(), expected[0][:, start:stop], atol=0.015, rtol=0.015
             )
-            bucket_errors[label] = _relative_rms(runs[1][1][:, start:stop], expected[1][:, start:stop])
+            bucket_errors[label] = _relative_rms(runs[-1][1][:, start:stop], expected[1][:, start:stop])
             assert bucket_errors[label] < 0.012
             pair_buckets[label] = {
-                "relative_rms": _relative_rms(runs[1][1][:, start:stop], runs[0][1][:, start:stop]),
-                "maxabs": float((runs[1][1][:, start:stop].float() - runs[0][1][:, start:stop].float()).abs().max()),
+                "relative_rms": _relative_rms(runs[-1][1][:, start:stop], runs[0][1][:, start:stop]),
+                "maxabs": float((runs[-1][1][:, start:stop].float() - runs[0][1][:, start:stop].float()).abs().max()),
             }
             assert pair_buckets[label]["relative_rms"] < 0.012
     print(
         json.dumps(
             {
                 "length": length,
+                "direction": direction,
+                "off_off_gradient_control": aa_metrics,
                 "head_dim": 192,
                 "gqa": 16,
                 "providers": providers,

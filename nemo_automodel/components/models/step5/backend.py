@@ -31,6 +31,9 @@ class Step5BackendConfig(BackendConfig):
             forward blocks for single-document, unpadded B1 CP1 inputs on SM90
             with head dimension 192. Backward block lists stay unchanged.
             Requires attn="fa4".
+        csa_backward_full_blocks: Skip custom masks on proven complete backward
+            blocks under the same single-document guard. May change FP32
+            dK/dV accumulation order. Requires attn="fa4".
         swa_varlen: Use native FA4 window attention for valid single-batch
             SM90 D192 query prefixes. Padding keeps its custom-mask path.
             Requires enabled sparse metadata; communication is unchanged.
@@ -49,6 +52,7 @@ class Step5BackendConfig(BackendConfig):
 
     indexed_csa: bool = False
     csa_forward_full_blocks: bool = False
+    csa_backward_full_blocks: bool = False
     swa_varlen: bool = False
     prepare_hybridep_extent: bool = False
     bf16_fsdp_retention_mib_per_part: int = 0
@@ -63,6 +67,10 @@ class Step5BackendConfig(BackendConfig):
             raise TypeError("csa_forward_full_blocks must be a bool")
         if self.csa_forward_full_blocks and self.attn != "fa4":
             raise ValueError("csa_forward_full_blocks requires attn=fa4")
+        if not isinstance(self.csa_backward_full_blocks, bool):
+            raise TypeError("csa_backward_full_blocks must be a bool")
+        if self.csa_backward_full_blocks and self.attn != "fa4":
+            raise ValueError("csa_backward_full_blocks requires attn=fa4")
         if not isinstance(self.swa_varlen, bool):
             raise TypeError("swa_varlen must be a bool")
         if not isinstance(self.prepare_hybridep_extent, bool):
