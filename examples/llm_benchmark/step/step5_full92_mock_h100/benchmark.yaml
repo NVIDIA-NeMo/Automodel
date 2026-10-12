@@ -1,0 +1,255 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Preserved job 20038646 benchmark: full92, mock/fake-balanced, 128 H100.
+# Run the native module from the repository root; see README.md.
+
+benchmark:
+  allocator_stats_path: outputs/step5-full92-mock-h100/allocator-stats
+  batch_metadata_path: outputs/step5-full92-mock-h100/batch-metadata
+  flops_scope: model
+  json_output_path: outputs/step5-full92-mock-h100/benchmark.json
+  loaded_model_audit_path: outputs/step5-full92-mock-h100/random-initialization-audit
+  nsys_end: -1
+  nsys_ranks: []
+  nsys_start: -1
+  peak_tflops: 989
+  warmup_steps: 7
+checkpoint:
+  checkpoint_dir: outputs/step5-full92-mock-h100/checkpoints
+  enabled: false
+clip_grad_norm:
+  max_norm: 1.0
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null
+  num_workers: 0
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  batch_size: 16
+  exclude_token_ids:
+  - 1
+  num_samples: 100000
+  seed: 42
+  seq_len: 8192
+  tokenizer:
+    _target_: transformers.PreTrainedTokenizerFast.from_pretrained
+    local_files_only: true
+    pretrained_model_name_or_path: /workspace/checkpoints/first4-native-view
+  vocab_size: 128896
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+distributed:
+  activation_checkpointing: true
+  cp_size: 1
+  defer_fsdp_grad_sync: false
+  dp_size: 32
+  enable_fsdp2_prefetch: false
+  ep_size: 32
+  moe:
+    ignore_router_for_ac: true
+    mp_policy:
+      _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+      cast_forward_inputs: false
+      output_dtype: null
+      param_dtype: bfloat16
+      reduce_dtype: float32
+    reshard_after_forward: true
+    wrap_outer_model: true
+  pipeline:
+    module_fqns_per_model_part:
+    - - model.embed_tokens
+      - model.layers.0
+      - model.layers.1
+      - model.layers.2
+      - model.layers.3
+      - model.layers.4
+      - model.layers.5
+      - model.layers.6
+      - model.layers.7
+      - model.layers.8
+      - model.layers.9
+      - model.layers.10
+      - model.layers.11
+      - model.layers.12
+      - model.layers.13
+      - model.layers.14
+      - model.layers.15
+      - model.layers.16
+      - model.layers.17
+      - model.layers.18
+      - model.layers.19
+      - model.layers.20
+      - model.layers.21
+      - model.layers.22
+      - model.layers.23
+      - model.layers.24
+    - - model.layers.25
+      - model.layers.26
+      - model.layers.27
+      - model.layers.28
+      - model.layers.29
+      - model.layers.30
+      - model.layers.31
+      - model.layers.32
+      - model.layers.33
+      - model.layers.34
+      - model.layers.35
+      - model.layers.36
+      - model.layers.37
+      - model.layers.38
+      - model.layers.39
+      - model.layers.40
+      - model.layers.41
+      - model.layers.42
+      - model.layers.43
+      - model.layers.44
+      - model.layers.45
+      - model.layers.46
+    - - model.layers.47
+      - model.layers.48
+      - model.layers.49
+      - model.layers.50
+      - model.layers.51
+      - model.layers.52
+      - model.layers.53
+      - model.layers.54
+      - model.layers.55
+      - model.layers.56
+      - model.layers.57
+      - model.layers.58
+      - model.layers.59
+      - model.layers.60
+      - model.layers.61
+      - model.layers.62
+      - model.layers.63
+      - model.layers.64
+      - model.layers.65
+      - model.layers.66
+      - model.layers.67
+      - model.layers.68
+    - - model.layers.69
+      - model.layers.70
+      - model.layers.71
+      - model.layers.72
+      - model.layers.73
+      - model.layers.74
+      - model.layers.75
+      - model.layers.76
+      - model.layers.77
+      - model.layers.78
+      - model.layers.79
+      - model.layers.80
+      - model.layers.81
+      - model.layers.82
+      - model.layers.83
+      - model.layers.84
+      - model.layers.85
+      - model.layers.86
+      - model.layers.87
+      - model.layers.88
+      - model.layers.89
+      - model.layers.90
+      - model.layers.91
+      - model.norm
+      - lm_head
+    pp_microbatch_size: 1
+    pp_schedule: 1f1b
+    pp_seq_len: 8192
+    scale_grads_in_schedule: false
+  pp_size: 4
+  reshard_after_forward: true
+  sequence_parallel: false
+  strategy: fsdp2
+  tp_size: 1
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+lr_scheduler:
+  lr_decay_style: constant
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  backend:
+    _target_: nemo_automodel.components.models.step5.backend.Step5BackendConfig
+    attn: fa4
+    benchmark_static_routing: true
+    compile_norm: true
+    compile_router_weight: true
+    csa_forward_full_blocks: true
+    dispatcher: hybridep
+    dispatcher_hybridep_compact_routing: false
+    dispatcher_hybridep_permute_fusion: false
+    enable_fsdp_optimizations: true
+    enable_hf_state_dict_adapter: true
+    experts: torch_mm
+    fake_balanced_gate: true
+    fake_gate_noise: 0.0
+    gate_precision: float32
+    linear: te
+    rms_norm: torch_fp32
+    swa_varlen: true
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: examples/llm_benchmark/step/step5_full92_mock_h100/model-config
+  torch_dtype: bfloat16
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+  lr: 1.0e-05
+  master_weights: true
+  store_param_remainders: true
+  weight_decay: 0.1
+recipe: BenchmarkingRecipeForNextTokenPrediction
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  ranked: true
+  seed: 42
+seed: 42
+step_scheduler:
+  ckpt_every_steps: 1000
+  gc_every_steps: 5
+  global_batch_size: 512
+  local_batch_size: 16
+  log_remote_every_steps: 1
+  max_steps: 17
+  num_epochs: 1
+  save_checkpoint_every_epoch: false
+  val_every_steps: 1000
+wandb:
+  dir: outputs/step5-full92-mock-h100
+  enable: true
+  entity: Nemo-automodel
+  group: step5-native-schedule1f1b-vpp1
+  mode: online
+  name: step5-full92-mock-cp1-ep32-pp4-vpp1-m16-attention-opt-benchmark
+  project: huiyingl_workspace
+  resume: never
+  tags:
+  - full92
+  - random-init
+  - mock8k
+  - fakebalanced-static
+  - PP4-VPP1-DP32-EP32-CP1
+  - M16-GB512-GA1
+  - compact-off
+  - unprofiled-benchmark
+  - swa-varlen
+  - csa-forward-full-blocks
+  - qnorm-layout
+  - indexer-int32
