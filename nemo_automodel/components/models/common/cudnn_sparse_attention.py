@@ -98,18 +98,13 @@ def _compact_and_sort_indices(indices: torch.Tensor, key_count: int) -> tuple[to
     """
     valid = (indices >= 0) & (indices < key_count)
     topk_length = valid.sum(dim=-1, dtype=torch.int32)
-    positions = torch.arange(indices.size(-1), device=indices.device).view(1, -1)
-    compact_order = torch.where(valid, positions, torch.full_like(positions, indices.size(-1))).argsort(dim=-1)
-    indices = torch.gather(indices, -1, compact_order)
-    compact_valid = torch.gather(valid, -1, compact_order)
-    indices = indices.masked_fill(~compact_valid, -1)
-
-    prefix = positions < topk_length.unsqueeze(-1)
-    sort_key = torch.where(prefix, indices, torch.full_like(indices, key_count))
-    sort_order = sort_key.argsort(dim=-1)
-    indices = torch.gather(indices, -1, sort_order)
-    sorted_valid = torch.gather(prefix.expand_as(indices), -1, sort_order)
-    return indices.masked_fill(~sorted_valid, -1).to(torch.int32).contiguous(), topk_length.contiguous()
+    # One sort does both jobs: valid coordinates ascend, and the key_count sentinel
+    # (strictly above every valid coordinate) pushes invalid entries behind them.
+    # Sorting int32 values directly halves the radix passes of an int64 argsort and
+    # removes the two gathers of the previous compact-then-sort implementation.
+    sort_key = torch.where(valid, indices, key_count).to(torch.int32)
+    sorted_key, _ = sort_key.sort(dim=-1)
+    return sorted_key.masked_fill(sorted_key == key_count, -1).contiguous(), topk_length.contiguous()
 
 
 def _padded_head_count(num_heads: int, major: int) -> int:
