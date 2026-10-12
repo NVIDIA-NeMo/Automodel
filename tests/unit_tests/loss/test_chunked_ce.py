@@ -366,3 +366,30 @@ def test_transformed_head_rejected_before_training():
         _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), model, False)
     torch.testing.assert_close(model.lm_head.weight, original_weight)
     assert model.lm_head.weight.grad is None
+
+
+def test_tp_linear_head_validation_preserves_transformed_subclass_rejection():
+    from nemo_automodel.components.distributed.parallel_styles import TPLinear
+
+    class TransformedTPHead(TPLinear):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """Apply an extra output transform.
+
+            Args:
+                x: Hidden states shaped [..., hidden].
+
+            Returns:
+                Transformed logits shaped [..., vocab].
+            """
+            return super().forward(x).tanh()
+
+    loss = ChunkedCrossEntropy(compile=False)
+    head = TPLinear(7, 13, bias=False)
+    hidden = torch.randn(3, 7)
+    labels = torch.tensor([0, 3, 8])
+    weight = loss.prepare_lm_weight(head)
+    torch.testing.assert_close(loss(hidden, labels, weight), F.cross_entropy(head(hidden), labels, reduction="sum"))
+    with pytest.raises(ValueError, match="plain bias-free"):
+        loss.prepare_lm_weight(TransformedTPHead(7, 13, bias=False))
+    with pytest.raises(ValueError, match="plain bias-free"):
+        loss.prepare_lm_weight(TPLinear(7, 13, bias=True))

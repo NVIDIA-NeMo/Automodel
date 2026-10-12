@@ -28,7 +28,7 @@ from torch.distributed.tensor.parallel import (
 )
 
 from nemo_automodel.components.distributed.tp_replicas import mark_tp_replica_gradient_reduction
-from nemo_automodel.shared.tp_linear import TPLinear as TPLinear
+from nemo_automodel.shared.tp_linear import tp_linear_forward
 
 __all__ = ["ReplicatedWithGradAllReduce", "translate_to_lora"]
 
@@ -50,6 +50,58 @@ def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
     )
     assert dist_param.requires_grad == param.requires_grad
     _module.register_parameter(name, dist_param)
+
+
+class TPLinear(nn.Linear):
+    """nn.Linear variant safe for torch.compile + DTensor tensor-parallel weights.
+
+    F.linear decomposes to aten.view + aten.mm + aten.view for 3-D input.  In
+    AOT-autograd backward tracing the view on a sharded DTensor activation hits
+    DTensor's slow-path sharding propagation (no explicit rule for aten.view that
+    changes the shard-dim index), which recurses infinitely.
+
+    torch.bmm is a native 3-D op whose backward is also bmm -- no view is ever
+    emitted.  DTensor has explicit strategies for bmm covering the ColwiseParallel
+    (Replicate x Shard(2) -> Shard(2)) and RowwiseParallel (Shard(2) x Shard(1) ->
+    Partial) patterns.  The exception is Inductor's async-TP mode: its fusion
+    pass recognizes reshape-mm-reshape but not bmm, so that mode emits the
+    former while every other compile path retains the DTensor-safe fallback.
+
+    Note: expand(b, -1, -1) dispatches through DTensor's ShardingPropagator which
+    caches via lru_cache keyed on DTensorSpec.  With dynamic shapes, b = x.shape[0]
+    is a SymInt, making DTensorSpec._hash_impl raise TypeError.  This is handled by
+    _patch_dtensor_spec_hash_for_symint() in parallelizer.py which falls back to a
+    placement-only hash for SymInt shapes.
+
+    Usage: after TP weight sharding, convert an nn.Linear instance by setting
+    ``linear.__class__ = TPLinear``.  This is the same __class__-swap trick used
+    by translate_to_lora, and ensures torch.compile/dynamo sees the correct
+    type(module).forward rather than nn.Linear.forward.
+    """
+
+    def forward(self, x):
+        """Apply the linear layer through the shared TP-safe dispatch.
+
+        Args:
+            x (Tensor): Input activations of shape ``[B, S, in_features]``
+                (``B`` = batch, ``S`` = sequence) or ``[N, in_features]``
+                (``N`` = flattened tokens).  May be a DTensor: a 3-D DTensor
+                sharded on dim 0 or 1 (e.g. ``Shard(1)`` from sequence
+                parallelism) takes the ``torch.bmm`` path; replicated or
+                last-dimension-sharded inputs (``Shard(2)`` or ``Shard(-1)``)
+                take ``F.linear``, which under async-TP tracing is the fusable
+                native linear graph.
+
+        Returns:
+            Tensor: Output of shape ``[..., out_features]`` with the same
+            leading dimensions as ``x``; a DTensor if ``x`` and the weight
+            are DTensors.
+        """
+        return tp_linear_forward(x, self.weight, self.bias, mm_for_2d_compile=True)
+
+    # Linear CE may bypass this exact forward with F.linear. Comparing the
+    # method identity prevents transformed subclasses from inheriting the opt-in.
+    _linear_ce_forward = forward
 
 
 class ColwiseParallelLora(ColwiseParallel):

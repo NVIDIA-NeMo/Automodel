@@ -27,7 +27,6 @@ from torch.distributed.tensor.parallel import loss_parallel
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
-from nemo_automodel.shared.tp_linear import TPLinear
 
 
 def _validate_chunk_len(chunk_len: int) -> int:
@@ -281,7 +280,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         # FSDP preserves the forward of Linear or the equivalent TP-safe variant.
         if (
             not isinstance(lm_head, nn.Linear)
-            or type(lm_head).forward not in (nn.Linear.forward, TPLinear.forward)
+            or type(lm_head).forward is not getattr(type(lm_head), "_linear_ce_forward", nn.Linear.forward)
             or lm_head.bias is not None
         ):
             raise ValueError(
