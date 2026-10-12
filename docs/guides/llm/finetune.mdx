@@ -844,11 +844,11 @@ validation_dataloader:
 #   - nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
 #       Chunks the output projection and CE; chunk_len defaults to 512 tokens.
 #       Requires final hidden states, logits_to_keep support, and a plain
-#       bias-free linear head without final_logit_softcapping. Models with
-#       soft-capped logits must use MaskedCrossEntropy.
+#       bias-free linear head. Recipes preserve final_logit_softcapping.
 #       Direct callers use loss(hidden_states, labels,
 #       lm_weight), replacing loss(logits, labels); recipes supply these inputs.
-#       TP-sharded output heads are not supported.
+#       Vocabulary-sharded heads on a named tp mesh are supported, including
+#       FSDP2 + TP. Hidden states must be replicated across TP ranks.
 #   - nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 #       Fuses the final linear projection (lm_head) with the CE computation,
 #       avoiding the full logit tensor. Significant **memory savings** for large vocabs.

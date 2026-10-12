@@ -20,6 +20,37 @@ from nemo_automodel.components.loss.loss import ChunkedCEConfig, build_loss_modu
 from nemo_automodel.components.loss.utils import calculate_loss
 
 
+@pytest.mark.parametrize("softcap", [0.5, 20.0])
+@pytest.mark.parametrize("reduction", ["none", "sum", "mean"])
+def test_softcapped_loss_and_gradients(softcap, reduction):
+    torch.manual_seed(12)
+    hidden = torch.randn(2, 11, 7, requires_grad=True)
+    weight = torch.randn(13, 7, requires_grad=True)
+    labels = torch.randint(13, (2, 11))
+    labels[0, :4] = -100
+    actual = ChunkedCrossEntropy(3, compile=False, reduction=reduction)(hidden, labels, weight, logit_softcap=softcap)
+    logits = F.linear(hidden, weight)
+    expected = F.cross_entropy(
+        (torch.tanh(logits / softcap) * softcap).flatten(0, 1), labels.flatten(), reduction=reduction
+    )
+    if reduction == "none":
+        expected = expected.reshape(labels.shape)
+    torch.testing.assert_close(actual, expected)
+    upstream = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad(actual, (hidden, weight), upstream)
+    expected_grads = torch.autograd.grad(expected, (hidden, weight), upstream)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("softcap", [0, -1, float("inf"), float("nan")])
+def test_invalid_softcap(softcap):
+    with pytest.raises(ValueError, match="logit_softcap must be positive and finite"):
+        ChunkedCrossEntropy(compile=False)(
+            torch.randn(3, 7), torch.arange(3), torch.randn(13, 7), logit_softcap=softcap
+        )
+
+
 @pytest.mark.parametrize("chunk_len", [1, 5, 64])
 @pytest.mark.parametrize("reduction", ["sum", "mean", "none"])
 @pytest.mark.parametrize("train_hidden,train_weight", [(True, True), (True, False), (False, True)])

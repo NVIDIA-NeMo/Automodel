@@ -117,10 +117,10 @@ def test_ddp_preserves_chunked_ce_head_validation(ddp_group, invalid):
         model.lm_head = nn.Linear(16, 32, bias=True)
         message = "plain bias-free"
     else:
-        # Use a real config with a declared softcapping field.
+        # Invalid caps must still be rejected through the DDP wrapper.
         from transformers import Gemma2Config
 
-        model.config = Gemma2Config(final_logit_softcapping=30.0)
+        model.config = Gemma2Config(final_logit_softcapping=-1.0)
         message = "final_logit_softcapping"
     wrapped = DDP(model)
     loss = ChunkedCrossEntropy(compile=False)

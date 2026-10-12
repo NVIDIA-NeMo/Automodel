@@ -152,9 +152,10 @@ def prepare_lm_weight(
         grad_reduce_group: Group contributing independent token losses.
 
     Returns:
-        Dense [vocab, hidden] weight under ``materialize_lm_weight``'s layout
-        and gradient contract. Chunked CE also honors the head's compute dtype;
-        share this result across loss calls to retain only one converted copy.
+        Projection weight with global shape [vocab, hidden] under the loss's
+        layout and gradient contract. Chunked CE preserves TP vocabulary shards
+        and honors the head's compute dtype. Share this result across loss calls
+        to retain only one converted copy.
     """
     # Match setup's head/config lookup without changing the training wrapper.
     if isinstance(model, nn.parallel.DistributedDataParallel):
@@ -191,6 +192,11 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         loss_fn_kwargs["loss_weights"] = loss_weights
     if isinstance(loss_fn, LinearCrossEntropy):
         model = kwargs.pop("model")
+        config_model = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
+        model_config = getattr(config_model, "config", None)
+        text_config = model_config.get_text_config() if model_config is not None else None
+        output_multiplier = getattr(text_config, "output_multiplier", 1.0)
+        hidden_states = kwargs.pop("hidden_states")
         # Reuse a caller-materialized LM head when provided so a single
         # full_tensor() all-gather is shared across the main loss and every MTP
         # depth (see calculate_mtp_loss). Re-gathering the (vocab x hidden) head
@@ -204,9 +210,15 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
             loss_fn_kwargs["logits_dtype"] = kwargs.pop(
                 "logits_dtype", logits.dtype if isinstance(logits, torch.Tensor) else None
             )
+            loss_fn_kwargs["logit_softcap"] = getattr(text_config, "final_logit_softcapping", None)
+            loss_fn_kwargs["logit_scale"] = output_multiplier
+        elif output_multiplier != 1.0:
+            # Preserve the existing fused-loss input contract; chunked CE can
+            # retain the model's exact post-projection scaling order instead.
+            hidden_states = hidden_states * output_multiplier
         loss_fn_kwargs.update(
             {
-                "hidden_states": kwargs.pop("hidden_states"),
+                "hidden_states": hidden_states,
                 "labels": labels,
                 "lm_weight": lm_head,
                 "grad_reduce_group": kwargs.pop("grad_reduce_group", None),
