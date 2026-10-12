@@ -103,6 +103,23 @@ def apply_draft_activation_checkpointing(draft_model: nn.Module, mode: bool | st
         logger.info("Enabled full activation checkpointing on %d draft layers", len(layers))
 
 
+def read_load_metadata_with_gloo(checkpoint_cfg: Any) -> bool:
+    """Read ``checkpoint.load_metadata_with_gloo`` for the frozen target load.
+
+    Speculative-decoding recipes load the target before they build the draft
+    ``CheckpointingConfig``, so the YAML ``checkpoint`` section is read directly here.
+
+    Args:
+        checkpoint_cfg: The recipe's ``checkpoint`` config section, or ``None`` when absent.
+
+    Returns:
+        Whether DCP load planning for the target should use a dedicated Gloo group.
+    """
+    if checkpoint_cfg is None:
+        return False
+    return bool(checkpoint_cfg.get("load_metadata_with_gloo", False))
+
+
 def raise_if_peft_configured(cfg: Any, recipe_name: str) -> None:
     """Fail fast on EAGLE-3-only draft knobs set on a recipe that does not support them.
 

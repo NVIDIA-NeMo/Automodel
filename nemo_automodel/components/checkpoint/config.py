@@ -110,6 +110,9 @@ class CheckpointingConfig:
     wait_for_staging: bool = False  # block on async staging before freeing memory; no effect unless is_async
     cpu_offload: bool = False  # If True, move DCP model and optimizer state dict tensors to CPU before saving.
     # Use a separate CPU group for DCP load planning; tensor shards are still read onto their destination devices.
+    # Applies to this checkpointer's own loads and to NeMoAuto ``from_pretrained`` base-weight loads in the LLM, VLM,
+    # KD, sequence-classification, and speculative-decoding recipes. Bagel, retrieval, and diffusion load base
+    # weights through their own loaders and only honor it for resume loads.
     load_metadata_with_gloo: bool = False
     # Permit pickle-based loading of legacy training state. Enable only for checkpoints from a trusted source.
     allow_legacy_pickle_restore: bool = False

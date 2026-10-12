@@ -89,11 +89,12 @@ def _worker(rank: int, world_size: int, port: int, root: str, use_gloo: bool) ->
         dist.destroy_process_group()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
 @pytest.mark.parametrize("world_size", [1, 2])
 @pytest.mark.parametrize("use_gloo", [False, True])
 def test_load_metadata_transport(tmp_path: Path, world_size: int, use_gloo: bool) -> None:
     """Changing the planning backend must preserve every loaded weight and group ownership."""
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} CUDA GPUs")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]

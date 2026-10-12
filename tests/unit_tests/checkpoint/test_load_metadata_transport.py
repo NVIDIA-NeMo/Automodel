@@ -15,13 +15,24 @@
 
 """Opt-in checkpoint metadata transport and process-group ownership."""
 
+import os
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
+import torch.multiprocessing as mp
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart
+
+# Over the default 5s budget on purpose: the real-group test spawns worker processes that re-import torch.
+pytestmark = pytest.mark.timeout(90)
 
 
 def test_load_metadata_transport_defaults_to_existing_group() -> None:
@@ -34,8 +45,14 @@ def test_load_metadata_transport_requires_boolean(value: object) -> None:
         CheckpointingConfig(save_consolidated=False, load_metadata_with_gloo=value)
 
 
-@pytest.mark.parametrize("initialized,world_size,backend", [(False, 1, "nccl"), (True, 1, "nccl"), (True, 2, "gloo")])
-def test_no_extra_group_without_multi_rank_nccl(initialized: bool, world_size: int, backend: str) -> None:
+@pytest.mark.parametrize(
+    "enabled,initialized,world_size,backend",
+    [(True, False, 1, "nccl"), (True, True, 1, "nccl"), (True, True, 2, "gloo"), (False, True, 2, "nccl")],
+)
+def test_no_extra_group_without_multi_rank_nccl(
+    enabled: bool, initialized: bool, world_size: int, backend: str
+) -> None:
+    """No owned group unless the option is on and the caller's group is a multi-rank NCCL group."""
     original = object()
     with (
         patch("torch.distributed.is_initialized", return_value=initialized),
@@ -44,7 +61,7 @@ def test_no_extra_group_without_multi_rank_nccl(initialized: bool, world_size: i
         patch("torch.distributed.new_group") as create,
         patch("torch.distributed.destroy_process_group") as destroy,
     ):
-        checkpointer = CheckpointingConfig(save_consolidated=False, load_metadata_with_gloo=True).build(
+        checkpointer = CheckpointingConfig(save_consolidated=False, load_metadata_with_gloo=enabled).build(
             0, 0, 0, process_group=original
         )
         assert checkpointer.process_group is original
@@ -118,3 +135,86 @@ def test_load_uses_cpu_group_and_save_keeps_callers_group() -> None:
         finally:
             checkpointer.close()
     destroy.assert_called_once_with(owned)
+
+
+def test_part_wise_model_load_uses_owned_group() -> None:
+    """The adapter-driven MoE load path hands the owned group to every per-part dcp.load."""
+    original, owned = object(), object()
+    checkpoint_module = "nemo_automodel.components.checkpoint.checkpointing"
+    tensors = {"a": torch.zeros(2), "b": torch.zeros(3)}
+    parts = [
+        CheckpointLoadPart(
+            checkpoint_tensors={name: tensors[name]},
+            model_keys=frozenset({name}),
+            temporary_checkpoint_keys=frozenset(),
+            finish=Mock(),
+        )
+        for name in tensors
+    ]
+    metadata = SimpleNamespace(state_dict_metadata=dict.fromkeys(tensors))
+    model_state = SimpleNamespace(uses_tied_lm_head=False, is_peft=False, model=[None])
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_backend", return_value="nccl"),
+        patch("torch.distributed.get_process_group_ranks", return_value=[0, 1]),
+        patch("torch.distributed.new_group", return_value=owned),
+        patch("torch.distributed.destroy_process_group") as destroy,
+        patch(f"{checkpoint_module}._get_checkpoint_metadata", return_value=metadata),
+        patch(f"{checkpoint_module}.dcp.load") as load,
+    ):
+        checkpointer = CheckpointingConfig(save_consolidated=False, load_metadata_with_gloo=True).build(
+            0, 0, 0, process_group=original
+        )
+        try:
+            checkpointer._load_model_in_parts(model_state, iter(parts), tensors, "/checkpoint/model", Mock())
+        finally:
+            checkpointer.close()
+    assert load.call_count == len(parts)
+    assert all(call.kwargs["process_group"] is owned for call in load.call_args_list)
+    for part in parts:
+        part.finish.assert_called_once_with()
+    destroy.assert_called_once_with(owned)
+
+
+def _real_gloo_worker(rank: int, world_size: int, init_file: str, root: str) -> None:
+    """Load a real sharded DCP checkpoint through an owned Gloo group and leave the caller's group intact."""
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    checkpointer = None
+    try:
+        mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("dp",))
+        full = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        dcp.save({"weight": distribute_tensor(full, mesh, [Shard(0)])}, checkpoint_id=f"{root}/ckpt")
+        checkpointer = CheckpointingConfig(
+            enabled=False, save_consolidated=False, load_metadata_with_gloo=True, checkpoint_dir=f"{root}/unused"
+        ).build(rank, 0, 0, process_group=dist.group.WORLD)
+        destination = {"weight": DTensor.from_local(torch.zeros(8 // world_size, 4), mesh, [Shard(0)])}
+        # The caller's group is Gloo on CPU; report it as NCCL so the option takes effect as on GPU.
+        with patch("torch.distributed.get_backend", return_value="nccl"):
+            owned = checkpointer._get_load_process_group()
+        assert owned is not dist.group.WORLD
+        assert dist.get_backend(owned) == "gloo"
+        assert dist.get_process_group_ranks(owned) == list(range(world_size))
+        assert checkpointer._get_load_process_group() is owned
+        with patch("torch.distributed.checkpoint.load", wraps=dcp.load) as spy:
+            checkpointer._do_load(destination, f"{root}/ckpt")
+        assert spy.call_args.kwargs["process_group"] is owned
+        torch.testing.assert_close(destination["weight"].to_local(), full.chunk(world_size)[rank], rtol=0, atol=0)
+        checkpointer.close()
+        checkpointer.close()
+        assert checkpointer._load_process_group is None
+        check = torch.ones(1)
+        dist.all_reduce(check)
+        assert check.item() == world_size
+    finally:
+        if checkpointer is not None:
+            checkpointer.close()
+        dist.destroy_process_group()
+
+
+def test_real_gloo_group_loads_sharded_checkpoint(tmp_path) -> None:
+    """Two CPU ranks: the owned Gloo group carries DCP planning and every shard loads bit-exactly."""
+    mp.spawn(_real_gloo_worker, args=(2, str(tmp_path / "dist_init"), str(tmp_path)), nprocs=2, join=True)
