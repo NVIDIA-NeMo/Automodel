@@ -27,6 +27,7 @@ import math
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_activation_checkpointing,
     make_warmup_cosine_schedule,
@@ -218,7 +219,16 @@ def test_draft_activation_checkpointing_warns_when_draft_has_no_layers():
         ({}, False),
         ({"load_metadata_with_gloo": False}, False),
         ({"load_metadata_with_gloo": True}, True),
+        ({"load_metadata_with_gloo": "true"}, True),
+        ({"load_metadata_with_gloo": "false"}, False),
     ],
 )
 def test_read_load_metadata_with_gloo(checkpoint_cfg, expected):
-    assert read_load_metadata_with_gloo(checkpoint_cfg) is expected
+    node = None if checkpoint_cfg is None else ConfigNode(checkpoint_cfg)
+    assert read_load_metadata_with_gloo(node) is expected
+
+
+@pytest.mark.parametrize("value", ["invalid", 1, None])
+def test_read_load_metadata_with_gloo_rejects_non_boolean(value):
+    with pytest.raises(ValueError, match="load_metadata_with_gloo must be a boolean"):
+        read_load_metadata_with_gloo(ConfigNode({"load_metadata_with_gloo": value}))

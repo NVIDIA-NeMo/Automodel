@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
+from weakref import WeakKeyDictionary
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -105,6 +106,14 @@ _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
+
+# Load metadata groups belong to the distributed world, not an individual checkpointer.
+# Retaining one per caller group avoids reusing Gloo rendezvous keys after close/reopen
+# on PyTorch 2.10. destroy_process_group() tears down every registered group; weak keys
+# release cache entries when the corresponding caller groups are no longer referenced.
+_load_metadata_groups: WeakKeyDictionary[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup] = (
+    WeakKeyDictionary()
+)
 
 
 class _DTensorInitCopyMode(TorchFunctionMode):
@@ -659,7 +668,7 @@ class Checkpointer:
         _warn_if_inline_consolidation_enabled(self.config)
 
     def _get_load_process_group(self) -> torch.distributed.ProcessGroup | None:
-        """Lazily own a CPU metadata group while preserving the caller's group."""
+        """Reuse a world-owned CPU metadata group with the caller's membership."""
         if (
             self._load_process_group is None
             and self.config.load_metadata_with_gloo
@@ -668,8 +677,13 @@ class Checkpointer:
             and torch.distributed.get_backend(self.process_group) != "gloo"
         ):
             # DCP exchanges Python load plans. NCCL can retain root-side P2P buffers.
-            self._load_process_group = _new_gloo_process_group(self.process_group)
-            logger.info("Using a dedicated Gloo process group for checkpoint load metadata.")
+            caller_group = self.process_group if self.process_group is not None else torch.distributed.group.WORLD
+            load_group = _load_metadata_groups.get(caller_group)
+            if load_group is None:
+                load_group = _new_gloo_process_group(self.process_group)
+                _load_metadata_groups[caller_group] = load_group
+            self._load_process_group = load_group
+            logger.info("Using a shared Gloo process group for checkpoint load metadata.")
         return self._load_process_group if self._load_process_group is not None else self.process_group
 
     @torch.no_grad()
@@ -1885,8 +1899,10 @@ class Checkpointer:
         state.load_state_dict(state_dict)
 
     def close(self) -> None:
-        """
-        Close the checkpointer.
+        """Close owned save resources and release the shared load-group reference.
+
+        Load metadata groups are reused across checkpointers with the same caller
+        group and destroyed by the final distributed-world teardown.
         """
         self.maybe_wait_for_staging()
         self.async_wait()
@@ -1896,7 +1912,7 @@ class Checkpointer:
             self._optim_ctx.stager.close()
         consolidation_process_group = self._consolidation_process_group
         self._consolidation_process_group = None
-        load_process_group = self._load_process_group
+        # The load group is shared across checkpointers until distributed-world teardown.
         self._load_process_group = None
         if torch.distributed.is_initialized():
             for context in (self._model_ctx, self._optim_ctx):
@@ -1905,8 +1921,6 @@ class Checkpointer:
                     context.process_group = None
             if consolidation_process_group is not None:
                 torch.distributed.destroy_process_group(consolidation_process_group)
-            if load_process_group is not None:
-                torch.distributed.destroy_process_group(load_process_group)
 
     def finalize(self) -> None:
         """Publish any final async checkpoint and close owned resources."""

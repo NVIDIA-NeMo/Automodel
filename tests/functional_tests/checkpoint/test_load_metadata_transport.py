@@ -55,14 +55,14 @@ def _worker(rank: int, world_size: int, port: int, root: str, use_gloo: bool) ->
         for name, full in (("weight", weight), ("bias", bias)):
             local = torch.zeros_like(full.chunk(world_size)[rank], device="cuda")
             setattr(model, name, torch.nn.Parameter(DTensor.from_local(local, mesh, [Shard(0)])))
-        checkpointer = CheckpointingConfig(
-            enabled=False,
-            save_consolidated=False,
-            load_metadata_with_gloo=use_gloo,
-            checkpoint_dir=str(Path(root) / "unused"),
-            model_repo_id=str(path),
-        ).build(rank, 0, 0)
         for _ in range(2):
+            checkpointer = CheckpointingConfig(
+                enabled=False,
+                save_consolidated=False,
+                load_metadata_with_gloo=use_gloo,
+                checkpoint_dir=str(Path(root) / "unused"),
+                model_repo_id=str(path),
+            ).build(rank, 0, 0, process_group=dist.group.WORLD)
             with torch.no_grad():
                 for parameter in model.parameters():
                     parameter.to_local().zero_()
@@ -71,14 +71,14 @@ def _worker(rank: int, world_size: int, port: int, root: str, use_gloo: bool) ->
                 torch.testing.assert_close(
                     getattr(model, name).to_local().cpu(), expected.chunk(world_size)[rank], rtol=0, atol=0
                 )
-        owned = checkpointer._load_process_group
-        if use_gloo and world_size > 1:
-            assert owned is not None and dist.get_backend(owned) == "gloo"
-            assert dist.get_process_group_ranks(owned) == list(range(world_size))
-        else:
-            assert owned is None
-        checkpointer.close()
-        checkpointer.close()
+            metadata_group = checkpointer._load_process_group
+            if use_gloo and world_size > 1:
+                assert metadata_group is not None and dist.get_backend(metadata_group) == "gloo"
+                assert dist.get_process_group_ranks(metadata_group) == list(range(world_size))
+            else:
+                assert metadata_group is None
+            checkpointer.close()
+            checkpointer.close()
         check = torch.ones(1, device="cuda")
         dist.all_reduce(check)
         assert check.item() == world_size

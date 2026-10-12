@@ -15,7 +15,9 @@
 
 """Opt-in checkpoint metadata transport and process-group ownership."""
 
+import gc
 import os
+import time
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -30,9 +32,6 @@ from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart
-
-# Over the default 5s budget on purpose: the real-group test spawns worker processes that re-import torch.
-pytestmark = pytest.mark.timeout(90)
 
 
 def test_load_metadata_transport_defaults_to_existing_group() -> None:
@@ -52,7 +51,7 @@ def test_load_metadata_transport_requires_boolean(value: object) -> None:
 def test_no_extra_group_without_multi_rank_nccl(
     enabled: bool, initialized: bool, world_size: int, backend: str
 ) -> None:
-    """No owned group unless the option is on and the caller's group is a multi-rank NCCL group."""
+    """No shared group unless the option is on and the caller's group is a multi-rank NCCL group."""
     original = object()
     with (
         patch("torch.distributed.is_initialized", return_value=initialized),
@@ -72,8 +71,8 @@ def test_no_extra_group_without_multi_rank_nccl(
     destroy.assert_not_called()
 
 
-def test_owned_load_group_preserves_membership_and_closes_once() -> None:
-    original, owned = object(), object()
+def test_load_group_preserves_membership_and_survives_checkpointer_close() -> None:
+    original, owned = Mock(spec=dist.ProcessGroup), Mock(spec=dist.ProcessGroup)
     with (
         patch("torch.distributed.is_initialized", return_value=True),
         patch("torch.distributed.get_world_size", return_value=2),
@@ -94,7 +93,13 @@ def test_owned_load_group_preserves_membership_and_closes_once() -> None:
         checkpointer.close()
         checkpointer.close()
         assert checkpointer._load_process_group is None
-    destroy.assert_called_once_with(owned)
+        successor = CheckpointingConfig(save_consolidated=False, load_metadata_with_gloo=True).build(
+            0, 0, 0, process_group=original
+        )
+        assert successor._get_load_process_group() is owned
+        successor.close()
+        create.assert_called_once()
+    destroy.assert_not_called()
 
 
 def test_default_does_not_create_metadata_group() -> None:
@@ -106,7 +111,7 @@ def test_default_does_not_create_metadata_group() -> None:
 
 
 def test_load_uses_cpu_group_and_save_keeps_callers_group() -> None:
-    original, owned = object(), object()
+    original, owned = Mock(spec=dist.ProcessGroup), Mock(spec=dist.ProcessGroup)
     checkpoint_module = "nemo_automodel.components.checkpoint.checkpointing"
     with (
         patch("torch.distributed.is_initialized", return_value=True),
@@ -134,12 +139,12 @@ def test_load_uses_cpu_group_and_save_keeps_callers_group() -> None:
             assert save.call_args.kwargs["process_group"] is original
         finally:
             checkpointer.close()
-    destroy.assert_called_once_with(owned)
+    destroy.assert_not_called()
 
 
 def test_part_wise_model_load_uses_owned_group() -> None:
-    """The adapter-driven MoE load path hands the owned group to every per-part dcp.load."""
-    original, owned = object(), object()
+    """The adapter-driven MoE load path hands the shared group to every per-part dcp.load."""
+    original, owned = Mock(spec=dist.ProcessGroup), Mock(spec=dist.ProcessGroup)
     checkpoint_module = "nemo_automodel.components.checkpoint.checkpointing"
     tensors = {"a": torch.zeros(2), "b": torch.zeros(3)}
     parts = [
@@ -174,11 +179,11 @@ def test_part_wise_model_load_uses_owned_group() -> None:
     assert all(call.kwargs["process_group"] is owned for call in load.call_args_list)
     for part in parts:
         part.finish.assert_called_once_with()
-    destroy.assert_called_once_with(owned)
+    destroy.assert_not_called()
 
 
 def _real_gloo_worker(rank: int, world_size: int, init_file: str, root: str) -> None:
-    """Load a real sharded DCP checkpoint through an owned Gloo group and leave the caller's group intact."""
+    """Load a real sharded DCP checkpoint through a shared Gloo group and leave the caller's group intact."""
     os.environ["GLOO_SOCKET_IFNAME"] = "lo"
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
@@ -215,6 +220,86 @@ def _real_gloo_worker(rank: int, world_size: int, init_file: str, root: str) -> 
         dist.destroy_process_group()
 
 
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=90,
+    reason="Spawns two CPU ranks that re-import torch and perform a real DCP round trip.",
+)
 def test_real_gloo_group_loads_sharded_checkpoint(tmp_path) -> None:
-    """Two CPU ranks: the owned Gloo group carries DCP planning and every shard loads bit-exactly."""
+    """Two CPU ranks: the shared Gloo group carries DCP planning and every shard loads bit-exactly."""
     mp.spawn(_real_gloo_worker, args=(2, str(tmp_path / "dist_init"), str(tmp_path)), nprocs=2, join=True)
+
+
+def _successive_checkpointers_worker(rank: int, init_file: str, root: str, enabled: bool) -> None:
+    """Exercise subgroup-only loads across checkpointer and distributed-world lifetimes."""
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    for generation in range(2):
+        dist.init_process_group(
+            "gloo",
+            init_method=f"file://{init_file}-{generation}",
+            rank=rank,
+            world_size=3,
+            timeout=timedelta(seconds=30),
+        )
+        try:
+            caller = dist.new_group(ranks=[1, 2], backend="gloo")
+            if rank in (1, 2):
+                mesh = torch.distributed.device_mesh.DeviceMesh.from_group(caller, "cpu", mesh_dim_names=("dp",))
+                full = torch.arange(32, dtype=torch.float32).reshape(8, 4) + generation
+                path = f"{root}/ckpt-{generation}"
+                dcp.save(
+                    {"weight": distribute_tensor(full, mesh, [Shard(0)])}, checkpoint_id=path, process_group=caller
+                )
+                for iteration in range(3):
+                    if iteration and rank == 2:
+                        time.sleep(3)
+                    checkpointer = CheckpointingConfig(
+                        enabled=False, save_consolidated=False, load_metadata_with_gloo=enabled
+                    ).build(rank - 1, 0, 0, process_group=caller)
+                    destination = {"weight": DTensor.from_local(torch.zeros(4, 4), mesh, [Shard(0)])}
+                    try:
+                        # Real CPU groups and DCP I/O; only select the NCCL-caller branch.
+                        with patch("torch.distributed.get_backend", return_value="nccl"):
+                            checkpointer._get_load_process_group()
+                        checkpointer._do_load(destination, path)
+                        torch.testing.assert_close(
+                            destination["weight"].to_local(), full.chunk(2)[rank - 1], rtol=0, atol=0
+                        )
+                    finally:
+                        checkpointer.close()
+                    del checkpointer
+                    gc.collect()
+                check = torch.ones(1)
+                dist.all_reduce(check, group=caller)
+                assert check.item() == 2
+            # Rank zero never enters the subgroup's checkpoint operations.
+            check = torch.ones(1)
+            dist.all_reduce(check)
+            assert check.item() == 3
+        finally:
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=90,
+    reason="Spawns three CPU ranks, loads through successive checkpointers with a delayed rank, and reinitializes the world.",
+)
+def test_successive_checkpointers_load_on_subgroup(tmp_path, enabled: bool) -> None:
+    processes = mp.spawn(
+        _successive_checkpointers_worker,
+        args=(str(tmp_path / "dist_init"), str(tmp_path), enabled),
+        nprocs=3,
+        join=False,
+    )
+    deadline = time.monotonic() + 55
+    try:
+        while not processes.join(timeout=1):
+            if time.monotonic() >= deadline:
+                pytest.fail("Successive subgroup checkpointers stalled during load or group creation")
+    finally:
+        for process in processes.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)

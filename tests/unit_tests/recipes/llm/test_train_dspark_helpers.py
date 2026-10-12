@@ -604,7 +604,8 @@ _TINY_GLM_CONFIG = {
 }
 
 
-def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeypatch, enabled):
     """Regression: ``from_pretrained`` re-read the checkpoint's own config, silently
     rebuilding the full-depth target and discarding ``target_num_hidden_layers`` (OOM
     on one node). The GLM target build must hand the reduced, repaired config to
@@ -628,7 +629,7 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
 
     recipe_cfg = _opt_cfg(target_num_hidden_layers=2)
     target_config, target_model, distributed_setup = tb.build_glm_5_2_target(
-        cfg=SimpleNamespace(),
+        cfg=ConfigNode({"checkpoint": {"load_metadata_with_gloo": enabled}}),
         world_size=8,
         device=SimpleNamespace(type="cuda"),
         compute_dtype=torch.bfloat16,
@@ -645,6 +646,7 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
     # The attribute-map clobber is repaired back to the raw checkpoint value.
     assert target_config.qk_rope_head_dim == 8
     assert captured["load_base_model"] is True
+    assert captured["load_metadata_with_gloo"] is enabled
     assert captured["distributed_setup"] == "distributed-setup"
     assert captured["torch_dtype"] == torch.bfloat16
 
@@ -664,7 +666,8 @@ def test_build_glm_5_2_target_requires_cuda(tmp_path):
         )
 
 
-def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch, enabled):
     """The V4 build must hand the (reduced) config to ``from_config`` with the sharded
     distributed_setup and ``load_base_model=True`` (the full 43-layer target OOMs on
     one node, so ``target_num_hidden_layers`` must survive to ``from_config``)."""
@@ -685,7 +688,7 @@ def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
     monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
 
     target_config, target_model, distributed_setup = tb.build_deepseek_v4_target(
-        cfg=SimpleNamespace(),
+        cfg=ConfigNode({"checkpoint": {"load_metadata_with_gloo": enabled}}),
         world_size=8,
         device=SimpleNamespace(type="cuda"),
         compute_dtype=torch.bfloat16,
@@ -699,6 +702,7 @@ def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
     assert target_config.num_hidden_layers == 4
     assert captured["config"] is target_config
     assert captured["load_base_model"] is True
+    assert captured["load_metadata_with_gloo"] is enabled
     assert captured["distributed_setup"] == "distributed-setup"
     assert captured["torch_dtype"] == torch.bfloat16
 
