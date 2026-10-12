@@ -25,6 +25,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.moe import swiglu_triton
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_geglu_impl,
@@ -1210,7 +1211,7 @@ def relu2_deepep(x, permuted_probs):
 
 
 @torch.compile(fullgraph=True, options={"max_autotune": True})
-def swiglu_clamped_deepep(x, permuted_probs, limit: float):
+def _swiglu_clamped_deepep_compiled(x, permuted_probs, limit: float):
     """Clamped SwiGLU (DeepSeek V4 style) for DeepEP.
 
     Gate is clamped at ``max=limit`` and up at ``(-limit, +limit)`` in FP32
@@ -1232,6 +1233,16 @@ def swiglu_clamped_deepep(x, permuted_probs, limit: float):
     up = up.float().clamp(min=-limit, max=limit)
     inter = F.silu(gate) * up
     return (inter * permuted_probs).to(x.dtype)
+
+
+def swiglu_clamped_deepep(x, permuted_probs, limit: float):
+    """Clamped SwiGLU (DeepSeek V4 style) for DeepEP: Triton kernels on CUDA, the compiled function elsewhere.
+
+    See :mod:`nemo_automodel.components.moe.swiglu_triton` for the kernels and the layout guard.
+    """
+    if swiglu_triton.uses_triton_kernel(x, permuted_probs):
+        return swiglu_triton.swiglu_clamped_triton(x, permuted_probs, limit)
+    return _swiglu_clamped_deepep_compiled(x, permuted_probs, limit)
 
 
 def get_expert_activation_for_deepep(config: MoEConfig):

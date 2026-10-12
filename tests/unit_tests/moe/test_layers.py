@@ -31,7 +31,7 @@ from nemo_automodel.components.moe.layers import (
     FakeBalancedGate,
     Gate,
     MoE,
-    _compiled_clamped_swiglu,
+    _clamped_swiglu_act,
 )
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
@@ -1966,7 +1966,7 @@ def test_compiled_clamped_swiglu_cuda(dtype: torch.dtype, shape: tuple[int, ...]
     gate.requires_grad_()
     up.requires_grad_()
     expected = (F.silu(gate.float().clamp(max=10)) * up.float().clamp(min=-10, max=10)).to(dtype)
-    actual = _compiled_clamped_swiglu(gate, up, 10.0, dtype)
+    actual = _clamped_swiglu_act(gate, up, 10.0)
     expected_grads = torch.autograd.grad(expected, (gate, up), torch.ones_like(expected))
     actual_grads = torch.autograd.grad(actual, (gate, up), torch.ones_like(actual))
     for observed, reference in [(actual, expected), *zip(actual_grads, expected_grads)]:
@@ -1982,45 +1982,69 @@ def test_compiled_clamped_swiglu_cuda(dtype: torch.dtype, shape: tuple[int, ...]
 @pytest.mark.parametrize(
     "device_type", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not HAVE_CUDA, reason="CUDA unavailable"))]
 )
-def test_mlp_clamped_activation_matches_reference(device_type: str) -> None:
-    """Check the complete MLP against explicit clamped arithmetic on CPU and CUDA."""
+@pytest.mark.parametrize(
+    "input_dtype,weight_dtype,autocast_enabled",
+    [
+        (torch.float32, torch.float32, False),
+        (torch.bfloat16, torch.bfloat16, False),
+        (torch.float32, torch.float32, True),
+        (torch.bfloat16, torch.float32, True),
+    ],
+)
+def test_mlp_clamped_activation_matches_reference(
+    device_type: str, input_dtype: torch.dtype, weight_dtype: torch.dtype, autocast_enabled: bool
+) -> None:
+    """Check complete MLP outputs and input/weight gradients against eager FP32 clamps."""
     torch.compiler.reset()
-    mlp = MLP(16, 32, backend="torch", dtype=torch.float32, swiglu_limit=10).to(device_type)
-    x = torch.randn(2, 16, device=device_type)
-    expected = F.linear(
-        (
-            F.silu(F.linear(x, mlp.gate_proj.weight).float().clamp(max=10))
-            * F.linear(x, mlp.up_proj.weight).float().clamp(-10, 10)
-        ).to(x.dtype),
-        mlp.down_proj.weight,
-    )
-    actual = mlp(x)
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-
-
-@pytest.mark.skipif(not HAVE_CUDA, reason="Actual compiled activation requires CUDA")
-def test_compiled_clamped_swiglu_explicit_output_dtype() -> None:
-    """Keep the caller-selected output dtype when projection outputs are FP32."""
-    torch.compiler.reset()
-    gate = torch.randn(4, 32, device="cuda", dtype=torch.float32)
-    up = torch.randn_like(gate)
-    actual = _compiled_clamped_swiglu(gate, up, 10.0, torch.bfloat16)
-    expected = (F.silu(gate.clamp(max=10)) * up.clamp(-10, 10)).to(torch.bfloat16)
-    assert actual.dtype == torch.bfloat16
-    torch.testing.assert_close(actual, expected)
+    torch.manual_seed(653)
+    mlp = MLP(16, 32, backend="torch", dtype=weight_dtype, swiglu_limit=10).to(device_type)
+    x = (torch.randn(17, 16, device=device_type, dtype=input_dtype) * 8).requires_grad_()
+    with torch.autocast(device_type, dtype=torch.bfloat16, enabled=autocast_enabled):
+        expected = F.linear(
+            (
+                F.silu(F.linear(x, mlp.gate_proj.weight).float().clamp(max=10))
+                * F.linear(x, mlp.up_proj.weight).float().clamp(-10, 10)
+            ).to(x.dtype),
+            mlp.down_proj.weight,
+        )
+        actual = mlp(x)
+    output_dtype = torch.bfloat16 if autocast_enabled else input_dtype
+    assert actual.dtype == expected.dtype == output_dtype
+    upstream = torch.randn_like(expected)
+    inputs = (x, *mlp.parameters())
+    expected_grads = torch.autograd.grad(expected, inputs, upstream)
+    actual_grads = torch.autograd.grad(actual, inputs, upstream)
+    for observed, reference in [(actual, expected), *zip(actual_grads, expected_grads)]:
+        assert observed.dtype == reference.dtype
+        assert torch.isfinite(observed).all()
+        torch.testing.assert_close(
+            observed,
+            reference,
+            rtol=1e-5 if output_dtype == torch.float32 else 2 * torch.finfo(output_dtype).eps,
+            atol=1e-5,
+        )
+    assert actual_grads[0].dtype == input_dtype
+    assert all(grad.dtype == weight_dtype for grad in actual_grads[1:])
 
 
 @pytest.mark.skipif(not HAVE_CUDA, reason="Actual compilation requires CUDA")
-def test_compiled_clamped_swiglu_falls_back_after_recompile_limit() -> None:
-    """Shape churn must preserve the eager path instead of raising at the cache limit."""
+def test_compiled_clamped_swiglu_variable_length_cuda() -> None:
+    """Exercise real Inductor forward/backward across more token counts than the graph budget."""
     torch.compiler.reset()
+    torch.manual_seed(653)
     try:
-        with torch._dynamo.config.patch(recompile_limit=1):
-            for rows in (2, 3):
-                gate = torch.randn(rows, 32, device="cuda")
-                up = torch.randn_like(gate)
-                actual = _compiled_clamped_swiglu(gate, up, 10.0, torch.float32)
-                expected = F.silu(gate.clamp(max=10)) * up.clamp(-10, 10)
-                torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        with torch._dynamo.config.patch(recompile_limit=3):
+            for rows in (2, 3, 17, 64, 257, 1024, 4096, 8192):
+                gate = (torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16) * 8).requires_grad_()
+                up = (torch.randn_like(gate) * 8).requires_grad_()
+                actual = _clamped_swiglu_act(gate, up, 10.0)
+                expected = (F.silu(gate.float().clamp(max=10)) * up.float().clamp(-10, 10)).to(gate.dtype)
+                upstream = torch.randn_like(expected)
+                actual_grads = torch.autograd.grad(actual, (gate, up), upstream)
+                expected_grads = torch.autograd.grad(expected, (gate, up), upstream)
+                for observed, reference in [(actual, expected), *zip(actual_grads, expected_grads)]:
+                    assert observed.dtype == torch.bfloat16
+                    assert torch.isfinite(observed).all()
+                    torch.testing.assert_close(observed, reference, rtol=2 * torch.finfo(gate.dtype).eps, atol=1e-5)
     finally:
         torch.compiler.reset()
