@@ -77,12 +77,15 @@ class TestSharedExpertActivationBoundary:
         torch.compiler.reset()
         yield
 
+    # CUDA only: training runs the compiled kernel on GPU, and the CPU variant's cold Inductor C++ build alone took
+    # ~25 s on H200 hosts, close to the 30 s cap for new tests.
     @pytest.mark.runtime_budget(
-        60,
+        30,
         reason="Compiles the shared weighted SwiGLU forward/backward kernels from a reset Dynamo state "
-        "(cold Inductor C++/Triton build).",
+        "(cold Triton build).",
     )
-    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="The compiled kernel runs on CUDA in training")
+    @pytest.mark.parametrize("device", ["cuda"])
     @pytest.mark.parametrize("n,inter", [(4096, 64), (1000, 24)])
     def test_compiled_kernel_meets_fp32_boundary(self, device, n, inter):
         """Declared bounds (measured 0.0004% / 0.001% on 16k x 512 and 16k x 2560): output and input-gradient
