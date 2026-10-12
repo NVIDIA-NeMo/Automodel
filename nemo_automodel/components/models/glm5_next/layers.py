@@ -724,6 +724,13 @@ class Glm5NextSparseAttention(nn.Module):
             full_hidden = all_gather_sequence(hidden_states, self._cp_mesh.get_group(), dim=1)
         else:
             full_hidden = hidden_states
+        if self.backend.attn == "cudnn":
+            output = self._forward_packed_cudnn(full_hidden, packed_context, hidden_states.shape[1])
+            if packed_context.cp_enabled:
+                output = output + all_gather_backward_anchor(full_hidden)
+            if padding_mask is not None:
+                output = output.masked_fill(padding_mask.unsqueeze(-1), 0)
+            return output
         output = torch.zeros_like(hidden_states)
         local_start = packed_context.seq_start
         local_end = local_start + hidden_states.shape[1]
@@ -893,6 +900,146 @@ class Glm5NextSparseAttention(nn.Module):
         )
         attention_output = torch.einsum("qhc,hvc->qhv", latent_output, w_vc.to(latent_output.dtype))
         return self.o_proj(attention_output.reshape(1, query_end - query_start, -1))
+
+    def _forward_packed_cudnn(
+        self,
+        full_hidden: torch.Tensor,
+        packed_context: Glm5NextPackedContext,
+        local_sequence_length: int,
+    ) -> torch.Tensor:
+        """Batch document-isolated attention after gathering global hidden states.
+
+        Preserve the original per-document K/V projection, indexer and query
+        projection order and shapes. Concatenate only the attention inputs.
+
+        Args:
+            full_hidden: Gathered states [batch, global_sequence, hidden].
+            packed_context: Global document map and this rank's query offset.
+            local_sequence_length: Number of tokens owned by this CP rank.
+
+        Returns:
+            Attention states [batch, local_sequence, hidden], zero at padding.
+        """
+        if not is_cudnn_sparse_attention_available():
+            raise RuntimeError("Packed cuDNN attention requires the FlashMLA/cuDNN runtimes.")
+        weight = self.kv_b_proj.weight.view(self.num_heads, self.qk_head_dim + self.v_head_dim, self.kv_lora_rank)
+        w_kc, w_vc = weight.split([self.qk_head_dim, self.v_head_dim], dim=1)
+        local_start = packed_context.seq_start
+        local_end = local_start + local_sequence_length
+        output = torch.zeros_like(full_hidden[:, local_start:local_end])
+        for row in range(full_hidden.shape[0]):
+            queries = []
+            selected = []
+            latents = []
+            intervals = []
+            key_offset = 0
+            for doc_start, doc_end in packed_context.row_document_ranges(row):
+                start, end = max(doc_start, local_start), min(doc_end, local_end)
+                if end <= start:
+                    continue
+                begin = start - local_start
+                length = end - start
+                document = full_hidden[row : row + 1, doc_start:doc_end]
+                query_hidden = document[:, start - doc_start : end - doc_start]
+                latent = self.kv_a_layernorm(self.kv_a_proj_with_mqa(document))
+                pool_keys, pool_indices = self.indexer.prepare_pools(document)
+                q_resid = self.q_a_layernorm(self.q_a_proj(query_hidden))
+                indices = self._select_document_indices_cudnn(
+                    query_hidden,
+                    q_resid,
+                    pool_keys,
+                    pool_indices,
+                    start - doc_start,
+                    end - doc_start,
+                    doc_end - doc_start,
+                )
+                query = self.q_b_proj(q_resid).view(1, length, self.num_heads, self.qk_head_dim)
+                queries.append(torch.einsum("bqhd,hdc->bqhc", query, w_kc.to(query.dtype)).squeeze(0))
+                latents.append(latent.squeeze(0))
+                selected.append(torch.where(indices >= 0, indices + key_offset, indices))
+                key_offset += doc_end - doc_start
+                intervals.append((begin, length))
+            if not intervals:
+                continue
+            query = torch.cat(queries, dim=0).contiguous()
+            indices = torch.cat(selected, dim=0).contiguous()
+            latent = torch.cat(latents, dim=0)
+            del queries, selected, latents
+            latent_output = cudnn_sparse_attention(
+                query,
+                latent.unsqueeze(1).contiguous(),
+                indices,
+                self.scaling,
+                all_rows_nonempty=self.indexer.always_select_tail,
+            )
+            chunks = latent_output.split([length for _, length in intervals], dim=0)
+            for chunk, (begin, length) in zip(chunks, intervals, strict=True):
+                attention_output = torch.einsum("qhc,hvc->qhv", chunk, w_vc.to(chunk.dtype))
+                output[row : row + 1, begin : begin + length] = self.o_proj(attention_output.reshape(1, length, -1))
+        return output
+
+    def _select_document_indices_cudnn(
+        self,
+        query_hidden: torch.Tensor,
+        q_resid: torch.Tensor,
+        pool_keys: torch.Tensor,
+        pool_indices: torch.Tensor,
+        query_start: int,
+        query_end: int,
+        length: int,
+    ) -> torch.Tensor:
+        """Select document-local keys using the original indexer projection tiles.
+
+        Args:
+            query_hidden: Local query states [1, queries, hidden].
+            q_resid: Normalized low-rank queries [1, queries, q_lora_rank].
+            pool_keys: Compressed index keys [complete_pools, index_head_dim].
+            pool_indices: Document-local indices [complete_pools, index_kpool].
+            query_start: First local query's position within the document.
+            query_end: Exclusive document-local query end.
+            length: Full document length.
+
+        Returns:
+            Selected document-local indices [queries, 1, selection_width].
+            Invalid entries retain the -1 sentinel.
+        """
+        selected_indices = []
+
+        # Bound the FP32 [queries, index_heads, pools] score tensor to 256 MiB.
+        # At 256K/KPool4 this retains the original 32-query score workspace.
+        def chunk_size(score_heads: int) -> int:
+            bytes_per_query = max(1, pool_keys.shape[0]) * score_heads * 4
+            size = min(self.indexer_query_chunk_size, max(1, (256 * 1024**2) // bytes_per_query))
+            return 1 << (size.bit_length() - 1) if size > 512 else size
+
+        projection_chunk = chunk_size(self.indexer.n_heads)
+        indexer_chunk = projection_chunk
+        if self.indexer.backend == "cudnn":
+            indexer_chunk = (chunk_size(1) // projection_chunk) * projection_chunk
+        for start in range(query_start, query_end, indexer_chunk):
+            end = min(start + indexer_chunk, query_end)
+            positions = torch.arange(start, end, device=query_hidden.device)
+            # Skip only complete original chunks; sparse GEMM shapes stay unchanged.
+            if end // self.indexer.index_kpool <= self.indexer.index_topk // self.indexer.index_kpool:
+                indices = _dense_prefix_indices(
+                    positions,
+                    self.indexer.index_topk,
+                    self.indexer.index_kpool,
+                    self.indexer.always_select_tail,
+                )
+            else:
+                indices = self.indexer.select(
+                    query_hidden[:, start - query_start : end - query_start],
+                    q_resid[:, start - query_start : end - query_start],
+                    positions,
+                    pool_keys,
+                    pool_indices,
+                    length,
+                    query_projection_chunk_size=projection_chunk,
+                )
+            selected_indices.append(indices.squeeze(0).unsqueeze(1))
+
+        return torch.cat(selected_indices, dim=0).contiguous()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:
