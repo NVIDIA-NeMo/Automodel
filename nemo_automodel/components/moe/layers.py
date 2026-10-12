@@ -112,15 +112,35 @@ class MLP(nn.Module):
         if self.swiglu_limit > 0.0:
             # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
             # gate clamp and symmetric up clamp; cast back before down_proj.
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            if x.is_cuda:
+                # One fused kernel instead of two fp32 up-casts, two clamps, silu, mul and a down-cast
+                # (seven launches and two fp32 temporaries per call; the shared-expert branch is issued on
+                # a side stream while the main stream waits for its launches).
+                return self.down_proj(_clamped_swiglu_act(gate, up, self.swiglu_limit))
             dtype = x.dtype
-            gate = self.gate_proj(x).float().clamp(max=self.swiglu_limit)
-            up = self.up_proj(x).float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            gate = gate.float().clamp(max=self.swiglu_limit)
+            up = up.float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
             return self.down_proj((F.silu(gate) * up).to(dtype))
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
         self.apply(init_weights_fn)
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def _clamped_swiglu_act(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
+    """fp32 clamped SwiGLU on separate gate / up projections, cast back to the input dtype.
+
+    Same arithmetic as the eager branch of ``MLP.forward`` (the DeepSeek-V4 reference Expert.forward); inductor
+    fuses it into one kernel per direction. Static shapes: a new token count compiles again, which the
+    benchmark's fixed shapes never trigger after warm-up; CPU inputs keep the eager chain.
+    """
+    gate_f = gate.float().clamp(max=limit)
+    up_f = up.float().clamp(min=-limit, max=limit)
+    return (F.silu(gate_f) * up_f).to(gate.dtype)
 
 
 class FakeBalancedGate(nn.Module):
