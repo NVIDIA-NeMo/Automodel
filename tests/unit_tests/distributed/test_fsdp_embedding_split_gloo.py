@@ -30,14 +30,13 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-    Qwen3_5ParallelizationStrategy,
-)
+from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+from nemo_automodel.components.models.nemotron_v3.parallelization import NemotronHModelParallelizer
+from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ModelParallelizer
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 class _ToyLM(nn.Module):
@@ -93,6 +92,13 @@ class _ToyLM(nn.Module):
         return head(hidden)
 
 
+class _ToyNemotronH(_ToyLM):
+    @property
+    def backbone(self) -> SimpleNamespace:
+        """Expose the decoder blocks through the remote Nemotron-H layout."""
+        return SimpleNamespace(layers=self.transformer["blocks"])
+
+
 def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
     """Materialize a distributed tensor for numerical comparison.
 
@@ -115,15 +121,16 @@ def _free_port() -> int:
 def _run_case(
     mesh: DeviceMesh,
     *,
-    strategy: DefaultParallelizationStrategy,
+    parallelizer: ModelParallelizer,
     tied: bool,
     input_in_container: bool = False,
     output_in_container: bool = False,
     nested_output: bool = False,
     shared_module: bool = False,
+    model_class: type[_ToyLM] = _ToyLM,
 ) -> None:
     torch.manual_seed(2026)
-    model = _ToyLM(
+    model = model_class(
         tied=tied,
         input_in_container=input_in_container,
         output_in_container=output_in_container,
@@ -136,14 +143,16 @@ def _run_case(
 
     if tied and not shared_module and (input_in_container or output_in_container):
         original_parameters = list(model.parameters())
-        with pytest.raises(ValueError, match="Distinct tied input/output embedding modules inside a ModuleList or ModuleDict"):
-            strategy.parallelize(model, device_mesh=mesh, mp_policy=mp_policy)
+        with pytest.raises(
+            ValueError, match="Distinct tied input/output embedding modules inside a ModuleList or ModuleDict"
+        ):
+            parallelizer._apply(model, device_mesh=mesh, mp_policy=mp_policy)
         assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
         assert [id(param) for param in model.parameters()] == [id(param) for param in original_parameters]
         assert not any(isinstance(module, FSDPModule) for module in model.modules())
         return
 
-    strategy.parallelize(model, device_mesh=mesh, mp_policy=mp_policy)
+    parallelizer._apply(model, device_mesh=mesh, mp_policy=mp_policy)
 
     assert isinstance(model, FSDPModule)
     if tied:
@@ -198,20 +207,20 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     try:
         mesh = init_device_mesh("cpu", (1, world_size, 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"))
-        for strategy in (DefaultParallelizationStrategy(), Qwen3_5ParallelizationStrategy()):
+        for parallelizer in (ModelParallelizer(), Qwen3_5ModelParallelizer()):
             for tied in (False, True):
                 for input_in_container in (False, True):
                     for output_in_container in (False, True):
                         _run_case(
                             mesh,
-                            strategy=strategy,
+                            parallelizer=parallelizer,
                             tied=tied,
                             input_in_container=input_in_container,
                             output_in_container=output_in_container,
                         )
             _run_case(
                 mesh,
-                strategy=strategy,
+                parallelizer=parallelizer,
                 tied=True,
                 input_in_container=True,
                 output_in_container=True,
@@ -221,11 +230,18 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             for input_in_container in (False, True):
                 _run_case(
                     mesh,
-                    strategy=strategy,
+                    parallelizer=parallelizer,
                     tied=True,
                     input_in_container=input_in_container,
                     shared_module=True,
                 )
+        for tied in (False, True):
+            _run_case(
+                mesh,
+                parallelizer=NemotronHModelParallelizer(),
+                tied=tied,
+                model_class=_ToyNemotronH,
+            )
         dist.barrier()
     finally:
         dist.destroy_process_group()

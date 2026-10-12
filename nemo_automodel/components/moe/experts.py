@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as torch_checkpoint
 from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
@@ -42,6 +43,101 @@ from nemo_automodel.shared.import_utils import safe_import
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
 _BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr(tl, "make_tensor_descriptor")
+# Bound each GPT-OSS-sized FP32 temporary to about 45 MiB while leaving small
+# dispatches on the faster single-operation path.
+_BIAS_CHUNK_ROWS = 4096
+_BIAS_CHUNK_THRESHOLD = 12288
+# Above this size, materializing both grouped-GEMM intermediates for biased experts
+# can exhaust memory even when bias additions themselves are bounded. Recompute
+# row chunks during backward instead of retaining full expert-MLP activations.
+# Bias-free experts retain whole-dispatch GEMMs for throughput.
+_EXPERT_MLP_CHUNK_BYTES = 512 * 1024 * 1024
+
+
+if _HAVE_TRITON and _HAVE_TRITON_LANGUAGE:
+
+    @triton.jit
+    def _weighted_bias_add_kernel(
+        value_ptr,
+        bias_ptr,
+        expert_ids_ptr,
+        probs_ptr,
+        output_ptr,
+        numel,
+        hidden: tl.constexpr,
+        value_stride_0: tl.constexpr,
+        value_stride_1: tl.constexpr,
+        bias_stride_0: tl.constexpr,
+        bias_stride_1: tl.constexpr,
+        probs_stride_0: tl.constexpr,
+        output_stride_0: tl.constexpr,
+        output_stride_1: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
+        """Add weighted expert bias without expanded bias or FP32 activation buffers.
+
+        Args:
+            value_ptr: Tensor of shape [tokens, hidden] containing grouped expert outputs.
+            bias_ptr: Tensor of shape [experts, hidden] containing per-expert biases.
+            expert_ids_ptr: Contiguous integer tensor of shape [tokens] mapping each row to its expert.
+            probs_ptr: FP32 tensor of shape [tokens, 1] containing routing weights.
+            output_ptr: Tensor of shape [tokens, hidden], optionally aliasing ``value_ptr`` exactly.
+            numel: Number of output elements.
+            hidden: Feature count.
+            value_stride_0: Value row stride.
+            value_stride_1: Value feature stride.
+            bias_stride_0: Bias expert stride.
+            bias_stride_1: Bias feature stride.
+            probs_stride_0: Probability row stride.
+            output_stride_0: Output row stride.
+            output_stride_1: Output feature stride.
+            BLOCK: Number of elements processed by each program.
+        """
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < numel
+        rows, cols = offsets // hidden, offsets % hidden
+        experts = tl.load(expert_ids_ptr + rows, mask, other=0)
+        value = tl.load(value_ptr + rows * value_stride_0 + cols * value_stride_1, mask, other=0).to(tl.float32)
+        bias = tl.load(bias_ptr + experts * bias_stride_0 + cols * bias_stride_1, mask, other=0).to(tl.float32)
+        probs = tl.load(probs_ptr + rows * probs_stride_0, mask, other=0)
+        tl.store(output_ptr + rows * output_stride_0 + cols * output_stride_1, value + bias * probs, mask)
+
+    @triton.jit
+    def _weighted_bias_probs_grad_kernel(
+        grad_output_ptr,
+        bias_ptr,
+        expert_ids_ptr,
+        grad_probs_ptr,
+        hidden: tl.constexpr,
+        grad_stride_0: tl.constexpr,
+        grad_stride_1: tl.constexpr,
+        bias_stride_0: tl.constexpr,
+        bias_stride_1: tl.constexpr,
+        probs_stride_0: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
+        """Reduce each row's bias-weighted gradient without expanded bias buffers.
+
+        Args:
+            grad_output_ptr: Upstream gradient of shape [tokens, hidden].
+            bias_ptr: Per-expert bias of shape [experts, hidden].
+            expert_ids_ptr: Contiguous integer tensor of shape [tokens] mapping each row to its expert.
+            grad_probs_ptr: FP32 probability gradient of shape [tokens, 1].
+            hidden: Feature count.
+            grad_stride_0: Upstream-gradient row stride.
+            grad_stride_1: Upstream-gradient feature stride.
+            bias_stride_0: Bias expert stride.
+            bias_stride_1: Bias feature stride.
+            probs_stride_0: Probability-gradient row stride.
+            BLOCK: Power-of-two feature extent processed by each program.
+        """
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        expert = tl.load(expert_ids_ptr + row)
+        grad = tl.load(grad_output_ptr + row * grad_stride_0 + cols * grad_stride_1, cols < hidden, other=0)
+        bias = tl.load(bias_ptr + expert * bias_stride_0 + cols * bias_stride_1, cols < hidden, other=0)
+        grad_probs = tl.sum(grad.to(tl.float32) * bias.to(tl.float32), axis=0)
+        tl.store(grad_probs_ptr + row * probs_stride_0, grad_probs)
 
 
 def _allocate_triton_workspace(size: int, alignment: int, stream: int | None) -> torch.Tensor:
@@ -65,17 +161,20 @@ if _BIAS_GRAD_TRITON_AVAILABLE:
     def _deterministic_bias_grad_kernel(
         grad_output_ptr,
         token_offsets_ptr,
+        probs_ptr,
         grad_bias_ptr,
         n_tokens,
         hidden: tl.constexpr,
+        USE_PROBS: tl.constexpr,
         BLOCK_TOKENS: tl.constexpr,
         BLOCK_HIDDEN: tl.constexpr,
     ):
         """Reduce one expert's contiguous token gradients without atomic writes.
 
-        ``grad_output_ptr`` is a contiguous row-major ``[tokens, hidden]`` allocation. The caller ensures its row
-        stride is descriptor-aligned and its token offsets fit in int32. Each program exclusively owns one
-        ``[expert, hidden block]`` output tile, so the reduction order is deterministic.
+        ``grad_output_ptr`` is a contiguous row-major ``[tokens, hidden]`` allocation and ``probs_ptr`` is a
+        contiguous FP32 ``[tokens, 1]`` allocation when ``USE_PROBS`` is true. The caller ensures the gradient row
+        stride is descriptor-aligned and token offsets fit in int32. Each program exclusively owns one contiguous
+        FP32 ``[expert, hidden block]`` tile in ``grad_bias_ptr``, so the reduction order is deterministic.
         """
         expert_idx = tl.program_id(0)
         hidden_block_start = tl.program_id(1) * BLOCK_HIDDEN
@@ -95,6 +194,9 @@ if _BIAS_GRAD_TRITON_AVAILABLE:
             token_offsets = token_block_start + tl.arange(0, BLOCK_TOKENS)
             values = grad_output.load([token_block_start, hidden_block_start]).to(tl.float32)
             values = tl.where(token_offsets[:, None] < token_end, values, 0.0)
+            if USE_PROBS:
+                probs = tl.load(probs_ptr + token_offsets, mask=token_offsets < token_end, other=0.0).to(tl.float32)
+                values *= probs[:, None]
             block_sum = tl.sum(values, axis=0)
 
             # Kahan compensation protects the serial accumulation of the balanced
@@ -247,6 +349,35 @@ def _permute_tokens_for_grouped_mm(
     return sorted_token_ids, sorted_weights, tokens_per_expert, offs
 
 
+def _segment_reduce_bias_grad(
+    grad_output: torch.Tensor,
+    token_counts: torch.Tensor,
+    accumulation_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reduce contiguous expert segments into an accumulation-dtype tensor.
+
+    Args:
+        grad_output: Tensor of shape [tokens, hidden], grouped contiguously by expert.
+        token_counts: Tensor of shape [experts] containing each contiguous segment length.
+        accumulation_dtype: Dtype used by the segmented sums.
+
+    Returns:
+        Tensor of shape [experts, hidden] in ``accumulation_dtype``.
+    """
+    accumulation_input = grad_output.to(accumulation_dtype)
+    hidden = accumulation_input.shape[1]
+    flattened_by_hidden = accumulation_input.transpose(0, 1).contiguous().view(-1)
+    repeated_counts = token_counts.repeat(hidden)
+    grad_bias = torch.segment_reduce(
+        flattened_by_hidden,
+        "sum",
+        lengths=repeated_counts,
+        axis=0,
+        unsafe=True,
+    )
+    return grad_bias.view(hidden, token_counts.numel()).transpose(0, 1).contiguous()
+
+
 def _reduce_bias_grad_fallback(grad_output: torch.Tensor, token_counts: torch.Tensor) -> torch.Tensor:
     """Reduce grouped token gradients without requiring Triton.
 
@@ -262,32 +393,31 @@ def _reduce_bias_grad_fallback(grad_output: torch.Tensor, token_counts: torch.Te
     )
     if grad_output.dtype == torch.float64:
         accumulation_dtype = torch.float64
-    accumulation_input = grad_output.to(accumulation_dtype)
-    hidden = accumulation_input.shape[1]
-    flattened_by_hidden = accumulation_input.transpose(0, 1).contiguous().view(-1)
-    repeated_counts = token_counts.repeat(hidden)
-    grad_bias = torch.segment_reduce(
-        flattened_by_hidden,
-        "sum",
-        lengths=repeated_counts,
-        axis=0,
-        unsafe=True,
-    )
-    return grad_bias.view(hidden, token_counts.numel()).transpose(0, 1).contiguous().to(grad_output.dtype)
+    return _segment_reduce_bias_grad(grad_output, token_counts, accumulation_dtype).to(grad_output.dtype)
 
 
-def _reduce_bias_grad_triton(grad_output: torch.Tensor, token_counts: torch.Tensor) -> torch.Tensor:
+def _reduce_bias_grad_triton(
+    grad_output: torch.Tensor,
+    token_counts: torch.Tensor,
+    probs: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     """Reduce grouped CUDA token gradients with deterministic compensated FP32 sums.
 
     Args:
         grad_output: Contiguous CUDA tensor of shape [tokens, hidden], grouped by expert. Supported dtypes are
             FP16, BF16, and FP32.
         token_counts: Contiguous CUDA tensor of shape [experts] containing each segment length.
+        probs: Optional FP32 routing probabilities of shape [tokens, 1].
+        output_dtype: Result dtype. Defaults to ``grad_output.dtype``.
 
     Returns:
-        CUDA tensor of shape [experts, hidden] and the same dtype as ``grad_output``.
+        CUDA tensor of shape [experts, hidden] and ``output_dtype`` when provided,
+        otherwise the same dtype as ``grad_output``.
     """
     grad_output = grad_output.contiguous()
+    if probs is not None:
+        probs = probs.contiguous()
     hidden = grad_output.shape[1]
     token_offsets = torch.cat((token_counts.new_zeros(1), token_counts.cumsum(dim=0)))
     grad_bias = torch.empty((token_counts.numel(), hidden), dtype=torch.float32, device=grad_output.device)
@@ -298,14 +428,16 @@ def _reduce_bias_grad_triton(grad_output: torch.Tensor, token_counts: torch.Tens
     _deterministic_bias_grad_kernel[grid](
         grad_output,
         token_offsets,
+        probs if probs is not None else grad_output,
         grad_bias,
         grad_output.shape[0],
         hidden,
+        USE_PROBS=probs is not None,
         BLOCK_TOKENS=128,
         BLOCK_HIDDEN=block_hidden,
         num_warps=4,
     )
-    return grad_bias.to(grad_output.dtype)
+    return grad_bias.to(output_dtype or grad_output.dtype)
 
 
 class _DeterministicBiasRepeatInterleave(Function):
@@ -355,7 +487,195 @@ class _DeterministicBiasRepeatInterleave(Function):
         return grad_bias, None, None
 
 
-def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
+def _reduce_bias_grad_chunked_fallback(
+    grad_output: torch.Tensor,
+    token_counts: torch.Tensor,
+    probs: torch.Tensor | None,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reduce bias gradients without full-size intermediates.
+
+    Args:
+        grad_output: Tensor of shape [tokens, hidden], grouped contiguously by expert.
+        token_counts: Tensor of shape [experts] containing each contiguous segment length.
+        probs: Optional routing probabilities of shape [tokens, 1].
+        output_dtype: Result dtype.
+
+    Returns:
+        Tensor of shape [experts, hidden] with one weighted gradient sum per expert.
+    """
+    product_dtype = torch.promote_types(grad_output.dtype, output_dtype)
+    if probs is not None:
+        product_dtype = torch.promote_types(product_dtype, probs.dtype)
+    accumulation_dtype = torch.float64 if not grad_output.is_cuda or product_dtype == torch.float64 else torch.float32
+    token_offsets = torch.cat((token_counts.new_zeros(1), token_counts.cumsum(dim=0)))
+    partials = []
+    for chunk_start in range(0, grad_output.shape[0], _BIAS_CHUNK_ROWS):
+        chunk_end = min(chunk_start + _BIAS_CHUNK_ROWS, grad_output.shape[0])
+        chunk = grad_output[chunk_start:chunk_end].to(product_dtype)
+        if probs is not None:
+            chunk = chunk * probs[chunk_start:chunk_end].to(product_dtype)
+        clipped_offsets = token_offsets.clamp(min=chunk_start, max=chunk_end)
+        chunk_counts = clipped_offsets[1:] - clipped_offsets[:-1]
+        partials.append(_segment_reduce_bias_grad(chunk, chunk_counts, accumulation_dtype))
+    if not partials:
+        return torch.zeros(
+            (token_counts.numel(), grad_output.shape[1]),
+            dtype=output_dtype,
+            device=grad_output.device,
+        )
+    return torch.stack(partials).sum(dim=0).to(output_dtype)
+
+
+class _ChunkedBiasAdd(Function):
+    """Add expert bias without materializing a full-size expanded bias."""
+
+    @staticmethod
+    def forward(ctx, value, bias, token_counts, probs=None, reuse_input=False):
+        """Add optionally weighted expert bias with bounded temporary memory.
+
+        Args:
+            ctx: Autograd context used to retain the compact inputs.
+            value: Grouped expert output of shape [tokens, hidden].
+            bias: Per-expert bias of shape [experts, hidden].
+            token_counts: Tensor of shape [experts] containing nonnegative token counts.
+            probs: Optional FP32 routing probabilities of shape [tokens, 1].
+            reuse_input: Whether the caller transfers ownership of ``value`` so its storage can hold the result.
+
+        Returns:
+            Tensor of shape [tokens, hidden] and the same dtype as ``value``.
+        """
+        expert_ids = torch.repeat_interleave(
+            torch.arange(token_counts.numel(), device=token_counts.device),
+            token_counts,
+            output_size=value.shape[0],
+        )
+        ctx.has_probs = probs is not None
+        tensors_to_save = (bias, token_counts) if probs is None else (bias, token_counts, probs)
+        ctx.save_for_backward(*tensors_to_save)
+        if reuse_input:
+            ctx.mark_dirty(value)
+            output = value
+        else:
+            output = torch.empty_like(value)
+        compute_dtype = torch.promote_types(value.dtype, bias.dtype)
+        if probs is not None:
+            compute_dtype = torch.promote_types(compute_dtype, probs.dtype)
+        if (
+            _HAVE_TRITON
+            and _HAVE_TRITON_LANGUAGE
+            and value.is_cuda
+            and probs is not None
+            and probs.dtype == torch.float32
+            and compute_dtype == torch.float32
+            and value.numel() > 0
+        ):
+            # Keep the bounded-memory contract while avoiding one sequence of
+            # gather/cast/multiply/add/copy launches for every 4096 token rows.
+            _weighted_bias_add_kernel[(triton.cdiv(value.numel(), 1024),)](
+                value,
+                bias,
+                expert_ids,
+                probs,
+                output,
+                value.numel(),
+                value.shape[1],
+                *value.stride(),
+                *bias.stride(),
+                probs.stride(0),
+                *output.stride(),
+                BLOCK=1024,
+                enable_fp_fusion=False,
+            )
+            return output
+        for start in range(0, value.shape[0], _BIAS_CHUNK_ROWS):
+            end = min(start + _BIAS_CHUNK_ROWS, value.shape[0])
+            bias_rows = bias.index_select(0, expert_ids[start:end]).to(compute_dtype)
+            if probs is not None:
+                bias_rows = bias_rows * probs[start:end].to(compute_dtype)
+            output[start:end] = (value[start:end].to(compute_dtype) + bias_rows).to(value.dtype)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Compute value, bias, and probability gradients in bounded memory.
+
+        Args:
+            ctx: Autograd context containing bias, token counts, and optional probabilities.
+            grad_output: Upstream gradient of shape [tokens, hidden].
+
+        Returns:
+            Gradients for ``value``, ``bias``, and ``probs``; token counts are non-differentiable.
+        """
+        if ctx.has_probs:
+            bias, token_counts, probs = ctx.saved_tensors
+        else:
+            bias, token_counts = ctx.saved_tensors
+            probs = None
+        grad_value = grad_output if ctx.needs_input_grad[0] else None
+        grad_bias = None
+        grad_probs = None
+        if ctx.needs_input_grad[1]:
+            use_triton = (
+                _BIAS_GRAD_TRITON_AVAILABLE
+                and grad_output.is_cuda
+                and grad_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and (probs is None or probs.dtype == torch.float32)
+                and bias.dtype != torch.float64
+                and grad_output.shape[0] < 2**31
+                and grad_output.shape[1] * grad_output.element_size() % 16 == 0
+                and not torch.is_grad_enabled()
+            )
+            if use_triton:
+                grad_bias = _reduce_bias_grad_triton(grad_output, token_counts, probs, bias.dtype)
+            else:
+                grad_bias = _reduce_bias_grad_chunked_fallback(grad_output, token_counts, probs, bias.dtype)
+        if probs is not None and ctx.needs_input_grad[3]:
+            grad_probs = torch.empty_like(probs)
+            compute_dtype = torch.promote_types(probs.dtype, torch.promote_types(grad_output.dtype, bias.dtype))
+            if (
+                _HAVE_TRITON
+                and _HAVE_TRITON_LANGUAGE
+                and grad_output.is_cuda
+                and probs.dtype == torch.float32
+                and compute_dtype == torch.float32
+                and grad_output.numel() > 0
+                and grad_output.shape[1] <= 8192
+                and not torch.is_grad_enabled()
+            ):
+                expert_ids = torch.repeat_interleave(
+                    torch.arange(token_counts.numel(), device=token_counts.device),
+                    token_counts,
+                    output_size=grad_output.shape[0],
+                )
+                _weighted_bias_probs_grad_kernel[(grad_output.shape[0],)](
+                    grad_output,
+                    bias,
+                    expert_ids,
+                    grad_probs,
+                    grad_output.shape[1],
+                    *grad_output.stride(),
+                    *bias.stride(),
+                    grad_probs.stride(0),
+                    BLOCK=triton.next_power_of_2(grad_output.shape[1]),
+                    enable_fp_fusion=False,
+                )
+            else:
+                token_offsets = torch.cat((token_counts.new_zeros(1), token_counts.cumsum(dim=0)))
+                for start in range(0, grad_output.shape[0], _BIAS_CHUNK_ROWS):
+                    end = min(start + _BIAS_CHUNK_ROWS, grad_output.shape[0])
+                    clipped_offsets = token_offsets.clamp(min=start, max=end)
+                    chunk_counts = clipped_offsets[1:] - clipped_offsets[:-1]
+                    bias_rows = _DeterministicBiasRepeatInterleave.apply(bias, chunk_counts, end - start).to(
+                        compute_dtype
+                    )
+                    grad_probs[start:end] = (
+                        (grad_output[start:end].to(compute_dtype) * bias_rows).sum(dim=-1, keepdim=True).to(probs.dtype)
+                    )
+        return grad_value, grad_bias, None, grad_probs, None
+
+
+def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None, reuse_input=False):
     """Apply per-expert bias to grouped GEMM output.
 
     NOTE: torch._grouped_mm accepts a `bias` kwarg in its schema but raises
@@ -369,10 +689,12 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
         tokens_per_expert: Token counts, shape [num_experts].
         permuted_probs: Optional routing probabilities broadcastable to
             [total_tokens, features], typically [total_tokens, 1].
+        reuse_input: Reuse ``value`` storage for the result when the bounded-memory path supports it. The caller
+            must not read ``value`` afterward or pass storage retained by a selective-checkpoint cache.
 
     Returns:
         Grouped GEMM output with per-expert bias applied, shape
-        [total_tokens, features]. The inputs are not mutated.
+        [total_tokens, features]. Inputs are not mutated unless ``reuse_input`` is true.
     """
     if bias is None:
         return value
@@ -380,8 +702,15 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
         bias = torch.stack(tuple(bias))
 
     shape = value.shape
-    flat_value = value.reshape(-1, shape[-1])
+    # Keep owned 2D outputs off the view-mutation path: AOTAutograd cannot trace
+    # the CopySlices backward created by marking a redundant reshape dirty.
+    flat_value = value if value.ndim == 2 else value.reshape(-1, shape[-1])
     token_counts = torch.as_tensor(tokens_per_expert, device=bias.device, dtype=torch.long)
+    chunkable_probs = permuted_probs is None or (
+        permuted_probs.dim() == 2 and permuted_probs.shape == (flat_value.shape[0], 1)
+    )
+    if chunkable_probs and (reuse_input or flat_value.shape[0] > _BIAS_CHUNK_THRESHOLD):
+        return _ChunkedBiasAdd.apply(flat_value, bias, token_counts, permuted_probs, reuse_input).view(shape)
     if torch.is_grad_enabled() and bias.requires_grad:
         bias_to_expand = bias
         if permuted_probs is not None:
@@ -453,6 +782,76 @@ class GroupedExperts(nn.Module):
             self.down_proj_bias = None
 
         self.expert_activation_grouped = get_expert_activation_for_deepep(config)
+
+    @staticmethod
+    def _gather_ep_inputs(
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        *,
+        ep_group: dist.ProcessGroup,
+        ep_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+        """Gather unequal token shards across the expert-parallel group.
+
+        Args:
+            x: Tensor of shape [local_tokens, hidden], containing local activations.
+            token_mask: Tensor of shape [local_tokens], marking valid tokens.
+            weights: Tensor of shape [local_tokens, topk], containing routing probabilities.
+            indices: Tensor of shape [local_tokens, topk], containing global expert IDs.
+            ep_group: Expert-parallel process group.
+            ep_size: Number of ranks in ep_group.
+
+        Returns:
+            Activations [gathered_tokens, hidden], routing weights [gathered_tokens, topk],
+            expert IDs [gathered_tokens, topk], mask [gathered_tokens], and per-rank token counts,
+            concatenated in rank order without padding. Activations and FP32 routing weights
+            retain their autograd connections.
+        """
+        local_num_tokens = x.size(0)
+
+        # Exchange per-rank token counts
+        local_len_t = torch.tensor([local_num_tokens], device=x.device, dtype=torch.int64)
+        gathered_len_t = [torch.zeros_like(local_len_t) for _ in range(ep_size)]
+        dist.all_gather(gathered_len_t, local_len_t, group=ep_group)
+        gathered_lens = [int(t.item()) for t in gathered_len_t]
+        max_len = max(gathered_lens)
+
+        def _all_gather_dim0_var(local_tensor: torch.Tensor, *, differentiable: bool) -> torch.Tensor:
+            """Gather along the token axis, padding only for communication.
+
+            Args:
+                local_tensor: Tensor of shape [local_tokens, ...], with matching trailing axes across ranks.
+                differentiable: Whether backward reduces gradients to each source rank.
+
+            Returns:
+                Tensor of shape [gathered_tokens, ...], concatenated in rank order without padding.
+            """
+            if differentiable:
+                return _AllGatherConcatVarlenFn.apply(local_tensor, ep_group, gathered_lens, max_len)
+            if max_len > local_tensor.size(0):
+                pad_shape = (max_len - local_tensor.size(0),) + tuple(local_tensor.shape[1:])
+                pad = torch.zeros(pad_shape, dtype=local_tensor.dtype, device=local_tensor.device)
+                local_padded = torch.cat([local_tensor, pad], dim=0)
+            else:
+                local_padded = local_tensor
+            gathered = [torch.empty_like(local_padded) for _ in range(ep_size)]
+            dist.all_gather(gathered, local_padded, group=ep_group)
+            gathered = [g[:n] for g, n in zip(gathered, gathered_lens)]
+            return torch.cat(gathered, dim=0)
+
+        x = _all_gather_dim0_var(x, differentiable=True)
+        # Routing probabilities participate in the main-loss gradient.
+        # A plain ``dist.all_gather`` detaches every gathered tensor and
+        # silently leaves the router trainable only through auxiliary
+        # losses.  Use the same autograd-safe variable-length gather as
+        # activations so each source rank receives its local weight grad.
+        weights = _all_gather_dim0_var(weights.float(), differentiable=True)
+        indices = _all_gather_dim0_var(indices, differentiable=False)
+        token_mask = _all_gather_dim0_var(token_mask, differentiable=False)
+
+        return x, weights, indices, token_mask, gathered_lens
 
     def forward(
         self,
@@ -530,36 +929,9 @@ class GroupedExperts(nn.Module):
             ep_group = ep_mesh.get_group()
             local_num_tokens = x.size(0)
 
-            # Exchange per-rank token counts
-            local_len_t = torch.tensor([local_num_tokens], device=x.device, dtype=torch.int64)
-            gathered_len_t = [torch.zeros_like(local_len_t) for _ in range(ep_size)]
-            dist.all_gather(gathered_len_t, local_len_t, group=ep_group)
-            gathered_lens = [int(t.item()) for t in gathered_len_t]
-            max_len = max(gathered_lens)
-
-            def _all_gather_dim0_var(local_tensor: torch.Tensor, *, differentiable: bool) -> torch.Tensor:
-                if differentiable:
-                    return _AllGatherConcatVarlenFn.apply(local_tensor, ep_group, gathered_lens, max_len)
-                if max_len > local_tensor.size(0):
-                    pad_shape = (max_len - local_tensor.size(0),) + tuple(local_tensor.shape[1:])
-                    pad = torch.zeros(pad_shape, dtype=local_tensor.dtype, device=local_tensor.device)
-                    local_padded = torch.cat([local_tensor, pad], dim=0)
-                else:
-                    local_padded = local_tensor
-                gathered = [torch.empty_like(local_padded) for _ in range(ep_size)]
-                dist.all_gather(gathered, local_padded, group=ep_group)
-                gathered = [g[:n] for g, n in zip(gathered, gathered_lens)]
-                return torch.cat(gathered, dim=0)
-
-            x = _all_gather_dim0_var(x, differentiable=True)
-            # Routing probabilities participate in the main-loss gradient.
-            # A plain ``dist.all_gather`` detaches every gathered tensor and
-            # silently leaves the router trainable only through auxiliary
-            # losses.  Use the same autograd-safe variable-length gather as
-            # activations so each source rank receives its local weight grad.
-            weights = _all_gather_dim0_var(weights.float(), differentiable=True)
-            indices = _all_gather_dim0_var(indices, differentiable=False)
-            token_mask = _all_gather_dim0_var(token_mask, differentiable=False)
+            x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
+                x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
+            )
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
@@ -737,6 +1109,7 @@ class GroupedExperts(nn.Module):
                 # v0.17.0 has no bias arg). bf16 path byte-identical.
                 grouped_mm = select_grouped_mm(self.use_mxfp8)
                 output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
+                # Selective checkpointing may retain either GEMM output; bias must not mutate it.
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation_grouped(output1, activation_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
@@ -906,6 +1279,129 @@ def _stabilize_empty_routing_probs_dtype(permuted_probs: torch.Tensor, compute_d
     return permuted_probs
 
 
+def _checkpointed_chunked_expert_mlp(
+    hidden_states: torch.Tensor,
+    gate_and_up_projs: torch.Tensor,
+    down_projs: torch.Tensor,
+    gate_up_proj_bias: torch.Tensor | None,
+    down_proj_bias: torch.Tensor | None,
+    tokens_per_expert: torch.Tensor,
+    permuted_probs: torch.Tensor,
+    activation_fn,
+    apply_router_weight_after_down: bool,
+) -> torch.Tensor:
+    """Run a grouped expert MLP in bounded row chunks.
+
+    Each chunk is independently checkpointed, so backward recomputes its two
+    grouped GEMMs instead of retaining full ``[tokens, 2 * inter_dim]`` and
+    ``[tokens, inter_dim]`` activations. The final ``[tokens, hidden]`` tensor
+    is allocated once and populated by slice assignment; no concatenation or
+    stateful scratch buffer is used.
+
+    The checkpoint callback captures the input dtype rather than the routed
+    tensor so an enclosing activation checkpoint can release that tensor.
+
+    This helper is for the plain ``torch._grouped_mm`` path. MXFP8 uses a
+    different quantization contract and remains on its existing whole-dispatch
+    implementation.
+
+    Args:
+        hidden_states: Tensor of shape [tokens, hidden], with rows grouped contiguously by expert.
+        gate_and_up_projs: Tensor of shape [experts, hidden, gate_up], where ``gate_up`` stores the fused gate and
+            up projections in the ordering required by ``activation_fn``.
+        down_projs: Tensor of shape [experts, intermediate, hidden].
+        gate_up_proj_bias: Optional tensor of shape [experts, gate_up].
+        down_proj_bias: Optional tensor of shape [experts, hidden].
+        tokens_per_expert: Tensor of shape [experts] containing the number of contiguous rows for each expert.
+        permuted_probs: Tensor of shape [tokens, 1] containing each routed token's probability.
+        activation_fn: Callable mapping tensors of shape [chunk_tokens, gate_up] and [chunk_tokens, 1] to a tensor
+            of shape [chunk_tokens, intermediate].
+        apply_router_weight_after_down: Whether to apply ``permuted_probs`` after the down projection instead of in
+            ``activation_fn``.
+
+    Returns:
+        Tensor of shape [tokens, hidden] in ``hidden_states.dtype`` with independent storage.
+    """
+    output = torch.empty(
+        (hidden_states.shape[0], down_projs.shape[-1]),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    token_counts = torch.as_tensor(tokens_per_expert, device=hidden_states.device, dtype=torch.long)
+    token_offsets = torch.cat((token_counts.new_zeros(1), token_counts.cumsum(dim=0)))
+    grouped_mm = select_grouped_mm(use_mxfp8=False)
+
+    # Share one cast across all chunks so autograd combines bias gradients in
+    # FP32 before casting back to a low-precision parameter. Casting inside
+    # run_chunk would round every contribution before accumulation.
+    if gate_up_proj_bias is not None and gate_up_proj_bias.dtype in (torch.float16, torch.bfloat16):
+        gate_up_proj_bias = gate_up_proj_bias.float()
+    if down_proj_bias is not None and down_proj_bias.dtype in (torch.float16, torch.bfloat16):
+        down_proj_bias = down_proj_bias.float()
+
+    hidden_dtype = hidden_states.dtype
+
+    def run_chunk(
+        chunk_hidden,
+        chunk_probs,
+        chunk_counts,
+        gate_up_weights,
+        down_weights,
+        gate_up_bias,
+        down_bias,
+    ):
+        """Compute one contiguous routing chunk.
+
+        Args:
+            chunk_hidden: Tensor of shape [chunk_tokens, hidden].
+            chunk_probs: Tensor of shape [chunk_tokens, 1].
+            chunk_counts: Tensor of shape [experts] containing this chunk's per-expert row counts.
+            gate_up_weights: Tensor of shape [experts, hidden, gate_up].
+            down_weights: Tensor of shape [experts, intermediate, hidden].
+            gate_up_bias: Optional tensor of shape [experts, gate_up].
+            down_bias: Optional tensor of shape [experts, hidden].
+
+        Returns:
+            Tensor of shape [chunk_tokens, hidden].
+        """
+        chunk_offs = chunk_counts.cumsum(dim=0).to(torch.int32)
+        gate_up = grouped_mm(chunk_hidden, gate_up_weights, chunk_offs)
+        # An outer selective checkpoint may retain either GEMM output.
+        gate_up = _apply_bias(gate_up, gate_up_bias, chunk_counts)
+        activation_probs = torch.ones_like(chunk_probs) if apply_router_weight_after_down else chunk_probs
+        activated = activation_fn(gate_up, activation_probs)
+        expert_output = grouped_mm(activated, down_weights, chunk_offs)
+        expert_output = _apply_bias(
+            expert_output,
+            down_bias,
+            chunk_counts,
+            None if apply_router_weight_after_down else chunk_probs,
+        )
+        if apply_router_weight_after_down:
+            expert_output = _apply_router_weight_fp32(expert_output, chunk_probs, hidden_dtype)
+        return expert_output
+
+    for chunk_start in range(0, hidden_states.shape[0], _BIAS_CHUNK_ROWS):
+        chunk_end = min(chunk_start + _BIAS_CHUNK_ROWS, hidden_states.shape[0])
+        clipped_offsets = token_offsets.clamp(min=chunk_start, max=chunk_end)
+        chunk_counts = clipped_offsets[1:] - clipped_offsets[:-1]
+        args = (
+            hidden_states[chunk_start:chunk_end],
+            permuted_probs[chunk_start:chunk_end],
+            chunk_counts,
+            gate_and_up_projs,
+            down_projs,
+            gate_up_proj_bias,
+            down_proj_bias,
+        )
+        if torch.is_grad_enabled():
+            chunk_output = torch_checkpoint.checkpoint(run_chunk, *args, use_reentrant=False)
+        else:
+            chunk_output = run_chunk(*args)
+        output[chunk_start:chunk_end] = chunk_output
+    return output
+
+
 class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
@@ -961,6 +1457,21 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.dispatcher_hybridep_permute_fusion = (
+            backend.dispatcher_hybridep_permute_fusion if backend is not None else False
+        )
+        self.dispatcher_hybridep_compact_routing = (
+            backend.dispatcher_hybridep_compact_routing if backend is not None else False
+        )
+        self.dispatcher_hybridep_num_sms_preprocessing = (
+            backend.dispatcher_hybridep_num_sms_preprocessing if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_permute = (
+            backend.dispatcher_hybridep_num_blocks_permute if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_unpermute = (
+            backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
+        )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -994,6 +1505,11 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_hybridep_permute_fusion=self.dispatcher_hybridep_permute_fusion,
+            moe_hybridep_compact_routing=self.dispatcher_hybridep_compact_routing,
+            moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
+            moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
+            moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -1019,6 +1535,38 @@ class GroupedExpertsDeepEP(nn.Module):
 
         dtype_size = max(torch.empty((), dtype=self.config.dtype).element_size(), 2)
         get_buffer(ep_group, self.config.expert_dim * dtype_size)
+
+    def _dispatch_tokens(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dispatch valid tokens and stabilize empty probabilities for recomputation.
+
+        Args:
+            x: Tensor of shape [local_tokens, hidden], containing local activations.
+            token_mask: Tensor of shape [local_tokens], marking valid tokens.
+            weights: Tensor of shape [local_tokens, topk], containing routing probabilities.
+            indices: Tensor of shape [local_tokens, topk], containing global expert IDs.
+
+        Returns:
+            Expert-sorted activations [dispatched_tokens, hidden], counts [local_experts],
+            and probabilities [dispatched_tokens, 1]. Nonempty probabilities retain the
+            dispatcher's dtype and autograd connection; empty probabilities use the
+            configured compute dtype.
+        """
+        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
+            hidden_states=x,
+            num_local_tokens=x.size(0),
+            token_probs=weights,
+            token_indices=indices,
+        )
+        permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, self.config.dtype)
+        permuted_probs = permuted_probs.unsqueeze(-1)
+        return permuted_local_hidden_states, tokens_per_expert, permuted_probs
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
         """Return dispatcher-owned resources that must be ready before a PP step.
@@ -1063,15 +1611,9 @@ class GroupedExpertsDeepEP(nn.Module):
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
 
-        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
-            hidden_states=x,
-            num_local_tokens=x.size(0),
-            token_probs=weights,
-            token_indices=indices,
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
+            x, token_mask, weights, indices
         )
-        permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, self.config.dtype)
-        permuted_probs = permuted_probs.unsqueeze(-1)
         activation_probs = (
             torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
         )
@@ -1088,10 +1630,32 @@ class GroupedExpertsDeepEP(nn.Module):
         # With static routing (forced balance, no noise) every expert receives tokens by
         # construction, so the count_nonzero device-to-host read (one per microbatch, and
         # again per activation-checkpoint recompute) can be skipped.
+        router_weight_already_applied = False
         if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
+            gate_up_output_bytes = (
+                permuted_local_hidden_states.shape[0]
+                * gate_and_up_projs.shape[-1]
+                * permuted_local_hidden_states.element_size()
+            )
 
-            if self.expert_bias:
+            # Retain bounded MLP recomputation for biased experts. Bias-free
+            # dispatches use whole grouped GEMMs: small row chunks introduce
+            # expensive gradient copies and redundant activation recomputation.
+            if self.expert_bias and not self.use_mxfp8 and gate_up_output_bytes > _EXPERT_MLP_CHUNK_BYTES:
+                output2 = _checkpointed_chunked_expert_mlp(
+                    permuted_local_hidden_states,
+                    gate_and_up_projs,
+                    down_projs,
+                    self.gate_up_proj_bias.to_local(),
+                    self.down_proj_bias.to_local(),
+                    tokens_per_expert_gpu,
+                    permuted_probs,
+                    self.expert_activation,
+                    self.config.apply_router_weight_after_down,
+                )
+                router_weight_already_applied = self.config.apply_router_weight_after_down
+            elif self.expert_bias:
                 # torch._grouped_mm does not support bias yet (raises
                 # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
                 # Apply bias manually after each grouped GEMM via _apply_bias.
@@ -1105,6 +1669,7 @@ class GroupedExpertsDeepEP(nn.Module):
                 # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
                 # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
                 # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
+                # Selective checkpointing can cache GEMM outputs for recomputation.
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation(output1, activation_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
@@ -1130,7 +1695,7 @@ class GroupedExpertsDeepEP(nn.Module):
             output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
 
-        if self.config.apply_router_weight_after_down:
+        if self.config.apply_router_weight_after_down and not router_weight_already_applied:
             # HybridEP/DeepEP combine expects the expert activation dtype. Keep
             # the multiply in fp32, then cast each routed expert output back.
             # Chunked custom-autograd path: saves the raw inputs only, instead
@@ -1241,6 +1806,21 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.dispatcher_hybridep_permute_fusion = (
+            backend.dispatcher_hybridep_permute_fusion if backend is not None else False
+        )
+        self.dispatcher_hybridep_compact_routing = (
+            backend.dispatcher_hybridep_compact_routing if backend is not None else False
+        )
+        self.dispatcher_hybridep_num_sms_preprocessing = (
+            backend.dispatcher_hybridep_num_sms_preprocessing if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_permute = (
+            backend.dispatcher_hybridep_num_blocks_permute if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_unpermute = (
+            backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
+        )
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
         # Non-gated (ReLU²): out_features = moe_inter_dim
@@ -1551,6 +2131,11 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_hybridep_permute_fusion=self.dispatcher_hybridep_permute_fusion,
+            moe_hybridep_compact_routing=self.dispatcher_hybridep_compact_routing,
+            moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
+            moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
+            moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -1694,6 +2279,11 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
             return tensor.to_local()
         else:
             return tensor
+
+    # mxfp4-resident experts hold packed base weights (no gate_and_up_projs /
+    # down_projs); those are filled from the checkpoint, nothing to init here.
+    if getattr(module, "_mxfp4_resident", False):
+        return
 
     with torch.device(buffer_device):
         if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP)):

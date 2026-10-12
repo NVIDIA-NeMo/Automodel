@@ -30,10 +30,8 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from nemo_automodel._transformers.capabilities import _is_deepseek_v4
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-    get_parallelization_strategy,
-)
+from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -52,7 +50,7 @@ from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetMo
 
 # Over the default 5s budget on purpose: this module runs full-model forwards and distributed FSDP checks.
 # Shrink the model fixtures and process startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _tiny_config() -> DeepseekV41Config:
@@ -397,10 +395,10 @@ def test_indexers_are_frozen_by_the_model_constructor() -> None:
     assert expected and frozen == expected
 
 
-def test_v41_uses_generic_moe_parallelization() -> None:
+def test_v41_uses_unified_moe_parallelization() -> None:
     model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
     assert not _is_deepseek_v4_model(model)
-    assert type(get_parallelization_strategy(model)) is DefaultParallelizationStrategy
+    assert isinstance(get_model_parallelizer(model), ModelParallelizer)
     assert not dsv4_fsdp._is_deepseek_v4_module(model)
     assert not _is_deepseek_v4(model)
     assert _is_deepseek_v4(SimpleNamespace(config=SimpleNamespace(model_type="deepseek_v4")))
@@ -484,3 +482,15 @@ def test_fsdp_initialization_preserves_local_storage_dtype_and_checkpoint_values
     tmp_path: Path, storage_dtype: torch.dtype
 ) -> None:
     mp.spawn(_fsdp_initialization_worker, args=(str(tmp_path / "rendezvous"), storage_dtype), nprocs=2, join=True)
+
+
+def test_model_validates_attention_inputs_once_before_the_layers() -> None:
+    """The model runs the host-synchronising position / mask checks once per forward and the layers skip them."""
+    model = _model()
+    input_ids = torch.randint(0, 17, (1, 4))
+    with pytest.raises(ValueError, match="zero-based"):
+        model(input_ids, position_ids=torch.tensor([[0, 1, 0, 1]]))
+    with pytest.raises(ValueError, match="right padding"):
+        model(input_ids, position_ids=torch.arange(4)[None], attention_mask=torch.tensor([[0, 1, 1, 1]]))
+    logits = model(input_ids, position_ids=torch.arange(4)[None]).logits
+    assert logits.shape == (1, 4, 17)

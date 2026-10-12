@@ -1038,3 +1038,125 @@ def test_load_state_dict_partial_wd_info(dummy_optimizer, caplog):
     assert scheduler.end_wd == 0.1
     assert scheduler.wd_incr_steps == 500
     assert scheduler.wd_incr_style == "linear"
+
+
+def _optimizer_with_own_group_values():
+    """AdamW whose second and third groups carry their own lr / weight_decay, as the Dion and retrieval builders do."""
+    base, no_decay, head = (torch.nn.Parameter(torch.zeros(2)) for _ in range(3))
+    return torch.optim.AdamW(
+        [
+            {"params": [base]},
+            {"params": [no_decay], "weight_decay": 0.0},
+            {"params": [head], "lr": 1e-2, "weight_decay": 0.0},
+        ],
+        lr=1e-3,
+        weight_decay=0.1,
+    )
+
+
+def _cosine_scheduler(optimizer):
+    # max_lr deliberately differs from the optimizer's lr: every group scales with the schedule, not to its raw lr.
+    return OptimizerParamScheduler(
+        optimizer=optimizer,
+        init_lr=1e-4,
+        max_lr=2e-3,
+        min_lr=1e-5,
+        lr_warmup_steps=10,
+        lr_decay_steps=100,
+        lr_decay_style="cosine",
+        start_wd=0.1,
+        end_wd=0.1,
+        wd_incr_steps=100,
+        wd_incr_style="constant",
+    )
+
+
+@pytest.mark.parametrize("num_steps", [0, 5, 50, 150])
+def test_step_keeps_each_group_lr_and_weight_decay_relative_to_group_0(num_steps):
+    optimizer = _optimizer_with_own_group_values()
+    scheduler = _cosine_scheduler(optimizer)
+    scheduler.step(num_steps)
+    base, no_decay, head = optimizer.param_groups
+
+    assert base["lr"] == scheduler.get_lr(base)
+    assert base["weight_decay"] == pytest.approx(0.1)
+    assert no_decay["weight_decay"] == 0.0
+    assert no_decay["lr"] == base["lr"]
+    assert head["lr"] == pytest.approx(10 * base["lr"])
+    assert head["weight_decay"] == 0.0
+
+
+def test_groups_with_explicit_scheduler_keys_keep_their_scaling():
+    base, scaled, peaked, floored = (torch.nn.Parameter(torch.zeros(2)) for _ in range(4))
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [base]},
+            # lr_mult / wd_mult alone scale this group; its own lr and weight_decay are not applied on top.
+            {"params": [scaled], "lr": 5e-3, "weight_decay": 0.0, "lr_mult": 2.0, "wd_mult": 0.5},
+            # A per-group max_lr is already this group's peak.
+            {"params": [peaked], "lr": 4e-3, "max_lr": 4e-3},
+            # A per-group min_lr alone also opts the group out of the ratio.
+            {"params": [floored], "lr": 4e-3, "min_lr": 1e-6},
+        ],
+        lr=1e-3,
+        weight_decay=0.1,
+    )
+    scheduler = _cosine_scheduler(optimizer)
+    scheduler.step(50)
+    _, scaled_group, peaked_group, floored_group = optimizer.param_groups
+
+    assert scaled_group["lr"] == pytest.approx(2.0 * scheduler.get_lr(scaled_group))
+    assert scaled_group["weight_decay"] == pytest.approx(0.5 * 0.1)
+    assert peaked_group["lr"] == pytest.approx(scheduler.get_lr(peaked_group))
+    assert floored_group["lr"] == pytest.approx(scheduler.get_lr(floored_group))
+
+
+@pytest.mark.parametrize("group_0_lr", [0.0, None], ids=["zero", "none"])
+def test_group_0_without_a_usable_lr_gives_every_group_the_base_schedule(group_0_lr):
+    first, second = (torch.nn.Parameter(torch.zeros(2)) for _ in range(2))
+    optimizer = torch.optim.AdamW([{"params": [first]}, {"params": [second], "lr": 5e-3}], lr=1e-3, weight_decay=0.1)
+    # A zero lr cannot anchor a ratio, and relative-step Adafactor leaves lr as None.
+    optimizer.param_groups[0]["lr"] = group_0_lr
+    scheduler = _cosine_scheduler(optimizer)
+    scheduler.step(50)
+
+    assert [g["lr"] for g in optimizer.param_groups] == [scheduler.get_lr(g) for g in optimizer.param_groups]
+
+
+def test_group_added_after_construction_follows_the_base_schedule():
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(2))], lr=1e-3, weight_decay=0.1)
+    scheduler = _cosine_scheduler(optimizer)
+    optimizer.add_param_group({"params": [torch.nn.Parameter(torch.zeros(2))], "lr": 5e-3, "weight_decay": 0.0})
+    scheduler.step(50)
+    late_group = optimizer.param_groups[1]
+
+    assert late_group["lr"] == scheduler.get_lr(late_group)
+    assert late_group["weight_decay"] == scheduler.get_wd()
+
+
+def test_group_mults_are_stored_in_the_param_groups():
+    optimizer = _optimizer_with_own_group_values()
+    _cosine_scheduler(optimizer)
+
+    # Stored in the param groups, the multipliers are saved with the optimizer and restored on resume.
+    assert [g["lr_mult"] for g in optimizer.param_groups] == pytest.approx([1.0, 1.0, 10.0])
+    assert [g["wd_mult"] for g in optimizer.param_groups] == pytest.approx([1.0, 0.0, 0.0])
+
+
+def test_restored_group_mults_win_over_the_resumed_config():
+    optimizer = _optimizer_with_own_group_values()
+    scheduler = _cosine_scheduler(optimizer)
+    scheduler.step(50)
+    saved_optimizer, saved_scheduler = optimizer.state_dict(), scheduler.state_dict()
+
+    # The resumed run doubles group 0's lr, which alone would halve the derived head multiplier.
+    resumed = _optimizer_with_own_group_values()
+    resumed.param_groups[0]["lr"] = 2e-3
+    resumed_scheduler = _cosine_scheduler(resumed)
+    resumed.load_state_dict(saved_optimizer)
+    resumed_scheduler.load_state_dict(saved_scheduler)
+
+    assert [g["lr"] for g in resumed.param_groups] == pytest.approx([g["lr"] for g in optimizer.param_groups])
+    assert [g["weight_decay"] for g in resumed.param_groups] == pytest.approx(
+        [g["weight_decay"] for g in optimizer.param_groups]
+    )

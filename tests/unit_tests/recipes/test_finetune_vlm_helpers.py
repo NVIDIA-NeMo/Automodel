@@ -31,6 +31,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
 )
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
@@ -43,6 +44,7 @@ from nemo_automodel.recipes._typed_config import (
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
     _get_model_name,
+    _maybe_downgrade_loss_fn,
     build_model,
 )
 
@@ -1610,6 +1612,171 @@ def _prepare_pp_vlm_batch(batch, n_microbatches=2):
     )
 
 
+class _StageWithLogitsToKeep(nn.Module):
+    def forward(self, input_ids=None, logits_to_keep=0, **kwargs):
+        return None
+
+
+class _StageNoLogitsToKeep(nn.Module):
+    def forward(self, input_ids=None, **kwargs):
+        return None
+
+
+@pytest.mark.parametrize(
+    "has_logits_to_keep, has_marker, pp_enabled, expect_fused",
+    [
+        (True, True, True, True),  # PP generic patched forward -> fused CE kept
+        (False, True, True, False),  # PP, no logits_to_keep -> fall back
+        (True, False, True, False),  # PP, logits_to_keep but no hidden-states marker (MoE/custom) -> fall back
+        (True, False, False, True),  # non-PP: the hidden-states marker gate does not apply -> fused CE kept
+    ],
+)
+def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, expect_fused):
+    """FusedLinearCrossEntropy survives only when the probed stage module supports
+    logits_to_keep and (under PP) advertises hidden-states emission via
+    _pp_return_hidden_states_supported; otherwise it downgrades to MaskedCrossEntropy."""
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.recipes.vlm.finetune import _maybe_downgrade_loss_fn
+
+    probe = (_StageWithLogitsToKeep if has_logits_to_keep else _StageNoLogitsToKeep)()
+    if has_marker:
+        probe._pp_return_hidden_states_supported = True  # set by patch_hf_model_for_pp on the generic forward
+
+    result = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(ignore_index=0), probe, pp_enabled=pp_enabled)
+
+    assert isinstance(result, FusedLinearCrossEntropy) is expect_fused
+    if not expect_fused:
+        assert isinstance(result, MaskedCrossEntropy)
+        assert result.ignore_index == 0
+
+
+def test_vlm_maybe_downgrade_keeps_masked_ce_object():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    loss_fn = MaskedCrossEntropy()
+    assert _maybe_downgrade_loss_fn(loss_fn, _StageNoLogitsToKeep(), pp_enabled=True) is loss_fn
+
+
+def test_vlm_maybe_downgrade_pp_fallback_preserves_reduction_and_warns(caplog):
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    with caplog.at_level("WARNING"):
+        result = _maybe_downgrade_loss_fn(
+            FusedLinearCrossEntropy(ignore_index=-7, reduction="mean"), _StageWithLogitsToKeep(), pp_enabled=True
+        )
+
+    assert isinstance(result, MaskedCrossEntropy)
+    assert result.ignore_index == -7
+    assert result.reduction == "mean"
+    assert "not supported under pipeline parallelism" in caplog.text
+
+
+class _StageWithDynamicHiddenStateSupport(_StageWithLogitsToKeep):
+    def __init__(self, supported):
+        super().__init__()
+        self._supported = supported
+
+    @property
+    def _pp_return_hidden_states_supported(self):
+        return self._supported
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_vlm_maybe_downgrade_reads_class_level_marker(supported):
+    """Models declare support as a class attribute or property (e.g. Qwen3.5-MoE without MTP)."""
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    result = _maybe_downgrade_loss_fn(
+        FusedLinearCrossEntropy(), _StageWithDynamicHiddenStateSupport(supported), pp_enabled=True
+    )
+
+    assert isinstance(result, FusedLinearCrossEntropy) is supported
+
+
+@pytest.mark.parametrize("pp_enabled", [False, True])
+def test_chunked_ce_never_silently_falls_back_to_full_logits(pp_enabled):
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+    probe = _StageWithLogitsToKeep() if pp_enabled else _StageNoLogitsToKeep()
+    with pytest.raises(ValueError, match="ChunkedCrossEntropy requires"):
+        _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), probe, pp_enabled)
+
+
+def test_configure_pipeline_fused_ce_requests_hidden_states():
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    first_stage_model = nn.Linear(2, 2)
+    last_stage_model = nn.Linear(2, 2)
+    recipe = _create_pp_recipe(first_stage_model)
+    recipe.__dict__["model_parts"] = [first_stage_model, last_stage_model]
+    recipe.__dict__["loss_fn"] = FusedLinearCrossEntropy()
+    pipeline_loss = object()
+    build_loss = MagicMock(return_value=pipeline_loss)
+    recipe.__dict__["cfg"] = SimpleNamespace(mtp=SimpleNamespace(build=build_loss))
+    reduce_group = object()
+    recipe.__dict__["_get_dp_group"] = lambda include_cp=True: reduce_group
+    pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True)
+    pp.info.stages = [SimpleNamespace(is_last=False), SimpleNamespace(is_last=True)]
+    recipe.__dict__["pp"] = pp
+
+    recipe._configure_pipeline_loss_fn()
+
+    assert not hasattr(first_stage_model, "_pp_return_hidden_states")
+    assert last_stage_model._pp_return_hidden_states is True
+    assert pp.info.schedule._loss_fn is pipeline_loss
+    build_loss.assert_called_once_with(
+        recipe.loss_fn,
+        last_stage_model,
+        grad_reduce_group=reduce_group,
+    )
+
+
+def test_configure_pipeline_chunked_ce_requests_hidden_states():
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+    last_stage_model = nn.Linear(2, 2)
+    recipe = _create_pp_recipe(last_stage_model)
+    recipe.__dict__["model_parts"] = [last_stage_model]
+    recipe.__dict__["loss_fn"] = ChunkedCrossEntropy(compile=False)
+    recipe.__dict__["cfg"] = SimpleNamespace(mtp=SimpleNamespace(build=MagicMock(return_value=object())))
+    recipe.__dict__["_get_dp_group"] = lambda include_cp=True: object()
+    pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True)
+    pp.info.stages = [SimpleNamespace(is_last=True)]
+    recipe.__dict__["pp"] = pp
+
+    recipe._configure_pipeline_loss_fn()
+
+    assert last_stage_model._pp_return_hidden_states is True
+
+
+def test_configure_pipeline_masked_ce_keeps_logits_output():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    last_stage_model = nn.Linear(2, 2)
+    recipe = _create_pp_recipe(last_stage_model)
+    recipe.__dict__["model_parts"] = [last_stage_model]
+    recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
+    pipeline_loss = object()
+    build_loss = MagicMock(return_value=pipeline_loss)
+    recipe.__dict__["cfg"] = SimpleNamespace(mtp=SimpleNamespace(build=build_loss))
+    reduce_group = object()
+    recipe.__dict__["_get_dp_group"] = lambda include_cp=True: reduce_group
+    pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True)
+    pp.info.stages = [SimpleNamespace(is_last=True)]
+    recipe.__dict__["pp"] = pp
+
+    recipe._configure_pipeline_loss_fn()
+
+    assert not hasattr(last_stage_model, "_pp_return_hidden_states")
+    assert pp.info.schedule._loss_fn is pipeline_loss
+    build_loss.assert_called_once_with(
+        recipe.loss_fn,
+        last_stage_model,
+        grad_reduce_group=reduce_group,
+    )
+
+
 class TestForwardBackwardStepPP:
     """Tests for _forward_backward_step with pipeline parallelism enabled."""
 
@@ -2901,7 +3068,6 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     )
     loader_config = SimpleNamespace(
         packing=None,
-        resolve_packing_attn_implementation=lambda **kwargs: None,
         build=lambda **kwargs: SimpleNamespace(dataloader="dl", processor="proc"),
     )
     monkeypatch.setattr(
@@ -3471,24 +3637,37 @@ def _patches_for_packing(neat_pack_side_effect):
     processor = MagicMock()
     processor.tokenizer.pad_token_id = 0
     processor.chat_template = "{{ x }}"
-    return processor, [
-        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
-        patch("torch.utils.data.distributed.DistributedSampler"),
-        patch(
-            "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
-            return_value=MagicMock(),
-        ),
-        patch(
-            "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
-            side_effect=neat_pack_side_effect,
-        ),
-        patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", return_value=MagicMock()),
-        patch("nemo_automodel.components.models.common.packing.configure_packing"),
-        patch(
-            "nemo_automodel.components.models.common.packing.get_attn_implementation",
-            return_value="sdpa",
-        ),
-    ]
+    packing_contract = SimpleNamespace(
+        packed_mask_type="document_ids",
+        requires_packed_sequence_metadata=True,
+    )
+    stateful_dataloader = MagicMock(return_value=MagicMock())
+    return (
+        processor,
+        packing_contract,
+        stateful_dataloader,
+        [
+            patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
+            patch("torch.utils.data.distributed.DistributedSampler"),
+            patch(
+                "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
+                side_effect=neat_pack_side_effect,
+            ),
+            patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", stateful_dataloader),
+            patch(
+                "nemo_automodel.components.models.common.packing.configure_packing",
+                return_value=packing_contract,
+            ),
+            patch(
+                "nemo_automodel.components.models.common.packing.get_model_attn_implementation",
+                return_value="sdpa",
+            ),
+        ],
+    )
 
 
 def test_build_dataloader_forwards_get_rope_index_to_packing():
@@ -3504,7 +3683,7 @@ def test_build_dataloader_forwards_get_rope_index_to_packing():
         captured.update(kwargs)
         return MagicMock()
 
-    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+    _, _, _, ctx_managers = _patches_for_packing(fake_neat_pack)
 
     with ExitStack() as stack:
         for cm in ctx_managers:
@@ -3519,6 +3698,7 @@ def test_build_dataloader_forwards_get_rope_index_to_packing():
             1,
             cfg_ps=_make_packing_cfg(pack_size=64),
             get_rope_index=sentinel,
+            model=object(),
         )
 
     assert captured.get("get_rope_index") is sentinel, (
@@ -3538,7 +3718,7 @@ def test_build_dataloader_default_get_rope_index_is_none():
         captured.update(kwargs)
         return MagicMock()
 
-    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+    _, _, _, ctx_managers = _patches_for_packing(fake_neat_pack)
 
     with ExitStack() as stack:
         for cm in ctx_managers:
@@ -3552,10 +3732,61 @@ def test_build_dataloader_default_get_rope_index_is_none():
             42,
             1,
             cfg_ps=_make_packing_cfg(pack_size=64),
+            model=object(),
         )
 
     assert "get_rope_index" in captured, "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
     assert captured["get_rope_index"] is None
+
+
+def test_build_dataloader_forwards_structural_packing_contract_to_collator():
+    """The recipe forwards configure_packing's structural result without a backend string."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    _, packing_contract, stateful_dataloader, ctx_managers = _patches_for_packing(lambda *args, **kwargs: [{}])
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        build_dataloader(
+            _make_dataset_cfg(),
+            _vlm_dataloader_cfg(),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+            model=object(),
+        )
+
+    collate_fn = stateful_dataloader.call_args.kwargs["collate_fn"]
+    assert collate_fn.keywords["packing"] is packing_contract
+    assert "attn_implementation" not in collate_fn.keywords
+
+
+def test_deprecated_build_dataloader_requires_model_for_packing():
+    """The legacy helper must not silently invent a backend-only data contract."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    _, _, _, ctx_managers = _patches_for_packing(lambda *args, **kwargs: [{}])
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        with pytest.raises(ValueError, match="require the built model"):
+            build_dataloader(
+                _make_dataset_cfg(),
+                _vlm_dataloader_cfg(),
+                "test/model",
+                None,
+                None,
+                42,
+                1,
+                cfg_ps=_make_packing_cfg(pack_size=64),
+            )
 
 
 def _run_build_dataloader_capturing_wrapper(dataset_cfg):
@@ -3565,7 +3796,7 @@ def _run_build_dataloader_capturing_wrapper(dataset_cfg):
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
     wrapper_mock = MagicMock(return_value=MagicMock())
-    _, ctx_managers = _patches_for_packing(lambda *a, **k: MagicMock())
+    _, _, _, ctx_managers = _patches_for_packing(lambda *a, **k: MagicMock())
 
     with ExitStack() as stack:
         for cm in ctx_managers:
@@ -3586,6 +3817,7 @@ def _run_build_dataloader_capturing_wrapper(dataset_cfg):
             42,
             1,
             cfg_ps=_make_packing_cfg(pack_size=64),
+            model=object(),
         )
     return wrapper_mock
 

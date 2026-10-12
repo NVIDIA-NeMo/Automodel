@@ -19,11 +19,13 @@ import random
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, List, Tuple, Union
 
 from datasets import Dataset, concatenate_datasets, load_dataset
 from huggingface_hub import HfApi, hf_hub_download
+from PIL import Image
 
 EXAMPLE_TEMPLATE = {"text": "", "image": "", "nr_ocr": ""}
 
@@ -685,9 +687,13 @@ def _transform_func(
             cur_pos_neg_text.append(text)
 
             # Extract image
-            if cur_doc["image"] != "":
-                cur_doc["image"] = cur_doc["image"].convert("RGB")
-            cur_pos_neg_image.append(cur_doc["image"])
+            image = cur_doc["image"]
+            if isinstance(image, (bytes, bytearray, memoryview)):
+                with Image.open(BytesIO(bytes(image))) as encoded_image:
+                    image = encoded_image.convert("RGB")
+            elif image != "":
+                image = image.convert("RGB")
+            cur_pos_neg_image.append(image)
 
         cur_pos_neg_text_batch.append(cur_pos_neg_text)
         cur_pos_neg_image_batch.append(cur_pos_neg_image)

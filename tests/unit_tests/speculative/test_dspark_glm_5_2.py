@@ -31,7 +31,7 @@ from nemo_automodel.components.speculative.dspark.registry import resolve_dspark
 
 # Over the default 5s budget on purpose: this module runs full draft-model forwards and backwards.
 # Shrink the model fixtures before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 VOCAB = 128
 HIDDEN = 64

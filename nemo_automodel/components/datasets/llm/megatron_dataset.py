@@ -19,11 +19,9 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from importlib.util import find_spec
 from pathlib import Path
 from typing import ClassVar, Dict, List, Union
 
-import torch.distributed as dist
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
@@ -210,19 +208,7 @@ class MegatronPretraining:
                 reading .bin/.idx files from S3/MSC. A dict with ``path_to_idx_cache`` (required)
                 and ``bin_chunk_nbytes`` (optional, default 256 MiB) is also accepted.
         """
-        if find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is None:
-            try:
-                if dist.is_available() and dist.is_initialized():
-                    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
-                        compile_helper()
-                    dist.barrier()
-                else:
-                    compile_helper()
-                assert find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is not None
-            except AssertionError:
-                raise ImportError(
-                    "Could not compile megatron dataset C++ helper functions and therefore cannot import helpers python file."
-                )
+        compile_helper()
 
         # Normalise object_storage_config: accept plain dict from YAML
         if isinstance(object_storage_config, dict):
