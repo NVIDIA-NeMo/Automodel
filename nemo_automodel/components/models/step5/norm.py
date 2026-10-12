@@ -62,6 +62,31 @@ def _activation_rms_norm(
     return _rms_norm_with_rstd(hidden, weight, eps, output_dtype)
 
 
+@torch.compile(
+    fullgraph=True,
+    dynamic=True,
+    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+)
+def _grouped_rms_norm(
+    hidden: torch.Tensor, weight: torch.Tensor, eps: float, output_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize grouped query rows without copying interleaved QKV gaps.
+
+    Args:
+        hidden: Query tensor [token_groups, heads_per_group, channels], where
+            token_groups flattens batch, sequence and KV group. The outer stride
+            includes the interleaved K/V rows, and channels has unit stride.
+        weight: FP32 additive scale [channels].
+        eps: Additive variance epsilon.
+        output_dtype: Final normalized activation dtype.
+
+    Returns:
+        Normalized query [token_groups, heads_per_group, channels] and FP32
+        inverse RMS [token_groups, heads_per_group, 1]. Neither aliases input.
+    """
+    return _rms_norm_with_rstd(hidden, weight, eps, output_dtype)
+
+
 class Step5RMSNorm(Step3p5RMSNorm):
     """Fuse the main-stream norm while retaining FP32 additive scale parameters.
 
@@ -82,8 +107,10 @@ class Step5RMSNorm(Step3p5RMSNorm):
         """Normalize [..., hidden_size] before the optional projection-input cast.
 
         Args:
-            hidden: Activations with the normalized feature axis last. Decoder
-                residual inputs remain FP32 through normalization.
+            hidden: Activations [..., hidden_size] with arbitrary leading axes.
+                Grouped queries use [batch, sequence, groups, heads_per_group,
+                hidden_size] and may be a strided slice of interleaved QKV.
+                Decoder residual inputs remain FP32 through normalization.
             output_dtype: Final output dtype; defaults to the input dtype.
 
         Returns:
@@ -92,6 +119,12 @@ class Step5RMSNorm(Step3p5RMSNorm):
         """
         dtype = hidden.dtype if output_dtype is None else output_dtype
         if self.compile_norm and hidden.is_cuda:
+            if hidden.ndim == 5:
+                # Preserve each contiguous run of query heads. Flattening all
+                # rows would copy across the interleaved K/V gap in each group.
+                rows = hidden.reshape(-1, hidden.shape[-2], hidden.shape[-1])
+                output, _ = _grouped_rms_norm(rows, self.weight, self.variance_epsilon, dtype)
+                return output.reshape(hidden.shape)
             # Normalize the leading layout so decoder, Q/K, and final norms
             # share a compiled rank. Interleaved key projections stay strided
             # views: only the normalized feature axis must remain last.

@@ -227,9 +227,12 @@ class Step5Attention(nn.Module):
         groups, heads, dim = self.num_kv_heads, self.heads_per_group, self.head_dim
         # Interleaved group layout: [group, query_heads + key_head + value_head, dim].
         qkv = self.qkv_proj(hidden).view(batch, sequence, groups, heads + 2, dim)
-        query = qkv[:, :, :, :heads].reshape(batch, sequence, self.num_heads, dim)
+        query = qkv[:, :, :, :heads]
         key, value = qkv[:, :, :, heads], qkv[:, :, :, heads + 1]
-        query, key = self.rotary_emb.forward_pair(self.q_norm(query), self.k_norm(key), positions)
+        # Preserve the QKV slice through normalization; merging group/head axes
+        # beforehand would materialize the otherwise strided query input.
+        query = self.q_norm(query).flatten(2, 3)
+        query, key = self.rotary_emb.forward_pair(query, self.k_norm(key), positions)
         query_start = 0 if self.cp_group is None else dist.get_rank(self.cp_group) * sequence
         key_positions, key_padding = global_positions, global_padding
         if self.cp_group is not None:
