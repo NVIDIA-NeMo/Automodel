@@ -109,6 +109,10 @@ class CheckpointingConfig:
     is_async: bool = False
     wait_for_staging: bool = False  # block on async staging before freeing memory; no effect unless is_async
     cpu_offload: bool = False  # If True, move DCP model and optimizer state dict tensors to CPU before saving.
+    # If False, skip writing optimizer and LR-scheduler state at every checkpoint (model weights are still
+    # saved). Cuts checkpoint time/IO for large optimizers, at the cost of being unable to resume training
+    # from that checkpoint with full fidelity.
+    save_optimizer: bool = True
     # Permit pickle-based loading of legacy training state. Enable only for checkpoints from a trusted source.
     allow_legacy_pickle_restore: bool = False
     # None or True permits dequantization when the source model config declares quantized weights; False disables it.

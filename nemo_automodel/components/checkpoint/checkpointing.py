@@ -845,6 +845,10 @@ class Checkpointer:
         """
         Load optimizer (and optional scheduler) state from `weights_path/optim` using DCP.
 
+        If the checkpoint was written with `checkpoint.save_optimizer=False`, the `optim`
+        subdirectory does not exist; this is not an error, the optimizer and scheduler are
+        left at their freshly-constructed state and a warning is logged.
+
         Args:
             optimizer: Optimizer or per-model-part optimizers to populate.
             model: Model or pipeline model parts providing partitioning context.
@@ -853,6 +857,15 @@ class Checkpointer:
             optimizer_part_ids: Global pipeline-stage indices corresponding to
                 per-model-part optimizers.
         """
+        optimizer_path = os.path.join(weights_path, "optim")
+        if not os.path.exists(optimizer_path):
+            logger.warning(
+                "No optimizer state found at %s (checkpoint.save_optimizer was False when this "
+                "checkpoint was written). Resuming with a freshly-initialized optimizer/scheduler.",
+                optimizer_path,
+            )
+            return
+
         optimizer_state = OptimizerState(
             model,
             optimizer,
@@ -863,7 +876,7 @@ class Checkpointer:
             optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
-        self._do_load(state_dict, os.path.join(weights_path, "optim"))
+        self._do_load(state_dict, optimizer_path)
         optimizer_state.load_state_dict(state_dict)
 
     def _load_model_in_parts(
