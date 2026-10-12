@@ -165,6 +165,18 @@ def _packing_kwargs(batch: dict) -> dict:
     }
 
 
+def _validate_draft_packing(draft_model: torch.nn.Module) -> None:
+    """Reject sequence packing for a draft whose forward ignores the packing metadata.
+
+    Such a draft would silently let anchors cross document boundaries.
+    """
+    if not getattr(draft_model, "supports_sequence_packing", False):
+        raise NotImplementedError(
+            f"Sequence packing (packed_sequence_size>0) is not supported by the "
+            f"{type(draft_model).__name__} DSpark draft."
+        )
+
+
 def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
     """Reject sequence-packing configs the DSpark path cannot honor (fail fast at setup).
 
@@ -1089,13 +1101,8 @@ class TrainDSparkRecipe(BaseRecipe):
             draft_model = draft_cls(draft_config_obj)
         self.draft_model = draft_model.to(device=self.device)
         cast_model_to_dtype(self.draft_model, self.compute_dtype)
-        if self.packed_sequence_size > 0 and type(self.draft_model).__name__ != "Qwen3DSparkModel":
-            # Only the Qwen3 draft forward threads the packing metadata so far; the
-            # other DSpark drafts would silently let anchors cross document boundaries.
-            raise NotImplementedError(
-                f"Sequence packing (packed_sequence_size>0) is only supported by the Qwen3 DSpark draft, "
-                f"not {type(self.draft_model).__name__}."
-            )
+        if self.packed_sequence_size > 0:
+            _validate_draft_packing(self.draft_model)
 
         # training only the backbone, fc, Markov head, and confidence head.
         if embed_src is None or head_src is None:

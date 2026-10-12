@@ -71,6 +71,7 @@ are reduced across data-parallel ranks and written to
 | `markov_rank` / `markov_head_type` | serial head size and variant (`vanilla` / `gated` / `rnn`) |
 | `confidence_head_alpha` / `confidence_head_with_markov` | confidence-head weight and conditioning |
 | `confidence_head_stop_gradient` | DeepSeek V4.1 only: train the confidence head on detached inputs so its loss cannot back-propagate into the draft backbone (default `false`) |
+| `packed_sequence_size` | packs documents into rows of this many tokens when greater than 0 (Qwen3, DeepSeek V4, and DeepSeek V4.1 targets; online text-only data with `cp_size: 1`) |
 
 ## DeepSeek V4.1 Flash
 
@@ -115,8 +116,17 @@ Use the production-scale
 [`deepseek_v41_flash_dspark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/dspark/deepseek_v41_flash_dspark.yaml)
 as the starting point. It uses FSDP2 for the trainable draft and the model's
 distributed EP/FSDP path for the frozen target. Pipeline parallelism, context
-parallelism, sequence packing, image inputs, and the serving-time dynamic
-verification scheduler are not part of this training path.
+parallelism, image inputs, and the serving-time dynamic verification scheduler
+are not part of this training path.
+
+Sequence packing (`packed_sequence_size`) works for both DeepSeek V4 and V4.1.
+The frozen target starts every packed document on a compression-group boundary,
+the least common multiple of its nonzero `compress_ratios` (128 for V4-Flash, 2
+for V4.1-Flash), so no compressed group or indexer score mixes documents and each
+document's features match a forward on that document alone. The draft keeps every
+block inside its anchor's document. Alignment padding lengthens the target forward
+by less than one alignment unit per document, plus one for the row; with the
+HybridEP dispatcher every rank also pads to the longest aligned row of all ranks.
 
 Supported targets include Qwen3 (dense and MoE), Gemma4, DeepSeek V4 and V4.1,
 GLM-5.2, Kimi K3, and MiniMax M3.

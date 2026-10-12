@@ -56,6 +56,11 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common.aligned_packing import (
+    PackedSequenceLayout,
+    aligned_packed_length,
+    packed_layout,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -84,7 +89,6 @@ from nemo_automodel.components.models.deepseek_v41.layers import (
     compile_hc_cores,
     compile_norm_core,
 )
-from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 from nemo_automodel.components.models.deepseek_v41.processing import (
     IMAGE,
     IMAGE_END,
@@ -664,14 +668,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 raise ValueError("Packed text requires seq_lens or prepared packed_seq_ids, without image inputs")
             if cp_group is not None and dist.get_world_size(cp_group) > 1:
                 raise ValueError("Packed CP input must pass through the model-owned ContextParallelSharder")
-            layout = packed_layout(
-                seq_lens,
-                seq_lens_padded=seq_lens_padded,
-                input_shape=tuple(input_ids.shape),
-                alignment=self._packed_alignment,
-                minimum_length=input_ids.shape[1],
-            )
-            input_ids = layout.pack(input_ids, fill=self.config.text_config.pad_token_id or 0)
+            layout, input_ids = self._pack_text(input_ids, seq_lens, seq_lens_padded, input_ids.shape[1])
             position_ids = layout.position_ids
             packed_seq_ids = layout.sequence_ids
             attention_mask = packed_seq_ids > 0
@@ -717,6 +714,69 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             logits=projected.logits,
             hidden_states=captured if output_hidden_states else projected.hidden_states,
         )
+
+    def _pack_text(
+        self,
+        input_ids: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_padded: torch.Tensor | None,
+        minimum_length: int,
+    ) -> tuple[PackedSequenceLayout, torch.Tensor]:
+        """Start every packed document on a compression-group boundary.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence] holding packed documents.
+            seq_lens: Real document lengths of shape [batch, documents].
+            seq_lens_padded: Optional physical document spans of shape [batch, documents].
+            minimum_length: Minimum aligned row length.
+
+        Returns:
+            The aligned layout and the input IDs moved into it, of shape [batch,
+            aligned_sequence] with padding slots filled by the pad token.
+        """
+        layout = packed_layout(
+            seq_lens,
+            seq_lens_padded=seq_lens_padded,
+            input_shape=tuple(input_ids.shape),
+            alignment=self._packed_alignment,
+            minimum_length=minimum_length,
+        )
+        return layout, layout.pack(input_ids, fill=self.config.text_config.pad_token_id or 0)
+
+    def dspark_packed_forward(self, input_ids: torch.Tensor, *, seq_lens: torch.Tensor) -> PackedSequenceLayout:
+        """Run a frozen packed forward for DSpark target-feature capture.
+
+        Documents are aligned as in the ``seq_lens`` path of ``forward``, so no
+        compressed group spans two documents. Activations captured during the
+        forward use the aligned layout, which the returned layout maps back.
+        With the HybridEP dispatcher every rank pads to the longest aligned row of
+        all ranks. DSpark reads hooked activations, so only the last position's
+        logits are projected.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence] holding packed documents.
+            seq_lens: Document lengths of shape [batch, documents]; each row sums to
+                ``sequence`` and zero entries pad the document axis.
+
+        Returns:
+            Layout whose ``restore`` maps a tensor of shape [batch, aligned_sequence, ...]
+            to [batch, sequence, ...].
+        """
+        length = aligned_packed_length(
+            seq_lens,
+            alignment=self._packed_alignment,
+            minimum_length=input_ids.shape[1],
+            sync_across_ranks=self.backend.dispatcher == "hybridep",
+        )
+        layout, packed_input_ids = self._pack_text(input_ids, seq_lens, None, length)
+        self(
+            packed_input_ids,
+            attention_mask=layout.sequence_ids > 0,
+            position_ids=layout.position_ids,
+            packed_seq_ids=layout.sequence_ids,
+            logits_to_keep=1,
+        )
+        return layout
 
     @torch.no_grad()
     def initialize_weights(

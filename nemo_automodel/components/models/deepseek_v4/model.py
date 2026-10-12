@@ -56,6 +56,11 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.aligned_packing import (
+    PackedSequenceLayout,
+    aligned_packed_length,
+    packed_layout,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -1515,6 +1520,57 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
         )
+
+    def dspark_packed_forward(self, input_ids: torch.Tensor, *, seq_lens: torch.Tensor) -> PackedSequenceLayout:
+        """Run a frozen packed forward for DSpark target-feature capture.
+
+        The THD path derives document IDs from its ``seq_lens``, so sliding-window
+        attention, compressed KV, and the indexer stay inside each document. A
+        compressed group must also start where the document's first group would
+        start on its own, so every document is moved to a compression-group
+        boundary. The alignment padding runs as its own THD segments, which keeps a
+        legal key in every query row. With the HybridEP dispatcher every rank pads
+        to the longest aligned row of all ranks. DSpark reads hooked activations, so
+        only the last position's logits are projected.
+
+        Args:
+            input_ids: Token IDs with layout ``[batch, sequence]`` holding packed documents.
+            seq_lens: Document lengths with layout ``[batch, documents]``; each row sums
+                to ``sequence`` and zero entries pad the document axis.
+
+        Returns:
+            Layout whose ``restore`` maps a tensor with layout ``[batch, aligned_sequence,
+            ...]`` back to ``[batch, sequence, ...]``.
+        """
+        ratios = self.config.compress_ratios[: self.config.num_hidden_layers]
+        alignment = math.lcm(*(int(r) for r in ratios if r))
+        length = aligned_packed_length(
+            seq_lens,
+            alignment=alignment,
+            minimum_length=input_ids.shape[1],
+            sync_across_ranks=self.backend.dispatcher == "hybridep",
+        )
+        layout = packed_layout(
+            seq_lens,
+            seq_lens_padded=None,
+            input_shape=tuple(input_ids.shape),
+            alignment=alignment,
+            minimum_length=length,
+        )
+        # THD segments of shape [batch, 2 * documents + 1]: each document, then its
+        # alignment padding, then the row's trailing padding. Empty segments are skipped.
+        lengths = seq_lens.clamp_min(0)
+        spans = (lengths + alignment - 1) // alignment * alignment
+        tail = layout.sequence_ids.shape[1] - spans.sum(-1, keepdim=True)
+        segment_lens = torch.cat((torch.stack((lengths, spans - lengths), dim=-1).flatten(1), tail), dim=1)
+        self(
+            layout.pack(input_ids, fill=self.config.pad_token_id or 0),
+            position_ids=layout.position_ids,
+            qkv_format="thd",
+            seq_lens=segment_lens,
+            logits_to_keep=1,
+        )
+        return layout
 
     def update_moe_gate_bias(self) -> None:
         self.model.update_moe_gate_bias()

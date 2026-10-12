@@ -101,6 +101,15 @@ to `tilelang` for speed **if** your TileLang build JIT-compiles the V4
 sparse/indexer/Sinkhorn kernels. Some versions fail with
 `AttributeError: '_NestedLoopCheckVisitor' object has no attribute '_inst'`.
 
+### Sequence packing
+
+Set `recipe_args.packed_sequence_size` (for example `4096`) to pack documents
+into rows of that many tokens. The frozen target starts every document on a
+128-token compression-group boundary (the least common multiple of the CSA and
+HCA ratios), so no compressed group or indexer score mixes documents, and the
+draft keeps every block inside its anchor's document. Packing needs the online
+path (no `cached_target_path`) and `cp_size: 1`.
+
 ## Validation status
 
 - **Verified**: CPU unit tests for the draft / config / registry / RoPE `inv_freq`
