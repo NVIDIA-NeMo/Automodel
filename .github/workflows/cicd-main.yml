@@ -649,7 +649,8 @@ jobs:
         with:
           test-folder: parallelism_multigpu,moe_multigpu
           gpu-count: ${{ matrix.gpu-count }}
-          timeout: 5
+          # Allow ten minutes for cold HybridEP startup plus the precision cases.
+          timeout: 15
           max-attempts: 1
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}

@@ -64,7 +64,9 @@ class GPUWorkers:
         )
         started = time.monotonic()
         try:
-            self._wait_for(directory / "ready.json", 180.0)
+            # Cold HybridEP compilation can exceed three minutes on CI runners.
+            # Keep its startup budget separate from the per-case deadline.
+            self._wait_for(directory / "ready.json", 600.0 if warmup_moe else 180.0)
         except BaseException:
             self.close()
             raise

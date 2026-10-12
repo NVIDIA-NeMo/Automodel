@@ -9,10 +9,12 @@ no model. Workers default `NCCL_NVLS_ENABLE=0`: retaining these topology groups
 can exhaust H100 multicast resources, and the tiny tensors do not benefit from
 NVLink SHARP collectives. An explicit environment setting takes precedence.
 Each case still runs production model initialization, training and
-validation. Startup is bounded at three minutes;
+validation. Startup is bounded at ten minutes when MoE kernels are warmed,
+including cold compilation after a cache miss, and three minutes otherwise;
 each individual case has a 30-second deadline and records its own timing.
-Timeouts terminate the complete worker process group. The CI jobs have a
-five-minute limit and one attempt.
+Timeouts terminate the complete worker process group. The AWS CI jobs that
+include MoE have a fifteen-minute limit; the GCP job has a five-minute limit.
+All use one attempt.
 
 | Runner | Suites | Topologies |
 | --- | --- | --- |
