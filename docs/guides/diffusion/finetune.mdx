@@ -397,7 +397,6 @@ Use the following table to select a model for your use case:
 
 - **Adapter type**: `ltx2`
 - **Dataloader**: `build_video_multiresolution_dataloader` with `model_type: ltx2`
-- **Preprocessing**: use `--processor ltx2`, an explicit `8n+1` frame count, and `--output_format pt`
 - **Preprocessing**: Use `--processor ltx2`, an explicit `8n+1` frame count, and `--output_format pt`
 - **Loss**: Applies a shared noise level to synchronized video and audio latents and adds the weighted audio loss
 - **Configs**: [full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) and [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml)
