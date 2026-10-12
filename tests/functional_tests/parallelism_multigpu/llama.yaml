@@ -1,0 +1,109 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Tiny native Llama: PP2 x TP2 on four GPUs, PP2 x TP2 x CP2 on eight.
+checkpoint:
+  checkpoint_dir: checkpoints/tiny_pp_tp_cp
+  enabled: false
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  max_sentence_len: 32
+  mean_len: 31
+  num_sentences: 64
+  seed: 42
+  std_len: 0
+  vocab_size: 128
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+distributed:
+  activation_checkpointing: false
+  autocast_dtype: bfloat16
+  cp_size: 1
+  dp_size: none
+  ep_size: 1
+  pipeline:
+    pp_microbatch_size: 1
+    pp_schedule: 1f1b
+    scale_grads_in_schedule: false
+  pp_size: 2
+  # The PP boundary here carries replicated activations. Sequence-sharded PP
+  # boundaries need separate DTensor metadata support (see README).
+  sequence_parallel: false
+  strategy: fsdp2
+  tp_size: 2
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    dispatcher: torch
+    enable_fsdp_optimizations: true
+    enable_hf_state_dict_adapter: false
+    experts: torch_mm
+    fake_balanced_gate: false
+    linear: torch
+    rms_norm: torch
+    rope_fusion: false
+  config:
+    _target_: transformers.LlamaConfig
+    architectures:
+    - LlamaForCausalLM
+    vocab_size: 128
+    hidden_size: 64
+    intermediate_size: 128
+    num_hidden_layers: 2
+    num_attention_heads: 4
+    num_key_value_heads: 2
+    head_dim: 16
+    dtype: bfloat16
+    use_cache: false
+    attention_dropout: 0.0
+    tie_word_embeddings: false
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  foreach: false
+  lr: 1e-5
+  weight_decay: 0.01
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  ranked: true
+  seed: 42
+step_scheduler:
+  ckpt_every_steps: 1000
+  global_batch_size: 2
+  local_batch_size: 2
+  max_steps: 3
+  val_every_steps: 1000
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  max_sentence_len: 32
+  mean_len: 31
+  num_sentences: 2
+  seed: 7
+  std_len: 0
+  vocab_size: 128

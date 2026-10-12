@@ -136,7 +136,7 @@ def worker_main(directory: Path, *, warmup_moe: bool = False) -> None:
 
     info = initialize_distributed("nccl")
     device = info.device
-    setups = prepare_recipe_meshes(info.world_size, device) if warmup_moe else {}
+    setups = prepare_recipe_meshes(info.world_size, device, include_moe=warmup_moe)
     if warmup_moe:
         from nemo_automodel.components.models.common import BackendConfig
         from nemo_automodel.components.moe.megatron.fused_a2a import reset_hybrid_ep_buffer

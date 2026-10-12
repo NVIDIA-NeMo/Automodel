@@ -42,42 +42,48 @@ def _mesh_key(cfg: "ConfigNode") -> tuple[int, int, int, int]:
     )
 
 
-def prepare_recipe_meshes(world_size: int, device: torch.device) -> RecipeMeshes:
-    """Create and initialize the Nemotron MoE communication groups once per GPU job."""
+def prepare_recipe_meshes(world_size: int, device: torch.device, *, include_moe: bool) -> RecipeMeshes:
+    """Create and initialize the recipe communication groups once per GPU job."""
     from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
     from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
     from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 
-    path = Path(__file__).parents[1] / "moe_multigpu/nemotron.yaml"
-    cfg = parse_args_and_load_config(argv=["--config", str(path)])
+    specs = [(Path(__file__).with_name("llama.yaml"), [2, 1], ["--distributed.cp_size", str(world_size // 4)])]
+    if include_moe:
+        specs.append(
+            (Path(__file__).parents[1] / "moe_multigpu/nemotron.yaml", list(dict.fromkeys([world_size // 2, 2, 1])), [])
+        )
     setups: RecipeMeshes = {}
     token = torch.zeros(1, device=device)
-    for degree in dict.fromkeys([world_size // 2, 2, 1]):
-        started = time.monotonic()
-        cfg.set_by_dotted("distributed.pp_size", degree)
-        setup = create_distributed_setup_from_config(cfg, world_size=world_size)
-        mesh = setup.mesh_context.device_mesh
-        groups = list(mesh.get_all_groups())
-        groups.extend(get_flat_mesh(mesh, axis).get_group() for axis in ("dp", "dp_shard_cp", "dp_cp"))
-        if setup.mesh_context.moe_mesh is not None:
-            groups.extend(setup.mesh_context.moe_mesh.get_all_groups())
-        for group in dict.fromkeys(groups):
-            if torch.distributed.get_world_size(group) > 1:
-                torch.distributed.all_reduce(token, group=group)
-        # PP uses P2P communicators as well as collectives.
-        group = mesh["pp"].get_group()
-        ranks = torch.distributed.get_process_group_ranks(group)
-        for left, right in zip(ranks, ranks[1:]):
-            if torch.distributed.get_rank() == left:
-                torch.distributed.send(token, right, group=group)
-                torch.distributed.recv(token, right, group=group)
-            elif torch.distributed.get_rank() == right:
-                torch.distributed.recv(token, left, group=group)
-                torch.distributed.send(token, left, group=group)
-        setups[_mesh_key(cfg)] = setup
-        torch.distributed.barrier()
-        if torch.distributed.get_rank() == 0:
-            print(f"Prepared recipe mesh {_mesh_key(cfg)}: {time.monotonic() - started:.2f}s", flush=True)
+    for path, degrees, overrides in specs:
+        cfg = parse_args_and_load_config(argv=["--config", str(path), *overrides])
+        for degree in degrees:
+            started = time.monotonic()
+            cfg.set_by_dotted("distributed.pp_size", degree)
+            setup = create_distributed_setup_from_config(cfg, world_size=world_size)
+            mesh = setup.mesh_context.device_mesh
+            groups = list(mesh.get_all_groups())
+            groups.extend(get_flat_mesh(mesh, axis).get_group() for axis in ("dp", "dp_shard_cp", "dp_cp"))
+            if setup.mesh_context.moe_mesh is not None:
+                groups.extend(setup.mesh_context.moe_mesh.get_all_groups())
+            for group in dict.fromkeys(groups):
+                if torch.distributed.get_world_size(group) > 1:
+                    torch.distributed.all_reduce(token, group=group)
+            # PP and TE CP use P2P communicators as well as collectives.
+            for axis in ("pp", "cp"):
+                group = mesh[axis].get_group()
+                ranks = torch.distributed.get_process_group_ranks(group)
+                for left, right in zip(ranks, ranks[1:]):
+                    if torch.distributed.get_rank() == left:
+                        torch.distributed.send(token, right, group=group)
+                        torch.distributed.recv(token, right, group=group)
+                    elif torch.distributed.get_rank() == right:
+                        torch.distributed.recv(token, left, group=group)
+                        torch.distributed.send(token, left, group=group)
+            setups[_mesh_key(cfg)] = setup
+            torch.distributed.barrier()
+            if torch.distributed.get_rank() == 0:
+                print(f"Prepared recipe mesh {_mesh_key(cfg)}: {time.monotonic() - started:.2f}s", flush=True)
     return setups
 
 
