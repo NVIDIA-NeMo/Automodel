@@ -67,6 +67,9 @@ if HAVE_TRITON:
         row_ok = row < rows
         mask = row_ok[:, None] & (col[None, :] < inter)
         x_off = row[:, None] * stride_x + col[None, :]
+        # `limit` arrives as a Python float: fp32 under eager Triton, fp64 when inductor compiles the kernel
+        # (torch.compile of the enclosing module) — cast once so the math and the stores stay fp32
+        limit = limit.to(tl.float32)
         gate = tl.load(x_ptr + x_off, mask=mask, other=0.0).to(tl.float32)
         up = tl.load(x_ptr + x_off + inter, mask=mask, other=0.0).to(tl.float32)
         probs = tl.load(probs_ptr + row, mask=row_ok, other=0.0).to(tl.float32)
@@ -95,7 +98,8 @@ if HAVE_TRITON:
         pid = tl.program_id(0)
         row = pid * BLOCK_M + tl.arange(0, BLOCK_M)
         row_ok = row < rows
-        probs = tl.load(probs_ptr + row, mask=row_ok, other=0.0).to(tl.float32)
+        limit = limit.to(tl.float32)  # see the forward kernel: fp64 under inductor otherwise, and the loop-carried
+        probs = tl.load(probs_ptr + row, mask=row_ok, other=0.0).to(tl.float32)  # `acc` would change type
         acc = tl.zeros([BLOCK_M], dtype=tl.float32)
         for start in range(0, inter, BLOCK_N):
             col = start + tl.arange(0, BLOCK_N)
@@ -108,7 +112,7 @@ if HAVE_TRITON:
             up = tl.minimum(tl.maximum(up_raw, -limit), limit)
             sig = tl.sigmoid(gate)
             silu = gate * sig
-            acc += tl.sum(grad * silu * up, axis=1)
+            acc += tl.sum(grad * silu * up, axis=1).to(tl.float32)
             weighted = grad * probs[:, None]
             d_gate = weighted * up * (sig * (1.0 + gate * (1.0 - sig)))
             d_up = weighted * silu

@@ -53,3 +53,22 @@ def test_compiled_clamped_swiglu_matches_the_eager_chain(limit):
     assert torch.all(gate.grad.float()[saturated_gate] == 0)
     assert torch.all(up.grad.float()[saturated_up] == 0)
     assert torch.any(gate.grad.float()[~saturated_gate] != 0)
+
+
+@pytest.mark.runtime_budget(
+    240, hard_timeout=600, reason="two inductor graphs (static, then symbolic rows) compile on the CPU"
+)
+def test_distinct_row_counts_recompile_once_and_never_hit_the_recompile_limit():
+    """Variable-length batches give the shared expert a new token count each step. Dynamo's default shape policy
+    compiles a static graph, then one symbolic graph that every later shape reuses; `dynamic=False` with
+    `fullgraph=True` raised `FailOnRecompileLimitHit` after `recompile_limit` distinct shapes instead."""
+    torch._dynamo.reset()
+    torch.manual_seed(5)
+    limit = getattr(torch._dynamo.config, "recompile_limit", None) or getattr(
+        torch._dynamo.config, "cache_size_limit", 8
+    )
+    for rows in range(4, 4 + int(limit) + 3):  # more distinct shapes than the limit allows recompiles
+        gate = (torch.randn(rows, 8) * 3).to(torch.bfloat16)
+        up = (torch.randn(rows, 8) * 3).to(torch.bfloat16)
+        out = _clamped_swiglu_act(gate, up, 2.0)
+        torch.testing.assert_close(out, _eager(gate, up, 2.0), rtol=0, atol=0)

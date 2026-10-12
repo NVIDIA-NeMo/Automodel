@@ -130,13 +130,15 @@ class MLP(nn.Module):
         self.apply(init_weights_fn)
 
 
-@torch.compile(fullgraph=True, dynamic=False)
+@torch.compile(fullgraph=True)
 def _clamped_swiglu_act(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
     """fp32 clamped SwiGLU on separate gate / up projections, cast back to the input dtype.
 
     Same arithmetic as the eager branch of ``MLP.forward`` (the DeepSeek-V4 reference Expert.forward); inductor
-    fuses it into one kernel per direction. Static shapes: a new token count compiles again, which the
-    benchmark's fixed shapes never trigger after warm-up; CPU inputs keep the eager chain.
+    fuses it into one kernel per direction. Dynamo's default shape policy: the first token count compiles a static
+    graph, the second recompiles once with a symbolic row count and every later shape reuses it — ``dynamic=False``
+    with ``fullgraph=True`` would instead raise ``FailOnRecompileLimitHit`` after ``recompile_limit`` distinct
+    token counts (variable-length batches). CPU inputs keep the eager chain.
     """
     gate_f = gate.float().clamp(max=limit)
     up_f = up.float().clamp(min=-limit, max=limit)

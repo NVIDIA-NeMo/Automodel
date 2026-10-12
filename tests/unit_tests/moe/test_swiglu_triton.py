@@ -14,6 +14,7 @@
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from nemo_automodel.components.moe import swiglu_triton
@@ -105,3 +106,86 @@ def test_guard_rejects_unsupported_layouts():
         assert not swiglu_triton.uses_triton_kernel(x, probs.to(torch.bfloat16))  # probs dtype
         assert not swiglu_triton.uses_triton_kernel(x, probs[:3])  # one probability per row
     assert isinstance(swiglu_triton.HAVE_TRITON, bool)
+
+
+class _Expert(nn.Module):
+    """A projection followed by the routed activation: what autocast and the compiler see in training."""
+
+    def __init__(self, act, dtype: torch.dtype, device: str, hidden: int = 32, inter: int = 48):
+        super().__init__()
+        self.w = nn.Linear(hidden, 2 * inter, bias=False, dtype=dtype, device=device)
+        self.act = act
+
+    def forward(self, x, probs):
+        return self.act(self.w(x).contiguous(), probs, 2.0)
+
+
+@requires_gpu_triton
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+def test_autocast_with_fp32_parameters_matches_the_eager_reference(input_dtype):
+    """AMP training: FP32 parameters, BF16 or FP32 activations under autocast — the Triton path must return what the
+    eager chain returns (dtype, values, gradient dtypes); it is not an autocast op, so the projection's dtype rules."""
+    torch.manual_seed(1)
+    pr = _Expert(swiglu_clamped_deepep, torch.float32, "cuda")
+    ref = _Expert(_reference, torch.float32, "cuda")
+    ref.load_state_dict(pr.state_dict())
+    x = (torch.randn(64, 32, device="cuda") * 2).to(input_dtype).requires_grad_(True)
+    probs = torch.rand(64, 1, device="cuda").requires_grad_(True)
+    x_ref, probs_ref = x.detach().clone().requires_grad_(True), probs.detach().clone().requires_grad_(True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = pr(x, probs)
+        out_ref = ref(x_ref, probs_ref)
+    assert out.dtype == out_ref.dtype == torch.bfloat16
+    assert type(out.grad_fn).__name__.startswith("SwigluClampedTriton")
+    g = torch.randn_like(out_ref)
+    gx, gw, gp = torch.autograd.grad(out, (x, pr.w.weight, probs), g)
+    gx_ref, gw_ref, gp_ref = torch.autograd.grad(out_ref, (x_ref, ref.w.weight, probs_ref), g)
+    assert (
+        (gx.dtype, gw.dtype, gp.dtype)
+        == (gx_ref.dtype, gw_ref.dtype, gp_ref.dtype)
+        == (input_dtype, torch.float32, torch.float32)
+    )
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(gx.float(), gx_ref.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(gw, gw_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(gp, gp_ref, rtol=1e-2, atol=1e-2)
+
+
+@requires_gpu_triton
+@pytest.mark.runtime_budget(120, hard_timeout=300, reason="inductor compiles the module with the Triton kernels")
+def test_compiled_module_keeps_one_graph_and_matches_eager_on_cuda():
+    """torch.compile of a module around the Triton Function: no graph break, fullgraph compiles and runs forward +
+    backward through inductor (the backward kernel's loop-carried accumulator must stay fp32 when inductor passes the
+    Python-float limit as fp64)."""
+    torch._dynamo.reset()
+    torch.manual_seed(2)
+    mod = _Expert(swiglu_clamped_deepep, torch.bfloat16, "cuda")
+    x = (torch.randn(64, 32, device="cuda") * 2).to(torch.bfloat16).requires_grad_(True)
+    probs = torch.rand(64, 1, device="cuda").requires_grad_(True)
+    explanation = torch._dynamo.explain(mod)(x, probs)
+    assert explanation.graph_break_count == 0 and explanation.graph_count == 1, explanation
+    out_e = mod(x, probs)
+    gx_e, gp_e = torch.autograd.grad(out_e.float().sum(), (x, probs))
+    torch._dynamo.reset()
+    compiled = torch.compile(mod, fullgraph=True)
+    out_c = compiled(x, probs)
+    gx_c, gp_c = torch.autograd.grad(out_c.float().sum(), (x, probs))
+    torch.testing.assert_close(out_c.float(), out_e.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(gx_c.float(), gx_e.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(gp_c, gp_e, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.runtime_budget(60, hard_timeout=180, reason="Dynamo traces the dispatcher on the CPU")
+def test_dispatcher_is_capturable_without_graph_breaks_on_cpu():
+    """On CPU the dispatcher takes the compiled function; an outer torch.compile must see one graph (backend eager:
+    capture only, no inductor build on the CI runner)."""
+    torch._dynamo.reset()
+    torch.manual_seed(3)
+    mod = _Expert(swiglu_clamped_deepep, torch.float32, "cpu")
+    x = torch.randn(6, 32, requires_grad=True)
+    probs = torch.rand(6, 1, requires_grad=True)
+    explanation = torch._dynamo.explain(mod)(x, probs)
+    assert explanation.graph_break_count == 0 and explanation.graph_count == 1, explanation
+    out_e = mod(x, probs)
+    out_c = torch.compile(mod, backend="eager", fullgraph=True)(x, probs)
+    torch.testing.assert_close(out_c, out_e)
