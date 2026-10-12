@@ -338,22 +338,6 @@ jobs:
           echo "key=$KEY" | tee -a "$GITHUB_OUTPUT"
           echo "cache-to=type=registry,ref=${{ matrix.registry }}/automodel:${KEY}-buildcache,mode=max" | tee -a "$GITHUB_OUTPUT"
 
-      # DeepEP and other source builds can produce different result digests for
-      # the same BuildKit key. Reading multiple donors can select an incoherent
-      # parent chain and invalidate every expensive downstream layer.
-      - name: Select cache donor
-        id: cache_from
-        shell: bash
-        env:
-          BASELINE_CACHE: ${{ matrix.registry }}/automodel:main-buildcache
-          RUN_CACHE: ${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}-buildcache
-        run: |
-          DONOR_CACHE="$RUN_CACHE"
-          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
-            DONOR_CACHE="$BASELINE_CACHE"
-          fi
-          echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
-
       - name: Compute platform
         id: platform
         run: |
@@ -365,11 +349,36 @@ jobs:
             echo "cache-key=amd64" | tee -a "$GITHUB_OUTPUT"
           fi
 
+      - name: Select compatible container dependencies
+        id: dependencies
+        env:
+          PLATFORM: ${{ steps.platform.outputs.platforms }}
+          REGISTRY: ${{ matrix.registry }}
+          CACHE_KEY: ${{ steps.cache_keys.outputs.key }}
+        run: bash .github/scripts/prepare-container-dependencies.sh
+
+      # DeepEP and other source builds can produce different result digests for
+      # the same BuildKit key. Reading multiple donors can select an incoherent
+      # parent chain and invalidate every expensive downstream layer.
+      - name: Select cache donor
+        id: cache_from
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          BASELINE_CACHE: ${{ matrix.registry }}/automodel:main-buildcache
+          RUN_CACHE: ${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}-buildcache
+        run: |
+          DONOR_CACHE="$RUN_CACHE"
+          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
+            DONOR_CACHE="$BASELINE_CACHE"
+          fi
+          echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
+
       # Keep multi-GB cache ownership on main. Copied PR branches can restore
       # main's cache without consuming repository storage with scoped copies.
       - name: Restore and save uv build cache
         id: uv-build-cache-main
-        if: github.ref == 'refs/heads/main'
+        if: steps.dependencies.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .buildkit-cache/uv
@@ -378,7 +387,7 @@ jobs:
 
       - name: Restore uv build cache
         id: uv-build-cache-branch
-        if: github.ref != 'refs/heads/main'
+        if: steps.dependencies.outputs.cache-hit != 'true' && github.ref != 'refs/heads/main'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .buildkit-cache/uv
@@ -386,6 +395,7 @@ jobs:
           key: buildkit-uv-${{ runner.os }}-${{ steps.platform.outputs.cache-key }}-${{ hashFiles('docker/Dockerfile', 'docker/common/uv-pytorch.lock', 'uv.lock') }}
 
       - name: Inject uv cache into BuildKit
+        if: steps.dependencies.outputs.cache-hit != 'true'
         uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361 # v3.3.0
         with:
           builder: ${{ steps.setup-buildx.outputs.name }}
@@ -406,6 +416,26 @@ jobs:
           app-id: ${{ vars.BOT_ID }}
           private-key: ${{ secrets.BOT_KEY }}
 
+      # Persist installed native extensions and the complete venv. Unlike a
+      # BuildKit layer cache, this image remains reusable when its parent cache
+      # chain is missing or a PR/release has no writable Actions uv cache.
+      - name: Build and push container dependencies
+        id: build-dependencies
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          file: ./docker/Dockerfile
+          target: automodel_dependencies
+          push: true
+          context: .
+          platforms: ${{ steps.platform.outputs.platforms }}
+          build-args: ${{ steps.dependencies.outputs.build-args }}
+          cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
+          cache-to: ${{ steps.cache_keys.outputs.cache-to }}
+          tags: ${{ steps.dependencies.outputs.image }}
+          secrets: |
+            GH_TOKEN=${{ steps.app-token.outputs.token }}
+
       - name: Build and push
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
@@ -413,21 +443,11 @@ jobs:
           push: true
           context: .
           platforms: ${{ steps.platform.outputs.platforms }}
-          # Opt-in build parallelism (Dockerfile defaults keep the serial/lower values). Any
-          # consumer sharing this BuildKit cache must pass identical values to hit the same layers.
-          # Bake VLM media dependencies into CI images so tests do not install packages.
-          # Media remains opt-in for builds outside this workflow.
-          # Keep comments out of the block below: build-push-action passes `#` lines through.
-          build-args: |
-            BASE_IMAGE=pytorch
-            UV_SYNC_ARGS=--locked --extra vlm-media
-            FA3_MAX_JOBS=24
-            UV_SYNC_MAX_JOBS=24
-            BNB_BUILD_MAX_JOBS=8
-            BNB_BUILD_THREADS_PER_JOB=8
-          cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
-          cache-to: ${{ steps.cache_keys.outputs.cache-to }}
-          no-cache: false
+          build-args: ${{ steps.dependencies.outputs.build-args }}
+          # Override only the dependency stage; always copy this checkout and
+          # run the native-runtime and non-root checks in the final stage.
+          build-contexts: |
+            automodel_dependencies=docker-image://${{ steps.dependencies.outputs.image }}@${{ steps.dependencies.outputs.digest || steps.build-dependencies.outputs.digest }}
           tags: |
             ${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}
             ${{ matrix.registry }}/automodel:${{ github.sha }}
@@ -443,8 +463,8 @@ jobs:
           - test-name: L0_Unit_Tests_CPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: true
-            # The full CPU suite plus DSpark distributed tests exceeds 20 minutes.
-            timeout: 30
+            # The full CPU suite takes 28-30 minutes before teardown and coverage finish.
+            timeout: 40
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
