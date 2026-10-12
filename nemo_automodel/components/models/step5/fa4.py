@@ -26,7 +26,9 @@ from nemo_automodel.shared.import_utils import safe_import
 
 
 @functools.cache
-def _load_fa4(window: int | None, bitmap: bool, slots: int, provider_groups: int) -> tuple[Callable, type, Callable]:
+def _load_fa4(
+    window: int | None, bitmap: bool, slots: int, provider_groups: int, *, heads_per_group: int = 0
+) -> tuple[Callable, type, Callable]:
     """Load optional FA4 dependencies and cache a shape-independent CuTe mask."""
     imported = [
         safe_import(name)
@@ -62,7 +64,7 @@ def _load_fa4(window: int | None, bitmap: bool, slots: int, provider_groups: int
             and the sliding window or learned region set.
         """
         positions, key_positions, documents, key_documents, padding, membership, token_regions = aux_tensors
-        b = batch[0] // provider_groups
+        b = batch[0] if cutlass.const_expr(heads_per_group > 0) else batch[0] // provider_groups
         q = cutlass.min(query_idx[0], seqlen_info.seqlen_q - 1)
         k = cutlass.min(key_idx[0], seqlen_info.seqlen_k - 1)
         distance = positions[b, q] - key_positions[b, k]
@@ -77,7 +79,9 @@ def _load_fa4(window: int | None, bitmap: bool, slots: int, provider_groups: int
             valid = valid & (distance < window)
         elif cutlass.const_expr(slots > 0):
             target = token_regions[b, k]
-            group = batch[0] % provider_groups
+            group = (
+                head[0] // heads_per_group if cutlass.const_expr(heads_per_group > 0) else batch[0] % provider_groups
+            )
             if cutlass.const_expr(bitmap):
                 word = membership[b, group, q, target // 32]
                 valid = valid & (((word >> (target % 32)) & 1) != 0)
@@ -217,6 +221,24 @@ def _compact_selected_tiles(present: torch.Tensor) -> tuple[torch.Tensor, torch.
     return counts, indices
 
 
+def _provider_heads(tensor: torch.Tensor, *, batch: int, heads_per_group: int) -> torch.Tensor:
+    """Copy provider-specific block metadata into FA4's query-head axis.
+
+    Args:
+        tensor: Read-only int32 tensor [batch * groups, 1, query_tiles] for
+            counts, or [batch * groups, 1, query_tiles, key_tiles] for indices.
+            Backward metadata swaps query_tiles and key_tiles. Each provider
+            owns one KV group, with a common number of query heads per group.
+        batch: Original attention batch size before provider folding.
+        heads_per_group: Number of consecutive query heads sharing a KV group.
+
+    Returns:
+        Independent contiguous int32 metadata [batch, query_heads, ...],
+        where query_heads = groups * heads_per_group. No token mask is created.
+    """
+    return tensor.unflatten(0, (batch, -1)).squeeze(2).repeat_interleave(heads_per_group, dim=1)
+
+
 @torch.compile(dynamic=False)
 def _split_forward_full_blocks(
     counts: torch.Tensor, indices: torch.Tensor, *, prefix_length: int
@@ -224,9 +246,11 @@ def _split_forward_full_blocks(
     """Separate a low contiguous full-block prefix without changing K order.
 
     Args:
-        counts: Int32 selected K-block counts [providers, 1, query_tiles].
+        counts: Int32 selected K-block counts [provider_batches, heads, query_tiles].
+            Provider-folded layout uses provider_batches=batch*groups and heads=1;
+            native head layout uses provider_batches=batch and heads=query_heads.
         indices: Sorted unique nonnegative K-block indices
-            [providers, 1, query_tiles, key_tiles], with ignored trailing slots.
+            [provider_batches, heads, query_tiles, key_tiles], with ignored trailing slots.
             Both tensors use SM90 D192 tiles: 128 queries and 112 keys.
         prefix_length: Proven all-selected initial query count in a single
             unpadded CP1 document with physical positions starting at zero.
@@ -589,10 +613,10 @@ def fa4_attention(
     groups = 1 if selection is None else selection.region_ids.shape[1]
     heads_per_group = query.shape[2] // groups
     batch = query.shape[0]
-    attention, block_lists, mask_mod = _load_fa4(window, bitmap, slots, groups)
     # Requires FA4 #2888 (3c2c6b3): native 192-dimensional GQA backward.
     fwd_k, bwd_k = (128, 256) if split_values else ((112, 96) if dim == 192 else (80, 64))
     fwd_q = 256 if split_values and queries > 128 else 128
+    head_layout = False
     if selection is None:
         fc, fi = _block_lists(
             queries, keys, query_start, window, block_q=fwd_q, block_k=fwd_k, reverse=False, device=query.device
@@ -602,11 +626,31 @@ def fa4_attention(
         )
     else:
         fc, fi, bc, bi = _selected_block_lists(selection, regions, query_start, fwd_k, bwd_k, fwd_q)
-        # Grouping providers into the batch avoids a 16x metadata replication.
-        # For the usual batch=1 these input transforms are strided views.
-        query = query.unflatten(2, (groups, heads_per_group)).permute(0, 2, 1, 3, 4).flatten(0, 1)
-        key = key.unflatten(2, (groups, key.shape[2] // groups)).permute(0, 2, 1, 3, 4).flatten(0, 1)
-        value = value.unflatten(2, (groups, value.shape[2] // groups)).permute(0, 2, 1, 3, 4).flatten(0, 1)
+        # Native head layout avoids copying the full attention output back
+        # from provider-major order. Bound the complete expanded sparse-list
+        # storage (including full-block counts and a second forward index
+        # table) by that one eliminated BF16 output copy. This is a metadata
+        # payload bound, not a bound on total CUDA peak memory.
+        metadata_bytes = (
+            heads_per_group * (2 * fc.numel() + 2 * fi.numel() + 2 * bc.numel() + bi.numel()) * fc.element_size()
+        )
+        head_layout = (
+            capability == (9, 0) and dim == 192 and groups > 1 and metadata_bytes < query.numel() * query.element_size()
+        )
+        if head_layout:
+            fc, fi, bc, bi = (
+                _provider_heads(tensor, batch=batch, heads_per_group=heads_per_group) for tensor in (fc, fi, bc, bi)
+            )
+        else:
+            # Provider folding keeps metadata compact for large key histories.
+            # For batch=1 these input transforms are strided views.
+            query = query.unflatten(2, (groups, heads_per_group)).permute(0, 2, 1, 3, 4).flatten(0, 1)
+            key = key.unflatten(2, (groups, key.shape[2] // groups)).permute(0, 2, 1, 3, 4).flatten(0, 1)
+            value = value.unflatten(2, (groups, value.shape[2] // groups)).permute(0, 2, 1, 3, 4).flatten(0, 1)
+    if head_layout:
+        attention, block_lists, mask_mod = _load_fa4(window, bitmap, slots, groups, heads_per_group=heads_per_group)
+    else:
+        attention, block_lists, mask_mod = _load_fa4(window, bitmap, slots, groups)
     # This FA4 revision requires full-block tensors even for the default path.
     # Zero counts leave its aliased indices unused.
     full_indices = fi
@@ -664,6 +708,6 @@ def fa4_attention(
         )
         outputs.append(output[..., :value_width])
     output = torch.cat(outputs, dim=-1) if split_values else outputs[0]
-    if selection is not None:
+    if selection is not None and not head_layout:
         output = output.unflatten(0, (batch, groups)).permute(0, 2, 1, 3, 4).flatten(2, 3)
     return output

@@ -54,9 +54,14 @@ def _reference_vjp(
         for start in range(0, query.shape[1], 256):
             stop = min(start + 256, query.shape[1])
             positions = torch.arange(start, stop, device=query.device)[:, None]
-            # Legal independent router: most recent 512 historical regions
-            # plus current. It truly drops region0 starting at position4104.
-            allowed = (keys <= positions) & (keys // 8 >= (positions // 8 - 512).clamp_min(0))
+            # Each provider chooses a different legal 512-region interval,
+            # plus the current region. At 8K this catches head/group mixups.
+            providers = key.shape[2]
+            group = torch.arange(providers, device=query.device)[:, None, None]
+            current = positions // 8
+            lower = (current - 512).clamp_min(0)[None] * group // max(providers - 1, 1)
+            selected = ((keys // 8 >= lower) & (keys // 8 < lower + 512)) | (keys // 8 == current)
+            allowed = ((keys <= positions)[None] & selected).repeat_interleave(16, dim=0)[None]
             chunk = q[:, start:stop]
             result = F.scaled_dot_product_attention(
                 chunk.transpose(1, 2),
@@ -118,9 +123,12 @@ def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
         csa_forward_full_blocks=True,
     )
     current = positions // 8
-    ids = (current - 512).clamp_min(0)[..., None] + torch.arange(513, device="cuda")
-    ids = torch.where(ids <= current[..., None], ids, metadata.region_count).int()[:, None]
-    ids = ids.expand(-1, providers, -1, -1).clone()
+    lower = (current - 512).clamp_min(0)[:, None] * torch.arange(providers, device="cuda")[None, :, None]
+    lower = lower // max(providers - 1, 1)
+    historical = lower[..., None] + torch.arange(512, device="cuda")
+    historical = torch.where(historical < current[:, None, :, None], historical, metadata.region_count)
+    ids = torch.cat((historical, current[:, None, :, None].expand(-1, providers, -1, -1)), dim=-1)
+    ids = ids.sort(dim=-1).values.int()
     selection = RegionSelection(
         ids,
         metadata.token_regions,
@@ -141,8 +149,9 @@ def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
         """Observe forward metadata while preserving the real kernel call.
 
         Args:
-            counts: Int32 counts [groups, 1, query_tiles].
-            indices: Int32 indices [groups, 1, query_tiles, key_tiles].
+            counts: Int32 counts [provider_batches, heads, query_tiles];
+                either [groups, 1, query_tiles] or [1, query_heads, query_tiles].
+            indices: Int32 indices [provider_batches, heads, query_tiles, key_tiles].
             prefix_length: Proven initial all-selected query count.
 
         Returns:
@@ -185,7 +194,7 @@ def test_forward_full_blocks_match_fixed_routes_and_independent_vjp(
         )
         runs.append((output.detach(), gradients[0], gradients[1][:, :, 0], gradients[1][:, :, 1]))
     assert len(full_block_counts) == 1 and full_block_counts[0].sum() > 0
-    assert full_block_counts[0].shape[0] == providers
+    assert full_block_counts[0].shape[:2] == ((1, providers * 16) if providers > 1 else (1, 1))
     # Identical block traversal is a bitwise-forward hypothesis under test,
     # not an excuse to relax a mismatch.
     assert torch.equal(runs[0][0].view(torch.uint8), runs[1][0].view(torch.uint8))
