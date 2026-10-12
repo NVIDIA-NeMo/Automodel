@@ -196,8 +196,13 @@ def build_model(
     cfg_compile=None,
     distributed_setup: DistributedSetup | None = None,
     cfg_quantization=None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
+
+    Args:
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
 
     Returns:
         The instantiated model and optimizer.
@@ -207,6 +212,7 @@ def build_model(
         kwargs = {
             "peft_config": cfg_peft,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
+            "load_metadata_with_gloo": load_metadata_with_gloo,
         }
         if distributed_setup is not None:
             kwargs["distributed_setup"] = distributed_setup
@@ -569,6 +575,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             distributed_setup=self.distributed_setup,
             cfg_quantization=self.cfg.get("quantization", None),
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         capability_model = model.parts[0] if isinstance(model, AutoPipeline) else model
         _validate_cp_vision_frame_sharding_support(capability_model, self.cp_vision_frame_sharding)

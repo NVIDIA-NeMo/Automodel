@@ -219,6 +219,36 @@ def test_build_model_passes_freeze_config():
     assert captured_kwargs["freeze_config"] == {"freeze_language_model": False, "freeze_vision_tower": True}
 
 
+@pytest.mark.parametrize("load_metadata_with_gloo", [False, True])
+def test_build_model_passes_load_metadata_with_gloo(load_metadata_with_gloo):
+    """The checkpoint load transport flag reaches model instantiation unchanged."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
+        build_model(
+            cfg_model=CapturingModelConfig(),
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+            load_metadata_with_gloo=load_metadata_with_gloo,
+        )
+
+    assert captured_kwargs["load_metadata_with_gloo"] is load_metadata_with_gloo
+
+
 def test_build_model_passes_distributed_setup():
     """Distributed policy is passed through the single setup object."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
@@ -2863,7 +2893,7 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     )
 
     def _stub_build_checkpoint_config(*a, **k):
-        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None, load_metadata_with_gloo=False)
         cfg.build = lambda **kw: SimpleNamespace(
             config=cfg,
             load_base_model=lambda *a, **k: None,
@@ -3003,7 +3033,9 @@ def test_vlm_setup_threads_pp_group_to_checkpointer(monkeypatch):
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
     pp_group = object()
     build_kwargs = {}
-    checkpoint_config = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+    checkpoint_config = SimpleNamespace(
+        checkpoint_dir="ckpts", model_state_dict_keys=None, load_metadata_with_gloo=False
+    )
 
     def _build_checkpointer(**kwargs):
         build_kwargs.update(kwargs)
