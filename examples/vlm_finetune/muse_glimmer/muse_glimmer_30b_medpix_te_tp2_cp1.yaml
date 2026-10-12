@@ -78,10 +78,7 @@ freeze_config:
   freeze_language_model: false
 
 loss_fn:
-  # Recompute vocabulary-sharded projection chunks instead of retaining full logits.
-  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
-  chunk_len: 256
-  compile: false
+  _target_: nemo_automodel.components.loss.te_parallel_ce.TEParallelCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset

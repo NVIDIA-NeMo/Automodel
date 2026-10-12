@@ -1447,7 +1447,6 @@ class TestCalculateLoss:
 
         # Mock model with lm_head
         model = MagicMock()
-        model.config = None
         lm_head = torch.nn.Linear(64, 100).cuda()
         model.get_output_embeddings.return_value = lm_head
 

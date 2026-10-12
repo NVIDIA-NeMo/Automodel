@@ -922,9 +922,10 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
                 shift_labels.view(-1),
             )
 
-        # Linear CE must apply the output multiplier after projection. Scaling
-        # BF16 hidden states first changes the rounding and therefore gradients.
-        loss_hidden_states = hidden_states
+        # Fused/checkpointed linear CE consumes the final hidden states directly.
+        # Scaling here makes F.linear(hidden * multiplier, lm_head.weight) match
+        # MuseGlimmer's native output multiplier before optional logit soft-capping.
+        loss_hidden_states = hidden_states * output_multiplier
         if is_thd and loss_hidden_states.ndim == 2:
             loss_hidden_states = loss_hidden_states.unsqueeze(0)
         output = CausalLMOutputWithPast(

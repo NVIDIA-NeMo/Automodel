@@ -217,47 +217,7 @@ def test_text_forward_loss_and_external_loss_hidden_states():
     assert torch.isfinite(output.logits).all()
     assert output.logits.abs().max() <= config.output_soft_cap_temp
     torch.testing.assert_close(output.loss, expected_loss)
-    torch.testing.assert_close(output.hidden_states, backbone_hidden)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("compiled", [False, True])
-def test_chunked_loss_preserves_muse_glimmer_softcap(dtype, compiled):
-    from copy import deepcopy
-
-    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
-    from nemo_automodel.components.loss.utils import calculate_loss
-
-    torch.manual_seed(27)
-    model = MuseGlimmerForConditionalGeneration(
-        _tiny_config(output_soft_cap_temp=2.0), backend=BackendConfig(attn="sdpa")
-    ).to(dtype)
-    with torch.no_grad():
-        model.model.norm.weight.fill_(1.0)
-        model.lm_head.weight.mul_(20)
-    reference = deepcopy(model)
-    tokens = torch.randint(0, model.config.vocab_size, (2, 9))
-    labels = tokens.clone()
-    labels[0, :3] = -100
-    output = model(input_ids=tokens, logits_to_keep=1, output_hidden_states=True)
-    assert output.logits.shape[1] == 1
-    actual = calculate_loss(
-        ChunkedCrossEntropy(3, compile=compiled),
-        model=model,
-        hidden_states=output.hidden_states,
-        logits=output.logits,
-        labels=labels,
-        num_label_tokens=15,
-    )
-    expected = torch.nn.functional.cross_entropy(
-        reference(input_ids=tokens).logits.float().flatten(0, 1), labels.flatten()
-    )
-    actual.backward()
-    expected.backward()
-    rtol, atol = (1e-4, 2e-6) if dtype == torch.float32 else (3e-2, 3e-3)
-    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
-    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
-        torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=rtol, atol=atol)
+    torch.testing.assert_close(output.hidden_states, backbone_hidden * config.output_multiplier)
 
 
 def test_text_logits_match_canonical_transformers_bfloat16_order_exactly():

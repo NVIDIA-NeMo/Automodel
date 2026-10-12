@@ -20,37 +20,6 @@ from nemo_automodel.components.loss.loss import ChunkedCEConfig, build_loss_modu
 from nemo_automodel.components.loss.utils import calculate_loss
 
 
-@pytest.mark.parametrize("softcap", [0.5, 20.0])
-@pytest.mark.parametrize("reduction", ["none", "sum", "mean"])
-def test_softcapped_loss_and_gradients(softcap, reduction):
-    torch.manual_seed(12)
-    hidden = torch.randn(2, 11, 7, requires_grad=True)
-    weight = torch.randn(13, 7, requires_grad=True)
-    labels = torch.randint(13, (2, 11))
-    labels[0, :4] = -100
-    actual = ChunkedCrossEntropy(3, compile=False, reduction=reduction)(hidden, labels, weight, logit_softcap=softcap)
-    logits = F.linear(hidden, weight)
-    expected = F.cross_entropy(
-        (torch.tanh(logits / softcap) * softcap).flatten(0, 1), labels.flatten(), reduction=reduction
-    )
-    if reduction == "none":
-        expected = expected.reshape(labels.shape)
-    torch.testing.assert_close(actual, expected)
-    upstream = torch.randn_like(actual)
-    actual_grads = torch.autograd.grad(actual, (hidden, weight), upstream)
-    expected_grads = torch.autograd.grad(expected, (hidden, weight), upstream)
-    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=2e-5, atol=2e-6)
-
-
-@pytest.mark.parametrize("softcap", [0, -1, float("inf"), float("nan")])
-def test_invalid_softcap(softcap):
-    with pytest.raises(ValueError, match="logit_softcap must be positive and finite"):
-        ChunkedCrossEntropy(compile=False)(
-            torch.randn(3, 7), torch.arange(3), torch.randn(13, 7), logit_softcap=softcap
-        )
-
-
 @pytest.mark.parametrize("chunk_len", [1, 5, 64])
 @pytest.mark.parametrize("reduction", ["sum", "mean", "none"])
 @pytest.mark.parametrize("train_hidden,train_weight", [(True, True), (True, False), (False, True)])
@@ -366,30 +335,3 @@ def test_transformed_head_rejected_before_training():
         _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), model, False)
     torch.testing.assert_close(model.lm_head.weight, original_weight)
     assert model.lm_head.weight.grad is None
-
-
-def test_tp_linear_head_validation_preserves_transformed_subclass_rejection():
-    from nemo_automodel.components.distributed.parallel_styles import TPLinear
-
-    class TransformedTPHead(TPLinear):
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            """Apply an extra output transform.
-
-            Args:
-                x: Hidden states shaped [..., hidden].
-
-            Returns:
-                Transformed logits shaped [..., vocab].
-            """
-            return super().forward(x).tanh()
-
-    loss = ChunkedCrossEntropy(compile=False)
-    head = TPLinear(7, 13, bias=False)
-    hidden = torch.randn(3, 7)
-    labels = torch.tensor([0, 3, 8])
-    weight = loss.prepare_lm_weight(head)
-    torch.testing.assert_close(loss(hidden, labels, weight), F.cross_entropy(head(hidden), labels, reduction="sum"))
-    with pytest.raises(ValueError, match="plain bias-free"):
-        loss.prepare_lm_weight(TransformedTPHead(7, 13, bias=False))
-    with pytest.raises(ValueError, match="plain bias-free"):
-        loss.prepare_lm_weight(TPLinear(7, 13, bias=True))

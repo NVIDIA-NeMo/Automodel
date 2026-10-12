@@ -99,10 +99,6 @@ class TPLinear(nn.Linear):
         """
         return tp_linear_forward(x, self.weight, self.bias, mm_for_2d_compile=True)
 
-    # Linear CE may bypass this exact forward with F.linear. Comparing the
-    # method identity prevents transformed subclasses from inheriting the opt-in.
-    _linear_ce_forward = forward
-
 
 class ColwiseParallelLora(ColwiseParallel):
     """Column-wise tensor parallel style for LoRA-aware modules."""

@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from collections.abc import Callable
-from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -22,8 +20,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
-from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
-from torch.distributed.tensor.parallel import loss_parallel
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
@@ -63,26 +59,19 @@ def _linear_cross_entropy(
     labels: torch.Tensor,
     ignore_index: int,
     logits_dtype: torch.dtype | None,
-    logit_softcap: float | None,
-    logit_scale: float,
 ) -> torch.Tensor:
     """Project one token chunk and compute CE.
 
     Args:
         hidden: Local hidden states shaped [chunk_tokens, hidden].
-        weight: LM-head weight with global shape [vocab, hidden], either dense
-            or a vocabulary-sharded DTensor on a one-dimensional TP mesh.
+        weight: Dense LM-head weight shaped [vocab, hidden].
         labels: Target indices shaped [chunk_tokens].
         ignore_index: Ignored target value.
         logits_dtype: Optional model-owned output dtype after projection.
-        logit_softcap: Optional model-owned tanh logit cap before CE.
-        logit_scale: Model-owned multiplier applied after projection.
 
     Returns:
         FP32 losses shaped [chunk_tokens].
     """
-    if isinstance(weight, DTensor) and not isinstance(hidden, DTensor):
-        hidden = DTensor.from_local(hidden, weight.device_mesh, [Replicate()], run_check=False)
     logits = F.linear(hidden.to(weight.dtype), weight)
     if logits_dtype in (torch.float16, torch.bfloat16) and logits.dtype != logits_dtype:
         logits = logits.to(logits_dtype)
@@ -91,24 +80,7 @@ def _linear_cross_entropy(
         torch._dynamo.graph_break()
     elif logits_dtype is not None:
         logits = logits.to(logits_dtype)
-    if logit_scale != 1.0:
-        logits = logits * logit_scale
-        if logits.dtype in (torch.float16, torch.bfloat16):
-            torch._dynamo.graph_break()
-    if logit_softcap is not None:
-        # Match the model's low-precision rounding after each transformation,
-        # including in compiled forward and recomputed backward graphs.
-        logits = logits / logit_softcap
-        if logits.dtype in (torch.float16, torch.bfloat16):
-            torch._dynamo.graph_break()
-        logits = torch.tanh(logits)
-        if logits.dtype in (torch.float16, torch.bfloat16):
-            torch._dynamo.graph_break()
-        logits = logits * logit_softcap
-        if logits.dtype in (torch.float16, torch.bfloat16):
-            torch._dynamo.graph_break()
-    loss = compute_cross_entropy(logits, labels, ignore_index, "none")
-    return loss.to_local() if isinstance(loss, DTensor) else loss
+    return compute_cross_entropy(logits, labels, ignore_index, "none")
 
 
 class _ChunkedLinearCE(torch.autograd.Function):
@@ -122,44 +94,32 @@ class _ChunkedLinearCE(torch.autograd.Function):
         chunk_len: int,
         ignore_index: int,
         logits_dtype: torch.dtype | None,
-        logit_softcap: float | None,
-        logit_scale: float,
-        compute_loss: Callable[
-            [torch.Tensor, torch.Tensor, torch.Tensor, int, torch.dtype | None, float | None, float], torch.Tensor
-        ],
+        compute_loss: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.dtype | None], torch.Tensor],
     ) -> torch.Tensor:
         """Compute chunk losses without retaining logits.
 
         Args:
             ctx: Autograd context.
             hidden: Local hidden states shaped [tokens, hidden].
-            weight: Projection weight with global shape [vocab, hidden], dense
-                or vocabulary-sharded on the TP mesh.
+            weight: Dense projection weight shaped [vocab, hidden].
             labels: Target indices shaped [tokens].
             chunk_len: Maximum token rows per projection.
             ignore_index: Ignored target value.
             logits_dtype: Optional output cast matching the model projection.
-            logit_softcap: Optional tanh cap matching the model projection.
-            logit_scale: Multiplier applied after projection.
             compute_loss: Eager or compiled per-chunk loss.
 
         Returns:
             FP32 losses shaped [tokens]; inputs are not mutated.
         """
         losses = torch.empty(labels.shape, dtype=torch.float32, device=hidden.device)
-        with loss_parallel() if isinstance(weight, DTensor) else nullcontext():
-            for start in range(0, hidden.shape[0], chunk_len):
-                end = start + chunk_len
-                losses[start:end] = compute_loss(
-                    hidden[start:end], weight, labels[start:end], ignore_index, logits_dtype, logit_softcap, logit_scale
-                )
+        for start in range(0, hidden.shape[0], chunk_len):
+            end = start + chunk_len
+            losses[start:end] = compute_loss(hidden[start:end], weight, labels[start:end], ignore_index, logits_dtype)
         ctx.save_for_backward(hidden, weight, labels)
         ctx.chunk_len = chunk_len
         ctx.ignore_index = ignore_index
         ctx.compute_loss = compute_loss
         ctx.logits_dtype = logits_dtype
-        ctx.logit_softcap = logit_softcap
-        ctx.logit_scale = logit_scale
         return losses
 
     @staticmethod
@@ -167,7 +127,7 @@ class _ChunkedLinearCE(torch.autograd.Function):
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(
         ctx: Any, grad_out: torch.Tensor
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None, None, None, None]:
         """Recompute one projection/CE graph at a time.
 
         Args:
@@ -177,7 +137,7 @@ class _ChunkedLinearCE(torch.autograd.Function):
 
         Returns:
             Hidden-state and weight gradients matching the original shapes and
-            dtypes, followed by seven None entries. No input is mutated.
+            dtypes, followed by five None entries. No input is mutated.
         """
         hidden, weight, labels = ctx.saved_tensors
         need_hidden, need_weight = ctx.needs_input_grad[:2]
@@ -185,20 +145,14 @@ class _ChunkedLinearCE(torch.autograd.Function):
         # Accumulate across chunks in fp32, avoiding repeated bf16 rounding.
         accum_dtype = torch.float64 if weight.dtype == torch.float64 else torch.float32
         grad_weight = torch.zeros_like(weight, dtype=accum_dtype) if need_weight else None
-        with torch.enable_grad(), loss_parallel() if isinstance(weight, DTensor) else nullcontext():
+        with torch.enable_grad():
             local_weight = weight.detach().requires_grad_(need_weight)
             for start in range(0, hidden.shape[0], ctx.chunk_len):
                 end = start + ctx.chunk_len
                 local_hidden = hidden[start:end].detach().requires_grad_(need_hidden)
                 inputs = [x for x in (local_hidden, local_weight) if x.requires_grad]
                 loss = ctx.compute_loss(
-                    local_hidden,
-                    local_weight,
-                    labels[start:end],
-                    ctx.ignore_index,
-                    ctx.logits_dtype,
-                    ctx.logit_softcap,
-                    ctx.logit_scale,
+                    local_hidden, local_weight, labels[start:end], ctx.ignore_index, ctx.logits_dtype
                 )
                 grads = torch.autograd.grad(loss, inputs, grad_out[start:end])
                 if need_hidden:
@@ -206,17 +160,7 @@ class _ChunkedLinearCE(torch.autograd.Function):
                 if need_weight:
                     grad_weight.add_(grads[-1])
                 del loss, grads
-        return (
-            grad_hidden,
-            grad_weight.to(weight.dtype) if need_weight else None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return grad_hidden, grad_weight.to(weight.dtype) if need_weight else None, None, None, None, None, None
 
 
 class ChunkedCrossEntropy(LinearCrossEntropy):
@@ -254,7 +198,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         self.ignore_index = ignore_index
         self.reduction = reduction
         self._compute_loss: Callable[
-            [torch.Tensor, torch.Tensor, torch.Tensor, int, torch.dtype | None, float | None, float], torch.Tensor
+            [torch.Tensor, torch.Tensor, torch.Tensor, int, torch.dtype | None], torch.Tensor
         ] = torch.compile(_linear_cross_entropy, dynamic=True) if compile else _linear_cross_entropy
 
     @staticmethod
@@ -274,13 +218,15 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         """
         if model_config is not None:
             text_config = model_config.get_text_config()
-            softcap = getattr(text_config, "final_logit_softcapping", None)
-            if softcap is not None and (not math.isfinite(softcap) or softcap <= 0):
-                raise ValueError("final_logit_softcapping must be positive")
-        # FSDP preserves the forward of Linear or the equivalent TP-safe variant.
+            if getattr(text_config, "final_logit_softcapping", None) is not None:
+                raise ValueError(
+                    "ChunkedCrossEntropy does not support final_logit_softcapping; "
+                    "use MaskedCrossEntropy to preserve the model's post-projection transformation"
+                )
+        # FSDP dynamically subclasses Linear but retains its forward method.
         if (
             not isinstance(lm_head, nn.Linear)
-            or type(lm_head).forward is not getattr(type(lm_head), "_linear_ce_forward", nn.Linear.forward)
+            or type(lm_head).forward is not nn.Linear.forward
             or lm_head.bias is not None
         ):
             raise ValueError(
@@ -288,51 +234,6 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
                 "use MaskedCrossEntropy for transformed or biased heads"
             )
         return lm_head
-
-    @staticmethod
-    def materialize_lm_weight(
-        lm_weight: torch.Tensor,
-        *,
-        grad_reduce_group: dist.ProcessGroup | None = None,
-    ) -> torch.Tensor:
-        """Gather FSDP shards while retaining a named TP vocabulary shard.
-
-        Args:
-            lm_weight: Projection weight with global shape [vocab, hidden].
-            grad_reduce_group: DP/CP group contributing independent token losses.
-
-        Returns:
-            Dense weight for TP1, or a vocabulary-sharded DTensor on the TP mesh.
-            Backward averages independent DP/CP contributions and sums TP hidden
-            gradients through the per-chunk distributed projection.
-        """
-        if not isinstance(lm_weight, DTensor) or "tp" not in (lm_weight.device_mesh.mesh_dim_names or ()):
-            return LinearCrossEntropy.materialize_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
-        mesh = lm_weight.device_mesh
-        tp_axis = (mesh.mesh_dim_names or ()).index("tp")
-        tp_placement = lm_weight.placements[tp_axis]
-        if not isinstance(tp_placement, Shard) or tp_placement.dim != 0:
-            raise ValueError("ChunkedCrossEntropy requires vocabulary-sharded TP weights")
-        if mesh.ndim == 1:
-            return lm_weight
-        reduce_size = dist.get_world_size(grad_reduce_group) if grad_reduce_group is not None else 1
-        if torch.is_grad_enabled() and lm_weight.requires_grad:
-            indices: list[int | slice] = [slice(None)] * mesh.ndim
-            indices[tp_axis] = mesh.get_local_rank(tp_axis)
-            expected_ranks = mesh.mesh[tuple(indices)].flatten().tolist()
-            reduction_ranks = (
-                dist.get_process_group_ranks(grad_reduce_group) if grad_reduce_group is not None else [dist.get_rank()]
-            )
-            if sorted(expected_ranks) != sorted(reduction_ranks):
-                raise ValueError("ChunkedCrossEntropy requires grad_reduce_group to match the non-TP weight mesh")
-        placements = tuple(tp_placement if axis == tp_axis else Replicate() for axis in range(mesh.ndim))
-        grad_placements = tuple(tp_placement if axis == tp_axis else Partial() for axis in range(mesh.ndim))
-        local_weight = lm_weight.redistribute(placements=placements).to_local(grad_placements=grad_placements)
-        if local_weight.requires_grad and reduce_size > 1:
-            local_weight.register_hook(lambda grad: grad / reduce_size)
-        return DTensor.from_local(
-            local_weight, mesh["tp"], [Shard(0)], run_check=False, shape=lm_weight.shape, stride=lm_weight.stride()
-        )
 
     def prepare_lm_weight(
         self,
@@ -346,11 +247,11 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         Args:
             lm_head: Plain linear head with weight of global shape [vocab, hidden].
                 Its FSDP policy, when present, owns the compute dtype.
-            model_config: Owning model config, used to validate output-logit settings.
+            model_config: Owning model config, used to reject post-projection transforms.
             grad_reduce_group: Group contributing independent token losses.
 
         Returns:
-            Dense or TP-sharded [vocab, hidden] weight under ``materialize_lm_weight``'s
+            Dense [vocab, hidden] weight under ``materialize_lm_weight``'s
             gradient contract. Share this tensor across main and MTP losses;
             a dtype conversion allocates once and remains differentiable.
         """
@@ -372,8 +273,6 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         *,
         mask: torch.Tensor | None = None,
         logits_dtype: torch.dtype | None = None,
-        logit_softcap: float | None = None,
-        logit_scale: float = 1.0,
     ) -> torch.Tensor:
         """Compute CE directly from hidden states, with no full-logit allocation.
 
@@ -383,8 +282,8 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             labels: Target indices shaped [...] matching the token dimensions,
                 or [tokens] for packed hidden states shaped [1, tokens, hidden].
             lm_weight: Weight shaped [vocab, hidden]; FSDP DTensors use the
-                materialize_lm_weight contract. Named TP vocabulary shards are
-                retained; hidden states must be replicated across TP ranks.
+                LinearCrossEntropy.materialize_lm_weight contract. TP-sharded
+                vocabulary/hidden states are not supported by this loss.
             num_label_tokens: Global count normalizing a sum-reduced loss.
             grad_reduce_group: DP/CP group contributing independent token losses.
             loss_weights: Optional constant multipliers shaped [...], sum only.
@@ -392,8 +291,6 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             logits_dtype: Optional output cast after projection, matching the
                 owning model. Projection uses lm_weight.dtype; mixed-dtype
                 hidden states are converted per chunk, never the full weight.
-            logit_softcap: Optional model-owned tanh cap, applied before fp32 CE.
-            logit_scale: Model-owned multiplier after projection and before soft-capping.
 
         Returns:
             FP32 scalar, or losses shaped [...] for reduction="none". Inputs
@@ -414,11 +311,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             labels = labels.masked_fill(mask.to(labels.device) == 0, self.ignore_index)
         if loss_weights is not None and loss_weights.shape != labels.shape:
             raise ValueError("loss_weights.shape must match labels.shape")
-        if logit_softcap is not None and (not math.isfinite(logit_softcap) or logit_softcap <= 0):
-            raise ValueError("logit_softcap must be positive and finite")
         weight = self.materialize_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
-        if isinstance(hidden_states, DTensor) and any(not isinstance(p, Replicate) for p in hidden_states.placements):
-            raise ValueError("ChunkedCrossEntropy requires TP-replicated hidden states")
         losses = _ChunkedLinearCE.apply(
             hidden_states.reshape(-1, hidden_states.shape[-1]),
             weight,
@@ -426,8 +319,6 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             self.chunk_len,
             self.ignore_index,
             logits_dtype,
-            logit_softcap,
-            logit_scale,
             self._compute_loss,
         ).reshape(labels.shape)
         if loss_weights is not None:

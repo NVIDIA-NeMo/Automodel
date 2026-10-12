@@ -3615,7 +3615,17 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
         model.lm_head.weight.mul_(20)
     reference = deepcopy(model)
     loss_fn = ChunkedCrossEntropy(2, compile=False)
-    prepare_lm_weight(loss_fn, model)
+    if softcap is not None:
+        # A plain head is not sufficient: both setup and shared weight preparation
+        # must inspect the owning model's nested text config before training.
+        assert type(model.lm_head) is torch.nn.Linear
+        with pytest.raises(ValueError, match="final_logit_softcapping.*MaskedCrossEntropy"):
+            _maybe_downgrade_loss_fn(loss_fn, model, False)
+        with pytest.raises(ValueError, match="final_logit_softcapping.*MaskedCrossEntropy"):
+            prepare_lm_weight(loss_fn, model)
+        assert all(parameter.grad is None for parameter in model.parameters())
+        # The recommended logits-based alternative remains usable with soft-capping.
+        loss_fn = MaskedCrossEntropy()
     assert _maybe_downgrade_loss_fn(loss_fn, model, False) is loss_fn
 
     recipe = SimpleNamespace(
