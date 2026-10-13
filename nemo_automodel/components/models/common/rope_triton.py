@@ -172,11 +172,18 @@ class _FusedRope(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: object, values: torch.Tensor, frequencies: torch.Tensor, inverse: bool) -> torch.Tensor:
-        """Rotate CUDA values [B, S, D] or [B, S, H, D], preserving shape and dtype.
+        """Rotate CUDA values and save frequencies for the conjugate input gradient.
 
-        ``frequencies`` is contiguous FP32 [B, S, rotary_pairs, 2], storing
-        cosine and sine. Only values receive gradients; ``inverse`` conjugates
-        the frequencies. Save frequencies for the conjugate input gradient.
+        Args:
+            ctx: Autograd context storing frequencies and rotation direction.
+            values: CUDA tensor shaped [batch, sequence, channels] or
+                [batch, sequence, heads, channels]. Only values receive gradients.
+            frequencies: Contiguous FP32 tensor shaped [batch, sequence, rotary_pairs, 2],
+                storing cosine and sine for each channel pair.
+            inverse: Whether to conjugate the frequencies.
+
+        Returns:
+            Contiguous rotated tensor with the shape and dtype of ``values``.
         """
         ctx.save_for_backward(frequencies)
         ctx.inverse = inverse
@@ -184,11 +191,17 @@ class _FusedRope(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: object, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, None, None]:
-        """Return the input gradient with the shape and dtype of ``grad_output``.
+        """Rotate the incoming gradient by the conjugate of the forward rotation.
 
-        The incoming CUDA gradient has shape [B, S, D] or [B, S, H, D]. Rotate
-        it by the conjugate of the forward rotation; cached frequencies and
-        the Boolean direction have no gradients.
+        Args:
+            ctx: Autograd context containing frequencies and rotation direction.
+            grad_output: CUDA gradient shaped [batch, sequence, channels] or
+                [batch, sequence, heads, channels].
+
+        Returns:
+            Input gradient with the shape and dtype of ``grad_output``, or ``None``
+            when it is not needed, followed by ``None`` for the cached frequencies
+            and Boolean direction, which do not receive gradients.
         """
         if not ctx.needs_input_grad[0]:
             return None, None, None

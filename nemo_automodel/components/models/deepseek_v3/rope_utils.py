@@ -125,10 +125,11 @@ def apply_rotary_emb(
     """Rotate adjacent channel pairs using precomputed complex frequencies.
 
     Args:
-        x: Tensor of shape [B, S, H, D] for ``bshd`` or [T, H, D] for
-            ``thd``. Shared keys may omit H when ``unsqueeze_dim`` inserts it.
-        freqs_cis: Complex frequency table with D / 2 pairs per token, shaped
-            [B, S, D / 2] or [T, D / 2]. Cached CUDA complex64 frequencies
+        x: Tensor of shape [batch, sequence, heads, channels] for ``bshd`` or
+            [tokens, heads, channels] for ``thd``. Shared keys may omit the head
+            dimension when ``unsqueeze_dim`` inserts it.
+        freqs_cis: Complex frequency table with channels / 2 pairs per token, shaped
+            [batch, sequence, channels / 2] or [tokens, channels / 2]. Cached CUDA complex64 frequencies
             use the fused kernel; trainable frequencies retain autograd.
         qkv_format: ``thd`` adds a temporary batch dimension for packed inputs.
         unsqueeze_dim: Optional head dimension to insert after normalizing

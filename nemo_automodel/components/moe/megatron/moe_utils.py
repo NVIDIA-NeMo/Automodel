@@ -226,7 +226,9 @@ def swiglu_back(g, y):
 
 
 @torch.compile
-def weighted_swiglu_back(g, y, weights, need_weight_grad=True):
+def weighted_swiglu_back(
+    g: torch.Tensor, y: torch.Tensor, weights: torch.Tensor, need_weight_grad: bool = True
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Compute input and optional weight gradients for weighted SwiGLU.
 
     Args:
