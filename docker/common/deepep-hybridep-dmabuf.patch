@@ -1,5 +1,5 @@
 diff --git a/csrc/hybrid_ep/buffer/internode_doca.cu b/csrc/hybrid_ep/buffer/internode_doca.cu
-index 6a17ff7..57d9c27 100644
+index 6a17ff76..9bd1cc68 100644
 --- a/csrc/hybrid_ep/buffer/internode_doca.cu
 +++ b/csrc/hybrid_ep/buffer/internode_doca.cu
 @@ -3,9 +3,14 @@
@@ -18,7 +18,7 @@ index 6a17ff7..57d9c27 100644
  
  static int get_env_int_in_range(const char* name, int default_value, int min_value, int max_value) {
    const char* raw_value = std::getenv(name);
-@@ -25,6 +30,201 @@ static int get_env_int_in_range(const char* name, int default_value, int min_val
+@@ -25,6 +30,190 @@ static int get_env_int_in_range(const char* name, int default_value, int min_val
    return static_cast<int>(parsed_value);
  }
  
@@ -85,25 +85,20 @@ index 6a17ff7..57d9c27 100644
 +  }
 +};
 +
-+static ibv_mr* register_gpu_memory(
++ibv_mr* RDMACoordinator::register_gpu_memory(
 +    ibv_pd* pd,
 +    void* address,
 +    size_t length,
-+    int access,
-+    bool dmabuf_supported,
-+    int local_rank,
-+    const char* buffer_name) {
++    int access) {
 +  if (pd == nullptr) {
 +    std::ostringstream error;
-+    error << "HybridEP cannot register GPU buffer '" << buffer_name
-+          << "': the RDMA protection domain is null";
++    error << "HybridEP cannot register GPU buffer: the RDMA protection domain is null";
 +    append_registration_context(error, pd, address, length, access);
 +    throw std::runtime_error(error.str());
 +  }
 +  if (address == nullptr || length == 0) {
 +    std::ostringstream error;
-+    error << "HybridEP cannot register GPU buffer '" << buffer_name
-+          << "': address must be non-null and length must be nonzero";
++    error << "HybridEP cannot register GPU buffer: address must be non-null and length must be nonzero";
 +    append_registration_context(error, pd, address, length, access);
 +    throw std::runtime_error(error.str());
 +  }
@@ -115,10 +110,9 @@ index 6a17ff7..57d9c27 100644
 +  }
 +
 +  const int legacy_errno = errno;
-+  if (!dmabuf_supported) {
++  if (gpu_handler == nullptr || !gpu_handler->support_dmabuf) {
 +    std::ostringstream error;
-+    error << "HybridEP failed to register GPU buffer '" << buffer_name
-+          << "' with ibv_reg_mr: ";
++    error << "HybridEP failed to register GPU buffer with ibv_reg_mr: ";
 +    append_errno(error, legacy_errno);
 +    append_registration_context(error, pd, address, length, access);
 +    error << "; CUDA reports no DMA-BUF support";
@@ -130,8 +124,7 @@ index 6a17ff7..57d9c27 100644
 +  if (page_size_value <= 0) {
 +    const int page_size_errno = errno;
 +    std::ostringstream error;
-+    error << "HybridEP could not determine the host page size while registering GPU buffer '"
-+          << buffer_name << "' with DMA-BUF: ";
++    error << "HybridEP could not determine the host page size while registering GPU buffer with DMA-BUF: ";
 +    append_errno(error, page_size_errno);
 +    error << "; ibv_reg_mr failed with ";
 +    append_errno(error, legacy_errno);
@@ -144,8 +137,7 @@ index 6a17ff7..57d9c27 100644
 +  const size_t dmabuf_offset = iova - dmabuf_base;
 +  if (length > SIZE_MAX - dmabuf_offset) {
 +    std::ostringstream error;
-+    error << "HybridEP DMA-BUF registration range overflows for GPU buffer '"
-+          << buffer_name << "': page_size=" << page_size
++    error << "HybridEP DMA-BUF registration range overflows for GPU buffer: page_size=" << page_size
 +          << "; ibv_reg_mr failed with ";
 +    append_errno(error, legacy_errno);
 +    append_registration_context(error, pd, address, length, access);
@@ -156,8 +148,7 @@ index 6a17ff7..57d9c27 100644
 +  const size_t alignment_padding = trailing_bytes == 0 ? 0 : page_size - trailing_bytes;
 +  if (unaligned_length > SIZE_MAX - alignment_padding) {
 +    std::ostringstream error;
-+    error << "HybridEP DMA-BUF registration range overflows for GPU buffer '"
-+          << buffer_name << "': page_size=" << page_size
++    error << "HybridEP DMA-BUF registration range overflows for GPU buffer: page_size=" << page_size
 +          << "; ibv_reg_mr failed with ";
 +    append_errno(error, legacy_errno);
 +    append_registration_context(error, pd, address, length, access);
@@ -178,8 +169,7 @@ index 6a17ff7..57d9c27 100644
 +    cuGetErrorName(export_status, &error_name);
 +    cuGetErrorString(export_status, &error_description);
 +    std::ostringstream error;
-+    error << "HybridEP failed to export GPU buffer '" << buffer_name
-+          << "' as DMA-BUF after ibv_reg_mr failed: "
++    error << "HybridEP failed to export GPU buffer as DMA-BUF after ibv_reg_mr failed: "
 +          << (error_name != nullptr ? error_name : "unknown CUDA error")
 +          << " (" << (error_description != nullptr ? error_description : "no description")
 +          << "); ibv_reg_mr failed with ";
@@ -198,8 +188,7 @@ index 6a17ff7..57d9c27 100644
 +  const int dmabuf_errno = errno;
 +  if (mr == nullptr) {
 +    std::ostringstream error;
-+    error << "HybridEP failed to DMA-BUF register GPU buffer '" << buffer_name
-+          << "': ";
++    error << "HybridEP failed to DMA-BUF register GPU buffer: ";
 +    append_errno(error, dmabuf_errno);
 +    error << "; ibv_reg_mr failed with ";
 +    append_errno(error, legacy_errno);
@@ -220,20 +209,18 @@ index 6a17ff7..57d9c27 100644
  // Functions realted to get RDMA context.
  ibv_device *ctx_find_dev(const char *ib_devname) {
    int num_of_device;
-@@ -357,8 +557,18 @@ void RDMACoordinator::update_config(BufferConfig config) {
+@@ -357,8 +546,16 @@ void RDMACoordinator::update_config(BufferConfig config) {
  }
  
  void RDMACoordinator::allocate_buffers() {
 -  allocate_combine_buffers();
 -  allocate_dispatch_buffers();
-+  const bool dmabuf_supported =
-+      gpu_handler != nullptr && gpu_handler->support_dmabuf;
 +  // Mark cleanup as necessary before the first allocation. Both allocation
 +  // routines may throw while only a subset of their resources exists.
 +  buffer_allocated = true;
 +  try {
-+    allocate_combine_buffers(dmabuf_supported);
-+    allocate_dispatch_buffers(dmabuf_supported);
++    allocate_combine_buffers();
++    allocate_dispatch_buffers();
 +  } catch (...) {
 +    destroy();
 +    throw;
@@ -241,16 +228,7 @@ index 6a17ff7..57d9c27 100644
  }
  
  void RDMACoordinator::init(  
-@@ -412,7 +622,7 @@ void RDMACoordinator::init(
-   rdma_initialized = true;
- }
- 
--void RDMACoordinator::allocate_dispatch_buffers(){
-+void RDMACoordinator::allocate_dispatch_buffers(bool dmabuf_supported){
-   dispatch_buffers.data_type = buffer_config.token_data_type;
-   size_t sizeof_token_data_type = get_token_data_type_size(dispatch_buffers.data_type);
- 
-@@ -464,22 +674,38 @@ void RDMACoordinator::allocate_dispatch_buffers(){
+@@ -464,22 +661,30 @@ void RDMACoordinator::allocate_dispatch_buffers(){
    CUDA_CHECK(cudaMemset(dispatch_buffers.expected_rdma_flag_value, 0, sizeof(uint64_t)));
  
    // Allocate memory region
@@ -272,40 +250,32 @@ index 6a17ff7..57d9c27 100644
 -                        rdma_inter_node_group_scaling_factor_elts * sizeof(float), mr_access_flag);
 +  attn_input_token_mr = register_gpu_memory(
 +      ib_pd, dispatch_buffers.attn_input_token,
-+      attn_input_token_elts * sizeof_token_data_type, mr_access_flag,
-+      dmabuf_supported, local_rank, "dispatch.attn_input_token");
++      attn_input_token_elts * sizeof_token_data_type, mr_access_flag);
 +  dispatch_rdma_inter_node_group_token_mr = register_gpu_memory(
 +      ib_pd, dispatch_buffers.rdma_inter_node_group_token,
-+      rdma_inter_node_group_token_elts * sizeof_token_data_type, mr_access_flag,
-+      dmabuf_supported, local_rank, "dispatch.rdma_inter_node_group_token");
++      rdma_inter_node_group_token_elts * sizeof_token_data_type, mr_access_flag);
 +  attn_input_flags_mr = register_gpu_memory(
 +      ib_pd, dispatch_buffers.attn_input_flags,
-+      rdma_inter_node_group_flags_elts * sizeof(uint64_t), mr_access_flag,
-+      dmabuf_supported, local_rank, "dispatch.attn_input_flags");
++      rdma_inter_node_group_flags_elts * sizeof(uint64_t), mr_access_flag);
 +  dispatch_rdma_inter_node_group_flags_mr = register_gpu_memory(
 +      ib_pd, dispatch_buffers.rdma_inter_node_group_flags,
-+      rdma_inter_node_group_flags_elts * sizeof(uint64_t), mr_access_flag,
-+      dmabuf_supported, local_rank, "dispatch.rdma_inter_node_group_flags");
++      rdma_inter_node_group_flags_elts * sizeof(uint64_t), mr_access_flag);
 +  attn_input_prob_mr = register_gpu_memory(
 +      ib_pd, dispatch_buffers.attn_input_prob,
-+      attn_input_prob_elts * sizeof(float), mr_access_flag,
-+      dmabuf_supported, local_rank, "dispatch.attn_input_prob");
++      attn_input_prob_elts * sizeof(float), mr_access_flag);
 +  dispatch_rdma_inter_node_group_prob_mr = register_gpu_memory(
 +      ib_pd, dispatch_buffers.rdma_inter_node_group_prob,
-+      rdma_inter_node_group_prob_elts * sizeof(float), mr_access_flag,
-+      dmabuf_supported, local_rank, "dispatch.rdma_inter_node_group_prob");
++      rdma_inter_node_group_prob_elts * sizeof(float), mr_access_flag);
 +  attn_input_token_scaling_factor_mr = register_gpu_memory(
 +      ib_pd, dispatch_buffers.attn_input_scaling_factor,
-+      attn_input_token_scaling_factor_elts * sizeof(float), mr_access_flag,
-+      dmabuf_supported, local_rank, "dispatch.attn_input_scaling_factor");
++      attn_input_token_scaling_factor_elts * sizeof(float), mr_access_flag);
 +  dispatch_rdma_inter_node_group_scaling_factor_mr = register_gpu_memory(
 +      ib_pd, dispatch_buffers.rdma_inter_node_group_scaling_factor,
-+      rdma_inter_node_group_scaling_factor_elts * sizeof(float), mr_access_flag,
-+      dmabuf_supported, local_rank, "dispatch.rdma_inter_node_group_scaling_factor");
++      rdma_inter_node_group_scaling_factor_elts * sizeof(float), mr_access_flag);
  
    // Set dispatch queue pair attributes.
    int num_of_dispatch_qps = (buffer_config.num_of_nodes - 1) * buffer_config.num_of_blocks_dispatch_api;
-@@ -495,7 +721,8 @@ void RDMACoordinator::allocate_dispatch_buffers(){
+@@ -495,7 +700,8 @@ void RDMACoordinator::allocate_dispatch_buffers(){
    doca_verbs_qp_attr_set_allow_remote_read(dispatch_gverbs_ctx.qp_attr, 1);
    doca_verbs_qp_attr_set_allow_remote_atomic(dispatch_gverbs_ctx.qp_attr, DOCA_VERBS_QP_ATOMIC_MODE_IB_SPEC);
    
@@ -315,7 +285,7 @@ index 6a17ff7..57d9c27 100644
    dispatch_remote_info_vec = static_cast<remote_info *>(calloc(buffer_config.num_of_nodes * num_of_dispatch_qps, sizeof(remote_info)));
    remote_info *my_dispatch_info = static_cast<remote_info *>(calloc(num_of_dispatch_qps, sizeof(remote_info)));
    int token_stride = buffer_config.max_num_of_tokens_per_rank * buffer_config.hidden_dim;
-@@ -516,19 +743,19 @@ void RDMACoordinator::allocate_dispatch_buffers(){
+@@ -516,19 +722,19 @@ void RDMACoordinator::allocate_dispatch_buffers(){
        curr_info->token_rkey = dispatch_rdma_inter_node_group_token_mr->rkey;
        switch (dispatch_buffers.data_type) {
          case APP_TOKEN_DATA_TYPE::UINT8:
@@ -340,7 +310,7 @@ index 6a17ff7..57d9c27 100644
                                                      peer_idx * scaling_factor_stride);
      }
    }
-@@ -545,7 +772,8 @@ void RDMACoordinator::allocate_dispatch_buffers(){
+@@ -545,7 +751,8 @@ void RDMACoordinator::allocate_dispatch_buffers(){
    }
    CUDA_CHECK(cudaMalloc(&dispatch_gverbs_ctx.d_qps_gpu, num_of_dispatch_qps * sizeof(doca_gpu_dev_verbs_qp*)));
    CUDA_CHECK(cudaMemcpy(dispatch_gverbs_ctx.d_qps_gpu, h_qps_gpu, num_of_dispatch_qps * sizeof(doca_gpu_dev_verbs_qp*), cudaMemcpyHostToDevice));
@@ -350,7 +320,7 @@ index 6a17ff7..57d9c27 100644
    dispatch_mr_info_h = (dispatch_memory_region_info_t *)calloc(sizeof(dispatch_memory_region_info_t), num_of_dispatch_qps);
    CUDA_CHECK(cudaMalloc((void**)&dispatch_mr_info_d, num_of_dispatch_qps * sizeof(dispatch_memory_region_info_t)));
    for (int qp_idx = 0; qp_idx < buffer_config.num_of_blocks_dispatch_api; ++qp_idx) {
-@@ -555,20 +783,20 @@ void RDMACoordinator::allocate_dispatch_buffers(){
+@@ -555,20 +762,20 @@ void RDMACoordinator::allocate_dispatch_buffers(){
        int my_idx = qp_idx * (buffer_config.num_of_nodes - 1) + peer_idx;
        int rem_idx = actual_node_idx * num_of_dispatch_qps + qp_idx * (buffer_config.num_of_nodes - 1) + actual_idx_in_node;
        struct dispatch_memory_region_info_t *data = dispatch_mr_info_h + my_idx;
@@ -375,19 +345,15 @@ index 6a17ff7..57d9c27 100644
        data->prob_lkey = htobe32(attn_input_prob_mr->lkey);
        data->prob_raddr = dispatch_remote_info_vec[rem_idx].prob_vaddr;
        data->prob_rkey = htobe32(dispatch_remote_info_vec[rem_idx].prob_rkey);
-@@ -583,10 +811,9 @@ void RDMACoordinator::allocate_dispatch_buffers(){
+@@ -583,7 +790,6 @@ void RDMACoordinator::allocate_dispatch_buffers(){
    // Free temporary resources.
    free(my_dispatch_info);
    free(h_qps_gpu);
 -  buffer_allocated = true;
  }
  
--void RDMACoordinator::allocate_combine_buffers(){
-+void RDMACoordinator::allocate_combine_buffers(bool dmabuf_supported){
-   // Calculate rdma buffers sizes
-   auto rdma_intra_node_red_token_elts = buffer_config.max_num_of_tokens_per_rank *
-                                         (buffer_config.num_of_nodes - 1) * buffer_config.hidden_dim;
-@@ -623,18 +850,30 @@ void RDMACoordinator::allocate_combine_buffers(){
+ void RDMACoordinator::allocate_combine_buffers(){
+@@ -623,18 +829,24 @@ void RDMACoordinator::allocate_combine_buffers(){
    CUDA_CHECK(cudaMalloc((void**)&combine_buffers.expected_rdma_flag_value, sizeof(uint64_t)));
    CUDA_CHECK(cudaMemset(combine_buffers.expected_rdma_flag_value, 0, sizeof(uint64_t)));
  
@@ -405,32 +371,26 @@ index 6a17ff7..57d9c27 100644
 -                        rdma_inter_node_group_prob_elts * sizeof(float), mr_access_flag);
 +  rdma_intra_node_red_token_mr = register_gpu_memory(
 +      ib_pd, combine_buffers.rdma_intra_node_red_token,
-+      rdma_intra_node_red_token_elts * sizeof(uint16_t), mr_access_flag,
-+      dmabuf_supported, local_rank, "combine.rdma_intra_node_red_token");
++      rdma_intra_node_red_token_elts * sizeof(uint16_t), mr_access_flag);
 +  combine_rdma_inter_node_group_token_mr = register_gpu_memory(
 +      ib_pd, combine_buffers.rdma_inter_node_group_token,
-+      rdma_inter_node_group_token_elts * sizeof(uint16_t), mr_access_flag,
-+      dmabuf_supported, local_rank, "combine.rdma_inter_node_group_token");
++      rdma_inter_node_group_token_elts * sizeof(uint16_t), mr_access_flag);
 +  attn_output_flags_mr = register_gpu_memory(
 +      ib_pd, combine_buffers.attn_output_flags,
-+      rdma_inter_node_group_flags_elts * sizeof(uint64_t), mr_access_flag,
-+      dmabuf_supported, local_rank, "combine.attn_output_flags");
++      rdma_inter_node_group_flags_elts * sizeof(uint64_t), mr_access_flag);
 +  combine_rdma_inter_node_group_flags_mr = register_gpu_memory(
 +      ib_pd, combine_buffers.rdma_inter_node_group_flags,
-+      rdma_inter_node_group_flags_elts * sizeof(uint64_t), mr_access_flag,
-+      dmabuf_supported, local_rank, "combine.rdma_inter_node_group_flags");
++      rdma_inter_node_group_flags_elts * sizeof(uint64_t), mr_access_flag);
 +  rdma_intra_node_red_prob_mr = register_gpu_memory(
 +      ib_pd, combine_buffers.rdma_intra_node_red_prob,
-+      rdma_intra_node_red_prob_elts * sizeof(float), mr_access_flag,
-+      dmabuf_supported, local_rank, "combine.rdma_intra_node_red_prob");
++      rdma_intra_node_red_prob_elts * sizeof(float), mr_access_flag);
 +  combine_rdma_inter_node_group_prob_mr = register_gpu_memory(
 +      ib_pd, combine_buffers.rdma_inter_node_group_prob,
-+      rdma_inter_node_group_prob_elts * sizeof(float), mr_access_flag,
-+      dmabuf_supported, local_rank, "combine.rdma_inter_node_group_prob");
++      rdma_inter_node_group_prob_elts * sizeof(float), mr_access_flag);
  
    // Set combine queue pair attributes.
    int num_of_combine_qps = (buffer_config.num_of_nodes - 1) * buffer_config.num_of_blocks_combine_api;
-@@ -650,7 +889,8 @@ void RDMACoordinator::allocate_combine_buffers(){
+@@ -650,7 +862,8 @@ void RDMACoordinator::allocate_combine_buffers(){
    doca_verbs_qp_attr_set_allow_remote_read(combine_gverbs_ctx.qp_attr, 1);
    doca_verbs_qp_attr_set_allow_remote_atomic(combine_gverbs_ctx.qp_attr, DOCA_VERBS_QP_ATOMIC_MODE_IB_SPEC);
  
@@ -440,7 +400,7 @@ index 6a17ff7..57d9c27 100644
    combine_remote_info_vec = static_cast<remote_info *>(calloc(buffer_config.num_of_nodes * num_of_combine_qps, sizeof(remote_info)));
    remote_info *my_combine_info = static_cast<remote_info *>(calloc(num_of_combine_qps, sizeof(remote_info)));
    int token_stride = buffer_config.max_num_of_tokens_per_rank * buffer_config.hidden_dim;
-@@ -668,12 +908,12 @@ void RDMACoordinator::allocate_combine_buffers(){
+@@ -668,12 +881,12 @@ void RDMACoordinator::allocate_combine_buffers(){
        memset(&curr_info->gid, 0, sizeof(curr_info->gid));;
        memcpy(curr_info->gid.raw, combine_gverbs_ctx.gid.raw, 16);
        curr_info->token_rkey = combine_rdma_inter_node_group_token_mr->rkey;
@@ -456,7 +416,7 @@ index 6a17ff7..57d9c27 100644
                                            peer_idx * prob_stride);
      }
    }
-@@ -691,7 +931,8 @@ void RDMACoordinator::allocate_combine_buffers(){
+@@ -691,7 +904,8 @@ void RDMACoordinator::allocate_combine_buffers(){
    }
    CUDA_CHECK(cudaMalloc(&combine_gverbs_ctx.d_qps_gpu, num_of_combine_qps * sizeof(doca_gpu_dev_verbs_qp*)));
    CUDA_CHECK(cudaMemcpy(combine_gverbs_ctx.d_qps_gpu, h_qps_gpu, num_of_combine_qps * sizeof(doca_gpu_dev_verbs_qp*), cudaMemcpyHostToDevice));
@@ -466,7 +426,7 @@ index 6a17ff7..57d9c27 100644
    combine_mr_info_h = (combine_memory_region_info_t *)calloc(sizeof(combine_memory_region_info_t), num_of_combine_qps);
    CUDA_CHECK(cudaMalloc((void**)&combine_mr_info_d, num_of_combine_qps * sizeof(combine_memory_region_info_t)));
    for (int qp_idx = 0; qp_idx < buffer_config.num_of_blocks_combine_api; ++qp_idx) {
-@@ -701,16 +942,16 @@ void RDMACoordinator::allocate_combine_buffers(){
+@@ -701,16 +915,16 @@ void RDMACoordinator::allocate_combine_buffers(){
        int my_idx = qp_idx * (buffer_config.num_of_nodes - 1) + peer_idx;
        int rem_idx = actual_node_idx * num_of_combine_qps + qp_idx * (buffer_config.num_of_nodes - 1) + actual_idx_in_node;
        struct combine_memory_region_info_t *data = combine_mr_info_h + my_idx;
@@ -486,7 +446,7 @@ index 6a17ff7..57d9c27 100644
        data->prob_lkey = htobe32(rdma_intra_node_red_prob_mr->lkey);
        data->prob_raddr = combine_remote_info_vec[rem_idx].prob_vaddr;
        data->prob_rkey = htobe32(combine_remote_info_vec[rem_idx].prob_rkey);
-@@ -724,7 +965,6 @@ void RDMACoordinator::allocate_combine_buffers(){
+@@ -724,7 +938,6 @@ void RDMACoordinator::allocate_combine_buffers(){
    // Free temporary resources.
    free(my_combine_info);
    free(h_qps_gpu);
@@ -494,7 +454,7 @@ index 6a17ff7..57d9c27 100644
  }    
  
  void RDMACoordinator::destroy() {
-@@ -799,18 +1039,39 @@ void RDMACoordinator::destroy() {
+@@ -799,18 +1012,39 @@ void RDMACoordinator::destroy() {
    // If we use doca_gpu_verbs_destroy_qp_hl and re-allocate RDMA resources, "part or all of the requested memory range is already mapped" occurs. Do not know why now, so just comment it out.
    int num_of_dispatch_qps = (buffer_config.num_of_nodes - 1) * buffer_config.num_of_blocks_dispatch_api;
    int num_of_combine_qps = (buffer_config.num_of_nodes - 1) * buffer_config.num_of_blocks_combine_api;
@@ -540,7 +500,7 @@ index 6a17ff7..57d9c27 100644
  
    buffer_allocated = false;
    #undef CLOSE_MR
-@@ -853,8 +1114,8 @@ RDMACoordinator::~RDMACoordinator() {
+@@ -853,8 +1087,8 @@ RDMACoordinator::~RDMACoordinator() {
      ibv_dealloc_pd(ib_pd);
      // Close device.
      ibv_close_device(ib_context);
@@ -550,7 +510,7 @@ index 6a17ff7..57d9c27 100644
        free(gpu_handler);
        gpu_handler = nullptr;
      }
-@@ -862,4 +1123,4 @@ RDMACoordinator::~RDMACoordinator() {
+@@ -862,4 +1096,4 @@ RDMACoordinator::~RDMACoordinator() {
  
    rdma_initialized = false;
    buffer_allocated = false;
@@ -558,21 +518,18 @@ index 6a17ff7..57d9c27 100644
 \ No newline at end of file
 +}
 diff --git a/csrc/hybrid_ep/buffer/internode_doca.cuh b/csrc/hybrid_ep/buffer/internode_doca.cuh
-index 04f061d..ab4d0de 100644
+index 04f061d7..5000a92c 100644
 --- a/csrc/hybrid_ep/buffer/internode_doca.cuh
 +++ b/csrc/hybrid_ep/buffer/internode_doca.cuh
-@@ -144,8 +144,8 @@ public:
+@@ -144,6 +144,7 @@ public:
      InterNodeCombineBuffers combine_buffers;
  
  private:
--    void allocate_dispatch_buffers();
--    void allocate_combine_buffers();
-+    void allocate_dispatch_buffers(bool dmabuf_supported);
-+    void allocate_combine_buffers(bool dmabuf_supported);
++    struct ibv_mr* register_gpu_memory(struct ibv_pd* pd, void* address, size_t length, int access);
+     void allocate_dispatch_buffers();
+     void allocate_combine_buffers();
      int gid_index = 0;
-     int node_rank = -1;
-     int local_rank = -1;
-@@ -170,7 +170,7 @@ private:
+@@ -170,7 +171,7 @@ private:
      struct ibv_mr *dispatch_rdma_inter_node_group_scaling_factor_mr = nullptr;
      struct remote_info *dispatch_remote_info_vec = nullptr;
      struct dispatch_memory_region_info_t *dispatch_mr_info_h = nullptr;
@@ -581,7 +538,7 @@ index 04f061d..ab4d0de 100644
      struct dispatch_memory_region_info_t *dispatch_mr_info_d = nullptr;
  
      struct ibv_mr *rdma_intra_node_red_token_mr = nullptr;
-@@ -181,7 +181,7 @@ private:
+@@ -181,7 +182,7 @@ private:
      struct ibv_mr *combine_rdma_inter_node_group_flags_mr = nullptr;
      struct remote_info *combine_remote_info_vec = nullptr;
      struct combine_memory_region_info_t *combine_mr_info_h = nullptr;

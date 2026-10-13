@@ -156,7 +156,7 @@ RUN if [ "$INSTALL_TE" = "True" ] || \
 # deepep.patch also backports https://github.com/deepseek-ai/DeepEP/pull/564 for NVSHMEM 3.6.5 compatibility.
 # Remove the configs.cuh/ibgda_device.cuh hunks when the pinned revision includes that fix.
 # deepep-hybridep-dmabuf.patch backports https://github.com/deepseek-ai/DeepEP/pull/750
-# at 6e6017c62ea466b5c51deea10d7a803d0958b54d (base: DEEPEP_COMMIT below).
+# at 4242f706f25adc34acd8dfd002ed83dd3ac5b6ad (base: DEEPEP_COMMIT below).
 # It falls back to DMA-BUF only when legacy ibv_reg_mr registration fails.
 # Remove this patch when DEEPEP_COMMIT includes the upstream fix.
 COPY docker/common/deepep.patch /opt/deepep.patch
