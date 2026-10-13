@@ -534,3 +534,14 @@ class TestBackendConfigHybridEPSyncFree:
     def test_capacity_factor_below_one_is_rejected(self):
         with pytest.raises(ValueError, match="must be >= 1.0"):
             BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_capacity_factor=0.5)
+
+    def test_capacity_factor_with_static_routing_is_rejected(self):
+        """The pinned static count already keeps the dispatch non-blocking; the factor would be silently unused."""
+        with pytest.raises(ValueError, match="no effect under benchmark_static_routing"):
+            BackendConfig(
+                experts="torch_mm",
+                dispatcher="hybridep",
+                fake_balanced_gate=True,
+                benchmark_static_routing=True,
+                dispatcher_capacity_factor=1.5,
+            )

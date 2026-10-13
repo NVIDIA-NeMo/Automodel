@@ -1014,6 +1014,9 @@ class HybridEPCombine(torch.autograd.Function):
             num_permuted_tokens=ctx.num_permuted_tokens,
             fuse_permute_dispatch=ctx.fuse_permute,
             # Capacity mode hands a host int: the backward dispatch then needs no stream drain either.
+            # The static-routing pin is a 0-d tensor (``tokens_per_expert.sum()``): the forward treats
+            # any non-None extent as non-blocking, but the backward keeps that pin on the blocking path
+            # as before this change, which only moves the capacity path off the drain.
             non_blocking=isinstance(ctx.num_permuted_tokens, int),
         )
         return dispatched_hidden, None, None, None, None

@@ -824,9 +824,46 @@ class TestHybridEPCapacityMode:
         _, _, asserts = self._run(monkeypatch, 1.5, [8, 8], tpe_rows=[5, 5], overflow=1)
         assert asserts and asserts[-1][0] is False and "capacity" in asserts[-1][1]
 
-    def test_static_routing_ignores_the_factor(self, monkeypatch):
-        m, passed, asserts = self._run(monkeypatch, 1.5, [8, 8], tpe_rows=[5, 5], static=True)
-        assert passed[0] is None and m._hybridep_capacity is None and asserts == []
+    def test_static_routing_with_the_factor_is_rejected(self, monkeypatch):
+        """BackendConfig refuses the pairing; the manager refuses it too when built directly."""
+        with pytest.raises(ValueError, match="cannot be combined with benchmark_static_routing"):
+            self._run(monkeypatch, 1.5, [8, 8], tpe_rows=[5, 5], static=True)
+
+    def test_capacity_rounds_up_not_down(self, monkeypatch):
+        """10 rows x 1.25 = 12.5 -> ceil 13 -> aligned 16; floor would give 12 and no alignment step."""
+        m, passed, _ = self._run(monkeypatch, 1.25, [8, 8], tpe_rows=[5, 5])
+        assert m._hybridep_capacity == 16 and passed == [None, 16]
+
+    def test_capacity_is_the_ep_group_maximum(self, monkeypatch):
+        """Every rank must allocate the same buffers: the local capacity goes through an EP-group MAX."""
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            m = _HybridEPManager(
+                group=None, num_local_experts=2, num_experts=8, router_topk=2, moe_hybridep_capacity_factor=1.5
+            )
+        reduced = []
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            reduced.append((int(tensor), op))
+            tensor.fill_(40)  # another rank calibrated a larger capacity
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        m._calibrate_hybridep_capacity(torch.tensor([5, 5]), torch.device("cpu"))
+        assert reduced == [(16, torch.distributed.ReduceOp.MAX)]
+        assert m._hybridep_capacity == 40 and m.num_permuted_tokens == 10
+
+    def test_overflow_guard_refuses_an_unexpected_handle_layout(self):
+        """A handle that does not end with the overflow_flag tensor is an error, never a silent no-op."""
+        from nemo_automodel.components.moe.megatron.token_dispatcher import _assert_no_hybridep_overflow
+
+        with pytest.raises(RuntimeError, match="does not end with the overflow_flag tensor"):
+            _assert_no_hybridep_overflow(("layout", 12), capacity=16)
+        with pytest.raises(RuntimeError, match="does not end with the overflow_flag tensor"):
+            _assert_no_hybridep_overflow(None, capacity=16)
 
     def test_no_factor_keeps_the_blocking_path(self, monkeypatch):
         m, passed, asserts = self._run(monkeypatch, None, [8, 8], tpe_rows=[5, 5])

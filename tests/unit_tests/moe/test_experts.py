@@ -1032,6 +1032,46 @@ class TestGroupedExpertsDeepEP:
         for actual, reference in zip(actual_grads, expected_grads):
             torch.testing.assert_close(actual, reference)
 
+    @pytest.mark.parametrize(
+        ("backend_kwargs", "skips_host_read"),
+        [
+            ({"dispatcher": "deepep"}, False),
+            ({"dispatcher": "hybridep", "dispatcher_capacity_factor": 1.5}, True),
+            ({"dispatcher": "hybridep", "fake_balanced_gate": True, "benchmark_static_routing": True}, True),
+        ],
+        ids=["blocking", "capacity", "static-routing"],
+    )
+    def test_grouped_experts_deepep_forward_skips_count_nonzero_when_rows_are_never_empty(
+        self, moe_config, monkeypatch, backend_kwargs, skips_host_read
+    ):
+        """Capacity mode and static routing never dispatch an empty buffer: the per-microbatch
+        ``count_nonzero`` device-to-host read is skipped; the blocking path still performs it."""
+        config = replace(
+            moe_config, n_routed_experts=1, n_activated_experts=1, dim=4, moe_inter_dim=3, dtype=torch.float32
+        )
+        torch.manual_seed(42)
+        backend = BackendConfig(experts="torch_mm", **backend_kwargs)
+        experts = GroupedExpertsDeepEP(config, backend=backend)
+        assert experts.dispatch_rows_never_empty is skips_host_read
+        for parameter in experts.parameters():
+            torch.nn.init.normal_(parameter, std=0.1)
+        args = self._prepare_forward_path(experts, num_tokens=5)
+        experts.expert_activation = lambda value, probabilities: value.chunk(2, dim=-1)[0] * probabilities
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: lambda v, w, offs: v @ w[0]
+        )
+        host_reads = []
+        real_count_nonzero = torch.count_nonzero
+
+        def counting_count_nonzero(*a, **kw):
+            host_reads.append(1)
+            return real_count_nonzero(*a, **kw)
+
+        monkeypatch.setattr(torch, "count_nonzero", counting_count_nonzero)
+        output = experts(*args[:4])
+        assert output.shape == (5, config.dim)
+        assert (len(host_reads) == 0) is skips_host_read
+
     def test_grouped_experts_deepep_forward_preserves_bias_free_mxfp8_backend(self, moe_config, monkeypatch):
         """Bias-free whole-dispatch execution forwards the requested MXFP8 backend."""
         backend = BackendConfig(experts="torch_mm_mxfp8", dispatcher="deepep")

@@ -557,7 +557,8 @@ class BackendConfig:
     # HybridEP only: every EP rank dispatches the same number of rows (fixed-shape batches, which is
     # every batch that is not variable-length / in-batch packed), so the per-dispatch EP-group MAX
     # all-reduce + int() host sync that derives the pad size is skipped and the local count is only
-    # aligned. Leave False for variable-length inputs: unequal counts abort the HybridEP collective.
+    # aligned. Leave False for variable-length inputs: with genuinely unequal aligned counts the
+    # HybridEP collective hangs silently (no exception; the job sits until its time limit).
     dispatcher_equal_token_counts: bool = False
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     dispatcher_hybridep_permute_fusion: bool = False
@@ -731,6 +732,13 @@ class BackendConfig:
             raise ValueError(
                 f"dispatcher_capacity_factor must be >= 1.0 (a smaller buffer overflows on the first skewed batch), "
                 f"got {self.dispatcher_capacity_factor!r}"
+            )
+        if self.dispatcher_capacity_factor is not None and self.benchmark_static_routing:
+            # Static routing already pins the dispatched count after the first dispatch, so the capacity
+            # buffers would never be used; refuse instead of ignoring the factor at run time.
+            raise ValueError(
+                "dispatcher_capacity_factor has no effect under benchmark_static_routing (the pinned count already "
+                "keeps the dispatch non-blocking); unset one of them"
             )
 
 

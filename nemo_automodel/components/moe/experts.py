@@ -1485,13 +1485,15 @@ class GroupedExpertsDeepEP(nn.Module):
         )
         # HybridEP capacity mode (BackendConfig.dispatcher_capacity_factor): the dispatcher returns
         # device-side tokens_per_expert and buffers of a fixed capacity, so the per-microbatch
-        # count_nonzero host read below is skipped as well (rows are never empty).
-        self.dispatcher_capacity_factor = (
-            getattr(backend, "dispatcher_capacity_factor", None) if backend is not None else None
-        )
-        self.dispatcher_equal_token_counts = (
-            bool(getattr(backend, "dispatcher_equal_token_counts", False)) if backend is not None else False
-        )
+        # count_nonzero host read in forward is skipped as well (rows are never empty).
+        self.dispatcher_capacity_factor = backend.dispatcher_capacity_factor if backend is not None else None
+        self.dispatcher_equal_token_counts = backend.dispatcher_equal_token_counts if backend is not None else False
+        # One flag for the four expert classes' forward: with static routing (forced balance, no noise)
+        # every expert receives tokens by construction, and capacity mode never dispatches an empty
+        # buffer, so the count_nonzero device-to-host read (one per microbatch, and again per
+        # activation-checkpoint recompute) can be skipped. The wrappers copy it with the other
+        # HybridEP settings.
+        self.dispatch_rows_never_empty = self.static_routing or self.dispatcher_capacity_factor is not None
         if self.dispatcher_capacity_factor is not None and self.expert_bias:
             # Capacity mode pads the dispatched buffer past the routed row count while tokens_per_expert
             # still sums to the routed rows; _apply_bias sizes its repeat_interleave from the buffer rows,
@@ -1657,15 +1659,9 @@ class GroupedExpertsDeepEP(nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
-        # With static routing (forced balance, no noise) every expert receives tokens by
-        # construction, so the count_nonzero device-to-host read (one per microbatch, and
-        # again per activation-checkpoint recompute) can be skipped.
+        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read.
         router_weight_already_applied = False
-        if (
-            self.static_routing
-            or self.dispatcher_capacity_factor is not None
-            or torch.count_nonzero(tokens_per_expert) > 0
-        ):
+        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             gate_up_output_bytes = (
                 permuted_local_hidden_states.shape[0]

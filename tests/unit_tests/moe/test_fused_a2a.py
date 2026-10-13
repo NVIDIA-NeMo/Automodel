@@ -201,6 +201,34 @@ def test_hybridep_permute_fusion_is_used_in_forward_and_backward(monkeypatch):
     torch.testing.assert_close(probs.grad, torch.ones_like(probs))
 
 
+@pytest.mark.parametrize(
+    ("extent", "expect_non_blocking"),
+    [(24, True), (torch.tensor(24), False), (None, False)],
+    ids=["capacity-int", "static-pin-tensor", "blocking"],
+)
+def test_hybridep_combine_backward_dispatch_is_non_blocking_only_for_a_host_int_extent(
+    monkeypatch, extent, expect_non_blocking
+):
+    """Capacity mode's host int keeps the backward dispatch off the stream drain; a tensor pin or None does not."""
+    seen = {}
+
+    class FakeHybridEPBuffer:
+        def combine_with_unpermute(self, *, hidden, handle, pad_multiple, fuse_unpermute_combine=False):
+            return hidden, None
+
+        def dispatch_with_permute(self, **kwargs):
+            seen.update(kwargs)
+            return kwargs["hidden"], None, None, torch.tensor([1, 1]), ("unused",)
+
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", FakeHybridEPBuffer())
+    hidden = torch.randn(2, 4, requires_grad=True)
+
+    fused_a2a.HybridEPCombine.apply(hidden, ("handle",), extent, None, False).sum().backward()
+
+    assert seen["non_blocking"] is expect_non_blocking
+    assert seen["num_permuted_tokens"] is extent
+
+
 def test_hybridep_combine_permute_fusion_is_used_in_forward_and_backward(monkeypatch):
     """Combine autograd must pair fused unpermute forward with fused permute backward."""
 
