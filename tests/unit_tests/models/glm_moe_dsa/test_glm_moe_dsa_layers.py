@@ -19,6 +19,9 @@ import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.glm_moe_dsa.config import (
+    GlmMoeDsaConfig as AutoModelConfig,
+)
 from nemo_automodel.components.models.glm_moe_dsa.layers import (
     GlmMoeDsaIndexer,
     GlmMoeDsaMLA,
@@ -132,6 +135,102 @@ def test_rotate_activation_converts_to_bfloat16():
 
 
 class TestGlmMoeDsaIndexer:
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("interleaved", [None, False, True])
+    def test_checkpoint_rotary_layout_selects_expected_keys(self, config, sdpa_backend, packed, interleaved):
+        # Load checkpoint-style fields through AutoModel's config boundary.
+        fields = config.to_dict()
+        fields.pop("indexer_rope_interleave", None)
+        if interleaved is not None:
+            fields["indexer_rope_interleave"] = interleaved
+        config = AutoModelConfig.from_dict(fields)
+        torch.manual_seed(31)
+        indexer = GlmMoeDsaIndexer(config, sdpa_backend)
+        batch, seq_len = 2, 9  # More valid causal keys than index_topk=2.
+        x = torch.randn(batch, seq_len, config.hidden_size)
+        q_resid = torch.randn(batch, seq_len, config.q_lora_rank)
+        angles = torch.arange(seq_len).float()[:, None] * torch.tensor([0.7, 0.2])
+        angles = angles.expand(batch, -1, -1)
+        freqs = torch.polar(torch.ones_like(angles), angles)
+
+        # Independent reference: multiply by explicit rotation matrices, leaving
+        # the non-positional coordinates untouched. No production RoPE helpers.
+        rotation = torch.eye(config.index_head_dim).repeat(batch, seq_len, 1, 1)
+        pairs = [(0, 1), (2, 3)] if interleaved else [(0, 2), (1, 3)]
+        for frequency, (first, second) in enumerate(pairs):
+            cos, sin = angles[..., frequency].cos(), angles[..., frequency].sin()
+            rotation[..., first, first] = cos
+            rotation[..., second, second] = cos
+            rotation[..., first, second] = -sin
+            rotation[..., second, first] = sin
+        q = indexer.wq_b(q_resid).reshape(batch, seq_len, config.index_n_heads, config.index_head_dim)
+        k = indexer.k_norm(indexer.wk(x))
+        q = torch.einsum("bsij,bshj->bshi", rotation, q)
+        k = torch.einsum("bsij,bsj->bsi", rotation, k)
+        scores = torch.einsum("bshd,btd->bsht", q, k).mul(config.index_head_dim**-0.5).relu()
+        weights = indexer.weights_proj(x) * config.index_n_heads**-0.5
+        scores = torch.einsum("bsht,bsh->bst", scores, weights)
+        future = torch.ones(seq_len, seq_len, dtype=torch.bool).triu(1)
+        scores = scores.masked_fill(future, float("-inf"))
+        expected = scores.topk(config.index_topk, dim=-1).indices
+
+        if packed:
+            # Each THD invocation is one document; BSHD covers independent batches.
+            actual = torch.stack([indexer(x[b], q_resid[b], freqs[b]) for b in range(batch)])
+        else:
+            actual = indexer(x, q_resid, freqs)
+        # Exclude the initial dense prefix and compare sets, not tied-score order.
+        torch.testing.assert_close(
+            actual[:, config.index_topk :].sort(dim=-1).values,
+            expected[:, config.index_topk :].sort(dim=-1).values,
+        )
+
+    @pytest.mark.parametrize("backend_name", ["tilelang", "cudnn"])
+    @pytest.mark.parametrize("interleaved", [False, True])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_rotary_layout_at_sparse_kernel_boundary(self, config, sdpa_backend, backend_name, interleaved, dtype):
+        fields = config.to_dict()
+        fields["indexer_rope_interleave"] = interleaved
+        config = AutoModelConfig.from_dict(fields)
+        sdpa_backend.attn = backend_name
+        torch.manual_seed(31)
+        indexer = GlmMoeDsaIndexer(config, sdpa_backend).to(dtype=dtype)
+        x = torch.randn(5, config.hidden_size, dtype=dtype, requires_grad=True)
+        q_resid = torch.randn(5, config.q_lora_rank, dtype=dtype, requires_grad=True)
+        # A quarter turn at frequency 0 and identity at frequency 1 have an
+        # exact signed-permutation oracle in either dtype.
+        freqs = torch.tensor([[1j, 1 + 0j]], dtype=torch.complex64).expand(5, -1).contiguous()
+        q = indexer.wq_b(q_resid).reshape(5, config.index_n_heads, config.index_head_dim)
+        k = indexer.k_norm(indexer.wk(x))
+        permutation = [1, 0, 2, 3, 4, 5, 6, 7] if interleaved else [2, 1, 0, 3, 4, 5, 6, 7]
+        signs = torch.tensor([-1, 1, 1, 1, 1, 1, 1, 1], dtype=dtype)
+        expected_q, expected_k = q[..., permutation] * signs, k[..., permutation] * signs
+        module = "nemo_automodel.components.models.glm_moe_dsa.layers"
+        # Only the optional GPU scoring kernel is replaced; all projection,
+        # normalization and rotary math runs on real tensors through forward().
+        with (
+            patch(f"{module}.is_cudnn_dsa_available", return_value=True),
+            patch(f"{module}.is_dsa_kernel_available", return_value=True),
+            patch(f"{module}.should_use_tilelang", return_value=True),
+            patch(f"{module}.{backend_name}_indexer_topk") as kernel,
+        ):
+            indexer(x, q_resid, freqs, cu_seqlens=torch.tensor([0, 5], dtype=torch.int32))
+        actual_q, actual_k = kernel.call_args.args[:2]
+        torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=0)
+        upstream = (torch.randn_like(q), torch.randn_like(k))
+        actual_grads = torch.autograd.grad((actual_q, actual_k), (x, q_resid), upstream)
+        expected_grads = torch.autograd.grad((expected_q, expected_k), (x, q_resid), upstream)
+        for actual, expected in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("invalid", [None, "false", 0, 1])
+    def test_invalid_checkpoint_rotary_layout_is_rejected(self, config, sdpa_backend, invalid):
+        fields = config.to_dict()
+        fields["indexer_rope_interleave"] = invalid
+        with pytest.raises(ValueError, match="indexer_rope_interleave must be boolean"):
+            GlmMoeDsaIndexer(AutoModelConfig.from_dict(fields), sdpa_backend)
+
     def test_initialization_uses_reference_shapes_and_layernorm_eps(self, config, sdpa_backend):
         indexer = GlmMoeDsaIndexer(config, sdpa_backend)
 

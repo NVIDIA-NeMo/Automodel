@@ -40,6 +40,13 @@ def hf_config_hub(tmp_path, monkeypatch):
         if request.url.path == "/api/agent-harnesses":
             return httpx.Response(200, request=request, json={})
         requests.append(request)
+        if request.url.path == "/api/models/test/config-race" or request.url.path.startswith(
+            "/api/models/test/config-race/revision/"
+        ):
+            revision = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200, request=request, json={"id": "test/config-race", "sha": A if revision == A else B}
+            )
         revision = request.url.path.split("/resolve/")[1].split("/")[0]
         commit = A if revision == A else B
         filename = request.url.path.split("/resolve/")[1].split("/", 1)[1]
@@ -61,5 +68,4 @@ def hf_config_hub(tmp_path, monkeypatch):
     monkeypatch.setattr(httpx.Client, "send", respond)
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
     monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", False)
-    monkeypatch.setattr("transformers.utils.hub._is_offline_mode", False, raising=False)
     return tmp_path, cache, ref, requests

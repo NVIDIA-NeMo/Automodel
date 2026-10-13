@@ -1404,18 +1404,26 @@ class TestMoE:
     def test_moe_forwards_dispatcher_config_to_experts(self, moe_config, backend_config):
         """MoE should pass BackendConfig dispatcher knobs to flex dispatcher experts."""
         backend_config.experts = "torch_mm"
-        backend_config.dispatcher = "deepep"
+        backend_config.dispatcher = "hybridep"
         backend_config.dispatcher_num_sms = 12
         backend_config.dispatcher_share_token_dispatcher = False
         backend_config.dispatcher_async_dispatch = True
+        backend_config.dispatcher_hybridep_permute_fusion = True
+        backend_config.dispatcher_hybridep_num_sms_preprocessing = 132
+        backend_config.dispatcher_hybridep_num_blocks_permute = 112
+        backend_config.dispatcher_hybridep_num_blocks_unpermute = 111
         with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
             moe = MoE(moe_config, backend_config)
 
         assert isinstance(moe.experts, GroupedExpertsDeepEP)
-        assert moe.experts.dispatcher_backend == "deepep"
+        assert moe.experts.dispatcher_backend == "hybridep"
         assert moe.experts.dispatcher_num_sms == 12
         assert moe.experts.dispatcher_share_token_dispatcher is False
         assert moe.experts.dispatcher_async_dispatch is True
+        assert moe.experts.dispatcher_hybridep_permute_fusion is True
+        assert moe.experts.dispatcher_hybridep_num_sms_preprocessing == 132
+        assert moe.experts.dispatcher_hybridep_num_blocks_permute == 112
+        assert moe.experts.dispatcher_hybridep_num_blocks_unpermute == 111
 
     def test_moe_init_with_shared_experts(self, moe_config, backend_config):
         """Test MoE initialization with shared experts."""

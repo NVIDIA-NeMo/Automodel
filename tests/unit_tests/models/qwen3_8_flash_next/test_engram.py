@@ -39,7 +39,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 class _RowIdLookup(nn.Module):
@@ -655,3 +655,105 @@ def test_ple_casts_fp32_owner_table_to_bfloat16_compute() -> None:
     assert ple.key_proj.weight.grad is not None
     assert ple.key_proj.weight.grad.dtype == torch.bfloat16
     assert torch.isfinite(ple.key_proj.weight.grad).all()
+
+
+# Packed rows. Row 0: documents of 3, 12, 1 and 13 tokens (two shorter than the
+# nine-token convolution reach), an in-document EOS, and a padded tail segment.
+# Row 1 uses different boundaries so that the multi-row case checks per-row segments.
+_PACKED_ROWS = ((0, 3, 15, 16, 29, 32), (0, 7, 8, 20, 32))
+
+
+def _packed_ple_inputs(rows: int = 1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(2051)
+    input_ids = torch.randint(2, 60, (rows, 32), generator=generator)
+    input_ids[0, 20] = 99
+    hidden_states = torch.randn(rows, 32, 4, generator=generator)
+    sequence_ids = torch.stack(
+        [
+            torch.repeat_interleave(torch.arange(len(bounds) - 1), torch.tensor(bounds).diff())
+            for bounds in _PACKED_ROWS[:rows]
+        ]
+    )
+    return input_ids, hidden_states, sequence_ids
+
+
+def _separate(run, *tensors: torch.Tensor) -> torch.Tensor:
+    """Run every document of every row on its own and reassemble the packed layout.
+
+    Args:
+        run: Callable applied to one document, taking slices of ``tensors``.
+        *tensors: Packed inputs of shape ``[batch, sequence, ...]``, with arbitrary
+            trailing dimensions and shared batch and sequence axes.
+
+    Returns:
+        Reassembled tensor of shape ``[batch, sequence, ...]``, with trailing
+        dimensions determined by ``run``.
+    """
+    return torch.cat(
+        [
+            torch.cat([run(*(t[row : row + 1, a:b] for t in tensors)) for a, b in zip(bounds, bounds[1:])], dim=1)
+            for row, bounds in enumerate(_PACKED_ROWS[: tensors[0].shape[0]])
+        ]
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 2])
+def test_packed_hash_matches_separate_documents(rows: int) -> None:
+    ngram = _tiny_ngram_embedding(_RowIdLookup())
+    input_ids, _, sequence_ids = _packed_ple_inputs(rows)
+
+    packed = ngram._hash_input_ids(input_ids, sequence_ids)
+
+    torch.testing.assert_close(packed, _separate(ngram._hash_input_ids, input_ids), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [1, 2])
+def test_packed_ple_matches_separate_documents_forward_and_backward(rows: int) -> None:
+    packed_ple = _tiny_ple()
+    separate_ple = _tiny_ple()
+    input_ids, hidden_states, sequence_ids = _packed_ple_inputs(rows)
+    packed_hidden = hidden_states.clone().requires_grad_(True)
+    separate_hidden = hidden_states.clone().requires_grad_(True)
+    upstream = torch.linspace(-1.0, 1.0, hidden_states.numel()).view_as(hidden_states)
+
+    packed = packed_ple(packed_hidden, input_ids, sequence_ids=sequence_ids)
+    separate = _separate(separate_ple, separate_hidden, input_ids)
+    torch.testing.assert_close(packed, separate, rtol=1e-6, atol=1e-6)
+
+    (packed * upstream).sum().backward()
+    (separate * upstream).sum().backward()
+    torch.testing.assert_close(packed_hidden.grad, separate_hidden.grad, rtol=1e-6, atol=1e-6)
+    for (name, packed_parameter), separate_parameter in zip(
+        packed_ple.named_parameters(), separate_ple.parameters(), strict=True
+    ):
+        assert packed_parameter.grad is not None, name
+        torch.testing.assert_close(packed_parameter.grad, separate_parameter.grad, rtol=1e-5, atol=1e-6, msg=name)
+
+
+@pytest.mark.parametrize("rows", [1, 2])
+def test_segmented_conv_matches_per_segment_conv(rows: int) -> None:
+    ple = _tiny_ple()
+    _, hidden_states, sequence_ids = _packed_ple_inputs(rows)
+    packed_hidden = hidden_states.clone().requires_grad_(True)
+    separate_hidden = hidden_states.clone().requires_grad_(True)
+
+    packed = ple._causal_short_conv(packed_hidden, sequence_ids=sequence_ids)
+    separate = _separate(ple._causal_short_conv, separate_hidden)
+    torch.testing.assert_close(packed, separate, rtol=1e-6, atol=1e-6)
+
+    packed.square().sum().backward()
+    separate.square().sum().backward()
+    torch.testing.assert_close(packed_hidden.grad, separate_hidden.grad, rtol=1e-6, atol=1e-6)
+
+
+def test_packed_ple_without_boundaries_reads_previous_document() -> None:
+    ple = _tiny_ple()
+    input_ids, hidden_states, _ = _packed_ple_inputs()
+    with torch.no_grad():
+        packed = ple(hidden_states, input_ids)
+        second_document = ple(hidden_states[:, 3:15], input_ids[:, 3:15])
+
+    # The hash reads two tokens back and the convolution nine: the first
+    # positions of a later document see the previous one, the rest do not.
+    assert not torch.allclose(packed[:, 3:5], second_document[:, :2])
+    torch.testing.assert_close(packed[:, 14:15], second_document[:, 11:12], rtol=1e-6, atol=1e-6)

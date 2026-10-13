@@ -340,6 +340,12 @@ class PipelineCausalLMLoss(nn.Module):
     call via the PP runtime's output→loss contract, so the wiring is
     schedule-agnostic. Legacy ``cu_seqlens`` (THD path) is a fallback for
     models that don't emit a seq_idx tail.
+
+    The recipe sets is_packed for each batch and supplies physical offsets in
+    cu_seqlens: an integer tensor [documents + 1] or [1, documents + 1], with
+    collation sentinels removed. A shared layout is usable only for one pack;
+    different microbatch layouts require their model-provided seq_idx tails.
+    Packed training with MTP rejects missing or unusable boundary metadata.
     """
 
     def __init__(
@@ -363,6 +369,7 @@ class PipelineCausalLMLoss(nn.Module):
         self.grad_reduce_group = grad_reduce_group
         # Legacy THD-pack fallback used when the model has no seq_idx tail.
         self.cu_seqlens: torch.Tensor | None = None
+        self.is_packed: bool = False
 
     @staticmethod
     def _extract_seq_idx_tail(output) -> tuple[torch.Tensor | None, object]:
@@ -387,7 +394,11 @@ class PipelineCausalLMLoss(nn.Module):
             output: bare hidden states ``[B, S, H]`` (FusedLinearCrossEntropy
                 path), a HF output with logits ``[B, S, V]``, or an MTP tuple
                 ``(logits, *mtp_per_depth_h[, seq_idx])`` with ``seq_idx``
-                ``[B, S]`` int32. A tuple with FusedLinearCrossEntropy raises.
+                ``[B, S]`` int32. Each MTP hidden tensor has shape [B, S, H];
+                models declaring MTP logits instead supply [B, S, V] tensors.
+                The tail describes the physical document layout of this
+                microbatch and overrides shared boundaries. A tuple with
+                FusedLinearCrossEntropy raises.
             labels: target token ids ``[B, S]`` int64.
 
         Returns:
@@ -440,6 +451,18 @@ class PipelineCausalLMLoss(nn.Module):
             grad_reduce_group=self.grad_reduce_group,
         )
         if (mtp_per_depth_h is not None or mtp_per_depth_logits is not None) and self.model.training:
+            if self.is_packed and seq_idx_mb is None:
+                boundaries = self.cu_seqlens
+                if (
+                    boundaries is None
+                    or boundaries.numel() < 2
+                    or boundaries.dim() not in (1, 2)
+                    or (boundaries.dim() == 2 and boundaries.shape[0] != 1)
+                ):
+                    raise ValueError(
+                        "Packed MTP requires cu_seqlens_padded with physical token boundaries "
+                        "or a per-microbatch seq_idx tail."
+                    )
             scaling_factor = self.scaling_factor if self.scaling_factor is not None else model_scaling_factor
             loss = loss + calculate_mtp_loss(
                 self.loss_fn,

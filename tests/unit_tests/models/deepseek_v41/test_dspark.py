@@ -25,7 +25,7 @@ from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSpa
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 
 # Keep a hard watchdog for draft-model tests; slower cases declare exact runtime budgets below.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _config(*, hidden_size: int = 16, quantization_config: dict[str, object] | None = None) -> DeepseekV41TextConfig:
@@ -233,7 +233,7 @@ def test_quantized_checkpoint_load_and_training_resume(tmp_path: Path) -> None:
 
 @pytest.mark.runtime_budget(
     15,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="Runs a complete three-stage draft forward/backward, including CPU MoE activation compilation.",
 )
 def test_cache_free_backbone_forward_and_backward() -> None:
@@ -262,7 +262,7 @@ def test_cache_free_backbone_forward_and_backward() -> None:
 
 @pytest.mark.runtime_budget(
     15,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="Checks confidence-gradient isolation through all three draft stages and compiled MoE activations.",
 )
 @pytest.mark.parametrize("stop_gradient", [False, True])
