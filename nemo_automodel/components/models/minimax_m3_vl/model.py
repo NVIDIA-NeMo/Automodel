@@ -153,7 +153,9 @@ class MiniMaxM3TextModel(nn.Module):
             )
 
         gemma = getattr(config, "use_gemma_norm", False)
-        self.norm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
+        self.norm = MiniMaxM3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
 
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -314,10 +316,6 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
     _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
     _pp_keep_self_forward: bool = True
 
-    # The state-dict adapter loads every tensor from the checkpoint, so skip HF
-    # random init on load (also avoids DTensor-collective hangs under sharding/PP).
-    _skip_init_weights_on_load = True
-
     @classmethod
     def from_config(
         cls, config: Any, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs
@@ -421,7 +419,9 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 nn.init.trunc_normal_(
                     self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
                 )
-        cast_model_to_dtype(self, dtype)
+        # Preserve the declared FP32 gates. After FSDP wrapping, restoring
+        # DTensor .data after a cast cannot restore its local shard.
+        cast_model_to_dtype(self, dtype, skip_modules=("gate",))
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 
@@ -458,10 +458,6 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # The same attention shards the packed sequence in forward and carries the document
     # boundaries into every layer, so it owns the packed CP path end to end.
     _owns_cp_attention = True
-    # The state-dict adapter fully populates every tensor from the checkpoint
-    # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
-    # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
-    _skip_init_weights_on_load = True
     # CP submesh, installed by the MoE parallelizer's apply_cp when context
     # parallelism is active; None (default) means the forward embeds and shards
     # nothing for CP. See prepare_model_inputs_for_cp / forward.
@@ -873,7 +869,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 nn.init.trunc_normal_(
                     self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
                 )
-        cast_model_to_dtype(self, dtype)
+        # Preserve the declared FP32 gates. After FSDP wrapping, restoring
+        # DTensor .data after a cast cannot restore its local shard.
+        cast_model_to_dtype(self, dtype, skip_modules=("gate",))
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 

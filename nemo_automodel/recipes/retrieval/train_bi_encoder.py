@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import pathlib
 import time
 from collections import deque
@@ -99,10 +100,8 @@ def _configure_sentence_transformer_export(model, collate_fn, *, tokenizer=None)
                     "does not expose static query_prefix and passage_prefix metadata."
                 )
             return
-        export_config = getattr(model, "sentence_transformer_export_config", None)
-        prompt_separator = "" if getattr(export_config, "input_mode", "text") == "structured_multimodal" else " "
-        query_prompt = f"{collate_fn.query_prefix}{prompt_separator}" if collate_fn.query_prefix else ""
-        document_prompt = f"{collate_fn.passage_prefix}{prompt_separator}" if collate_fn.passage_prefix else ""
+        query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
+        document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
 
     configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt, tokenizer=tokenizer)
 
@@ -238,6 +237,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
         self.temperature = self.cfg.get("temperature", 1.0)
+        if not math.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError(f"temperature must be finite and greater than 0, got {self.temperature!r}")
 
     def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
         """Build optimizer parameter groups for trainable model parameters."""

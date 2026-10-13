@@ -51,15 +51,20 @@ def reject_unsupported_mtp_cp(model: nn.Module) -> None:
         raise RuntimeError(f"{type(model).__name__} does not support MTP with context parallelism")
 
 
-def reject_unsupported_mtp_cp_pp(model: nn.Module) -> None:
-    """Reject MTP+CP on every trimmed pipeline stage before CP collectives."""
+def reject_unsupported_mtp_cp_pp(model: nn.Module, *, pp_size: int | None = None) -> None:
+    """Reject unsupported MTP+CP+PP before parallelizing the model.
+
+    Call only when context parallelism is active.
+
+    Args:
+        model: Model whose MTP capabilities are checked.
+        pp_size: Pipeline mesh size, when available. The legacy stage hook
+            also detects trimmed stages when the supplied mesh omits PP.
+    """
+    if not model.supports.mtp_enabled or model.supports.supports_mtp_cp_pp:
+        return
     is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
-    if (
-        model.supports.mtp_enabled
-        and not model.supports.supports_mtp_cp_pp
-        and callable(is_pp_stage_fn)
-        and is_pp_stage_fn()
-    ):
+    if (pp_size is not None and pp_size > 1) or (callable(is_pp_stage_fn) and is_pp_stage_fn()):
         raise NotImplementedError(
             "MTP with context and pipeline parallelism is not supported; use PP size 1 or CP size 1"
         )
@@ -262,7 +267,6 @@ def _mp_policy_with_param_dtype(
     object.__setattr__(mp_policy_copy, "param_dtype", param_dtype)
     if param_dtype == torch.float32:
         object.__setattr__(mp_policy_copy, "reduce_dtype", torch.float32)
-        object.__setattr__(mp_policy_copy, "output_dtype", torch.float32)
         # FP32 compute modules own any required input cast. Casting at the nested
         # FSDP boundary changes the module-visible input dtype and can make an
         # activation-checkpoint recompute disagree with the original forward.
@@ -495,10 +499,11 @@ def fully_shard_by_dtype(
             )
         if len(grouped_params) == 2:
             parent_key = next(key for key in grouped_params if key != least_items_key)
+            parent_policy = _mp_policy_with_param_dtype(mp_policy, parent_key[1])
             _call_fully_shard(
                 module,
                 mesh,
-                _mp_policy_with_param_dtype(mp_policy, parent_key[1]),
+                parent_policy,
                 offload_policy,
                 reshard_after_forward,
                 ignored_params,

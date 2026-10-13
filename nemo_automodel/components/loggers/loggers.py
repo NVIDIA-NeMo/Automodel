@@ -173,7 +173,7 @@ class MLflowConfig:
             "mlflow",
             msg=(
                 "mlflow is not installed. To enable MLflow experiment tracking, run: uv add nemo-automodel[mlflow]. "
-                "For the full MLflow stack (UI, SQL backend): uv add nemo-automodel[mlflow-full]"
+                "For the full MLflow stack (server, UI): uv add nemo-automodel[mlflow-full]"
             ),
         )
 

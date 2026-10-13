@@ -1694,3 +1694,135 @@ class TestConvertSingleTensorToHFQuantizationPaths:
 
         first_call_mesh = MockDTensor.from_local.call_args_list[0][0][1]
         assert first_call_mesh is mock_mesh
+
+
+class TestPeftOuterPrefixIsNotLoadBearing:
+    """The adapter must answer the same whether or not the PEFT outer prefix is present.
+
+    ``ModelState`` owns ``base_model.model.`` (stateful_wrappers.py adds it on save and
+    drops it on load). Adapters are meant to translate model paths, not to depend on
+    that wrapper being there, and issue #3867 moves the add/strip so they stop seeing it
+    at all. Anything here that reads the prefix to make a decision breaks under that
+    move, silently, by renaming adapter tensors it should have left alone.
+    """
+
+    _PREFIX = "base_model.model."
+
+    @pytest.fixture
+    def adapter(self):
+        config = KimiK25VLConfig()
+        moe_config = create_mock_moe_config()
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
+        return KimiK25VLStateDictAdapter(config, moe_config, backend, dtype=torch.bfloat16)
+
+    @staticmethod
+    def _peft_state_dict(prefix: str) -> dict[str, torch.Tensor]:
+        """A PEFT save's shape: adapter factors on an attention leaf, in native layout."""
+        base = f"{prefix}model.language_model.model.layers.0.self_attn.o_proj"
+        return {
+            f"{base}.lora_A.weight": torch.randn(2, 8),
+            f"{base}.lora_B.weight": torch.randn(8, 2),
+        }
+
+    @staticmethod
+    def _native_expert_lora(prefix: str, moe_config, rank: int = 2) -> dict[str, torch.Tensor]:
+        """Grouped expert LoRA as the native model holds it: one tensor per factor, all experts."""
+        experts = moe_config.n_routed_experts
+        base = f"{prefix}model.language_model.model.layers.0.mlp.experts"
+        return {
+            f"{base}.lora_gate_and_up_A": torch.randn(experts, moe_config.dim, rank),
+            f"{base}.lora_gate_and_up_B": torch.randn(experts, rank, 2 * moe_config.moe_inter_dim),
+            f"{base}.lora_down_A": torch.randn(experts, moe_config.moe_inter_dim, rank),
+            f"{base}.lora_down_B": torch.randn(experts, rank, moe_config.dim),
+        }
+
+    @staticmethod
+    def _assert_same(direct: dict, through_boundary: dict, what: str) -> None:
+        """Assert both routes through the adapter produced the same state dict.
+
+        Args:
+            direct: Mapping from parameter name to Tensor of shape [...], with arbitrary
+                rank and axis order. The adapter's output for prefixed keys.
+            through_boundary: Mapping with exactly the keys of ``direct``. Each value must
+                match the tensor under the same key in shape, axis order, dtype, device,
+                and values. The adapter's output for stripped keys, with the prefix
+                restored.
+            what: Name of the adapter call under test, used in the failure message.
+        """
+        assert set(direct) == set(through_boundary), (
+            f"{what} reads the outer prefix; direct_only={sorted(set(direct) - set(through_boundary))} "
+            f"boundary_only={sorted(set(through_boundary) - set(direct))}"
+        )
+        for key, value in direct.items():
+            torch.testing.assert_close(through_boundary[key], value, rtol=0, atol=0)
+
+    def _strip(self, state_dict: dict) -> dict:
+        """Drop the outer prefix from every key, as #3867 will before the adapter runs.
+
+        Args:
+            state_dict: Mapping from prefixed parameter name to Tensor of shape [...], with
+                arbitrary rank and axis order.
+
+        Returns:
+            The same tensor objects, not copies, under keys without ``base_model.model.``.
+        """
+        return {key.removeprefix(self._PREFIX): value for key, value in state_dict.items()}
+
+    def _restore(self, state_dict: dict) -> dict:
+        """Add the outer prefix back to every key, as #3867 will after the adapter runs.
+
+        Args:
+            state_dict: Mapping from unprefixed parameter name to Tensor of shape [...],
+                with arbitrary rank and axis order.
+
+        Returns:
+            The same tensor objects, not copies, under keys starting with ``base_model.model.``.
+        """
+        return {f"{self._PREFIX}{key}": value for key, value in state_dict.items()}
+
+    def test_to_hf_does_not_read_the_prefix(self, adapter):
+        """Exporting bare keys and re-adding the prefix has to match exporting prefixed ones."""
+        prefixed = self._peft_state_dict(self._PREFIX)
+
+        direct = adapter.to_hf(dict(prefixed))
+        through_boundary = self._restore(adapter.to_hf(self._strip(prefixed)))
+
+        self._assert_same(direct, through_boundary, "to_hf")
+
+    def test_from_hf_does_not_read_the_prefix(self, adapter):
+        """Loading bare keys and re-adding the prefix has to match loading prefixed ones.
+
+        ``from_hf`` used the prefix as its only signal for "this is an adapter key, leave
+        the name alone". The same question is already asked by ``.lora_`` on the export
+        side of this file, and that answer survives the boundary owning the prefix.
+        """
+        prefixed = self._peft_state_dict(self._PREFIX)
+
+        direct = adapter.from_hf(dict(prefixed))
+        through_boundary = self._restore(adapter.from_hf(self._strip(prefixed)))
+
+        self._assert_same(direct, through_boundary, "from_hf")
+
+    def test_to_hf_expert_lora_does_not_read_the_prefix(self, adapter):
+        """Grouped expert factors split per expert on export, with or without the prefix."""
+        native = self._native_expert_lora(self._PREFIX, adapter.moe_config)
+
+        direct = adapter.to_hf(dict(native))
+        through_boundary = self._restore(adapter.to_hf(self._strip(native)))
+
+        self._assert_same(direct, through_boundary, "to_hf on expert LoRA")
+
+    def test_from_hf_expert_lora_does_not_read_the_prefix(self, adapter):
+        """Per-expert factors recombine into grouped tensors on load, with or without the prefix.
+
+        This is where the prefix was load-bearing: ``from_hf`` only sent keys to the
+        expert recombiner when they started with ``base_model.``, so a bare adapter came
+        back as per-expert tensors the model holds no parameter for. The attention case
+        above cannot see that, because attention factors pass through unchanged either way.
+        """
+        exported = adapter.to_hf(self._native_expert_lora(self._PREFIX, adapter.moe_config))
+
+        direct = adapter.from_hf(dict(exported))
+        through_boundary = self._restore(adapter.from_hf(self._strip(exported)))
+
+        self._assert_same(direct, through_boundary, "from_hf on expert LoRA")

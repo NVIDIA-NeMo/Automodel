@@ -1,5 +1,5 @@
 # LoRA fine-tuning recipe for GLM-5.1 on HellaSwag
-# Estimated: 16 nodes (ep=64, pp=2 -> 64*2/8=16 nodes)
+# Estimated: 16 nodes (ep=32, pp=4 -> 32*4/8=16 nodes)
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -22,6 +22,10 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: zai-org/GLM-5.1
+  # Adapter checkpoints omit router buffers; keep the pretrained correction bias fixed.
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
@@ -42,7 +46,7 @@ peft:
   use_triton: True
 
 checkpoint:
-  enabled: false
+  enabled: true
 
 distributed:
   strategy: fsdp2
@@ -110,4 +114,23 @@ ci:
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
   recipe_owner: hemildesai
   nodes: 16
-  time: "00:20:00"
+  time: "00:35:00"
+  env_vars:
+    REQUIRE_FINITE_METRICS: 'true'
+  release:
+    step_scheduler.max_steps: 2
+    step_scheduler.ckpt_every_steps: 2
+    step_scheduler.val_every_steps: 1000
+    dataset.num_samples_limit: 4096
+  checkpoint_robustness:
+    # Native adapter/optimizer restart coverage; HF consumer coverage is tracked in #3867.
+    skip_source_load_parity: true
+    skip_hf_reload: true
+    tokenizer_name: zai-org/GLM-5.1
+    step_scheduler.max_steps: 2
+    step_scheduler.ckpt_every_steps: 2
+    step_scheduler.val_every_steps: 1000
+    step_scheduler.global_batch_size: 512
+    step_scheduler.local_batch_size: 8
+    dataset.num_samples_limit: 4096
+    peft.use_triton: true

@@ -553,13 +553,20 @@ def _replay_hybridep_dispatch_on_recompute(
         def scoped(mode: str, inner: AbstractContextManager):
             if mode == "replay":
                 recorder.rewind()
+                # Read the dispatch extents here, before the recompute op context
+                # opens: the copies started at the end of the checkpoint forward
+                # have normally completed by now, so this is at most a wait on an
+                # event that has already fired (once per microbatch, never once per
+                # layer), and no aten op enters the recompute trace.
+                recorder.resolve()
             with hybridep_dispatch_replay_scope(recorder, mode):
                 with inner:
                     yield
                 if mode == "record":
-                    # Cache the dispatch extents only after the selective-op
-                    # context exits. Recompute can then reuse them without an
-                    # extra aten.sum that would diverge from the forward trace.
+                    # Start the extent copies only after the selective-op context
+                    # exits (no extra aten.sum in the forward trace) and without a
+                    # host synchronization — reading them per block stalled the
+                    # launch queue once per layer per microbatch.
                     recorder.finalize()
 
         return scoped("record", forward_context), scoped("replay", recompute_context)
@@ -817,8 +824,8 @@ def apply_fsdp(
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
-            output_dtype=torch.bfloat16,
-            cast_forward_inputs=True,
+            output_dtype=None,
+            cast_forward_inputs=False,
         )
     experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
@@ -1236,8 +1243,6 @@ def parallelize_model(
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
-        parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
-        parallelizer_utils.reject_unsupported_mtp_cp(model)
         apply_cp(model, world_mesh[cp_axis_name])
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1

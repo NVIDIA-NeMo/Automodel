@@ -143,15 +143,24 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
     def _extra_eval_metric_sums(self, metrics) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Return additive DFlash 2 validation statistics.
 
-        Every returned value is a pair of scalar tensors on the trainer device.
         The shared validation loop SUM-reduces each pair before division.
+        Selector loss is weighted only by positions with a candidate hit.
+
+        Args:
+            metrics: DFlash2StepMetrics whose fields are scalar tensors of shape []
+                on the trainer device, with layouts documented by that dataclass.
+
+        Returns:
+            Metric names mapped to detached (numerator, denominator) pairs of
+            scalar tensors of shape [] on the trainer device.
         """
         loss_weight = metrics.loss_weight.detach()
+        selector_weight = metrics.selector_loss_denominator.detach()
         valid_tokens = metrics.valid_tokens.detach()
         valid_blocks = metrics.valid_blocks.detach()
         return {
             "val_base_loss": (metrics.base_loss.detach() * loss_weight, loss_weight),
-            "val_selector_loss": (metrics.selector_loss.detach() * loss_weight, loss_weight),
+            "val_selector_loss": (metrics.selector_loss.detach() * selector_weight, selector_weight),
             "val_base_accuracy": (metrics.base_correct_tokens.detach(), valid_tokens),
             "val_base_accept_len": (metrics.base_accept_len_sum.detach(), valid_blocks),
             "val_candidate_recall": (metrics.candidate_recall.detach() * valid_tokens, valid_tokens),

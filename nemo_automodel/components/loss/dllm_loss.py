@@ -1000,7 +1000,7 @@ class DFlashDecayLoss(nn.Module):
         block_mask: torch.Tensor,
         value_mask: torch.Tensor | None = None,
         total_blocks: int | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Weight ``values`` by :meth:`position_weights` and reduce with ``normalize="mean"`` semantics.
 
         Lets a second training objective over the same fixed-anchor block layout
@@ -1034,14 +1034,16 @@ class DFlashDecayLoss(nn.Module):
             total_blocks: See :meth:`_mean_denominator`.
 
         Returns:
-            Scalar tensor: the weighted mean of ``values``.
+            Tuple of scalar tensors ``(mean, denominator)``: the weighted mean of
+            ``values`` and the detached denominator it was divided by, so callers
+            can SUM-reduce ``mean * denominator`` and ``denominator`` across ranks.
         """
         if value_mask is None:
             value_mask = block_mask
         bsz, n_blocks, _ = block_mask.shape
         weights = self.position_weights(token_nll, block_mask) * value_mask.to(token_nll.dtype)
         denom = self._mean_denominator(weights, bsz, n_blocks, total_blocks=total_blocks)
-        return (values * weights).sum() / denom
+        return (values * weights).sum() / denom, denom.detach().float()
 
     def _reduce(
         self,
@@ -1086,7 +1088,7 @@ class DFlashDecayLoss(nn.Module):
                 draft_correct_per_pos=draft_correct_per_pos,
                 draft_count_per_pos=draft_count_per_pos,
             ),
-            denom.detach(),
+            denom.detach().float(),
         )
 
     @staticmethod

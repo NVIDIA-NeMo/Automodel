@@ -607,7 +607,7 @@ class TestDFlashDecayLossWeightedMean:
         )
 
         expected = loss_fn(logits, target_ids, block_mask).total_loss
-        actual = loss_fn.weighted_mean(token_nll, token_nll, block_mask)
+        actual = loss_fn.weighted_mean(token_nll, token_nll, block_mask)[0]
 
         assert torch.isclose(actual, expected, atol=1e-6)
 
@@ -620,7 +620,7 @@ class TestDFlashDecayLossWeightedMean:
         values = torch.rand(B_D, N_D, K_D)  # stands in for the selector's own CE
         loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.35, normalize="mean")
 
-        actual = loss_fn.weighted_mean(values, weight_source, block_mask)
+        actual = loss_fn.weighted_mean(values, weight_source, block_mask)[0]
 
         weights = loss_fn.position_weights(weight_source, block_mask)
         expected = (values * weights).sum() / float(B_D * N_D)
@@ -638,7 +638,7 @@ class TestDFlashDecayLossWeightedMean:
 
         weights = loss_fn.position_weights(token_nll, block_mask)
         expected = (token_nll * weights).sum() / float(B_D * N_D)
-        actual = loss_fn.weighted_mean(token_nll, token_nll, block_mask)
+        actual = loss_fn.weighted_mean(token_nll, token_nll, block_mask)[0]
 
         assert torch.isclose(actual, expected, atol=1e-6)
         assert not torch.isclose(actual, (token_nll * weights).sum() / (weights.sum() + 1e-6), atol=1e-6)
@@ -716,7 +716,7 @@ class TestDFlashDecayLossWeightedMean:
         torch.testing.assert_close(fixed, torch.tensor([0.0, 0.984375, 0.421875]).expand(bsz, n_blocks, 3))
 
         values = torch.ones(bsz, n_blocks, 3)
-        via_weighted_mean = loss_fn.weighted_mean(values, nll, full_mask, value_mask=full_mask * has_target)
+        via_weighted_mean = loss_fn.weighted_mean(values, nll, full_mask, value_mask=full_mask * has_target)[0]
         torch.testing.assert_close(via_weighted_mean, (values * fixed).sum() / float(bsz * n_blocks))
 
 
