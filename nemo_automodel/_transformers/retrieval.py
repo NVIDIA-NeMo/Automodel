@@ -17,7 +17,8 @@
 import inspect
 import os
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Protocol, runtime_checkable
+from copy import copy
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 import torch.nn as nn
@@ -35,6 +36,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import ModelOutput, logging
 
+from nemo_automodel._transformers.auto_config import NeMoAutoConfig
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.sentence_transformer_export import (
     SentenceTransformerExportConfig,
@@ -49,6 +51,10 @@ from nemo_automodel._transformers.sentence_transformer_export import (
 )
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.checkpoint.addons import _ConsolidatedHFMetadataExporter
+
 
 logger = logging.get_logger(__name__)
 
@@ -127,7 +133,9 @@ def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedMode
     return extracted_model
 
 
-def _get_supported_backbone_class(model_type: str, task: str) -> type[nn.Module] | None:
+def _get_supported_backbone_class(
+    model_type: str, task: str, config: PretrainedConfig | None = None
+) -> type[nn.Module] | None:
     """Return the registered retrieval backbone class for a model type and task."""
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
     if task_map is None:
@@ -135,6 +143,13 @@ def _get_supported_backbone_class(model_type: str, task: str) -> type[nn.Module]
 
     arch_name = task_map.get(task)
     if arch_name is None:
+        if task in ("embedding", "score"):
+            # Each retrieval task has a generic Hugging Face fallback.
+            logger.info(
+                f"No registered '{task}' backbone for model type '{model_type}'; "
+                "falling back to HuggingFace Auto classes"
+            )
+            return None
         raise ValueError(
             f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
         )
@@ -142,7 +157,8 @@ def _get_supported_backbone_class(model_type: str, task: str) -> type[nn.Module]
     if arch_name not in ModelRegistry.model_arch_name_to_cls:
         raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
 
-    logger.info(f"Using {arch_name} from registry")
+    if config is not None:
+        return ModelRegistry.resolve_custom_model_cls(arch_name, config)
     return ModelRegistry.model_arch_name_to_cls[arch_name]
 
 
@@ -277,17 +293,17 @@ def _set_text_backbone_is_causal(model: PreTrainedModel, is_causal: bool | None)
 
 def _load_from_extracted_state(
     backbone_class: type[PreTrainedModel],
-    config,
+    config: PretrainedConfig,
     extracted_model: PreTrainedModel,
+    **hf_kwargs: Any,
 ) -> PreTrainedModel:
     """Load a target backbone from an extracted model's in-memory state dict."""
-    # Use the base HF loader because some retrieval classes override
-    # from_pretrained for path-based checkpoint loading.
-    backbone = PreTrainedModel.from_pretrained.__func__(
-        backbone_class,
+    # Preserve model-owned loading behavior for in-memory checkpoints as well.
+    backbone = backbone_class.from_pretrained(
         None,
         config=config,
         state_dict=extracted_model.state_dict(),
+        **hf_kwargs,
     )
     return _move_to_extracted_dtype(backbone, extracted_model)
 
@@ -298,18 +314,19 @@ def _build_backbone_from_extracted_submodel(
     pooling: str | None,
     num_labels: int | None,
     temperature: float | None,
+    *,
+    model_name_or_path: str | None = None,
+    **hf_kwargs: Any,
 ) -> PreTrainedModel:
     """Build a task-specific retrieval backbone from an extracted text submodel."""
     text_config = extracted_model.config
     model_type = getattr(text_config, "model_type", "")
-    task_map = SUPPORTED_BACKBONES.get(model_type.lower())
-    has_supported_target = task_map is not None and task in task_map
-    # "score" and "embedding" both have a generic fallback below, so a model type that is
-    # registered for only one of them must not hard-fail on the other.
-    if task_map is not None and not has_supported_target and task not in ("score", "embedding"):
-        raise ValueError(
-            f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
-        )
+    # A decoder's config can still name its parent's head-bearing architecture.
+    # Dispatch using the module actually extracted so we do not invent a missing head.
+    dispatch_config = copy(text_config)
+    dispatch_config.architectures = [type(extracted_model).__name__]
+    backbone_class = _get_supported_backbone_class(model_type, task, dispatch_config)
+    has_supported_target = backbone_class is not None
 
     if task == "score" and not has_supported_target:
         config = text_config.__class__.from_dict(text_config.to_dict())
@@ -320,7 +337,6 @@ def _build_backbone_from_extracted_submodel(
     elif not has_supported_target:
         return extracted_model
     else:
-        backbone_class = _get_supported_backbone_class(model_type, task)
         config_class = getattr(backbone_class, "config_class", None)
         if config_class is None or not hasattr(text_config, "to_dict"):
             return extracted_model
@@ -328,6 +344,9 @@ def _build_backbone_from_extracted_submodel(
         config_dict = text_config.to_dict()
         config_dict.pop("model_type", None)
         config = config_class(**config_dict)
+
+    if model_name_or_path is not None:
+        config.name_or_path = model_name_or_path
 
     attn_implementation = getattr(text_config, "_attn_implementation", None)
     if attn_implementation is not None:
@@ -339,7 +358,7 @@ def _build_backbone_from_extracted_submodel(
     if has_supported_target and temperature is not None:
         config.temperature = temperature
 
-    return _load_from_extracted_state(backbone_class, config, extracted_model)
+    return _load_from_extracted_state(backbone_class, config, extracted_model, **hf_kwargs)
 
 
 def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
@@ -455,6 +474,15 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
+    hf_kwargs["revision"] = NeMoAutoConfig.resolve_revision(
+        model_name_or_path,
+        hf_kwargs.get("revision"),
+        cache_dir=hf_kwargs.get("cache_dir"),
+        token=hf_kwargs.get("token", hf_kwargs.get("use_auth_token")),
+        local_files_only=hf_kwargs.get("local_files_only", False),
+        subfolder=hf_kwargs.get("subfolder", ""),
+        force_download=hf_kwargs.get("force_download", False),
+    )
     config = loaded_config
     if config is None:
         config = AutoConfig.from_pretrained(
@@ -484,6 +512,13 @@ def build_encoder_backbone(
             pooling=pooling,
             num_labels=num_labels,
             temperature=temperature,
+            model_name_or_path=model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **{
+                key: hf_kwargs[key]
+                for key in ("cache_dir", "force_download", "local_files_only", "token", "revision", "subfolder")
+                if key in hf_kwargs
+            },
         )
         effective_is_causal = _resolve_text_backbone_is_causal(
             backbone,
@@ -494,10 +529,7 @@ def build_encoder_backbone(
         _set_text_backbone_is_causal(backbone, effective_is_causal)
         return backbone
 
-    backbone_model_class = _get_supported_backbone_class(model_type, task)
-    supports_config = getattr(backbone_model_class, "supports_config", None)
-    if supports_config is not None and not supports_config(config):
-        backbone_model_class = None
+    backbone_model_class = _get_supported_backbone_class(model_type, task, config)
     if backbone_model_class is not None:
         if pooling is not None:
             hf_kwargs["pooling"] = pooling
@@ -611,11 +643,14 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     model.model.save_pretrained(save_directory)
     if deploy_config is not None:
         deploy_config.save_pretrained(save_directory)
-    if tokenizer is not None:
+    if tokenizer is not None and cross_encoder_exporter is None:
         tokenizer.save_pretrained(save_directory)
     if cross_encoder_exporter is not None:
-        cross_encoder_exporter._save_sentence_transformer_assets(
-            hf_metadata_dir=save_directory, tokenizer=tokenizer, original_model_path=original_model_path
+        cross_encoder_exporter.save(
+            hf_metadata_dir=save_directory,
+            tokenizer=tokenizer,
+            original_model_path=original_model_path,
+            v4_compatible=False,
         )
     if export_config is None:
         return
@@ -637,6 +672,17 @@ _MINISTRAL3_BIDIREC_TASKS = {
 _LLAMA_NEMOTRON_VL_TASKS = {
     "embedding": "LlamaNemotronVLModel",
 }
+# Only "qwen3" is needed, with no "qwen3_reranker" alias: Qwen3RerankerConfig.to_dict()
+# rewrites the serialized identity to plain qwen3 so checkpoints load in vLLM, and no
+# config.json ever carries the custom name. Contrast llama_bidirec, which keeps its own
+# identity on disk and therefore needs both keys.
+#
+# "score" only. qwen3 has no custom embedding backbone, and listing the model type here
+# must not take qwen3 embedding runs away from the generic AutoModel path they used before
+# this entry existed -- see the "embedding" fallbacks in _get_supported_backbone_class and
+# _build_backbone_from_extracted_submodel.
+_QWEN3_RERANKER_TASKS = {"score": "Qwen3RerankerForCausalReranking"}
+
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
@@ -644,6 +690,7 @@ SUPPORTED_BACKBONES = {
     "mistral3_bidirec": _MISTRAL3_BIDIREC_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
     "llama_nemotron_vl": _LLAMA_NEMOTRON_VL_TASKS,
+    "qwen3": _QWEN3_RERANKER_TASKS,
 }
 
 
@@ -659,7 +706,7 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")
-    encoder.state_dict_adapter = EncoderStateDictAdapter()
+    encoder.state_dict_adapter = EncoderStateDictAdapter(getattr(model, "state_dict_adapter", None))
     configure_encoder_metadata(model, model.config)
 
 
@@ -738,17 +785,22 @@ class BiEncoderModel(nn.Module):
             raise ValueError("task must be specified when calling build()")
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
+        hf_kwargs["revision"] = NeMoAutoConfig.resolve_revision(
+            model_name_or_path,
+            hf_kwargs.get("revision"),
+            cache_dir=hf_kwargs.get("cache_dir"),
+            token=hf_kwargs.get("token", hf_kwargs.get("use_auth_token")),
+            local_files_only=hf_kwargs.get("local_files_only", False),
+            subfolder=hf_kwargs.get("subfolder", ""),
+            force_download=hf_kwargs.get("force_download", False),
+        )
         config = AutoConfig.from_pretrained(
             model_name_or_path,
             trust_remote_code=trust_remote_code,
             **hf_kwargs,
         )
         is_causal = _resolve_is_causal(config, is_causal)
-        metadata_kwargs = dict(hf_kwargs)
-        commit_hash = getattr(config, "_commit_hash", None)
-        if commit_hash is not None:
-            metadata_kwargs["revision"] = commit_hash
-        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, metadata_kwargs)
+        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, hf_kwargs)
         pooling, l2_normalize = _resolve_bi_encoder_options(
             config,
             saved_options,
@@ -780,7 +832,6 @@ class BiEncoderModel(nn.Module):
             )
         encoder.source_model_path = _resolve_cached_source_model_path(
             model_name_or_path,
-            backbone.config,
             hf_kwargs,
         )
         encoder.source_repository_path = _resolve_cached_source_repository_path(
@@ -790,7 +841,7 @@ class BiEncoderModel(nn.Module):
         )
         if encoder.sentence_transformer_export_config is not None:
             encoder.source_repository_path = (
-                _cache_hub_source_legal_assets(model_name_or_path, config, hf_kwargs) or encoder.source_repository_path
+                _cache_hub_source_legal_assets(model_name_or_path, hf_kwargs) or encoder.source_repository_path
             )
         return encoder
 
@@ -964,10 +1015,15 @@ class CrossEncoderModel(nn.Module):
 
     def _get_consolidated_hf_metadata_exporter(
         self, *, tokenizer: object, original_model_path: str | None
-    ) -> _CrossEncoderMetadataExporter | None:
+    ) -> "_ConsolidatedHFMetadataExporter | None":
         """Use the same CrossEncoder metadata contract for direct and consolidated saves."""
-        if tokenizer is None:
+        # Generative backbones keep their language-model export contract. Classifier
+        # metadata would load a different head instead of preserving their scoring rule.
+        if tokenizer is None or self.model.can_generate():
             return None
+        get_exporter = getattr(self.model, "_get_consolidated_hf_metadata_exporter", None)
+        if callable(get_exporter):
+            return get_exporter(tokenizer=tokenizer, original_model_path=original_model_path)
         return _CrossEncoderMetadataExporter(self)
 
     @property

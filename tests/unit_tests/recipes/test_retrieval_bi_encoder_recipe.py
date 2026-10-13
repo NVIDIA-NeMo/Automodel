@@ -71,7 +71,7 @@ def test_retrieval_attrs_accept_unwrapped_model():
     assert _uses_multi_vector_scoring(inner) is True
 
 
-def test_configure_sentence_transformer_export_binds_structured_multimodal_prompts_without_separator():
+def test_configure_sentence_transformer_export_binds_structured_multimodal_prompts_with_separator():
     captured = {}
 
     class _Model(torch.nn.Module):
@@ -92,7 +92,7 @@ def test_configure_sentence_transformer_export_binds_structured_multimodal_promp
     wrapped = _DDPLikeWrapper(_Model())
     _configure_sentence_transformer_export(wrapped, collator)
 
-    assert captured == {"query_prompt": "query:", "document_prompt": "passage:", "tokenizer": None}
+    assert captured == {"query_prompt": "query: ", "document_prompt": "passage: ", "tokenizer": None}
 
 
 def test_configure_sentence_transformer_export_retains_separator_for_text_prompts():

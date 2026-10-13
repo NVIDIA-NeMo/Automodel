@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 text-only mock benchmark: 4 nodes x 4 GB200, one NVLink domain.
+# NVIDIA-Nemotron-3-Super-120B-A12B-BF16 benchmark: 4 nodes x 4 GB200, one NVLink domain.
 # Native entry: nemo_automodel/recipes/llm/benchmark.py
 # Required environment: PYTORCH_ALLOC_CONF=expandable_segments:True
 # To enable online W&B, set wandb.enable: true and provide authentication.
@@ -20,7 +20,8 @@ recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 8
+  # 16,384 tokens per rank fits HybridEP capacity; global batch 128 gives 4 accumulation steps on 16 ranks.
+  local_batch_size: 2
   max_steps: 15
   num_epochs: 30
   ckpt_every_steps: 1000
@@ -37,7 +38,8 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
-    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+    # Public Hugging Face model ID; the entropy detector misclassifies it as a credential.
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16  # pragma: allowlist secret
     trust_remote_code: true
   dtype: bfloat16
   num_nextn_predict_layers: 0
@@ -61,12 +63,6 @@ distributed:
   reshard_after_forward: true
   moe:
     reshard_after_forward: true
-  multimodal:
-    frozen_sharding: replicate
-freeze_config:
-  freeze_vision_tower: true
-  freeze_audio_tower: true
-  freeze_language_model: false
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
   fp32_upcast: false
@@ -99,23 +95,21 @@ wandb:
   entity: Nemo-automodel
   project: huiyingl_workspace
   mode: online
-  name: super35-vl-text-8k-ep16-fused-adam
+  name: nemotron-super-v3-te-hybridep-8k-ep16-gb200
 benchmark:
-  flops_scope: text  # Text-only mock input; vision FLOPs are excluded.
   warmup_steps: 5
   peak_tflops: 2500
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
   num_nodes: 4
-  json_output_path: training_logs/super35_vl_text_8k_ep16_fused_adam.json
+  json_output_path: training_logs/nemotron_super_v3_te_hybridep_8k_ep16_gb200.json
 
 ci:
   recipe_owner: HuiyingLi
   time: "00:15:00"
   nodes: 4
+  cluster_tag: gb200
   nproc_per_node: 4
-  # Remove this gate once the intended checkpoint is publicly available.
-  known_issue_id: AMINT-383
   env_vars:
     PYTORCH_ALLOC_CONF: expandable_segments:True

@@ -266,7 +266,8 @@ class FSDP2Config:
             (position_ids that reset to 0 mid-sequence). Default ``False``.
         mp_policy (Optional[MixedPrecisionPolicy]): MixedPrecisionPolicy for FSDP2.
             If ``None`` (default), uses bf16 forward/backward compute with fp32
-            gradient reduction. Pair this with ``model.torch_dtype: float32`` for
+            gradient reduction, preserving the dtypes of module inputs and outputs.
+            Pair this with ``model.torch_dtype: float32`` for
             the Megatron-style fp32 master-weights pattern. Override from YAML
             using the ``_target_`` pattern::
 
@@ -274,7 +275,8 @@ class FSDP2Config:
                   _target_: torch.distributed.fsdp.MixedPrecisionPolicy
                   param_dtype: bfloat16
                   reduce_dtype: float32
-                  output_dtype: bfloat16
+                  output_dtype: null
+                  cast_forward_inputs: false
 
             See ``docs/guides/mixed-precision-training.md`` for the full set of recommended
             patterns and the bf16-storage trap.
@@ -327,8 +329,8 @@ class FSDP2Config:
         default_factory=lambda: MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
-            output_dtype=torch.bfloat16,
-            cast_forward_inputs=True,
+            output_dtype=None,
+            cast_forward_inputs=False,
         )
     )
     offload_policy: CPUOffloadPolicy | None = None
@@ -352,8 +354,8 @@ class FSDP2Config:
             self.mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
-                output_dtype=torch.bfloat16,
-                cast_forward_inputs=True,
+                output_dtype=None,
+                cast_forward_inputs=False,
             )
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
             self.activation_checkpointing_scope
