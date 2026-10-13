@@ -378,13 +378,14 @@ class GlmMoeDsaIndexer(nn.Module):
         # Per-head q·k scores with K kept single-head (no expand-to-heads), mirroring HF so the
         # index scores — and therefore the top-k selection — track the reference as closely as
         # floating point allows.
-        if qkv_format == "thd":
-            # q: [T, H, D], k: [T, D]  ->  [T, H, T]
-            scores = torch.matmul(q.float(), k.float().transpose(-1, -2))
-        else:
-            # q: [B, S, H, D], k: [B, S, D]  ->  [B, S, H, T]
-            scores = torch.matmul(q.float(), k.float().transpose(-1, -2).unsqueeze(1))
-        scores = torch.relu(scores * self.softmax_scale)
+        # Combine the query and head axes so all queries share one GEMM per batch,
+        # avoiding a batch of small [H, D] @ [D, T] products. Restore the reference
+        # [B, S, H, T] (or packed [T, H, T]) layout before reducing over heads.
+        scores = torch.matmul(q.float().flatten(-3, -2), k.float().transpose(-1, -2))
+        scores = scores.unflatten(-2, (seq_len, self.num_heads))
+        # The GEMM result is newly owned; keep the reference operation order while
+        # reusing its storage instead of creating two full FP32 score copies.
+        scores = scores.mul_(self.softmax_scale).relu_()
 
         # Head-weighted sum via matmul: weights[..., 1, H] @ scores[..., H, T] -> [..., 1, T].
         scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
