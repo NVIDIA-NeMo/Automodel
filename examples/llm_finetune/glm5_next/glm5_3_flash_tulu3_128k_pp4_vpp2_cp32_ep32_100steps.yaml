@@ -20,7 +20,8 @@
 #
 # The removed fixed input-capacity option is omitted. Keep HybridEP's default
 # input-size collective/padding and blocking dispatch; equal EP input lengths
-# are not assumed. All other training values match the frozen run YAML.
+# are not assumed. Training values match the frozen run YAML; W&B logging is
+# opt-in for this example.
 # The migrated configuration has not been rerun as a full model.
 #
 # Paths preserve the original DFW bind mount:
@@ -401,7 +402,7 @@ freeze_config:
   freeze_language_model: false
 checkpoint:
   enabled: false
-  checkpoint_dir: /workspace/glm53flash-perf-20261009/artifacts/full_tulu3_pp4_cp32_ep32_s128k/checkpoints
+  checkpoint_dir: /workspace/glm53flash-perf-20261009/artifacts/full_tulu3_pp4_cp32_ep32_s128k/checkpoints  # pragma: allowlist secret (filesystem path)
   dequantize_base_checkpoint: true
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
@@ -409,7 +410,7 @@ loss_fn:
   impl: torch_compile
 dataset:
   _target_: datasets.load_from_disk
-  dataset_path: /workspace/glm53flash-perf-20261009/data/tulu3_cp128k_full180k_v5/packed_dataset_lists
+  dataset_path: /workspace/glm53flash-perf-20261009/data/tulu3_cp128k_full180k_v5/packed_dataset_lists  # pragma: allowlist secret (filesystem path)
 packed_sequence:
   packed_sequence_size: 0
 dataloader:
@@ -434,11 +435,11 @@ optimizer:
   exp_avg_dtype: torch.bfloat16
   exp_avg_sq_dtype: torch.bfloat16
 wandb:
-  enable: true
+  enable: false  # Enable explicitly for full training runs.
   entity: Nemo-automodel
   project: glm53flash-cp-tulu3-20261011
   name: glm53flash_tulu3_128k_pp4_vpp2_cp32_ep32_gbs8_100steps_hidden_gather_batched30
-  dir: /workspace/glm53flash-perf-20261009/artifacts/full_tulu3_pp4_cp32_ep32_s128k/wandb
+  dir: /workspace/glm53flash-perf-20261009/artifacts/full_tulu3_pp4_cp32_ep32_s128k/wandb  # pragma: allowlist secret (filesystem path)
   group: tulu3_frozen128k_seed20261011
   tags:
   - glm53flash
@@ -458,10 +459,6 @@ moe_metrics:
   mode: detailed
   detailed_every_steps: 1
   top_k_experts: 0
-ci:
-  recipe_owner: HuiyingLi
-  nodes: 16
-  time: 00:30:00
 clip_grad_norm:
   max_norm: 1.0
 lr_scheduler:
@@ -473,3 +470,7 @@ mfu:
   peak_tflops: 989
 validation_dataset: null
 validation_dataloader: null
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 16
+  time: 00:30:00
