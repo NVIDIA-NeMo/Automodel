@@ -27,6 +27,12 @@ from __future__ import annotations
 import torch
 
 from nemo_automodel.components.models.deepseek_v4.kernels import tilelang_sparse_mla_bwd as sparse_mla_bwd
+from nemo_automodel.components.models.deepseek_v4.kernels import (
+    tilelang_sparse_mla_fp8_bwd as sparse_mla_fp8_bwd,
+)
+from nemo_automodel.components.models.deepseek_v4.kernels import (
+    tilelang_sparse_mla_fp8_fwd as sparse_mla_fp8_fwd,
+)
 from nemo_automodel.components.models.deepseek_v4.kernels import tilelang_sparse_mla_fwd as sparse_mla_fwd
 
 
@@ -154,3 +160,168 @@ def sparse_attn_tilelang_head_chunked(
 ) -> torch.Tensor:
     """Run vendored Miles sparse attention in TileLang head chunks."""
     return DeepSeekV4SparseAttentionHeadChunked.apply(q, kv, attn_sink, topk_idxs, max_heads_per_kernel, sm_scale)
+
+
+class DeepSeekV4Fp8SparseAttention(torch.autograd.Function):
+    """Sparse attention consuming true mixed FP8/BF16 KV storage.
+
+    ``kv_anchor`` carries the straight-through BF16 gradient; the forward and
+    backward numerical kernels load only the quantized storage tensors.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        kv_anchor: torch.Tensor,
+        kv_nope: torch.Tensor,
+        kv_rope: torch.Tensor,
+        kv_scales: torch.Tensor,
+        attn_sink: torch.Tensor,
+        topk_idxs: torch.Tensor,
+        sm_scale: float | None = None,
+    ) -> torch.Tensor:
+        del kv_anchor
+        output, lse = sparse_mla_fp8_fwd.sparse_mqa_fp8_fwd_interface(
+            q,
+            kv_nope,
+            kv_rope,
+            kv_scales,
+            attn_sink,
+            topk_idxs,
+            sm_scale=sm_scale,
+        )
+        ctx.save_for_backward(q, kv_nope, kv_rope, kv_scales, attn_sink, topk_idxs, output, lse)
+        ctx.sm_scale = sm_scale
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        q, kv_nope, kv_rope, kv_scales, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
+        grad_q, grad_kv, grad_attn_sink = sparse_mla_fp8_bwd.sparse_mqa_fp8_bwd_interface(
+            q,
+            kv_nope,
+            kv_rope,
+            kv_scales,
+            attn_sink,
+            output.contiguous(),
+            grad_output.contiguous(),
+            topk_idxs,
+            lse,
+            sm_scale=ctx.sm_scale,
+        )
+        return grad_q, grad_kv, None, None, None, grad_attn_sink, None, None
+
+
+class DeepSeekV4Fp8SparseAttentionHeadChunked(torch.autograd.Function):
+    """Head-chunked true-FP8 sparse attention with FP32 KV-grad accumulation."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        kv_anchor: torch.Tensor,
+        kv_nope: torch.Tensor,
+        kv_rope: torch.Tensor,
+        kv_scales: torch.Tensor,
+        attn_sink: torch.Tensor,
+        topk_idxs: torch.Tensor,
+        max_heads_per_kernel: int,
+        sm_scale: float | None = None,
+    ) -> torch.Tensor:
+        del kv_anchor
+        output = q.new_empty(q.shape)
+        lse = torch.empty(q.shape[:3], dtype=torch.float32, device=q.device)
+        for start in range(0, q.shape[2], max_heads_per_kernel):
+            end = min(start + max_heads_per_kernel, q.shape[2])
+            chunk_output, chunk_lse = sparse_mla_fp8_fwd.sparse_mqa_fp8_fwd_interface(
+                q[:, :, start:end, :].contiguous(),
+                kv_nope,
+                kv_rope,
+                kv_scales,
+                attn_sink[start:end].contiguous(),
+                topk_idxs,
+                sm_scale=sm_scale,
+            )
+            output[:, :, start:end, :].copy_(chunk_output)
+            lse[:, :, start:end].copy_(chunk_lse)
+        ctx.save_for_backward(q, kv_nope, kv_rope, kv_scales, attn_sink, topk_idxs, output, lse)
+        ctx.max_heads_per_kernel = max_heads_per_kernel
+        ctx.sm_scale = sm_scale
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        q, kv_nope, kv_rope, kv_scales, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
+        grad_q = torch.empty_like(q)
+        grad_kv = torch.zeros(
+            (*kv_nope.shape[:-1], kv_nope.shape[-1] + kv_rope.shape[-1]),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        grad_attn_sink = torch.empty_like(attn_sink)
+        for start in range(0, q.shape[2], ctx.max_heads_per_kernel):
+            end = min(start + ctx.max_heads_per_kernel, q.shape[2])
+            grad_q_chunk, grad_kv_chunk, grad_sink_chunk = sparse_mla_fp8_bwd.sparse_mqa_fp8_bwd_interface(
+                q[:, :, start:end, :].contiguous(),
+                kv_nope,
+                kv_rope,
+                kv_scales,
+                attn_sink[start:end].contiguous(),
+                output[:, :, start:end, :].contiguous(),
+                grad_output[:, :, start:end, :].contiguous(),
+                topk_idxs,
+                lse[:, :, start:end].contiguous(),
+                sm_scale=ctx.sm_scale,
+                return_dkv_accum_dtype=True,
+            )
+            grad_q[:, :, start:end, :].copy_(grad_q_chunk)
+            grad_kv += grad_kv_chunk
+            grad_attn_sink[start:end].copy_(grad_sink_chunk)
+        return (
+            grad_q,
+            grad_kv.to(torch.bfloat16),
+            None,
+            None,
+            None,
+            grad_attn_sink,
+            None,
+            None,
+            None,
+        )
+
+
+def sparse_attn_fp8_tilelang(
+    q: torch.Tensor,
+    kv_anchor: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_scales: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    max_heads_per_kernel: int,
+    sm_scale: float | None = None,
+) -> torch.Tensor:
+    """Run DSV4 sparse attention directly from vLLM-compatible FP8 KV."""
+    if q.shape[2] > max_heads_per_kernel:
+        return DeepSeekV4Fp8SparseAttentionHeadChunked.apply(
+            q,
+            kv_anchor,
+            kv_nope,
+            kv_rope,
+            kv_scales,
+            attn_sink,
+            topk_idxs,
+            max_heads_per_kernel,
+            sm_scale,
+        )
+    return DeepSeekV4Fp8SparseAttention.apply(
+        q,
+        kv_anchor,
+        kv_nope,
+        kv_rope,
+        kv_scales,
+        attn_sink,
+        topk_idxs,
+        sm_scale,
+    )

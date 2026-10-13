@@ -81,6 +81,8 @@ class DeepseekV4Config(PretrainedConfig):
         # Multi-token prediction layers appended after the main layers
         num_nextn_predict_layers: int = 1,
         # Standard options
+        kv_cache_dtype: str = "auto",
+        fp8_row_parallel_size: int = 1,
         rms_norm_eps: float = 1e-6,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
@@ -133,6 +135,8 @@ class DeepseekV4Config(PretrainedConfig):
         self.index_n_heads = index_n_heads
         self.index_topk = index_topk
         self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.kv_cache_dtype = kv_cache_dtype
+        self.fp8_row_parallel_size = fp8_row_parallel_size
         self.rms_norm_eps = rms_norm_eps
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout

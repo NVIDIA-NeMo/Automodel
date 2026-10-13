@@ -29,7 +29,9 @@ from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
     build_dsv4_cp_causal_padding_mask,
     dsv4_cp_all_gather,
+    dsv4_cp_all_gather_fp8,
 )
+from nemo_automodel.components.models.deepseek_v4.fp8 import quantize_dsv4_kv
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4RotaryEmbedding,
@@ -147,6 +149,39 @@ def _cp_collective_worker(rank: int, world_size: int, port: int) -> None:
             expected_mask[0, 0, 0, :3] = 0
             expected_mask[0, 0, 1, :3] = 0
         torch.testing.assert_close(mask, expected_mask)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _fp8_cp_collective_worker(rank: int, world_size: int, port: int) -> None:
+    try:
+        _init_gloo(rank, world_size, port)
+        local = torch.full((1, 2, 512), float(rank + 1), dtype=torch.bfloat16, requires_grad=True)
+        local_fp8 = quantize_dsv4_kv(local, backend="torch")
+        gathered = dsv4_cp_all_gather_fp8(local_fp8, dim=1, cp_group=dist.group.WORLD)
+
+        assert gathered.shape == (1, world_size * 2, 512)
+        expected = torch.cat(
+            [
+                quantize_dsv4_kv(
+                    torch.full((1, 2, 512), float(peer + 1), dtype=torch.bfloat16),
+                    backend="torch",
+                ).dequantize()
+                for peer in range(world_size)
+            ],
+            dim=1,
+        )
+        torch.testing.assert_close(gathered.dequantize(), expected, atol=0.0, rtol=0.0)
+
+        grad_global = torch.full_like(gathered.anchor, float(rank + 1))
+        gathered.anchor.backward(grad_global)
+        torch.testing.assert_close(
+            local.grad,
+            torch.full_like(local, float(sum(range(1, world_size + 1)))),
+            atol=0.0,
+            rtol=0.0,
+        )
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -294,6 +329,11 @@ def _compressed_attention_equivalence_worker(rank: int, world_size: int, port: i
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
 def test_dsv4_cp_collectives_have_autograd_and_global_padding_mask():
     mp.spawn(_cp_collective_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
+def test_dsv4_fp8_cp_gathers_payload_and_reduce_scatters_anchor_gradient():
+    mp.spawn(_fp8_cp_collective_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")

@@ -115,7 +115,13 @@ def _floating_param_dtypes(module: nn.Module) -> set[torch.dtype]:
     return {param.dtype for param in module.parameters() if torch.is_floating_point(param)}
 
 
-def _fp32_mp_policy(mp_policy):
+_DSV4_FP32_PRESERVE_INPUT_CLASS_NAMES = {
+    "DeepseekV4HyperConnection",
+    "DeepseekV4HyperHead",
+}
+
+
+def _fp32_mp_policy(mp_policy, module: nn.Module):
     if not isinstance(mp_policy, MixedPrecisionPolicy):
         return mp_policy
 
@@ -123,7 +129,14 @@ def _fp32_mp_policy(mp_policy):
         param_dtype=torch.float32,
         reduce_dtype=torch.float32,
         output_dtype=torch.float32,
-        cast_forward_inputs=mp_policy.cast_forward_inputs,
+        # HyperConnection math consumes a BF16 residual but keeps its learned
+        # coefficients in FP32. Casting the residual at the nested FSDP
+        # boundary changes the source values expected by vLLM's HC kernels.
+        cast_forward_inputs=(
+            False
+            if module.__class__.__name__ in _DSV4_FP32_PRESERVE_INPUT_CLASS_NAMES
+            else mp_policy.cast_forward_inputs
+        ),
     )
 
 
@@ -152,7 +165,7 @@ def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp3
     return fully_shard(
         module,
         mesh=mesh,
-        mp_policy=_fp32_mp_policy(mp_policy) if fp32_policy else mp_policy,
+        mp_policy=_fp32_mp_policy(mp_policy, module) if fp32_policy else mp_policy,
         offload_policy=offload_policy,
         **_fsdp_kwargs_for_module(module, fsdp_kwargs),
     )
@@ -169,6 +182,47 @@ def _iter_dsv4_fp32_modules(module: nn.Module):
             continue
         seen.add(id(submodule))
         yield submodule
+
+
+def _nested_fsdp_parameter_ids(module: nn.Module) -> set[int]:
+    """Parameters already owned by a nested FSDP unit."""
+    owned: set[int] = set()
+    for submodule in module.modules():
+        if submodule is module or not _has_fsdp_state(submodule):
+            continue
+        owned.update(id(param) for param in submodule.parameters())
+    return owned
+
+
+def _iter_storage_dtype_islands(module: nn.Module, excluded_param_ids: set[int]):
+    """Yield minority-storage-dtype subtrees not already owned by FSDP.
+
+    DSV4's regular torch modules can use fp32 master storage while TE modules
+    retain bf16 storage. FSDP2 requires one original storage dtype per unit even
+    when both units compute in bf16. The strict-fp32 modules are wrapped before
+    this helper and excluded here.
+    """
+    from nemo_automodel.components.distributed.parallelizer_utils import (
+        iter_maximal_uniform_dtype_subtrees,
+    )
+
+    grouped: dict[torch.dtype, list[nn.Parameter]] = {}
+    for param in module.parameters():
+        if id(param) in excluded_param_ids or not torch.is_floating_point(param):
+            continue
+        grouped.setdefault(param.dtype, []).append(param)
+    if len(grouped) <= 1:
+        return
+
+    minority_dtype = min(grouped.items(), key=lambda item: len(item[1]))[0]
+    for _path, submodule, dtype in iter_maximal_uniform_dtype_subtrees(
+        module,
+        include_buffers=False,
+        tensor_pred=lambda tensor: torch.is_floating_point(tensor) and id(tensor) not in excluded_param_ids,
+        return_paths=True,
+    ):
+        if dtype == minority_dtype and submodule is not module:
+            yield submodule
 
 
 def _fp32_module_fsdp_kwargs(module: nn.Module, fsdp_kwargs: dict) -> dict:
@@ -238,6 +292,7 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
             **fsdp_kwargs,
         )
 
+    excluded_param_ids = {id(param) for param in (fsdp_kwargs.get("ignored_params") or ())}
     for fp32_module in _iter_dsv4_fp32_modules(module):
         _fully_shard_once(
             fp32_module,
@@ -247,6 +302,22 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
             fp32_policy=True,
             **_fp32_module_fsdp_kwargs(fp32_module, fsdp_kwargs),
         )
+        excluded_param_ids.update(id(param) for param in fp32_module.parameters())
+
+    # True-FP8/TE DSV4 can have bf16 storage islands inside an fp32-master
+    # backbone. They use the normal mixed-precision policy (bf16 compute), but
+    # require a distinct FSDP unit so original storage dtypes stay uniform.
+    excluded_param_ids.update(_nested_fsdp_parameter_ids(module))
+    for dtype_module in _iter_storage_dtype_islands(module, excluded_param_ids):
+        _fully_shard_once(
+            dtype_module,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            fp32_policy=False,
+            **fsdp_kwargs,
+        )
+        excluded_param_ids.update(id(param) for param in dtype_module.parameters())
 
     ignored_params = set(fsdp_kwargs.get("ignored_params") or ())
     parent_kwargs = dict(fsdp_kwargs)

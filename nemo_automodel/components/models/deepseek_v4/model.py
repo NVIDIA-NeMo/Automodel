@@ -79,9 +79,11 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4HyperConnection,
     DeepseekV4HyperHead,
     DeepseekV4RotaryEmbedding,
+    _dsv4_kernel_backend,
     _dsv4_sinkhorn_backend,
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
+    dsv4_hc_post,
 )
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -199,6 +201,7 @@ class DeepseekV4Block(nn.Module):
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
             sinkhorn_backend=_dsv4_sinkhorn_backend(backend),
+            kernel_backend=_dsv4_kernel_backend(backend),
         )
         self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
@@ -224,8 +227,8 @@ class DeepseekV4Block(nn.Module):
             padding_mask = attention_mask.bool().logical_not()
 
         def attention_site(hidden_streams: torch.Tensor) -> torch.Tensor:
-            pre, post, comb = self.attn_hc(hidden_streams)
-            collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+            collapsed, post, comb = self.attn_hc(hidden_streams, collapse=True)
+            collapsed = collapsed.to(hidden_streams.dtype)
             attn_out, _ = self.self_attn(
                 hidden_states=self.input_layernorm(collapsed),
                 position_embeddings=position_embeddings,
@@ -235,16 +238,18 @@ class DeepseekV4Block(nn.Module):
                 position_ids=position_ids,
                 **attn_kwargs,
             )
-            dtype = hidden_streams.dtype
             # Expand: native DSV4 uses comb[j, h] * residual[j], i.e. comb.T @ residual.
-            return post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(
-                comb.transpose(-1, -2).to(dtype), hidden_streams
+            return dsv4_hc_post(
+                hidden_streams,
+                attn_out,
+                post,
+                comb,
+                backend=self.attn_hc.kernel_backend,
             )
 
         def ffn_prepare(hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            pre, post, comb = self.ffn_hc(hidden_streams)
-            collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
-            return collapsed, post, comb
+            collapsed, post, comb = self.ffn_hc(hidden_streams, collapse=True)
+            return collapsed.to(hidden_streams.dtype), post, comb
 
         x = attention_site(x)
         collapsed, post, comb = ffn_prepare(x)
@@ -254,8 +259,13 @@ class DeepseekV4Block(nn.Module):
         if self.is_hash_routing_layer and isinstance(self.mlp.gate, DeepseekV4HashGate):
             self.mlp.gate.set_input_ids(input_ids)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
-        dtype = x.dtype
-        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
+        return dsv4_hc_post(
+            x,
+            mlp_out,
+            post,
+            comb,
+            backend=self.ffn_hc.kernel_backend,
+        )
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.input_layernorm.reset_parameters()
@@ -291,6 +301,7 @@ class DeepseekV4HashGate(nn.Module):
         self.score_func = moe_config.score_func
         self.route_scale = moe_config.route_scale
         self.norm_topk_prob = moe_config.norm_topk_prob
+        self.vllm_fp8_moe_semantics = moe_config.vllm_fp8_moe_semantics
 
         # Routing score weight (used to compute weights, not for selection)
         self.weight = nn.Parameter(torch.zeros(self.n_experts, config.hidden_size))
@@ -363,7 +374,11 @@ class DeepseekV4HashGate(nn.Module):
             denom = weights.sum(dim=-1, keepdim=True) + 1e-20
             weights = weights / denom
         weights = weights * self.route_scale
-        return weights.type_as(x), indices, None
+        if self.vllm_fp8_moe_semantics:
+            weights = weights.float()
+        else:
+            weights = weights.type_as(x)
+        return weights, indices, None
 
 
 class DeepseekV4Model(nn.Module):
@@ -402,6 +417,14 @@ class DeepseekV4Model(nn.Module):
             # V4 Flash routed experts use clamped SwiGLU (gate.max=limit,
             # up.±limit) in FP32 — see reference model.py Expert.forward.
             swiglu_limit=float(getattr(config, "swiglu_limit", 0.0) or 0.0),
+            # Under true FP8, match vLLM's H100 DeepGEMM activation rounding
+            # and post-down routing-weight placement.  GroupedExpertsTE gates
+            # this at runtime on TE FP8 autocast, so BF16 remains unchanged.
+            vllm_fp8_moe_semantics=True,
+            # The actor owns full expert weights under EP, while rollout uses
+            # intermediate-dimension TP. Preserve one virtual partial per vLLM
+            # TP rank through the shared+routed reduction.
+            fp8_row_parallel_size=int(getattr(config, "fp8_row_parallel_size", 1) or 1),
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
@@ -439,16 +462,16 @@ class DeepseekV4Model(nn.Module):
         # HF partial_rotary_factor = qk_rope_head_dim / head_dim so cos/sin
         # come out sized to qk_rope_head_dim.
         partial_rotary_factor = float(config.qk_rope_head_dim) / float(config.head_dim)
-        # Reference (``dsv4flash/inference/model.py:519-525``) only applies YaRN
-        # to the compress-rope path: when compress_ratio>0 it uses
-        # ``original_seq_len=args.original_seq_len`` and theta=compress_rope_theta;
-        # otherwise ``original_seq_len=0`` (YaRN disabled) and theta=rope_theta.
+        # vLLM applies the checkpoint's YaRN parameters to both the main
+        # theta=10000 rope and the theta=160000 compress rope.  This differs
+        # from the older DSV4-Flash/NeMo-RL reference, which disabled YaRN on
+        # non-compress layers, but rollout parity follows vLLM.
         rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = DeepseekV4RotaryEmbedding(
             rope_theta=float(config.rope_theta),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
-            rope_scaling=None,
+            rope_scaling=rope_scaling,
         )
         self.rotary_emb_compress = DeepseekV4RotaryEmbedding(
             rope_theta=float(getattr(config, "compress_rope_theta", 160000.0) or 160000.0),

@@ -83,6 +83,7 @@ class RouterReplay:
         self.mode: Optional[RouterReplayMode] = None
         self.recorded_indices: Optional[torch.Tensor] = None
         self.target_indices: Optional[torch.Tensor] = None
+        self.replay_calls: int = 0
         RouterReplay._registry.append(self)
 
     def apply(self, indices: torch.Tensor) -> torch.Tensor:
@@ -113,6 +114,7 @@ class RouterReplay:
                     f"Replay indices shape {tuple(target.shape)} does not match the current "
                     f"selection shape {tuple(indices.shape)}; replay must run on the same tokens and topk."
                 )
+            self.replay_calls += 1
             return target
         return indices
 

@@ -29,6 +29,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsDeepEP,
     GroupedExpertsTE,
     is_gated_activation,
+    swiglu_clamped_vllm_fp8,
 )
 from nemo_automodel.components.moe.experts import (
     _init_weights as _init_expert_weights,
@@ -37,6 +38,137 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
+
+
+class TERowParallelLinear(nn.Module):
+    """Local TE FP8 row-parallel GEMMs that return one partial per partition.
+
+    The logical weight remains ``[out_features, in_features]`` for checkpoint
+    and refit compatibility. Internally each virtual TP rank owns one input
+    slice and produces a BF16 partial. The enclosing MoE combines routed and
+    shared partials before reducing them, matching vLLM's late all-reduce.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        n_partitions: int,
+        *,
+        bias: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        if bias:
+            raise ValueError("TERowParallelLinear does not support bias")
+        if in_features % n_partitions:
+            raise ValueError(f"in_features={in_features} must be divisible by n_partitions={n_partitions}")
+
+        from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding, GroupedLinear
+
+        from nemo_automodel.components.models.common.utils import _patch_te_modules
+
+        _patch_te_modules()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.n_partitions = n_partitions
+        self.in_features_per_partition = in_features // n_partitions
+        self._linear = GroupedLinear(
+            num_gemms=n_partitions,
+            in_features=self.in_features_per_partition,
+            out_features=out_features,
+            bias=False,
+            params_dtype=dtype,
+            device=torch.empty(0).device,
+        )
+        self._fp8_padding = Fp8Padding(n_partitions)
+        self._fp8_unpadding = Fp8Unpadding(n_partitions)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        """Return the logical released-checkpoint weight."""
+        return torch.cat([getattr(self._linear, f"weight{i}") for i in range(self.n_partitions)], dim=1)
+
+    @property
+    def bias(self) -> None:
+        return None
+
+    def reset_parameters(self, init_std: float = 0.02) -> None:
+        for partition_idx in range(self.n_partitions):
+            nn.init.normal_(getattr(self._linear, f"weight{partition_idx}"), mean=0.0, std=init_std)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_shape = x.shape[:-1]
+        rows = x.numel() // self.in_features
+        grouped_x = x.reshape(rows, self.n_partitions, self.in_features_per_partition)
+        grouped_x = grouped_x.permute(1, 0, 2).reshape(-1, self.in_features_per_partition)
+
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        m_splits = [rows] * self.n_partitions
+        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
+        if fp8_active:
+            grouped_x, padded_m_splits = self._fp8_padding(grouped_x, m_splits)
+        else:
+            padded_m_splits = m_splits
+        if fp8_active and grouped_x.dtype == torch.float32:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                grouped_y = self._linear(grouped_x, m_splits=padded_m_splits)
+        else:
+            grouped_y = self._linear(grouped_x, m_splits=padded_m_splits)
+        if fp8_active:
+            grouped_y = self._fp8_unpadding(grouped_y, m_splits)
+        grouped_y = grouped_y.view(self.n_partitions, rows, self.out_features)
+        return grouped_y.permute(1, 0, 2).reshape(*batch_shape, self.n_partitions, self.out_features)
+
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False, **kwargs):
+        if destination is None:
+            from collections import OrderedDict
+
+            destination = OrderedDict()
+            destination._metadata = OrderedDict()
+        if hasattr(destination, "_metadata"):
+            destination._metadata[prefix[:-1]] = {"version": self._version}
+        weight = self.weight
+        destination[f"{prefix}weight"] = weight if keep_vars else weight.detach()
+        destination[f"{prefix}_extra_state"] = self._linear.get_extra_state()
+        return destination
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        weight_key = f"{prefix}weight"
+        if weight_key in state_dict:
+            weight = state_dict.pop(weight_key)
+            expected_shape = (self.out_features, self.in_features)
+            if tuple(weight.shape) != expected_shape:
+                error_msgs.append(
+                    f"size mismatch for {weight_key}: expected {expected_shape}, got {tuple(weight.shape)}"
+                )
+            else:
+                for partition_idx in range(self.n_partitions):
+                    start = partition_idx * self.in_features_per_partition
+                    state_dict[f"{prefix}_linear.weight{partition_idx}"] = weight.narrow(
+                        1,
+                        start,
+                        self.in_features_per_partition,
+                    )
+        elif strict:
+            missing_keys.append(weight_key)
+
+        extra_state_key = f"{prefix}_extra_state"
+        child_extra_state_key = f"{prefix}_linear._extra_state"
+        state_dict[child_extra_state_key] = state_dict.pop(
+            extra_state_key,
+            self._linear.get_extra_state(),
+        )
 
 
 class MLP(nn.Module):
@@ -60,6 +192,8 @@ class MLP(nn.Module):
         activation: str = "swiglu",
         bias: bool = False,
         swiglu_limit: float = 0.0,
+        vllm_fp8_semantics: bool = False,
+        fp8_row_parallel_size: int = 1,
     ):
         """
         Initializes the MLP layer.
@@ -74,6 +208,11 @@ class MLP(nn.Module):
             swiglu_limit (float): When > 0 and activation is gated, run SwiGLU
                 in fp32 with one-sided gate clamp ``max=limit`` and symmetric
                 up clamp ``±limit``. Matches DSV4 reference ``Expert.forward``.
+            vllm_fp8_semantics (bool): When true and TE FP8 autocast is active,
+                preserve vLLM's BF16 clamp/SiLU/multiply boundaries before the
+                shared-expert down projection.
+            fp8_row_parallel_size (int): Number of virtual vLLM TP partials to
+                retain from the shared-expert down projection.
         """
         super().__init__()
         if activation not in ("swiglu", "relu2"):
@@ -82,6 +221,8 @@ class MLP(nn.Module):
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
         self.swiglu_limit = float(swiglu_limit)
+        self.vllm_fp8_semantics = bool(vllm_fp8_semantics)
+        self.fp8_row_parallel_size = int(fp8_row_parallel_size)
 
         self.up_proj = initialize_linear_module(
             linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
@@ -93,9 +234,20 @@ class MLP(nn.Module):
         else:
             self.gate_proj = None
 
-        self.down_proj = initialize_linear_module(
-            linear_impl=backend, in_features=inter_dim, out_features=dim, bias=bias, dtype=dtype
-        )
+        if self.fp8_row_parallel_size > 1:
+            if backend != "te":
+                raise ValueError("virtual FP8 row parallelism requires the TE linear backend")
+            self.down_proj = TERowParallelLinear(
+                inter_dim,
+                dim,
+                self.fp8_row_parallel_size,
+                bias=bias,
+                dtype=dtype,
+            )
+        else:
+            self.down_proj = initialize_linear_module(
+                linear_impl=backend, in_features=inter_dim, out_features=dim, bias=bias, dtype=dtype
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -110,6 +262,12 @@ class MLP(nn.Module):
         if not self.is_gated:
             return self.down_proj(F.relu(self.up_proj(x)).pow(2))
         if self.swiglu_limit > 0.0:
+            if self.vllm_fp8_semantics:
+                from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+                if FP8GlobalStateManager.is_fp8_enabled():
+                    gate_up = torch.cat((self.gate_proj(x), self.up_proj(x)), dim=-1)
+                    return self.down_proj(swiglu_clamped_vllm_fp8(gate_up, self.swiglu_limit))
             # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
             # gate clamp and symmetric up clamp; cast back before down_proj.
             dtype = x.dtype
@@ -264,6 +422,7 @@ class Gate(nn.Module):
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
         self.gate_precision = gate_precision
+        self.vllm_fp8_moe_semantics = config.vllm_fp8_moe_semantics
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -545,7 +704,14 @@ class Gate(nn.Module):
             weights, indices, original_scores = self._route_scores(scores)
 
         if self.gate_precision is not None:
-            weights = weights.to(dtype=original_dtype)
+            # vLLM keeps DeepSeek-V4 top-k routing weights in FP32 after the
+            # FP32 router, including normalization and routed scaling.  Do not
+            # narrow them back to the activation dtype before the expert
+            # reduction: that rounding is observable once it accumulates over
+            # many MoE layers.  The default path preserves the historical
+            # input-dtype output contract for every other model.
+            if not self.vllm_fp8_moe_semantics:
+                weights = weights.to(dtype=original_dtype)
             original_scores = original_scores.to(dtype=original_dtype)
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
@@ -575,7 +741,11 @@ class Gate(nn.Module):
         if self._track_load_balance and aux_loss is not None:
             self._last_aux_loss = aux_loss.detach()
 
-        return weights.type_as(x), indices, aux_loss
+        if self.vllm_fp8_moe_semantics:
+            weights = weights.float()
+        else:
+            weights = weights.type_as(x)
+        return weights, indices, aux_loss
 
     def update_bias(self) -> None:
         """
@@ -750,6 +920,7 @@ class MoE(nn.Module):
         self.dim = config.dim
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.n_activated_experts
+        self.fp8_row_parallel_size = int(config.fp8_row_parallel_size)
 
         if backend.fake_balanced_gate:
             self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
@@ -797,6 +968,8 @@ class MoE(nn.Module):
                 activation=config.shared_expert_activation,
                 bias=config.expert_bias,
                 swiglu_limit=config.swiglu_limit,
+                vllm_fp8_semantics=config.vllm_fp8_moe_semantics,
+                fp8_row_parallel_size=config.fp8_row_parallel_size,
             )
             if config.shared_expert_gate:
                 self.shared_expert_gate = initialize_linear_module(
@@ -864,14 +1037,32 @@ class MoE(nn.Module):
         if self.shared_experts is not None:
             z = self.shared_experts(x)
             if self.shared_expert_gate is not None:
-                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+                shared_gate = torch.nn.functional.sigmoid(self.shared_expert_gate(x))
+                if self.fp8_row_parallel_size > 1:
+                    shared_gate = shared_gate.unsqueeze(-2)
+                z = shared_gate * z
 
         # Routed experts on the main stream.
         y = self.experts(x_latent, token_mask, weights, indices)
 
         if self.fc2_latent_proj is not None:
             y = self.fc2_latent_proj(y)
-        if z is not None:
+        if self.fp8_row_parallel_size > 1:
+            if y.ndim != 3 or y.shape[-2] != self.fp8_row_parallel_size:
+                raise RuntimeError(
+                    "routed experts did not return the configured virtual-TP partials: "
+                    f"shape={tuple(y.shape)}, partitions={self.fp8_row_parallel_size}"
+                )
+            if z is not None:
+                if z.shape != y.shape:
+                    raise RuntimeError(
+                        f"shared/routed virtual-TP partial shape mismatch: {tuple(z.shape)} vs {tuple(y.shape)}"
+                    )
+                y = y + z
+            # Match the BF16 per-rank shared+routed add followed by vLLM's TP
+            # reduction accumulation and BF16 destination.
+            y = y.float().sum(dim=-2).to(y.dtype)
+        elif z is not None:
             y = y + z
         return y.view(shape)
 
@@ -898,7 +1089,10 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
             # Delegate expert initialization to experts.py
             _init_expert_weights(module, buffer_device, init_std)
         elif isinstance(module, MLP):
-            to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
+            if isinstance(module.down_proj, TERowParallelLinear):
+                module.down_proj.reset_parameters(init_std)
+            else:
+                to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
             to_local(module.up_proj.weight).normal_(mean=0.0, std=init_std)
             if module.gate_proj is not None:
                 to_local(module.gate_proj.weight).normal_(mean=0.0, std=init_std)

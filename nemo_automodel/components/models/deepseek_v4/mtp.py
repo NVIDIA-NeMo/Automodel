@@ -37,6 +37,9 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4HyperConnection,
     DeepseekV4HyperHead,
+    _dsv4_kernel_backend,
+    _dsv4_sinkhorn_backend,
+    dsv4_hc_post,
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
@@ -96,6 +99,8 @@ class DeepseekV4MTPBlock(nn.Module):
             hc_sinkhorn_iters=int(getattr(config, "hc_sinkhorn_iters", 20) or 20),
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(eps),
+            sinkhorn_backend=_dsv4_sinkhorn_backend(backend),
+            kernel_backend=_dsv4_kernel_backend(backend),
         )
         self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
@@ -147,8 +152,8 @@ class DeepseekV4MTPBlock(nn.Module):
         position_embeddings = self._rotary_emb(embed_input, position_ids)
         position_embeddings_compress = self._rotary_emb_compress(embed_input, position_ids)
 
-        pre, post, comb = self.attn_hc(hidden_states)
-        collapsed = (pre.unsqueeze(-1) * hidden_states).sum(dim=2).to(hidden_states.dtype)
+        collapsed, post, comb = self.attn_hc(hidden_states, collapse=True)
+        collapsed = collapsed.to(hidden_states.dtype)
         attn_out, _ = self.self_attn(
             hidden_states=self.input_layernorm(collapsed),
             position_embeddings=position_embeddings,
@@ -158,16 +163,23 @@ class DeepseekV4MTPBlock(nn.Module):
             position_ids=position_ids,
             **attn_kwargs,
         )
-        dtype = hidden_states.dtype
-        hidden_states = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(
-            comb.transpose(-1, -2).to(dtype), hidden_states
+        hidden_states = dsv4_hc_post(
+            hidden_states,
+            attn_out,
+            post,
+            comb,
+            backend=self.attn_hc.kernel_backend,
         )
 
-        pre, post, comb = self.ffn_hc(hidden_states)
-        collapsed = (pre.unsqueeze(-1) * hidden_states).sum(dim=2).to(hidden_states.dtype)
+        collapsed, post, comb = self.ffn_hc(hidden_states, collapse=True)
+        collapsed = collapsed.to(hidden_states.dtype)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
-        hidden_states = post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(
-            comb.transpose(-1, -2).to(dtype), hidden_states
+        hidden_states = dsv4_hc_post(
+            hidden_states,
+            mlp_out,
+            post,
+            comb,
+            backend=self.ffn_hc.kernel_backend,
         )
 
         prediction_hidden = self.norm(self.hc_head(hidden_states))

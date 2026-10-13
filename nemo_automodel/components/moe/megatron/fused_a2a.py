@@ -349,6 +349,8 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
+# Fence tensors share the HybridEP buffer lifecycle; reset releases their storage.
+_hybrid_ep_round_fences: dict[torch.device, torch.Tensor] = {}
 
 
 def init_hybrid_ep_buffer(
@@ -388,10 +390,30 @@ def init_hybrid_ep_buffer(
     )
 
 
-def reset_hybrid_ep_buffer():
-    """Reset the HybridEP buffer."""
+def reset_hybrid_ep_buffer() -> None:
+    """Release the HybridEP buffer and its round-fence tensors."""
     global _hybrid_ep_buffer
     _hybrid_ep_buffer = None
+    _hybrid_ep_round_fences.clear()
+
+
+def _hybrid_ep_round_fence(device: torch.device) -> None:
+    """Order consecutive HybridEP rounds that reuse one dispatch handle.
+
+    HybridEP's inter-node back-sync waits until each peer's round counter
+    exactly equals the local count. Back-to-back rounds on one handle have no
+    other EP communication in between, and CP32 RL showed a peer posting round
+    N+1 before a slower rank observed round N, which then never matches. A
+    stream-ordered all-reduce over the EP group between rounds keeps every rank
+    from starting round N+1 until all ranks finished round N.
+
+    Args:
+        device: Device of the tensors being communicated.
+    """
+    fence = _hybrid_ep_round_fences.get(device)
+    if fence is None:
+        fence = _hybrid_ep_round_fences[device] = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(fence, group=_hybrid_ep_buffer.group)
 
 
 class HybridEPDispatch(torch.autograd.Function):
@@ -456,7 +478,10 @@ class HybridEPDispatch(torch.autograd.Function):
         """Backward pass of fused dispatch of the HybridEP backend."""
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
+            hidden=grad_x.contiguous(),
+            probs=grad_probs.contiguous() if grad_probs is not None else None,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
         )
         return combined_hidden, None, combined_probs, None, None, None, None, None, None
 
@@ -480,13 +505,92 @@ class HybridEPCombine(torch.autograd.Function):
         """Backward pass of fused combine of the HybridEP backend."""
         handle = ctx.handle
         dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
-            hidden=grad_x,
+            # ``torch.stack``-based partitioned combines produce strided
+            # gradient views. HybridEP's C++ entrypoint requires contiguous
+            # token rows in both directions.
+            hidden=grad_x.contiguous(),
             scaling_factor=None,
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
         )
         return dispatched_hidden, None, None, None
+
+
+class HybridEPCombinePartitions(torch.autograd.Function):
+    """Combine bounded partitions with an optional sparse top-k slot axis."""
+
+    @staticmethod
+    def forward(ctx, x, route_slots, num_slots, handle, num_permuted_tokens, pad_multiple):
+        """Combine each slot/partition without materializing the routed slot axis.
+
+        Args:
+            x: Local BF16 tensor of shape [routes, partitions, hidden].
+            route_slots: Local integer tensor of shape [routes], or None for
+                an unslotted combine. Out-of-range slots contribute zero.
+            num_slots: Number of top-k slots; one when route_slots is None.
+            handle: Routing handle from the matching HybridEP dispatch.
+            num_permuted_tokens: Local dispatched row count, including padding.
+            pad_multiple: Expert row padding alignment.
+
+        Returns:
+            Tensor of shape [padded_tokens, num_slots * partitions, hidden],
+            ordered by slot then partition on the originating rank.
+        """
+        ctx.save_for_backward(route_slots)
+        ctx.input_shape = x.shape
+        ctx.handle = handle
+        ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.pad_multiple = pad_multiple
+        combined = []
+        for slot in range(num_slots):
+            mask = None if route_slots is None else route_slots.ne(slot).unsqueeze(-1)
+            for partition in range(x.shape[1]):
+                rows = x[:, partition, :]
+                rows = rows.contiguous() if mask is None else rows.masked_fill(mask, 0)
+                if combined:
+                    _hybrid_ep_round_fence(x.device)
+                restored, _ = _hybrid_ep_buffer.combine_with_unpermute(
+                    hidden=rows, handle=handle, pad_multiple=pad_multiple
+                )
+                combined.append(restored)
+        return torch.stack(combined, dim=1)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output):
+        """Dispatch gradients directly into the compact input layout.
+
+        Args:
+            grad_output: Tensor of shape [padded_tokens, slots * partitions,
+                hidden], with the same slot-major ordering as forward.
+
+        Returns:
+            Input gradient of shape [routes, partitions, hidden] and None
+            for the five metadata arguments. Only first derivatives supported.
+        """
+        (route_slots,) = ctx.saved_tensors
+        grad_input = grad_output.new_zeros(ctx.input_shape)
+        partitions = ctx.input_shape[1]
+        # Same collective order on every rank, including empty/invalid slots.
+        for lane in reversed(range(grad_output.shape[1])):
+            slot, partition = divmod(lane, partitions)
+            if lane != grad_output.shape[1] - 1:
+                _hybrid_ep_round_fence(grad_output.device)
+            dispatched, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
+                hidden=grad_output[:, lane, :].contiguous(),
+                scaling_factor=None,
+                handle=ctx.handle,
+                pad_multiple=ctx.pad_multiple,
+                num_permuted_tokens=ctx.num_permuted_tokens,
+            )
+            if route_slots is not None:
+                dispatched = dispatched.masked_fill(route_slots.ne(slot).unsqueeze(-1), 0)
+            # Each row belongs to at most one slot, so this adds no new
+            # rounding across nonzero slot contributions. The buffer is owned
+            # by this backward; no input or saved tensor is modified.
+            grad_input[:, partition, :].add_(dispatched)
+        return grad_input, None, None, None, None, None
 
 
 if HAVE_HYBRIDEP:
