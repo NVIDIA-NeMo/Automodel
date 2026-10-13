@@ -83,6 +83,7 @@ from nemo_automodel.components.utils.model_utils import (
     parse_freeze_config,
     print_trainable_parameters,
 )
+from nemo_automodel.shared import telemetry
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 if TYPE_CHECKING:
@@ -486,6 +487,7 @@ def _get_strategy_config(model_wrapper) -> DistributedStrategyConfig | None:
 
 
 #  apply_model_infrastructure  --  the main post-init orchestration function
+@telemetry.traced(telemetry.MODEL_INIT, "automodel.model.infrastructure")
 def apply_model_infrastructure(
     model,
     *,

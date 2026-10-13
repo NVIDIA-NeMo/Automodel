@@ -2180,3 +2180,81 @@ class TestUpdateProgressBar:
         pbar.close()
 
     # Should succeed without FileNotFoundError
+
+
+# ---------------------------------------------------------------------------
+# Telemetry
+# ---------------------------------------------------------------------------
+
+import nemo_automodel  # noqa: E402
+from tests.utils.telemetry import lens_capture  # noqa: E402, F401
+
+
+def test_save_and_load_checkpoint_emit_one_span_each(tmp_path, lens_capture):
+    capture = lens_capture("default")
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    recipe_inst.save_checkpoint(epoch=0, step=5, train_loss=1.0)
+    recipe_inst.load_checkpoint(restore_from="LATEST")
+
+    (save_span,) = capture.span_named("automodel.checkpoint.save")
+    assert save_span.attributes["dl.iteration"] == 5
+    assert save_span.attributes["automodel.checkpoint.async"] is False
+    assert len(capture.span_named("automodel.checkpoint.load")) == 1
+
+
+def test_no_checkpoint_span_when_nothing_is_saved_or_loaded(tmp_path, lens_capture):
+    capture = lens_capture("default")
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    recipe_inst.load_checkpoint()  # empty checkpoint dir: nothing to restore
+    recipe_inst.checkpointer.config.enabled = False
+    recipe_inst.save_checkpoint(epoch=0, step=5, train_loss=1.0)
+
+    assert capture.spans() == []
+
+
+def _recipe_with_mesh(tmp_path, telemetry_cfg, model):
+    recipe_inst = _ToyRecipe(
+        tmp_path, cfg_dict={"telemetry": telemetry_cfg, "model": {"pretrained_model_name_or_path": model}}
+    )
+    recipe_inst.mesh_context = SimpleNamespace(tp_size=2, pp_size=1, cp_size=4, ep_size=1, dp_size=8)
+    return recipe_inst
+
+
+def test_telemetry_resource_attributes_describe_the_process(tmp_path, monkeypatch):
+    pytest.importorskip("nemo.lens")
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    recipe_inst = _recipe_with_mesh(tmp_path, {"enabled": True}, "org/model")
+
+    attributes = recipe_inst._telemetry_resource_attributes()
+
+    assert attributes == {
+        "service.version": nemo_automodel.__version__,
+        "nv.dl.local_rank": 3,
+        "dl.tensor_parallel.size": 2,
+        "dl.pipeline_parallel.size": 1,
+        "dl.context_parallel.size": 4,
+        "dl.expert_parallel.size": 1,
+        "dl.data_parallel.size": 8,
+        "nemo.automodel.recipe": "_ToyRecipe",
+        "nemo.automodel.model": "org/model",
+    }
+
+
+def test_telemetry_resource_attributes_never_record_a_local_model_path(tmp_path):
+    pytest.importorskip("nemo.lens")
+    recipe_inst = _recipe_with_mesh(tmp_path, {"enabled": True}, str(tmp_path))
+    assert "nemo.automodel.model" not in recipe_inst._telemetry_resource_attributes()
+
+
+def test_telemetry_resource_attributes_are_empty_and_lens_free_when_disabled(tmp_path, monkeypatch):
+    from nemo_automodel.shared import telemetry
+
+    class _Unavailable:
+        def __getattr__(self, name):
+            raise AssertionError("semconv read while telemetry is disabled")
+
+    monkeypatch.setattr(telemetry, "semconv", _Unavailable())
+    recipe_inst = _recipe_with_mesh(tmp_path, {"enabled": False}, "org/model")
+    assert recipe_inst._telemetry_resource_attributes() == {}

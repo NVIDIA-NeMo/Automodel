@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import signal
 from dataclasses import asdict, dataclass
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING
 from torch.distributed.checkpoint.stateful import Stateful
 
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler, SignalLike
+from nemo_automodel.shared import telemetry
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -201,18 +203,26 @@ class StepScheduler(Stateful):
         """
         if self.step >= self.max_steps:
             return
-        batch_buffer = []
-        for batch in self.dataloader:
-            batch_buffer.append(batch)
-            if len(batch_buffer) == self.grad_acc_steps:
-                yield batch_buffer
-                self.step += 1
-                batch_buffer = []
-                if self.step >= self.max_steps or self.sigterm_flag:
-                    return
-        if batch_buffer:
+        batches = iter(self.dataloader)
+        while True:
+            # Fetch a whole accumulation window before yielding it, so the span measures the
+            # dataloader alone. It must close before the yield: a span held open across a
+            # yield would also time, and parent, the caller's work on the window.
+            with telemetry.span(telemetry.DATA_LOADING, "automodel.data.wait") as span:
+                batch_buffer = list(itertools.islice(batches, self.grad_acc_steps))
+                if span is not None:
+                    span.set_attribute(telemetry.semconv.DL_ITERATION, self.step)
+                    # Fewer than grad_acc_steps on the last window of an epoch; 0 when the
+                    # dataloader was already exhausted.
+                    span.set_attribute("automodel.data.batches", len(batch_buffer))
+            if not batch_buffer:
+                break
             yield batch_buffer
             self.step += 1
+            if len(batch_buffer) < self.grad_acc_steps:
+                break
+            if self.step >= self.max_steps or self.sigterm_flag:
+                return
         self.epoch += 1
 
     def set_epoch(self, epoch: int):
