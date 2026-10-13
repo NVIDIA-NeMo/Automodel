@@ -43,9 +43,22 @@ def test_weighted_swiglu_matches_autograd_and_skips_unused_router_gradient(monke
     backward_kernel = moe_utils.weighted_swiglu_back
     requested = []
 
-    def checked_backward(g, y, w, need_weight_grad=True):
+    def checked_backward(
+        g: torch.Tensor, y: torch.Tensor, w: torch.Tensor, *, need_weight_grad: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Check whether the weighted activation requests routing gradients.
+
+        Args:
+            g: Upstream gradient shaped [tokens, intermediate].
+            y: Gate/up activations shaped [tokens, 2 * intermediate].
+            w: Routing weights shaped [tokens, 1].
+            need_weight_grad: Whether routing weights require a gradient.
+
+        Returns:
+            Activation gradient shaped like ``y`` and the optional gradient of ``w``.
+        """
         requested.append(need_weight_grad)
-        input_grad, weight_grad = backward_kernel(g, y, w, need_weight_grad)
+        input_grad, weight_grad = backward_kernel(g, y, w, need_weight_grad=need_weight_grad)
         assert (weight_grad is not None) == train_router
         return input_grad, weight_grad
 

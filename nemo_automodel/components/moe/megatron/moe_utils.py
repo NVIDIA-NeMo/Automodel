@@ -227,7 +227,7 @@ def swiglu_back(g, y):
 
 @torch.compile
 def weighted_swiglu_back(
-    g: torch.Tensor, y: torch.Tensor, weights: torch.Tensor, need_weight_grad: bool = True
+    g: torch.Tensor, y: torch.Tensor, weights: torch.Tensor, *, need_weight_grad: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Compute input and optional weight gradients for weighted SwiGLU.
 
@@ -358,7 +358,7 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights, ctx.needs_input_grad[1])
+        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights, need_weight_grad=ctx.needs_input_grad[1])
         return tmp, wgrad, None
 
 
