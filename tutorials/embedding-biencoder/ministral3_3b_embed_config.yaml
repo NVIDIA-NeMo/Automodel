@@ -31,17 +31,26 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512-BF16
+  trust_remote_code: true
   pooling: avg
   l2_normalize: true
   is_causal: false
+  use_liger_kernel: true
   use_sdpa_patching: true
   torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  extract_submodel: language_model
   do_distributed_inbatch_negative: false
 
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512-BF16
+  padding_side: left
+  tokenizer_backend: tokenizers
+  fix_mistral_regex: true
+  split_special_tokens: true
+  add_bos_token: true
   add_eos_token: false
 
 dataset:
@@ -58,15 +67,15 @@ dataloader:
     _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
     q_max_len: 256
     p_max_len: 256
-    query_prefix: "query: "
-    passage_prefix: "passage: "
+    query_prefix: "query:"
+    passage_prefix: "passage:"
     pad_to_multiple_of: 8
   shuffle: true
   num_workers: 0
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 5.0e-6
+  lr: 2.0e-6
   weight_decay: 0.01
 
 lr_scheduler:
@@ -75,7 +84,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: ./output/llama_embed_tutorial/checkpoints
+  checkpoint_dir: ./output/ministral3_3b_embed_tutorial/checkpoints
   model_save_format: safetensors
   save_consolidated: true
 
