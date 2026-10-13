@@ -560,13 +560,15 @@ class GlmMoeDsaMLA(nn.Module):
         `torch.full(..., finfo.min).scatter_(-1, topk_indices, 0)`
 
         Args:
-            topk_indices: Indices of top-k positions [B, S, topk] or [T, topk]
+            topk_indices: Integer tensor of shape [batch, sequence, top_k] or
+                [tokens, top_k] for packed THD inputs.
             seq_len: Sequence length
             qkv_format: 'bshd' or 'thd'
             bsz: Batch size (only used for bshd format)
             n_heads: Number of attention heads to expand to
             dtype: Data type for the output tensor
-            attention_mask: Optional attention mask to combine with (for SDPA)
+            attention_mask: Optional key keep mask of shape [batch, sequence],
+                or additive mask broadcastable to [batch, heads, sequence, sequence].
             union_across_batches: If True, union top-k across batches (for TE);
                                   if False, keep per-batch masks (for SDPA)
 
@@ -582,38 +584,27 @@ class GlmMoeDsaMLA(nn.Module):
         # TE's core_attention_bias tolerates -inf, which is why only the SDPA path was affected.
         neg = torch.finfo(dtype).min
 
+        num_tokens = topk_indices.shape[0] if qkv_format == "thd" else seq_len
+        mask_shape = (num_tokens, num_tokens) if qkv_format == "thd" else (bsz, seq_len, seq_len)
+        sparse_mask = torch.full(mask_shape, neg, device=device, dtype=dtype).scatter_(-1, topk_indices, 0.0)
+
+        # Top-k can include future positions when fewer than top_k causal keys exist.
+        # Apply causality before head expansion: masking the expanded TE bias would
+        # allocate and traverse an additional [1, heads, sequence, sequence] tensor.
+        causal_bool = torch.ones(num_tokens, num_tokens, dtype=torch.bool, device=device).triu(1)
+        sparse_mask.masked_fill_(causal_bool, neg)
+
         if qkv_format == "thd":
-            num_tokens = topk_indices.shape[0]
-            # Create mask directly in final shape [1, n_heads, T, T]
-            # All heads share the same mask, so we create [T, T] and expand
-            sparse_mask = torch.full((num_tokens, num_tokens), neg, device=device, dtype=dtype).scatter_(
-                -1, topk_indices, 0.0
-            )
             # expand creates a view, contiguous makes a copy
             sparse_mask = sparse_mask.view(1, 1, num_tokens, num_tokens).expand(1, n_heads, -1, -1).contiguous()
         else:
             if union_across_batches:
-                # For TE: create [B, S, S], scatter, union via max, then expand
-                sparse_mask = torch.full((bsz, seq_len, seq_len), neg, device=device, dtype=dtype).scatter_(
-                    -1, topk_indices, 0.0
-                )
                 # Union: max(0, finfo.min) = 0 for any position selected in any batch
                 sparse_mask = sparse_mask.max(dim=0, keepdim=True).values
                 sparse_mask = sparse_mask.view(1, 1, seq_len, seq_len).expand(1, n_heads, -1, -1).contiguous()
             else:
-                # For SDPA: create [B, S, S], scatter, expand (no contiguous needed)
-                sparse_mask = torch.full((bsz, seq_len, seq_len), neg, device=device, dtype=dtype).scatter_(
-                    -1, topk_indices, 0.0
-                )
+                # SDPA accepts a broadcast view over heads.
                 sparse_mask = sparse_mask.unsqueeze(1).expand(-1, n_heads, -1, -1)
-
-        # Enforce causality independently of the top-k selection: a query attends only to keys
-        # at positions <= its own. Required because at seq_len <= index_topk the top-k selects
-        # every token (including future) and the SDPA path consumes this mask with is_causal=False;
-        # without it the DSA attention is bidirectional and leaks the next token.
-        q_len, k_len = sparse_mask.shape[-2], sparse_mask.shape[-1]
-        causal_bool = torch.ones(q_len, k_len, dtype=torch.bool, device=sparse_mask.device).triu(1)
-        sparse_mask = sparse_mask.masked_fill(causal_bool, neg)
 
         # Combine with the attention mask if provided. Convert a {0,1} keep-mask to an additive
         # key mask (kept -> 0, padding -> finfo.min) and broadcast it over the key axis; adding a raw

@@ -360,6 +360,43 @@ class TestGlmMoeDsaMLA:
         assert sparse_mask[0, 0, 2, 2] == 0
         assert sparse_mask[0, 0, 0, 1] == torch.finfo(torch.float32).min
 
+    @pytest.mark.parametrize("qkv_format,union", [("bshd", False), ("bshd", True), ("thd", False)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("top_k", [2, 5])
+    def test_sparse_mask_matches_causal_selection_for_every_head(
+        self, config, sdpa_backend, qkv_format, union, dtype, top_k
+    ):
+        """Future selections remain masked even when top-k spans the full sequence."""
+        mla = GlmMoeDsaMLA(config, sdpa_backend)
+        seq_len, n_heads = 5, 3
+        bsz = 1 if qkv_format == "thd" else 2
+        torch.manual_seed(14)
+        indices = torch.rand(bsz, seq_len, seq_len).argsort(dim=-1)[..., :top_k]
+        topk_indices = indices[0] if qkv_format == "thd" else indices
+        actual = mla._build_sparse_mask(
+            topk_indices,
+            seq_len,
+            qkv_format,
+            bsz=bsz,
+            n_heads=n_heads,
+            dtype=dtype,
+            union_across_batches=union,
+        )
+
+        output_batches = 1 if union else bsz
+        expected = torch.full((output_batches, n_heads, seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype)
+        for batch in range(output_batches):
+            selected_batches = range(bsz) if union else [batch]
+            for query in range(seq_len):
+                selected_keys = {int(key) for source in selected_batches for key in indices[source, query]}
+                for key in selected_keys:
+                    if key <= query:
+                        expected[batch, :, query, key] = 0
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if union or qkv_format == "thd":
+            assert actual.is_contiguous()
+
     def test_shared_forward_requires_previous_topk(self, config, sdpa_backend):
         mla = GlmMoeDsaMLA(config, sdpa_backend, skip_topk=True)
         x = torch.randn(1, 3, config.hidden_size)
