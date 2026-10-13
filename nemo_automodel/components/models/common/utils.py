@@ -446,7 +446,7 @@ class BackendConfig:
             else falls back to torch._grouped_mm at runtime).
         te_grouped_tensor: Prefer TE 2.19 native grouped-tensor GEMMs for ``experts="te"``.
             Device and precision support follows TE's ``GroupedLinear`` contract.
-            Parameters retain their existing per-expert checkpoint layout.
+            Parameters and checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.

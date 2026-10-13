@@ -18,12 +18,14 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExpertsTE
+from nemo_automodel.shared.import_utils import is_te_min_version
 
 
 @dataclass
@@ -65,7 +67,7 @@ class _GroupedInputDispatcher:
         return hidden_states
 
 
-def _experts(*, native: bool, counts: list[int]) -> GroupedExpertsTE:
+def _experts(*, native: bool, counts: list[int], bias: bool = True) -> GroupedExpertsTE:
     config = MoEConfig(
         n_routed_experts=4,
         n_shared_experts=0,
@@ -81,7 +83,7 @@ def _experts(*, native: bool, counts: list[int]) -> GroupedExpertsTE:
         inter_dim=512,
         moe_inter_dim=512,
         norm_topk_prob=False,
-        expert_bias=True,
+        expert_bias=bias,
         dtype=torch.bfloat16,
     )
     backend = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native)
@@ -93,26 +95,103 @@ def _experts(*, native: bool, counts: list[int]) -> GroupedExpertsTE:
     return module
 
 
+def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """Measure tensor error without dividing by individual near-zero elements.
+
+    Args:
+        actual: Observed tensor, with the same shape as ``expected``.
+        expected: Reference tensor of any shape.
+
+    Returns:
+        Ratio of error L2 norm to reference L2 norm; zero references require exact equality.
+    """
+    assert actual.shape == expected.shape
+    assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+    actual, expected = actual.float(), expected.float()
+    norm = expected.norm().item()
+    if norm == 0:
+        assert torch.count_nonzero(actual).item() == 0
+        return 0.0
+    return (actual - expected).norm().item() / norm
+
+
+def _fp32_reference(
+    module: GroupedExpertsTE,
+    hidden: torch.Tensor,
+    probability: torch.Tensor,
+    upstream: torch.Tensor,
+    counts: list[int],
+) -> dict[str, torch.Tensor]:
+    """Evaluate an independent, unquantized expert MLP and its gradients.
+
+    Args:
+        module: Expert module whose parameters supply the reference weights.
+        hidden: Tensor of shape [tokens, hidden], grouped by expert.
+        probability: Routing probabilities of shape [tokens, 1].
+        upstream: Output gradients of shape [tokens, hidden].
+        counts: Token count for each expert, including empty experts.
+
+    Returns:
+        FP32 output, input and routing gradients, and gradients keyed by parameter name.
+    """
+    parameters = {name: value.detach().float().requires_grad_() for name, value in module.named_parameters()}
+    hidden = hidden.detach().float().requires_grad_()
+    probability = probability.detach().float().requires_grad_()
+    outputs = []
+    offset = 0
+    for expert, count in enumerate(counts):
+        rows = slice(offset, offset + count)
+        gate_up = F.linear(
+            hidden[rows],
+            parameters[f"gate_up_linear.weight{expert}"],
+            parameters[f"gate_up_linear.bias{expert}"] if module.expert_bias else None,
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        activated = F.silu(gate) * up * probability[rows]
+        output = F.linear(activated, parameters[f"down_linear.weight{expert}"])
+        if module.expert_bias:
+            output = output + parameters[f"down_linear.bias{expert}"] * probability[rows]
+        outputs.append(output)
+        offset += count
+    output = torch.cat(outputs)
+    gradients = torch.autograd.grad(output, (hidden, probability, *parameters.values()), grad_outputs=upstream.float())
+    return {
+        "output": output,
+        "input_grad": gradients[0],
+        "probability_grad": gradients[1],
+        **dict(zip(parameters, gradients[2:], strict=True)),
+    }
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("checkpointed", [False, True])
-def test_native_te_grouped_tensor_numerics(fp8: bool, checkpointed: bool) -> None:
+@pytest.mark.parametrize("bias", [False, True])
+def test_native_te_grouped_tensor_numerics(fp8: bool, checkpointed: bool, bias: bool) -> None:
     """Preserve outputs, all gradients, updates, padding and empty-expert behavior."""
     te = pytest.importorskip("transformer_engine.pytorch", reason="Optional TE backend is required")
+    if not is_te_min_version("2.19.0"):
+        pytest.skip("Native grouped-tensor GEMMs require TE 2.19.0 or newer")
     from transformer_engine.common.recipe import Float8CurrentScaling
+    from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
+
+    if not is_module_grouped_tensor_path_supported(Float8CurrentScaling() if fp8 else None, torch.bfloat16):
+        pytest.skip("The native grouped-tensor path does not support this device/recipe combination")
 
     torch.manual_seed(13)
     # Imbalanced counts exercise FP8 padding and an empty expert in both GEMMs.
     counts = [17, 0, 63, 32]
-    reference = _experts(native=False, counts=counts)
-    candidate = _experts(native=True, counts=counts)
+    reference = _experts(native=False, counts=counts, bias=bias)
+    candidate = _experts(native=True, counts=counts, bias=bias)
     with torch.no_grad():
         for reference_parameter, parameter in zip(reference.parameters(), candidate.parameters(), strict=True):
             parameter.copy_(reference_parameter)
     optimizers = [torch.optim.SGD(module.parameters(), lr=0.001) for module in (reference, candidate)]
     mask = torch.ones(sum(counts), device="cuda", dtype=torch.bool)
     indices = torch.cat([torch.full((count, 1), expert) for expert, count in enumerate(counts)]).cuda()
+    original_precision = torch.get_float32_matmul_precision()
     try:
+        torch.set_float32_matmul_precision("highest")
         for _step in range(2):
             for optimizer in optimizers:
                 optimizer.zero_grad(set_to_none=True)
@@ -144,27 +223,56 @@ def test_native_te_grouped_tensor_numerics(fp8: bool, checkpointed: bool) -> Non
                     else:
                         output = run(hidden, probability)
                     output.backward(upstream)
+                    assert hidden.grad is not None and probability.grad is not None
                     outputs.append(output.detach())
                     input_grads.append(hidden.grad)
                     probability_grads.append(probability.grad)
-                for expected, actual in (outputs, input_grads, probability_grads):
-                    # BF16 grouped GEMM reductions may choose different tilings; FP8
-                    # operands are quantized independently by each TE module.
-                    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
+                for name, (expected, actual) in zip(
+                    ("output", "input_grad", "probability_grad"), (outputs, input_grads, probability_grads), strict=True
+                ):
+                    # Different GEMM tilings and BF16 reductions produce relative
+                    # outliers near zero. Bound the whole-tensor error instead.
+                    assert _relative_l2(actual, expected) < (0.03 if fp8 else 0.01), name
+                if microbatch == 0:
+                    oracle = _fp32_reference(reference, x, probs, upstream, counts)
+                    oracle_errors = []
+                    for index, module in enumerate((reference, candidate)):
+                        values = {
+                            "output": outputs[index],
+                            "input_grad": input_grads[index],
+                            "probability_grad": probability_grads[index],
+                        }
+                        for name, parameter in module.named_parameters():
+                            assert parameter.grad is not None, name
+                            values[name] = parameter.grad
+                        oracle_errors.append(
+                            {name: _relative_l2(value, oracle[name]) for name, value in values.items()}
+                        )
+                    for name in oracle:
+                        legacy_error, native_error = (errors[name] for errors in oracle_errors)
+                        # Both implementations must approximate the independent
+                        # FP32 computation, including the router and every expert.
+                        assert max(legacy_error, native_error) < (0.12 if fp8 else 0.01), name
+                        assert native_error <= legacy_error + 0.005, name
             for (name, expected), (_, actual) in zip(
                 reference.named_parameters(), candidate.named_parameters(), strict=True
             ):
                 assert expected.grad is not None and actual.grad is not None, name
-                torch.testing.assert_close(actual.grad, expected.grad, rtol=0.03, atol=0.003)
+                assert _relative_l2(actual.grad, expected.grad) < (0.04 if fp8 else 0.01), name
                 if name.endswith(("weight1", "bias1")):
                     assert torch.count_nonzero(actual.grad).item() == 0, name
             for optimizer in optimizers:
                 optimizer.step()
-        # The integration keeps the existing per-expert parameter/checkpoint layout.
+        # Keep per-expert parameters and the exported stacked checkpoint layout.
         for (name, expected), (actual_name, actual) in zip(
             reference.named_parameters(), candidate.named_parameters(), strict=True
         ):
             assert name == actual_name
-            torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
+            assert _relative_l2(actual, expected) < 0.02, name
+        expected_state, actual_state = reference.state_dict(), candidate.state_dict()
+        assert expected_state.keys() == actual_state.keys()
+        for name, expected in expected_state.items():
+            assert _relative_l2(actual_state[name], expected) < 0.02, name
     finally:
         set_is_first_microbatch(None)
+        torch.set_float32_matmul_precision(original_precision)
