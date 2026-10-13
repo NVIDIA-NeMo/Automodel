@@ -19,19 +19,31 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from types import TracebackType
-from typing import Any
 
 import torch
 from torch._dynamo.backends.common import aot_autograd
 from torch._functorch.aot_autograd import make_boxed_func
+from torch._functorch.partitioners import min_cut_rematerialization_partition
 from torch._inductor.compile_fx import compile_fx
-from torch._subclasses.fake_tensor import FakeTensor
+from torch._inductor.decomposition import select_decomp_table
+from torch._ops import HigherOrderOperator, OpOverload, OpOverloadPacket
 from torch.fx.node import map_arg
-from torch.utils._pytree import tree_leaves
 from torch.utils.flop_counter import FlopCounterMode as TorchFlopCounterMode
-from torch.utils.flop_counter import _FlopCounterMode
+from torch.utils.flop_counter import _FlopCounterMode, shape_wrapper
 
 logger = logging.getLogger(__name__)
+
+
+def _grouped_mm_flops(a_shape: Sequence[int], b_shape: Sequence[int], *args: object, **kwargs: object) -> int:
+    """Count grouped GEMMs, excluding bias just like PyTorch's MM formula.
+
+    Shapes are [groups, rows, reduction] / [groups, reduction, columns]
+    for 3D operands. A 2D operand packs the variable group dimension:
+    rows for 2D/3D, columns for 3D/2D, or reduction for 2D/2D.
+    Summing group sizes therefore requires no offset tensor values.
+    """
+    groups = a_shape[0] if len(a_shape) == len(b_shape) == 3 else 1
+    return 2 * groups * a_shape[-2] * a_shape[-1] * b_shape[-1]
 
 
 class _CompileAwareDispatchMode(_FlopCounterMode):
@@ -43,13 +55,13 @@ class _CompileAwareDispatchMode(_FlopCounterMode):
 
     def __torch_dispatch__(
         self,
-        func: Callable[..., Any],
+        func: OpOverload | HigherOrderOperator,
         types: tuple[type, ...],
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> Any:
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
         """Follow PyTorch's dispatch contract for arbitrary operator tensor layouts."""
-        if self.counter._compiled_depth or any(isinstance(arg, FakeTensor) for arg in tree_leaves((args, kwargs))):
+        if self.counter._compiled_depth:
             # Inductor can call ATen GEMMs as well as fused kernels. Both are
             # already included in the graph count; do not count GEMMs twice.
             return func(*args, **(kwargs or {}))
@@ -70,11 +82,15 @@ class FlopCounterMode(TorchFlopCounterMode):
     stance/backend is restored on exit. These instrumented steps must not be used
     for throughput timing. This is an Inductor measurement, not a measurement of
     another backend's optimizations or exact fused-kernel instructions.
+    The measurement backend replaces each function's ``mode`` and ``options``
+    with Inductor defaults, so kernel selection and rounding may differ.
 
     Counts describe registered ATen graph operations before Inductor fusion, with
     PyTorch's usual omissions (for example, elementwise operations). Custom opaque
     kernels still need a FLOPs formula. Only global totals are collected;
     measurement does not install module tracking hooks.
+    Activation-checkpoint and Inductor rematerialization FLOPs are included
+    whenever their registered operations execute in the measured graphs.
     Symbolic FLOP totals specialize the measurement graph to their integer value.
     This adapter uses the dispatch/compiler interfaces in the CI PyTorch 2.14.
     Like PyTorch's counter, instances are not reentrant or thread safe.
@@ -89,17 +105,27 @@ class FlopCounterMode(TorchFlopCounterMode):
         self,
         *,
         display: bool = True,
-        custom_mapping: dict[Any, Callable[..., int]] | None = None,
+        custom_mapping: dict[OpOverloadPacket | HigherOrderOperator, Callable[..., int]] | None = None,
     ) -> None:
         super().__init__(display=display, custom_mapping=custom_mapping)
+        # Fill the gap in PyTorch's registry without replacing an upstream or
+        # caller-supplied formula. Both eager dispatch and AOT graphs use this.
+        self.flop_registry.setdefault(torch.ops.aten._grouped_mm, shape_wrapper(_grouped_mm_flops))
         self._active = False
         self._compiled_depth = 0
         self._stack: ExitStack | None = None
         # Keep the backend identity stable when reusing this counter so that
         # measurement graphs can be reused without recompiling each iteration.
-        self._backend = aot_autograd(fw_compiler=self._compile_graph, bw_compiler=self._compile_graph)
+        self._backend = aot_autograd(
+            fw_compiler=self._compile_graph,
+            bw_compiler=self._compile_graph,
+            partition_fn=min_cut_rematerialization_partition,
+            decompositions=select_decomp_table(),
+        )
 
-    def _compile_graph(self, graph: torch.fx.GraphModule, inputs: Sequence[Any]) -> Callable[..., Any]:
+    def _compile_graph(
+        self, graph: torch.fx.GraphModule, inputs: Sequence[torch.Tensor | int | torch.SymInt]
+    ) -> Callable[..., Sequence[torch.Tensor | int | torch.SymInt | None]]:
         """Compile an AOT graph and attach its FLOPs to actual invocations.
 
         Args:
@@ -111,12 +137,17 @@ class FlopCounterMode(TorchFlopCounterMode):
             Boxed callable returning the graph's flat outputs in their original
             shapes, layouts and dtypes.
         """
-        counts: Counter[Any] = Counter()
+        counts: Counter[OpOverloadPacket | HigherOrderOperator] = Counter()
         for node in graph.graph.nodes:
             if node.op != "call_function":
                 continue
             target = node.target
-            packet = target._overloadpacket if isinstance(target, torch._ops.OpOverload) else target
+            if isinstance(target, OpOverload):
+                packet = target._overloadpacket
+            elif isinstance(target, HigherOrderOperator):
+                packet = target
+            else:
+                continue
             formula = self.flop_registry.get(packet)
             if formula is None and isinstance(target, torch._ops.HigherOrderOperator):
                 raise NotImplementedError(
@@ -135,7 +166,7 @@ class FlopCounterMode(TorchFlopCounterMode):
         finally:
             self._compiled_depth -= 1
 
-        def run(*args: Any) -> Any:
+        def run(*args: torch.Tensor | int | torch.SymInt) -> Sequence[torch.Tensor | int | torch.SymInt | None]:
             """Execute the compiled graph and count it on success.
 
             Args:

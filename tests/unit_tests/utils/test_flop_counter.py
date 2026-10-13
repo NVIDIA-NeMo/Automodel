@@ -59,6 +59,7 @@ def test_compiled_forward_backward_cache_and_restoration(warm: bool) -> None:
                 assert counter.get_total_flops() == 2 * 2 * 3 * 4
                 actual.backward(upstream)
             assert counter.get_total_flops() == 6 * 2 * 3 * 4
+            assert type(counter.get_total_flops()) is int
             torch.testing.assert_close(actual, reference)
             torch.testing.assert_close(x.grad, reference_grads[0])
             torch.testing.assert_close(weight.grad, reference_grads[1])
@@ -150,3 +151,86 @@ def test_counts_only_backward_graphs_that_execute(input_grad: bool, weight_grad:
         if input_grad or weight_grad:
             result.sum().backward()
     assert counter.get_total_flops() == (1 + input_grad + weight_grad) * 2 * 2 * 3 * 4
+
+
+def test_measurement_preserves_inductor_saved_activation_size() -> None:
+    torch.compiler.reset()
+    model = torch.nn.Sequential(
+        *(layer for _ in range(4) for layer in (torch.nn.Linear(16, 16), torch.nn.GELU(), torch.nn.LayerNorm(16)))
+    )
+    compiled = torch.compile(model, fullgraph=True)
+    x = torch.randn(8, 16, requires_grad=True)
+    upstream = torch.randn(8, 16)
+    saved_sizes = []
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        """Record a saved tensor's size.
+
+        Args:
+            tensor: Saved activation or parameter of arbitrary shape and dtype.
+
+        Returns:
+            The same tensor, with unchanged shape, dtype, and storage.
+        """
+        saved_sizes.append(tensor.numel())
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        reference = compiled(x)
+        reference.backward(upstream)
+    reference_sizes = sorted(saved_sizes)
+    reference_grads = [parameter.grad.clone() for parameter in model.parameters()]
+    reference_input_grad = x.grad.clone()
+    model.zero_grad(set_to_none=True)
+    x.grad = None
+    saved_sizes.clear()
+
+    with FlopCounterMode(display=False), torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        measured = compiled(x)
+        measured.backward(upstream)
+
+    assert reference_sizes
+    assert sorted(saved_sizes) == reference_sizes
+    torch.testing.assert_close(measured, reference)
+    torch.testing.assert_close(x.grad, reference_input_grad)
+    for parameter, reference_grad in zip(model.parameters(), reference_grads):
+        torch.testing.assert_close(parameter.grad, reference_grad)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize(
+    "a_shape,b_shape,group_flops",
+    [
+        ((24, 8), (3, 8, 16), [2 * rows * 8 * 16 for rows in (8, 0, 16)]),
+        ((3, 8, 16), (16, 24), [2 * 8 * 16 * columns for columns in (8, 0, 16)]),
+        ((8, 24), (24, 16), [2 * 8 * reduction * 16 for reduction in (8, 0, 16)]),
+        ((3, 8, 16), (3, 16, 8), [2 * 8 * 16 * 8] * 3),
+    ],
+)
+def test_grouped_mm_default_counts_forward_and_backward(
+    compiled: bool, a_shape: tuple[int, ...], b_shape: tuple[int, ...], group_flops: list[int]
+) -> None:
+    torch.compiler.reset()
+    # The compiled ATen meta kernel requires BF16, including on CPU.
+    a = torch.randn(a_shape, dtype=torch.bfloat16, requires_grad=True)
+    b = torch.randn(b_shape, dtype=torch.bfloat16, requires_grad=True)
+    offsets = None if len(a_shape) == len(b_shape) == 3 else torch.tensor([8, 8, 24], dtype=torch.int32)
+    multiply = (
+        torch.compile(torch.ops.aten._grouped_mm.default, fullgraph=True) if compiled else torch.ops.aten._grouped_mm
+    )
+    with FlopCounterMode(display=False) as counter:
+        result = multiply(a, b, offsets)
+        assert counter.get_total_flops() == sum(group_flops)
+        result.backward(torch.randn_like(result))
+    assert counter.get_total_flops() == 3 * sum(group_flops)
+    assert type(counter.get_total_flops()) is int
+
+
+def test_grouped_mm_custom_formula_overrides_default() -> None:
+    a = torch.randn(24, 8)
+    b = torch.randn(3, 8, 16)
+    with FlopCounterMode(
+        display=False, custom_mapping={torch.ops.aten._grouped_mm: lambda *args, **kwargs: 123}
+    ) as counter:
+        torch.ops.aten._grouped_mm(a, b, torch.tensor([8, 8, 24], dtype=torch.int32))
+    assert counter.get_total_flops() == 123

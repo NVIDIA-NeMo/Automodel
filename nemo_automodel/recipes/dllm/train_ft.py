@@ -504,6 +504,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         # by `measure_flops` (default off → no effect on normal / llada / nemotron runs);
         # attempted once, after `measure_flops_after` steps. Compiled regions use a
         # separate instrumented Inductor variant; later steps restore normal compilation.
+        # Measurement uses Inductor defaults instead of each function's mode/options,
+        # which may change kernels/rounding, and includes checkpoint/rematerialization work.
         # Only setup/reporting failures are optional; training failures still propagate.
         _fcm = None
         with ExitStack() as flop_context:
@@ -542,7 +544,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 # Per-GPU FLOPs for one full step (all microbatches' fwd+bwd).
                 self._step_flops_per_gpu = float(_fcm.get_total_flops())
                 logging.info(
-                    "Measured per-GPU step FLOPs: %.3e (TFLOPs reported on later clean steps)",
+                    "Measured per-GPU step FLOPs: %.3e (includes activation-checkpoint/Inductor recomputation; "
+                    "TFLOPs reported on later clean steps)",
                     self._step_flops_per_gpu,
                 )
             except Exception as e:

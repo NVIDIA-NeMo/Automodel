@@ -196,16 +196,10 @@ def test_formula_matches_executed_forward_backward(
     model = DeepseekV4ForCausalLM(config, backend=backend)
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
 
-    def grouped_mm_flops(a_shape, b_shape, *args, **kwargs):
-        # PyTorch's counter lacks grouped-MM accounting in some versions.
-        # Forward/dgrad split rows across experts; wgrad splits the reduction
-        # dimension. Summing the groups gives 2*M*K*N in either case.
-        return 2 * a_shape[0] * a_shape[1] * b_shape[-1]
-
     # Exercise compiled matrix arithmetic as well as the expert activation's
     # existing fullgraph helper. Count both forward and backward executions.
     model.model.hc_head.compile(fullgraph=True)
-    with FlopCounterMode(display=False, custom_mapping={torch.ops.aten._grouped_mm: grouped_mm_flops}) as counter:
+    with FlopCounterMode(display=False) as counter:
         logits = model(torch.arange(length).unsqueeze(0) % config.vocab_size).logits
         logits.backward(torch.ones_like(logits))
 
