@@ -408,6 +408,43 @@ def test_recipe_config_resolves_diffusion_validation_dataloader_only_when_declar
     assert config.shuffle is False
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader",
+        "nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader",
+        "nemo_automodel.components.datasets.diffusion.image_edit_dataset.ImageEditDataloaderConfig",
+    ],
+)
+@pytest.mark.parametrize("override", [None, True, False])
+def test_diffusion_validation_drop_last_default_preserves_training_and_overrides(target, override):
+    node = {"_target_": target, "cache_dir": "/tmp/cache"}
+    if override is not None:
+        node["drop_last"] = override
+    raw = ConfigNode({"data": {"dataloader": dict(node), "validation_dataloader": dict(node)}})
+    cfg = RecipeConfig(raw)
+
+    assert cfg.diffusion_validation_dataloader.drop_last is (False if override is None else override)
+    assert cfg.diffusion_dataloader.drop_last is (True if override is None else override)
+    assert raw.get("data.validation_dataloader.drop_last", None) is override
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        {"_target_": "nemo_automodel.components.datasets.diffusion.mock_dataloader.MockWanDataloaderConfig"},
+        {
+            "_target_": "nemo_automodel.components.datasets.diffusion.meta_files_dataset.MetaFilesDataloaderConfig",
+            "meta_folder": "/tmp/cache",
+        },
+    ],
+)
+def test_diffusion_validation_accepts_loaders_without_drop_last(node):
+    assert (
+        RecipeConfig(ConfigNode({"data": {"validation_dataloader": node}})).diffusion_validation_dataloader is not None
+    )
+
+
 def test_recipe_config_rejects_unknown_diffusion_dataloader_field():
     raw = ConfigNode(
         {

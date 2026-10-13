@@ -150,7 +150,7 @@ RUN if [ "$INSTALL_TE" = "True" ] || \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
+# Install HybridEP / DeepEP: nvshmem wheel 3.6.5.
 # The pinned hybrid-ep revision includes DeepEP #699, which inherits PyTorch's C++ standard
 # instead of forcing C++17 (PyTorch's Rubin builds require C++20).
 # deepep.patch also backports https://github.com/deepseek-ai/DeepEP/pull/564 for NVSHMEM 3.6.5 compatibility.
@@ -274,7 +274,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     fi && \
     rm -rf /tmp/fa
 
-FROM automodel_dep AS automodel_final
+FROM automodel_dep AS automodel_dependencies
 
 WORKDIR /opt/Automodel
 
@@ -302,10 +302,10 @@ RUN pip install "aiohttp>=3.14.3" \
         "mistune>=3.3.0" \
         "nbconvert>=7.17.0" \
         "notebook>=7.5.6" \
-        "onnx>=1.21.0" \
+        "onnx>=1.22.0" \
         "pillow>=12.3.0" \
         "protobuf>=6.33.5" \
-        "setuptools>=80.10.2" \
+        "setuptools>=83.0.0" \
         "tornado>=6.5.5" \
         "urllib3>=2.7.0" && \
     pip uninstall -y nvidia-dali-cuda130 wandb && \
@@ -352,6 +352,13 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/_private/runtime_env/agent/thirdparty_files && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
+
+# CI can supply this stage as a digest-pinned named build context, skipping all
+# dependency compilation. Ordinary Docker builds still build the stage above.
+FROM automodel_dependencies AS automodel_final
+ARG BASE_IMAGE=cuda
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
