@@ -1772,7 +1772,8 @@ class GroupedExpertsTE(nn.Module):
         Args:
             config: MoE configuration containing expert parameters.
             backend: Backend configuration; reads ``benchmark_static_routing``
-                (cache the per-microbatch split list under forced-balanced routing).
+                (cache the per-microbatch split list under forced-balanced routing) and
+                ``te_grouped_tensor`` (prefer TE native grouped-tensor GEMMs).
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
@@ -1813,6 +1814,7 @@ class GroupedExpertsTE(nn.Module):
         # first-microbatch copy, since forced-balanced routing makes it constant.
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self._static_m_splits: list | None = None
+        self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1845,6 +1847,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=config.dtype,
             device="meta",
+            use_grouped_tensor=True if self.use_grouped_tensor else None,
         )
         # down_linear: [moe_inter_dim] -> [dim]
         self.down_linear = GroupedLinear(
@@ -1854,6 +1857,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=config.dtype,
             device="meta",
+            use_grouped_tensor=True if self.use_grouped_tensor else None,
         )
 
         self.expert_activation = get_expert_activation_for_deepep(config)
@@ -2120,6 +2124,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=self.config.dtype,
             device="meta",
+            use_grouped_tensor=True if self.use_grouped_tensor else None,
         )
 
         # down_linear: [moe_inter_dim] -> [dim]
@@ -2130,6 +2135,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=self.config.dtype,
             device="meta",
+            use_grouped_tensor=True if self.use_grouped_tensor else None,
         )
 
         token_dispatcher_config = TokenDispatcherConfig(
@@ -2190,13 +2196,13 @@ class GroupedExpertsTE(nn.Module):
         Forward pass using TE's GroupedLinear with native FP8 support.
 
         Args:
-            x: [num_tokens, model_dim] input tensor
-            token_mask: [num_tokens] boolean mask for valid tokens
-            weights: [num_tokens, num_activated_experts] routing weights
-            indices: [num_tokens, num_activated_experts] expert indices
+            x: CUDA tensor of shape [tokens, hidden], local to this EP rank.
+            token_mask: Boolean tensor of shape [tokens] marking valid tokens.
+            weights: Tensor of shape [tokens, top_k] with routing probabilities.
+            indices: Integer tensor of shape [tokens, top_k] with global expert IDs.
 
         Returns:
-            [num_tokens, model_dim] output tensor
+            Tensor of shape [tokens, hidden], local to this EP rank.
         """
         assert not isinstance(x, DTensor), "Input should not be a DTensor"
         assert self.config.n_routed_experts % self.ep_size == 0, (
@@ -2227,9 +2233,16 @@ class GroupedExpertsTE(nn.Module):
             permuted_probs, _ = self.fp8_padding(permuted_probs, actual_m_splits)
 
         if sum(m_splits) > 0:
-            output1 = self.gate_up_linear(permuted_local_hidden_states, m_splits)
+            # The native grouped-tensor API consumes device-side int64 split sizes.
+            # Keep the host list for padding, unpadding, and the legacy TE path.
+            grouped_m_splits = (
+                torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
+                if self.use_grouped_tensor
+                else m_splits
+            )
+            output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
             output1 = self.expert_activation(output1, permuted_probs)
-            output2 = self.down_linear(output1, m_splits)
+            output2 = self.down_linear(output1, grouped_m_splits)
             # The down-projection bias must be weighted by the per-token routing probability
             # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
             # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
