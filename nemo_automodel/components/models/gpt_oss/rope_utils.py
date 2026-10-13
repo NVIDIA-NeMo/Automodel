@@ -216,8 +216,10 @@ def _apply_rotary_emb_qk(
 
 # Preserve BF16/FP16 rounding between multiplies and adds, not only when casting
 # the tables. Computing Q/K together also shares table casts and compiler guards.
+# Symbolic token dimensions keep packed microbatches from exhausting Dynamo's
+# recompile limit and silently falling back to eager execution.
 _compiled_apply_rotary_emb_qk = torch.compile(
-    _apply_rotary_emb_qk, dynamic=False, options={"emulate_precision_casts": True}
+    _apply_rotary_emb_qk, dynamic=True, options={"emulate_precision_casts": True}
 )
 
 

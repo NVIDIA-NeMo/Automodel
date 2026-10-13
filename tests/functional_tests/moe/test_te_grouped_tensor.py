@@ -89,6 +89,8 @@ def _experts(*, native: bool, counts: list[int], bias: bool = True) -> GroupedEx
     )
     backend = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native)
     module = GroupedExpertsTE(config, backend=backend)
+    assert module.gate_up_linear.use_grouped_tensor is native
+    assert module.down_linear.use_grouped_tensor is native
     module.gate_up_linear.reset_parameters()
     module.down_linear.reset_parameters()
     module.ep_size = 1
@@ -165,25 +167,41 @@ def _fp32_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
-@pytest.mark.parametrize("precision", ["bf16", "fp8", "mxfp8"])
+def test_native_te_rejects_delayed_scaling() -> None:
+    te = pytest.importorskip("transformer_engine.pytorch")
+    if not is_te_min_version("2.19.0"):
+        pytest.skip("Native grouped-tensor GEMMs require TE 2.19.0 or newer")
+    from transformer_engine.common.recipe import DelayedScaling
+
+    module = _experts(native=True, counts=[17, 0, 63, 32])
+    x = torch.randn(112, 256, device="cuda", dtype=torch.bfloat16)
+    probabilities = torch.ones(112, 1, device="cuda", dtype=x.dtype)
+    indices = torch.zeros(112, 1, device="cuda", dtype=torch.long)
+    with te.autocast(enabled=True, recipe=DelayedScaling()):
+        with pytest.raises(ValueError, match="Set te_grouped_tensor=False"):
+            module(x, torch.ones(112, device="cuda", dtype=torch.bool), probabilities, indices)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
+@pytest.mark.parametrize("precision", ["bf16", "fp8", "block", "mxfp8"])
 @pytest.mark.parametrize("checkpointed", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
 def test_native_te_grouped_tensor_numerics(precision: str, checkpointed: bool, bias: bool) -> None:
     """Preserve outputs, all gradients, updates, padding and empty-expert behavior.
 
     Args:
-        precision: BF16, FP8 current scaling, or MXFP8 block scaling.
+        precision: BF16, FP8 current scaling, FP8 block scaling, or MXFP8.
         checkpointed: Whether to recompute the expert forward during backward.
         bias: Whether the grouped projections include bias parameters.
     """
     te = pytest.importorskip("transformer_engine.pytorch", reason="Optional TE backend is required")
     if not is_te_min_version("2.19.0"):
         pytest.skip("Native grouped-tensor GEMMs require TE 2.19.0 or newer")
-    from transformer_engine.common.recipe import Float8CurrentScaling, MXFP8BlockScaling
+    from transformer_engine.common.recipe import Float8BlockScaling, Float8CurrentScaling, MXFP8BlockScaling
     from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
 
     fp8 = precision != "bf16"
-    recipe = MXFP8BlockScaling() if precision == "mxfp8" else Float8CurrentScaling()
+    recipe = {"block": Float8BlockScaling, "mxfp8": MXFP8BlockScaling}.get(precision, Float8CurrentScaling)()
     if not is_module_grouped_tensor_path_supported(recipe if fp8 else None, torch.bfloat16):
         pytest.skip("The native grouped-tensor path does not support this device/recipe combination")
 

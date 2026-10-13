@@ -16,7 +16,7 @@ import math
 
 import torch
 
-from nemo_automodel.components.models.common.rope_triton import HAVE_TRITON, apply_complex_rope
+from nemo_automodel.components.models.common.rope_triton import apply_complex_rope
 
 
 # Taken from https://github.com/huggingface/transformers/blob/main/src/transformers/models/deepseek_v3/modular_deepseek_v3.py#L78
@@ -139,29 +139,14 @@ def apply_rotary_emb(
         Tensor with the input shape and dtype. Rotation uses FP32 complex
         multiplication before rounding back to the input dtype.
     """
-    dtype = x.dtype
     if qkv_format == "thd":
         x = x.unsqueeze(0)
 
     if unsqueeze_dim is not None:
         x = x.unsqueeze(unsqueeze_dim)
 
-    if (
-        HAVE_TRITON
-        and x.is_cuda
-        and freqs_cis.is_cuda
-        and x.ndim == 4
-        and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
-        and freqs_cis.dtype == torch.complex64
-        and not freqs_cis.requires_grad
-    ):
-        frequencies = freqs_cis.reshape(x.size(0), x.size(1), x.size(-1) // 2)
-        y = apply_complex_rope(x, frequencies)
-    else:
-        x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))  # [b, s, h, d] -> [b, s, h, d/2, 2]
-        freqs_cis = freqs_cis.view(x.size(0), x.size(1), 1, x.size(-1))
-        y = torch.view_as_real(x * freqs_cis).flatten(3)
-        y = y.to(dtype)
+    frequencies = freqs_cis.reshape(x.size(0), x.size(1), x.size(-1) // 2)
+    y = apply_complex_rope(x, frequencies)
 
     if unsqueeze_dim is not None:
         y = y.squeeze(unsqueeze_dim)

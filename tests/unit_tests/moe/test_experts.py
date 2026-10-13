@@ -17,7 +17,7 @@ import importlib.util
 import sys
 import weakref
 from dataclasses import replace
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -2141,6 +2141,157 @@ def test_grouped_experts_te_legacy_constructor_compatibility(moe_config, monkeyp
             experts.init_token_dispatcher(mesh)
         assert experts.gate_up_linear.num_gemms == moe_config.n_routed_experts // 2
         assert experts.down_linear.num_gemms == moe_config.n_routed_experts // 2
+
+
+@pytest.fixture
+def fake_native_te(monkeypatch):
+    """Exercise Automodel's TE integration on CPU, including coupled autograd outputs."""
+
+    class GroupedLinear(torch.nn.Module):
+        def __init__(
+            self, *, num_gemms, in_features, out_features, bias, params_dtype, device, use_grouped_tensor=False
+        ):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.use_grouped_tensor = use_grouped_tensor
+            self.weight = torch.nn.Parameter(torch.randn(out_features, in_features, dtype=params_dtype) * 0.02)
+
+        def forward(self, values, splits):
+            assert isinstance(splits, torch.Tensor) == self.use_grouped_tensor
+            return torch.nn.functional.linear(values, self.weight)
+
+    class Padding(torch.nn.Module):
+        def __init__(self, num_gemms, align_size=None):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.align_size = align_size
+            self.calls = 0
+
+        def forward(self, values, splits):
+            self.calls += 1
+            return values, splits
+
+    class Unpadding(Padding):
+        def forward(self, values, splits):
+            self.calls += 1
+            return values
+
+    class CoupledDispatch(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, probabilities):
+            ctx.set_materialize_grads(False)
+            return hidden.clone(), probabilities[:, 0].clone()
+
+        @staticmethod
+        def backward(ctx, hidden_grad, probability_grad):
+            return hidden_grad, None if probability_grad is None else probability_grad.unsqueeze(-1)
+
+    class Dispatcher:
+        def __init__(self, num_local_experts, **kwargs):
+            self.num_local_experts = num_local_experts
+
+        def token_permutation2(self, hidden_states, token_probs, **kwargs):
+            hidden, probs = CoupledDispatch.apply(hidden_states, token_probs)
+            assert probs.requires_grad  # Even when the input probabilities are frozen.
+            return hidden, [hidden.shape[0]] + [0] * (self.num_local_experts - 1), probs
+
+        def token_unpermutation(self, values):
+            return values
+
+    state = Mock()
+    state.is_fp8_enabled.return_value = False
+    supported = Mock(return_value=True)
+    te = ModuleType("transformer_engine.pytorch")
+    te.GroupedLinear, te.Fp8Padding, te.Fp8Unpadding = GroupedLinear, Padding, Unpadding
+    quantization = ModuleType("transformer_engine.pytorch.quantization")
+    quantization.FP8GlobalStateManager = state
+    grouped_linear = ModuleType("transformer_engine.pytorch.module.grouped_linear")
+    grouped_linear.is_module_grouped_tensor_path_supported = supported
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.quantization", quantization)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module.grouped_linear", grouped_linear)
+    monkeypatch.setattr("nemo_automodel.components.moe.experts.is_te_min_version", lambda version: True)
+    monkeypatch.setattr("nemo_automodel.components.models.common.utils._patch_te_modules", lambda: None)
+    monkeypatch.setattr("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher", Dispatcher)
+    return SimpleNamespace(state=state, supported=supported)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("train_router", [False, True])
+def test_te_construction_ep_rebuild_and_frozen_dispatch_probs(moe_config, fake_native_te, native, train_router):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    backend = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native)
+    experts = GroupedExpertsTE(moe_config, backend=backend)
+    for ep_size in (1, 2):
+        if ep_size == 2:
+            mesh = Mock()
+            mesh.size.return_value = ep_size
+            mesh.get_local_rank.return_value = 0
+            mesh.mesh_dim_names = ("ep",)
+            experts.init_token_dispatcher(mesh)
+        for layer in (experts.gate_up_linear, experts.down_linear):
+            assert layer.num_gemms == moe_config.n_routed_experts // ep_size
+            assert layer.use_grouped_tensor is native
+        assert experts.fp8_padding.num_gemms == moe_config.n_routed_experts // ep_size
+        if native:
+            for padding in (experts.native_fp8_padding, experts.native_fp8_unpadding):
+                assert padding.num_gemms == moe_config.n_routed_experts // ep_size
+                assert padding.align_size == 128
+
+    observed = []
+
+    def activation(values, probabilities):
+        observed.append(probabilities.requires_grad)
+        return values.chunk(2, -1)[0] * probabilities
+
+    experts.expert_activation = activation
+    x = torch.randn(3, moe_config.dim, dtype=moe_config.dtype, requires_grad=True)
+    weights = torch.rand(3, 1, dtype=moe_config.dtype, requires_grad=train_router)
+    experts(x, torch.ones(3, dtype=torch.bool), weights, torch.zeros(3, 1, dtype=torch.long)).sum().backward()
+    assert observed == [train_router]
+    assert x.grad is not None
+    assert (weights.grad is not None) == train_router
+    assert fake_native_te.supported.call_count == int(native)
+
+
+def test_te_native_recipe_validation_and_padding(moe_config, fake_native_te):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    experts = GroupedExpertsTE(
+        moe_config, backend=BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=True)
+    )
+    mesh = Mock()
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 0
+    mesh.mesh_dim_names = ("ep",)
+    experts.init_token_dispatcher(mesh)
+    experts.expert_activation = lambda values, probabilities: values.chunk(2, -1)[0] * probabilities
+    x = torch.randn(3, moe_config.dim, dtype=moe_config.dtype, requires_grad=True)
+    args = (x, torch.ones(3, dtype=torch.bool), torch.ones(3, 1, dtype=x.dtype), torch.zeros(3, 1, dtype=torch.long))
+    experts(*args)
+    experts(*args)
+    fake_native_te.supported.assert_called_once_with(None, x.dtype)
+
+    fake_native_te.state.is_fp8_enabled.return_value = True
+    for mxfp8, block in ((False, False), (True, False), (False, True)):
+        recipe = Mock()
+        recipe.mxfp8.return_value = mxfp8
+        recipe.float8_block_scaling.return_value = block
+        fake_native_te.state.get_fp8_recipe.return_value = recipe
+        experts(*args)
+        experts(*args)
+        fake_native_te.supported.assert_called_with(recipe, x.dtype)
+    assert fake_native_te.supported.call_count == 4
+    assert experts.fp8_padding.calls == 4
+    assert experts.native_fp8_padding.calls == 8
+    assert experts.native_fp8_unpadding.calls == 4
+
+    fake_native_te.state.get_fp8_recipe.return_value = Mock(name="DelayedScaling")
+    fake_native_te.supported.return_value = False
+    with patch("torch.tensor", side_effect=AssertionError("Must reject before creating device splits")):
+        with pytest.raises(ValueError, match="Set te_grouped_tensor=False"):
+            experts(*args)
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")

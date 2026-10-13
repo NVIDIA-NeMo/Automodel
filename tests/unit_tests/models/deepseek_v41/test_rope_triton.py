@@ -125,7 +125,7 @@ def test_use_triton_rope_toggles_dispatch(monkeypatch):
 def test_eager_mirror_matches_attention_apply_rope(shape, inverse, dtype):
     values, angles, _ = _inputs(shape, 4, dtype, "cpu")
     assert torch.equal(
-        rope_triton._apply_rope_torch(values, angles, inverse=inverse), _apply_rope(values, angles, inverse=inverse)
+        rope_triton.apply_rope_triton(values, angles, inverse=inverse), _apply_rope(values, angles, inverse=inverse)
     )
 
 

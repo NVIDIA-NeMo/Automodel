@@ -385,6 +385,8 @@ class GlmMoeDsaIndexer(nn.Module):
         scores = scores.unflatten(-2, (seq_len, self.num_heads))
         # The GEMM result is newly owned; keep the reference operation order while
         # reusing its storage instead of creating two full FP32 score copies.
+        # Scale before ReLU: ReLU's backward saves its output, so a later in-place
+        # scaling would invalidate that saved tensor if scores receive a gradient.
         scores = scores.mul_(self.softmax_scale).relu_()
 
         # Head-weighted sum via matmul: weights[..., 1, H] @ scores[..., H, T] -> [..., 1, T].

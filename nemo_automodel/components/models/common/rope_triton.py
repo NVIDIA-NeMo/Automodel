@@ -19,6 +19,14 @@ value dtype, and copies any leading unrotated channels. Frequencies are already
 computed by the owning model, so it preserves their exact cosine/sine values.
 The explicit FMA order matches CUDA ``c10::complex<float>`` multiplication in
 both forward and the conjugate rotation used for the input gradient.
+
+For ``(x0 + i*x1) * (c + i*s)``, CUDA contracts the first product of each
+component: ``r0 = fma(x0, c, -(x1*s))`` and ``r1 = fma(x0, s, x1*c)``.
+The explicit ``tl.fma`` calls preserve that order independently of Triton's
+fusion defaults. Conjugation only negates ``s`` exactly; the final cast uses
+round-to-nearest-even. If GPU parity shows one-ulp differences, inspect those
+two FMA calls. Models supply their original frequencies so no new trig
+implementation changes the cosine/sine bits.
 """
 
 from __future__ import annotations
@@ -209,18 +217,66 @@ class _FusedRope(torch.autograd.Function):
         return _launch(grad_output, frequencies, negate_sin=not ctx.inverse), None, None
 
 
+def supports_fused_rope(values: torch.Tensor, frequencies: torch.Tensor) -> bool:
+    """Check the shared kernel's device, layout, dtype, and autograd contract.
+
+    Args:
+        values: Tensor of shape [batch, sequence, channels] or [batch, sequence, heads, channels].
+        frequencies: Complex tensor of shape [batch, sequence, rotary_pairs].
+
+    Returns:
+        Whether the inputs can use the Triton implementation.
+    """
+    return (
+        HAVE_TRITON
+        and values.is_cuda
+        and frequencies.is_cuda
+        and values.ndim in (3, 4)
+        and values.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and frequencies.dtype == torch.complex64
+        and not frequencies.requires_grad
+    )
+
+
+def _apply_complex_rope_torch(
+    values: torch.Tensor, frequencies: torch.Tensor, *, inverse: bool = False
+) -> torch.Tensor:
+    """Rotate with eager complex multiplication, preserving frequency gradients.
+
+    Args:
+        values: Tensor of shape [batch, sequence, channels] or [batch, sequence, heads, channels].
+        frequencies: Complex tensor of shape [batch, sequence, rotary_pairs].
+        inverse: Whether to conjugate the rotation.
+
+    Returns:
+        Independent tensor with the input shape/dtype and unchanged leading non-rotary channels.
+    """
+    rotary_dim = frequencies.shape[-1] * 2
+    pairs = torch.view_as_complex(values[..., -rotary_dim:].float().unflatten(-1, (-1, 2)).contiguous())
+    if values.ndim == 4:
+        frequencies = frequencies.unsqueeze(2)
+    if inverse:
+        frequencies = frequencies.conj()
+    rotated = torch.view_as_real(pairs * frequencies).flatten(-2).to(values.dtype)
+    return torch.cat((values[..., :-rotary_dim], rotated), dim=-1)
+
+
 def apply_complex_rope(values: torch.Tensor, frequencies: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
     """Rotate trailing channel pairs using a model's cached complex frequencies.
 
     Args:
-        values: CUDA BF16, FP16, or FP32 tensor of shape [batch, sequence, channels]
+        values: Tensor of shape [batch, sequence, channels]
             or [batch, sequence, heads, channels]. Leading dimensions may be strided.
-        frequencies: CUDA complex64 tensor of shape [batch, sequence, rotary_pairs].
-            Must not require gradients. The rotary width must fit within channels.
+        frequencies: Complex tensor of shape [batch, sequence, rotary_pairs].
+            The rotary width must fit within channels. CUDA BF16/FP16/FP32 values
+            and cached complex64 frequencies use Triton; other inputs use eager
+            operations, preserving frequency gradients when required.
         inverse: Whether to conjugate the rotation.
 
     Returns:
         New contiguous tensor with the shape and dtype of ``values``. Its input
         gradient uses the conjugate rotation with the same FP32 rounding order.
     """
-    return _FusedRope.apply(values, torch.view_as_real(frequencies.resolve_conj()).contiguous(), inverse)
+    if supports_fused_rope(values, frequencies):
+        return _FusedRope.apply(values, torch.view_as_real(frequencies.resolve_conj()).contiguous(), inverse)
+    return _apply_complex_rope_torch(values, frequencies, inverse=inverse)

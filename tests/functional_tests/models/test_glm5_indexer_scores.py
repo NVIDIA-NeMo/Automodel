@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import inspect
+import logging
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaIndexer as HFIndexer
 
@@ -24,6 +26,20 @@ from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaIndexer
 
 # HF 5.18 requires this unused compatibility argument; earlier releases omit it.
 _HF_INDEXER_KWARGS = {"position_ids": None} if "position_ids" in inspect.signature(HFIndexer.forward).parameters else {}
+
+
+class _CaptureTopKScores(TorchDispatchMode):
+    """Retain the reference's actual pre-top-k scores for boundary diagnostics."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scores: torch.Tensor | None = None
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        """Preserve the dispatch contract for arbitrary operator tensor layouts."""
+        if func is torch.ops.aten.topk.default:
+            self.scores = args[0].detach()
+        return func(*args, **(kwargs or {}))
 
 
 @pytest.mark.gpu
@@ -69,18 +85,36 @@ def test_dense_indexer_preserves_hf_selection_on_cuda(dtype, seq_len, packed, co
         torch.ones(seq_len, seq_len, device="cuda", dtype=torch.bool).triu(1), float("-inf")
     )
     # HF 5.18 returns int32 indices; AutoModel's sparse-mask contract is int64.
-    expected = reference(x, q_resid, (cos, sin), causal, **_HF_INDEXER_KWARGS).to(torch.int64)
+    with _CaptureTopKScores() as capture:
+        expected = reference(x, q_resid, (cos, sin), causal, **_HF_INDEXER_KWARGS).to(torch.int64)
     run = torch.compile(indexer, fullgraph=True) if compiled else indexer
     if packed:
         actual = run(x[0], q_resid[0], freqs[0]).unsqueeze(0)
     else:
         actual = run(x, q_resid, freqs)
-    # Tied output order is irrelevant to the sparse mask, but selected sets must
-    # still match. Initial rows can contain equally masked future-key fillers.
+    # Initial rows can contain equally masked future-key fillers. For later
+    # queries, permit only boundary ties within one input-dtype resolution.
     prefix = min(config.index_topk, seq_len) - 1
-    torch.testing.assert_close(
-        actual[:, prefix:].sort(dim=-1).values,
-        expected[:, prefix:].sort(dim=-1).values,
-        rtol=0,
-        atol=0,
+    actual, expected = actual[:, prefix:], expected[:, prefix:]
+    different = (actual.sort(-1).values != expected.sort(-1).values).any(-1)
+    if config.index_topk >= seq_len:
+        assert not different.any()
+        return
+    assert capture.scores is not None
+    scores = capture.scores[:, prefix:].float()
+    boundary = scores.topk(config.index_topk + 1, dim=-1).values[..., -2:]
+    margin = boundary[..., 0] - boundary[..., 1]
+    resolution = boundary.abs().amax(-1) * torch.finfo(dtype).eps
+    selected = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, actual, True)
+    reference_selected = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, expected, True)
+    changed = selected ^ reference_selected
+    changed_distance = torch.where(changed, (scores - boundary[..., :1]).abs(), 0).amax(-1)
+    diagnostics = (
+        f"different queries={different.sum().item()}/{different.numel()}, "
+        f"min k/k+1 margin among differing queries={margin[different].min().item() if different.any() else 'n/a'}, "
+        f"max changed-key distance={changed_distance.max().item()}"
     )
+    logging.getLogger(__name__).info(diagnostics)
+    assert torch.all(
+        ~different | (torch.isfinite(margin) & (margin <= resolution) & (changed_distance <= resolution))
+    ), diagnostics
