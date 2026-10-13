@@ -2224,6 +2224,10 @@ class GroupedExpertsTE(nn.Module):
             token_probs=weights,
             token_indices=indices,
         )
+        # Dispatcher autograd couples its outputs even when routing weights are frozen.
+        # Preserve the router's gradient requirement before the expert activation.
+        if not weights.requires_grad:
+            permuted_probs = permuted_probs.detach()
         permuted_probs = permuted_probs.unsqueeze(-1)
 
         m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)

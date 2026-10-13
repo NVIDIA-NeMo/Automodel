@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.autograd.function import FunctionCtx
 from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -276,3 +277,149 @@ def test_native_te_grouped_tensor_numerics(fp8: bool, checkpointed: bool, bias: 
     finally:
         set_is_first_microbatch(None)
         torch.set_float32_matmul_precision(original_precision)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("checkpointed", [False, True])
+@pytest.mark.parametrize("train_router", [False, True])
+def test_te_dispatch_preserves_router_gradients(
+    native: bool, fp8: bool, checkpointed: bool, train_router: bool
+) -> None:
+    """Coupled dispatcher outputs preserve frozen and trainable router semantics.
+
+    Args:
+        native: Whether both modules use native grouped-tensor kernels.
+        fp8: Whether the expert GEMMs use FP8 current scaling.
+        checkpointed: Whether to recompute the expert forward during backward.
+        train_router: Whether the original routing probabilities need gradients.
+    """
+    te = pytest.importorskip("transformer_engine.pytorch", reason="Optional TE backend is required")
+    if not is_te_min_version("2.19.0"):
+        pytest.skip("Native grouped-tensor GEMMs require TE 2.19.0 or newer")
+    from transformer_engine.common.recipe import Float8CurrentScaling
+    from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
+
+    if not is_module_grouped_tensor_path_supported(Float8CurrentScaling() if fp8 else None, torch.bfloat16):
+        pytest.skip("The native grouped-tensor path does not support this device/recipe combination")
+
+    class CoupledDispatch(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx: FunctionCtx, hidden: torch.Tensor, probability: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            """Clone grouped hidden states [tokens, hidden] and probabilities [tokens].
+
+            Args:
+                ctx: Autograd context; no values need saving for identity derivatives.
+                hidden: Already grouped hidden states of shape [tokens, hidden].
+                probability: One probability per grouped token, shape [tokens].
+
+            Returns:
+                Independent output tensors with the same shapes and a shared grad_fn.
+            """
+            return hidden.clone(), probability.clone()
+
+        @staticmethod
+        def backward(
+            ctx: FunctionCtx, hidden_grad: torch.Tensor, probability_grad: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            """Return identity derivatives, preserving PyTorch's materialized zero gradients.
+
+            Args:
+                ctx: Autograd context, unused by the identity derivative.
+                hidden_grad: Gradient of shape [tokens, hidden].
+                probability_grad: Gradient of shape [tokens], zero when unused.
+
+            Returns:
+                Input gradients with the same shapes as the two forward inputs.
+            """
+            return hidden_grad, probability_grad
+
+    class CoupledDispatcher(_GroupedInputDispatcher):
+        def token_permutation2(
+            self,
+            hidden_states: torch.Tensor,
+            num_local_tokens: int,
+            token_probs: torch.Tensor,
+            token_indices: torch.Tensor,
+        ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
+            """Attach one autograd node to both dispatcher outputs.
+
+            Args:
+                hidden_states: Already grouped hidden states [tokens, hidden].
+                num_local_tokens: Number of rows in the hidden states.
+                token_probs: Routing probabilities [tokens, 1].
+                token_indices: Expert IDs [tokens, 1].
+
+            Returns:
+                Grouped hidden states [tokens, hidden], expert counts, probabilities [tokens].
+            """
+            hidden, counts, probability = super().token_permutation2(
+                hidden_states, num_local_tokens, token_probs, token_indices
+            )
+            hidden, probability = CoupledDispatch.apply(hidden, probability)
+            # A multi-output dispatcher attaches a grad_fn to frozen probabilities.
+            assert probability.requires_grad
+            return hidden, counts, probability
+
+    torch.manual_seed(17)
+    counts = [17, 0, 63, 32]
+    reference = _experts(native=native, counts=counts, bias=False)
+    candidate = _experts(native=native, counts=counts, bias=False)
+    candidate.token_dispatcher = CoupledDispatcher(counts)
+    with torch.no_grad():
+        for expected, actual in zip(reference.parameters(), candidate.parameters(), strict=True):
+            actual.copy_(expected)
+    activation = candidate.expert_activation
+
+    def checked_activation(hidden: torch.Tensor, probability: torch.Tensor) -> torch.Tensor:
+        """Check routing gradients at the activation boundary, including FP8 padding.
+
+        Args:
+            hidden: Gate/up projection of shape [padded_tokens, 2 * intermediate].
+            probability: Routing probabilities of shape [padded_tokens, 1].
+
+        Returns:
+            Weighted activation of shape [padded_tokens, intermediate].
+        """
+        assert probability.requires_grad == train_router
+        return activation(hidden, probability)
+
+    candidate.expert_activation = checked_activation
+    hidden = torch.randn(sum(counts), 256, device="cuda", dtype=torch.bfloat16)
+    probabilities = torch.rand(sum(counts), 1, device="cuda", dtype=torch.float32)
+    upstream = torch.randn_like(hidden)
+    mask = torch.ones(sum(counts), device="cuda", dtype=torch.bool)
+    indices = torch.cat([torch.full((count, 1), expert) for expert, count in enumerate(counts)]).cuda()
+    values = []
+    for module in (reference, candidate):
+        x = hidden.detach().clone().requires_grad_()
+        probs = probabilities.detach().clone().requires_grad_(train_router)
+
+        def run(x: torch.Tensor, probs: torch.Tensor, *, module: GroupedExpertsTE = module) -> torch.Tensor:
+            """Evaluate one expert module with the same precision during recomputation.
+
+            Args:
+                x: Grouped hidden states of shape [tokens, hidden].
+                probs: Routing probabilities of shape [tokens, 1].
+                module: Expert implementation pinned for checkpoint recomputation.
+
+            Returns:
+                Expert output of shape [tokens, hidden].
+            """
+            with te.autocast(enabled=fp8, recipe=Float8CurrentScaling()):
+                return module(x, mask, probs, indices)
+
+        output = checkpoint(run, x, probs, use_reentrant=False) if checkpointed else run(x, probs)
+        output.backward(upstream)
+        values.append((output, x.grad, probs.grad))
+    for expected, actual in zip(*values, strict=True):
+        if expected is None:
+            assert actual is None
+        else:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for expected, actual in zip(reference.parameters(), candidate.parameters(), strict=True):
+        assert expected.grad is not None and actual.grad is not None
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
