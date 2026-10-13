@@ -165,18 +165,26 @@ def _fp32_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped GEMMs require CUDA")
-@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("precision", ["bf16", "fp8", "mxfp8"])
 @pytest.mark.parametrize("checkpointed", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
-def test_native_te_grouped_tensor_numerics(fp8: bool, checkpointed: bool, bias: bool) -> None:
-    """Preserve outputs, all gradients, updates, padding and empty-expert behavior."""
+def test_native_te_grouped_tensor_numerics(precision: str, checkpointed: bool, bias: bool) -> None:
+    """Preserve outputs, all gradients, updates, padding and empty-expert behavior.
+
+    Args:
+        precision: BF16, FP8 current scaling, or MXFP8 block scaling.
+        checkpointed: Whether to recompute the expert forward during backward.
+        bias: Whether the grouped projections include bias parameters.
+    """
     te = pytest.importorskip("transformer_engine.pytorch", reason="Optional TE backend is required")
     if not is_te_min_version("2.19.0"):
         pytest.skip("Native grouped-tensor GEMMs require TE 2.19.0 or newer")
-    from transformer_engine.common.recipe import Float8CurrentScaling
+    from transformer_engine.common.recipe import Float8CurrentScaling, MXFP8BlockScaling
     from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
 
-    if not is_module_grouped_tensor_path_supported(Float8CurrentScaling() if fp8 else None, torch.bfloat16):
+    fp8 = precision != "bf16"
+    recipe = MXFP8BlockScaling() if precision == "mxfp8" else Float8CurrentScaling()
+    if not is_module_grouped_tensor_path_supported(recipe if fp8 else None, torch.bfloat16):
         pytest.skip("The native grouped-tensor path does not support this device/recipe combination")
 
     torch.manual_seed(13)
@@ -206,17 +214,20 @@ def test_native_te_grouped_tensor_numerics(fp8: bool, checkpointed: bool, bias: 
                     hidden = x.detach().clone().requires_grad_()
                     probability = probs.detach().clone().requires_grad_()
 
-                    def run(hidden: torch.Tensor, probability: torch.Tensor) -> torch.Tensor:
+                    def run(
+                        hidden: torch.Tensor, probability: torch.Tensor, *, module: GroupedExpertsTE = module
+                    ) -> torch.Tensor:
                         """Evaluate the same precision recipe during checkpoint recomputation.
 
                         Args:
                             hidden: Tensor of shape [tokens, hidden], grouped by expert.
                             probability: Tensor of shape [tokens, 1] with routing probabilities.
+                            module: Expert module bound for this checkpoint evaluation.
 
                         Returns:
                             Tensor of shape [tokens, hidden].
                         """
-                        with te.autocast(enabled=fp8, recipe=Float8CurrentScaling()):
+                        with te.autocast(enabled=fp8, recipe=recipe):
                             return module(hidden, mask, probability, indices)
 
                     if checkpointed:
@@ -423,3 +434,44 @@ def test_te_dispatch_preserves_router_gradients(
     for expected, actual in zip(reference.parameters(), candidate.parameters(), strict=True):
         assert expected.grad is not None and actual.grad is not None
         torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MXFP8 recipe switching requires CUDA")
+def test_native_te_grouped_tensor_recipe_switch() -> None:
+    """Changing external autocast recipes preserves expert outputs and all gradients."""
+    te = pytest.importorskip("transformer_engine.pytorch", reason="Optional TE backend is required")
+    if not is_te_min_version("2.19.0"):
+        pytest.skip("Native grouped-tensor GEMMs require TE 2.19.0 or newer")
+    from transformer_engine.common.recipe import Float8CurrentScaling, MXFP8BlockScaling
+    from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
+
+    recipes = [Float8CurrentScaling(), MXFP8BlockScaling(), Float8CurrentScaling()]
+    if not all(is_module_grouped_tensor_path_supported(recipe, torch.bfloat16) for recipe in recipes):
+        pytest.skip("Recipe switching requires native MXFP8 support on Blackwell")
+    torch.manual_seed(41)
+    counts = [17, 0, 63, 32]
+    reference = _experts(native=False, counts=counts, bias=False)
+    candidate = _experts(native=True, counts=counts, bias=False)
+    with torch.no_grad():
+        for expected, actual in zip(reference.parameters(), candidate.parameters(), strict=True):
+            actual.copy_(expected)
+    mask = torch.ones(sum(counts), dtype=torch.bool, device="cuda")
+    indices = torch.cat([torch.full((count, 1), expert) for expert, count in enumerate(counts)]).cuda()
+    try:
+        for recipe in recipes:
+            set_is_first_microbatch(True)
+            hidden = torch.randn(sum(counts), 256, dtype=torch.bfloat16, device="cuda")
+            probability = torch.rand(sum(counts), 1, dtype=torch.bfloat16, device="cuda")
+            upstream = torch.randn_like(hidden)
+            results = []
+            for module in (reference, candidate):
+                x = hidden.detach().clone().requires_grad_()
+                probs = probability.detach().clone().requires_grad_()
+                with te.autocast(enabled=True, recipe=recipe):
+                    output = module(x, mask, probs, indices)
+                gradients = torch.autograd.grad(output, (x, probs, *module.parameters()), upstream)
+                results.append((output, *gradients))
+            for expected, actual in zip(*results, strict=True):
+                assert _relative_l2(actual, expected) < 0.04
+    finally:
+        set_is_first_microbatch(None)

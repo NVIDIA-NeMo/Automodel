@@ -1875,6 +1875,12 @@ class GroupedExpertsTE(nn.Module):
 
         self.fp8_padding = Fp8Padding(config.n_routed_experts)
         self.fp8_unpadding = Fp8Unpadding(config.n_routed_experts)
+        self.native_mxfp8_padding = (
+            Fp8Padding(config.n_routed_experts, align_size=128) if self.use_grouped_tensor else None
+        )
+        self.native_mxfp8_unpadding = (
+            Fp8Unpadding(config.n_routed_experts, align_size=128) if self.use_grouped_tensor else None
+        )
 
         self.token_dispatcher = None
         self.ep_mesh = None
@@ -2178,6 +2184,12 @@ class GroupedExpertsTE(nn.Module):
 
         self.fp8_padding = Fp8Padding(self.num_local_experts)
         self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+        self.native_mxfp8_padding = (
+            Fp8Padding(self.num_local_experts, align_size=128) if self.use_grouped_tensor else None
+        )
+        self.native_mxfp8_unpadding = (
+            Fp8Unpadding(self.num_local_experts, align_size=128) if self.use_grouped_tensor else None
+        )
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
         """Return dispatcher-owned resources that must be ready before a PP step.
@@ -2238,10 +2250,20 @@ class GroupedExpertsTE(nn.Module):
 
         fp8_active = FP8GlobalStateManager.is_fp8_enabled()
         actual_m_splits = None
+        unpadding = self.fp8_unpadding
         if fp8_active:
             actual_m_splits = m_splits
-            permuted_local_hidden_states, m_splits = self.fp8_padding(permuted_local_hidden_states, m_splits)
-            permuted_probs, _ = self.fp8_padding(permuted_probs, actual_m_splits)
+            padding = self.fp8_padding
+            if self.use_grouped_tensor and FP8GlobalStateManager.get_fp8_recipe().mxfp8():
+                # Native MXFP8 grouped quantization requires 128-row segments;
+                # the legacy MXFP8 padding defaults to 32. Keep separate modules
+                # so external autocast recipe changes do not cache this alignment
+                # into the legacy/current-scaling path.
+                assert self.native_mxfp8_padding is not None and self.native_mxfp8_unpadding is not None
+                padding = self.native_mxfp8_padding
+                unpadding = self.native_mxfp8_unpadding
+            permuted_local_hidden_states, m_splits = padding(permuted_local_hidden_states, m_splits)
+            permuted_probs, _ = padding(permuted_probs, actual_m_splits)
 
         if sum(m_splits) > 0:
             # The native grouped-tensor API consumes device-side int64 split sizes.
@@ -2297,7 +2319,7 @@ class GroupedExpertsTE(nn.Module):
             output2 = output2 + all_expert_dependency
 
         if fp8_active and actual_m_splits is not None:
-            output2 = self.fp8_unpadding(output2, actual_m_splits)
+            output2 = unpadding(output2, actual_m_splits)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
