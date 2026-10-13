@@ -122,15 +122,21 @@ def precompute_freqs_cis(
 def apply_rotary_emb(
     x: torch.Tensor, freqs_cis: torch.Tensor, qkv_format: str = "bshd", unsqueeze_dim: int | None = None
 ) -> torch.Tensor:
-    """
-    Applies rotary positional embeddings to the input tensor.
+    """Rotate adjacent channel pairs using precomputed complex frequencies.
 
     Args:
-        x (torch.Tensor): Input tensor with positional embeddings to be applied.
-        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
+        x: Tensor of shape [B, S, H, D] for ``bshd`` or [T, H, D] for
+            ``thd``. Shared keys may omit H when ``unsqueeze_dim`` inserts it.
+        freqs_cis: Complex frequency table with D / 2 pairs per token, shaped
+            [B, S, D / 2] or [T, D / 2]. Cached CUDA complex64 frequencies
+            use the fused kernel; trainable frequencies retain autograd.
+        qkv_format: ``thd`` adds a temporary batch dimension for packed inputs.
+        unsqueeze_dim: Optional head dimension to insert after normalizing
+            packed inputs to include a batch dimension.
 
     Returns:
-        torch.Tensor: Tensor with rotary embeddings applied.
+        Tensor with the input shape and dtype. Rotation uses FP32 complex
+        multiplication before rounding back to the input dtype.
     """
     dtype = x.dtype
     if qkv_format == "thd":

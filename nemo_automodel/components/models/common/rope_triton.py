@@ -172,12 +172,24 @@ class _FusedRope(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: object, values: torch.Tensor, frequencies: torch.Tensor, inverse: bool) -> torch.Tensor:
+        """Rotate CUDA values [B, S, D] or [B, S, H, D], preserving shape and dtype.
+
+        ``frequencies`` is contiguous FP32 [B, S, rotary_pairs, 2], storing
+        cosine and sine. Only values receive gradients; ``inverse`` conjugates
+        the frequencies. Save frequencies for the conjugate input gradient.
+        """
         ctx.save_for_backward(frequencies)
         ctx.inverse = inverse
         return _launch(values, frequencies, negate_sin=inverse)
 
     @staticmethod
     def backward(ctx: object, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, None, None]:
+        """Return the input gradient with the shape and dtype of ``grad_output``.
+
+        The incoming CUDA gradient has shape [B, S, D] or [B, S, H, D]. Rotate
+        it by the conjugate of the forward rotation; cached frequencies and
+        the Boolean direction have no gradients.
+        """
         if not ctx.needs_input_grad[0]:
             return None, None, None
         (frequencies,) = ctx.saved_tensors
