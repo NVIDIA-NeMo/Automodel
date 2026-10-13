@@ -22,6 +22,7 @@ from torch.utils.checkpoint import checkpoint
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel import autonvtx
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+from nemo_automodel.shared.telemetry import TelemetryConfig
 
 
 @pytest.fixture
@@ -81,6 +82,7 @@ def test_vlm_setup_nvtx_preserves_forward_backward(monkeypatch, nvtx_ranges, nvt
         wandb=None,
         trackio=None,
         mlflow=None,
+        telemetry=TelemetryConfig(),
         model=object(),
         loss_fn=SimpleNamespace(build=lambda: torch.nn.MSELoss()),
         checkpoint=SimpleNamespace(build=lambda **_: object(), load_metadata_with_gloo=False),
@@ -89,7 +91,9 @@ def test_vlm_setup_nvtx_preserves_forward_backward(monkeypatch, nvtx_ranges, nvt
     if nvtx is not None:
         recipe.cfg.nvtx = nvtx
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
-    monkeypatch.setattr(vlm_finetune, "initialize_distributed", lambda **_: SimpleNamespace(is_main=False))
+    monkeypatch.setattr(
+        vlm_finetune, "initialize_distributed", lambda **_: SimpleNamespace(is_main=False, rank=0, world_size=1)
+    )
     monkeypatch.setattr(vlm_finetune, "setup_logging", lambda: None)
     monkeypatch.setattr(vlm_finetune, "apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr(vlm_finetune, "StatefulRNG", lambda **_: None)

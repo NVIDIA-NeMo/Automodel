@@ -92,6 +92,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared import telemetry
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
@@ -687,6 +688,7 @@ class Checkpointer:
         return self._load_process_group if self._load_process_group is not None else self.process_group
 
     @torch.no_grad()
+    @telemetry.traced(telemetry.CHECKPOINT, "automodel.checkpoint.save.model")
     def save_model(
         self,
         model: nn.Module,
@@ -828,6 +830,7 @@ class Checkpointer:
         self._maybe_log_final_offline_consolidation_hint(model_dir, is_final_checkpoint)
 
     @torch.no_grad()
+    @telemetry.traced(telemetry.CHECKPOINT, "automodel.checkpoint.save.optimizer")
     def save_optimizer(
         self,
         optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
@@ -862,6 +865,7 @@ class Checkpointer:
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
+    @telemetry.traced(telemetry.LOAD_CHECKPOINT, "automodel.checkpoint.load.optimizer")
     def load_optimizer(
         self,
         optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
@@ -1029,6 +1033,7 @@ class Checkpointer:
         )
 
     @torch.no_grad()
+    @telemetry.traced(telemetry.LOAD_CHECKPOINT, "automodel.checkpoint.load.model")
     def load_model(
         self,
         model: nn.Module,
@@ -1699,10 +1704,12 @@ class Checkpointer:
         Wait for the staging to finish if it is enabled.
         """
         if self._model_ctx.staging_active and self._model_ctx.future is not None:
-            self._model_ctx.future.staging_completion.result()
+            with telemetry.span(telemetry.CHECKPOINT, "automodel.checkpoint.wait.staging.model"):
+                self._model_ctx.future.staging_completion.result()
             self._model_ctx.staging_active = False
         if self._optim_ctx.staging_active and self._optim_ctx.future is not None:
-            self._optim_ctx.future.staging_completion.result()
+            with telemetry.span(telemetry.CHECKPOINT, "automodel.checkpoint.wait.staging.optimizer"):
+                self._optim_ctx.future.staging_completion.result()
             self._optim_ctx.staging_active = False
 
     def async_wait(self) -> None:
@@ -1710,11 +1717,13 @@ class Checkpointer:
         Wait for the async save (and any deferred consolidation) to finish.
         """
         if self._model_ctx.future is not None:
-            self._model_ctx.future.upload_completion.result()
+            with telemetry.span(telemetry.CHECKPOINT, "automodel.checkpoint.wait.upload.model"):
+                self._model_ctx.future.upload_completion.result()
             self._model_ctx.future = None
             self._release_async_stager(self._model_ctx)
         if self._optim_ctx.future is not None:
-            self._optim_ctx.future.upload_completion.result()
+            with telemetry.span(telemetry.CHECKPOINT, "automodel.checkpoint.wait.upload.optimizer"):
+                self._optim_ctx.future.upload_completion.result()
             self._optim_ctx.future = None
             self._release_async_stager(self._optim_ctx)
         self._join_deferred_consolidation()

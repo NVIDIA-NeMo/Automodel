@@ -21,8 +21,8 @@ recipe body only ever sees typed component configs and calls
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
 ``apply()``: ``wandb``/``trackio``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
-``embedding_row_repair``/``mfu``/``domain_mixture`` map to component config
-dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
+``embedding_row_repair``/``mfu``/``domain_mixture``/``telemetry`` map to component
+config dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
     from nemo_automodel.components.training.prewarm import PrewarmConfig
     from nemo_automodel.components.utils.model_utils import FreezeConfig
+    from nemo_automodel.shared.telemetry import TelemetryConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
@@ -659,6 +660,13 @@ class RecipeConfig:
 
         node = self._raw.get("mfu", None)
         return MFUConfig(**_section_kwargs(node)) if node else MFUConfig()
+
+    @cached_property
+    def telemetry(self) -> "TelemetryConfig":
+        from nemo_automodel.shared.telemetry import TelemetryConfig
+
+        node = self._raw.get("telemetry", None)
+        return TelemetryConfig(**_section_kwargs(node)) if node else TelemetryConfig()
 
     @cached_property
     def embedding_row_repair(self) -> "EmbeddingRowRepairConfig | None":

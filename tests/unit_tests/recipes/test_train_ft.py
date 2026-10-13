@@ -4104,3 +4104,96 @@ def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is
         torch.testing.assert_close(model.logits.grad, reference_logits.grad)
     else:
         assert model.logits.grad is None
+
+
+# ---------------------------------------------------------------------------
+# Telemetry
+# ---------------------------------------------------------------------------
+
+from tests.utils.telemetry import lens_capture  # noqa: E402, F401
+
+
+def _two_step_trainer():
+    class _TwoStepScheduler:
+        def __init__(self):
+            self.step = 0
+            self.epoch = 0
+            self.epochs = [0]
+            self.is_ckpt_step = False
+            self.sigterm_flag = False
+
+        @property
+        def is_val_step(self):
+            return self.step == 1
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            for _ in range(2):
+                yield ["dummy-batch"]
+                self.step += 1
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.model_parts = [MagicMock()]
+    trainer.step_scheduler = _TwoStepScheduler()
+    trainer.max_grad_norm = 1.0
+    trainer.partial_cuda_graph_manager = None
+    trainer._partial_cuda_graph_capture_pending = False
+    trainer._enable_qat_if_delayed = MagicMock()
+    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0, "tps": 250.0}))
+    trainer._run_validation_epoch = MagicMock(
+        return_value=SimpleNamespace(metrics={"val_loss": 0.5, "num_label_tokens": 8})
+    )
+    trainer._maybe_collect_garbage = MagicMock()
+    trainer._collect_moe_load_balance = MagicMock()
+    trainer.log_train_metrics = MagicMock()
+    trainer.log_val_metrics = MagicMock()
+    trainer.save_checkpoint = MagicMock()
+    trainer.val_dataloaders = {"squad": object()}
+    trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
+    trainer.metric_logger_valid = {"squad": SimpleNamespace(close=MagicMock())}
+    trainer.checkpointer = SimpleNamespace(finalize=MagicMock())
+    trainer.best_metric_key = "default"
+    trainer.domain_mixture = None
+    trainer.dist_env = SimpleNamespace(is_main=True)
+    return trainer
+
+
+def test_run_train_validation_loop_emits_step_spans_and_metrics(lens_capture):
+    capture = lens_capture("per_step")
+    trainer = _two_step_trainer()
+    trainer.telemetry_handle = capture.handle
+
+    trainer.run_train_validation_loop()
+
+    steps = sorted(capture.span_named("automodel.train.step"), key=lambda s: s.attributes["dl.iteration"])
+    (first_step,) = capture.span_named("automodel.train.first_step")
+    (evaluate,) = capture.span_named("automodel.evaluate")
+    assert [s.attributes["dl.iteration"] for s in steps] == [0, 1]
+    # Only the first step of the process sits under the first-iteration span.
+    assert steps[0].parent.span_id == first_step.context.span_id
+    assert steps[1].parent is None
+    assert evaluate.attributes["automodel.validation.name"] == "squad"
+    assert evaluate.attributes["dl.iteration"] == 1
+    metrics = capture.metrics()
+    (duration,) = metrics["automodel.train.step.duration"].data.data_points
+    (throughput,) = metrics["automodel.train.throughput"].data.data_points
+    assert duration.count == 2
+    assert throughput.value == 250.0
+
+
+def test_run_train_validation_loop_records_no_throughput_off_the_main_rank(lens_capture):
+    capture = lens_capture("default")
+    trainer = _two_step_trainer()
+    trainer.telemetry_handle = capture.handle
+    trainer.dist_env = SimpleNamespace(is_main=False)
+
+    trainer.run_train_validation_loop()
+
+    metrics = capture.metrics()
+    assert metrics["automodel.train.step.duration"].data.data_points[0].count == 2
+    assert "automodel.train.throughput" not in metrics
+    # The default preset records the first step but no per-step spans.
+    assert [s.name for s in capture.spans()].count("automodel.train.step") == 0
+    assert len(capture.span_named("automodel.train.first_step")) == 1

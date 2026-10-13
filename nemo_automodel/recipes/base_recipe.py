@@ -19,6 +19,7 @@ import socket
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -50,13 +51,19 @@ from nemo_automodel.components.checkpoint.utils import (
     resolve_restore_from_to_checkpoint_dir,
 )
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
+from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.package_info import __version__ as _automodel_version
 from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.shared import telemetry
+
+if TYPE_CHECKING:
+    from nemo.lens import TelemetryHandle
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +171,9 @@ class BaseRecipe:
     BaseRecipe provides checkpoint load/save functionality for recipes.
     """
 
+    #: Telemetry handle that ``setup()`` sets from ``cfg.telemetry.build()``; ``None`` while telemetry is off.
+    telemetry_handle: "TelemetryHandle | None" = None
+
     @staticmethod
     def _distributed_setup_attributes(distributed_setup):
         """Return common recipe attributes derived from a distributed setup."""
@@ -252,7 +262,23 @@ class BaseRecipe:
         """
         if not self.checkpointer.config.enabled:
             return
+        self._save_checkpoint(epoch, step, train_loss, val_loss, best_metric_key)
 
+    @telemetry.traced(telemetry.CHECKPOINT, "automodel.checkpoint.save")
+    def _save_checkpoint(
+        self,
+        epoch: int,
+        step: int,
+        train_loss: float,
+        val_loss: dict[str, float] | None,
+        best_metric_key: str,
+    ) -> None:
+        """Save a checkpoint; :meth:`save_checkpoint` has checked that checkpointing is enabled."""
+        if telemetry.enabled(telemetry.CHECKPOINT):
+            telemetry.set_span_attributes(
+                telemetry.CHECKPOINT,
+                {telemetry.semconv.DL_ITERATION: step, "automodel.checkpoint.async": self.checkpointer.config.is_async},
+            )
         # Wait for any in-flight checkpoint (async case) to complete
         self.checkpointer.async_wait()
         self.checkpointer.lifecycle.complete_pending()
@@ -536,7 +562,11 @@ class BaseRecipe:
 
         if is_rank_0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
+        self._load_checkpoint_from_dir(ckpt_dir)
 
+    @telemetry.traced(telemetry.LOAD_CHECKPOINT, "automodel.checkpoint.load")
+    def _load_checkpoint_from_dir(self, ckpt_dir: str) -> None:
+        """Restore every tracked state object, the model, and the optimizer from ``ckpt_dir``."""
         model, optimizer, scheduler = self._load_checkpoint_tracked_state(ckpt_dir)
 
         # Composite models (e.g. ``Gemma4WithDrafter``) save weights to multiple
@@ -593,6 +623,33 @@ class BaseRecipe:
                 print(cfg_yaml, flush=True)
         except (AttributeError, TypeError, ValueError, yaml.YAMLError):
             logger.info("Recipe config: <unavailable>", exc_info=True)
+
+    def _telemetry_resource_attributes(self) -> dict[str, str | bool | int | float]:
+        """Return the OpenTelemetry resource attributes of this process: facts fixed for its life.
+
+        Rank and world size are added by :meth:`TelemetryConfig.build`. Returns an empty mapping when
+        telemetry is disabled, so a run without nemo-lens never reads its semantic conventions.
+        """
+        if not self.cfg.telemetry.enabled:
+            return {}
+        semconv = telemetry.semconv
+        mesh = self.mesh_context
+        attributes: dict[str, str | bool | int | float] = {
+            "service.version": _automodel_version,
+            semconv.NV_DL_LOCAL_RANK: get_local_rank_preinit(),
+            semconv.DL_TENSOR_PARALLEL_SIZE: mesh.tp_size,
+            semconv.DL_PIPELINE_PARALLEL_SIZE: mesh.pp_size,
+            telemetry.CONTEXT_PARALLEL_SIZE: mesh.cp_size,
+            telemetry.EXPERT_PARALLEL_SIZE: mesh.ep_size,
+            telemetry.RECIPE: type(self).__name__,
+        }
+        if mesh.dp_size is not None:
+            attributes[semconv.DL_DATA_PARALLEL_SIZE] = mesh.dp_size
+        model = self.cfg.get("model.pretrained_model_name_or_path", None)
+        # A Hub id names the model; a local path would only expose the user's directory layout.
+        if isinstance(model, str) and not os.path.isabs(model) and not os.path.exists(model):
+            attributes[telemetry.MODEL] = model
+        return attributes
 
     def _log_library_versions(self):
         """Log import paths and versions for nemo_automodel, transformers, and torch."""
