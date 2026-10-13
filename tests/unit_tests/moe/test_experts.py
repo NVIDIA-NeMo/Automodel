@@ -14,8 +14,10 @@
 
 import gc
 import importlib.util
+import sys
 import weakref
 from dataclasses import replace
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 import pytest
@@ -2022,6 +2024,47 @@ def test_grouped_experts_te_rejects_router_weight_after_down_without_te_import(m
 
     with pytest.raises(ValueError, match="GroupedExpertsTE"):
         GroupedExpertsTE(moe_config)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_grouped_experts_te_legacy_constructor_compatibility(moe_config, monkeypatch, native):
+    """The default path still constructs with TE releases lacking the new keyword."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    class LegacyGroupedLinear(torch.nn.Module):
+        def __init__(self, *, num_gemms, in_features, out_features, bias, params_dtype, device):
+            super().__init__()
+            self.num_gemms = num_gemms
+
+    class LegacyPadding(torch.nn.Module):
+        def __init__(self, num_gemms):
+            super().__init__()
+
+    te = ModuleType("transformer_engine")
+    te.__version__ = "2.14.1"
+    te_pytorch = ModuleType("transformer_engine.pytorch")
+    te_pytorch.GroupedLinear = LegacyGroupedLinear
+    te_pytorch.Fp8Padding = LegacyPadding
+    te_pytorch.Fp8Unpadding = LegacyPadding
+    monkeypatch.setitem(sys.modules, "transformer_engine", te)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te_pytorch)
+    monkeypatch.setattr("nemo_automodel.components.models.common.utils._patch_te_modules", lambda: None)
+    backend = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native)
+    if native:
+        with pytest.raises(ValueError, match="Transformer Engine 2.19.0 or newer"):
+            GroupedExpertsTE(moe_config, backend=backend)
+    else:
+        experts = GroupedExpertsTE(moe_config, backend=backend)
+        assert experts.gate_up_linear.num_gemms == moe_config.n_routed_experts
+        assert experts.down_linear.num_gemms == moe_config.n_routed_experts
+        mesh = Mock()
+        mesh.size.return_value = 2
+        mesh.get_local_rank.return_value = 0
+        mesh.mesh_dim_names = ("ep",)
+        with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher"):
+            experts.init_token_dispatcher(mesh)
+        assert experts.gate_up_linear.num_gemms == moe_config.n_routed_experts // 2
+        assert experts.down_linear.num_gemms == moe_config.n_routed_experts // 2
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")

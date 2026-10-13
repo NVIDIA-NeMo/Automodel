@@ -39,7 +39,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
-from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.import_utils import is_te_min_version, safe_import
 
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
@@ -1815,6 +1815,8 @@ class GroupedExpertsTE(nn.Module):
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self._static_m_splits: list | None = None
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
+        if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
+            raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1847,7 +1849,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=config.dtype,
             device="meta",
-            use_grouped_tensor=True if self.use_grouped_tensor else None,
+            **({"use_grouped_tensor": True} if self.use_grouped_tensor else {}),
         )
         # down_linear: [moe_inter_dim] -> [dim]
         self.down_linear = GroupedLinear(
@@ -1857,7 +1859,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=config.dtype,
             device="meta",
-            use_grouped_tensor=True if self.use_grouped_tensor else None,
+            **({"use_grouped_tensor": True} if self.use_grouped_tensor else {}),
         )
 
         self.expert_activation = get_expert_activation_for_deepep(config)
@@ -2124,7 +2126,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=self.config.dtype,
             device="meta",
-            use_grouped_tensor=True if self.use_grouped_tensor else None,
+            **({"use_grouped_tensor": True} if self.use_grouped_tensor else {}),
         )
 
         # down_linear: [moe_inter_dim] -> [dim]
@@ -2135,7 +2137,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=self.config.dtype,
             device="meta",
-            use_grouped_tensor=True if self.use_grouped_tensor else None,
+            **({"use_grouped_tensor": True} if self.use_grouped_tensor else {}),
         )
 
         token_dispatcher_config = TokenDispatcherConfig(
