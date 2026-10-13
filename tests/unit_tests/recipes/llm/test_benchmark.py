@@ -797,6 +797,8 @@ class TestBenchmarkingRecipeJSONOutput:
         assert summary_data["training_steps"] == 20
         assert summary_data["peak_tflops"] == 989
         assert summary_data["world_size"] == 8
+        assert summary_data["tflops_total"] == mock_recipe.tflops
+        assert summary_data["tflops_per_gpu"] == mock_recipe.tflops / 8
         assert summary_data["global_batch_size"] == 256
         assert summary_data["local_batch_size"] == 4
         assert summary_data["seq_len"] == 2048
@@ -912,7 +914,8 @@ class TestBenchmarkingRecipeSummaryData:
         assert "summary/avg_mfu_percent" in scalar_metrics
         assert scalar_metrics["summary/flops_scope"] == scope
         assert "summary/training_time_seconds" in scalar_metrics
-        assert "summary/tflops_per_gpu" in scalar_metrics
+        assert scalar_metrics["summary/tflops_total"] == mock_recipe.tflops
+        assert scalar_metrics["summary/tflops_per_gpu"] == mock_recipe.tflops / mock_recipe.dist_env.world_size
 
     @patch("wandb.finish")
     def test_wandb_finish_called(self, mock_wandb_finish, mock_recipe):
