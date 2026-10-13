@@ -226,12 +226,25 @@ def swiglu_back(g, y):
 
 
 @torch.compile
-def weighted_swiglu_back(g, y, weights):
-    """Compute input and weight gradients for weighted SwiGLU."""
+def weighted_swiglu_back(g, y, weights, need_weight_grad=True):
+    """Compute input and optional weight gradients for weighted SwiGLU.
+
+    Args:
+        g: Upstream gradient of shape [tokens, intermediate].
+        y: Gate/up activations of shape [tokens, 2 * intermediate].
+        weights: Routing weights of shape [tokens, 1].
+        need_weight_grad: Whether the routing weights require a gradient.
+
+    Returns:
+        Input gradient with ``y``'s shape and dtype, and either the weight
+        gradient with ``weights``' shape and dtype or ``None``.
+    """
 
     input_dtype = y.dtype
     w_dtype = weights.dtype
     input_grad = swiglu_back(g * weights, y)
+    if not need_weight_grad:
+        return input_grad.to(input_dtype), None
     # precison of w may be higher than y and g, so we need to cast g to w_dtype
     weights_grad = swiglu(y) * g.to(w_dtype)
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
@@ -343,7 +356,7 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
+        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights, ctx.needs_input_grad[1])
         return tmp, wgrad, None
 
 

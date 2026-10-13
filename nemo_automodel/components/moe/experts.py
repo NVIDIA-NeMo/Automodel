@@ -1565,8 +1565,8 @@ class GroupedExpertsDeepEP(nn.Module):
         Returns:
             Expert-sorted activations [dispatched_tokens, hidden], counts [local_experts],
             and probabilities [dispatched_tokens, 1]. Nonempty probabilities retain the
-            dispatcher's dtype and autograd connection; empty probabilities use the
-            configured compute dtype.
+            dispatcher's dtype and require gradients only when ``weights`` does;
+            empty probabilities use the configured compute dtype.
         """
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
@@ -1576,6 +1576,11 @@ class GroupedExpertsDeepEP(nn.Module):
             token_indices=indices,
         )
         permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, self.config.dtype)
+        # Multi-output dispatcher autograd functions can attach gradients to probabilities
+        # merely because the hidden states require them. Routing probabilities depend only
+        # on the original weights, so preserve frozen routers through dispatch/permutation.
+        if not weights.requires_grad:
+            permuted_probs = permuted_probs.detach()
         permuted_probs = permuted_probs.unsqueeze(-1)
         return permuted_local_hidden_states, tokens_per_expert, permuted_probs
 
