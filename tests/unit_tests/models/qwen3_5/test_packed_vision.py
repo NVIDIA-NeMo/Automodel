@@ -17,6 +17,7 @@
 import pytest
 import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from transformers.vision_utils import get_vision_attention_seqlens
 
 from nemo_automodel.components.datasets.utils import neat_packed_collater
@@ -25,11 +26,17 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.packing import configure_packing_for_models
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
+from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForConditionalGeneration
 
 
 def _model(
-    *, attn: str = "sdpa", device: str = "cpu", dtype: torch.dtype = torch.float32, hybrid: bool = False
-) -> Qwen3_5ForConditionalGeneration:
+    *,
+    attn: str = "sdpa",
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float32,
+    hybrid: bool = False,
+    moe: bool = False,
+) -> Qwen3_5ForConditionalGeneration | Qwen3_5MoeForConditionalGeneration:
     torch.manual_seed(42)
     hidden_size = 16 if device == "cpu" else 128
     text = Qwen3_5TextConfig(
@@ -70,7 +77,22 @@ def _model(
         tie_word_embeddings=False,
     )
     backend = BackendConfig(attn=attn, linear="torch", rms_norm="torch", rope_fusion=False)
-    model = Qwen3_5ForConditionalGeneration(config, backend=backend).to(device=device).eval()
+    if moe:
+        moe_text = text.to_dict()
+        moe_text.update(
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            shared_expert_intermediate_size=32,
+            num_nextn_predict_layers=0,
+        )
+        config = Qwen3_5MoeConfig(**{**config.to_dict(), "text_config": moe_text})
+        backend.experts = "torch"
+        backend.dispatcher = "torch"
+        model = Qwen3_5MoeForConditionalGeneration(config, backend=backend)
+    else:
+        model = Qwen3_5ForConditionalGeneration(config, backend=backend)
+    model = model.to(device=device).eval()
     model.model.language_model.init_weights(buffer_device=torch.device(device))
     cast_model_to_dtype(model, dtype)
     return model
@@ -85,10 +107,11 @@ def check_packed_media_parity(
     dtype: torch.dtype = torch.float32,
     pack_sizes: tuple[int, ...] = (2,),
     hybrid: bool = False,
+    moe: bool = False,
 ) -> None:
     """Compare packed logits and all parameter gradients to independent documents."""
-    model = _model(attn=attn, device=device, dtype=dtype, hybrid=hybrid)
-    reference = _model(device=device, dtype=dtype, hybrid=hybrid)
+    model = _model(attn=attn, device=device, dtype=dtype, hybrid=hybrid, moe=moe)
+    reference = _model(device=device, dtype=dtype, hybrid=hybrid, moe=moe)
     # TE's attention bookkeeping has no counterpart in the SDPA reference.
     reference.load_state_dict(
         {key: value for key, value in model.state_dict().items() if not key.endswith("._extra_state")}
