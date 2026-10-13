@@ -42,7 +42,8 @@ def model_flops(config: DeepseekV4Config, *, gbs: int = 1, seq_len: int | None =
     Counts assume one unpadded document per sequence. Activation recomputation,
     masked-out dense work, communication, optimizer updates, pooling, softmax,
     norms, RoPE, and elementwise operations are excluded, as for other MFU
-    formulas. Compressor projections are counted before pooling at every token.
+    formulas. Compressor projections run at every token, but have no backward
+    pass when the sequence is too short to produce a complete pooled window.
 
     Args:
         config: DeepSeek V4 text configuration with MTP disabled.
@@ -92,11 +93,14 @@ def model_flops(config: DeepseekV4Config, *, gbs: int = 1, seq_len: int | None =
     local_pairs = window * (window + 1) // 2 + (length - window) * window
     attention_pairs = layers * local_pairs
     indexer_macs = 0
+    compressor_flops = 0
     for ratio in ratios[:layers]:
         if ratio == 0:
             continue
         overlap = 2 if ratio == 4 else 1
-        per_token += 2 * hidden * overlap * dim  # Compressor wkv and wgate.
+        # The training cache disconnects the empty pool when length < ratio.
+        compressor_macs = length * 2 * hidden * overlap * dim  # wkv and wgate.
+        compressor_flops += (6 if length >= ratio else 2) * compressor_macs
         cap = config.index_topk if ratio == 4 else length // ratio
         attention_pairs += _compressed_pairs(length, ratio, cap)
         if ratio == 4:
@@ -108,4 +112,4 @@ def model_flops(config: DeepseekV4Config, *, gbs: int = 1, seq_len: int | None =
             indexer_macs += index_heads * index_dim * _compressed_pairs(length, ratio, length // ratio)
 
     trainable_macs = length * per_token + 2 * heads * dim * attention_pairs
-    return float(gbs * (6 * trainable_macs + 2 * indexer_macs))
+    return float(gbs * (6 * trainable_macs + compressor_flops + 2 * indexer_macs))
