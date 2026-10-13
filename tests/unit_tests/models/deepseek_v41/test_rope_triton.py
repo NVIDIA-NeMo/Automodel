@@ -19,9 +19,10 @@ import math
 import pytest
 import torch
 
-from nemo_automodel.components.models.deepseek_v41 import attention, rope_triton
+from nemo_automodel.components.models.common import rope_triton
+from nemo_automodel.components.models.common.rope_triton import HAVE_TRITON, apply_rope_triton
+from nemo_automodel.components.models.deepseek_v41 import attention
 from nemo_automodel.components.models.deepseek_v41.attention import _apply_rope, use_triton_rope
-from nemo_automodel.components.models.deepseek_v41.rope_triton import HAVE_TRITON, apply_rope_triton
 
 _CUDA_AND_TRITON = pytest.mark.skipif(
     not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA and Triton are required for the fused RoPE kernel"

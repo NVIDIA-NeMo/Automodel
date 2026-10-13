@@ -280,3 +280,34 @@ def apply_complex_rope(values: torch.Tensor, frequencies: torch.Tensor, *, inver
     if supports_fused_rope(values, frequencies):
         return _FusedRope.apply(values, torch.view_as_real(frequencies.resolve_conj()).contiguous(), inverse)
     return _apply_complex_rope_torch(values, frequencies, inverse=inverse)
+
+
+def apply_rope_triton(values: torch.Tensor, angles: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
+    """Rotate the final channels of ``values`` with the fused Triton kernel.
+
+    The last ``2 * angles.shape[-1]`` channels are rotated as adjacent pairs by
+    ``exp(i * angles)`` (its conjugate when ``inverse``) and the remaining channels
+    are copied, all in one pass. The backward rotates the gradient by the conjugate
+    in one pass; ``angles`` receives no gradient. Inputs that are not on CUDA, whose
+    angles require a gradient, or whose dtype is outside BF16/FP16/FP32 use the eager path.
+
+    Args:
+        values: Tensor of shape [batch, sequence, channels] or
+            [batch, sequence, heads, channels]; non-contiguous inputs are accepted.
+        angles: FP32 tensor of shape [batch, sequence, rotary_pairs].
+        inverse: Conjugate the rotation, as for the attention output.
+
+    Returns:
+        New contiguous tensor with the shape and dtype of ``values``.
+
+    Raises:
+        ValueError: ``angles`` does not describe an even rotary width within ``values``.
+    """
+    rotary_dim = 2 * angles.shape[-1]
+    if angles.ndim != 3 or angles.shape[:2] != values.shape[:2] or not 0 < rotary_dim <= values.shape[-1]:
+        raise ValueError(
+            f"angles of shape {tuple(angles.shape)} do not fit values of shape {tuple(values.shape)}: expected "
+            "[batch, sequence, rotary_pairs] with 0 < 2 * rotary_pairs <= channels"
+        )
+    frequencies = torch.polar(torch.ones_like(angles), angles)
+    return apply_complex_rope(values, frequencies, inverse=inverse)
