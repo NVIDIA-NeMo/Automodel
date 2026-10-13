@@ -189,7 +189,13 @@ def test_formula_matches_executed_forward_backward(ratios: list[int], length: in
         # dimension. Summing the groups gives 2*M*K*N in either case.
         return 2 * a_shape[0] * a_shape[1] * b_shape[-1]
 
-    with FlopCounterMode(display=False, custom_mapping={torch.ops.aten._grouped_mm: grouped_mm_flops}) as counter:
+    # Count ATen operations, including those inside compiled activation helpers.
+    # An outer dispatch mode cannot trace fullgraph=True functions, and fused
+    # kernels can hide operations from the counter. Restore compilation on exit.
+    with (
+        torch.compiler.set_stance("force_eager"),
+        FlopCounterMode(display=False, custom_mapping={torch.ops.aten._grouped_mm: grouped_mm_flops}) as counter,
+    ):
         logits = model(torch.arange(length).unsqueeze(0) % config.vocab_size).logits
         logits.backward(torch.ones_like(logits))
 
