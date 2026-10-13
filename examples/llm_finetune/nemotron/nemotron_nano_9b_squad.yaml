@@ -103,6 +103,8 @@ lr_scheduler:
 
 ci:
   vllm_deploy: true
+  # NemotronH requires vLLM's native backend; its remote Transformers model is unsupported.
+  vllm_smoke_test: true
   recipe_owner: HuiyingLi
   time: "00:30:00"
   checkpoint_robustness:
