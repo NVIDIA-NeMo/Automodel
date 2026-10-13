@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import ExitStack, nullcontext
+from contextlib import nullcontext
 
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -498,54 +498,52 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
         # Optional one-shot FLOPs measurement for the perf report.
-        # FlopCounterMode counts registered eager/compiled graph FLOPs of one post-warmup
+        # FlopCounterMode captures the ACTUAL per-GPU model FLOPs of one post-warmup
         # step (encoder + both decode passes + active experts + both lm heads) — which
         # an analytical formula can't easily express for this encoder-decoder MoE. Gated
         # by `measure_flops` (default off → no effect on normal / llada / nemotron runs);
-        # attempted once, after `measure_flops_after` steps. Compiled regions use a
-        # separate instrumented Inductor variant; later steps restore normal compilation.
-        # Measurement uses Inductor defaults instead of each function's mode/options,
-        # which may change kernels/rounding, and includes checkpoint/rematerialization work.
-        # Only setup/reporting failures are optional; training failures still propagate.
+        # attempted once, after `measure_flops_after` steps; any failure degrades to "no
+        # TFLOPs" rather than crashing the step.
         _fcm = None
-        with ExitStack() as flop_context:
-            if (
-                bool(self.cfg.get("measure_flops", False))
-                and not getattr(self, "_flop_measure_attempted", False)
-                and self.step_scheduler.step >= int(self.cfg.get("measure_flops_after", 3))
-            ):
-                self._flop_measure_attempted = True
-                try:
-                    from nemo_automodel.components.utils.flop_counter import FlopCounterMode
+        if (
+            bool(self.cfg.get("measure_flops", False))
+            and not getattr(self, "_flop_measure_attempted", False)
+            and self.step_scheduler.step >= int(self.cfg.get("measure_flops_after", 3))
+        ):
+            self._flop_measure_attempted = True
+            try:
+                from torch.utils.flop_counter import FlopCounterMode
 
-                    _fcm = flop_context.enter_context(FlopCounterMode(display=False))
-                except Exception as e:
-                    logging.warning("FLOPs measurement unavailable, skipping: %s", e)
+                _fcm = FlopCounterMode(display=False)
+                _fcm.__enter__()
+            except Exception as e:
+                logging.warning("FLOPs measurement unavailable, skipping: %s", e)
+                _fcm = None
 
-            for i, batch in enumerate(batches):
-                if i == num_batches - 1:
-                    prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+        for i, batch in enumerate(batches):
+            if i == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-                self.dllm_strategy.forward_backward(
-                    self,
-                    i,
-                    batch,
-                    loss_buffer=loss_buffer,
-                    num_diffusion_tokens=num_diffusion_tokens,
-                    num_ar_tokens=num_ar_tokens,
-                    num_batches=num_batches,
-                )
+            self.dllm_strategy.forward_backward(
+                self,
+                i,
+                batch,
+                loss_buffer=loss_buffer,
+                num_diffusion_tokens=num_diffusion_tokens,
+                num_ar_tokens=num_ar_tokens,
+                num_batches=num_batches,
+            )
 
-                if i == 0:
-                    prepare_after_first_microbatch()
+            if i == 0:
+                prepare_after_first_microbatch()
 
         if _fcm is not None:
             try:
+                _fcm.__exit__(None, None, None)
                 # Per-GPU FLOPs for one full step (all microbatches' fwd+bwd).
                 self._step_flops_per_gpu = float(_fcm.get_total_flops())
                 logging.info(
-                    "Measured per-GPU step FLOPs: %.3e (includes activation-checkpoint/Inductor recomputation; "
-                    "TFLOPs reported on later clean steps)",
+                    "Measured per-GPU step FLOPs: %.3e (TFLOPs reported on later clean steps)",
                     self._step_flops_per_gpu,
                 )
             except Exception as e:

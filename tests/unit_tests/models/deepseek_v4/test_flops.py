@@ -79,17 +79,6 @@ def _oracle(length: int) -> int:
     return result
 
 
-@pytest.fixture
-def isolated_compile_cache():
-    import torch
-
-    # Each parameterization constructs a different model and measurement backend.
-    # Keep these independent models from exhausting the shared helper's cache.
-    torch.compiler.reset()
-    yield
-    torch.compiler.reset()
-
-
 @pytest.mark.parametrize("length", [1, 3, 4, 5, 9, 127, 128, 129])
 def test_formula_matches_matrix_shapes_and_enumerated_causal_keys(length: int) -> None:
     config = _config()
@@ -151,14 +140,12 @@ def test_unsupported_mtp_and_vision_are_explicit(config: DeepseekV4Config) -> No
         ([0, 4, 128], 129, 1),
     ],
 )
-def test_formula_matches_executed_forward_backward(
-    ratios: list[int], length: int, hash_layers: int, isolated_compile_cache
-) -> None:
+def test_formula_matches_executed_forward_backward(ratios: list[int], length: int, hash_layers: int) -> None:
     import torch
+    from torch.utils.flop_counter import FlopCounterMode
 
     from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
-    from nemo_automodel.components.utils.flop_counter import FlopCounterMode
 
     config = DeepseekV4Config(
         vocab_size=32,
@@ -196,10 +183,19 @@ def test_formula_matches_executed_forward_backward(
     model = DeepseekV4ForCausalLM(config, backend=backend)
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
 
-    # Exercise compiled matrix arithmetic as well as the expert activation's
-    # existing fullgraph helper. Count both forward and backward executions.
-    model.model.hc_head.compile(fullgraph=True)
-    with FlopCounterMode(display=False) as counter:
+    def grouped_mm_flops(a_shape, b_shape, *args, **kwargs):
+        # PyTorch's counter lacks grouped-MM accounting in some versions.
+        # Forward/dgrad split rows across experts; wgrad splits the reduction
+        # dimension. Summing the groups gives 2*M*K*N in either case.
+        return 2 * a_shape[0] * a_shape[1] * b_shape[-1]
+
+    # Count ATen operations, including those inside compiled activation helpers.
+    # An outer dispatch mode cannot trace fullgraph=True functions, and fused
+    # kernels can hide operations from the counter. Restore compilation on exit.
+    with (
+        torch.compiler.set_stance("force_eager"),
+        FlopCounterMode(display=False, custom_mapping={torch.ops.aten._grouped_mm: grouped_mm_flops}) as counter,
+    ):
         logits = model(torch.arange(length).unsqueeze(0) % config.vocab_size).logits
         logits.backward(torch.ones_like(logits))
 
