@@ -372,8 +372,11 @@ def fully_shard_across_blocks(
     CPU-bound, with the GPU idle (40 units ≈ 40 serialised collectives per step). One unit for all
     blocks' instances turns that into a single reduce-scatter; ``reshard_after_forward=False`` keeps
     the few kilobytes unsharded so the step also pays one all-gather instead of one per block and
-    per activation-checkpoint recompute. Numerics are unchanged: the parameters stay FSDP-sharded fp32
-    DTensors with the same reduce dtype.
+    per activation-checkpoint recompute. That is also why ``reshard_after_forward`` is hard-coded here
+    rather than threaded from the caller like every other ``fully_shard`` call in the parallelizer: a
+    resharded unit would be re-gathered inside every checkpoint recompute, which is exactly the per-block
+    cost this unit removes, and the memory it keeps resident is a few kilobytes. Numerics are unchanged:
+    the parameters stay FSDP-sharded fp32 DTensors with the same reduce dtype.
 
     Args:
         blocks: Decoder blocks (checkpoint wrappers included) whose submodules are searched.

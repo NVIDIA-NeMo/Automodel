@@ -200,6 +200,13 @@ def _apply_fused_adam_empty_shard_patch() -> None:
     _logger.info("Applied FusedAdam empty-shard monkey-patch.")
 
 
+# Sentinel stored in place of a plan for a group that can never take the cached path (FP8 parameters, fp16
+# moments or master weights, mixed fp16 + bf16, a dtype the kernel does not take): the original ``step`` runs
+# for it every time without replaying the per-parameter walk first. Dropped with the plans on
+# ``load_state_dict`` / ``add_param_group``; the uninitialised-state case (first step) is *not* negative-cached.
+_FUSED_ADAM_NO_PLAN = object()
+
+
 class _FusedAdamGroupPlan:
     """The multi-tensor lists of one parameter group, in the order ``FusedAdam.step`` builds them."""
 
@@ -267,7 +274,17 @@ def _apply_fused_adam_cached_lists_patch() -> None:
     capturable mode, decoupled gradients, a grad scaler or closure, FP8 / block-scaled
     parameters, optimizer states that need an unscale pass (fp16 or non-fused bf16 moments),
     uninitialised states (the first step), or a gradient that appears or disappears. The plan is
-    dropped on ``load_state_dict`` and ``add_param_group``.
+    dropped on ``load_state_dict`` and ``add_param_group``; a group that can never take the cached
+    path (FP8 parameters, fp16 moments or master weights, mixed fp16 + bf16) is remembered as such,
+    so the original ``step`` runs for it without a per-parameter walk first.
+
+    Deliberately *not* checked between steps: parameter dtype and shape, the identity of
+    ``state["exp_avg"]`` / ``state["exp_avg_sq"]`` / ``state["master_param"]``, and the optimizer's
+    ``master_weights`` / ``store_param_remainders`` settings. The plan holds the state tensors by
+    object, exactly as the original loop would have fetched them, so anything that replaces a
+    state tensor without going through ``load_state_dict`` or ``add_param_group`` (a script
+    assigning ``optimizer.state[p]["exp_avg"] = ...``, or a future TE change) would update a stale
+    tensor. Nothing in the training paths here does that; it is the one invariant the caller owns.
     """
 
     from nemo_automodel.shared.import_utils import safe_import, safe_import_te
@@ -303,7 +320,12 @@ def _apply_fused_adam_cached_lists_patch() -> None:
         return dtype == torch.bfloat16 and bool(optimizer.fuse_unscale) and name in ("exp_avg", "exp_avg_sq")
 
     def build_plan(optimizer, group: dict):
-        """Replay the original per-parameter loop once; None when any parameter needs the original path."""
+        """Replay the original per-parameter loop once.
+
+        Returns the plan, ``None`` when a state is still uninitialised (the original step fills it on its
+        first call and the next call plans again), or ``_FUSED_ADAM_NO_PLAN`` when the group can never take
+        the cached path (remembered until ``load_state_dict`` / ``add_param_group``).
+        """
         plan = _FusedAdamGroupPlan(group["params"])
         for param in group["params"]:
             state = optimizer.state[param]
@@ -314,17 +336,17 @@ def _apply_fused_adam_cached_lists_patch() -> None:
                 continue
             local_param = local_tensor(param)
             if type(local_param) not in plain_tensor_types:
-                return None  # Float8Tensor / QuantizedTensor parameters keep their dedicated paths
+                return _FUSED_ADAM_NO_PLAN  # Float8Tensor / QuantizedTensor parameters keep their dedicated paths
             if "exp_avg" not in state or "exp_avg_sq" not in state:
-                return None
+                return _FUSED_ADAM_NO_PLAN
             if not (state_supported(optimizer, "exp_avg") and state_supported(optimizer, "exp_avg_sq")):
-                return None
+                return _FUSED_ADAM_NO_PLAN
             moment = local_tensor(state["exp_avg"])
             velocity = local_tensor(state["exp_avg_sq"])
             if param.dtype in (torch.float16, torch.bfloat16):
                 if optimizer.master_weights:
                     if "master_param" not in state or not state_supported(optimizer, "master_param"):
-                        return None
+                        return _FUSED_ADAM_NO_PLAN
                     plan.f16_master.append(local_tensor(state["master_param"]).data)
                 plan.has_fp16 = plan.has_fp16 or param.dtype == torch.float16
                 plan.has_bf16 = plan.has_bf16 or param.dtype == torch.bfloat16
@@ -336,9 +358,9 @@ def _apply_fused_adam_cached_lists_patch() -> None:
                 plan.f32_m.append(moment)
                 plan.f32_v.append(velocity)
             else:
-                return None
+                return _FUSED_ADAM_NO_PLAN
         if plan.has_fp16 and plan.has_bf16:
-            return None  # the original step raises for this mix
+            return _FUSED_ADAM_NO_PLAN  # the original step raises for this mix
         return plan
 
     def grads_of(params: list) -> list:
@@ -367,18 +389,22 @@ def _apply_fused_adam_cached_lists_patch() -> None:
             if len(group["params"]) == 0:
                 continue
             plan = plans[index]
+            if plan is _FUSED_ADAM_NO_PLAN:
+                return original_step(self, closure, grad_scaler)  # remembered verdict: no walk
             if plan is None or not plan.still_valid(group):
                 plan = build_plan(self, group)
                 plans[index] = plan
-                if plan is None:
+                if plan is None or plan is _FUSED_ADAM_NO_PLAN:
                     return original_step(self, closure, grad_scaler)
 
         applier = fused_adam.multi_tensor_applier
         for index, group in enumerate(self.param_groups):
+            # TE increments the step before skipping an empty group (a group can be empty on some DP ranks;
+            # a rank resuming from such a rank's checkpoint must not apply a stale bias correction).
+            group["step"] = group["step"] + 1 if "step" in group else 1
             if len(group["params"]) == 0:
                 continue
             plan = plans[index]
-            group["step"] = group["step"] + 1 if "step" in group else 1
             bias_correction = 1 if group["bias_correction"] else 0
             beta1, beta2 = group["betas"]
             kernel_args = (

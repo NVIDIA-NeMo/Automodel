@@ -455,11 +455,12 @@ class _FakeFusedAdam:
     def step(self, closure=None, grad_scaler=None):
         self.original_calls += 1
         for group in self.param_groups:
+            # TE 2.19 order: the step counter advances before an empty group is skipped
+            group["step"] = group["step"] + 1 if "step" in group else 1
             if len(group["params"]) == 0:
                 continue
             bias_correction = 1 if group["bias_correction"] else 0
             beta1, beta2 = group["betas"]
-            group["step"] = group["step"] + 1 if "step" in group else 1
             p_f16, g_f16, m_f16, v_f16, main_f16 = [], [], [], [], []
             p_f32, g_f32, m_f32, v_f32 = [], [], [], []
             has_fp16 = has_bf16 = False
@@ -714,6 +715,50 @@ class TestFusedAdamCachedListsPatch:
         optimizer.step()
         assert optimizer.original_calls == 2  # the new group's state is initialised by the original step
         assert len(calls) == 3
+
+    def test_empty_parameter_group_keeps_its_step_counter_in_sync(self, monkeypatch):
+        """TE advances ``group["step"]`` before skipping an empty group (a group can be empty on some DP ranks);
+        the cached path must count the same, or a rank resuming from such a checkpoint applies a stale bias
+        correction (HuiyingLi on #4285: ``[4, 1]`` vs ``[4, 4]`` after four steps)."""
+        _, FusedAdam, calls = self._patched_module(monkeypatch)
+        params = _fake_params()
+        optimizer = FusedAdam(params)
+        optimizer.add_param_group(
+            {"params": [], "lr": 1e-3, "betas": (0.9, 0.95), "eps": 1e-8, "weight_decay": 0.0, "bias_correction": True}
+        )
+        reference = _FakeFusedAdam([torch.nn.Parameter(p.detach().clone()) for p in params])
+        reference.add_param_group(
+            {"params": [], "lr": 1e-3, "betas": (0.9, 0.95), "eps": 1e-8, "weight_decay": 0.0, "bias_correction": True}
+        )
+        for step in range(4):
+            _set_grads(params, seed=100 + step)
+            _set_grads(reference.param_groups[0]["params"], seed=100 + step)
+            optimizer.step()
+            reference.step()
+        assert optimizer.original_calls == 1  # steps 2-4 took the cached path
+        assert [g["step"] for g in optimizer.param_groups] == [4, 4]
+        assert [g["step"] for g in optimizer.param_groups] == [g["step"] for g in reference.param_groups]
+
+    def test_unsupported_group_is_remembered_until_the_hooks_drop_it(self, monkeypatch):
+        """A group that can never take the cached path is negative-cached: the original step runs without a
+        per-parameter walk first; ``load_state_dict`` drops the verdict with the plans."""
+        _, FusedAdam, calls = self._patched_module(monkeypatch)
+
+        class Float8Like(torch.Tensor):
+            pass
+
+        params = _fake_params()
+        params.append(torch.nn.Parameter(Float8Like(torch.randn(2))))
+        optimizer = FusedAdam(params)
+        self._run(optimizer, params, 3, calls)
+        plans = optimizer.__dict__["_nemo_fused_adam_plans"]
+        assert plans[0] is te_patches_module._FUSED_ADAM_NO_PLAN
+        assert optimizer.original_calls == 3
+        optimizer.load_state_dict({})
+        assert "_nemo_fused_adam_plans" not in optimizer.__dict__
+        self._run(optimizer, params, 1, calls)
+        assert optimizer.__dict__["_nemo_fused_adam_plans"][0] is te_patches_module._FUSED_ADAM_NO_PLAN
+        assert optimizer.original_calls == 4
 
     def test_dtensor_parameters_hand_their_local_shards_to_the_kernel(self, monkeypatch):
         dist = pytest.importorskip("torch.distributed")
