@@ -81,12 +81,13 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
+from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 from nemo_automodel.components.models.mistral3.state_dict_adapter import Mistral3FP8StateDictAdapter
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
@@ -2195,6 +2196,79 @@ class TestLoadModelCustomModelGuard:
         for key, expected in expected_state.items():
             torch.testing.assert_close(model.state_dict()[key], expected)
 
+    def test_gpt_oss_mxfp4_checkpoint_loads_without_full_cpu_state(self, tmp_path):
+        """The one-GPU GPT-OSS path must decode packed experts into persistent model tensors."""
+
+        class LinearWithExtraState(torch.nn.Linear):
+            def get_extra_state(self) -> torch.Tensor:
+                """Return backend bookkeeping that is not present in the HF checkpoint."""
+                return torch.empty(0, dtype=torch.uint8)
+
+        CustomModel = type("CustomModel", (torch.nn.Module,), {})
+        CustomModel.__module__ = "nemo_automodel.components.models.gpt_oss.model"
+        model = CustomModel()
+        model.model = torch.nn.Module()
+        model.model.embed_tokens = torch.nn.Embedding(4, 4, dtype=torch.bfloat16)
+        model.model.layers = torch.nn.ModuleList()
+        layer = torch.nn.Module()
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.q_proj = LinearWithExtraState(4, 4, bias=False, dtype=torch.bfloat16)
+        layer.mlp = torch.nn.Module()
+        layer.mlp.gate = torch.nn.Linear(4, 2, bias=False, dtype=torch.bfloat16)
+        layer.mlp.experts = torch.nn.Module()
+        layer.mlp.experts.gate_and_up_projs = torch.nn.Parameter(torch.zeros(1, 32, 64, dtype=torch.bfloat16))
+        layer.mlp.experts.down_projs = torch.nn.Parameter(torch.zeros(1, 32, 64, dtype=torch.bfloat16))
+        model.model.layers.append(layer)
+        model.config = SimpleNamespace(
+            tie_word_embeddings=False,
+            num_hidden_layers=1,
+            quantization_config={"quant_method": "mxfp4"},
+        )
+        model.state_dict_adapter = GPTOSSStateDictAdapter(
+            config=model.config,
+            moe_config=SimpleNamespace(),
+            backend=SimpleNamespace(attn="flex"),
+        )
+
+        checkpoint_state = {}
+        for model_key, target in model.state_dict().items():
+            if model_key.endswith("_extra_state"):
+                continue
+            hf_key = model.state_dict_adapter._model_to_hf_key(model_key)
+            if model_key.endswith(("gate_and_up_projs", "down_projs")):
+                n_experts, input_features, output_features = target.shape
+                checkpoint_state[f"{hf_key}_blocks"] = torch.full(
+                    (n_experts, output_features, input_features // 32, 16), 0x12, dtype=torch.uint8
+                )
+                checkpoint_state[f"{hf_key}_scales"] = torch.full(
+                    (n_experts, output_features, input_features // 32), 127, dtype=torch.uint8
+                )
+            else:
+                checkpoint_state[hf_key] = torch.full_like(target, 3)
+
+        model_path = tmp_path / "model"
+        model_path.mkdir()
+        save_file(checkpoint_state, model_path / "model.safetensors")
+        checkpointer = self._make_checkpointer()
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype"
+            ) as full_cpu_load,
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp.load", wraps=dcp.load) as dcp_load,
+        ):
+            checkpointer.load_model(model, model_path=str(model_path), is_init_step=True)
+
+        full_cpu_load.assert_not_called()
+        assert dcp_load.call_count == 2  # direct tensors and one MXFP4 decoder-layer group
+        expected_expert = torch.tensor([1.0, 0.5] * 16, dtype=torch.bfloat16).view(1, 32, 1).expand(1, 32, 64)
+        loaded_state = model.state_dict()
+        torch.testing.assert_close(loaded_state["model.layers.0.mlp.experts.gate_and_up_projs"], expected_expert)
+        torch.testing.assert_close(loaded_state["model.layers.0.mlp.experts.down_projs"], expected_expert)
+        torch.testing.assert_close(
+            loaded_state["model.layers.0.mlp.gate.weight"], torch.full((2, 4), 3, dtype=torch.bfloat16)
+        )
+
 
 class TestLoadModelCheckpointKeySubset:
     """Test allow_checkpoint_key_subset support for torch_save exports."""
@@ -3724,9 +3798,11 @@ def _make_ckptr(is_peft=False, is_async=False):
     config.is_async = is_async
     ckptr = MagicMock(spec=Checkpointer)
     ckptr.config = config
+    ckptr._load_process_group = None
+    ckptr._get_load_process_group = Checkpointer._get_load_process_group.__get__(ckptr)
+    ckptr.process_group = None
     ckptr._model_ctx = MagicMock(staging_active=False)
     ckptr._optim_ctx = MagicMock(staging_active=False)
-    ckptr.process_group = None
     ckptr._planner_cache_namespace = "test"
     return ckptr
 
@@ -3956,6 +4032,9 @@ class TestDoLoad:
         config.is_peft = is_peft
         ckptr = MagicMock(spec=Checkpointer)
         ckptr.config = config
+        ckptr._load_process_group = None
+        ckptr._get_load_process_group = Checkpointer._get_load_process_group.__get__(ckptr)
+        ckptr.process_group = None
         return ckptr
 
     def test_cloud_path_uses_msc_reader(self):
@@ -4012,6 +4091,9 @@ class TestDoLoad:
         config.is_async = False
         ckptr = MagicMock(spec=Checkpointer)
         ckptr.config = config
+        ckptr._load_process_group = None
+        ckptr._get_load_process_group = Checkpointer._get_load_process_group.__get__(ckptr)
+        ckptr.process_group = None
         ckptr._planner_cache_namespace = "test"
         state_dict = {"weight": torch.ones(4)}
         path = "msc://bucket/step-300"
@@ -4584,9 +4666,11 @@ class TestSyncAsyncSave:
         config.is_async = is_async
         ckptr = MagicMock(spec=Checkpointer)
         ckptr.config = config
+        ckptr._load_process_group = None
+        ckptr._get_load_process_group = Checkpointer._get_load_process_group.__get__(ckptr)
+        ckptr.process_group = None
         ckptr._model_ctx = MagicMock(staging_active=False)
         ckptr._optim_ctx = MagicMock(staging_active=False)
-        ckptr.process_group = None
         ckptr._planner_cache_namespace = "test"
         return ckptr
 

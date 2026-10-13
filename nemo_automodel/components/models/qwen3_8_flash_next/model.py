@@ -14,11 +14,11 @@
 
 """Trainable Qwen3.8-Flash-Next conditional-generation model.
 
-This implementation uses the checkpoint's compressed-block QSA router and a
-FlexAttention sparse-GQA path for CUDA BF16 long-sequence SFT, with a PyTorch
-oracle for CPU and numerical parity. Pipeline and tensor parallelism remain
-unsupported. Context parallelism uses a model-owned contiguous sequence shard
-for QSA, GDN, and PLE, and composes with sequence packing.
+This implementation uses the checkpoint's compressed-block QSA router and
+FlexAttention or optional SM90 CuTe sparse GQA for CUDA BF16 long-sequence SFT,
+with a PyTorch oracle for CPU and numerical parity. Pipeline and tensor
+parallelism remain unsupported. Context parallelism uses a model-owned contiguous
+sequence shard for QSA, GDN, and PLE, and composes with sequence packing.
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+from .backend import Qwen3_8_FlashNextBackendConfig
 from .config import Qwen3_8_FlashNextConfig, Qwen3_8_FlashNextTextConfig
 from .cp import (
     Qwen3_8_FlashNextCPContext,
@@ -72,8 +73,8 @@ class Qwen3_8_FlashNextCausalLMOutput(CausalLMOutputWithPast):
 
 
 def _qwen3_8_flash_next_backend(backend: BackendConfig | None = None) -> BackendConfig:
-    """Return a backend whose rotary path supports text and multimodal layouts."""
-    resolved = copy.copy(backend) if backend is not None else BackendConfig()
+    """Return a typed backend with the model's unfused rotary path."""
+    resolved = copy.copy(backend) if backend is not None else Qwen3_8_FlashNextBackendConfig()
     resolved.rope_fusion = False
     return resolved
 
@@ -487,8 +488,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     _keep_in_fp32_modules_strict = ["_fp32_params"]
     _owns_cp_attention = True
     # Packed (THD) training and packed CP are owned by the model's
-    # FlexAttention QSA path; other attention backends have no packed routing.
-    _packed_cp_attn_backends = ("flex",)
+    # route-indexed QSA path for the listed CUDA backends.
+    _packed_cp_attn_backends = ("flex", "cute")
 
     @dataclass(frozen=True)
     class ModelCapabilities:

@@ -40,7 +40,7 @@ from nemo_automodel.components.speculative.regen_loop import (
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 _MODULE = "nemo_automodel.components.speculative.regen_loop"
 

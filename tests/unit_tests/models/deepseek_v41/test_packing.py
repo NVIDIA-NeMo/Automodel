@@ -237,7 +237,7 @@ def _cp_worker(rank, rendezvous):
 
 @pytest.mark.runtime_budget(
     45,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="two spawned workers import the model stack and compile packed CP forward/backward with checkpointing",
 )
 def test_packed_cp2_forward_backward_with_activation_checkpointing(

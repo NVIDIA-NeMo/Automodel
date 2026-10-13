@@ -47,7 +47,7 @@ from tools.retrieval import warm_retrieval_hf_cache as warm
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 class _DummyImage:

@@ -49,7 +49,9 @@ def cpu_model_infrastructure():
         patch("nemo_automodel._transformers.auto_model.instantiate_infrastructure", return_value=(None,) * 4),
         patch("nemo_automodel._transformers.auto_model.init_empty_weights", side_effect=nullcontext),
         patch("nemo_automodel._transformers.auto_model.no_init_weights", side_effect=nullcontext),
-        patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", side_effect=lambda **kw: kw["model"]),
+        patch(
+            "nemo_automodel._transformers.auto_model.apply_model_infrastructure", side_effect=lambda **kw: kw["model"]
+        ),
     ):
         yield
 
@@ -124,7 +126,10 @@ def test_retrieval_storage_dtype(checkpoint, cpu_model_infrastructure, model_cls
 
 @pytest.mark.parametrize("dtype_key", ["dtype", "torch_dtype"])
 @pytest.mark.parametrize("entrypoint", ["from_pretrained", "from_config"])
-def test_recipe_model_config_preserves_dtype_after_retry(checkpoint, cpu_model_infrastructure, dtype_key, entrypoint):
+@pytest.mark.parametrize("custom_cache", [False, True])
+def test_recipe_model_config_preserves_dtype_after_retry(
+    checkpoint, cpu_model_infrastructure, dtype_key, entrypoint, custom_cache, tmp_path
+):
     model_settings = {
         "_target_": f"nemo_automodel.NeMoAutoModelForCausalLM.{entrypoint}",
         "pretrained_model_name_or_path" if entrypoint == "from_pretrained" else "config": checkpoint,
@@ -134,6 +139,8 @@ def test_recipe_model_config_preserves_dtype_after_retry(checkpoint, cpu_model_i
         "attn_implementation": "eager",
         dtype_key: "float32",
     }
+    if custom_cache:
+        model_settings["cache_dir"] = str(tmp_path / "hub-cache")
     config = ConfigNode(model_settings)
     original_config = config.to_dict()
     with patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", side_effect=RuntimeError("retry")):

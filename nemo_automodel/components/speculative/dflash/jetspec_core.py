@@ -199,7 +199,9 @@ class JetSpecTrainerModule(DFlashTrainerModule):
             target_hidden=hidden_states,
             attention_mask=attn_mask,
         )
-        logits = _to_full_tensor(self.lm_head(output_hidden))  # [B, N*bs, V]
+        # ``compute_logits`` applies the target's output transform (multiplier /
+        # softcapping) so training supervises the distribution serving produces.
+        logits = _to_full_tensor(self.draft_model.compute_logits(output_hidden, self.lm_head))  # [B, N*bs, V]
         student_logits = logits.view(bsz, n, bs, -1)[:, :, 1:, :].reshape(bsz, n * (bs - 1), -1)
 
         teacher_logits = self._gather_teacher_logits(_to_full_tensor(target_logits), label_indices, seq_len)

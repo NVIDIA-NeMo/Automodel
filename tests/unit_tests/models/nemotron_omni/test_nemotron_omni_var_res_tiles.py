@@ -22,6 +22,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.models.nemotron_omni.model import (
     NemotronOmniForConditionalGeneration,
+    VisionProjector,
 )
 
 
@@ -55,9 +56,15 @@ def _marker(h: int, w: int) -> float:
     return float((h // 8) * 10 + (w // 8))
 
 
-class _IdentityProjector(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+class _IdentityProjector(VisionProjector):
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.vision_final_layernorm = None
+        self.downsample_ratio = 0.5
+        self.norm = nn.Identity()
+        self.linear1 = nn.Identity()
+        self.activation = nn.Identity()
+        self.linear2 = nn.Identity()
 
 
 class _StubLM(nn.Module):

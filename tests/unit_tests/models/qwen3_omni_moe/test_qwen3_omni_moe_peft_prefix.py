@@ -176,3 +176,33 @@ def test_thinker_less_adapter_dict_updates_the_flags():
         adapter.from_hf(hf_state)
 
     assert adapter._uses_thinker_prefix is False
+
+
+def test_target_modules_follow_the_base_checkpoint_layout():
+    """target_modules must name modules the way the exported tensors do.
+
+    Both tensor exporters namespace under ``thinker.`` only when the base
+    checkpoint does, so the target_modules hook has to make the same choice.
+    When the two disagree, adapter_config.json points at modules the receiving
+    model does not have and PEFT refuses the adapter outright.
+    """
+    from unittest.mock import patch
+
+    native = "model.layers.0.self_attn.q_proj"
+
+    full_omni = _tiny_adapter()
+    assert full_omni._uses_thinker_prefix is True
+    assert full_omni.map_peft_target_module_to_hf(native) == "thinker." + native
+
+    standalone = _tiny_adapter()
+    with patch.object(standalone, "_from_hf_w_merged_experts", side_effect=lambda sd, mesh=None: sd):
+        standalone.from_hf({"model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(16, 32)})
+    assert standalone._uses_thinker_prefix is False
+    assert standalone.map_peft_target_module_to_hf(native) == native
+
+    # The entry has to name the module the exported tensor key names, which is
+    # the invariant the two halves of a checkpoint are matched on.
+    with patch.object(standalone, "_to_hf_w_split_experts", side_effect=lambda sd, **kwargs: sd):
+        exported = next(iter(standalone.to_hf({f"base_model.model.{native}.lora_A.weight": torch.randn(4, 32)})))
+    module = exported.removeprefix("base_model.model.").rsplit(".lora_", 1)[0]
+    assert module == standalone.map_peft_target_module_to_hf(native)

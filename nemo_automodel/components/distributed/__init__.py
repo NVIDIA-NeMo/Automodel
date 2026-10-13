@@ -22,6 +22,9 @@ from nemo_automodel.components.distributed.config import (
 )
 from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
+from nemo_automodel.components.distributed.model_parallelizer import (
+    ModelParallelizer,
+)
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
 __all__ = [
@@ -31,6 +34,7 @@ __all__ = [
     "FSDP2Config",
     "MegatronFSDPConfig",
     "MeshContext",
+    "ModelParallelizer",
     "MoEParallelizerConfig",
     "MultimodalDistributedConfig",
     "ParallelismSizes",

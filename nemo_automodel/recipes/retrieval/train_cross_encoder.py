@@ -14,10 +14,12 @@
 
 import logging
 from contextlib import nullcontext
+from typing import cast
 
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel._transformers.retrieval import CrossEncoderModel
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
@@ -44,7 +46,30 @@ def batch_mrr(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1.0 / rank.float()).sum()
 
 
+def _validate_temperature_sources(recipe_temperature: float, model_temperature: float) -> None:
+    """Reject simultaneous recipe-level and model-level temperature scaling.
+
+    Args:
+        recipe_temperature: Temperature applied by the cross-encoder recipe.
+        model_temperature: Temperature applied by the loaded model.
+
+    Raises:
+        ValueError: If both temperatures are non-unit.
+    """
+    if recipe_temperature != 1.0 and model_temperature != 1.0:
+        raise ValueError(
+            "Cross-encoder temperature scaling is configured twice: "
+            f"top-level temperature={recipe_temperature!r} and effective model.temperature={model_temperature!r}. "
+            "Set either top-level temperature or model.temperature to 1.0."
+        )
+
+
 class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
+    def _validate_model(self, model: torch.nn.Module) -> None:
+        """Validate the effective temperature applied by the constructed model."""
+        cross_encoder = cast(CrossEncoderModel, model)
+        _validate_temperature_sources(self.temperature, cross_encoder.effective_score_temperature)
+
     def _run_train_optim_step(self, batches, max_grad_norm=None):
         self._acc_buffer = []
         result = super()._run_train_optim_step(batches, max_grad_norm)
@@ -89,7 +114,16 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
 
         torch.cuda.reset_peak_memory_stats()
 
-    def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
+    def _forward_backward_step(
+        self,
+        idx,
+        batch,
+        *,
+        loss_buffer,
+        num_batches,
+        is_train: bool = True,
+        modality_loss_buffers=None,
+    ):
         """Forward and backward pass for a single micro-batch."""
         batch = {
             k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
@@ -111,7 +145,15 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
         with train_ctx, sync_ctx:
             outputs = model(**batch, return_dict=True)
 
-            outputs.logits = outputs.logits.view(-1, self.train_n_passages)
+            # Listwise softmax over each query's candidates, scaled by the recipe-level
+            # temperature as the bi-encoder path does. Backbones that scale inside
+            # forward apply model.temperature there; recipe validation rejects configurations
+            # where both temperatures are non-unit.
+            #
+            # Recipe-owned scaling and cross entropy use fp32. A backbone-owned
+            # temperature has already been applied in the backbone's score dtype;
+            # preserve that checkpoint behavior rather than scaling a second time.
+            outputs.logits = outputs.logits.view(-1, self.train_n_passages).float() / self.temperature
             loss = F.cross_entropy(outputs.logits, labels)
 
             loss_buffer.append(loss.clone().detach())
@@ -145,7 +187,8 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
 
                     with autocast_ctx:
                         outputs = model(**batch, return_dict=True)
-                        logits = outputs.logits.view(-1, self.val_n_passages)
+                        # fp32 before the temperature division, as in the train step.
+                        logits = outputs.logits.view(-1, self.val_n_passages).float() / self.temperature
                         loss = F.cross_entropy(logits, labels)
 
                     loss_buffer.append(loss.clone().detach())
