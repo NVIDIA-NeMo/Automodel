@@ -216,6 +216,10 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         total_params += n
         if p.requires_grad:
             trainable_params += n
+        # Quantized parameters can store packed integer bytes. They still count
+        # above, but a norm of those bytes is neither supported nor meaningful.
+        if not (p.is_floating_point() or p.is_complex()):
+            continue
         try:
             local_sq_norm += p.detach().norm(2) ** 2
         except Exception:

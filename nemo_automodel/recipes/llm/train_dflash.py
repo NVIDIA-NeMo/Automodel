@@ -69,6 +69,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
     raise_if_peft_configured,
+    read_load_metadata_with_gloo,
     should_sync_grads,
 )
 
@@ -439,6 +440,7 @@ class TrainDFlashRecipe(BaseRecipe):
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            load_metadata_with_gloo=read_load_metadata_with_gloo(self.cfg.get("checkpoint", None)),
         )
         if target_attn_implementation is not None:
             target_kwargs["attn_implementation"] = target_attn_implementation

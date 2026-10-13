@@ -554,6 +554,32 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
         cache_position=None,
         **kwargs,
     ):
+        """Route multimodal inputs while keeping text boundaries out of vision.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or floating-point
+                pipeline hidden states of shape [batch, sequence, hidden].
+            attention_mask: Padding/document IDs of shape [batch, sequence] or
+                a dense mask of shape [batch, 1, sequence, sequence].
+            position_ids: Text positions of shape [batch, sequence] or mRoPE
+                coordinates of shape [3 or 4, batch, sequence].
+            past_key_values: Unsupported recurrent or KV cache.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            pixel_values: Optional image patches of shape [patches, patch_features].
+            pixel_values_videos: Optional video patches of shape [patches, patch_features].
+            image_grid_thw: Image grids of shape [images, 3] in temporal/height/width order.
+            video_grid_thw: Video grids of shape [videos, 3] in temporal/height/width order.
+            cache_position: Optional token positions of shape [sequence].
+            **kwargs: Text metadata, including ``cu_seqlens`` of shape
+                [batch, max_documents + 1] or [documents + 1], integer
+                ``max_seqlen``, and ``packed_token_indices`` of shape [batch,
+                sequence] or [tokens]. Image/video-prefixed metadata retains
+                the inherited HF precomputed-vision contract.
+
+        Returns:
+            Model output with ``last_hidden_state`` of shape [batch, sequence,
+            hidden] and, on the HF media path, ``rope_deltas`` of shape [batch, 1].
+        """
         # If we have visual pixel values and a vision encoder, go through the full HF
         # VL forward (vision encoding + multimodal scatter + text).
         if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
@@ -574,6 +600,11 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
             if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
+            # HF interprets bare sequence metadata as vision-frame boundaries.
+            # Preserve packed text metadata until the native text decoder.
+            for key in ("cu_seqlens", "max_seqlen"):
+                if key in kwargs:
+                    kwargs[f"_text_{key}"] = kwargs.pop(key)
             return super().forward(
                 input_ids=None,
                 attention_mask=attention_mask,
@@ -723,11 +754,17 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
                 [batch, max_documents + 1] or [documents + 1], and integer
                 ``max_seqlen``. Batch-major metadata uses -1 padding. Explicit
                 token metadata is supported without context parallelism.
+                The multimodal wrapper temporarily prefixes ``cu_seqlens`` and
+                ``max_seqlen`` with ``_text_`` across HF vision processing; their
+                layouts and values are unchanged.
 
         Returns:
             Model output whose ``last_hidden_state`` has shape [batch, sequence,
             hidden].
         """
+        for key in ("cu_seqlens", "max_seqlen"):
+            if f"_text_{key}" in attn_kwargs:
+                attn_kwargs[key] = attn_kwargs.pop(f"_text_{key}")
         if past_key_values is not None or use_cache:
             raise NotImplementedError("KV cache is not supported for the Qwen3.5-MoE backend implementation.")
 

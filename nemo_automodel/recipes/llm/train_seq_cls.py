@@ -132,6 +132,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
             cfg_freeze=freeze_config,
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)

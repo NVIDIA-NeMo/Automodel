@@ -121,6 +121,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         dspark_n_routed_experts: int = 128,
         dspark_num_experts_per_tok: int = 3,
         dtype: str = "bfloat16",
+        compile_cache_quant: bool = False,
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
@@ -212,6 +213,9 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # Serialized Transformers configs can contain rope_parameters in
         # addition to rope_scaling. Its YaRN validator reads the model's
         # dimensions during base initialization, so establish them first.
+        # torch.compile the cache quantize/dequantize core (fp8 / mxfp4 / nvfp4 rounding of the sliding-window and
+        # compressed caches); a DeepSeek-V4.1 knob, so it lives here rather than on the shared BackendConfig
+        self.compile_cache_quant = compile_cache_quant
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,
