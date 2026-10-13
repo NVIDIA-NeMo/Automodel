@@ -252,7 +252,7 @@ def _successive_checkpointers_worker(rank: int, init_file: str, root: str, enabl
                 )
                 for iteration in range(3):
                     if iteration and rank == 2:
-                        time.sleep(3)
+                        time.sleep(1)
                     checkpointer = CheckpointingConfig(
                         enabled=False, save_consolidated=False, load_metadata_with_gloo=enabled
                     ).build(rank - 1, 0, 0, process_group=caller)
@@ -282,7 +282,7 @@ def _successive_checkpointers_worker(rank: int, init_file: str, root: str, enabl
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.runtime_budget(
-    60,
+    30,
     hard_timeout=90,
     reason="Spawns three CPU ranks, loads through successive checkpointers with a delayed rank, and reinitializes the world.",
 )
