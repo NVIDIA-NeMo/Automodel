@@ -223,12 +223,15 @@ class _DeepseekV41DSparkBlock(nn.Module):
         layer_idx = config.num_hidden_layers + stage_idx
         self.attn = _DeepseekV41DSparkAttention(config, layer_idx, backend)
         self.ffn = MoE(moe_config, backend)
-        self.ffn.gate = DeepseekV4VisionGate(
-            DeepseekV4Config(vocab_size=config.vocab_size),
-            moe_config,
-            gate_precision=torch.float32,
-            hash_routing=False,
-        )
+        # As in the backbone block, BackendConfig.fake_balanced_gate keeps the
+        # FakeBalancedGate that MoE built.
+        if not backend.fake_balanced_gate:
+            self.ffn.gate = DeepseekV4VisionGate(
+                DeepseekV4Config(vocab_size=config.vocab_size),
+                moe_config,
+                gate_precision=torch.float32,
+                hash_routing=False,
+            )
         norm = (
             partial(initialize_rms_norm_module, "te", device=self.attn.wq_a.weight.device)
             if backend.rms_norm == "te"
@@ -300,7 +303,9 @@ class _DeepseekV41DSparkBlock(nn.Module):
         residual = hidden_states
         ffn_mix = self.ffn_hc(hidden_states)
         collapsed = self.ffn_hc.collapse(hidden_states, attn_mix.pre)
-        self.ffn.gate.set_routing_context(None, None)
+        gate = self.ffn.gate
+        if isinstance(gate, DeepseekV4VisionGate):
+            gate.set_routing_context(None, None)
         output = self.ffn(self.ffn_norm(collapsed), None)
         streams = self.ffn_hc.expand(output, residual, ffn_mix)
         if not hasattr(self, "norm"):
@@ -460,7 +465,8 @@ class DeepseekV41DSparkBackbone(nn.Module):
             layer.ffn_hc.reset_parameters(std)
             nn.init.ones_(layer.attn_norm.weight)
             nn.init.ones_(layer.ffn_norm.weight)
-            layer.ffn.gate.bias_vl.zero_()
+            if isinstance(layer.ffn.gate, DeepseekV4VisionGate):
+                layer.ffn.gate.bias_vl.zero_()
             layer.attn.reset_parameters(std)
         first = self.mtp[0]
         nn.init.normal_(first.main_proj.weight, std=std)

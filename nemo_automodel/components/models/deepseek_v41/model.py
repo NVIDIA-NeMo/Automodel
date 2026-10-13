@@ -71,14 +71,18 @@ from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionG
 from nemo_automodel.components.models.deepseek_v41.attention import (
     DeepseekV41Attention,
     DeepseekV41AttentionState,
+    use_triton_rope,
+    validate_attention_inputs,
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
 from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram, DeepseekV41NgramHash
-from nemo_automodel.components.models.deepseek_v41.fsdp import fully_shard_deepseek_v41
+from nemo_automodel.components.models.deepseek_v41.fsdp import PARALLELIZER
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41HyperConnection,
     DeepseekV41RMSNorm,
+    compile_hc_cores,
+    compile_norm_core,
 )
 from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 from nemo_automodel.components.models.deepseek_v41.processing import (
@@ -88,6 +92,7 @@ from nemo_automodel.components.models.deepseek_v41.processing import (
     IMAGE_START,
     image_inputs_from_batch,
 )
+from nemo_automodel.components.models.deepseek_v41.quantization import compile_cache_quantization
 from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import DeepseekV41StateDictAdapter
 from nemo_automodel.components.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
@@ -117,12 +122,15 @@ class DeepseekV41Block(nn.Module):
         self.ffn = MoE(moe_config, backend)
         # V4.1 uses exactly V4's modality-aware score routing with hash routing
         # disabled. The shared MoE keeps ownership of gate, experts and dispatch.
-        self.ffn.gate = DeepseekV4VisionGate(
-            DeepseekV4Config(vocab_size=config.vocab_size),
-            moe_config,
-            gate_precision=torch.float32,
-            hash_routing=False,
-        )
+        # As in DeepSeek-V4, BackendConfig.fake_balanced_gate keeps the
+        # FakeBalancedGate that MoE built (benchmark forced balance).
+        if not backend.fake_balanced_gate:
+            self.ffn.gate = DeepseekV4VisionGate(
+                DeepseekV4Config(vocab_size=config.vocab_size),
+                moe_config,
+                gate_precision=torch.float32,
+                hash_routing=False,
+            )
         norm = (
             partial(initialize_rms_norm_module, "te", device=self.attn.wq_a.weight.device)
             if backend.rms_norm == "te"
@@ -130,7 +138,7 @@ class DeepseekV41Block(nn.Module):
         )
         self.attn_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.ffn_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
-        sinkhorn_backend = "tilelang" if backend.attn == "tilelang" else "torch"
+        sinkhorn_backend = "tilelang" if backend.attn in ("tilelang", "cudnn") else "torch"
         self.attn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
         self.ffn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
         self.engram = (
@@ -161,6 +169,7 @@ class DeepseekV41Block(nn.Module):
         engram_hash_ids: torch.Tensor | None = None,
         cp_group: dist.ProcessGroup | None = None,
         packed_seq_ids: torch.Tensor | None = None,
+        inputs_validated: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, DeepseekV41AttentionState]:
         """Execute one block while retaining differentiable shared KV ownership.
 
@@ -201,12 +210,15 @@ class DeepseekV41Block(nn.Module):
             attention_mask=attention_mask,
             cp_group=cp_group,
             packed_seq_ids=packed_seq_ids,
+            inputs_validated=inputs_validated,
         )
         hidden_states = self.attn_hc.expand(attended.hidden_states, hidden_states, attn_mix)
         ffn_mix = self.ffn_hc(hidden_states)
         collapsed = self.ffn_hc.collapse(hidden_states, attn_mix.pre)
-        vision_types = None if image_mask is None else image_mask.to(torch.int32) - 1
-        self.ffn.gate.set_routing_context(None, vision_types)
+        gate = self.ffn.gate
+        if isinstance(gate, DeepseekV4VisionGate):
+            vision_types = None if image_mask is None else image_mask.to(torch.int32) - 1
+            gate.set_routing_context(None, vision_types)
         padding_mask = None if attention_mask is None else ~attention_mask.bool()
         output = self.ffn(self.ffn_norm(collapsed), padding_mask)
         hidden_states = self.ffn_hc.expand(output, hidden_states, ffn_mix)
@@ -232,6 +244,12 @@ class DeepseekV41Model(nn.Module):
         config = config.text_config
         self.config = config
         self.moe_config = moe_config
+        if backend.compile_hc:
+            compile_hc_cores()
+        if backend.compile_norm and backend.rms_norm != "te":
+            compile_norm_core()
+        if config.compile_cache_quant:
+            compile_cache_quantization()
         dtype = dtype_from_str(config.dtype, torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
         active_engram = any(i < config.num_hidden_layers for i in config.engram_layer_ids)
@@ -374,6 +392,11 @@ class DeepseekV41Model(nn.Module):
             hashes = self.engram_hash(full_ids, token_mask=full_mask, sequence_ids=full_seq_ids)
             start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
             hashes = hashes[:, start : start + input_ids.shape[1]]
+        # The host-synchronising input checks run once here instead of in every attention layer (and again in
+        # every checkpoint recompute): with 40 layers that was 80+ launch-queue drains per step.
+        validate_attention_inputs(
+            position_ids, attention_mask, packed_seq_ids, sequence=input_ids.shape[1], cp_group=cp_group
+        )
         state = DeepseekV41AttentionState()
         captured = [] if output_hidden_states else None
         for layer in self.layers.values():
@@ -389,6 +412,7 @@ class DeepseekV41Model(nn.Module):
                 engram_hash_ids=None if layer.engram is None else hashes[:, :, layer.engram.layer_hash_index],
                 cp_group=cp_group,
                 packed_seq_ids=packed_seq_ids,
+                inputs_validated=True,
             )
         hidden_states = DeepseekV41HyperConnection.collapse(hidden_states, pre_mix)
         return self.norm(hidden_states), None if captured is None else tuple(captured)
@@ -403,7 +427,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     shard mesh must match the owner group exactly.
     """
 
-    _nemo_fully_shard = staticmethod(fully_shard_deepseek_v41)
     _owns_cp_attention: bool = True
     config_class: type[DeepseekV41Config] = DeepseekV41Config
     base_model_prefix: str = "model"
@@ -445,6 +468,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         backend: BackendConfig | None = None,
         *,
         tokenizer: PreTrainedTokenizerFast | None = None,
+        revision: str | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -456,11 +480,15 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         self.backend = backend or BackendConfig(
             attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="hybridep"
         )
+        if self.backend.rope == "triton":
+            # Process-wide dispatch of the attention module's rotation (same once-per-process pattern as the
+            # compiled cores): modules built before this call pick it up too. Default "torch" leaves eager.
+            use_triton_rope(True)
         dtype = dtype_from_str(text.dtype, torch.bfloat16)
         if engram_process_group is None and dist.is_available() and dist.is_initialized():
             engram_process_group = dist.group.WORLD
         if tokenizer is None and any(i < text.num_hidden_layers for i in text.engram_layer_ids):
-            tokenizer = config.build_tokenizer()
+            tokenizer = config.build_tokenizer(revision=revision)
         moe_config = moe_config or MoEConfig(
             dim=text.hidden_size,
             inter_dim=text.moe_intermediate_size,
@@ -716,7 +744,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             layer.ffn_hc.reset_parameters(std)
             nn.init.ones_(layer.attn_norm.weight)
             nn.init.ones_(layer.ffn_norm.weight)
-            layer.ffn.gate.bias_vl.zero_()
+            if isinstance(layer.ffn.gate, DeepseekV4VisionGate):
+                layer.ffn.gate.bias_vl.zero_()
             layer.attn.reset_parameters(std)
             if layer.engram is not None:
                 layer.engram.init_weights()
@@ -730,4 +759,5 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 layer.engram.embed.mark_sharding_contract()
 
 
+DeepseekV41ForCausalLM.parallelizer = PARALLELIZER
 ModelClass = DeepseekV41ForCausalLM

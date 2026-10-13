@@ -105,8 +105,9 @@ def _install_torch_and_layers_stubs(monkeypatch):
     nn_stub = types.ModuleType("torch.nn")
 
     class Parameter:
-        def __init__(self, data=None):
+        def __init__(self, data=None, requires_grad=True):
             self.data = data
+            self.requires_grad = requires_grad
 
     class Module:
         pass
@@ -372,8 +373,13 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.distributed.mesh_utils",
         "nemo_automodel.components.distributed.parallelizer_utils",
     ]:
-        if mod in sys.modules:
-            sys.modules.pop(mod)
+        # Restore both import caches after the test. Otherwise later files keep
+        # collected classes while imports/patches resolve freshly loaded ones.
+        parent_name, _, attribute = mod.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            monkeypatch.delattr(parent, attribute, raising=False)
+        monkeypatch.delitem(sys.modules, mod, raising=False)
 
     _install_torch_and_layers_stubs(monkeypatch)
 
@@ -425,7 +431,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         fp32_compute_module_names=(),
         reshard_after_forward=None,
         ignored_params=None,
-        fully_shard_fn=None,
+        model_parallelizer=None,
     ):
         kwargs = {
             "mesh": mesh,
@@ -436,29 +442,16 @@ def _import_parallelizer_with_stubs(monkeypatch):
             kwargs["reshard_after_forward"] = reshard_after_forward
         if ignored_params:
             kwargs["ignored_params"] = ignored_params
-        fully_shard_fn(module, **kwargs)
+        shard_module = (
+            sys.modules["nemo_automodel.components.moe.parallelizer"].fully_shard
+            if model_parallelizer is None
+            else model_parallelizer._fully_shard_module
+        )
+        shard_module(module, **kwargs)
 
     parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
     parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
-
-    def reject_unsupported_mtp_cp(model):
-        if model.supports.mtp_enabled and not model.supports.supports_mtp_cp:
-            raise RuntimeError("Model does not support MTP with context parallelism")
-
-    parallelizer_utils_stub.reject_unsupported_mtp_cp = reject_unsupported_mtp_cp
-
-    def reject_unsupported_mtp_cp_pp(model):
-        is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
-        if (
-            model.supports.mtp_enabled
-            and not model.supports.supports_mtp_cp_pp
-            and callable(is_pp_stage_fn)
-            and is_pp_stage_fn()
-        ):
-            raise NotImplementedError("MTP with context and pipeline parallelism is not supported")
-
-    parallelizer_utils_stub.reject_unsupported_mtp_cp_pp = reject_unsupported_mtp_cp_pp
 
     monkeypatch.setitem(
         sys.modules,
@@ -533,6 +526,24 @@ def _import_parallelizer_with_stubs(monkeypatch):
     )
 
     return importlib.import_module("nemo_automodel.components.moe.parallelizer")
+
+
+def test_stub_import_restores_real_module_identity() -> None:
+    import importlib
+
+    module_names = (
+        "nemo_automodel.components.moe.layers",
+        "nemo_automodel.components.distributed.pipelining.config",
+        "nemo_automodel.components.distributed.mesh_utils",
+    )
+    original_modules = {name: importlib.import_module(name) for name in module_names}
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _import_parallelizer_with_stubs(monkeypatch)
+
+    for name, module in original_modules.items():
+        assert importlib.import_module(name) is module
+        parent_name, _, attribute = name.rpartition(".")
+        assert getattr(importlib.import_module(parent_name), attribute) is module
 
 
 def test_expert_parallel_apply_calls_distribute_module(monkeypatch):
@@ -1088,7 +1099,7 @@ def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_
         ),
         reshard_after_forward=True,
         ignored_params=set(block.mlp.experts.parameters()),
-        fully_shard_fn=fully_shard_mock,
+        model_parallelizer=None,
     )
 
 
@@ -1878,82 +1889,6 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
     )
 
 
-def test_parallelize_model_rejects_cp_mtp_pipeline_stage_before_ep_or_cp(monkeypatch):
-    """The MoE/EP path must reject the same unsupported topology on every PP stage."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    apply_cp_mock = MagicMock()
-    apply_ep_mock = MagicMock()
-    monkeypatch.setattr(P, "apply_cp", apply_cp_mock)
-    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
-
-    world_mesh = FakeWorldMesh(
-        {"cp": 2, ("dp",): 2},
-        mesh_dim_names=["dp", "cp"],
-    )
-    moe_mesh = FakeMoeMesh({"ep": 2})
-    model = type(
-        "PipelineStage",
-        (),
-        {
-            "supports": types.SimpleNamespace(mtp_enabled=True, supports_mtp_cp_pp=False),
-            "mtp_config": type("MTP", (), {"enabled": True})(),
-            "moe_config": type("MC", (), {"n_routed_experts": 4})(),
-            "_is_pipeline_parallel_stage": lambda self: True,
-        },
-    )()
-
-    with pytest.raises(NotImplementedError, match="MTP with context and pipeline parallelism"):
-        P.parallelize_model(
-            model=model,
-            world_mesh=world_mesh,
-            moe_mesh=moe_mesh,
-            dp_axis_names=("dp",),
-            cp_axis_name="cp",
-            ep_axis_name="ep",
-        )
-
-    apply_cp_mock.assert_not_called()
-    apply_ep_mock.assert_not_called()
-
-
-def test_parallelize_model_rejects_cp_mtp_without_capability_before_ep_or_cp(monkeypatch):
-    """The MoE/EP path must enforce the same MTP+CP capability as the dense path."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    apply_cp_mock = MagicMock()
-    apply_ep_mock = MagicMock()
-    monkeypatch.setattr(P, "apply_cp", apply_cp_mock)
-    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
-
-    world_mesh = FakeWorldMesh({"cp": 2, ("dp",): 2}, mesh_dim_names=["dp", "cp"])
-    moe_mesh = FakeMoeMesh({"ep": 2})
-    model = type(
-        "UnsupportedMTPModel",
-        (),
-        {
-            "supports": types.SimpleNamespace(
-                mtp_enabled=True,
-                supports_mtp_cp=False,
-                supports_mtp_cp_pp=False,
-            ),
-            "mtp_config": type("MTP", (), {"enabled": True})(),
-            "moe_config": type("MC", (), {"n_routed_experts": 4})(),
-        },
-    )()
-
-    with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
-        P.parallelize_model(
-            model=model,
-            world_mesh=world_mesh,
-            moe_mesh=moe_mesh,
-            dp_axis_names=("dp",),
-            cp_axis_name="cp",
-            ep_axis_name="ep",
-        )
-
-    apply_cp_mock.assert_not_called()
-    apply_ep_mock.assert_not_called()
-
-
 def test_parallelize_model_forwards_offload_policy_to_fsdp(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     apply_fsdp_mock = MagicMock()
@@ -2061,8 +1996,10 @@ def test_apply_fsdp_without_lm_head_precision_uses_default_policy(monkeypatch):
 
 
 @pytest.mark.parametrize("model_owned_sharding", [False, True])
-def test_apply_fsdp_uses_model_wrapper_or_default(monkeypatch: pytest.MonkeyPatch, model_owned_sharding: bool) -> None:
-    """Language and multimodal units share one model-selected FSDP callback."""
+def test_apply_fsdp_uses_sidecar_sharder_or_default(
+    monkeypatch: pytest.MonkeyPatch, model_owned_sharding: bool
+) -> None:
+    """Language and multimodal units share the sidecar-selected FSDP primitive."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
     default_shard = MagicMock()
@@ -2071,8 +2008,11 @@ def test_apply_fsdp_uses_model_wrapper_or_default(monkeypatch: pytest.MonkeyPatc
     block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])
     model.visual = DummyExperts()
+    model_parallelizer = None
     if model_owned_sharding:
-        model._nemo_fully_shard = model_shard
+        model_parallelizer = types.SimpleNamespace(
+            _fully_shard_module=model_shard,
+        )
 
     P.apply_fsdp(
         model=model,
@@ -2080,6 +2020,7 @@ def test_apply_fsdp_uses_model_wrapper_or_default(monkeypatch: pytest.MonkeyPatc
         ep_enabled=False,
         ep_shard_enabled=False,
         lm_head_precision=None,
+        model_parallelizer=model_parallelizer,
     )
 
     selected = model_shard if model_owned_sharding else default_shard

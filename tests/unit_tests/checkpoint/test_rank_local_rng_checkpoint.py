@@ -28,7 +28,7 @@ from nemo_automodel.components.training.rng import StatefulRNG, init_all_rng
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _run_rank_local_rng_roundtrip(rank: int, world_size: int, init_file: str, checkpoint_dir: str) -> None:

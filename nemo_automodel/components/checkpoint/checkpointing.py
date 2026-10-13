@@ -21,11 +21,12 @@ import pickle
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
+from weakref import WeakKeyDictionary
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -52,8 +53,10 @@ from torch import nn
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 from torch.nn.parallel import DistributedDataParallel
+from torch.overrides import TorchFunctionMode
 from torch.serialization import MAP_LOCATION, FileLike
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
@@ -103,6 +106,56 @@ _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
+
+# Load metadata groups belong to the distributed world, not an individual checkpointer.
+# Retaining one per caller group avoids reusing Gloo rendezvous keys after close/reopen
+# on PyTorch 2.10. destroy_process_group() tears down every registered group; weak keys
+# release cache entries when the corresponding caller groups are no longer referenced.
+_load_metadata_groups: WeakKeyDictionary[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup] = (
+    WeakKeyDictionary()
+)
+
+
+class _DTensorInitCopyMode(TorchFunctionMode):
+    """Adapt full-tensor initialization copies to an already-sharded destination."""
+
+    def __torch_function__(
+        self, func: Callable, types: tuple[type, ...], args: tuple = (), kwargs: dict | None = None
+    ) -> Any:
+        """Preserve ``copy_`` semantics while matching the destination's DTensor layout.
+
+        Args:
+            func: Intercepted torch operation.
+            types: Tensor types participating in the operation.
+            args: Operation arguments. For ``copy_``, the destination has arbitrary
+                global shape and the source is broadcastable to that shape. A plain
+                source is privately copied, broadcast from mesh rank zero, and
+                locally sharded to the destination's placements before the in-place
+                copy; existing DTensor sources and plain destinations keep their
+                normal behavior.
+            kwargs: Keyword arguments to the operation, including an optional
+                ``other`` source tensor with the same contract as above.
+
+        Returns:
+            The operation result; ``copy_`` returns and mutates the original
+            destination without replacing its parameter object or local storage.
+        """
+        kwargs = kwargs or {}
+        if func is torch.Tensor.copy_ and isinstance(args[0], DTensor):
+            destination = args[0]
+            source = args[1] if len(args) > 1 else kwargs["other"]
+            if isinstance(source, torch.Tensor) and not isinstance(source, DTensor):
+                # Broadcast then shard locally to avoid persistent NCCL scatter memory.
+                source = distribute_tensor(
+                    source.to(device=destination.device, copy=True).expand(destination.shape),
+                    destination.device_mesh,
+                    [Replicate()] * destination.device_mesh.ndim,
+                ).redistribute(placements=destination.placements)
+                if len(args) > 1:
+                    args = (destination, source, *args[2:])
+                else:
+                    kwargs = {**kwargs, "other": source}
+        return func(*args, **kwargs)
 
 
 def _format_restricted_load_error(f: FileLike) -> str:
@@ -578,6 +631,7 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.process_group = process_group
+        self._load_process_group: torch.distributed.ProcessGroup | None = None
         self.lifecycle = CheckpointLifecycle(config=config, process_group=process_group)
         self._planner_cache_namespace = uuid.uuid4().hex
 
@@ -612,6 +666,25 @@ class Checkpointer:
         if self.config.is_peft:
             self._addons.append(PeftAddon())
         _warn_if_inline_consolidation_enabled(self.config)
+
+    def _get_load_process_group(self) -> torch.distributed.ProcessGroup | None:
+        """Reuse a world-owned CPU metadata group with the caller's membership."""
+        if (
+            self._load_process_group is None
+            and self.config.load_metadata_with_gloo
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=self.process_group) > 1
+            and torch.distributed.get_backend(self.process_group) != "gloo"
+        ):
+            # DCP exchanges Python load plans. NCCL can retain root-side P2P buffers.
+            caller_group = self.process_group if self.process_group is not None else torch.distributed.group.WORLD
+            load_group = _load_metadata_groups.get(caller_group)
+            if load_group is None:
+                load_group = _new_gloo_process_group(self.process_group)
+                _load_metadata_groups[caller_group] = load_group
+            self._load_process_group = load_group
+            logger.info("Using a shared Gloo process group for checkpoint load metadata.")
+        return self._load_process_group if self._load_process_group is not None else self.process_group
 
     @torch.no_grad()
     def save_model(
@@ -835,7 +908,8 @@ class Checkpointer:
         Args:
             model_state: Wrapper for the model whose final parameter storage is populated.
             load_parts: Adapter-owned sequence of checkpoint destinations and finish callbacks.
-            model_state_dict: Native model names mapped to final model tensors. Every key must be completed exactly
+            model_state_dict: Native names mapped to final tensors of arbitrary shape/dtype on their destination
+                devices. DTensors retain their global shape and mesh placements. Every key must be completed exactly
                 once across ``load_parts``.
             model_path: Hugging Face safetensors checkpoint directory.
             storage_reader: Reader already bound to ``model_path``. Its parsed metadata is reused across parts.
@@ -856,7 +930,8 @@ class Checkpointer:
         read_seconds = 0.0
         finish_seconds = 0.0
         part_count = 0
-        process_group_kwargs = {"process_group": self.process_group} if self.process_group is not None else {}
+        process_group = self._get_load_process_group()
+        process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
 
         for part in load_parts:
             if not isinstance(part, CheckpointLoadPart):
@@ -960,7 +1035,7 @@ class Checkpointer:
         model_path: str,
         is_init_step: bool = False,
         use_checkpoint_id: bool = True,
-        key_mapping: dict[str, str] | None = None,
+        key_mapping: dict[str, str] | Callable[[str], str] | None = None,
         allow_checkpoint_key_subset: bool = False,
     ) -> None:
         """
@@ -977,7 +1052,8 @@ class Checkpointer:
             model_path: Path to the model checkpoint directory or HF snapshot.
             is_init_step: If True, treat load as initialization from a base checkpoint.
             use_checkpoint_id: Pass `checkpoint_id` to DCP if True; disable when using direct HF paths.
-            key_mapping: Optional key remapping when reading from HF checkpoints.
+            key_mapping: Optional regex mapping or callable renaming HF checkpoint keys.
+                Tensor-merging conversions require a regex mapping.
             allow_checkpoint_key_subset: If True, keep the model's current initialization for
                 parameters that are absent from the checkpoint instead of requiring an exact key match.
         """
@@ -1003,6 +1079,8 @@ class Checkpointer:
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
+            if callable(key_mapping):
+                raise ValueError("Tensor-merging checkpoint loads require a regex key mapping, not a callable.")
             converted_state_dict = _convert_checkpoint_with_transformers(model_state.model[0], model_path, key_mapping)
             if converted_state_dict:
                 materialized_tied_lm_head = materialize_missing_tied_lm_head(
@@ -1199,6 +1277,9 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
+        adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        checkpoint_key_aliases = dict(getattr(adapter, "checkpoint_key_aliases", {}))
+        applied_key_aliases: dict[str, str] = {}
         checkpoint_metadata = {}
         checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
@@ -1206,9 +1287,23 @@ class Checkpointer:
         shared_parameter_names = (
             _get_shared_parameter_names(model_state.model) if is_init_step and uses_standard_hf_state_dict else []
         )
-        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys or shared_parameter_names:
+        if (
+            should_try_tied_lm_head_compat
+            or allow_checkpoint_key_subset
+            or extra_state_keys
+            or shared_parameter_names
+            or checkpoint_key_aliases
+        ):
             checkpoint_metadata = _get_checkpoint_metadata(model_path, storage_reader).state_dict_metadata
             checkpoint_metadata_keys = set(checkpoint_metadata)
+        for current_key, legacy_key in checkpoint_key_aliases.items():
+            if (
+                current_key in state_dict
+                and current_key not in checkpoint_metadata_keys
+                and legacy_key in checkpoint_metadata_keys
+            ):
+                state_dict[legacy_key] = state_dict.pop(current_key)
+                applied_key_aliases[legacy_key] = current_key
         if extra_state_keys:
             # Serialized module metadata can grow after training (e.g. TE FP8 scaling history).
             # Allocate its saved representation; parameter and buffer destinations retain strict shape checks.
@@ -1324,6 +1419,10 @@ class Checkpointer:
         # It was needed for the read, but restore the original key set for installation and mismatch reporting.
         for source_name in set(shared_alias_sources.values()) - expected_keys:
             state_dict.pop(source_name)
+
+        for legacy_key, current_key in applied_key_aliases.items():
+            if legacy_key in state_dict:
+                state_dict[current_key] = state_dict.pop(legacy_key)
 
         state_dict = _maybe_adapt_state_dict_from_hf(
             model_state.model[0],
@@ -1504,16 +1603,30 @@ class Checkpointer:
                 saved_padding_idx = [(mod, mod.padding_idx) for mod in padded_embeddings]
                 for mod, _ in saved_padding_idx:
                     mod.padding_idx = None
+                # Newer HF versions classify FSDP's generated class as custom code
+                # and skip container initializers that populate child buffers.
+                # Bind the query to the original model class only during init.
+                bind_original_hf_class = (
+                    isinstance(model, FSDPModule)
+                    and hasattr(model, "is_custom_code")
+                    and "is_custom_code" not in vars(model)
+                )
                 try:
-                    try:
-                        if param_dtype is not None:
-                            model.initialize_weights(dtype=param_dtype)
-                        else:
+                    if bind_original_hf_class:
+                        original_class = next(cls for cls in type(model).__mro__ if not issubclass(cls, FSDPModule))
+                        model.is_custom_code = original_class.is_custom_code
+                    with _DTensorInitCopyMode():
+                        try:
+                            if param_dtype is not None:
+                                model.initialize_weights(dtype=param_dtype)
+                            else:
+                                model.initialize_weights()
+                        except TypeError:
+                            # Model's initialize_weights() does not accept a dtype kwarg.
                             model.initialize_weights()
-                    except TypeError:
-                        # Model's initialize_weights() does not accept a dtype kwarg.
-                        model.initialize_weights()
                 finally:
+                    if bind_original_hf_class:
+                        del model.is_custom_code
                     for mod, padding_idx in saved_padding_idx:
                         mod.padding_idx = padding_idx
                 for mod, padding_idx in saved_padding_idx:
@@ -1557,7 +1670,12 @@ class Checkpointer:
             assert model_name is not None, "model_name is required when loading base model"
             # Get combined key mapping from model attribute and model-type specific conversions
             model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
-            key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
+            # Adapters and tensor converters own their complete conversion. Standard
+            # HF models also need the scoped renames declared by nested submodels.
+            mapping_model = (
+                model if not hasattr(model, "state_dict_adapter") and not requires_tensor_merging(model_type) else None
+            )
+            key_mapping = get_combined_key_mapping(model_type, model_key_mapping, model=mapping_model)
             # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
             # skip backbone.*→model.* conversion to avoid key mismatch
             if model_type == "nemotron_h" and hasattr(model, "backbone"):
@@ -1765,17 +1883,26 @@ class Checkpointer:
         dcp.save(state_dict, checkpoint_id=state_dir, planner=planner, **process_group_kwargs)
 
     def load_distributed_state(self, state: Any, state_name: str, path: str) -> None:
-        """Load a custom stateful object previously saved with DCP."""
+        """Load a custom stateful object previously saved with DCP.
+
+        Args:
+            state: Stateful object whose state dict maps keys to tensors of arbitrary shape/dtype or auxiliary
+                values. Tensor devices and DTensor mesh placements define the rank-local load destinations.
+            state_name: Subdirectory containing the saved state.
+            path: Checkpoint root directory.
+        """
         state_dir = os.path.join(path, state_name)
         state_dict = state.state_dict()
-        process_group = getattr(self, "process_group", None)
+        process_group = self._get_load_process_group()
         process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
         dcp.load(state_dict, checkpoint_id=state_dir, **process_group_kwargs)
         state.load_state_dict(state_dict)
 
     def close(self) -> None:
-        """
-        Close the checkpointer.
+        """Close owned save resources and release the shared load-group reference.
+
+        Load metadata groups are reused across checkpointers with the same caller
+        group and destroyed by the final distributed-world teardown.
         """
         self.maybe_wait_for_staging()
         self.async_wait()
@@ -1785,6 +1912,8 @@ class Checkpointer:
             self._optim_ctx.stager.close()
         consolidation_process_group = self._consolidation_process_group
         self._consolidation_process_group = None
+        # The load group is shared across checkpointers until distributed-world teardown.
+        self._load_process_group = None
         if torch.distributed.is_initialized():
             for context in (self._model_ctx, self._optim_ctx):
                 if context.process_group is not None:
@@ -1813,13 +1942,15 @@ class Checkpointer:
         Load a state dictionary from `path` using DCP or PEFT special-case logic.
 
         Args:
-            state_dict: Mutable state dict to populate with tensors.
+            state_dict: Mutable mapping to destination tensors of arbitrary shape/dtype. DTensors retain their
+                global shape and mesh placements; each rank loads its local shard on the existing device.
             path: Checkpoint directory path.
             storage_reader: Optional HF storage reader for safetensors.
             is_init_step: True if loading from a base checkpoint during initialization.
 
         Returns:
-            The populated state dictionary (may be replaced for PEFT).
+            The populated mapping, preserving tensor shapes/dtypes/devices and DTensor placements. DCP fills
+            existing tensor storage in place; PEFT may replace the mapping.
         """
         # Both model and optimizer loading is done in this function.
         is_model = _is_model_checkpoint_path(path)
@@ -1828,7 +1959,7 @@ class Checkpointer:
             state_dict = _load_safetensors(_adapter_path(path))
         else:
             storage_reader = _maybe_msc_reader(path, storage_reader)
-            process_group = getattr(self, "process_group", None)
+            process_group = self._get_load_process_group()
             process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, **process_group_kwargs)
         return state_dict
@@ -2159,7 +2290,7 @@ fi
     def _get_storage_reader(
         self,
         model_path: str,
-        key_mapping: dict[str, str] | None,
+        key_mapping: dict[str, str] | Callable[[str], str] | None,
         is_init_step: bool = False,
         is_safetensors: bool | None = None,
     ) -> StorageReader | None:
@@ -2174,7 +2305,7 @@ fi
 
         Args:
             model_path: Path to the model checkpoint directory or HF snapshot.
-            key_mapping: Optional key remapping for conversion.
+            key_mapping: Optional regex mapping or callable renaming checkpoint keys.
             is_init_step: If True, always produce a reader for base HF load.
             is_safetensors: Whether `model_path` holds a safetensors checkpoint; computed
                 from the directory contents when not supplied.
@@ -2614,10 +2745,10 @@ def _apply(module, fn, recurse=True) -> nn.Module:
 
 def _apply_key_mapping(
     state_dict: dict[str, torch.Tensor],
-    key_mapping: dict[str, str],
+    key_mapping: dict[str, str] | Callable[[str], str],
 ) -> dict[str, torch.Tensor]:
     """
-    Rename state-dict keys using regex-based ``key_mapping``.
+    Rename state-dict keys using a regex mapping or a scoped rename callable.
 
     This mirrors the renaming logic used by the DCP / HuggingFace storage
     reader but operates directly on an in-memory state dict.  It is needed
@@ -2626,11 +2757,13 @@ def _apply_key_mapping(
     parameter FQNs (e.g. ``model.language_model.X``).
 
     Args:
-        state_dict: Original state dict whose keys may need renaming.
-        key_mapping: ``{regex_pattern: replacement}`` pairs applied in order.
+        state_dict: Original state dict mapping keys to tensors of arbitrary shape.
+            Tensor layout, dtype, device, and storage are preserved.
+        key_mapping: First-match ``{regex_pattern: replacement}`` pairs or a
+            callable applying the complete key conversion.
 
     Returns:
-        A new dict with renamed keys.
+        A new dict with renamed keys and the same tensor objects as the input.
     """
     from nemo_automodel.components.checkpoint._backports.hf_storage import (
         _get_key_renaming_mapping,

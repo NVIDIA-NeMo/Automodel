@@ -13,11 +13,14 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from torch import nn
 
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
 
@@ -118,8 +121,11 @@ def test_vlm_kd_teacher_forward_uses_scoped_offloading_when_enabled(monkeypatch)
 
 
 class _Cfg:
+    vlm_dataloader = None
+
     def __init__(self, **values):
         self._values = values
+        self.checkpoint = CheckpointingConfig(save_consolidated=False)
 
     def get(self, key, default=None):
         return self._values.get(key, default)
@@ -133,8 +139,9 @@ class _Cfg:
         ({"offload_teacher_model": True}, True, "cpu"),
     ],
 )
+@pytest.mark.parametrize("load_metadata_with_gloo", [False, True])
 def test_setup_sets_offload_flag_and_teacher_device(
-    monkeypatch, cfg_overrides, expected_offload, expected_device
+    monkeypatch, cfg_overrides, expected_offload, expected_device, load_metadata_with_gloo
 ):
     captured = {}
 
@@ -161,6 +168,9 @@ def test_setup_sets_offload_flag_and_teacher_device(
         seed=7,
         **cfg_overrides,
     )
+    recipe.cfg.checkpoint = CheckpointingConfig(
+        save_consolidated=False, load_metadata_with_gloo=load_metadata_with_gloo
+    )
     recipe.dist_env = SimpleNamespace(device="cuda:0")
     recipe.device_mesh = None
     recipe.moe_mesh = None
@@ -173,6 +183,7 @@ def test_setup_sets_offload_flag_and_teacher_device(
     assert recipe._offload_teacher_model is expected_offload
     assert captured["build_teacher_kwargs"]["device"] == expected_device
     assert captured["build_teacher_kwargs"]["seed"] == 7
+    assert captured["build_teacher_kwargs"]["load_metadata_with_gloo"] is load_metadata_with_gloo
     assert recipe.kd_ratio == 0.5
     assert recipe._ce_loss_buffer == []
     assert recipe._kd_loss_buffer == []
@@ -191,3 +202,39 @@ def test_setup_raises_when_pipeline_parallelism_enabled(monkeypatch):
 
     with pytest.raises(NotImplementedError):
         recipe.setup()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_teacher_builder_forwards_load_metadata_transport(monkeypatch, enabled):
+    teacher = nn.Linear(2, 3)
+    build = Mock(return_value=teacher)
+    monkeypatch.setattr(vlm_kd, "build_model", build)
+    result = vlm_kd._build_teacher_model(
+        ConfigNode({"pretrained_model_name_or_path": "teacher"}),
+        cfg_freeze=None,
+        seed=7,
+        load_metadata_with_gloo=enabled,
+    )
+    assert build.call_args.kwargs["load_metadata_with_gloo"] is enabled
+    assert result is teacher
+    assert not teacher.training
+    assert all(not parameter.requires_grad for parameter in teacher.parameters())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_separate_teacher_setup_forwards_load_metadata_transport(monkeypatch, enabled):
+    build = Mock(return_value=nn.Linear(2, 3))
+    monkeypatch.setattr(vlm_kd, "_verify_tokenizer_compatibility", lambda *args: None)
+    monkeypatch.setattr(vlm_kd.FinetuneRecipeForVLM, "setup", lambda self: None)
+    monkeypatch.setattr(vlm_kd, "_build_teacher_model", build)
+    recipe = vlm_kd.KnowledgeDistillationRecipeForVLM.__new__(vlm_kd.KnowledgeDistillationRecipeForVLM)
+    recipe.cfg = _Cfg(teacher_model=ConfigNode({"pretrained_model_name_or_path": "teacher"}))
+    recipe.cfg.checkpoint = CheckpointingConfig(save_consolidated=False, load_metadata_with_gloo=enabled)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.distributed_setup = None
+    recipe.pp_enabled = False
+    recipe.separate_meshes = True
+    recipe.kd_mesh_bridge = SimpleNamespace(is_teacher=True, synchronize=Mock())
+    recipe.setup()
+    assert build.call_args.kwargs["load_metadata_with_gloo"] is enabled
+    recipe.kd_mesh_bridge.synchronize.assert_called_once_with()

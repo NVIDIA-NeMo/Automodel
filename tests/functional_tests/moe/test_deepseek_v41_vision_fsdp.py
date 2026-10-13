@@ -26,8 +26,13 @@ import torch.multiprocessing as mp
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
+from nemo_automodel.components.distributed import (
+    FSDP2Config,
+    MeshContext,
+    MoEParallelizerConfig,
+    ParallelismSizes,
+)
+from nemo_automodel.components.distributed.model_parallelizer import parallelize_model
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import (
     DeepseekV41Config,
@@ -35,7 +40,6 @@ from nemo_automodel.components.models.deepseek_v41.config import (
     DeepseekV41VisionConfig,
 )
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
-from nemo_automodel.components.moe.parallelizer import parallelize_model
 
 
 def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
@@ -118,21 +122,20 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
         model.zero_grad(set_to_none=True)
         pixels.grad = None
         mesh = MeshContext.build(
-            FSDP2Config(),
+            FSDP2Config(
+                mp_policy=MixedPrecisionPolicy(
+                    param_dtype=torch.bfloat16,
+                    reduce_dtype=torch.float32,
+                    output_dtype=None,
+                    cast_forward_inputs=False,
+                )
+            ),
             ParallelismSizes(dp_size=2, ep_size=2),
+            moe_parallel_config=MoEParallelizerConfig(lm_head_precision=torch.float32),
+            activation_checkpointing=activation_checkpointing,
             world_size=2,
         )
-        parallelize_model(
-            model,
-            mesh.device_mesh,
-            mesh.moe_mesh,
-            mp_policy=MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=None, cast_forward_inputs=False
-            ),
-            lm_head_precision=torch.float32,
-            activation_checkpointing=activation_checkpointing,
-            **mesh.parallelize_axis_kwargs(),
-        )
+        parallelize_model(model, mesh)
         for name, p in model.named_parameters():
             if name.startswith("model.vision.") and any(n in name for n in (".norm.", ".norm1.", ".norm2.")):
                 assert p.dtype == torch.float32, name

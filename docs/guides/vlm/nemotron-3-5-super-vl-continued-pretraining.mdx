@@ -11,8 +11,8 @@ setup, training, checkpoint, and results structure of the
 objective and **Megatron-indexed `.bin/.idx` data**.
 
 The model is loaded from
-`nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`. Despite the historical
-`67B` in its name, this checkpoint contains approximately 121B parameters. The complete
+the BF16 checkpoint
+`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`. The complete
 VL model is retained; its RADIO vision tower and vision projector are frozen and unused
 during this text-only run. The language backbone is trained with full-parameter updates,
 with no LoRA adapters. The MTP head is disabled.
@@ -59,7 +59,7 @@ image understanding.
 ## Hardware Requirements
 
 - **8 nodes × 8 H100 80 GB GPUs** (64 GPUs) required for this recipe
-- **Storage**: Approximately 232 GiB for the base BF16 checkpoint, and approximately 6 TiB of additional shared storage for checkpoint retention
+- **Storage**: Approximately 232 GiB for the BF16 checkpoint, and approximately 6 TiB of additional shared storage for checkpoint retention
 
 ## Run Configuration
 
@@ -96,8 +96,8 @@ The [installation guide](/get-started/installation) describes the complete envir
 Set shared paths accessible from every training node:
 
 ```bash
-export MODEL=nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
-export MODEL_REVISION=2a6837af6b67067b5a89ceb73cb6d01dfdc71ea8
+export MODEL=nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+export MODEL_REVISION=main
 export HF_HOME=/path/to/shared/hf_cache
 export CPT_DATA_ROOT=/path/to/shared/super35_fineweb
 export FINEWEB_DATA_DIR="$CPT_DATA_ROOT/megatron"
@@ -110,7 +110,7 @@ export WANDB_CONSOLE=off
 ```
 
 Replace the W&B entity and project placeholders with your values. Authenticate Hugging Face
-if the model requires access. Download the base model once into the shared cache before starting a
+if the model requires access. Download the BF16 model once into the shared cache before starting a
 multi-node allocation:
 
 ```bash
@@ -119,9 +119,13 @@ MODEL_SNAPSHOT=$(hf download "$MODEL" \
   --cache-dir "$HF_HOME/hub" \
   --quiet)
 export MODEL_SNAPSHOT
+export MODEL_REVISION="${MODEL_SNAPSHOT##*/}"
 ```
 
-The base BF16 checkpoint is approximately 232 GiB (249 GB). A full sharded training
+The snapshot directory records the resolved commit. Reuse this `MODEL_REVISION` for
+subsequent runs to pin the model and tokenizer to the same version.
+
+The BF16 checkpoint is approximately 232 GiB (249 GB). A full sharded training
 checkpoint in this configuration occupies approximately **1.35 TiB**, including
 about 227 GiB of model shards and 1.1 TiB of optimizer state. Allow approximately
 **6 TiB of additional storage** for two recent checkpoints, a potentially separate

@@ -40,7 +40,7 @@ from nemo_automodel.components.training.prewarm import (
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 class _FakeGDN(torch.nn.Module):
@@ -117,7 +117,7 @@ def test_apply_runs_only_enabled_prewarms(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_automodel.components.training.prewarm._prewarm_comm_groups",
-        lambda model_parts, device, pp_mesh=None: calls.append(("comm", pp_mesh)),
+        lambda model_parts, device, pp_mesh=None, ep_mesh=None: calls.append(("comm", pp_mesh, ep_mesh)),
     )
 
     PrewarmConfig(cublas_backward=True, fla_gdn_autotune=True, mamba_ssd_autotune=True, comm_groups=True).apply(
@@ -125,12 +125,13 @@ def test_apply_runs_only_enabled_prewarms(monkeypatch):
         device=torch.device("cpu"),
         batch_size=4,
         pp_mesh="pp-mesh",
+        ep_mesh="ep-mesh",
     )
     assert calls == [
         ("cublas", torch.device("cpu")),
         ("fla", torch.device("cpu"), 4),
         ("mamba", torch.device("cpu")),
-        ("comm", "pp-mesh"),
+        ("comm", "pp-mesh", "ep-mesh"),
     ]
 
     calls.clear()

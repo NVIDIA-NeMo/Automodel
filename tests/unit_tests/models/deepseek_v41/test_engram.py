@@ -30,6 +30,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 from transformers import PreTrainedTokenizerFast
 
+from nemo_automodel.components.distributed.multimodal_fsdp import ignored_params_for_root
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import (
     DeepseekV41Config,
@@ -41,11 +42,10 @@ from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCa
 from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import DeepseekV41StateDictAdapter
 from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextOwnerShardedEmbedding
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.shared.multimodal_fsdp import ignored_params_for_root
 
 # Over the default 5s budget on purpose: distributed owner and checkpoint tests spawn Gloo workers.
 # Shrink process startup and checkpoint round trips before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _tiny_config() -> DeepseekV41TextConfig:

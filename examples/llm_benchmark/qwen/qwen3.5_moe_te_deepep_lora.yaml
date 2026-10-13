@@ -64,16 +64,18 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3.5-35B-A3B
   trust_remote_code: true
+  # Measure base-model throughput without the checkpoint's additional MTP layer.
+  num_nextn_predict_layers: 0
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
     rms_norm: te
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true

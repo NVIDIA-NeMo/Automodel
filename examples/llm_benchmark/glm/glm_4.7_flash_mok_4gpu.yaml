@@ -101,7 +101,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: gmm  # Ignored by MoK; retained for parity with HybridEP recipes.
+    experts: torch_mm  # Ignored by MoK; retained for parity with HybridEP recipes.
     dispatcher: mok
     gate_precision: float32
     fake_balanced_gate: false

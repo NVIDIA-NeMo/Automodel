@@ -76,7 +76,6 @@ from nemo_automodel.components.models.deepseek_v4.cp import (
     dsv4_cp_size,
     make_dsv4_contiguous_shard_cp_batch_and_ctx,
 )
-from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4HyperConnection,
@@ -86,6 +85,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
 )
+from nemo_automodel.components.models.deepseek_v4.parallelization import PARALLELIZER
 from nemo_automodel.components.models.deepseek_v4.processing import (
     COMPRESS_PAD_TO,
     IMAGE,
@@ -1044,6 +1044,9 @@ class DeepseekV4Model(nn.Module):
         return h
 
     def update_moe_gate_bias(self) -> None:
+        """Update routing biases only when enabled by the model's MoE configuration."""
+        if not self.moe_config.train_gate or self.moe_config.gate_bias_update_factor <= 0:
+            return
         with torch.no_grad():
             for block in self.layers.values():
                 if isinstance(block.mlp, MoE):
@@ -1072,8 +1075,6 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    _nemo_fully_shard = staticmethod(fully_shard_deepseek_v4)
-
     # Keep HC mixers and the MoE gate's correction bias in fp32 regardless of
     # the outer cast policy.  Matches HF PR 45616's
     # ``DeepseekV4PreTrainedModel._keep_in_fp32_modules_strict`` (lines 890-900
@@ -1546,4 +1547,5 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         cast_model_to_dtype(self, dtype)
 
 
+DeepseekV4ForCausalLM.parallelizer = PARALLELIZER
 ModelClass = DeepseekV4ForCausalLM

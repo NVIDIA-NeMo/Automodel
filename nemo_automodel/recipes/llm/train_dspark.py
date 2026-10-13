@@ -59,11 +59,6 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
-from nemo_automodel.components.distributed.activation_checkpointing import (
-    apply_selective_checkpointing_to_layers,
-    apply_submodule_checkpointing,
-    is_selective_activation_checkpointing,
-)
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
@@ -137,11 +132,13 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     validate_dspark_parallelism_axes,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_activation_checkpointing,
     apply_draft_compile,
     apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
     raise_if_peft_configured,
+    read_load_metadata_with_gloo,
 )
 
 logger = logging.getLogger(__name__)
@@ -293,24 +290,6 @@ def _resolve_warmup_steps(warmup_ratio: float, total_optim_steps: int, min_warmu
     if warmup_ratio <= 0:
         return 1
     return max(min_warmup_steps, int(warmup_ratio * total_optim_steps))
-
-
-def _apply_draft_activation_checkpointing(draft_model: torch.nn.Module, mode: bool | str) -> None:
-    """Apply the recipe's AC mode to the trainable DSpark draft before FSDP."""
-    if not mode or (isinstance(mode, str) and mode.lower() == "false"):
-        return
-    layers = list(getattr(draft_model, "layers", ()))
-    if not layers:
-        logger.warning("Draft activation checkpointing requested, but the draft exposes no layers.")
-        return
-    if is_selective_activation_checkpointing(mode):
-        apply_selective_checkpointing_to_layers(draft_model, layers, has_kv_sharing=False)
-        logger.info("Enabled selective activation checkpointing on %d draft layers", len(layers))
-    else:
-        # DSpark's native layers are not HF GradientCheckpointingLayer subclasses.
-        # Checkpoint their attention/MLP/norm submodules before FSDP indexes params.
-        apply_submodule_checkpointing(layers, has_kv_sharing=False)
-        logger.info("Enabled full activation checkpointing on %d draft layers", len(layers))
 
 
 def _validate_cached_dspark_manifest(
@@ -671,6 +650,7 @@ class TrainDSparkRecipe(BaseRecipe):
         if self.cached_target_path is None or chat_template is not None:
             _apply_target_chat_template(self.tokenizer, chat_template)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        load_metadata_with_gloo = read_load_metadata_with_gloo(self.cfg.get("checkpoint", None))
 
         if is_deepseek_v4_target:
             if self.cached_target_path is None:
@@ -770,7 +750,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     linear="torch",
                     rms_norm="torch_fp32",
                     rope_fusion=False,
-                    experts=str(recipe_cfg.get("target_experts", "gmm")),
+                    experts=str(recipe_cfg.get("target_experts", "torch_mm")),
                     dispatcher="hybridep",
                     enable_hf_state_dict_adapter=True,
                     enable_fsdp_optimizations=True,
@@ -780,6 +760,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     trust_remote_code=trust_remote_code,
                     torch_dtype=self.compute_dtype,
                     distributed_setup=self.distributed_setup,
+                    load_metadata_with_gloo=load_metadata_with_gloo,
                     backend=backend,
                     # The released bf16 checkpoint ships no real MTP weights despite the
                     # config declaring some, and DSpark trains its own separate draft
@@ -867,6 +848,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     torch_dtype=self.compute_dtype,
                     force_hf=bool(recipe_cfg.get("target_force_hf", False)),
                     distributed_setup=self.distributed_setup,
+                    load_metadata_with_gloo=load_metadata_with_gloo,
                     **target_kwargs,
                 )
                 if self.distributed_setup is None:
@@ -1144,7 +1126,7 @@ class TrainDSparkRecipe(BaseRecipe):
         activation_checkpointing = dist_cfg.get("activation_checkpointing", False) if dist_cfg is not None else False
         # The target consumes this setting through its distributed setup, while
         # the separately constructed trainable draft must be wrapped explicitly.
-        _apply_draft_activation_checkpointing(self.draft_model, activation_checkpointing)
+        apply_draft_activation_checkpointing(self.draft_model, activation_checkpointing)
 
         trainer_module = DSparkTrainerModule(
             self.draft_model,
@@ -1162,7 +1144,9 @@ class TrainDSparkRecipe(BaseRecipe):
             if strategy == "fsdp2":
                 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
-                mp_policy = MixedPrecisionPolicy(param_dtype=self.compute_dtype, reduce_dtype=torch.float32)
+                mp_policy = MixedPrecisionPolicy(
+                    param_dtype=self.compute_dtype, reduce_dtype=torch.float32, cast_forward_inputs=False
+                )
                 # CP keeps the draft replicated across CP ranks. Otherwise use a
                 # named WORLD mesh so checkpoint adapters can resolve FSDP shards.
                 draft_mesh = self.dp_mesh
