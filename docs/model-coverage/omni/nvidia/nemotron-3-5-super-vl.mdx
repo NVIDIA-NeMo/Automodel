@@ -31,7 +31,7 @@ uv run automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_
 | Goal | Start Here |
 | --- | --- |
 | Full SFT, text-only (vision/audio towers frozen and unused) | Use [nemotron_3_5_super_vl_tulu3_text_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml). Dataset: Tulu-3. |
-| 256K packed SFT, `cp_size=32`; text-only packs (`inject_fake_images: false`) | Use [nemotron_3_5_super_vl_tulu3_packed_256k_cp32_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_256k_cp32_100steps.yaml). Dataset: Tulu-3 (packed, THD). |
+| 256K packed SFT on 16 GB200 GPUs, `cp_size=8` / `ep_size=16`; text-only packs (`inject_fake_images: false`) | Use [nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200.yaml). Dataset: Tulu-3 (packed, THD). |
 | Low-rank adaptation (LoRA) (rank 64) on the LLM linear projections, base model frozen; receipt image to structured field tokens; single node | Use [nemotron_3_5_super_vl_cord_v2_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml). Dataset: CORD-v2. |
 
 ### LoRA on CORD-v2

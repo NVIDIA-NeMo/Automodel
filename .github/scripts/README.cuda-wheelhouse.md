@@ -42,10 +42,19 @@ there is no older-key fallback.
    repository and `install-test.yml` signer. Cached manifests must originate
    from `refs/heads/main`; fresh builds must match the current source ref and
    source/workflow commit.
-3. Pip and UV download the producer's artifact by ID. Before installing any
-   wheel, they check the verified manifest digest, expected build fingerprint,
-   complete wheel set, and every wheel's SHA-256. Verification errors stop the
-   job. Legacy unsigned cache entries are excluded by the v4 cache namespace.
+3. On a cache hit, pip and UV restore the producer's exact cache key directly;
+   the producer skips uploading the full wheelhouse artifact. Fresh builds
+   still upload an artifact, which consumers download by ID. Both paths pass
+   the small manifest/signature artifact through the provenance verifier.
+   Before installing any wheel, consumers check the verified manifest digest,
+   expected build fingerprint, complete wheel set, and every wheel's SHA-256.
+   Verification errors stop the job. Legacy unsigned cache entries are excluded
+   by the v4 cache namespace.
+
+If a cache hit disappears before a consumer restores it, that consumer fails
+instead of compiling or falling back to another key. Rerun the workflow to
+select the cache or fresh-build path again. Source-validation jobs consume
+neither the wheelhouse cache nor the artifact.
 
 The attestation identifies the CI builder and the bytes it produced. It does
 not establish that upstream source packages are benign or replace GPU runtime

@@ -15,10 +15,11 @@
 """Tests for the model-owned parallelization contract."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed import (
     DDPConfig,
@@ -125,7 +126,7 @@ def test_fsdp2_dispatch_receives_model_parallelizer(monkeypatch):
 def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch):
     parallelizer = ModelParallelizer()
     model = nn.Linear(2, 2)
-    context = SimpleNamespace(ep_size=2, strategy_config=FSDP2Config())
+    context = SimpleNamespace(cp_size=1, ep_size=2, strategy_config=FSDP2Config())
     call = Mock(return_value=model)
     monkeypatch.setattr("nemo_automodel.components.distributed.model_parallelizer._parallelize_moe", call)
 
@@ -191,3 +192,108 @@ def test_model_parallelizer_dispatches_non_fsdp2_strategies(monkeypatch, strateg
 
     assert ModelParallelizer().parallelize(model, context) is model
     executor.assert_called_once_with(model, context)
+
+
+@pytest.fixture(params=["default", "qwen35", "nemotron"])
+def mtp_parallelizer(request):
+    from nemo_automodel.components.models.nemotron_v3.parallelization import NemotronHModelParallelizer
+    from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ModelParallelizer
+
+    return {
+        "default": ModelParallelizer,
+        "qwen35": Qwen3_5ModelParallelizer,
+        "nemotron": NemotronHModelParallelizer,
+    }[request.param]()
+
+
+def _mtp_context(*, pp_size=2, cp_size=2, ep_size=1):
+    mesh = MagicMock(spec=DeviceMesh)
+    mesh.mesh_dim_names = ("pp", "cp", "tp")
+    axes = {name: Mock() for name in mesh.mesh_dim_names}
+    for name, size in (("pp", pp_size), ("cp", cp_size), ("tp", 1)):
+        axes[name].size.return_value = size
+    mesh.__getitem__.side_effect = axes.__getitem__
+    moe_mesh = MagicMock(spec=DeviceMesh)
+    moe_mesh.mesh_dim_names = ("ep",)
+    moe_mesh.__getitem__.return_value.size.return_value = ep_size
+    return MeshContext(device_mesh=mesh, moe_mesh=moe_mesh, strategy_config=FSDP2Config())
+
+
+@pytest.mark.parametrize("ep_size", [1, 2])
+@pytest.mark.parametrize(
+    "pp_size, supports_mtp_cp, trimmed_stage, error, message",
+    [
+        (2, True, False, NotImplementedError, "use PP size 1 or CP size 1"),
+        (2, False, False, NotImplementedError, "use PP size 1 or CP size 1"),
+        (1, True, True, NotImplementedError, "use PP size 1 or CP size 1"),
+        (1, False, False, RuntimeError, "does not support MTP with context parallelism"),
+    ],
+)
+def test_mtp_rejected_before_strategy_dispatch(
+    monkeypatch, mtp_parallelizer, ep_size, pp_size, supports_mtp_cp, trimmed_stage, error, message
+):
+    """Both EP routes reject before any TP, CP, or FSDP surgery can begin."""
+
+    class Model(nn.Module):
+        parallelizer = mtp_parallelizer
+
+    model = Model()
+    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=supports_mtp_cp, supports_mtp_cp_pp=False)
+    if trimmed_stage:
+        model._is_pipeline_parallel_stage = lambda: True
+    context = _mtp_context(pp_size=pp_size, ep_size=ep_size)
+    fsdp = Mock(side_effect=AssertionError("FSDP2 surgery reached"))
+    moe = Mock(side_effect=AssertionError("MoE surgery reached"))
+    monkeypatch.setattr("nemo_automodel.components.distributed.model_parallelizer._parallelize_fsdp2", fsdp)
+    monkeypatch.setattr("nemo_automodel.components.distributed.model_parallelizer._parallelize_moe", moe)
+
+    with pytest.raises(error, match=message):
+        parallelize_model(model, context)
+
+    fsdp.assert_not_called()
+    moe.assert_not_called()
+    assert not hasattr(model, "cp_mesh")
+
+
+@pytest.mark.parametrize("ep_size", [1, 2])
+@pytest.mark.parametrize(
+    "pp_size, cp_size, mtp_enabled, supports_mtp_cp, supports_mtp_cp_pp",
+    [
+        (1, 2, True, True, False),
+        (2, 1, True, False, False),
+        (2, 2, False, False, False),
+        (2, 2, True, True, True),
+    ],
+)
+def test_mtp_supported_configurations_reach_strategy_dispatch(
+    monkeypatch, mtp_parallelizer, ep_size, pp_size, cp_size, mtp_enabled, supports_mtp_cp, supports_mtp_cp_pp
+):
+    class Model(nn.Module):
+        parallelizer = mtp_parallelizer
+
+    model = Model()
+    model.supports = SimpleNamespace(
+        mtp_enabled=mtp_enabled, supports_mtp_cp=supports_mtp_cp, supports_mtp_cp_pp=supports_mtp_cp_pp
+    )
+    context = _mtp_context(pp_size=pp_size, cp_size=cp_size, ep_size=ep_size)
+    fsdp = Mock(return_value=model)
+    moe = Mock(return_value=model)
+    monkeypatch.setattr("nemo_automodel.components.distributed.model_parallelizer._parallelize_fsdp2", fsdp)
+    monkeypatch.setattr("nemo_automodel.components.distributed.model_parallelizer._parallelize_moe", moe)
+
+    assert parallelize_model(model, context) is model
+    selected, unused = (moe, fsdp) if ep_size > 1 else (fsdp, moe)
+    selected.assert_called_once_with(model, context, parallelizer=mtp_parallelizer)
+    unused.assert_not_called()
+
+
+def test_cp_dispatch_accepts_modules_without_transformers_capabilities(monkeypatch):
+    """Diffusers components reach this public API without model.supports."""
+    model = nn.Linear(2, 2)
+    context = _mtp_context(pp_size=1)
+    fsdp = Mock(return_value=model)
+    monkeypatch.setattr("nemo_automodel.components.distributed.model_parallelizer._parallelize_fsdp2", fsdp)
+
+    assert parallelize_model(model, context) is model
+    fsdp.assert_called_once_with(model, context, parallelizer=get_model_parallelizer(model))
+    assert not hasattr(model, "supports")

@@ -566,6 +566,9 @@ class BackendConfig:
     # (currently DeepSeek V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
     # Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_hc: bool = False
+    # When True, torch.compile DeepSeek V4.1's cache quantize/dequantize core (fp8 SWA KV, mxfp4 index
+    # Q/K, nvfp4 compressed KV): the per-tensor chain of a dozen elementwise kernels becomes one or two,
+    # same lazy once-per-process pattern as compile_hc. Numerics match eager (elementwise ops only). Default False.
     # When True, MoE models with shared experts (the shared MoE class and Kimi K3) run them on a side CUDA
     # stream, launched before the routed-expert path and joined after it, so the shared-expert
     # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's

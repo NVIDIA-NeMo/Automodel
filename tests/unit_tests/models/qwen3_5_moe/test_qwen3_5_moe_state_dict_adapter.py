@@ -15,7 +15,7 @@
 import json
 import re
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -253,6 +253,83 @@ class TestInitialization:
 
         with pytest.raises(ValueError, match="both split-FP8 and grouped decoder expert keys"):
             _infer_base_expert_hf_layout(checkpoint_keys)
+
+
+class TestSplitFp8MtpExperts:
+    @pytest.mark.parametrize("scale_multiplier", [1, 2])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_dequantizes_mtp_scales(self, split_fp8_adapter, scale_multiplier, dtype):
+        split_fp8_adapter.dtype = dtype
+        source, gate_up, down = _build_split_fp8_hf_state(split_fp8_adapter)
+        source = {key.replace("model.layers.", "mtp.layers."): value for key, value in source.items()}
+        for key in source:
+            if key.endswith("_scale_inv"):
+                source[key] *= scale_multiplier
+        native = split_fp8_adapter.from_hf(source)
+        torch.testing.assert_close(
+            native["mtp.layers.0.mlp.experts.gate_and_up_projs"],
+            (gate_up * scale_multiplier).to(dtype),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            native["mtp.layers.0.mlp.experts.down_projs"],
+            (down * scale_multiplier).to(dtype),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_rejects_fp8_mtp_weight_without_scale(self, split_fp8_adapter):
+        source, _, _ = _build_split_fp8_hf_state(split_fp8_adapter)
+        source = {key.replace("model.layers.", "mtp.layers."): value for key, value in source.items()}
+        del source["mtp.layers.0.mlp.experts.0.gate_proj.weight_scale_inv"]
+        with pytest.raises(RuntimeError, match="Missing FP8 scale.*mtp.layers.0"):
+            split_fp8_adapter.from_hf(source)
+
+    def test_checkpointer_loads_split_fp8_mtp(self, split_fp8_adapter, tmp_path):
+        source, gate_up, down = _build_split_fp8_hf_state(split_fp8_adapter)
+        source.update(
+            {key.replace("model.layers.", "mtp.layers."): value.clone() for key, value in list(source.items())}
+        )
+        save_file(source, tmp_path / "model.safetensors")
+        target = torch.nn.Module()
+        target.config = SimpleNamespace(quantization_config={"quant_method": "fp8"})
+        expected = {}
+        for prefix in ("model.layers.0", "mtp.layers.0"):
+            for suffix, value in (("gate_and_up_projs", gate_up), ("down_projs", down)):
+                key = f"{prefix}.mlp.experts.{suffix}"
+                expected[key] = value
+                parent = target
+                for part in key.split(".")[:-1]:
+                    if not hasattr(parent, part):
+                        parent.add_module(part, torch.nn.Module())
+                    parent = getattr(parent, part)
+                parent.register_parameter(suffix, torch.nn.Parameter(torch.zeros_like(value)))
+        target.state_dict_adapter = Qwen3_5MoeStateDictAdapter(
+            config=SimpleNamespace(_name_or_path=str(tmp_path), name_or_path=str(tmp_path)),
+            moe_config=split_fp8_adapter.moe_config,
+            backend=split_fp8_adapter.backend,
+            dtype=torch.float32,
+            text_only=True,
+            pretrained_model_name_or_path=str(tmp_path),
+        )
+        checkpointer = Checkpointer(
+            CheckpointingConfig(
+                enabled=True,
+                checkpoint_dir=str(tmp_path / "output"),
+                model_save_format="safetensors",
+                model_cache_dir=str(tmp_path),
+                model_repo_id=str(tmp_path),
+                save_consolidated=False,
+            ),
+            dp_rank=0,
+            tp_rank=0,
+            pp_rank=0,
+            moe_mesh=None,
+        )
+        checkpointer.load_model(target, model_path=str(tmp_path), is_init_step=True)
+        for key, value in target.state_dict().items():
+            torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
 
 
 class TestSplitFp8BaseExperts:
@@ -857,7 +934,8 @@ class TestFromHF:
         for key in hf_state:
             torch.testing.assert_close(roundtrip[key], hf_state[key])
 
-    def test_converts_mtp_split_dtensors_from_dcp(self, adapter, monkeypatch):
+    @pytest.mark.parametrize("fp8", [False, True])
+    def test_converts_mtp_split_dtensors_from_dcp(self, adapter, monkeypatch, fp8):
         """DCP split experts must unwrap their residual DTensor before rebuilding the EP DTensor."""
 
         class FakeDTensor(torch.Tensor):
@@ -865,10 +943,23 @@ class TestFromHF:
 
             @staticmethod
             def __new__(cls, data):
-                return torch.Tensor._make_subclass(cls, data)
+                result = torch.Tensor._make_subclass(cls, data)
+                result.device_mesh = "residual_mesh"
+                result.placements = "residual_placements"
+                return result
 
             def to_local(self):
                 return self.as_subclass(torch.Tensor)
+
+        def from_local(local_tensor, device_mesh, placements, shape, stride):
+            assert device_mesh == "residual_mesh"
+            assert placements == "residual_placements"
+            assert local_tensor.shape == shape
+            return FakeDTensor(local_tensor)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter.DTensor.from_local", from_local
+        )
 
         monkeypatch.setattr(
             "nemo_automodel.components.moe.state_dict_utils.is_dtensor",
@@ -880,7 +971,7 @@ class TestFromHF:
         )
         monkeypatch.setattr(
             "nemo_automodel.components.moe.state_dict_utils.get_submesh",
-            lambda mesh, dims: Mock(get_rank=lambda: 0),
+            lambda mesh, dims: Mock(get_rank=lambda: 0, size=lambda: 2, get_local_rank=lambda: 0),
         )
 
         rebuilt_locals = []
@@ -895,8 +986,9 @@ class TestFromHF:
             fake_create_dtensor,
         )
 
-        device_mesh = Mock()
-        device_mesh.mesh_dim_names = ["ep"]
+        device_mesh = MagicMock()
+        device_mesh.mesh_dim_names = ["ep", "ep_shard"]
+        device_mesh.__getitem__.return_value = Mock(size=lambda: 2, get_local_rank=lambda: 0)
         hf_state = {}
         expected_gate_up = []
         expected_down = []
@@ -904,9 +996,17 @@ class TestFromHF:
             gate = torch.randn(32, 64)
             up = torch.randn(32, 64)
             down = torch.randn(64, 32)
+            if fp8:
+                gate, up, down = (value.to(torch.float8_e4m3fn) for value in (gate, up, down))
             hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight"] = FakeDTensor(gate)
             hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight"] = FakeDTensor(up)
             hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight"] = FakeDTensor(down)
+            if fp8:
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.{projection}.weight_scale_inv"] = torch.full(
+                        (1, 1), 0.25
+                    )
+                gate, up, down = (value.float() * 0.25 for value in (gate, up, down))
             expected_gate_up.append(torch.cat((gate.transpose(0, 1), up.transpose(0, 1)), dim=1))
             expected_down.append(down.transpose(0, 1))
 

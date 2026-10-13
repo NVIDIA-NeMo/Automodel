@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
 from nemo_automodel.components.speculative.dspark.config import build_kimi_k3_draft_config
 from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
@@ -191,7 +192,8 @@ def test_target_builder_requires_cuda():
         )
 
 
-def test_target_builder_uses_text_config_and_distributed_loader(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_target_builder_uses_text_config_and_distributed_loader(monkeypatch, enabled):
     target_config = KimiK3Config(text_config=_target_config())
     distributed_setup = object()
     target_model = object()
@@ -214,7 +216,7 @@ def test_target_builder_uses_text_config_and_distributed_loader(monkeypatch):
 
     monkeypatch.setattr(_dspark_target_build.NeMoAutoModelForCausalLM, "from_config", _from_config)
     config, model, setup = _dspark_target_build.build_kimi_k3_target(
-        cfg={"distributed": {}},
+        cfg=ConfigNode({"distributed": {}, "checkpoint": {"load_metadata_with_gloo": enabled}}),
         world_size=64,
         device=SimpleNamespace(type="cuda"),
         compute_dtype=torch.bfloat16,
@@ -232,3 +234,4 @@ def test_target_builder_uses_text_config_and_distributed_loader(monkeypatch):
     assert captured["config"] is config
     assert captured["distributed_setup"] is distributed_setup
     assert captured["load_base_model"] is True
+    assert captured["load_metadata_with_gloo"] is enabled

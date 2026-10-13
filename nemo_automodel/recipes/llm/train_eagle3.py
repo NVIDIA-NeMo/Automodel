@@ -76,6 +76,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    read_load_metadata_with_gloo,
     should_sync_grads,
 )
 from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
@@ -1145,6 +1146,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            load_metadata_with_gloo=read_load_metadata_with_gloo(self.cfg.get("checkpoint", None)),
         )
         # Optional target attention backend (default: HF auto-select). Pin to
         # ``sdpa`` to dodge the Qwen3 FA2 ``s_aux=None`` crash in transformers.

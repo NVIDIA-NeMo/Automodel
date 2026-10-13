@@ -136,8 +136,16 @@ jobs:
         with:
           version: 0.9.26
 
-      - name: Download cached CUDA wheelhouse
-        if: matrix.mode == 'wheelhouse'
+      - name: Restore cached CUDA wheelhouse
+        if: matrix.mode == 'wheelhouse' && needs.cuda-wheelhouse.outputs.cache_hit == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /tmp/cuda-wheelhouse
+          key: ${{ needs.cuda-wheelhouse.outputs.cache_key }}
+          fail-on-cache-miss: true
+
+      - name: Download newly built CUDA wheelhouse
+        if: matrix.mode == 'wheelhouse' && needs.cuda-wheelhouse.outputs.cache_hit != 'true'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           artifact-ids: ${{ needs.cuda-wheelhouse.outputs.artifact_id }}
@@ -242,6 +250,7 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
       provenance_id: ${{ steps.provenance-upload.outputs.artifact-id }}
       fingerprint: ${{ steps.cuda-wheelhouse-key.outputs.fingerprint }}
+      cache_key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
       cache_hit: ${{ steps.cuda-wheelhouse-cache-main.outputs.cache-hit == 'true' || steps.cuda-wheelhouse-cache-branch.outputs.cache-hit == 'true' }}
     needs: [pre-flight, setup-install-image]
     if: |
@@ -347,8 +356,11 @@ jobs:
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/mamba_ssm*.whl 2>/dev/null)"
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/transformer_engine_torch*.whl 2>/dev/null)"
 
-      - name: Upload CUDA wheelhouse artifact
+      # Consumers restore cache hits directly. Only fresh builds need a full
+      # artifact; the small provenance artifact below is verified on both paths.
+      - name: Upload newly built CUDA wheelhouse artifact
         id: upload
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: cuda-wheelhouse-py${{ matrix.python-version }}
@@ -411,7 +423,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Download cached CUDA wheelhouse
+      - name: Restore cached CUDA wheelhouse
+        if: needs.cuda-wheelhouse.outputs.cache_hit == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.WHEELHOUSE_DIR }}
+          key: ${{ needs.cuda-wheelhouse.outputs.cache_key }}
+          fail-on-cache-miss: true
+
+      - name: Download newly built CUDA wheelhouse
+        if: needs.cuda-wheelhouse.outputs.cache_hit != 'true'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           artifact-ids: ${{ needs.cuda-wheelhouse.outputs.artifact_id }}
