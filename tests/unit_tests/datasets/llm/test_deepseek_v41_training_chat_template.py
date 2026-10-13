@@ -35,7 +35,7 @@ TEMPLATE = TEMPLATE_PATH.read_text()
 TULU3_TEMPLATE = (REPO_ROOT / "examples/llm_finetune/deepseek_v41/tulu3_chat_template.jinja").read_text()
 YAML_PATH = REPO_ROOT / "examples/speculative/dspark/deepseek_v41_flash_dspark.yaml"
 # sha256 of the released chat_template.jinja after its leading comment block.
-RELEASED_BODY_SHA256 = "899908e9e015a11ebc6e7ed39a0c57b7e99d30d81362f2358a2f30b3c54ece93"
+RELEASED_BODY_SHA256 = "899908e9e015a11ebc6e7ed39a0c57b7e99d30d81362f2358a2f30b3c54ece93"  # pragma: allowlist secret
 BOS = "<｜begin▁of▁sentence｜>"
 EOS = "<｜end▁of▁sentence｜>"
 EFFORT = "<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
