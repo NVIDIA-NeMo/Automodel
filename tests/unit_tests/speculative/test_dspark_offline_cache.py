@@ -384,6 +384,7 @@ def test_precompute_resume_mismatch_does_not_overwrite_target_weights(monkeypatc
         draft_num_hidden_layers=5,
         target_layer_ids=list(_LAYERS),
         chat_template=None,
+        chat_template_kwargs=None,
         mask_reasoning_content=False,
         mask_generation_prompt=False,
         target_attn_implementation=None,
@@ -479,7 +480,10 @@ def test_precompute_run_writes_cache(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: fake_model,
     )
     monkeypatch.setattr(precompute_dspark, "HFDSparkTargetModel", _FakeWrapper)
-    monkeypatch.setattr(precompute_dspark, "build_eagle3_dataloader", lambda **_kwargs: _FakeLoader())
+    loader_kwargs = {}
+    monkeypatch.setattr(
+        precompute_dspark, "build_eagle3_dataloader", lambda **kwargs: loader_kwargs.update(kwargs) or _FakeLoader()
+    )
 
     cache_dir = str(tmp_path / "cache")
     args = SimpleNamespace(
@@ -497,6 +501,7 @@ def test_precompute_run_writes_cache(monkeypatch, tmp_path):
         draft_num_hidden_layers=5,
         target_layer_ids=list(_LAYERS),
         chat_template=None,
+        chat_template_kwargs={"enable_thinking": False},
         mask_reasoning_content=False,
         mask_generation_prompt=False,
         target_attn_implementation=None,
@@ -510,6 +515,9 @@ def test_precompute_run_writes_cache(monkeypatch, tmp_path):
     manifest = read_manifest(cache_dir)
     assert manifest["num_samples"] == 3
     assert manifest["target_layer_ids"] == _LAYERS
+    # The template arguments reach both the dataloader and the recorded input identity.
+    assert loader_kwargs["chat_template_kwargs"] == {"enable_thinking": False}
+    assert manifest["chat_template_kwargs"] == {"enable_thinking": False}
     dataset = CachedDSparkDataset(cache_dir)
     assert len(dataset) == 3
     assert dataset[0]["target_hidden_states"].shape == (4, _HIDDEN * len(_LAYERS))
@@ -522,3 +530,18 @@ def test_parser_mask_generation_prompt_flag():
     base = ["--target-model", "tiny", "--input-data", "data.jsonl", "--output-dir", "out"]
     assert _build_parser().parse_args(base).mask_generation_prompt is False
     assert _build_parser().parse_args(base + ["--mask-generation-prompt"]).mask_generation_prompt is True
+
+
+def test_parser_chat_template_kwargs_flag():
+    base = ["--target-model", "tiny", "--input-data", "data.jsonl", "--output-dir", "out"]
+    assert _build_parser().parse_args(base).chat_template_kwargs is None
+    args = _build_parser().parse_args(base + ["--chat-template-kwargs", '{"thinking_mode": "thinking"}'])
+    assert args.chat_template_kwargs == {"thinking_mode": "thinking"}
+
+
+@pytest.mark.parametrize("value", ["not json", "[1, 2]"])
+def test_parser_chat_template_kwargs_rejects_non_objects(value, capsys):
+    base = ["--target-model", "tiny", "--input-data", "data.jsonl", "--output-dir", "out"]
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(base + ["--chat-template-kwargs", value])
+    assert "--chat-template-kwargs" in capsys.readouterr().err

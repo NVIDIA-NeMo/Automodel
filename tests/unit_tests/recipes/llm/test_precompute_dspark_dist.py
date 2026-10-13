@@ -157,6 +157,7 @@ def test_build_manifest_schema():
     assert manifest["mask_reasoning_content"] is False
     assert manifest["mask_generation_prompt"] is False
     assert manifest["chat_template_sha256"] == "0" * 64
+    assert manifest["chat_template_kwargs"] == {}
 
 
 def test_ensure_output_dir_compatible_absent_manifest_is_noop(tmp_path):
@@ -191,11 +192,21 @@ def test_ensure_output_dir_compatible_rejects_different_input_identity(tmp_path)
         ("mask_reasoning_content", True),
         ("mask_generation_prompt", True),
         ("chat_template_sha256", "f" * 64),
+        ("chat_template_kwargs", {"enable_thinking": False}),
     ]:
         with pytest.raises(ValueError, match=field):
             pdd._ensure_output_dir_compatible(
                 str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(**{field: value}))
             )
+
+
+def test_read_manifest_does_not_share_a_mutable_default(tmp_path):
+    from nemo_automodel.components.datasets.llm.dspark_cache import read_manifest, write_manifest
+
+    current = pdd.build_cache_manifest(**_manifest_kwargs())
+    write_manifest(str(tmp_path), {k: v for k, v in current.items() if k != "chat_template_kwargs"})
+    read_manifest(str(tmp_path), allow_incomplete=True)["chat_template_kwargs"]["leaked"] = True
+    assert read_manifest(str(tmp_path), allow_incomplete=True)["chat_template_kwargs"] == {}
 
 
 def test_ensure_output_dir_compatible_allows_rerun_into_incomplete_dir(tmp_path):
@@ -489,7 +500,11 @@ def test_run_writes_cache_single_process(monkeypatch, tmp_path):
     cfg = _Cfg(
         {
             "dist_env": {"backend": "gloo"},
-            "recipe_args": _recipe_cfg(cache_output_dir=cache_dir, mask_generation_prompt=True),
+            "recipe_args": _recipe_cfg(
+                cache_output_dir=cache_dir,
+                mask_generation_prompt=True,
+                chat_template_kwargs={"enable_thinking": False},
+            ),
         }
     )
     assert pdd.run(cfg) == 0
@@ -499,6 +514,8 @@ def test_run_writes_cache_single_process(monkeypatch, tmp_path):
     # The loss-mask option reaches both the dataloader and the recorded input identity.
     assert loader_kwargs["mask_generation_prompt"] is True
     assert manifest["mask_generation_prompt"] is True
+    assert loader_kwargs["chat_template_kwargs"] == {"enable_thinking": False}
+    assert manifest["chat_template_kwargs"] == {"enable_thinking": False}
     assert manifest["target_layer_ids"] == _LAYERS
     dataset = CachedDSparkDataset(cache_dir)
     assert len(dataset) == 3
@@ -529,8 +546,12 @@ def test_main_parses_config_and_runs(monkeypatch):
     assert seen["cfg"] is sentinel_cfg
 
 
-def test_manifest_without_mask_generation_prompt_matches_default(tmp_path):
-    """Caches written before the field existed compare as ``mask_generation_prompt=False``."""
+@pytest.mark.parametrize(
+    ("field", "default", "other"),
+    [("mask_generation_prompt", False, True), ("chat_template_kwargs", {}, {"enable_thinking": False})],
+)
+def test_manifest_without_a_later_field_matches_its_default(tmp_path, field, default, other):
+    """Caches written before a field existed compare as its default (``MANIFEST_DEFAULTS``)."""
     from nemo_automodel.components.datasets.llm.dspark_cache import (
         manifest_mismatch_fields,
         read_manifest,
@@ -538,14 +559,12 @@ def test_manifest_without_mask_generation_prompt_matches_default(tmp_path):
     )
 
     current = pdd.build_cache_manifest(**_manifest_kwargs())
-    legacy = {k: v for k, v in current.items() if k != "mask_generation_prompt"}
+    legacy = {k: v for k, v in current.items() if k != field}
     write_manifest(str(tmp_path), legacy)
 
-    # The reader fills the field in, so the legacy cache compares (and trains) as False.
+    # The reader fills the field in, so the legacy cache compares (and trains) as the default.
     recorded = read_manifest(str(tmp_path), allow_incomplete=True)
-    assert recorded["mask_generation_prompt"] is False
+    assert recorded[field] == default
     assert manifest_mismatch_fields(recorded, current) == []
-    assert manifest_mismatch_fields(
-        recorded, pdd.build_cache_manifest(**_manifest_kwargs(mask_generation_prompt=True))
-    ) == ["mask_generation_prompt"]
+    assert manifest_mismatch_fields(recorded, pdd.build_cache_manifest(**_manifest_kwargs(**{field: other}))) == [field]
     pdd._ensure_output_dir_compatible(str(tmp_path), current)  # no raise
