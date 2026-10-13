@@ -344,7 +344,8 @@ def test_flex_membership_gives_empty_rows_a_kernel_safe_dummy_route() -> None:
         dtype=torch.int32,
     )
 
-    membership, has_routes = _routes_to_membership(selected, kv_length=4)
+    packed, has_routes = _routes_to_membership(selected, kv_length=4)
+    membership = ((packed[..., :1].int() >> torch.arange(4)) & 1).bool()
 
     torch.testing.assert_close(has_routes, torch.tensor([[False, True, True, False]]))
     torch.testing.assert_close(

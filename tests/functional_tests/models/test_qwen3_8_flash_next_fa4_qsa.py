@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import qsa_gqa_attention
 
 pytestmark = pytest.mark.skipif(
@@ -80,7 +81,8 @@ def _reference(
     "seed,batch,sq,sk,width",
     [(11, 1, 1, 1, 1), (19, 1, 17, 31, 17), (23, 2, 33, 65, 41), (29, 1, 127, 263, 129), (31, 1, 256, 257, 2051)],
 )
-def test_output_and_all_gradients(seed: int, batch: int, sq: int, sk: int, width: int) -> None:
+@pytest.mark.parametrize("backend", ["cute", "flex"])
+def test_output_and_all_gradients(seed: int, batch: int, sq: int, sk: int, width: int, backend: str) -> None:
     torch.manual_seed(seed)
     q = torch.randn(batch, sq, 24, 512, device="cuda", dtype=torch.bfloat16)[..., ::2].requires_grad_()
     k = torch.randn(batch, sk, 2, 512, device="cuda", dtype=torch.bfloat16)[..., ::2].requires_grad_()
@@ -97,7 +99,7 @@ def test_output_and_all_gradients(seed: int, batch: int, sq: int, sk: int, width
         routes[:, 3 : sq // 2] = routes[:, 3 : sq // 2].remainder(sk // 3)
         routes[:, sq // 2 :] = routes[:, sq // 2 :].remainder(sk - sk * 2 // 3) + sk * 2 // 3
     scale = 0.125
-    out = qsa_gqa_attention(q, k, v, routes, backend="cute", softmax_scale=scale)
+    out = qsa_gqa_attention(q, k, v, routes, backend=backend, softmax_scale=scale)
     grads = torch.autograd.grad(out, (q, k, v), dy)
     inputs64 = [x.detach().double().requires_grad_() for x in (q, k, v)]
     ref, mask = _reference(*inputs64, routes, scale=scale)
@@ -111,7 +113,8 @@ def test_output_and_all_gradients(seed: int, batch: int, sq: int, sk: int, width
     assert torch.count_nonzero(grads[1][unused]) == 0
     assert torch.count_nonzero(grads[2][unused]) == 0
 
-    call = functools.partial(fa4_sparse_gqa_attention, softmax_scale=scale)
+    attention = fa4_sparse_gqa_attention if backend == "cute" else flex_sparse_gqa_attention
+    call = functools.partial(attention, softmax_scale=scale)
     checkpointed = checkpoint(call, q, k, v, routes, use_reentrant=False)
     ac_grads = torch.autograd.grad(checkpointed, (q, k, v), dy)
     for actual, expected in zip((checkpointed, *ac_grads), (ref, *ref_grads)):
@@ -256,3 +259,51 @@ def test_model_qsa_layer_parameter_gradients(monkeypatch: pytest.MonkeyPatch) ->
         assert torch.isfinite(result).all(), name
         relative = (result.float() - target.float()).norm() / target.float().norm().clamp_min(1e-12)
         assert relative < 0.015, (name, float(relative))
+
+
+@pytest.mark.parametrize("sk", [7, 8, 31, 32, 33, 80, 81, 65537])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_atomic_bitset_matches_cpu_route_sets(sk: int, dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise word boundaries, invalid/duplicate IDs, tails and strided reads."""
+    from nemo_automodel.components.models.qwen3_8_flash_next import fa4_qsa
+
+    # Other tests exercise the compiled end-to-end path. Compare the discrete
+    # CUDA builder and block lists to CPU without compiling every boundary size.
+    for name in ("_prepare_membership", "_compact_blocks"):
+        monkeypatch.setattr(fa4_qsa, name, getattr(fa4_qsa, name).__wrapped__)
+    torch.manual_seed(4147 + sk)
+    queries = 3 if sk > 1024 else 129
+    # Slice every axis so the builder must honor all three input strides.
+    backing = torch.randint(-4, sk + 5, (4, queries * 2, 258), dtype=dtype)
+    routes = backing[::2, ::2, ::2]
+    routes[:, 0] = -1
+    routes[:, 1] = min(31, sk - 1)
+    routes[:, 2] = -1
+    routes[:, 2, :4] = torch.tensor([0, min(32, sk - 1), sk - 1, sk])
+    if dtype == torch.int64:
+        routes[:, 2, 4:6] = torch.tensor([2**40 + 1, -(2**40) - 1])
+    expected = fa4_qsa._preprocess(routes, sk)
+    actual = fa4_qsa._preprocess(backing.cuda()[::2, ::2, ::2], sk)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result.cpu(), reference, rtol=0, atol=0)
+
+    # Expanded batch/query strides are zero, another valid noncontiguous layout.
+    broadcast = routes[:1, 1:2].cuda().expand(2, 3, -1)
+    mask = fa4_qsa._preprocess(broadcast, sk)[0]
+    torch.testing.assert_close(mask.cpu(), expected[0][:1, 1:2].expand(2, 3, -1), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_bitset_noncurrent_device():
+    from nemo_automodel.components.models.common.route_bitset import build_route_bitset
+
+    original = torch.cuda.current_device()
+    try:
+        torch.cuda.set_device(0)
+        routes = torch.tensor([[[0, 31, 32, -1]]], device="cuda:1")
+        result = build_route_bitset(routes, 33)
+        assert result.device == routes.device
+        assert result.cpu().tolist() == [[[1, 0, 0, 128, 1]]]
+        assert torch.cuda.current_device() == 0
+    finally:
+        torch.cuda.set_device(original)

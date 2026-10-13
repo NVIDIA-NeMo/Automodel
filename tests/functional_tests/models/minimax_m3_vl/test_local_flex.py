@@ -290,7 +290,9 @@ def test_local_flex_forward_backward(
     actual = attn(x, freqs_cis=freqs, attention_mask=mask)
     expected, selected, keep = _reference(reference, xr, freqs, mask)
     assert len(selections) == 1
-    torch.testing.assert_close(selections[0], selected, rtol=0, atol=0)
+    blocks = torch.arange(selected.shape[-1], device=selected.device)
+    unpacked = ((selections[0][..., blocks // 8].int() >> (blocks % 8)) & 1).bool()
+    torch.testing.assert_close(unpacked, selected, rtol=0, atol=0)
     boundary = attn.indexer.topk_blocks * attn.indexer.block_size
     has_sparse_tail = length > boundary
     dropped = keep[0, :, boundary:].sum(-1) < torch.arange(boundary + 1, max(boundary, length) + 1, device="cuda")
