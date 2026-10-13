@@ -474,6 +474,8 @@ def _apply_parallelization(
 
     if not torch.distributed.is_initialized():
         raise RuntimeError("Distributed environment must be initialized for parallelization")
+    # Preserve explicit placement, including CPU, over the single-rank Gloo
+    # CUDA default. Copy the context to keep the caller's settings unchanged.
     if (
         device is not None
         and isinstance(mesh_context.strategy_config, DDPConfig)
