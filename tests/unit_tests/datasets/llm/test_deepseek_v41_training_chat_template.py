@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The DeepSeek-V4.1-Flash DSpark training chat template.
+"""The DeepSeek-V4.1-Flash training chat template.
 
 The template is a training preamble followed by the released ``deepseek-ai/DeepSeek-V4.1-Flash``
 ``chat_template.jinja`` body (revision ``2cba9e42aa026125f3ed06c6d98c1db82f7ca027``), unchanged
@@ -29,9 +29,10 @@ from transformers.utils.chat_template_utils import render_jinja_template
 
 from nemo_automodel.components.datasets.llm import formatting_utils
 
-REPO_ROOT = Path(__file__).parents[3]
-TEMPLATE_PATH = REPO_ROOT / "examples/speculative/dspark/deepseek_v41_flash_training_chat_template.jinja"
+REPO_ROOT = Path(__file__).parents[4]
+TEMPLATE_PATH = REPO_ROOT / "examples/llm_finetune/deepseek_v41/deepseek_v41_flash_training_chat_template.jinja"
 TEMPLATE = TEMPLATE_PATH.read_text()
+TULU3_TEMPLATE = (REPO_ROOT / "examples/llm_finetune/deepseek_v41/tulu3_chat_template.jinja").read_text()
 YAML_PATH = REPO_ROOT / "examples/speculative/dspark/deepseek_v41_flash_dspark.yaml"
 # sha256 of the released chat_template.jinja after its leading comment block.
 RELEASED_BODY_SHA256 = "899908e9e015a11ebc6e7ed39a0c57b7e99d30d81362f2358a2f30b3c54ece93"
@@ -64,10 +65,10 @@ TOOL_TURNS = [
 ]
 
 
-def _render(messages, **kwargs):
+def _render(messages, template=TEMPLATE, **kwargs):
     (rendered,), (spans,) = render_jinja_template(
         conversations=[messages],
-        chat_template=TEMPLATE,
+        chat_template=template,
         return_assistant_tokens_mask=True,
         **kwargs,
     )
@@ -162,6 +163,20 @@ def test_generation_prompt_is_unchanged(thinking_mode, expected):
     )
     assert rendered == expected
     assert spans == []
+
+
+@pytest.mark.parametrize(
+    ("messages", "add_generation_prompt"),
+    [
+        (SYSTEM_CHAT + [{"role": "user", "content": "Again"}, {"role": "assistant", "content": "Hi again."}], False),
+        ([{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello!"}] + SYSTEM_CHAT, False),
+        ([{"role": "user", "content": "Hi"}], True),
+    ],
+)
+def test_chat_mode_matches_the_tulu3_sft_template(messages, add_generation_prompt):
+    # The V4.1 SFT recipes use tulu3_chat_template.jinja; both must frame the roles it accepts the same way.
+    tokens = {"bos_token": BOS, "eos_token": EOS, "add_generation_prompt": add_generation_prompt}
+    assert _render(messages, **tokens) == _render(messages, template=TULU3_TEMPLATE, **tokens)
 
 
 def test_invalid_thinking_mode_is_rejected():
