@@ -1,6 +1,6 @@
 ---
 title: "Beam-1.0-501B-A23B"
-description: "Fine-tune Beam-1.0-501B-A23B, Reflection AI's 501B sparse MoE language model, with NeMo AutoModel using a one-node EP8 LoRA recipe."
+description: "Fine-tune Beam-1.0-501B-A23B, Reflection AI's 501B sparse MoE language model, with NeMo AutoModel: a one-node LoRA recipe and an 8-node full-parameter recipe."
 slug: model-coverage/large-language-models/reflection/Beam-1.0-501B-A23B
 ---
 
@@ -12,7 +12,7 @@ slug: model-coverage/large-language-models/reflection/Beam-1.0-501B-A23B
 |---|---|
 | **Task** | Text Generation (MoE, mixed sliding-window and full attention) |
 | **Architecture** | `BeamForCausalLM` (`model_type: beam`) |
-| **Parameters** | 501.3B total, 23.4B activated per token |
+| **Parameters** | 501B total, 23B activated per token |
 | **Validated hardware** | LoRA: 1 node, 8 H200 GPUs, EP8; full-parameter SFT: 8 nodes, 64 H200 GPUs, EP64 |
 | **HF Org** | [reflection](https://huggingface.co/reflection) |
 
@@ -20,13 +20,40 @@ slug: model-coverage/large-language-models/reflection/Beam-1.0-501B-A23B
 
 ## Fine-Tune Beam
 
-Follow the [installation instructions](/get-started/installation), then run the LoRA recipe from the repository root on one node of eight 141 GB GPUs:
+Follow the [installation instructions](/get-started/installation), then run the LoRA recipe from the repository root on one node of 8xH200 GPUs (141 GB VRAM):
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml
 ```
 
-The recipe trains rank-32 LoRA adapters on the attention and dense-MLP projections and on the routed experts with EP8, packed 2048-token sequences of the Tulu-3 SFT mixture, and a global batch of 64 packs. It needs about 130 GiB per GPU, so it does not fit 80 GB GPUs at EP8. Keep `backend.enable_fsdp_optimizations: false` when the global batch implies gradient accumulation; otherwise every layer's gathered parameters stay resident through the backward pass and the first backward runs out of memory.
+The recipe trains rank-32 LoRA adapters on the attention and dense-MLP projections and on the routed experts with EP8, packed 2048-token sequences of the Tulu-3 SFT mixture, and a global batch of 64 packs.
+
+For full-parameter SFT, run the 8-node recipe on each of 8 nodes of 8xH200 GPUs, with `NODE_RANK` 0-7 and `MASTER_ADDR` set to the first node:
+
+```bash
+uv run torchrun --nnodes=8 --nproc-per-node=8 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml
+```
+
+It trains all weights with EP64 on the same Tulu-3 data, packed to 4096 tokens, with a global batch of 64 packs. TE FusedAdam keeps fp32 master weights and Adam moments while the model weights and checkpoints stay bf16. Each checkpoint holds about 6 TB, so `checkpoint_dir` must be on a shared filesystem.
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml). |
+| Run full-parameter SFT on 8 nodes | Use the [full-parameter recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml). |
+| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8x H200 (141 GB) |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=8 |
+| Nodes | 1 |
+| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), LoRA, Packed sequences (packed_sequence_size=2048), Transformer Engine |
+| Advanced | bfloat16, attention=te, linear=torch, experts=torch_mm, dispatcher=torch |
 
 ## Model Reference
 
@@ -44,17 +71,32 @@ The recipe trains rank-32 LoRA adapters on the attention and dense-MLP projectio
 | Vocabulary | 151,936, untied embeddings and LM head |
 | Output | Final logit soft-capping at 30.0 |
 
-### Implementation
+## Architecture
 
-- `BeamForCausalLM` mirrors the Hugging Face module tree, so checkpoints load without renames except for the experts. `BeamStateDictAdapter` converts the per-expert `gate_proj` / `up_proj` / `down_proj` weights to the grouped layout and back, so exports match the Hugging Face layout.
+- `BeamStateDictAdapter` converts the per-expert `gate_proj` / `up_proj` / `down_proj` weights of the Hugging Face checkpoint to the grouped expert layout and back, so exports keep the Hugging Face layout.
 - The router weight and `e_score_correction_bias` stay fp32 through the model cast, checkpoint load, FSDP2 sharding (their own fp32 unit) and export.
 - Parallelism: EP, FSDP2, PP and CP are supported; TP is not. Context parallelism requires the TE attention backend. Full-attention layers use TE's `p2p` exchange; sliding-window layers use `all_gather`, or `a2a` for packed (THD) input, which needs the CP size to divide the 48 query and 8 KV heads (CP 2, 4 or 8).
-- Backends: attention `te`, `sdpa` or `flex` (`flex` rejects attention masks), linear `torch` or `te`, experts `torch` or `torch_mm`. FP8 uses the existing torchao and TE paths; the grouped experts stay bf16.
-- Requires a `transformers` version that includes the Beam model (`transformers.models.beam`).
+- Backends: attention `te`, `sdpa` or `flex`, linear `torch` or `te`, experts `torch` or `torch_mm`. `flex` handles only unpadded, unpacked batches: it rejects a padding `attention_mask` and packed (THD) input, so use `te` or `sdpa` for padded or packed data. FP8 uses the existing torchao and TE paths; the grouped experts stay bf16.
+
+## Validated Configuration
+
+| Area | Validated Configuration |
+| --- | --- |
+| Training | Full-parameter SFT with FSDP2 and activation checkpointing |
+| Optimizer | TE FusedAdam with fp32 master weights (bf16 weights plus 16-bit remainders) and fp32 Adam moments |
+| Distributed setup | EP64 / CP1, TP1 / PP1 |
+| Workload | `allenai/tulu-3-sft-mixture`, packed 4,096-token sequences |
+| Batch | Local batch size 1; global batch size 64 |
+| Scale | 8 nodes / 64 H200 GPUs |
+| Duration | 100 optimizer steps |
+
+The [full-parameter recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml) reduced training loss from 0.6622 at step 0 to 0.5137 at step 99, with a mean of 0.5183 over steps 10-99, and the validation loss from 0.4832 after 25 steps to 0.4682 after 100. Peak logged memory was 117.0 GiB per GPU. The run completed without non-finite losses or gradient norms and saved the model and optimizer state after 50 and 100 steps, about 6 TB per checkpoint. Resuming from the checkpoint saved after 50 steps on the same 8 nodes reproduced the next step's loss bit-exactly, stayed within 0.05% of the uninterrupted run over the following 10 steps, and did not raise peak memory. This validates the training mechanics, not model convergence.
 
 ## Numerical Validation
 
-Logits of the native implementation against the Hugging Face reference on 4 held-out Tulu-3 conversations of 4096 tokens (16,384 positions, full vocabulary), measured on a pre-release Beam checkpoint with the same architecture. Truncated models keep the first N decoder layers plus embeddings, final norm and LM head.
+### Hugging Face Logit Parity
+
+Logits of the native implementation against the Hugging Face reference on 4 held-out Tulu-3 conversations of 4096 tokens (16,384 positions, full vocabulary). Truncated models keep the first N decoder layers plus embeddings, final norm and LM head.
 
 | Model | Compute | Mean KL | Logits cosine | Top-1 agreement |
 | --- | --- | ---: | ---: | ---: |
@@ -64,28 +106,36 @@ Logits of the native implementation against the Hugging Face reference on 4 held
 
 The FP32 row shows numerical equivalence; the BF16 rows measure rounding noise, which grows with depth and with near-tie expert selection. Loading the full checkpoint maps all 38,366 tensors with no missing or mismatched entries, and a load, sharded save and offline consolidation round trip reproduces all 38,366 tensors bit-exactly at EP1, EP2 and EP8.
 
-## Training Results
+### 100-Step LoRA Training
 
-| Run | Parallelism | Hardware | Result |
-| --- | --- | --- | --- |
-| LoRA SFT (this recipe), Tulu-3, 100 steps | EP8 | 1 node, 8 H200 | Validation loss 0.5272 to 0.4945, ~5,750 tokens/s, 130 GiB peak |
-| Full-parameter SFT, Tulu-3, 100 steps | EP64 | 8 nodes, 64 H200 | Validation loss 0.5209 to 0.5012, ~17,400 tokens/s, 74 GiB peak |
-| Full-parameter SFT, CP4 and CP8 vs CP1 | EP64 + CP | 8 nodes, 64 H200 | Mean absolute loss difference 0.0004 (CP4) and 0.0006 (CP8) over 100 steps |
+The LoRA recipe, [`beam_1_0_501b_a23b_tulu3_lora_ep8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml), trained for 100 steps on 1 node / 8 H200 GPUs.
 
-The LoRA row runs this recipe unchanged on the released checkpoint. The full-parameter rows used a pre-release checkpoint with the same architecture and kept bf16 weights and AdamW states. A full-parameter recipe is not included: a new one should keep fp32 master weights (see the [mixed-precision guide](/development/mixed-precision-training)), which this configuration has not been validated with.
+| Metric | Result |
+| --- | ---: |
+| Step 0 loss | 0.7253 |
+| Step 99 loss | 0.4777 |
+| Mean loss, steps 10-99 | 0.5110 |
+| Validation loss, after 10 / 100 steps | 0.5272 / 0.4945 |
+| Peak logged memory | 129.7 GiB |
+
+The validation loss on 256 held-out conversations fell at every evaluation. The run completed without non-finite losses or gradient norms.
+
+### Packed CP1 / CP4 / CP8 Training Parity
+
+The full model trained for 100 steps with the same Tulu-3 workload, global batch size 64, EP64, TP1 and PP1, using torch AdamW with bf16 optimizer state. The CP1 reference packs documents with the same per-document alignment as the CP runs.
+
+| Run | Resources | Peak Logged Memory | Step 99 Loss |
+| --- | ---: | ---: | ---: |
+| CP1 | 8 nodes / 64 H200s | 74.30 GiB | 0.6219 |
+| CP4 | 8 nodes / 64 H200s | 92.67 GiB | 0.6213 |
+| CP8 | 8 nodes / 64 H200s | 91.55 GiB | 0.6219 |
+
+Across all 100 matched steps, the CP4 loss curve differed from CP1 by a mean absolute difference of 0.000413 (RMSE 0.000465, maximum 0.0012), and the CP8 curve by 0.000582 (RMSE 0.000880, maximum 0.0022).
 
 ## Current Scope
 
 - Tensor parallelism is not supported, and the LM head must stay untied from the embeddings.
 - Packed context parallelism needs CP 2, 4 or 8.
-- Saving the full model at EP8 on one node of 8 H200 GPUs runs out of memory while materializing the per-expert export views (it fits 8 B300 GPUs). On H200, save sharded from two nodes and consolidate offline with `tools/offline_hf_consolidation.py`. LoRA adapter checkpoints are not affected.
-- TE MXFP8 with LoRA needs LoRA ranks divisible by 32; torchao Float8 together with LoRA is not supported.
-
-## Example Recipes
-
-| Recipe | Description |
-| --- | --- |
-| [beam_1_0_501b_a23b_tulu3_lora_ep8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml) | LoRA SFT on the Tulu-3 SFT mixture, one node of eight H200 GPUs, EP8 |
 
 ## Related Resources
 
