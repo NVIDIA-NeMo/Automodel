@@ -1,27 +1,5 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# One-node MuseGlimmer TP2/CP2 recipe with 2K packing and FP32 optimizer state.
-# TP2 shards all language attention projections; the model has exactly two KV heads.
-# CP2 splits activations across two ranks to leave room for FP32 Adam moments and masters.
-#
-# Run on one 8-GPU node:
-#   automodel examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix_te_tp2_cp2.yaml --nproc-per-node 8
-
 recipe: FinetuneRecipeForVLM
 seed: 1234
-
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
@@ -31,65 +9,52 @@ step_scheduler:
   gc_every_steps: 5
   num_epochs: 1
   max_steps: 100
-
 dist_env:
   backend: nccl
   timeout_minutes: 30
-
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1234
   ranked: true
-
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
   torch_dtype: bfloat16
-  # HF config validation remains on SDPA; native language attention is selected below.
   attn_implementation: sdpa
   backend:
     attn: te
   use_liger_kernel: false
-
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
   trust_remote_code: true
-
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/muse_glimmer_30b_medpix_te_tp2_cp2/
+  checkpoint_dir: checkpoints/muse_glimmer_30b_medpix_te_tp2_cp1/
   model_save_format: safetensors
   save_consolidated: false
-
 distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 2
-  cp_size: 2
+  cp_size: 1
   pp_size: 1
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
   defer_fsdp_grad_sync: false
-
 freeze_config:
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
-
 loss_fn:
   _target_: nemo_automodel.components.loss.te_parallel_ce.TEParallelCrossEntropy
-
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
   split: train
-
 packed_sequence:
   pretokenize: true
-  # Keep documents within the native sliding window and cap packed streams at
-  # 2048 tokens to leave room for activations and optimizer state on eight H100s.
   max_length: 2048
   pack_size: 2048
   collate_max_length: 2048
@@ -97,42 +62,47 @@ packed_sequence:
   drop_long_samples: true
   balance_media_tokens: true
   packing_format: thd
-
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 0
   drop_last: true
-
-# Train for 100 optimizer steps without a trailing validation epoch.
 validation_dataset: none
 validation_dataloader: none
-
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.FusedAdam
-  betas: [0.9, 0.95]
+  betas:
+  - 0.9
+  - 0.95
   eps: 1e-8
-  lr: 5.0e-6
+  lr: 5.0e-06
   weight_decay: 0.1
   adam_w_mode: true
   master_weights: true
   master_weight_dtype: torch.float32
   exp_avg_dtype: torch.float32
   exp_avg_sq_dtype: torch.float32
-
 lr_scheduler:
   lr_decay_style: constant
-
 wandb:
   enable: false
   project: automodel-muse-glimmer
   entity: <your_wandb_entity>
-  name: muse_glimmer_30b_medpix_packed2k_te_tp2_cp2_100step
-  group: muse_glimmer_30b_medpix_packed2k_te_tp2_cp2
-  tags: [muse_glimmer, 30b, dense, vlm, medpix, packed2k, thd, te, tp2, cp2]
-  dir: logs/muse_glimmer_30b_medpix_te_tp2_cp2/wandb
-
+  name: muse_glimmer_30b_medpix_packed2k_te_tp2_cp1_100step
+  group: muse_glimmer_30b_medpix_packed2k_te_tp2_cp1
+  tags:
+  - muse_glimmer
+  - 30b
+  - dense
+  - vlm
+  - medpix
+  - packed2k
+  - thd
+  - te
+  - tp2
+  - cp1
+  dir: logs/muse_glimmer_30b_medpix_te_tp2_cp1/wandb
 ci:
   recipe_owner: HuiyingLi
-  nodes: 1
-  time: "02:00:00"
+  nodes: 2
+  time: 02:00:00
   max_steps: 5
