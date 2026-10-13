@@ -94,6 +94,7 @@ from nemo_automodel.components.models.deepseek_v4.processing import (
     IMAGE_START,
     build_image_block,
 )
+from nemo_automodel.components.models.deepseek_v4.sparse_mask import build_dsv4_sparse_mask
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.models.deepseek_v4.vision import (
     DeepseekV4VisionAligner,
@@ -944,7 +945,37 @@ class DeepseekV4Model(nn.Module):
                 packed_seq_ids = packed_seq_ids.unsqueeze(0)
             attn_kwargs["packed_seq_ids"] = packed_seq_ids
 
-        if cp_active and packed_seq_ids is not None:
+        # Custom 4-D masks and image visibility retain their established path.
+        # Text TileLang consumes selected IDs and only needs compact metadata.
+        use_sparse_mask = (
+            self.backend.attn == "tilelang"
+            and vision_token_types is None
+            and (attention_mask is None or attention_mask.dim() == 2)
+        )
+        sparse_mask = None
+        if use_sparse_mask:
+            local_positions = torch.arange(shape_ref.shape[1], device=shape_ref.device).unsqueeze(0)
+            mask_positions = position_ids if cp_active else local_positions.expand(shape_ref.shape[0], -1)
+            mask_seq_ids = packed_seq_ids if cp_active or packed_seq_lens is not None else None
+            # The local THD mask uses padded document extents, not a separate
+            # padding mask; preserve that contract exactly.
+            mask_padding = None
+            if cp_active:
+                mask_padding = padding_mask
+                if mask_padding is None and attention_mask is not None:
+                    mask_padding = attention_mask == 0
+            elif packed_seq_lens is None and attention_mask is not None:
+                mask_padding = attention_mask == 0
+            sparse_mask = build_dsv4_sparse_mask(
+                mask_positions,
+                key_len=shape_ref.shape[1] * dsv4_cp_size(cp_group),
+                packed_seq_ids=mask_seq_ids,
+                padding_mask=mask_padding,
+                sliding_window=sliding_window,
+                cp_group=cp_group,
+            )
+            attention_mask_4d = None
+        elif cp_active and packed_seq_ids is not None:
             cp_padding_mask = padding_mask
             if cp_padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
                 cp_padding_mask = attention_mask.bool().logical_not()
@@ -1015,6 +1046,7 @@ class DeepseekV4Model(nn.Module):
                 position_embeddings_compress=position_embeddings_compress,
                 rotary_compress=self.rotary_emb_compress,
                 attention_mask=attention_mask_4d,
+                sparse_mask=sparse_mask,
                 padding_mask=padding_mask
                 if padding_mask is not None
                 else (
@@ -1455,7 +1487,27 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
             sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
             cp_group = attn_kwargs.get("_dsv4_cp_group")
-            if dsv4_cp_enabled(cp_group):
+            mtp_sparse_mask = None
+            if self.backend.attn == "tilelang" and (attention_mask is None or attention_mask.dim() == 2):
+                cp_active = dsv4_cp_enabled(cp_group)
+                mask_positions = (
+                    position_ids
+                    if cp_active
+                    else torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
+                )
+                mask_padding = padding_mask if cp_active else None
+                if mask_padding is None and attention_mask is not None:
+                    mask_padding = attention_mask == 0
+                mtp_sparse_mask = build_dsv4_sparse_mask(
+                    mask_positions,
+                    key_len=seq_len * dsv4_cp_size(cp_group),
+                    packed_seq_ids=None,
+                    padding_mask=mask_padding,
+                    sliding_window=sliding_window,
+                    cp_group=cp_group,
+                )
+                mtp_attn_mask = None
+            elif dsv4_cp_enabled(cp_group):
                 cp_padding_mask = padding_mask
                 if cp_padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
                     cp_padding_mask = attention_mask.bool().logical_not()
@@ -1481,6 +1533,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 "hidden_states": mtp_hc_hidden,
                 "position_ids": position_ids,
                 "attention_mask": mtp_attn_mask,
+                "sparse_mask": mtp_sparse_mask,
                 "padding_mask": padding_mask,
             }
             if cp_group is not None:
