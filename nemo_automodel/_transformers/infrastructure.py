@@ -505,6 +505,7 @@ def apply_model_infrastructure(
     cache_dir=None,
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
+    preserve_parameter_dtypes: bool = False,
     inject_te_attention: bool = False,
     load_metadata_with_gloo: bool = False,
     **_kwargs,
@@ -542,6 +543,8 @@ def apply_model_infrastructure(
             model init (e.g., by HF's from_pretrained on a real device, which also
             handles BnB quantization atomically). When True, checkpoint loading in
             this function is skipped. Default: False.
+        preserve_parameter_dtypes: Keep per-parameter storage precision during
+            materialization. The model initializer must support dtype=None.
         inject_te_attention: When True, inject TransformerEngine DotProductAttention
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
@@ -626,7 +629,12 @@ def apply_model_infrastructure(
                 # Only meta-device models need their parameter shells materialized first.
                 if is_meta_device:
                     lora_a_init = getattr(peft_config, "lora_A_init", None)
-                    checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+                    checkpointer.initialize_model_weights(
+                        model,
+                        device,
+                        peft_init_method=lora_a_init,
+                        preserve_parameter_dtypes=preserve_parameter_dtypes,
+                    )
                 checkpointer.load_base_model(
                     model,
                     device,
@@ -738,7 +746,12 @@ def apply_model_infrastructure(
                 # a different number of DTensor RNG collectives on each stage. Every
                 # parameter is about to be populated from the pretrained checkpoint.
                 mp._skip_init_weights_on_load = True
-            checkpointer.initialize_model_weights(mp, init_device, peft_init_method=lora_a_init)
+            checkpointer.initialize_model_weights(
+                mp,
+                init_device,
+                peft_init_method=lora_a_init,
+                preserve_parameter_dtypes=preserve_parameter_dtypes,
+            )
 
     # Load the checkpoint if pretrained weights are needed and weren't already loaded
     # (e.g., by HF's from_pretrained on a real device, which also handles BnB
