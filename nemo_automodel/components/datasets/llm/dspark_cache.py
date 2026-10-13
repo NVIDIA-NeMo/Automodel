@@ -99,6 +99,7 @@ def build_cache_manifest(
     mask_reasoning_content: bool,
     chat_template_sha256: str,
     mask_generation_prompt: bool = False,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the DSpark cache manifest.
 
@@ -108,9 +109,9 @@ def build_cache_manifest(
 
     Beyond the tensor-shaping target/cache settings, the manifest records the
     *input identity* of the run (dataset path/split, shuffle seed, masking
-    settings, effective chat template): a rerun into an existing directory with
-    a different input therefore fails the manifest-compatibility check instead
-    of silently interleaving old and new supervision shard by shard.
+    settings, effective chat template and its kwargs): a rerun into an existing
+    directory with a different input therefore fails the manifest-compatibility
+    check instead of silently interleaving old and new supervision shard by shard.
     """
     hidden_size = int(target_text_config.hidden_size)
     return {
@@ -132,6 +133,7 @@ def build_cache_manifest(
         "mask_reasoning_content": bool(mask_reasoning_content),
         "mask_generation_prompt": bool(mask_generation_prompt),
         "chat_template_sha256": chat_template_sha256,
+        "chat_template_kwargs": dict(chat_template_kwargs or {}),
     }
 
 
@@ -139,7 +141,11 @@ _IDENTITY_EXEMPT_FIELDS = ("format_version", "complete")
 # Manifest fields added after the first release, with the value a producer that
 # predates them effectively used; ``read_manifest`` fills them in so older
 # caches compare and train as if they recorded it.
-MANIFEST_DEFAULTS: dict[str, Any] = {"mask_reasoning_content": False, "mask_generation_prompt": False}
+MANIFEST_DEFAULTS: dict[str, Any] = {
+    "mask_reasoning_content": False,
+    "mask_generation_prompt": False,
+    "chat_template_kwargs": {},
+}
 
 
 def manifest_mismatch_fields(recorded: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
