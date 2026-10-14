@@ -35,7 +35,7 @@ Numerics follow the eager path by construction wherever PyTorch allows it:
   multiplication contracts the imaginary component differently across PyTorch/CUDA builds
   and devices. A small eager multiplication selects the matching order once per device;
   only that choice is cached for the process lifetime. The same order is used for the
-  conjugate in the backward. Unrecognized arithmetic takes the eager path.
+  conjugate in the backward. Unrecognized arithmetic defaults to the first-product order.
 * The FP32 result is rounded to ``values.dtype`` with round-to-nearest-even, exactly as
   ``Tensor.to`` rounds.
 """
@@ -59,7 +59,7 @@ _FUSED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 @lru_cache(maxsize=16)
 @torch.compiler.assume_constant_result
-def _imaginary_fma_uses_second_product(device: torch.device) -> bool | None:
+def _imaginary_fma_uses_second_product(device: torch.device) -> bool:
     """Identify eager complex multiplication's contraction for this CUDA device.
 
     The bounded, process-local cache retains only the arithmetic choice, not tensors.
@@ -71,8 +71,8 @@ def _imaginary_fma_uses_second_product(device: torch.device) -> bool | None:
         device: CUDA device on which the eager reference will execute.
 
     Returns:
-        Whether the imaginary component fuses its second product, or None if neither
-        supported contraction matches the eager reference exactly.
+        Whether the eager reference matches the second-product contraction exactly.
+        Otherwise, use the first-product contraction.
     """
     values = torch.tensor(
         [[1.2345, -0.9876], [-1.392927, 0.757227], [0.812345, 1.987654], [-0.765432, -1.234567]],
@@ -83,16 +83,11 @@ def _imaginary_fma_uses_second_product(device: torch.device) -> bool | None:
     x0, x1 = values.double().unbind(-1)
     cos, sin = frequencies.double().unbind(-1)
     real = (x0 * cos - (x1 * sin).float().double()).float()
-    first = torch.stack((real, (x0 * sin + (x1 * cos).float().double()).float()), dim=-1)
     second = torch.stack((real, (x1 * cos + (x0 * sin).float().double()).float()), dim=-1)
     actual = torch.view_as_real(
         torch.view_as_complex(values).to(device) * torch.view_as_complex(frequencies).to(device)
     ).cpu()
-    if torch.equal(actual, first):
-        return False
-    if torch.equal(actual, second):
-        return True
-    return None
+    return torch.equal(actual, second)
 
 
 if HAVE_TRITON:
@@ -293,7 +288,6 @@ def _uses_fused_kernel(values: torch.Tensor, frequencies: torch.Tensor) -> bool:
         and frequencies.dtype == torch.complex64
         and values.dtype in _FUSED_DTYPES
         and values.ndim in (3, 4)
-        and _imaginary_fma_uses_second_product(values.device) is not None
     )
 
 
