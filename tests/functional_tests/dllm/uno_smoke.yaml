@@ -34,7 +34,7 @@ peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: ["*_proj"]
   dim: 16
-  alpha: 256      # Uno ratio alpha = 16 * r
+  alpha: 256      # alpha = 16 * r, as in the released Uno-Qwen3-8B recipe
   dropout: 0.0
 
 checkpoint:
