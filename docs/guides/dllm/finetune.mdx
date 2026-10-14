@@ -54,7 +54,7 @@ For a dedicated walkthrough of DiffusionGemma fine-tuning, including full fine-t
 
 ## Install NeMo AutoModel
 
-Install NeMo AutoModel with uv:
+Install NeMo AutoModel with `uv`:
 
 ```bash
 uv venv
@@ -114,7 +114,7 @@ SCDD (see the [SCDD paper](https://openreview.net/forum?id=zQKlzKB6I9)) trains s
 instead of bolting it on at inference. Its forward process mixes the usual absorbing `[MASK]` noise
 with **uniform token transitions**, so the model is trained on contexts that contain
 wrong-but-plausible tokens and learns to overwrite them. The objective adds a correction term at
-every visible position on top of the familiar denoising term at `[MASK]` positions, which is what
+every visible position on top of the familiar denoising term at `[MASK]` positions. That extra term
 lets the sampler decode many tokens per step without the quality collapse a pure absorbing model
 shows under parallel decoding.
 
@@ -145,7 +145,7 @@ dataset:
 ```
 
 The schedule values above match the config shipped with the authors' released checkpoint. Their
-only other released setting differs solely in `uniform_ratio: 0.2`, so that is the first knob to
+only other released setting differs solely in `uniform_ratio: 0.2`, so that is the first hyperparameter to
 sweep.
 
 Decode SCDD checkpoints with `--sampler scdd`, passing the same `uniform_ratio`, `schedule_shape`,
@@ -187,7 +187,7 @@ Refer to [`diffusion_gemma_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/b
 ```yaml
 model:
   pretrained_model_name_or_path: google/diffusiongemma-26B-A4B-it
-  torch_dtype: float32          # fp32 master weights; compute is bf16 via mp_policy
+  torch_dtype: float32          # fp32 master weights; compute is bf16 using mp_policy
   canvas_length: 256
   self_conditioning: true
   freeze_router: true
@@ -255,8 +255,10 @@ dflash:
   block_size: 0                                 # 0 reads from draft model config
   loss_decay_gamma: 0.0                         # 0 uses paper defaults (γ=7 for block_size=16)
   num_blocks_per_sample: 512                    # Paper default (Appendix A.1)
-  attention_backend: flex_attention             # required for N > ~64; sdpa OOMs
-  overlap_anchors: true                         # paper samples anchors independently
+  attention_backend: flex_attention             # Required for N > ~64; sdpa OOMs
+  overlap_anchors: true                         # Paper samples anchors independently
+  loss_type: dflash                             # dflash | dpace | dpace-cumulative-confidence-only | dpace-continuation-value-only
+  dpace_alpha: 0.5                              # Smoothing alpha for the D-PACE variants
 ```
 
 The following table describes the key configuration fields for DFlash fine-tuning:
@@ -269,6 +271,24 @@ The following table describes the key configuration fields for DFlash fine-tunin
 | `dflash.num_blocks_per_sample` | Number of anchor blocks processed per sequence per step (paper default: 512, Appendix A.1) |
 | `dflash.attention_backend` | `flex_attention` (sparse, scales to 512 anchors) or `sdpa` (dense, runs out of memory above approximately 64). The default is `sdpa` for backward compatibility. Set it to `flex_attention` for production runs. |
 | `dflash.overlap_anchors` | `true` (paper, independent sampling) or `false` (non-overlapping stars-and-bars, caps at `seq_len // block_size`) |
+| `dflash.loss_type` | `dflash` (decay-weighted CE, default) or a D-PACE variant: `dpace`, `dpace-cumulative-confidence-only`, `dpace-continuation-value-only` (detached confidence-aware weights) |
+| `dflash.dpace_alpha` | Smoothing α in `[0, 1]` for the D-PACE confidence products; ignored when `loss_type: dflash` |
+
+<Note>
+The `dpace*` variants implement D-PACE (Dynamic Position-Aware Cross-Entropy),
+which reweights each position by detached cumulative draft confidence; see
+[arXiv:2605.18810](https://arxiv.org/abs/2605.18810). Their weighted sum is
+divided by the globally reduced batch size times `num_blocks_per_sample`. This
+is equivalent to the local mean used by the dedicated DFlash recipe
+(`train_dflash.py`), including across data-parallel ranks and gradient
+accumulation, so `dpace_alpha` and `optimizer.lr` are portable between paths.
+
+Switching `loss_type` from `dflash` to a `dpace*` variant here does change the
+scale: `dflash` uses `normalize="tokens"` (a supervised-token count) in this
+strategy, not `normalize="mean"`, so it is on a different scale than either
+D-PACE convention. Retune `optimizer.lr` when switching `loss_type`.
+
+</Note>
 
 #### DFlash Training Metrics
 
@@ -279,7 +299,7 @@ In addition to the shared metrics (such as `loss`, `grad_norm`, `lr`, `mem`, `tp
 | `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` | Console line and `wandb`, `mlflow`, `comet`, and file loggers |
 | `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`), which forms the acceptance-length curve | `wandb`, `mlflow`, `comet`, and file loggers (one panel per offset). Intentionally omitted from the console line to keep it readable. |
 
-Both metrics are computed from the logits that the chunked linear cross-entropy path already produces, without an additional model forward pass. They are reduced across data-parallel and context-parallel ranks using per-rank raw `(correct, count)` sums. An all-reduce operation sums these values before division. This process ensures that the values are correct across arbitrary per-rank token distributions in any AutoModel distributed mode.
+Both metrics are computed from the logits that the chunked linear cross-entropy path already produces, without an additional model forward pass. They are reduced across data-parallel and context-parallel ranks using per-rank raw `(correct, count)` sums. An all-reduce operation sums these values before division. This process ensures that the values are correct across arbitrary per-rank token distributions in any NeMo AutoModel distributed mode.
 
 #### Prepare DFlash Training Data
 
@@ -336,6 +356,8 @@ dataset:
 The mask is built for `sdpa` or `eager` (dense additive) or `flex_attention` (sparse `BlockMask`, preferred at scale). FlashAttention-2 is unsupported because it ignores arbitrary masks, and context parallelism is also unsupported. The paper trains a `block_length` 1→2→3 curriculum (one epoch each). Run the stages as successive fine-tunes, and enable `auto_balance_clean_loss` at the b3 stage.
 
 ## Fine-Tune the Model
+
+Run the following commands to launch fine-tuning for each supported model family.
 
 ### Fine-Tune LLaDA2
 
@@ -459,7 +481,7 @@ uv run python examples/dllm_generate/generate.py \
 
 ### Generation Parameters
 
-The sampler selected with the `--sampler` argument supplies these preset values. LLaDA uses the standalone AutoModel sampler. LLaDA2, Nemotron, and DiffusionGemma call the built-in `generate()` methods of their models. DiffusionGemma only forwards `--steps` (as `max_denoising_steps`, default 48) and `--max_new_tokens` (default 256). The remaining flags keep their upstream Hugging Face defaults. The `--remasking` and `--no_kv_cache` arguments do not affect LLaDA2 or DiffusionGemma generation.
+The sampler selected with the `--sampler` argument supplies these preset values. LLaDA uses the standalone NeMo AutoModel sampler. LLaDA2, Nemotron, and DiffusionGemma call the built-in `generate()` methods of their models. DiffusionGemma only forwards `--steps` (as `max_denoising_steps`, default 48) and `--max_new_tokens` (default 256). The remaining flags keep their upstream Hugging Face defaults. The `--remasking` and `--no_kv_cache` arguments do not affect LLaDA2 or DiffusionGemma generation.
 
 The following table lists the default and preset values for the generation parameters:
 

@@ -38,7 +38,7 @@ from nemo_automodel.recipes.dllm.strategy import (
     _build_target_layer_ids,
     get_dllm_strategy,
 )
-
+from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -581,6 +581,8 @@ def test_dflash_setup_extra_resolves_fake_target_and_config(monkeypatch):
                 "overlap_anchors": False,
                 "use_fused_linear_ce": False,
                 "ce_chunk_size": 17,
+                "loss_type": "dpace",
+                "dpace_alpha": 0.25,
             },
             "dataset": {"seq_length": 128},
         },
@@ -610,6 +612,39 @@ def test_dflash_setup_extra_resolves_fake_target_and_config(monkeypatch):
     assert isinstance(strategy.dflash_loss_fn, DFlashDecayLoss)
     assert strategy.dflash_loss_fn.loss_gamma == 4.0
     assert strategy.dflash_loss_fn.chunk_size == 17
+    assert strategy.dflash_loss_fn.loss_type == "dpace"
+    assert strategy.dflash_loss_fn.dpace_alpha == 0.25
+    # pre_step supplies the globally reduced batch-block denominator.
+    assert strategy.dflash_loss_fn.normalize == "tokens"
+
+
+def test_dflash_setup_extra_keeps_tokens_normalize_for_the_dflash_default(monkeypatch):
+    """Unlike D-PACE, ``loss_type="dflash"`` predates this recipe and keeps its
+    existing ``normalize="tokens"`` -- switching it would retune every already
+    deployed DFlash config built on this strategy."""
+    monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: _FakeTargetModel())
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _FakeTokenizer())
+
+    draft = types.SimpleNamespace(config=types.SimpleNamespace(block_size=8, num_target_layers=12, num_hidden_layers=3))
+    recipe = types.SimpleNamespace(
+        cfg={"dflash": {"target_model_id": "fake-target"}, "dataset": {}},
+        mask_token_id=None,
+        dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+        model_parts=[draft],
+    )
+
+    strategy = DFlashStrategy()
+    strategy.setup_extra(recipe)
+
+    assert strategy.dflash_loss_fn.loss_type == "dflash"
+    assert strategy.dflash_loss_fn.normalize == "tokens"
+
+
+def test_dflash_setup_extra_rejects_context_parallel(monkeypatch):
+    recipe = types.SimpleNamespace(distributed_config=types.SimpleNamespace(cp_size=2))
+
+    with pytest.raises(ValueError, match="context parallelism"):
+        DFlashStrategy().setup_extra(recipe)
 
 
 def test_dflash_setup_extra_requires_target_model_id():
@@ -685,6 +720,26 @@ def test_dflash_pre_step_stashes_target_and_anchor_tensors():
     assert batch["_dflash_block_output_ids"].shape == (2, 8)
     assert batch["_dflash_block_targets"].shape == (2, 6)
     assert batch["_dflash_block_mask"].sum().item() == 12.0
+
+
+def test_dpace_pre_step_routes_batch_block_denominator_to_recipe():
+    strategy = _make_strategy(block_size=4, overlap_anchors=False)
+    strategy.num_blocks_per_sample = 2
+    strategy.dflash_loss_fn = DFlashDecayLoss(loss_type="dpace")
+    strategy._run_target_forward = lambda input_ids, attention_mask, start: torch.ones(input_ids.size(0), start, 3)
+    recipe = types.SimpleNamespace(mask_token_id=MASK_ID, dist_env=types.SimpleNamespace(device=torch.device("cpu")))
+    batch = {
+        "input_ids": torch.arange(32, dtype=torch.long).view(2, 16),
+        "attention_mask": torch.ones(2, 16, dtype=torch.long),
+        "loss_mask": torch.ones(2, 16, dtype=torch.long),
+    }
+
+    num_noise, num_supervised = strategy.pre_step(recipe, [batch])
+    recipe.dllm_strategy = strategy
+    num_diffusion, num_ar = DiffusionLMSFTRecipe._compute_loss_denominators(recipe, [batch], num_noise, num_supervised)
+
+    assert (num_noise, num_supervised) == (12, 4)
+    assert (num_diffusion, num_ar) == (4, 4)
 
 
 @pytest.mark.parametrize("use_fused_linear_ce", [False, True])
