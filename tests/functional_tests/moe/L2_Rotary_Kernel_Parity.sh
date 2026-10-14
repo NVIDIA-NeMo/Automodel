@@ -17,4 +17,5 @@ set -xeuo pipefail
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 TRANSFORMERS_OFFLINE=1 python3 -m pytest -q \
-    tests/functional_tests/moe/test_gptoss_compiled_rope.py
+    tests/functional_tests/moe/test_gptoss_compiled_rope.py \
+    tests/functional_tests/moe/test_packed_complex_rope.py

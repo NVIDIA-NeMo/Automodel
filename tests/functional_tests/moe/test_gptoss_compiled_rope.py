@@ -17,7 +17,11 @@ import torch
 from torch._dynamo.utils import counters
 from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb
 
-from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.components.models.gpt_oss.rope_utils import (
+    RotaryEmbedding,
+    apply_rotary_emb_qk,
+    position_ids_to_freqs_cis,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="compiled RoPE requires CUDA")
 
@@ -92,3 +96,57 @@ def test_packed_rope_reuses_compiled_graph_across_token_counts(dtype: torch.dtyp
     # A disabled compiled branch produces zero; static specialization reaches
     # the default eight-graph limit and then silently switches to eager.
     assert 1 <= counters["stats"]["unique_graphs"] - graphs_before <= 2
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("rotary_dim", [64, 128])
+def test_packed_document_resets_and_padding_match_hf(dtype: torch.dtype, rotary_dim: int) -> None:
+    """Compare padded THD documents independently, including partial YaRN rotation and gradients."""
+    torch.compiler.reset()
+    graphs_before = counters["stats"]["unique_graphs"]
+    torch.manual_seed(4346)
+    lengths, extents = (1, 7, 3, 18), (4, 8, 4, 20)
+    # The third document has a nonzero starting position; padding uses position 0.
+    offsets = (0, 0, 65536, 0)
+    positions = torch.cat(
+        [
+            torch.cat((torch.arange(length) + offset, torch.zeros(extent - length)))
+            for length, extent, offset in zip(lengths, extents, offsets)
+        ]
+    ).to(device="cuda", dtype=torch.int64)
+    rotary = RotaryEmbedding(
+        head_dim=128,
+        base=10000,
+        dtype=torch.float32,
+        scaling_factor=4.0,
+        partial_rotary_factor=rotary_dim / 128,
+        device=torch.device("cuda"),
+    )
+    frequencies = position_ids_to_freqs_cis(rotary, positions, qkv_format="thd", for_fused_rope=False)
+    concentration, inv_freq = rotary._compute_concentration_and_inv_freq()
+    q = torch.randn(sum(extents), 8, 256, device="cuda", dtype=dtype)[..., ::2].requires_grad_()
+    k = torch.randn(sum(extents), 2, 256, device="cuda", dtype=dtype)[..., ::2].requires_grad_()
+    actual = apply_rotary_emb_qk(q, k, frequencies, format="thd", rope_fusion=False)
+    expected_q, expected_k = [], []
+    for q_doc, k_doc, length, extent, offset in zip(q.split(extents), k.split(extents), lengths, extents, offsets):
+        doc_positions = torch.cat(
+            (torch.arange(length, device="cuda") + offset, torch.zeros(extent - length, device="cuda"))
+        )
+        angles = doc_positions.float().unsqueeze(-1) * inv_freq
+        cos, sin = (angles.cos() * concentration).to(dtype), (angles.sin() * concentration).to(dtype)
+        q_rot, k_rot = apply_rotary_pos_emb(
+            q_doc[..., :rotary_dim],
+            k_doc[..., :rotary_dim],
+            torch.cat((cos, cos), -1),
+            torch.cat((sin, sin), -1),
+            unsqueeze_dim=1,
+        )
+        expected_q.append(torch.cat((q_rot, q_doc[..., rotary_dim:]), -1))
+        expected_k.append(torch.cat((k_rot, k_doc[..., rotary_dim:]), -1))
+    expected = (torch.cat(expected_q), torch.cat(expected_k))
+    upstream = (torch.randn_like(q), torch.randn_like(k))
+    actual_grads = torch.autograd.grad(actual, (q, k), upstream)
+    expected_grads = torch.autograd.grad(expected, (q, k), upstream)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_grads, expected_grads, rtol=0, atol=0)
+    assert counters["stats"]["unique_graphs"] > graphs_before

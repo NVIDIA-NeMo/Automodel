@@ -869,17 +869,19 @@ def test_cuda_rotary_matches_complex_reference_and_input_gradient(dtype, layout)
         ),
     ],
 )
-def test_trainable_rotary_frequencies_keep_their_gradient(device):
+@pytest.mark.parametrize("packed", [False, True])
+def test_trainable_rotary_frequencies_keep_their_gradient(device, packed):
     torch.manual_seed(19)
-    values = torch.randn(2, 17, 3, 64, device=device, requires_grad=True)
-    angles = torch.randn(2, 17, 32, device=device)
+    shape = (17, 3, 64) if packed else (2, 17, 3, 64)
+    values = torch.randn(*shape, device=device, requires_grad=True)
+    angles = torch.randn(*shape[:-2], 32, device=device)
     frequencies = torch.polar(torch.ones_like(angles), angles).requires_grad_()
     grad = torch.randn_like(values)
     expected = torch.view_as_real(
-        torch.view_as_complex(values.unflatten(-1, (-1, 2))) * frequencies.unsqueeze(2)
+        torch.view_as_complex(values.unflatten(-1, (-1, 2))) * frequencies.unsqueeze(-2)
     ).flatten(-2)
     expected_grads = torch.autograd.grad(expected, (values, frequencies), grad)
-    actual = apply_rotary_emb(values, frequencies)
+    actual = apply_rotary_emb(values, frequencies, qkv_format="thd" if packed else "bshd")
     actual_grads = torch.autograd.grad(actual, (values, frequencies), grad)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
