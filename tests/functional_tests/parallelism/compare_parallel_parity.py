@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 
 # Both runs share a seed and a data order, so step 1 differs only by floating-
 # point reduction order. Later steps accumulate that difference through the
@@ -77,6 +78,8 @@ def read_metrics(jsonl_path: str) -> dict[int, dict[str, float]]:
             grad_norm = record.get("grad_norm")
             if grad_norm is not None:
                 sample["grad_norm"] = float(grad_norm)
+            for key, value in sample.items():
+                assert math.isfinite(value), f"{jsonl_path}: step {record['step']} has non-finite {key}={value}"
             entries[int(record["step"])] = sample
     return entries
 
@@ -131,6 +134,7 @@ def main() -> None:
     parser.add_argument("baseline_jsonl", help="training.jsonl from the single-rank baseline run")
     parser.add_argument("parallel_jsonl", help="training.jsonl from the parallel run")
     parser.add_argument("--axis", required=True, help="Parallelism axis under test, e.g. pp/tp/cp/ep")
+    parser.add_argument("--expected-steps", type=int, help="Require every training step from 0 through N-1")
     parser.add_argument("--loss-tol", type=float, default=DEFAULT_LOSS_TOL, help="Absolute per-step loss tolerance")
     parser.add_argument(
         "--grad-norm-rtol",
@@ -142,6 +146,11 @@ def main() -> None:
 
     baseline = read_metrics(args.baseline_jsonl)
     parallel = read_metrics(args.parallel_jsonl)
+    if args.expected_steps is not None:
+        expected = set(range(args.expected_steps))
+        for name, metrics in (("baseline", baseline), ("parallel", parallel)):
+            assert set(metrics) == expected, f"{name}: expected steps {sorted(expected)}, got {sorted(metrics)}"
+            assert all("grad_norm" in row for row in metrics.values()), f"{name}: missing gradient norms"
 
     assert len(baseline) > 0, f"No training records in {args.baseline_jsonl}"
     assert len(parallel) > 0, f"No training records in {args.parallel_jsonl}"

@@ -42,6 +42,10 @@ inputs:
     description: "0-based pytest-shard index for splitting a suite across runners"
     required: false
     default: ""
+  gpu-count:
+    description: "Number of GPUs exposed to the test suite"
+    required: false
+    default: "2"
   num-shards:
     description: "Total number of pytest-shard chunks the suite is split into"
     required: false
@@ -149,7 +153,7 @@ runs:
             export NCCL_NET=Socket
           fi
 
-          bash tests/run_test.sh --UNIT_TEST=${{ inputs.is-unit-test }} --CPU=${{ inputs.cpu-only}} --TEST_NAME=${{ inputs.test-folder }} --SHARD_ID=${{ inputs.shard-id }} --NUM_SHARDS=${{ inputs.num-shards }}
+          bash tests/run_test.sh --UNIT_TEST=${{ inputs.is-unit-test }} --CPU=${{ inputs.cpu-only}} --TEST_NAME=${{ inputs.test-folder }} --SHARD_ID=${{ inputs.shard-id }} --NUM_SHARDS=${{ inputs.num-shards }} --GPU_COUNT=${{ inputs.gpu-count }}
 
         '
 

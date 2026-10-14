@@ -1,0 +1,103 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Training/validation parity using the shared GPU worker group."""
+
+import json
+import math
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from tests.functional_tests.parallelism_multigpu.gpu_workers import GPUWorkers
+
+REPO = Path(__file__).resolve().parents[3]
+
+
+def gpu_count() -> int:
+    """Require a four- or eight-GPU allocation; a wrong runner must fail."""
+    import torch
+
+    count = torch.cuda.device_count()
+    assert count in (4, 8), f"This suite needs four or eight visible GPUs, got {count}"
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        assert count == len(visible.split(",")), f"Requested GPUs {visible}, but only {count} are available"
+    return count
+
+
+def compare_recipe_runs(*, baseline: Path, parallel: Path, loss_tol: float, grad_norm_rtol: float) -> None:
+    """Require all three training steps and final validation to agree and be finite."""
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "tests/functional_tests/parallelism/compare_parallel_parity.py"),
+            str(baseline / "training.jsonl"),
+            str(parallel / "training.jsonl"),
+            "--axis",
+            "pp",
+            "--expected-steps",
+            "3",
+            "--loss-tol",
+            str(loss_tol),
+            "--grad-norm-rtol",
+            str(grad_norm_rtol),
+        ],
+        check=True,
+    )
+    validation = []
+    for directory in (baseline, parallel):
+        records = [
+            json.loads(line) for line in (directory / "validation.jsonl").read_text().splitlines() if line.strip()
+        ]
+        assert len(records) == 1 and records[0]["step"] == 2, records
+        loss = float(records[0]["val_loss"])
+        assert math.isfinite(loss), f"{directory}: non-finite validation loss {loss}"
+        validation.append(loss)
+    assert abs(validation[0] - validation[1]) <= loss_tol, validation
+
+
+def run_recipe_pair(
+    *,
+    workers: GPUWorkers,
+    pp_size: int,
+    config: Path,
+    overrides: list[str],
+    output: Path,
+    loss_tol: float,
+    grad_norm_rtol: float,
+) -> None:
+    """Compare PP with a no-PP reference sharing global weights, data and batch size."""
+    workers.run(
+        {"kind": "recipe", "config": str(config), "overrides": overrides, "pp_size": pp_size, "output": str(output)},
+        output,
+    )
+    initial_weights = []
+    for name in ("baseline", "parallel"):
+        weights = {}
+        for path in (output / name).glob("initial_weights.*.json"):
+            for parameter, fingerprint in json.loads(path.read_text()).items():
+                assert parameter not in weights or weights[parameter] == fingerprint, parameter
+                weights[parameter] = fingerprint
+        assert weights, f"No initial parameter fingerprints in {name}"
+        initial_weights.append(weights)
+    assert initial_weights[0] == initial_weights[1], "Baseline and PP must start from identical weights"
+    # A successful numerical comparison must actually have used the static PP path.
+    log = (output / "worker.log").read_text()
+    assert "Precomputed pipeline stage shapes" in log
+    assert "dynamic metadata inference" not in log
+    compare_recipe_runs(
+        baseline=output / "baseline", parallel=output / "parallel", loss_tol=loss_tol, grad_norm_rtol=grad_norm_rtol
+    )

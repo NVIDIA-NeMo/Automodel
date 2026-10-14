@@ -113,7 +113,7 @@ def initialize_distributed(
                 flush=True,
             )
         if device_count > 0:
-            device = torch.cuda.current_device()
+            device = torch.device("cuda", torch.cuda.current_device())
     else:
         if get_rank_safe() == 0:
             print("> initializing torch distributed with {} workers.".format(get_world_size_safe()), flush=True)
