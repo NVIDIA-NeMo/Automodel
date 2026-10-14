@@ -3,7 +3,7 @@ title: "Mixed-Precision Training"
 description: "Recommended dtype patterns for fp32 master weights and optimizer state, bf16 compute, and FSDP2 mixed precision in NeMo AutoModel."
 ---
 
-NeMo AutoModel uses FSDP2's [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) to control compute precision during forward and backward, and the model's storage dtype (`model.dtype`) to control the precision of the *resident* sharded parameter. Together, these decide what numeric precision the optimizer state ends up in, which is the part that determines whether long full-parameter training runs converge cleanly.
+NeMo AutoModel uses FSDP2's [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) to control compute precision during forward and backward, and the model's storage dtype (`model.dtype`) to control the precision of the *resident* sharded base parameters. LoRA adapters have a separate storage setting, `peft.lora_dtype`, which defaults to fp32. With PyTorch Adam/AdamW, optimizer moment buffers follow the storage dtype of each trainable parameter. This distinction matters for update precision in both full-parameter training and LoRA.
 
 This page describes the recommended precision patterns and the pattern to avoid. For any long full-parameter training run (pre-training or extended fine-tuning), the key rule is: do not combine `torch.optim.AdamW` with bf16 resident parameters unless you have explicitly accepted bf16 master weights and Adam state.
 
@@ -15,12 +15,13 @@ Precision settings have distinct effects:
 
 | Setting | Controls | Effect on Optimizer State |
 | --- | --- | --- |
-| `model.dtype` | Storage dtype of the sharded parameter that PyTorch holds. | For `torch.optim.Adam`/`AdamW`, the EMA buffers (`exp_avg`, `exp_avg_sq`) use this dtype. Transformer Engine (TE) FusedAdam configures master weights and EMA dtypes separately. |
+| `model.dtype` | Storage dtype of the sharded base parameters that PyTorch holds. | For trainable base parameters, `torch.optim.Adam`/`AdamW` EMA buffers (`exp_avg`, `exp_avg_sq`) use the parameter dtype. Frozen base parameters require no optimizer state. Transformer Engine (TE) FusedAdam configures master weights and EMA dtypes separately. |
+| `peft.lora_dtype` | LoRA adapter storage dtype, defaulting to fp32 independently of base storage. | With `torch.optim.Adam`/`AdamW`, adapter EMA buffers follow the adapter storage dtype and therefore default to fp32. |
 | `mp_policy.param_dtype` | Compute dtype FSDP2 casts to during forward/backward. | None directly; this only affects matmul/activation precision. |
 | `mp_policy.reduce_dtype` | Dtype used for gradient reduce-scatter/all-reduce across data-parallel (DP) ranks. | None directly; this only affects how gradients are summed. |
 | `mp_policy.output_dtype` | Dtype FSDP2 casts module outputs to. | None directly; this affects activation tensors, including tensors that cross pipeline-parallel boundaries. |
 
-When `model.dtype: bfloat16` is used with `torch.optim.AdamW`, the AdamW EMA buffers (`exp_avg` and `exp_avg_sq`) are also stored in bf16. This is fragile for long full-parameter training runs: bf16 has only a 7-bit mantissa, so small EMA updates can be rounded away even though the values themselves are still in range. Symptoms range from silent degradation (slower convergence, that is, higher final loss at the same step count, with no visible instability) to overt failure: unstable `grad_norm`, loss bumps, loss spikes, or divergence.
+When trainable parameters are stored in bf16 and updated with `torch.optim.AdamW`, their AdamW EMA buffers (`exp_avg` and `exp_avg_sq`) are also stored in bf16. This is fragile for long full-parameter training runs: bf16 has only a 7-bit mantissa, so small EMA updates can be rounded away even though the values themselves are still in range. Symptoms range from silent degradation (slower convergence, that is, higher final loss at the same step count, with no visible instability) to overt failure: unstable `grad_norm`, loss bumps, loss spikes, or divergence.
 
 ## Recommended fp32 Master Weight and Optimizer-State Patterns
 
@@ -116,9 +117,31 @@ Both patterns keep the master weights and Adam EMA in fp32, so for most models t
 
 This is usually negligible. When bringing up a new model, fp32 storage (Pattern B) is a robust starting point because every part of the update path is fp32; move to TE (Pattern A) after it is validated for that model and you want bf16 checkpoints.
 
+## LoRA with bf16 Base Storage and fp32 Adapters
+
+For LoRA fine-tuning, use bf16 storage for frozen base weights and fp32 storage for trainable adapters. This applies to dense layers and MoE experts. Under the default FSDP2 mixed-precision policy, base and adapter matrix multiplications compute in bf16 while adapter storage remains fp32. Frozen base weights require no optimizer state; with `torch.optim.AdamW`, adapter gradients and Adam EMA buffers are fp32.
+
+The following settings can be added to a LoRA recipe with the appropriate target modules:
+
+```yaml
+model:
+  dtype: bfloat16
+
+peft:
+  lora_dtype: float32         # default; shown explicitly for clarity
+
+optimizer:
+  _target_: torch.optim.AdamW
+
+distributed:
+  strategy: fsdp2            # default mixed-precision policy uses bf16 compute
+```
+
+`peft.lora_dtype` controls storage independently of compute precision. Setting it to `bfloat16` explicitly also makes the adapter's AdamW moment buffers bf16. For unquantized base weights, `lora_dtype: null` inherits the base weight dtype. Use an explicit override when needed and validate convergence for your workload. The fp32 adapter default provides a consistent update-precision policy; it does not imply that bf16 adapters fail on every fine-tuning task.
+
 ## Risky Pattern Using torch AdamW with bf16 Model Storage
 
-This pattern is easy to enter accidentally. In several NeMo AutoModel paths, leaving `model.dtype` unset, or setting it to `auto`, resolves the resident model parameter dtype to bf16. If that is paired with `torch.optim.AdamW`, the AdamW EMA buffers are also bf16 because the optimizer initializes state from the parameter dtype.
+This pattern is easy to enter accidentally during full-parameter training. In several NeMo AutoModel paths, leaving `model.dtype` unset, or setting it to `auto`, resolves the resident model parameter dtype to bf16. If those base parameters are trainable and updated with `torch.optim.AdamW`, their AdamW EMA buffers are also bf16 because the optimizer initializes state from the parameter dtype.
 
 ```yaml
 model:
@@ -131,7 +154,7 @@ distributed:
   strategy: fsdp2
 ```
 
-This keeps the resident model parameters in bf16 instead of fp32, so it can reduce memory usage compared to the torch AdamW and `model.dtype: float32` pattern. It is common in existing fine-tuning example configs and is probably acceptable for short fine-tuning runs or LoRA/PEFT. It is **not** recommended for long full-parameter training (pre-training or extended fine-tuning): bf16 EMA quantization can quietly slow convergence (higher final loss at the same step count) and, in worse cases, produce unstable `grad_norm`, loss bumps, loss spikes, or divergence.
+This keeps the resident model parameters in bf16 instead of fp32, so it can reduce memory usage compared to the torch AdamW and `model.dtype: float32` pattern. It is common in existing fine-tuning example configs; validate convergence even for short fine-tuning runs. It is **not** recommended for long full-parameter training (pre-training or extended fine-tuning): bf16 EMA quantization can quietly slow convergence (higher final loss at the same step count) and, in worse cases, produce unstable `grad_norm`, loss bumps, loss spikes, or divergence. For LoRA, bf16 frozen base storage does not imply bf16 adapter updates or optimizer state; see [LoRA with bf16 Base Storage and fp32 Adapters](#lora-with-bf16-base-storage-and-fp32-adapters).
 
 ## Example Configs
 

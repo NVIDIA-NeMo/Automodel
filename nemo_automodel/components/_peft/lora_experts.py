@@ -65,15 +65,25 @@ class GroupedExpertsLoRA(GroupedExperts):
         lora_down_B (nn.Parameter): LoRA B matrix for down projection.
     """
 
-    def __init__(self, orig_module: GroupedExperts, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
-        super().__init__(orig_module.config)
+    def __init__(
+        self,
+        orig_module: GroupedExperts,
+        lora_dim: int = 8,
+        alpha: int = 32,
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = torch.float32,
+    ) -> None:
+        # Transfer the existing base parameters before sharding/optimizer creation.
+        # A meta shell avoids allocating a second full set of expert weights.
+        with torch.device("meta"):
+            super().__init__(orig_module.config)
 
-        self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
-        self.down_projs.data.copy_(orig_module.down_projs.data)
+        self.gate_and_up_projs = orig_module.gate_and_up_projs
+        self.down_projs = orig_module.down_projs
 
         if self.expert_bias:
-            self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
-            self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
+            self.gate_up_proj_bias = orig_module.gate_up_proj_bias
+            self.down_proj_bias = orig_module.down_proj_bias
 
         # Copy backend setting from original (super().__init__ defaults to False without backend)
         self.use_torch_mm = orig_module.use_torch_mm
@@ -87,7 +97,9 @@ class GroupedExpertsLoRA(GroupedExperts):
         )
 
     @staticmethod
-    def _init_adapter(obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+    def _init_adapter(
+        obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype: torch.dtype | str | None = torch.float32
+    ):
         obj.lora_dim = lora_dim
         obj.scale = alpha / lora_dim
 
@@ -124,6 +136,8 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         # Initialize LoRA weights
         GroupedExpertsLoRA.init_lora_weights(obj, lora_A_init_method)
+        # Storage is chosen at construction; compute casts must not change it.
+        obj._preserve_parameter_dtypes = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
 
     @torch.no_grad
     def init_lora_weights(self, init_method):
@@ -399,15 +413,21 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     """
 
     def __init__(
-        self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
-    ):
-        super().__init__(
-            orig_module.config,
-            dispatcher_backend=orig_module.dispatcher_backend,
-            dispatcher_num_sms=orig_module.dispatcher_num_sms,
-            dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
-            dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
-        )
+        self,
+        orig_module: GroupedExpertsDeepEP,
+        lora_dim: int = 8,
+        alpha: int = 32,
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = torch.float32,
+    ) -> None:
+        with torch.device("meta"):
+            super().__init__(
+                orig_module.config,
+                dispatcher_backend=orig_module.dispatcher_backend,
+                dispatcher_num_sms=orig_module.dispatcher_num_sms,
+                dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
+                dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
+            )
         self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
         self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
@@ -419,12 +439,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
         self.dispatch_rows_never_empty = orig_module.dispatch_rows_never_empty
 
-        self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
-        self.down_projs.data.copy_(orig_module.down_projs.data)
+        self.gate_and_up_projs = orig_module.gate_and_up_projs
+        self.down_projs = orig_module.down_projs
 
         if self.expert_bias:
-            self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
-            self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
+            self.gate_up_proj_bias = orig_module.gate_up_proj_bias
+            self.down_proj_bias = orig_module.down_proj_bias
 
         # Copy DeepEP state from orig_module (set by init_token_dispatcher, not __init__)
         self.n_routed_experts = getattr(orig_module, "n_routed_experts", self.config.n_routed_experts)
@@ -442,7 +462,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         )
 
     @staticmethod
-    def _init_adapter(obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+    def _init_adapter(
+        obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype: torch.dtype | str | None = torch.float32
+    ):
         obj.lora_dim = lora_dim
         obj.scale = alpha / lora_dim
 
@@ -476,6 +498,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         )
 
         GroupedExpertsDeepEPLoRA.init_lora_weights(obj, lora_A_init_method)
+        obj._preserve_parameter_dtypes = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
 
     @torch.no_grad
     def init_lora_weights(self, init_method):

@@ -97,7 +97,12 @@ class TPLinear(nn.Linear):
             leading dimensions as ``x``; a DTensor if ``x`` and the weight
             are DTensors.
         """
-        return tp_linear_forward(x, self.weight, self.bias, mm_for_2d_compile=True)
+        weight = self.weight
+        # LoRA projections keep FP32 storage even in TP-only execution without FSDP.
+        if "weight" in getattr(self, "_preserve_parameter_dtypes", ()):
+            dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
+            weight = weight.to(dtype)
+        return tp_linear_forward(x, weight, self.bias, mm_for_2d_compile=True)
 
 
 class ColwiseParallelLora(ColwiseParallel):

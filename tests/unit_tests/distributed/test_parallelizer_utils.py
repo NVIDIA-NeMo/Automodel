@@ -1119,3 +1119,50 @@ def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
     assert compute_dtype_of(attention.sinks_param.weight) == torch.float32
     assert compute_dtype_of(attention.sinks_param.scale) == torch.float32
     assert compute_dtype_of(attention.proj.weight) == torch.bfloat16
+
+
+@pytest.mark.parametrize("modern_torch", [True, False])
+def test_frozen_bf16_base_with_fp32_adapter_storage(monkeypatch, modern_torch):
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class MixedStorage(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base = nn.Parameter(torch.ones(4, 4, dtype=torch.bfloat16), requires_grad=False)
+            self.adapter = nn.Parameter(torch.ones(4, 4, dtype=torch.float32))
+
+    model = MixedStorage()
+    calls = []
+    monkeypatch.setattr(parallelizer_utils, "is_torch_min_version", lambda version: modern_torch)
+    monkeypatch.setattr(parallelizer_utils, "fully_shard", lambda module, **kwargs: calls.append((module, kwargs)))
+    if not modern_torch:
+        with pytest.raises(ValueError, match="could not isolate parameters"):
+            fully_shard_by_dtype(model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=None)
+        assert not calls
+        return
+    fully_shard_by_dtype(model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=None)
+    assert len(calls) == 1
+    assert calls[0][0] is model
+    assert calls[0][1]["mp_policy"].param_dtype == torch.bfloat16
+    assert model.base.dtype == torch.bfloat16
+    assert model.adapter.dtype == torch.float32
+
+
+def test_mixed_lora_storage_keeps_fp32_compute_unit_separate(monkeypatch):
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    model = nn.Module()
+    model.experts = nn.Module()
+    model.experts.base = nn.Parameter(torch.ones(4, 4, dtype=torch.bfloat16), requires_grad=False)
+    model.experts.adapter = nn.Parameter(torch.ones(4, 4, dtype=torch.float32))
+    model.router = nn.Linear(4, 4, dtype=torch.float32)
+    calls = []
+    monkeypatch.setattr(parallelizer_utils, "is_torch_min_version", lambda version: True)
+    monkeypatch.setattr(parallelizer_utils, "fully_shard", lambda module, **kwargs: calls.append((module, kwargs)))
+    fully_shard_by_dtype(
+        model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=None, fp32_compute_module_names=("router",)
+    )
+    assert len(calls) == 2
+    policies = {id(module): kwargs["mp_policy"].param_dtype for module, kwargs in calls}
+    assert policies[id(model.experts)] == torch.bfloat16
+    assert policies[id(model)] == torch.float32

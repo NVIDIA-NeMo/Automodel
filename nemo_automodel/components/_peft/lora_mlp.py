@@ -180,15 +180,15 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         # ``addmm_`` is not autocast-eligible — an in-place op cannot change its output dtype — so
         # unlike the ``F.linear`` calls its operands are *not* auto-cast and must already be in the
         # base projection's dtype. They are not when the adapters are held in a different dtype than
-        # the base (``lora_dtype``), which the per-linear path handles via autocast; cast to keep the
+        # the base (``lora_dtype``); cast to keep the
         # fused path identical to it. A no-op when the dtypes already agree.
         e = F.linear(x2, gW)  # gate_out (saved)
-        e.addmm_(*_cast(e.dtype, F.linear(x2, gA) * gS, gB.t()))
+        e.addmm_(*_cast(e.dtype, F.linear(x2, gA.to(x2.dtype)) * gS, gB.t()))
         g = F.linear(x2, uW)  # up_out (saved)
-        g.addmm_(*_cast(g.dtype, F.linear(x2, uA) * uS, uB.t()))
+        g.addmm_(*_cast(g.dtype, F.linear(x2, uA.to(x2.dtype)) * uS, uB.t()))
         h = _swiglu_fwd(e, g)  # down-projection input (recomputed in backward)
         out = F.linear(h, dW)
-        out.addmm_(*_cast(out.dtype, F.linear(h, dA) * dS, dB.t()))
+        out.addmm_(*_cast(out.dtype, F.linear(h, dA.to(h.dtype)) * dS, dB.t()))
 
         # Save only x / gate_out / up_out; the SwiGLU activation and down-input are recomputed.
         ctx.save_for_backward(x2, e, g, gA, gB, uA, uB, dA, dB)
@@ -354,11 +354,11 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         # See LoRASwiGLUMLPFunction.forward: ``addmm_`` is not autocast-eligible, so cast its operands
         # to the base projection's dtype for a ``lora_dtype`` that differs from the base weights.
         e = F.linear(x2, uW)  # up_out (saved)
-        e.addmm_(*_cast(e.dtype, F.linear(x2, uA) * uS, uB.t()))
+        e.addmm_(*_cast(e.dtype, F.linear(x2, uA.to(x2.dtype)) * uS, uB.t()))
         relu_e = torch.relu(e)
         f = relu_e * relu_e  # down-projection input (recomputed in backward)
         out = F.linear(f, dW)
-        out.addmm_(*_cast(out.dtype, F.linear(f, dA) * dS, dB.t()))
+        out.addmm_(*_cast(out.dtype, F.linear(f, dA.to(f.dtype)) * dS, dB.t()))
         ctx.save_for_backward(x2, e, uA, uB, dA, dB)
         ctx.bases = (uW, dW)
         ctx.scales = (uS, dS)

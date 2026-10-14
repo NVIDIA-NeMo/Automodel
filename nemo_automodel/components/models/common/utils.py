@@ -1059,8 +1059,13 @@ def cast_model_to_dtype(
     Respects ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` on
     the model (the same attributes HuggingFace transformers uses).
 
-    Uses ``nn.Module.to()`` which is safe for both plain tensors and DTensors
-    (FSDP2 sharded parameters).  When the model is already FSDP2-sharded
+    Modules may declare ``_preserve_parameter_dtypes``, a tuple of directly owned
+    parameter names whose storage dtype is already configured independently of
+    compute (for example FP32 LoRA adapters). These parameters are excluded from the cast without copying or rounding their values. The
+    declaration survives meta materialization and FSDP parameter replacement.
+
+    Uses ``nn.Module._apply()`` (the mechanism behind ``to()``), supporting both
+    plain tensors and DTensors. When the model is already FSDP2-sharded
     (parameters are DTensors), strict fp32 modules are restored to fp32 because
     they are expected to be isolated as uniform fp32 FSDP units. Non-strict fp32
     hints only restore matching buffers, since their parameters may share an
@@ -1106,8 +1111,27 @@ def cast_model_to_dtype(
                     detached.append((parent, child_name, child))
                     parent._modules[child_name] = None
 
+    preserved_tensor_ids = set()
+    for module in model.modules():
+        for name in getattr(module, "_preserve_parameter_dtypes", ()):
+            parameter = module._parameters.get(name)
+            if parameter is not None:
+                preserved_tensor_ids.add(id(parameter))
+                if parameter.grad is not None:
+                    preserved_tensor_ids.add(id(parameter.grad))
+
+    def convert(tensor: torch.Tensor) -> torch.Tensor:
+        # Keep configured storage without rounding; otherwise match Module.to(dtype).
+        # Parameters remain registered so FSDP's _apply can refresh its shard views.
+        if id(tensor) in preserved_tensor_ids or not (tensor.is_floating_point() or tensor.is_complex()):
+            return tensor
+        return tensor.to(dtype=dtype)
+
     try:
-        model.to(dtype)
+        if preserved_tensor_ids:
+            model._apply(convert)
+        else:
+            model.to(dtype)
     finally:
         for parent, child_name, child in detached:
             parent._modules[child_name] = child
@@ -1160,8 +1184,8 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
     per-element perturbation that preserves the init statistics. Wrap the body of a model's
     ``initialize_weights`` to keep that round-trip in one place.
 
-    Works whether or not the model is already FSDP2-sharded: both casts are *uniform* whole-model
-    casts, so FSDP2's invariant that every parameter in a group shares one dtype is preserved. In
+    Works whether or not the model is already FSDP2-sharded. Adapter parameters declared
+    in ``_preserve_parameter_dtypes`` keep their independently configured storage. In
     the AutoModel pipeline ``initialize_weights`` actually runs after sharding (via
     ``checkpointer.initialize_model_weights``), i.e. on DTensor params, which is supported.
 
@@ -1457,7 +1481,9 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     ``_keep_in_fp32_modules_strict`` are left in fp32. The function is a no-op when
     ``compute_dtype`` is None and for tensors already in ``compute_dtype``. Frozen parameters
     are never updated during training. Trainable plain tensors are cast only in mixed subtrees,
-    where unsharded execution must match the requested compute dtype.
+    where unsharded execution must match the requested compute dtype. Parameters declared
+    in ``_preserve_parameter_dtypes`` retain their configured storage; their forward path
+    must provide compute casting (via autocast, FSDP, or explicit operand casts).
 
     Args:
         model: The model, already materialized, checkpoint-loaded, and sharded.
@@ -1481,6 +1507,12 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     # both matmul paths uniform. With FSDP, the trainable params are DTensors and remain managed
     # by its mixed-precision policy.
     named_params = list(model.named_parameters())
+    preserved_param_ids = {
+        id(module._parameters[name])
+        for module in model.modules()
+        for name in getattr(module, "_preserve_parameter_dtypes", ())
+        if module._parameters.get(name) is not None
+    }
     frozen_param_owners: set[str] = set()
     parameter_subtrees: set[str] = set()
     trainable_subtrees: set[str] = set()
@@ -1516,6 +1548,8 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     # Parameters: cast frozen plain floats and plain floats in mixed adapter subtrees; leave
     # all other trainable params and every sharded (DTensor) param to FSDP mixed precision.
     for name, param in named_params:
+        if id(param) in preserved_param_ids:
+            continue
         if (param.requires_grad and not _is_in_subtrees(name, mixed_subtrees)) or _is_fp32_pinned(name):
             continue
         if DTensor and isinstance(param, DTensor):

@@ -336,7 +336,7 @@ def test_apply_lora_respects_memory_efficient_lora_toggle():
 _PROJS = ("gate_proj", "up_proj", "down_proj")
 
 
-def _mixed_precision_mlp(activation, memory_efficient, lora_dtype=None):
+def _mixed_precision_mlp(activation, memory_efficient, lora_dtype=torch.float32):
     """A BF16-weight MLP with LoRA applied through the production entry point.
 
     ``apply_lora_to_linear_modules`` is what training actually calls: it patches the projections and
@@ -431,3 +431,20 @@ def test_fused_mlp_mixed_dtype_matches_unfused(case, act_dtype, lora_dtype, acti
     assert _rel(dx_f, dx_u) < 2e-2
     for name in grads_f:
         assert _rel(grads_f[name], grads_u[name]) < 2e-2, f"grad mismatch for {name}"
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "relu2"])
+def test_fused_mlp_fp32_storage_bf16_compute_without_autocast(activation):
+    fused = _mixed_precision_mlp(activation, memory_efficient=True)
+    unfused = _mixed_precision_mlp(activation, memory_efficient=False)
+    x = torch.randn(2, 8, 32, dtype=torch.bfloat16, requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_(True)
+    actual, expected = fused(x), unfused(ref_x)
+    assert actual.dtype == expected.dtype == torch.bfloat16
+    actual.float().square().sum().backward()
+    expected.float().square().sum().backward()
+    assert _rel(actual, expected) < 2e-2
+    assert _rel(x.grad, ref_x.grad) < 2e-2
+    for name, grad in _lora_grads(fused).items():
+        assert grad.dtype == torch.float32
+        assert _rel(grad, _lora_grads(unfused)[name]) < 2e-2, name
