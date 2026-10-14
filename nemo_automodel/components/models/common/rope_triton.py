@@ -31,19 +31,18 @@ Numerics follow the eager path by construction wherever PyTorch allows it:
   agreeing with the CUDA math library PyTorch was built with. They are computed once per
   forward call and saved for the backward, which is the same footprint as the eager path's
   saved ``frequencies``.
-* The complex product ``(x0 + i x1) * (c + i s)`` is evaluated in FP32 as
-  ``r0 = fma(x0, c, -(x1 * s))`` and ``r1 = fma(x0, s, x1 * c)``. ``c10::complex<float>``
-  multiplies as ``a * c - b * d`` and ``a * d + b * c``, and nvcc contracts each expression
-  into one FMA with the first product fused; the kernel spells that contraction out so the
-  result does not depend on Triton's FP-fusion default. The conjugate used by
-  ``inverse=True`` and by every backward only negates ``s``, which is exact and leaves the
-  rounding pattern unchanged. If a GPU parity run ever reports one-ulp differences, the two
-  ``tl.fma`` lines in :func:`_rope_kernel` are the single place to adjust.
+* The complex product is evaluated in FP32 with explicit FMAs. Eager CUDA complex
+  multiplication contracts the imaginary component differently across PyTorch/CUDA builds
+  and devices. A small eager multiplication selects the matching order once per device;
+  only that choice is cached for the process lifetime. The same order is used for the
+  conjugate in the backward. Unrecognized arithmetic takes the eager path.
 * The FP32 result is rounded to ``values.dtype`` with round-to-nearest-even, exactly as
   ``Tensor.to`` rounds.
 """
 
 from __future__ import annotations
+
+from functools import lru_cache
 
 import torch
 
@@ -56,6 +55,44 @@ HAVE_TRITON: bool = bool(_HAVE_TRITON and _HAVE_TRITON_LANGUAGE)
 # Elements of ``values`` handled by one program: 32 per thread at four warps.
 _ELEMENTS_PER_PROGRAM = 4096
 _FUSED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+@lru_cache(maxsize=16)
+@torch.compiler.assume_constant_result
+def _imaginary_fma_uses_second_product(device: torch.device) -> bool | None:
+    """Identify eager complex multiplication's contraction for this CUDA device.
+
+    The bounded, process-local cache retains only the arithmetic choice, not tensors.
+    Calibration synchronizes on first use, before the first Triton kernel compilation.
+    FP64 CPU products distinguish the two FP32 FMA orders without using a CUDA FMA
+    implementation as the reference or changing the random-number generator state.
+
+    Args:
+        device: CUDA device on which the eager reference will execute.
+
+    Returns:
+        Whether the imaginary component fuses its second product, or None if neither
+        supported contraction matches the eager reference exactly.
+    """
+    values = torch.tensor(
+        [[1.2345, -0.9876], [-1.392927, 0.757227], [0.812345, 1.987654], [-0.765432, -1.234567]],
+        dtype=torch.float32,
+        device="cpu",
+    )
+    frequencies = torch.tensor([[0.8765, 0.4814]], dtype=torch.float32, device="cpu")
+    x0, x1 = values.double().unbind(-1)
+    cos, sin = frequencies.double().unbind(-1)
+    real = (x0 * cos - (x1 * sin).float().double()).float()
+    first = torch.stack((real, (x0 * sin + (x1 * cos).float().double()).float()), dim=-1)
+    second = torch.stack((real, (x1 * cos + (x0 * sin).float().double()).float()), dim=-1)
+    actual = torch.view_as_real(
+        torch.view_as_complex(values).to(device) * torch.view_as_complex(frequencies).to(device)
+    ).cpu()
+    if torch.equal(actual, first):
+        return False
+    if torch.equal(actual, second):
+        return True
+    return None
 
 
 if HAVE_TRITON:
@@ -75,6 +112,7 @@ if HAVE_TRITON:
         stride_sequence,
         stride_head,
         NEGATE_SIN: tl.constexpr,
+        IMAGINARY_SECOND_PRODUCT: tl.constexpr,
         BLOCK_R: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
@@ -101,6 +139,8 @@ if HAVE_TRITON:
             stride_sequence: Input sequence stride in elements.
             stride_head: Input head stride in elements; ignored when ``heads`` is 1.
             NEGATE_SIN: Rotate by the conjugate frequency.
+            IMAGINARY_SECOND_PRODUCT: Fuse ``x1 * cos`` in the imaginary component
+                to match the installed eager CUDA complex multiplication.
             BLOCK_R: Rows handled by one program.
             BLOCK_K: Power-of-two pair extent per row, at least ``pair_offset + pairs``.
         """
@@ -130,9 +170,11 @@ if HAVE_TRITON:
 
         x0_fp32 = x0.to(tl.float32)
         x1_fp32 = x1.to(tl.float32)
-        # c10::complex<float> multiplies as (a*c - b*d, a*d + b*c); nvcc fuses the first product.
         rotated0 = tl.fma(x0_fp32, cos, -(x1_fp32 * sin))
-        rotated1 = tl.fma(x0_fp32, sin, x1_fp32 * cos)
+        if IMAGINARY_SECOND_PRODUCT:
+            rotated1 = tl.fma(x1_fp32, cos, x0_fp32 * sin)
+        else:
+            rotated1 = tl.fma(x0_fp32, sin, x1_fp32 * cos)
         y0 = tl.where(rotary_mask[None, :], rotated0.to(x0.dtype), x0)
         y1 = tl.where(rotary_mask[None, :], rotated1.to(x1.dtype), x1)
         output_offset = row * channels
@@ -183,6 +225,7 @@ def _launch(values: torch.Tensor, frequencies: torch.Tensor, *, negate_sin: bool
         values.stride(1),
         stride_head,
         NEGATE_SIN=negate_sin,
+        IMAGINARY_SECOND_PRODUCT=_imaginary_fma_uses_second_product(values.device),
         BLOCK_R=block_r,
         BLOCK_K=block_k,
         num_warps=num_warps,
@@ -246,6 +289,7 @@ def _uses_fused_kernel(values: torch.Tensor, frequencies: torch.Tensor) -> bool:
         and frequencies.dtype == torch.complex64
         and values.dtype in _FUSED_DTYPES
         and values.ndim in (3, 4)
+        and _imaginary_fma_uses_second_product(values.device) is not None
     )
 
 
