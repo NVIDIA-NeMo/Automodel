@@ -23,7 +23,9 @@ if [ "${PYTEST_PROPAGATE_S:-}" = "1" ]; then
     PYTEST_S_FLAG="-s"
 fi
 
-UNO_SMOKE_MODEL=${UNO_SMOKE_MODEL:-Qwen/Qwen3-0.6B}
+# Tiny public checkpoint + the committed SCDD chat fixture: the point is to prove the
+# Uno wiring runs on one GPU, not to converge.
+UNO_SMOKE_MODEL=${UNO_SMOKE_MODEL:-hf-internal-testing/tiny-random-LlamaForCausalLM}
 
 python \
 -m coverage run \

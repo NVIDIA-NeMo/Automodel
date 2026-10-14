@@ -1,10 +1,9 @@
-# Smoke config for Uno diffusion-adapter training (dllm.mode: uno) on a small Qwen3.
+# Smoke config for Uno diffusion-adapter training (dllm.mode: uno) on a tiny public checkpoint.
 #
-# Trains only a token-gated LoRA adapter on a frozen Qwen3: the adapter is on for the noisy x_t copy
+# Trains only a token-gated LoRA adapter on the frozen model: the adapter is on for the noisy x_t copy
 # and off for the clean x_0 copy, whose logits are the frozen AR teacher for the total-variation loss.
 # A short 3-stage block-size curriculum (2 -> 4 -> 8) exercises the stage switches within 6 steps.
-# Data: uno_smoke_data.jsonl holds the first 32 rows of open-thoughts/OpenThoughts3-1.2M (Apache-2.0,
-# revision 61bcf9d4, the Uno training set) in its ShareGPT format, truncated to 1500/2000 characters.
+# Reuses the SCDD smoke model and chat fixture: the point is to prove the Uno wiring, not to converge.
 #
 # Launched by L2_DLLM_Uno_Smoke.sh.
 
@@ -26,7 +25,7 @@ seed: 42
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3-0.6B
+  pretrained_model_name_or_path: hf-internal-testing/tiny-random-LlamaForCausalLM
   torch_dtype: float32
   attn_implementation: sdpa
 
@@ -59,11 +58,11 @@ dllm:
   tv_weight: 1.0
   kl_weight: 0.0
   block_curriculum:
-    tokens_per_step: 1024  # global_batch_size * seq_length
+    tokens_per_step: 128  # global_batch_size * seq_length
     stages:
-      - {block_size: 2, tokens: 2048}
-      - {block_size: 4, tokens: 2048}
-      - {block_size: 8, tokens: 2048}
+      - {block_size: 2, tokens: 256}
+      - {block_size: 4, tokens: 256}
+      - {block_size: 8, tokens: 256}
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -75,13 +74,16 @@ clip_grad_norm:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
-  path_or_dataset_id: tests/functional_tests/dllm/uno_smoke_data.jsonl
-  seq_length: 512
+  path_or_dataset_id: tests/functional_tests/dllm/scdd_smoke_data.jsonl
+  seq_length: 64
   padding: max_length
   truncation: true
   unshifted: true
+  # The tiny test tokenizer ships no chat template; reuse the LLaDA one so the
+  # assistant turn is tagged and the answer-only loss mask is populated.
+  chat_template: examples/dllm_sft/llada_chat_template.jinja
   tokenizer:
-    pretrained_model_name_or_path: Qwen/Qwen3-0.6B
+    pretrained_model_name_or_path: hf-internal-testing/tiny-random-LlamaForCausalLM
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
