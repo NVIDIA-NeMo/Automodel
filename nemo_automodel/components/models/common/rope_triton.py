@@ -171,6 +171,10 @@ if HAVE_TRITON:
         x0_fp32 = x0.to(tl.float32)
         x1_fp32 = x1.to(tl.float32)
         rotated0 = tl.fma(x0_fp32, cos, -(x1_fp32 * sin))
+        # Both branches compute x0 * sin + x1 * cos. FMA rounds its product and
+        # sum together; the other product rounds separately, so swapping the
+        # fused product can change the last bits. Match the contraction order
+        # observed in PyTorch's complex multiply on this device for exact parity.
         if IMAGINARY_SECOND_PRODUCT:
             rotated1 = tl.fma(x1_fp32, cos, x0_fp32 * sin)
         else:
