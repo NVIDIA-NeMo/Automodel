@@ -65,14 +65,16 @@ def _patch_ep_mesh_utils(monkeypatch, *, expert_range=(2, 4), ep_shard_rank=1):
     monkeypatch.setattr(
         adapter_mod.state_dict_utils,
         "get_submesh",
-        lambda device_mesh, dims: _FakeSubmesh(size=2, local_rank=ep_shard_rank)
-        if dims == ("ep_shard",)
-        else _FakeSubmesh(size=2, rank=ep_shard_rank),
+        lambda device_mesh, dims: (
+            _FakeSubmesh(size=2, local_rank=ep_shard_rank)
+            if dims == ("ep_shard",)
+            else _FakeSubmesh(size=2, rank=ep_shard_rank)
+        ),
     )
     monkeypatch.setattr(
         adapter_mod.state_dict_utils,
         "create_dtensor_from_local",
-        lambda local_tensor, device_mesh, rank: local_tensor,
+        lambda local_tensor, device_mesh, rank, *, n_experts: local_tensor,
     )
 
 

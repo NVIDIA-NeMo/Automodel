@@ -212,10 +212,10 @@ class DiffusionGemmaStateDictAdapter(StateDictAdapter):
 
             prefix = f"{_NATIVE_PREFIX}{layer_path}"
             state_dict[f"{prefix}.moe.experts.gate_and_up_projs"] = state_dict_utils.create_dtensor_from_local(
-                gate_and_up_local, device_mesh, rank
+                gate_and_up_local, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
             )
             state_dict[f"{prefix}.moe.experts.down_projs"] = state_dict_utils.create_dtensor_from_local(
-                down_local, device_mesh, rank
+                down_local, device_mesh, rank, n_experts=self.moe_config.n_routed_experts
             )
 
         return state_dict

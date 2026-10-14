@@ -296,6 +296,7 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config, device):
 
     # Manually inject mock state since DeepEP init fails on non-Hopper hardware
     orig_experts.n_routed_experts = 4
+    orig_experts.num_local_experts = 4
     orig_experts.ep_size = 1
 
     lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4).to(device).to(torch.bfloat16)
@@ -627,6 +628,7 @@ def test_deepep_lora_zero_tokens(moe_config, device):
         orig_experts.init_weights(device)
 
     orig_experts.n_routed_experts = 4
+    orig_experts.num_local_experts = 4
     orig_experts.ep_size = 1
 
     lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4).to(device).to(torch.bfloat16)
@@ -772,6 +774,7 @@ def test_deepep_lora_relu2_non_gated_shapes(device):
         orig_experts.init_weights(device)
 
     orig_experts.n_routed_experts = 4
+    orig_experts.num_local_experts = 4
     orig_experts.ep_size = 1
 
     lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8)
@@ -915,6 +918,7 @@ def test_deepep_lora_forward_torch_mm(moe_config, device):
         orig_experts.init_weights(device)
 
     orig_experts.n_routed_experts = 4
+    orig_experts.num_local_experts = 4
     orig_experts.ep_size = 1
     # lora_dim must be >= 8 for bf16 to satisfy torch._grouped_mm 16-byte stride alignment
     lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(device).to(torch.bfloat16)
@@ -960,6 +964,7 @@ def test_deepep_lora_dtype_string(moe_config, device):
     with torch.no_grad():
         orig_experts.init_weights(device)
     orig_experts.n_routed_experts = 4
+    orig_experts.num_local_experts = 4
     orig_experts.ep_size = 1
 
     if device.type == "cuda" and torch.cuda.is_bf16_supported():
@@ -974,6 +979,7 @@ def test_deepep_lora_kaiming_init(moe_config, device):
     with torch.no_grad():
         orig_experts.init_weights(device)
     orig_experts.n_routed_experts = 4
+    orig_experts.num_local_experts = 4
     orig_experts.ep_size = 1
 
     lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8, lora_A_init_method="kaiming")
@@ -1014,6 +1020,7 @@ def test_deepep_lora_forward_torch_mm_with_bias(device):
     with torch.no_grad():
         orig_experts.init_weights(device)
     orig_experts.n_routed_experts = 4
+    orig_experts.num_local_experts = 4
     orig_experts.ep_size = 1
     # lora_dim must be >= 8 for bf16 to satisfy torch._grouped_mm 16-byte stride alignment
     lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(device).to(torch.bfloat16)
