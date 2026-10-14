@@ -34,7 +34,9 @@ extent. The pytest launcher uses --all-variants to run the complete matrix,
 including dense and compact capacity-mode variants, in one worker launch and
 process group. It also runs the dynamic-batch regression from PR #3641 with no
 fixed capacity: counts change between calls, the larger rank swaps, and either
-rank can be empty, with and without checkpointing.
+rank can be empty, with and without checkpointing, across routing/fusion variants.
+Profiler assertions also check that fixed slot capacity removes token-count
+collectives and that nested scopes restore negotiation and capacity correctly.
 """
 
 import argparse
@@ -207,7 +209,7 @@ def _run_variant(
         )
 
 
-def _run_dynamic_token_counts(ep_group: dist.ProcessGroup) -> None:
+def _run_dynamic_token_counts(ep_group: dist.ProcessGroup, *, compact_routing: bool, permute_fusion: bool) -> None:
     """Exercise PR #3641's negotiated path across changing two-rank batches.
 
     Reuse one dispatcher so a stale group maximum or shape cannot be hidden by
@@ -228,6 +230,8 @@ def _run_dynamic_token_counts(ep_group: dist.ProcessGroup) -> None:
             moe_share_token_dispatcher=False,
             moe_hybridep_equal_token_counts=False,
             moe_benchmark_static_routing=False,
+            moe_hybridep_compact_routing=compact_routing,
+            moe_hybridep_permute_fusion=permute_fusion,
         ),
         ep_group=ep_group,
     )
@@ -248,8 +252,66 @@ def _run_dynamic_token_counts(ep_group: dist.ProcessGroup) -> None:
             for actual, expected in zip(recomputed, eager):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             print(
-                f"[rank {rank}] OK: PR #3641 dynamic counts={counts}; negotiated slots, "
+                f"[rank {rank}] OK: PR #3641 dynamic counts={counts}, "
+                f"compact={compact_routing}, fusion={permute_fusion}; negotiated slots, "
                 "output, hidden/router gradients, and checkpoint replay",
+                flush=True,
+            )
+
+
+def _run_slot_capacity_collectives(ep_group: dist.ProcessGroup) -> None:
+    """Verify real collective counts and numerical parity as capacity scopes change."""
+    rank = dist.get_rank(ep_group)
+    torch.manual_seed(744 + rank)
+    num_local = NUM_EXPERTS // dist.get_world_size(ep_group)
+    dispatcher = MoEFlexTokenDispatcher(
+        num_local_experts=num_local,
+        local_expert_indices=list(range(rank * num_local, (rank + 1) * num_local)),
+        config=TokenDispatcherConfig(
+            moe_flex_dispatcher_backend="hybridep",
+            num_moe_experts=NUM_EXPERTS,
+            moe_router_topk=TOPK,
+            moe_share_token_dispatcher=False,
+            moe_hybridep_equal_token_counts=False,
+            moe_benchmark_static_routing=False,
+        ),
+        ep_group=ep_group,
+    )
+    num_tokens = (17, 5)[rank]
+    hidden = torch.randn(num_tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    indices = (torch.arange(num_tokens * TOPK, device="cuda").reshape(num_tokens, TOPK) + rank) % NUM_EXPERTS
+    probs = torch.rand(num_tokens, TOPK, dtype=torch.float32, device="cuda").softmax(dim=-1)
+    with hybrid_ep_token_capacity(None):
+        # Warm up outside profiling and retain a numerical baseline for every scope.
+        reference = run_dispatch_combine(dispatcher, hidden, indices, probs)
+        for activation_checkpointing in (False, True):
+
+            def check_collectives(expected: int) -> None:
+                """Profile real c10d calls while also checking outputs and both gradients."""
+                with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+                    result = run_dispatch_combine(
+                        dispatcher, hidden, indices, probs, activation_checkpointing=activation_checkpointing
+                    )
+                collective_count = sum(event.count for event in prof.key_averages() if event.key == "c10d::allreduce_")
+                assert collective_count == expected, (
+                    f"rank {rank}, checkpoint={activation_checkpointing}: "
+                    f"expected {expected} token-count all-reduces, got {collective_count}"
+                )
+                for actual, baseline in zip(result, reference):
+                    torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
+
+            negotiated_count = 2 if activation_checkpointing else 1
+            check_collectives(negotiated_count)
+            with hybrid_ep_token_capacity(32):
+                check_collectives(0)
+                with hybrid_ep_token_capacity(None):
+                    check_collectives(negotiated_count)
+                check_collectives(0)
+            check_collectives(negotiated_count)
+            print(
+                f"[rank {rank}] OK: slot-capacity scopes, checkpoint={activation_checkpointing}; "
+                f"all-reduces={negotiated_count}/0/{negotiated_count}/0/{negotiated_count}, "
+                "output and hidden/router gradients match",
                 flush=True,
             )
 
@@ -281,7 +343,10 @@ def main() -> None:
         variants = [(args.compact_routing, args.permute_fusion, args.activation_checkpointing, args.capacity_factor)]
     try:
         if args.all_variants:
-            _run_dynamic_token_counts(ep_group)
+            for compact in (False, True):
+                for fusion in (False, True):
+                    _run_dynamic_token_counts(ep_group, compact_routing=compact, permute_fusion=fusion)
+            _run_slot_capacity_collectives(ep_group)
         for compact, fusion, activation_checkpointing, capacity_factor in variants:
             start = time.perf_counter()
             for slot_capacity in (None, max(32, FULL_TOKENS)):
