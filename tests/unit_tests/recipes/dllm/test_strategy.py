@@ -497,6 +497,23 @@ class TestUnoStrategy:
         assert ((response >= 0) & (response <= 70)).all()
         assert torch.equal(batch["_clean_input_ids"], input_ids)
 
+    def test_pre_step_noise_range_includes_the_microbatch_max(self, strategy):
+        """The upper bound is max(input_ids) + 1 (exclusive), so the max id itself is drawn."""
+        generator = torch.Generator().manual_seed(0)
+
+        def apply_corruption(input_ids, loss_mask, microbatch_idx=0):
+            return strategy.apply_corruption(
+                input_ids, loss_mask, 999, eps=1e-3, block_size=None, half_life_ratio=None, generator=generator
+            )
+
+        input_ids = torch.zeros(1, 256, dtype=torch.long)
+        input_ids[0, 0] = 1
+        loss_mask = torch.ones(1, 256, dtype=torch.long)
+        loss_mask[0, 0] = 0
+        batch = {"input_ids": input_ids, "loss_mask": loss_mask}
+        strategy.pre_step(types.SimpleNamespace(_apply_corruption=apply_corruption), [batch])
+        assert set(batch["_noisy_input_ids"][0, 1:].tolist()) == {0, 1}
+
     def test_apply_corruption_outside_pre_step_raises(self, strategy):
         with pytest.raises(RuntimeError, match="pre_step"):
             strategy.apply_corruption(
@@ -637,7 +654,8 @@ class TestUnoStrategy:
                 {"step_scheduler": {"global_batch_size": global_batch_size}, "dataset": {"seq_length": seq_length}}
             ),
             step_scheduler=types.SimpleNamespace(max_steps=max_steps),
-            distributed_config=types.SimpleNamespace(cp_size=1),
+            distributed_config=types.SimpleNamespace(cp_size=1, tp_size=1),
+            peft_config=types.SimpleNamespace(use_dora=False),
             model_parts=[
                 types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=151936))
             ],
@@ -659,6 +677,22 @@ class TestUnoStrategy:
         strategy.create_loss_fn({"block_curriculum": self.UNO_QWEN3_8B_CURRICULUM})
         strategy.setup_extra(self._curriculum_recipe(128, 4096, 1000))
         assert "differs from the block curriculum's last stage end step 28125" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("field", "value", "match"),
+        [
+            ("peft_config", None, "add a `peft:` LoRA config"),
+            ("peft_config", types.SimpleNamespace(use_dora=True), "DoRA"),
+            ("distributed_config", types.SimpleNamespace(cp_size=1, tp_size=2), "tensor parallelism"),
+        ],
+    )
+    def test_setup_extra_rejects_unsupported_adapter_setups(self, strategy, field, value, match):
+        """The token-gated adapter needs plain LoRA and tp_size == 1; fail at setup, not at the first forward."""
+        strategy.create_loss_fn({"block_length": 4})
+        recipe = self._curriculum_recipe(128, 4096, 28125)
+        setattr(recipe, field, value)
+        with pytest.raises(ValueError, match=match):
+            strategy.setup_extra(recipe)
 
     def test_setup_extra_fills_a_placeholder_mask_token_id(self, strategy):
         """Uno has no mask token: a missing dllm.mask_token_id becomes an unused placeholder."""

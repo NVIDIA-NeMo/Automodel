@@ -644,10 +644,11 @@ class UnoStrategy(IDLMStrategy):
         self._tokens_per_step = tokens_per_step
 
     def setup_extra(self, recipe) -> None:
-        """Run the I-DLM checks, then check the curriculum against the batch and step budget.
+        """Run the I-DLM checks, then check the adapter setup and the curriculum budget.
 
         Uno has no mask token, so a missing ``dllm.mask_token_id`` gets a harmless placeholder (as the
-        block-diffusion recipe does) to satisfy the shared checks. ``tokens_per_step`` must equal
+        block-diffusion recipe does) to satisfy the shared checks. The token-gated adapter needs a plain
+        LoRA ``peft:`` config without DoRA and ``tp_size == 1``. ``tokens_per_step`` must equal
         ``step_scheduler.global_batch_size * dataset.seq_length`` or every stage boundary lands on the wrong
         step; a ``max_steps`` other than the last stage's end step truncates the curriculum or trains past it
         at the final block size.
@@ -655,17 +656,20 @@ class UnoStrategy(IDLMStrategy):
         if recipe.mask_token_id is None:
             recipe.mask_token_id = 0
         super().setup_extra(recipe)
+        if recipe.peft_config is None:
+            raise ValueError("Uno trains a token-gated LoRA adapter; add a `peft:` LoRA config.")
+        if recipe.peft_config.use_dora:
+            raise ValueError("Uno does not support DoRA (peft.use_dora must be false).")
+        if getattr(recipe.distributed_config, "tp_size", 1) > 1:
+            raise ValueError("Uno does not support tensor parallelism (tp_size must be 1).")
         if not self._stage_end_steps:
             return
-        global_batch_size = recipe.cfg.get("step_scheduler.global_batch_size", None)
-        seq_length = recipe.cfg.get("dataset.seq_length", None)
-        if global_batch_size is not None and seq_length is not None:
-            expected = int(global_batch_size) * int(seq_length)
-            if self._tokens_per_step != expected:
-                raise ValueError(
-                    f"dllm.block_curriculum.tokens_per_step={self._tokens_per_step} must equal "
-                    f"step_scheduler.global_batch_size * dataset.seq_length = {expected}."
-                )
+        expected = int(recipe.cfg.get("step_scheduler.global_batch_size")) * int(recipe.cfg.get("dataset.seq_length"))
+        if self._tokens_per_step != expected:
+            raise ValueError(
+                f"dllm.block_curriculum.tokens_per_step={self._tokens_per_step} must equal "
+                f"step_scheduler.global_batch_size * dataset.seq_length = {expected}."
+            )
         if recipe.step_scheduler.max_steps != self._stage_end_steps[-1]:
             logger.warning(
                 "step_scheduler.max_steps=%d differs from the block curriculum's last stage end step %d.",
