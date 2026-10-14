@@ -57,6 +57,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
     raise_if_peft_configured,
+    read_load_metadata_with_gloo,
     should_sync_grads,
 )
 
@@ -175,6 +176,7 @@ class TrainEagle1Recipe(BaseRecipe):
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            load_metadata_with_gloo=read_load_metadata_with_gloo(self.cfg.get("checkpoint", None)),
         )
         self.dist_setup = None
         self.distributed_config = None

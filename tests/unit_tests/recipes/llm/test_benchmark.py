@@ -738,6 +738,15 @@ class TestBenchmarkingRecipeWandBIntegration:
                 barrier=False,
             )
 
+    def test_log_iteration_mfu_uses_global_flops_once(
+        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mock_recipe.timers._get_global_min_max_time.return_value = {"iteration": (0.5, 1.5)}
+        with caplog.at_level("INFO", logger="nemo_automodel.recipes.llm.benchmark"):
+            mock_recipe._log_iteration_metrics("iteration", ga_steps=4, peak_tflops=989, rank=0, iteration=10)
+        expected_mfu = mock_recipe.tflops / (mock_recipe.dist_env.world_size * 1.5 * 989) * 100
+        assert f"MFU: {expected_mfu:.6f}%" in caplog.text
+
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
 class TestBenchmarkingRecipeJSONOutput:
@@ -797,11 +806,13 @@ class TestBenchmarkingRecipeJSONOutput:
         assert summary_data["training_steps"] == 20
         assert summary_data["peak_tflops"] == 989
         assert summary_data["world_size"] == 8
+        assert summary_data["tflops_total"] == mock_recipe.tflops
+        assert summary_data["tflops_per_gpu"] == mock_recipe.tflops / 8
         assert summary_data["global_batch_size"] == 256
         assert summary_data["local_batch_size"] == 4
         assert summary_data["seq_len"] == 2048
-        assert "avg_iter_time_seconds" in summary_data
-        assert "avg_mfu_percent" in summary_data
+        assert summary_data["avg_iter_time_seconds"] == pytest.approx(10.0 / 20)
+        assert summary_data["avg_mfu_percent"] == pytest.approx(mock_recipe.tflops / (8 * (10.0 / 20) * 989) * 100)
 
     def test_log_benchmark_summary_skips_json_when_none(self, mock_recipe, tmp_path):
         """Test that JSON output is skipped when path is None."""
@@ -873,6 +884,12 @@ class TestBenchmarkingRecipeSummaryData:
         assert "World Size" in metric_names
         assert "Global Batch Size" in metric_names
         assert "Sequence Length" in metric_names
+        metrics = dict(data)
+        avg_iter_time = 100.0 / 20
+        per_gpu_tflops_per_second = mock_recipe.tflops / (mock_recipe.dist_env.world_size * avg_iter_time)
+        assert metrics["Avg Iteration Time (s)"] == pytest.approx(avg_iter_time)
+        assert metrics[expected_mfu_label] == pytest.approx(per_gpu_tflops_per_second / 989 * 100)
+        assert metrics["TFLOPs/GPU/s"] == pytest.approx(per_gpu_tflops_per_second)
 
     @pytest.mark.parametrize("scope", ["model", "text"])
     @patch("wandb.log")
@@ -908,11 +925,15 @@ class TestBenchmarkingRecipeSummaryData:
 
         assert scalar_call is not None
         scalar_metrics = scalar_call[0][0]
-        assert "summary/avg_iter_time_seconds" in scalar_metrics
-        assert "summary/avg_mfu_percent" in scalar_metrics
+        avg_iter_time = 100.0 / 20
+        assert scalar_metrics["summary/avg_iter_time_seconds"] == pytest.approx(avg_iter_time)
+        assert scalar_metrics["summary/avg_mfu_percent"] == pytest.approx(
+            mock_recipe.tflops / (mock_recipe.dist_env.world_size * avg_iter_time * 989) * 100
+        )
         assert scalar_metrics["summary/flops_scope"] == scope
         assert "summary/training_time_seconds" in scalar_metrics
-        assert "summary/tflops_per_gpu" in scalar_metrics
+        assert scalar_metrics["summary/tflops_total"] == mock_recipe.tflops
+        assert scalar_metrics["summary/tflops_per_gpu"] == mock_recipe.tflops / mock_recipe.dist_env.world_size
 
     @patch("wandb.finish")
     def test_wandb_finish_called(self, mock_wandb_finish, mock_recipe):

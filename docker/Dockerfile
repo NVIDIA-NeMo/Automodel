@@ -265,7 +265,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     fi && \
     rm -rf /tmp/fa
 
-FROM automodel_dep AS automodel_final
+FROM automodel_dep AS automodel_dependencies
 
 WORKDIR /opt/Automodel
 
@@ -343,6 +343,13 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/_private/runtime_env/agent/thirdparty_files && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
+
+# CI can supply this stage as a digest-pinned named build context, skipping all
+# dependency compilation. Ordinary Docker builds still build the stage above.
+FROM automodel_dependencies AS automodel_final
+ARG BASE_IMAGE=cuda
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1

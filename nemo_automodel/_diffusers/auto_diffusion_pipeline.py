@@ -43,7 +43,7 @@ Usage:
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Dict, Iterable
 
 import torch
@@ -452,8 +452,13 @@ def _apply_parallelization(
     pipe,
     mesh_context: MeshContext | None,
     components_to_load: Iterable[str] | None = None,
+    *,
+    device: torch.device | None = None,
 ):
     """Apply FSDP2/DDP parallelization to pipeline components.
+
+    Explicit single-rank DDP placement is carried in a copy of MeshContext.
+    Multi-rank placement remains owned by the distributed strategy.
 
     Each parallelized component is stamped with ``_pre_shard_hf_state_dict_keys``:
     its state-dict keys captured just before sharding (after LoRA injection, QKV
@@ -470,6 +475,14 @@ def _apply_parallelization(
 
     if not torch.distributed.is_initialized():
         raise RuntimeError("Distributed environment must be initialized for parallelization")
+    # Preserve explicit placement, including CPU, over the single-rank Gloo
+    # CUDA default. Copy the context to keep the caller's settings unchanged.
+    if (
+        device is not None
+        and isinstance(mesh_context.strategy_config, DDPConfig)
+        and torch.distributed.get_world_size() == 1
+    ):
+        mesh_context = replace(mesh_context, ddp_device=device)
     for comp_name, comp_module in _iter_pipeline_modules(pipe):
         if components_to_load is not None and comp_name not in components_to_load:
             continue
@@ -836,7 +849,7 @@ class NeMoAutoDiffusionPipeline:
         # sets up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
         # DDP LoRA: base weights are frozen before wrapping so DDP only reduces LoRA gradients.
         parallel_components = components_to_load if components_to_parallelize is None else components_to_parallelize
-        _apply_parallelization(pipe, mesh_context, parallel_components)
+        _apply_parallelization(pipe, mesh_context, parallel_components, device=device)
 
         # Freeze base weights after FSDP2 wrapping — mirrors the LLM pattern in
         # nemo_automodel/_transformers/infrastructure.py lines 513-518.
@@ -1064,6 +1077,6 @@ class NeMoAutoDiffusionPipeline:
                 _ensure_params_trainable(module, module_name=name)
 
         # Apply parallelization (FSDP2 or DDP)
-        _apply_parallelization(pipe, mesh_context, components_to_load)
+        _apply_parallelization(pipe, mesh_context, components_to_load, device=device)
 
         return pipe

@@ -39,6 +39,7 @@ from nemo_automodel import NeMoAutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
+from nemo_automodel.recipes.llm._spec_train_utils import read_load_metadata_with_gloo
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +236,7 @@ def build_deepseek_v4_target(
         backend=backend,
         distributed_setup=distributed_setup,
         load_base_model=True,
+        load_metadata_with_gloo=read_load_metadata_with_gloo(cfg.get("checkpoint", None)),
         revision=revision,
         torch_dtype=compute_dtype,
         trust_remote_code=trust_remote_code,
@@ -326,6 +328,7 @@ def build_glm_5_2_target(
         backend=backend,
         distributed_setup=distributed_setup,
         load_base_model=True,
+        load_metadata_with_gloo=read_load_metadata_with_gloo(cfg.get("checkpoint", None)),
         revision=revision,
         torch_dtype=compute_dtype,
         trust_remote_code=trust_remote_code,
@@ -425,6 +428,7 @@ def build_kimi_k3_target(
         backend=build_kimi_k3_backend(recipe_cfg),
         distributed_setup=distributed_setup,
         load_base_model=True,
+        load_metadata_with_gloo=read_load_metadata_with_gloo(cfg.get("checkpoint", None)),
         revision=revision,
         torch_dtype=compute_dtype,
         trust_remote_code=trust_remote_code,

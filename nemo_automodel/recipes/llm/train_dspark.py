@@ -138,6 +138,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
     raise_if_peft_configured,
+    read_load_metadata_with_gloo,
 )
 
 logger = logging.getLogger(__name__)
@@ -649,6 +650,7 @@ class TrainDSparkRecipe(BaseRecipe):
         if self.cached_target_path is None or chat_template is not None:
             _apply_target_chat_template(self.tokenizer, chat_template)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        load_metadata_with_gloo = read_load_metadata_with_gloo(self.cfg.get("checkpoint", None))
 
         if is_deepseek_v4_target:
             if self.cached_target_path is None:
@@ -758,6 +760,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     trust_remote_code=trust_remote_code,
                     torch_dtype=self.compute_dtype,
                     distributed_setup=self.distributed_setup,
+                    load_metadata_with_gloo=load_metadata_with_gloo,
                     backend=backend,
                     # The released bf16 checkpoint ships no real MTP weights despite the
                     # config declaring some, and DSpark trains its own separate draft
@@ -845,6 +848,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     torch_dtype=self.compute_dtype,
                     force_hf=bool(recipe_cfg.get("target_force_hf", False)),
                     distributed_setup=self.distributed_setup,
+                    load_metadata_with_gloo=load_metadata_with_gloo,
                     **target_kwargs,
                 )
                 if self.distributed_setup is None:
