@@ -121,34 +121,6 @@ def test_packing_requires_position_ids():
         draft(ids, th, torch.ones(1, 6, dtype=torch.long), seq_lens=torch.tensor([[3, 3]], dtype=torch.long))
 
 
-def test_recipe_packing_kwargs_helper():
-    """The recipe helper extracts packing metadata only when the batch is packed."""
-    from nemo_automodel.recipes.llm.train_eagle1 import _packing_kwargs
-
-    assert _packing_kwargs({"input_ids": torch.zeros(1, 4)}) == {}
-    packed = {
-        "input_ids": torch.zeros(1, 4),
-        "position_ids": torch.zeros(1, 4),
-        "seq_lens": torch.tensor([[4]]),
-        "doc_remaining": torch.zeros(1, 4),
-    }
-    assert set(_packing_kwargs(packed)) == {"position_ids", "seq_lens", "doc_remaining"}
-
-
-def test_recipe_packing_gates_fail_fast():
-    """Packing configs EAGLE-1/2 cannot honor must be rejected at setup, not mid-run."""
-    from nemo_automodel.recipes.llm.train_eagle1 import _validate_packing_gates
-
-    # Compatible: eager/sdpa target, no CP, any batch size -> no raise.
-    _validate_packing_gates(cp_size=1, target_attn_impl="sdpa", micro_batch_size=4)
-    # Context parallelism shards the sequence and strips the block-causal mask.
-    with pytest.raises(NotImplementedError, match="context parallelism"):
-        _validate_packing_gates(cp_size=2, target_attn_impl="sdpa", micro_batch_size=1)
-    # FlashAttention target packs documents only at batch size 1.
-    with pytest.raises(ValueError, match="micro_batch_size=1"):
-        _validate_packing_gates(cp_size=1, target_attn_impl="flash_attention_2", micro_batch_size=2)
-
-
 def test_target_wrapper_packing_requires_position_ids():
     """The target wrapper must fail loud when packing is requested without position_ids."""
     wrapper = HFEagleTargetModel(_build_target())

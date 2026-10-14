@@ -216,22 +216,6 @@ def test_domino_trainer_runs_with_tensor_parallel_target(single_rank_pg, shift_l
 
 
 # --------------------------------------------------------------------------- #
-# _submesh_or_none
-# --------------------------------------------------------------------------- #
-def test_submesh_or_none_handles_none_present_and_missing(monkeypatch):
-    assert train_dflash._submesh_or_none(None, "dp") is None
-
-    monkeypatch.setattr(train_dflash, "get_flat_mesh", lambda mesh, name: ("submesh", name))
-    assert train_dflash._submesh_or_none(object(), "dp") == ("submesh", "dp")
-
-    def _raise(mesh, name):
-        raise KeyError(name)
-
-    monkeypatch.setattr(train_dflash, "get_flat_mesh", _raise)
-    assert train_dflash._submesh_or_none(object(), "dp") is None
-
-
-# --------------------------------------------------------------------------- #
 # TrainDFlashRecipe seams: target build / DDP group / checkpoint dp_rank
 # --------------------------------------------------------------------------- #
 def _bare_recipe(**attrs):
@@ -312,7 +296,7 @@ def test_build_target_model_tensor_parallel_path(monkeypatch):
     )
     monkeypatch.setattr(train_dflash, "create_distributed_setup_from_config", lambda cfg, world_size: dist_setup)
     monkeypatch.setattr(
-        train_dflash, "_submesh_or_none", lambda mesh, name: sentinel_cp if name == "cp" else sentinel_dp
+        train_dflash, "submesh_or_none", lambda mesh, name: sentinel_cp if name == "cp" else sentinel_dp
     )
 
     recipe = _bare_recipe(
@@ -357,8 +341,10 @@ def test_build_checkpointer_keys_dp_rank_on_dp_mesh(monkeypatch, tmp_path):
     """The checkpoint shard is keyed on the dp coordinate (identical across tp
     ranks of a replica), and tp_rank stays 0 (the draft is never tp-sharded)."""
     captured = {}
-    monkeypatch.setattr(train_dflash, "CheckpointingConfig", lambda **kw: SimpleNamespace(**kw))
-    monkeypatch.setattr(train_dflash, "Checkpointer", lambda **kw: captured.update(kw) or SimpleNamespace(**kw))
+    monkeypatch.setattr(
+        "nemo_automodel.components.checkpoint.checkpointing.Checkpointer",
+        lambda **kw: captured.update(kw) or SimpleNamespace(**kw),
+    )
 
     recipe = _bare_recipe(
         cfg={},  # no "checkpoint" section
@@ -375,8 +361,10 @@ def test_build_checkpointer_keys_dp_rank_on_dp_mesh(monkeypatch, tmp_path):
 def test_build_checkpointer_falls_back_to_global_rank(monkeypatch, tmp_path):
     # tp_size=1 -> dp_mesh None -> key on the global rank (0 here, no dist init).
     captured = {}
-    monkeypatch.setattr(train_dflash, "CheckpointingConfig", lambda **kw: SimpleNamespace(**kw))
-    monkeypatch.setattr(train_dflash, "Checkpointer", lambda **kw: captured.update(kw) or SimpleNamespace(**kw))
+    monkeypatch.setattr(
+        "nemo_automodel.components.checkpoint.checkpointing.Checkpointer",
+        lambda **kw: captured.update(kw) or SimpleNamespace(**kw),
+    )
     monkeypatch.setattr(train_dflash.dist, "is_initialized", lambda: False)
 
     recipe = _bare_recipe(

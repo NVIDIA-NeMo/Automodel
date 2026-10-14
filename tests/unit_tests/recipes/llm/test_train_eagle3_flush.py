@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Coverage tests for the EAGLE-3 trailing grad-accum flush and related
-recipe internals: ``_all_reduce_mean``, ``_optim_steps_per_epoch``,
+recipe internals: ``_optim_steps_per_epoch``,
 ``run_train_validation_loop`` with divisible / non-divisible batch counts,
 gradient rescaling, ``_save_checkpoint``, and ``_run_eval``."""
 
@@ -29,7 +29,6 @@ from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
 from nemo_automodel.recipes.llm._spec_train_utils import optim_steps_per_epoch as _optim_steps_per_epoch
 from nemo_automodel.recipes.llm.train_eagle3 import (
     TrainEagle3Recipe,
-    _all_reduce_mean,
 )
 
 # ---------------------------------------------------------------------------
@@ -141,16 +140,6 @@ def _build_recipe(tmp_path, num_samples=5, grad_accum=3, num_epochs=1, log_every
     recipe.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(recipe.optimizer, lambda s: 1.0)
 
     return recipe
-
-
-# ---------------------------------------------------------------------------
-# _all_reduce_mean (non-distributed)
-# ---------------------------------------------------------------------------
-
-
-def test_all_reduce_mean_passthrough():
-    t = torch.tensor(3.0)
-    assert _all_reduce_mean(t).item() == 3.0
 
 
 # ---------------------------------------------------------------------------
