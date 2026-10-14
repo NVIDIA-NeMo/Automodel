@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ import torch
 from torch import nn
 
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
@@ -117,6 +119,7 @@ def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled
     recipe.cfg = _Cfg()
     recipe.timestamp = 1.0
     recipe.step_scheduler = SimpleNamespace(step=7, epoch=1)
+    recipe.loss_fn = MaskedCrossEntropy(ignore_index=0)
     recipe.kd_ratio = 0.5
     recipe.kd_loss_fn = SimpleNamespace(temperature=1.0)
     recipe._ce_loss_buffer = []
@@ -135,8 +138,8 @@ def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled
     recipe._forward_backward_step = _fake_forward_backward_step
 
     batches = [
-        {"labels": torch.tensor([[1, -100, 2]])},
-        {"labels": torch.tensor([[-100, 3, -100]])},
+        {"labels": torch.tensor([[0, 1, 2]])},
+        {"labels": torch.tensor([[0, 3, -100]])},
     ]
 
     MoEAuxLossAutoScaler.main_loss_backward_scale = None
@@ -174,3 +177,40 @@ def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled
     assert metrics.metrics["tps"] == 5.0
     assert metrics.metrics["tps_per_gpu"] == pytest.approx(5.0 / 2 / 4)
     assert metrics.metrics["num_label_tokens"] == 3
+
+
+def test_vlm_kd_validation_uses_loss_ignore_index(monkeypatch):
+    monkeypatch.setattr(vlm_kd, "ScopedRNG", lambda **kwargs: nullcontext())
+    monkeypatch.setattr(vlm_kd.torch.cuda, "max_memory_allocated", lambda: 0)
+    recipe = vlm_kd.KnowledgeDistillationRecipeForVLM.__new__(vlm_kd.KnowledgeDistillationRecipeForVLM)
+    recipe.model_parts = [_Model()]
+    recipe.loss_fn = MaskedCrossEntropy(ignore_index=0)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
+    recipe.optimizer = [_Optimizer()]
+    recipe._ce_loss_buffer = []
+    recipe._kd_loss_buffer = []
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+    seen_num_label_tokens = []
+
+    def _forward_backward_step(
+        idx,
+        batch,
+        *,
+        loss_buffer,
+        num_label_tokens,
+        num_batches,
+        is_train=True,
+    ):
+        seen_num_label_tokens.append(num_label_tokens)
+        loss_buffer.append(torch.tensor(1.0))
+        recipe._ce_loss_buffer.append(torch.tensor(0.25))
+        recipe._kd_loss_buffer.append(torch.tensor(0.75))
+
+    recipe._forward_backward_step = _forward_backward_step
+
+    metrics = recipe._run_validation_epoch([{"labels": torch.tensor([[0, 1], [0, 2]])}])
+
+    assert seen_num_label_tokens == [2]
+    assert metrics.metrics["num_label_tokens"] == 2
+    assert metrics.metrics["val_loss"] == pytest.approx(1.0)

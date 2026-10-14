@@ -25,8 +25,10 @@ from .caption_loaders import (
 from .flux import FluxProcessor
 from .flux2 import Flux2Processor
 from .hunyuan import HunyuanVideoProcessor
+from .hunyuan_image3 import HunyuanImage3Processor
 from .ltx2 import LTX2Processor
 from .qwen_image import QwenImageProcessor
+from .qwen_image_21 import QwenImage21Processor
 from .qwen_image_edit import QwenImageEditProcessor
 from .registry import ProcessorRegistry
 from .wan import Wan22Processor, WanProcessor
@@ -40,7 +42,9 @@ __all__ = [
     # Image processors
     "FluxProcessor",
     "Flux2Processor",
+    "HunyuanImage3Processor",
     "QwenImageProcessor",
+    "QwenImage21Processor",
     "QwenImageEditProcessor",
     # Video processors
     "WanProcessor",

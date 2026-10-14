@@ -24,6 +24,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
@@ -64,6 +65,36 @@ class _TensorHiddenStateStudent(nn.Module):
         if logits_to_keep is not None:
             logits = logits[:, -logits_to_keep:]
         return CausalLMOutputWithPast(logits=logits, hidden_states=self.hidden_states)
+
+
+class _KDLogitsModel(nn.Module):
+    def __init__(self, logits: torch.Tensor, *, trainable: bool):
+        """Register logits used by the KD recipe regression.
+
+        Args:
+            logits: Tensor of shape [batch, sequence, vocab].
+            trainable: Whether to register ``logits`` as a parameter.
+        """
+        super().__init__()
+        if trainable:
+            self.logits = nn.Parameter(logits)
+        else:
+            self.register_buffer("logits", logits)
+
+    def forward(self, input_ids: torch.Tensor) -> CausalLMOutputWithPast:
+        """Return fixed logits for a matching token layout.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence].
+
+        Returns:
+            Model output with logits of shape [batch, sequence, vocab].
+        """
+        if self.logits.shape[:-1] != input_ids.shape:
+            raise ValueError(
+                f"logits shape {tuple(self.logits.shape[:-1])} does not match input shape {tuple(input_ids.shape)}"
+            )
+        return CausalLMOutputWithPast(logits=self.logits)
 
 
 _RECIPE_CASES = (
@@ -124,6 +155,7 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
     batch = {
         "input_ids": torch.tensor([[0, 1, 2], [1, 2, 3]]),
         "labels": torch.tensor([[0, 1, 2], [1, 2, -100]]),
+        "max_seqlen": 3,
     }
     if recipe_module is vlm_kd:
         recipe._ce_loss_buffer = []
@@ -152,14 +184,126 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
     assert calculate_loss.call_args.kwargs["grad_reduce_group"] is grad_reduce_group
 
 
+@pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
+@pytest.mark.parametrize(
+    ("labels", "num_label_tokens"),
+    [
+        (torch.tensor([[0, 1], [0, 2]]), 2),
+        (torch.zeros(2, 2, dtype=torch.long), 0),
+    ],
+    ids=("mixed", "fully-masked"),
+)
+def test_kd_uses_main_loss_mask_and_denominator(
+    monkeypatch: pytest.MonkeyPatch,
+    recipe_module,
+    recipe_cls,
+    _,
+    labels: torch.Tensor,
+    num_label_tokens: int,
+):
+    """LLM and VLM KD use the main loss mask with the real KD loss.
+
+    Args:
+        monkeypatch: Pytest fixture used to replace distributed helpers.
+        recipe_module: LLM or VLM KD recipe module under test.
+        recipe_cls: LLM or VLM KD recipe class under test.
+        _: Unused parent recipe class from the shared parameter set.
+        labels: Tensor of shape [batch, sequence].
+        num_label_tokens: Number of positions supervised by the main loss.
+    """
+
+    def no_op_sharder(model, mesh, batch, **kwargs):
+        """Return a sharder that preserves tensors in the input mapping.
+
+        Args:
+            model: Student model under test.
+            mesh: Unused device mesh.
+            batch: Mapping containing tensors of shape [batch, sequence].
+            **kwargs: Unused context-parallel options.
+
+        Returns:
+            Object whose shard operation returns the unchanged batch.
+        """
+        del model, mesh, kwargs
+        return SimpleNamespace(shard=lambda actual_batch: (nullcontext, actual_batch))
+
+    monkeypatch.setattr(recipe_module, "ContextParallelSharder", no_op_sharder)
+    monkeypatch.setattr(recipe_module, "get_sync_ctx", lambda *args, **kwargs: nullcontext())
+
+    student_values = torch.tensor(
+        [
+            [[0.2, -0.1, 0.4], [0.5, 0.0, -0.3]],
+            [[-0.2, 0.3, 0.1], [0.7, -0.4, 0.2]],
+        ]
+    )
+    teacher_values = torch.tensor(
+        [
+            [[0.8, -0.2, 0.1], [0.1, 0.4, -0.5]],
+            [[0.6, -0.3, 0.2], [-0.1, 0.9, 0.0]],
+        ]
+    )
+    student = _KDLogitsModel(student_values.clone(), trainable=True)
+    teacher = _KDLogitsModel(teacher_values, trainable=False)
+    recipe = object.__new__(recipe_cls)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.pp_enabled = False
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.model_parts = [student]
+    recipe.teacher_model = teacher
+    recipe.loss_fn = MaskedCrossEntropy(ignore_index=0)
+    recipe.kd_loss_fn = KDLoss()
+    recipe.kd_ratio = 1.0
+    recipe._offload_teacher_model = False
+    recipe.separate_meshes = False
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+
+    aligned_labels = labels.masked_fill(labels == 0, -100)
+    reference_logits = student_values.clone().requires_grad_(True)
+    expected_loss = KDLoss()(
+        reference_logits,
+        teacher_values,
+        aligned_labels,
+        num_batch_labels=num_label_tokens,
+    )
+    expected_loss.backward()
+
+    batch = {"input_ids": torch.ones_like(labels), "labels": labels}
+    if recipe_module is vlm_kd:
+        recipe._ce_loss_buffer = []
+        recipe._kd_loss_buffer = []
+        loss_buffer = []
+        recipe._forward_backward_step(
+            0,
+            batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=num_label_tokens,
+            num_batches=1,
+            is_train=True,
+        )
+        actual_loss = recipe._kd_loss_buffer[-1]
+    else:
+        _, actual_loss, _ = recipe._forward_backward_step(
+            0,
+            batch,
+            num_label_tokens=num_label_tokens,
+            num_batches=1,
+            is_train=True,
+        )
+
+    torch.testing.assert_close(actual_loss, expected_loss.detach())
+    torch.testing.assert_close(student.logits.grad, reference_logits.grad)
+
+
 @pytest.mark.parametrize("recipe_module,recipe_cls,parent_cls", _RECIPE_CASES)
-def test_kd_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch, recipe_module, recipe_cls, parent_cls):
+@pytest.mark.parametrize("model_settings", [{}, {"dtype": "bfloat16"}, {"torch_dtype": "float32"}])
+def test_kd_setup_preserves_requested_storage_dtype(monkeypatch, recipe_module, recipe_cls, parent_cls, model_settings):
     class SetupStopped(Exception):
         pass
 
     cfg = ConfigNode(
         {
-            "model": {},
+            "model": model_settings,
             "teacher_model": {},
             "optimizer": {"_target_": "torch.optim.AdamW", "lr": 0.01},
         }
@@ -177,7 +321,7 @@ def test_kd_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch, recipe_m
     with pytest.raises(SetupStopped):
         recipe.setup()
 
-    assert cfg.model.torch_dtype == "float32"
+    assert cfg.model.to_dict() == model_settings
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
@@ -401,3 +545,270 @@ def test_run_loop_routes_teacher_and_stops_after_student(monkeypatch, recipe_mod
     shared.pp_enabled = False
     assert shared.run_train_validation_loop() == "trained"
     assert parent_calls == [student, shared]
+
+
+@pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
+@pytest.mark.parametrize("is_train", [False, True])
+def test_chunked_kd_real_llama_loss_and_gradients(recipe_module, recipe_cls, _, is_train):
+    from copy import deepcopy
+
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+    torch.manual_seed(23)
+    student = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            use_cache=False,
+        )
+    )
+    reference = deepcopy(student)
+    teacher = deepcopy(student).eval()
+    batch = {"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[2, -100, 4, 5]])}
+    results = []
+    for model, loss_fn in [(student, ChunkedCrossEntropy(2, compile=False)), (reference, MaskedCrossEntropy())]:
+        model.train(is_train)
+        recipe = object.__new__(recipe_cls)
+        recipe.dist_env = SimpleNamespace(device="cpu")
+        recipe.device_mesh = None
+        recipe.pp_enabled = False
+        recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+        recipe.model_parts = [model]
+        recipe.teacher_model = teacher
+        recipe.loss_fn = loss_fn
+        recipe.kd_loss_fn = KDLoss()
+        recipe.kd_ratio = 0.5
+        recipe._offload_teacher_model = False
+        recipe.separate_meshes = False
+        recipe._get_dp_group = lambda **kw: None
+        recipe._get_dp_group_size = lambda **kw: 1
+        recipe._ce_loss_buffer = []
+        recipe._kd_loss_buffer = []
+        if recipe_module is vlm_kd:
+            buffer = []
+            recipe._forward_backward_step(
+                0, dict(batch), loss_buffer=buffer, num_label_tokens=3, num_batches=1, is_train=is_train
+            )
+            result = (buffer[0], recipe._kd_loss_buffer[0], recipe._ce_loss_buffer[0])
+        else:
+            result = recipe._forward_backward_step(0, dict(batch), num_label_tokens=3, num_batches=1, is_train=is_train)
+        results.append(result)
+    for actual, expected in zip(*results):
+        torch.testing.assert_close(actual, expected)
+    if is_train:
+        for actual, expected in zip(student.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, expected.grad, atol=2e-6, rtol=1e-4)
+
+
+@pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
+@pytest.mark.parametrize("teacher_backend", ["sdpa", "fa4"])
+def test_kd_packing_covers_teacher_metadata_and_hooks(teacher_backend, recipe_module, recipe_cls, _):
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+    from nemo_automodel.components.models.common import BackendConfig
+
+    class Model(nn.Module):
+        packed_mask_type = "document_ids"
+        _uses_native_fa4 = True
+        requires_packed_sequence_metadata = True
+
+        def __init__(self, backend):
+            super().__init__()
+            self.backend = BackendConfig(attn=backend)
+
+        def forward(self, input_ids, packed_token_indices, cu_seqlens, **kwargs):
+            """Expose the metadata received at the model boundary.
+
+            Args:
+                input_ids: Tokens of shape [batch, sequence].
+                packed_token_indices: Row-local indices [batch, sequence] or flat [tokens].
+                cu_seqlens: Row-local boundaries [batch, documents + 1] or flat [documents + 1].
+                **kwargs: Remaining collated fields, unchanged.
+
+            Returns:
+                The two input metadata tensors in their received layouts.
+            """
+            return packed_token_indices, cu_seqlens
+
+    recipe = object.__new__(recipe_cls)
+    recipe.cfg = _Cfg(**{"packed_sequence.packed_sequence_size": 6, "packed_sequence.packing_strategy": "neat"})
+    recipe.cfg.vlm_dataloader = SimpleNamespace(packing=SimpleNamespace(packing_format="neat"))
+    recipe.model_parts = [Model("sdpa")]
+    recipe.teacher_model = Model(teacher_backend)
+    recipe.teacher_pp = None
+    recipe.separate_meshes = False
+    contract = recipe._configure_packing()
+    assert contract.requires_packed_sequence_metadata
+    recipe._configure_teacher_packing()
+    batch = neat_packed_collater(
+        [
+            dict(
+                input_ids=[1, 2, 3, 0],
+                labels=[2, -100, -100, -100],
+                position_ids=[0, 1, 0, 0],
+                attention_mask=[1, 1, 2, 0],
+            ),
+            dict(
+                input_ids=[2, 3, 1, 0],
+                labels=[3, -100, -100, -100],
+                position_ids=[0, 1, 0, 0],
+                attention_mask=[1, 1, 2, 0],
+            ),
+        ],
+        packing=contract,
+    )
+    assert isinstance(batch["max_seqlen"], int)
+    indices, boundaries = recipe.teacher_model(**batch)
+    if teacher_backend == "fa4":
+        assert indices.tolist() == [0, 1, 2, 4, 5, 6]
+        assert boundaries.tolist() == [0, 2, 3, 5, 6]
+    else:
+        assert indices.shape == (2, 4)
+        assert boundaries.shape == (2, 3)
+
+
+@pytest.mark.parametrize("separate_meshes", [False, True])
+def test_llm_kd_packing_rejects_incompatible_mask_layouts(monkeypatch, separate_meshes):
+    from nemo_automodel.components.models.common import BackendConfig
+
+    student = nn.Module()
+    student.backend = BackendConfig(attn="sdpa")
+    teacher = nn.Module()
+    teacher.backend = BackendConfig(attn="fa4")
+    teacher._uses_native_fa4 = True
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.cfg = _Cfg(**{"packed_sequence.packed_sequence_size": 6, "packed_sequence.packing_strategy": "neat"})
+    recipe.model_parts = [student]
+    recipe.teacher_model = teacher if not separate_meshes else None
+    recipe.teacher_pp = None
+    recipe.separate_meshes = separate_meshes
+    if separate_meshes:
+        group = object()
+        recipe.kd_mesh_bridge = SimpleNamespace(is_student=True, control_group=group)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda actual: 2 if actual is group else 0)
+
+        def gather(outputs, local, *, group):
+            assert local == ["block_causal"]
+            outputs[:] = [local, ["document_ids"]]
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="same packed mask layout"):
+        recipe._configure_teacher_packing()
+
+
+def _packing_contract_worker(rank, rendezvous):
+    import torch.distributed as dist
+
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.recipes.kd_utils import configure_kd_teacher_packing
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        control = dist.new_group(backend="gloo")
+        local = nn.Module()
+        local.backend = BackendConfig(attn="sdpa")
+        teacher_parts, student_parts = ([local], []) if rank == 1 else ([], [local])
+        configure_kd_teacher_packing(teacher_parts, student_parts, control_group=control)
+        if rank == 1:
+            local.packed_mask_type = "document_ids"
+        with pytest.raises(ValueError, match="same packed mask layout"):
+            configure_kd_teacher_packing(teacher_parts, student_parts, control_group=control)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=60,
+    reason="Two spawned CPU ranks import both recipe stacks; measured up to 21.48s in CI",
+)
+def test_kd_packing_contract_agreement_across_real_cpu_ranks(tmp_path):
+    # Process startup imports both recipe stacks; leave room for cold CI workers.
+    torch.multiprocessing.spawn(_packing_contract_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=2)
+
+
+@pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
+@pytest.mark.parametrize("student_requires,teacher_requires", [(False, False), (False, True), (True, False)])
+def test_kd_only_delivers_neat_offsets_to_consumers_that_require_them(
+    monkeypatch, recipe_module, recipe_cls, _, student_requires, teacher_requires
+):
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+    from nemo_automodel.components.models.common import BackendConfig
+
+    class Model(nn.Module):
+        def __init__(self, requires_metadata):
+            super().__init__()
+            self.backend = BackendConfig(attn="sdpa")
+            self.requires_packed_sequence_metadata = requires_metadata
+            self.scale = nn.Parameter(torch.tensor(1.0))
+            self.calls = 0
+
+        def forward(self, input_ids, **kwargs):
+            """Assert consumer-specific metadata, then compute differentiable logits.
+
+            Args:
+                input_ids: Token IDs of shape [batch, sequence].
+                **kwargs: Shared NEAT fields. Consumers require indices [batch, sequence]
+                    and boundaries [batch, documents + 1]; legacy THD consumers must
+                    not receive those NEAT offsets.
+
+            Returns:
+                Logits of shape [batch, sequence, 8].
+            """
+            self.calls += 1
+            if self.requires_packed_sequence_metadata:
+                assert kwargs["packed_token_indices"].shape == input_ids.shape
+                assert kwargs["cu_seqlens"].shape == (2, 3)
+            else:
+                assert not {"cu_seqlens", "packed_token_indices", "max_seqlen"}.intersection(kwargs)
+            return SimpleNamespace(logits=torch.nn.functional.one_hot(input_ids, num_classes=8).float() * self.scale)
+
+    recipe = object.__new__(recipe_cls)
+    recipe.cfg = _Cfg(**{"packed_sequence.packed_sequence_size": 4, "packed_sequence.packing_strategy": "neat"})
+    recipe.cfg.vlm_dataloader = SimpleNamespace(packing=SimpleNamespace(packing_format="neat"))
+    recipe.model_parts = [Model(student_requires)]
+    recipe.teacher_model = Model(teacher_requires)
+    recipe.teacher_pp = None
+    recipe.separate_meshes = False
+    contract = recipe._configure_packing()
+    recipe._configure_teacher_packing()
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.pp_enabled = False
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.loss_fn = MaskedCrossEntropy()
+    recipe.kd_loss_fn = KDLoss()
+    recipe.kd_ratio = 0.5
+    recipe._offload_teacher_model = False
+    recipe._get_dp_group = lambda **kwargs: None
+    recipe._get_dp_group_size = lambda **kwargs: 1
+    recipe._ce_loss_buffer = []
+    recipe._kd_loss_buffer = []
+    batch = neat_packed_collater(
+        [
+            dict(
+                input_ids=[1, 2, 3, 0],
+                labels=[2, -100, -100, -100],
+                position_ids=[0, 1, 0, 0],
+                attention_mask=[1, 1, 2, 0],
+            )
+        ]
+        * 2,
+        packing=contract,
+    )
+    monkeypatch.setattr(
+        recipe_module,
+        "ContextParallelSharder",
+        lambda *args, **kwargs: SimpleNamespace(shard=lambda actual: (nullcontext, actual)),
+    )
+    monkeypatch.setattr(recipe_module, "get_sync_ctx", lambda *args, **kwargs: nullcontext())
+    extra = {"loss_buffer": []} if recipe_module is vlm_kd else {}
+    recipe._forward_backward_step(0, batch, num_label_tokens=2, num_batches=1, is_train=True, **extra)
+    assert recipe.model_parts[0].calls == recipe.teacher_model.calls == 1
+    assert recipe.model_parts[0].scale.grad is not None
+    assert "cu_seqlens" in batch  # A model-entry hook must not mutate the shared batch.

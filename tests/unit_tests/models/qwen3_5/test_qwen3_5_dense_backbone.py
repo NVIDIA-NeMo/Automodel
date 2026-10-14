@@ -22,7 +22,7 @@ fp32-safe rotary embedding. All tests are CPU-only.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -34,13 +34,15 @@ pytest.importorskip("transformers.models.qwen3_5_moe")
 
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
-from nemo_automodel.components.models.common import BackendConfig, packing
+from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata, get_unpad_data
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5 import packing as qwen3_5_packing
 from nemo_automodel.components.models.qwen3_5.model import (
     Fp32SafeQwen3_5TextRotaryEmbedding,
     Qwen3_5DenseTextBackbone,
 )
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
+    CPAwareGatedDeltaNet,
     SSMGate,
     _resolve_ssm_dtype,
     _SSMGateParam,
@@ -209,6 +211,64 @@ class TestFp32SafeRotaryEmbedding:
 
 
 class TestDenseTextBackbone:
+    @pytest.mark.parametrize(
+        "attention_mask",
+        [
+            pytest.param(
+                torch.tensor(
+                    [[1, 1, 1, 2, 2, 0], [1, 1, 2, 2, 3, 3]],
+                    dtype=torch.long,
+                ),
+                id="conflicting-indexed-boundaries",
+            ),
+            pytest.param(torch.ones((2, 6), dtype=torch.long), id="binary-mask"),
+        ],
+    )
+    def test_packed_metadata_prefers_authoritative_ids_and_matches_reference(
+        self, attention_mask: torch.Tensor
+    ) -> None:
+        """Verify packed IDs override indexed and binary attention masks.
+
+        Args:
+            attention_mask: Tensor of shape [batch, sequence] containing either
+                indexed document IDs with conflicting boundaries or a binary mask.
+        """
+        packed_seq_ids = torch.tensor(
+            [[1, 1, 2, 2, 2, 0], [1, 2, 2, 3, 3, 3]],
+            dtype=torch.long,
+        )
+        packed_metadata = build_packed_sequence_metadata(packed_seq_ids)
+
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
+            attention_mask,
+            packed_seq_ids,
+            packed_token_indices=packed_metadata["packed_token_indices"],
+            cu_seqlens=packed_metadata["cu_seqlens"],
+        )
+        reference_indices, reference_cu_seqlens, _ = get_unpad_data(packed_seq_ids)
+
+        assert metadata is not None
+        assert metadata.document_ids is packed_seq_ids
+        torch.testing.assert_close(metadata.indices, reference_indices)
+        torch.testing.assert_close(metadata.cu_seqlens, reference_cu_seqlens.long())
+        torch.testing.assert_close(metadata.cu_seqlens_cpu, reference_cu_seqlens.long())
+
+    def test_packed_metadata_falls_back_from_binary_ids_to_indexed_attention_mask(self):
+        attention_mask = torch.tensor([[1, 1, 2, 2]], dtype=torch.long)
+        packed_seq_ids = torch.ones_like(attention_mask)
+        packed_metadata = build_packed_sequence_metadata(attention_mask)
+
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
+            attention_mask,
+            packed_seq_ids,
+            packed_token_indices=packed_metadata["packed_token_indices"],
+            cu_seqlens=packed_metadata["cu_seqlens"],
+        )
+
+        assert metadata is not None
+        assert metadata.document_ids is attention_mask
+        assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
+
     def test_builds_expected_layer_types(self):
         cfg = _tiny_config(layer_types=("full_attention", "linear_attention"))
         backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
@@ -227,16 +287,67 @@ class TestDenseTextBackbone:
         assert out.past_key_values is None
 
     def test_forward_shape_mixed_layers(self):
-        # The linear_attention block runs FLA's gated-delta-rule / causal_conv1d
-        # kernels, which are CUDA-only (no CPU fallback when CUDA is present), so
-        # build the backbone and inputs on the GPU. Skip when no GPU is available.
-        if not torch.cuda.is_available():
-            pytest.skip("linear_attention forward requires CUDA (FLA kernels)")
-        device = torch.device("cuda")
-        cfg = _tiny_config(layer_types=("full_attention", "linear_attention"))
-        backbone = Qwen3_5DenseTextBackbone(cfg, _backend()).to(device)
-        out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=device))
+        import inspect
+
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_modeling
+
+        cfg = _tiny_config(
+            layer_types=("full_attention", "linear_attention"),
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
+        linear_attn = backbone.layers["1"].linear_attn
+        # Shape coverage uses the real CPU math even when FLA is installed.
+        linear_attn.causal_conv1d_fn = None
+        linear_attn.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
+        with torch.no_grad():
+            linear_attn._fp32_params.A_log.zero_()
+            linear_attn._fp32_params.dt_bias.zero_()
+        out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long))
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
+        assert torch.isfinite(out.last_hidden_state).all()
+
+    def test_linear_attention_torch_convolution_fallback_forward_backward(self):
+        """HF's convolution fallback matches the local grouped-convolution path."""
+        import copy
+        import inspect
+
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_modeling
+
+        torch.manual_seed(42)
+        cfg = _tiny_config(
+            layer_types=("linear_attention",),
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        actual = CPAwareGatedDeltaNet(cfg, layer_idx=0).float()
+        with torch.no_grad():
+            actual._fp32_params.A_log.zero_()
+            actual._fp32_params.dt_bias.zero_()
+        # Exercise the CPU references even when optional CUDA kernels are installed.
+        actual.causal_conv1d_fn = inspect.unwrap(hf_modeling.causal_conv1d_fn)
+        actual.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
+        reference = copy.deepcopy(actual)
+        reference.causal_conv1d_fn = None
+        hidden = torch.randn(2, 7, cfg.hidden_size, requires_grad=True)
+        reference_hidden = hidden.detach().clone().requires_grad_()
+
+        actual_output = actual(hidden)
+        reference_output = reference(reference_hidden)
+        torch.testing.assert_close(actual_output, reference_output, rtol=1e-5, atol=1e-6)
+        gradient = torch.randn_like(actual_output)
+        actual_output.backward(gradient)
+        reference_output.backward(gradient)
+        torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=1e-5, atol=1e-6)
+        for name, parameter in actual.named_parameters():
+            expected = reference.get_parameter(name).grad
+            assert parameter.grad is not None and expected is not None, name
+            torch.testing.assert_close(parameter.grad, expected, rtol=1e-5, atol=1e-6)
 
     def test_forward_accepts_inputs_embeds(self):
         cfg = _tiny_config(layer_types=("full_attention",))
@@ -257,21 +368,22 @@ class TestDenseTextBackbone:
                 checkpoint_impl=CheckpointImpl.NO_REENTRANT,
             )
 
-        get_unpad_data = MagicMock(wraps=packing.get_unpad_data)
         chunk_gated_delta_rule = MagicMock(side_effect=lambda *args, **_kwargs: (args[2], None))
         for linear_attn in linear_attn_modules:
-            linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda **kwargs: kwargs["x"])
+            linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda x, **kwargs: x)
             linear_attn.chunk_gated_delta_rule = chunk_gated_delta_rule
             linear_attn.norm.forward = MagicMock(side_effect=torch.add)
 
-        with patch.object(qwen3_5_packing, "get_unpad_data", get_unpad_data):
-            output = backbone(
-                input_ids=torch.tensor([[1, 2, 3, 4]]),
-                attention_mask=torch.tensor([[1, 1, 2, 2]]),
-            ).last_hidden_state
-            output.backward(torch.randn_like(output))
+        attention_mask = torch.tensor([[1, 1, 2, 2]])
+        packed_metadata = build_packed_sequence_metadata(attention_mask)
+        output = backbone(
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=attention_mask,
+            packed_token_indices=packed_metadata["packed_token_indices"],
+            cu_seqlens=packed_metadata["cu_seqlens"],
+        ).last_hidden_state
+        output.backward(torch.randn_like(output))
 
-        assert get_unpad_data.call_count == 1
         assert chunk_gated_delta_rule.call_count == 4
         call_kwargs = [call.kwargs for call in chunk_gated_delta_rule.call_args_list]
         device_cu_seqlens = call_kwargs[0]["cu_seqlens"]

@@ -36,7 +36,7 @@ env:
 
 jobs:
   ephemeral-runner-routing:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@4fe957d4ea5816af1d67fae130bbab4b434c10b3 # v1.9.2
     with:
       lane: ${{ vars.NEMO_CI_EPHEMERAL_LANE }}
       legacy_label: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
@@ -45,10 +45,11 @@ jobs:
 
   pre-flight:
     needs: [ephemeral-runner-routing]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
     with:
+      workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160  # pragma: allowlist secret
       default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
-      non_nvidia_runner_prefix: ${{ needs.ephemeral-runner-routing.outputs.runner_label }}
+      non_nvidia_runner_prefix: ${{ needs.ephemeral-runner-routing.outputs.runner_label_base }}
       default_test_data_path: ${{ vars.DEFAULT_TEST_DATA_PATH }}
       non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
       sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
@@ -94,6 +95,18 @@ jobs:
         run: |
           source ./venv/bin/activate
           uv run --active bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
+      - name: Reject unsafe NumPy load/save calls
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tools/lint_numpy_pickle.py
+      - name: Reject globals()
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tools/lint_no_globals.py
+      - name: Enforce model parallelizer contract
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tools/lint_model_parallelizer_contract.py
 
   import_linting:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
@@ -129,6 +142,11 @@ jobs:
         run: |
           source ./venv/bin/activate
           uv run lint-imports --debug --verbose --no-cache
+
+      - name: Verify recipe import contract coverage
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tests/ci_tests/test_import_contracts.py
 
   type_checking:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
@@ -268,7 +286,7 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
     environment: ${{ contains(matrix.registry, 'azure') && 'nemo-ci' || '' }}
     steps:
       - name: Get PR info
@@ -320,22 +338,6 @@ jobs:
           echo "key=$KEY" | tee -a "$GITHUB_OUTPUT"
           echo "cache-to=type=registry,ref=${{ matrix.registry }}/automodel:${KEY}-buildcache,mode=max" | tee -a "$GITHUB_OUTPUT"
 
-      # DeepEP and other source builds can produce different result digests for
-      # the same BuildKit key. Reading multiple donors can select an incoherent
-      # parent chain and invalidate every expensive downstream layer.
-      - name: Select cache donor
-        id: cache_from
-        shell: bash
-        env:
-          BASELINE_CACHE: ${{ matrix.registry }}/automodel:main-buildcache
-          RUN_CACHE: ${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}-buildcache
-        run: |
-          DONOR_CACHE="$RUN_CACHE"
-          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
-            DONOR_CACHE="$BASELINE_CACHE"
-          fi
-          echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
-
       - name: Compute platform
         id: platform
         run: |
@@ -347,11 +349,36 @@ jobs:
             echo "cache-key=amd64" | tee -a "$GITHUB_OUTPUT"
           fi
 
+      - name: Select compatible container dependencies
+        id: dependencies
+        env:
+          PLATFORM: ${{ steps.platform.outputs.platforms }}
+          REGISTRY: ${{ matrix.registry }}
+          CACHE_KEY: ${{ steps.cache_keys.outputs.key }}
+        run: bash .github/scripts/prepare-container-dependencies.sh
+
+      # DeepEP and other source builds can produce different result digests for
+      # the same BuildKit key. Reading multiple donors can select an incoherent
+      # parent chain and invalidate every expensive downstream layer.
+      - name: Select cache donor
+        id: cache_from
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          BASELINE_CACHE: ${{ matrix.registry }}/automodel:main-buildcache
+          RUN_CACHE: ${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}-buildcache
+        run: |
+          DONOR_CACHE="$RUN_CACHE"
+          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
+            DONOR_CACHE="$BASELINE_CACHE"
+          fi
+          echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
+
       # Keep multi-GB cache ownership on main. Copied PR branches can restore
       # main's cache without consuming repository storage with scoped copies.
       - name: Restore and save uv build cache
         id: uv-build-cache-main
-        if: github.ref == 'refs/heads/main'
+        if: steps.dependencies.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .buildkit-cache/uv
@@ -360,7 +387,7 @@ jobs:
 
       - name: Restore uv build cache
         id: uv-build-cache-branch
-        if: github.ref != 'refs/heads/main'
+        if: steps.dependencies.outputs.cache-hit != 'true' && github.ref != 'refs/heads/main'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .buildkit-cache/uv
@@ -368,6 +395,7 @@ jobs:
           key: buildkit-uv-${{ runner.os }}-${{ steps.platform.outputs.cache-key }}-${{ hashFiles('docker/Dockerfile', 'docker/common/uv-pytorch.lock', 'uv.lock') }}
 
       - name: Inject uv cache into BuildKit
+        if: steps.dependencies.outputs.cache-hit != 'true'
         uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361 # v3.3.0
         with:
           builder: ${{ steps.setup-buildx.outputs.name }}
@@ -388,6 +416,26 @@ jobs:
           app-id: ${{ vars.BOT_ID }}
           private-key: ${{ secrets.BOT_KEY }}
 
+      # Persist installed native extensions and the complete venv. Unlike a
+      # BuildKit layer cache, this image remains reusable when its parent cache
+      # chain is missing or a PR/release has no writable Actions uv cache.
+      - name: Build and push container dependencies
+        id: build-dependencies
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          file: ./docker/Dockerfile
+          target: automodel_dependencies
+          push: true
+          context: .
+          platforms: ${{ steps.platform.outputs.platforms }}
+          build-args: ${{ steps.dependencies.outputs.build-args }}
+          cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
+          cache-to: ${{ steps.cache_keys.outputs.cache-to }}
+          tags: ${{ steps.dependencies.outputs.image }}
+          secrets: |
+            GH_TOKEN=${{ steps.app-token.outputs.token }}
+
       - name: Build and push
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
@@ -395,11 +443,11 @@ jobs:
           push: true
           context: .
           platforms: ${{ steps.platform.outputs.platforms }}
-          build-args: |
-            BASE_IMAGE=pytorch
-          cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
-          cache-to: ${{ steps.cache_keys.outputs.cache-to }}
-          no-cache: false
+          build-args: ${{ steps.dependencies.outputs.build-args }}
+          # Override only the dependency stage; always copy this checkout and
+          # run the native-runtime and non-root checks in the final stage.
+          build-contexts: |
+            automodel_dependencies=docker-image://${{ steps.dependencies.outputs.image }}@${{ steps.dependencies.outputs.digest || steps.build-dependencies.outputs.digest }}
           tags: |
             ${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}
             ${{ matrix.registry }}/automodel:${{ github.sha }}
@@ -409,27 +457,40 @@ jobs:
   cicd-unit-tests:
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 4
       matrix:
         include:
           - test-name: L0_Unit_Tests_CPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            is-unit-test: true
             cpu-only: true
-            timeout: 15
+            # The full CPU suite takes 28-30 minutes before teardown and coverage finish.
+            timeout: 40
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            is-unit-test: true
             cpu-only: false
-            timeout: 30
+            # GPU shards take ~30 minutes before teardown and coverage finish.
+            timeout: 40
             shard-id: 0
             num-shards: 2
           - test-name: L0_Unit_Tests_GPU_2_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            is-unit-test: true
             cpu-only: false
-            timeout: 30
+            timeout: 40
             shard-id: 1
             num-shards: 2
+          # Run cold Magi/TileLang compilation alongside the general unit shards.
+          # These functional parity checks remain required on every PR.
+          - test-name: L0_Kernel_Parity_GPU
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            is-unit-test: false
+            cpu-only: false
+            test-folder: kernel_parity
+            timeout: 20
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
     name: ${{ matrix.test-name }}
     if: |
       (
@@ -452,14 +513,18 @@ jobs:
         uses: ./.github/actions/test-template
         with:
           timeout: ${{ matrix.timeout || 10 }}
-          is-unit-test: "true"
+          # Keep one confirmation for runner failures without allowing a stuck
+          # unit-test shard to consume three consecutive 20-30m attempts.
+          max-attempts: "2"
+          is-unit-test: ${{ matrix.is-unit-test }}
+          test-folder: ${{ matrix.test-folder }}
           cpu-only: ${{ matrix.cpu-only || false }}
           shard-id: ${{ matrix.shard-id }}
           num-shards: ${{ matrix.num-shards }}
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
-          runner: ${{ matrix.runner }}
+          runner: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
 
   cicd-e2e-tests:
     strategy:
@@ -489,7 +554,7 @@ jobs:
           # sets the stage floor. A 40-minute timeout leaves more than 2x headroom
           # over the measured merged runtime while bounding timeout retries.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data
+            test-folder: hf_transformer,hf_transformer_llm,data,models/gemma4
             timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
@@ -528,7 +593,7 @@ jobs:
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
     name: ${{ matrix.test-name }}
     if: |
       (
@@ -552,11 +617,12 @@ jobs:
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
+          full-moe-matrix: ${{ github.event_name == 'schedule' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           is_unit_test: "false"
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ matrix.test-data-path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
-          runner: ${{ matrix.runner }}
+          runner: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
 
   cicd-e2e-tests-gb200:
     strategy:
@@ -564,6 +630,9 @@ jobs:
       max-parallel: 10
       matrix:
         include:
+          - test-name: L2_Attention
+            test-folder: attention
+            timeout: 20
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
             timeout: 20
@@ -582,9 +651,10 @@ jobs:
             is-optional: "true"
           # Merged with hf_transformer_llm + data, mirroring cicd-e2e-tests
           # (2.4 + 3.8 + 4.3 = 10.5 min median, under the 13.2 min L2_Context_Parallel
-          # floor). Leaves this matrix at 9 entries, one slot of headroom.
+          # floor). Together with attention, this uses the 10 available matrix slots.
+          # Include models/minimax_m3_vl here; its runtime is not part of the 10.5 min median.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data
+            test-folder: hf_transformer,hf_transformer_llm,data,models/minimax_m3_vl,models/gemma4
             timeout: 40
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
@@ -604,7 +674,7 @@ jobs:
             test-folder: moe,parallelism
             timeout: 30
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
-    runs-on: ${{ matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
+    runs-on: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
     name: gb200_${{ matrix.test-name }}
     if: |
       (
@@ -630,12 +700,13 @@ jobs:
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
+          full-moe-matrix: ${{ github.event_name == 'schedule' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           is-optional: ${{ matrix.is-optional || 'false' }}
           is_unit_test: "false"
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry-gb200 }}/automodel:${{ github.sha }}
-          runner: ${{ matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
+          runner: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
 
   Nemo_CICD_Test:
     needs:

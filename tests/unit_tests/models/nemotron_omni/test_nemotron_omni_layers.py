@@ -197,3 +197,49 @@ def test_registry_v2_entry_removed():
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
 
     assert "NemotronH_Nano_VL_V2" not in dict(MODEL_ARCH_MAPPING)
+
+
+def test_initialize_weights_preserves_sharded_mamba_fp32(tmp_path):
+    """Preserve FP32 storage and values so DCP can initialize fresh optimizer state."""
+    import torch.distributed as dist
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3MambaFP32Params
+
+    class TinyLanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._fp32_params = NemotronV3MambaFP32Params(num_heads=4)
+
+        @torch.no_grad()
+        def initialize_weights(self, buffer_device=None, dtype=torch.bfloat16):
+            # Values deliberately not representable in BF16 expose rounding on a broad cast.
+            for index, parameter in enumerate(self._fp32_params.parameters()):
+                parameter.fill_(0.1234567 + index)
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path}/init", rank=0, world_size=1)
+    try:
+        model = object.__new__(NemotronOmniForConditionalGeneration)
+        torch.nn.Module.__init__(model)
+        model.language_model = TinyLanguageModel()
+        model.vision_model = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+        mesh = init_device_mesh("cpu", (1,))
+        fully_shard(model.language_model._fp32_params, mesh=mesh)
+        fully_shard(model, mesh=mesh)
+
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
+
+        for index, parameter in enumerate(model.language_model._fp32_params.parameters()):
+            local = parameter.to_local()
+            assert parameter.dtype == torch.float32
+            assert local.dtype == torch.float32
+            torch.testing.assert_close(local, torch.full_like(local, 0.1234567 + index), rtol=0, atol=0)
+            parameter.grad = torch.zeros_like(parameter)
+            parameter.grad = None
+        assert model.vision_model.weight.dtype == torch.bfloat16
+        state = get_optimizer_state_dict(model, torch.optim.AdamW(model.parameters()))
+        assert set(state["state"]) == set(dict(model.named_parameters()))
+    finally:
+        dist.destroy_process_group()

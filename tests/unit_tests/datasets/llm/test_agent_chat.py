@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import json
 import logging
 
@@ -770,6 +771,70 @@ def test_format_example_forwards_mask_reasoning_content(monkeypatch):
 
     agent_chat._format_example(example, Tok(), 0, 0, mask_reasoning_content=True)
     assert captured["mask_reasoning_content"] is True
+
+
+def test_format_example_forwards_mask_generation_prompt(monkeypatch):
+    captured = {}
+
+    def fake_format_chat_template(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}
+
+    agent_chat._format_example(example, Tok(), 0, 0)
+    assert captured["mask_generation_prompt"] is False
+
+    agent_chat._format_example(example, Tok(), 0, 0, mask_generation_prompt=True)
+    assert captured["mask_generation_prompt"] is True
+
+
+def test_agent_chat_config_forwards_mask_generation_prompt(monkeypatch):
+    captured = {}
+
+    def fake_make(tokenizer, **kwargs):
+        captured.update(kwargs)
+        return "dataset"
+
+    monkeypatch.setattr(agent_chat, "make_agent_chat_dataset", fake_make)
+    cfg = agent_chat.AgentChatConfig(dataset_name="x", mask_generation_prompt=True)
+    assert cfg.build(tokenizer=object()) == "dataset"
+    assert captured["mask_generation_prompt"] is True
+    assert agent_chat.AgentChatConfig(dataset_name="x").mask_generation_prompt is False
+
+
+def test_agent_chat_config_positional_layout_is_unchanged():
+    # The dataclass is not keyword-only, so the new field must come after every pre-existing
+    # one: a positional construction written against the old layout keeps its meaning.
+    cfg = agent_chat.AgentChatConfig(
+        "x",  # dataset_name
+        None,  # path
+        "train",  # split
+        None,  # revision
+        False,  # filter_no_assistant
+        False,  # filter_overlong
+        False,  # trim_incomplete_last_turn
+        None,  # chat_template
+        64,  # seq_length
+        None,  # limit_dataset_samples
+        False,  # padding
+        False,  # truncation
+        False,  # mask_reasoning_content
+        True,  # train_on_last_turn_only
+        True,  # drop_history_reasoning_content
+        True,  # truncate_history
+    )
+    assert cfg.train_on_last_turn_only is True
+    assert cfg.drop_history_reasoning_content is True
+    assert cfg.truncate_history is True
+    assert cfg.mask_generation_prompt is False
+    assert [f.name for f in dataclasses.fields(agent_chat.AgentChatConfig)][-1] == "mask_generation_prompt"
 
 
 def test_convert_messages_drops_history_reasoning_keeps_last():

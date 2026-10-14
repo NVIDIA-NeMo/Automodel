@@ -154,6 +154,15 @@ harness fails with an actionable error instead of repeating content if a request
 document. Pipeline-parallel runs resize their stage activation buffers to the configured parity length; reduce the
 length only when a model has a documented memory limit.
 
+Parity forwards through AutoModel's shared `FlexAttention` wrapper use static compilation and fixed 64-by-64
+query/key tiles. A separate compiler entry point keeps training's recompilations out of the parity cache budget;
+full-graph compilation raises instead of silently falling back to unfused attention. The trained reference and
+reloaded model therefore use the same attention policy even when training has generalized shapes or autotuned
+different kernels. This temporary override also applies to AutoModel
+source-parity forwards and is restored afterward; training, native resume, other attention backends, and vanilla-HF
+attention retain their normal execution. It improves reload consistency without guaranteeing bitwise equality
+across different topologies or closer agreement with HF. Existing numerical thresholds still apply.
+
 For a diagnosed cross-framework instability, `cross_framework_gate_sequence_length` can gate Phases 0 and 3 on a
 prefix of the same long forward. It does not launch a shorter forward: the harness still runs and reports all
 `parity_sequence_length` tokens, while mean KL, p95 KL, and cosine use the configured prefix for pass/fail. Phase 2,
@@ -255,6 +264,26 @@ escape hatches, not additional profiles. JSD and max KL remain diagnostic and ca
 Legacy positive `check_*` controls, generic numeric cosine fields, and max-KL threshold fields are no longer accepted.
 All live recipes use default-on phases, semantic `skip_*` controls, and named profiles. The optional structured
 profile and numeric override mappings remain available for measured one-model exceptions.
+
+### Explicit HF reference precision
+
+`ci.checkpoint_robustness.hf_reference_compute_fp32: true` promotes sensitive operations in the test's HF
+reference alongside the existing FP32 tensor-loading treatment. It currently supports Mistral4 RMSNorm, RoPE,
+router scoring, and expert accumulation, and rejects models without Mistral4 routers. It runs the original HF algorithms
+with FP32 normalization through the norm-weight multiply, FP32 rotary tables/rotation, FP32 router softmax/selected
+weights, and FP32 expert accumulation. Projections, activations, and checkpoint storage retain their native dtypes;
+this does not load the whole model in FP32.
+
+These choices are corroborated by vLLM's CUDA RMSNorm, FlashInfer DeepSeek RoPE, fused top-k, and CUDA expert-sum paths at
+[vLLM 9dd969d](https://github.com/vllm-project/vllm/tree/9dd969da096e37256ee37e24f6a4689d860f39ce).
+The native vLLM fallback paths can differ; this is not a claim of bitwise equivalence to every inference backend.
+
+The harness applies the adjustment to source and export-reload forwards, repeats, and shape diagnostics. It preserves
+existing device-map wrappers and restores instance forwards after success or failure. HF's rotary free functions are
+patched only during the wrapped attention call and restored before the sequential harness evaluates another model.
+Omitting the option or setting it to false retains native HF computation. Enabling it logs a modified-reference
+message. The adjustment lives entirely in the test harness; other model families require separate validation before
+opting in. Source and reload thresholds remain enforced, independently of reference precision.
 
 Retrieval checkpoint robustness uses the same phase contract for Phases 1–4. Because a biencoder produces embeddings
 rather than language-model logits, its Phase 2 AutoModel reload gates the selected profile's same-implementation

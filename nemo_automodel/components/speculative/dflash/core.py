@@ -327,6 +327,19 @@ class DFlashTrainerModule(nn.Module):
         pos_ids = base + offsets
         return pos_ids.view(bsz, -1)
 
+    def _embed_noise_ids(self, noise_ids: torch.Tensor) -> torch.Tensor:
+        """Embed noise-block token ids and apply the target's input-embedding scale.
+
+        Mirrors ``Qwen3DFlashDraftModel.embed_noise_block``, which spec_generate
+        uses on the decode side: a target whose ``dflash_config`` sets
+        ``input_embedding_scale`` must see the same scaled embeddings during
+        training, or the draft learns one distribution and is served another --
+        the same train/serve mismatch ``compute_logits`` closes on the output side.
+        """
+        embedded = _to_full_tensor(self.embed_tokens(noise_ids))
+        scale = self.draft_model.input_embedding_scale
+        return embedded if scale == 1.0 else embedded * scale
+
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
         """Embed each block as ``[anchor_token, MASK, MASK, ...]`` (invalid blocks all MASK)."""
         bsz, seq_len = input_ids.shape
@@ -348,7 +361,7 @@ class DFlashTrainerModule(nn.Module):
         )
         # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
         # DTensor; gather it so the (plain) draft can consume the noise embedding.
-        return _to_full_tensor(self.embed_tokens(noise_ids))
+        return self._embed_noise_ids(noise_ids)
 
     def _create_vp_noise_embed(self, input_ids, anchor_positions, block_keep_mask, prefix_lengths):
         """Embed the draft blocks with a visible prefix of real tokens, then ``MASK``.
@@ -381,7 +394,7 @@ class DFlashTrainerModule(nn.Module):
         noise_ids = torch.where(fill_mask, real_tokens, mask_tokens).view(bsz, n * self.block_size)
         # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
         # DTensor; gather it so the (plain) draft can consume the noise embedding.
-        return _to_full_tensor(self.embed_tokens(noise_ids))
+        return self._embed_noise_ids(noise_ids)
 
     def _build_block_targets(
         self,
@@ -515,6 +528,35 @@ class DFlashTrainerModule(nn.Module):
             )
         return anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, prefix_lengths
 
+    @staticmethod
+    def _resolve_supervision_ids(input_ids: torch.Tensor, label_ids: torch.Tensor | None) -> torch.Tensor:
+        """Validate the optional label stream and return the supervised token ids.
+
+        Args:
+            input_ids: Long tensor of shape ``[batch, sequence]``; the context tokens.
+            label_ids: Long tensor of shape ``[batch, sequence]`` on the same device
+                as ``input_ids``, indexed like ``input_ids`` (unshifted) and holding
+                valid vocabulary ids everywhere, or ``None`` to supervise ``input_ids``.
+                Values are not range-checked here, to avoid a device sync.
+
+        Returns:
+            ``label_ids`` when given, else ``input_ids``; shape ``[batch, sequence]``.
+
+        Raises:
+            ValueError: If ``label_ids`` differs from ``input_ids`` in shape, dtype, or device.
+        """
+        if label_ids is None:
+            return input_ids
+        if label_ids.shape != input_ids.shape:
+            raise ValueError(
+                f"label_ids must match input_ids shape {tuple(input_ids.shape)}, got {tuple(label_ids.shape)}"
+            )
+        if label_ids.dtype != input_ids.dtype:
+            raise ValueError(f"label_ids must have dtype {input_ids.dtype}, got {label_ids.dtype}")
+        if label_ids.device != input_ids.device:
+            raise ValueError(f"label_ids must be on {input_ids.device}, got {label_ids.device}")
+        return label_ids
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -523,6 +565,7 @@ class DFlashTrainerModule(nn.Module):
         position_ids: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
+        label_ids: torch.Tensor | None = None,
     ) -> DFlashStepMetrics:
         """Parallel block-wise training forward pass.
 
@@ -531,8 +574,30 @@ class DFlashTrainerModule(nn.Module):
         keeps every block inside one document: anchors are constrained so the block
         does not cross a boundary, the block's context prefix attends only within the
         anchor's document, and the draft's RoPE uses the per-document positions.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence]; the context tokens.
+            hidden_states: Tensor of shape [batch, sequence, layers * hidden]; the
+                captured target-model context features.
+            loss_mask: Tensor of shape [batch, sequence]; the supervised-token mask.
+            position_ids: Long tensor of shape [batch, sequence] with per-document
+                reset positions under packing, or ``None``.
+            seq_lens: Long tensor of shape [batch, max_docs] with packed document
+                lengths, or ``None`` when unpacked.
+            doc_remaining: Long tensor of shape [batch, sequence]; real tokens left
+                in each position's document, or ``None`` when unpacked.
+            label_ids: Optional long tensor with the shape, dtype and device of
+                ``input_ids``; ``label_ids[:, t]`` is the unshifted supervision
+                token for position ``t``. Every entry must be a valid vocabulary
+                id; exclude positions with ``loss_mask``, not ``-100``. Context,
+                clean anchors and visible ``variable_prefix`` tokens still use
+                ``input_ids``; ``None`` supervises ``input_ids``.
+
+        Returns:
+            DFlashStepMetrics for this micro-batch.
         """
         bsz, seq_len = input_ids.shape
+        supervision_ids = self._resolve_supervision_ids(input_ids, label_ids)
 
         anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, prefix_lengths = (
             self._prepare_block_inputs(
@@ -548,14 +613,16 @@ class DFlashTrainerModule(nn.Module):
         )
         # A tensor-parallel target's lm_head is column-parallel and returns
         # vocab-sharded (DTensor) logits; gather to a full tensor for the loss.
-        logits = _to_full_tensor(self.lm_head(output_hidden))
+        # ``compute_logits`` applies the target's output transform (multiplier /
+        # softcapping) so training supervises the distribution serving produces.
+        logits = _to_full_tensor(self.draft_model.compute_logits(output_hidden, self.lm_head))
 
         n = anchor_positions.size(1)
         bs = self.block_size
 
         # Block position k predicts the token at anchor + k.
         _, target_ids, block_mask = self._build_block_targets(
-            input_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
+            supervision_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
         )
 
         if self.loss_type == "variable_prefix":

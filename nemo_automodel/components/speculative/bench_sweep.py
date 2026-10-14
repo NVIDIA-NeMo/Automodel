@@ -350,6 +350,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--temperature", type=float, default=0.0, help="Default 0.0 = greedy.")
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=0, help="0 disables top-k truncation.")
     parser.add_argument(
         "--num-steps", type=int, default=None, help="sglang engine only: speculative_num_steps fallback."
     )

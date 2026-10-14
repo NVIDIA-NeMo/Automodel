@@ -250,3 +250,112 @@ def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     # The stub returns 20, so after division by 10 we expect 2.0
     assert torch.is_tensor(out)
     assert out.item() == pytest.approx(2.0)
+
+
+def test_fused_cross_entropy_applies_per_token_weights(monkeypatch):
+    """The fused path requests unreduced values before applying objective weights."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    captured = {}
+
+    def _fake_linear_ce(hidden, weight, targets=None, **kwargs):
+        captured["reduction"] = kwargs["reduction"]
+        return torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
+    loss_weights = torch.tensor([[0.5, 0.5], [1.5, 1.5]])
+    out = linear_ce_mod.FusedLinearCrossEntropy(reduction="sum")(
+        torch.randn(2, 2, 3),
+        torch.zeros(2, 2, dtype=torch.long),
+        torch.randn(5, 3),
+        num_label_tokens=4,
+        loss_weights=loss_weights,
+    )
+
+    assert captured["reduction"] == "none"
+    assert out.item() == pytest.approx((0.5 + 1.0 + 4.5 + 6.0) / 4)
+
+
+def test_fused_cross_entropy_accumulates_hidden_grad_in_fp32(monkeypatch):
+    """The fused kernel must not accumulate the hidden-state gradient in bf16 or filter tokens."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    captured = {}
+
+    def _fake_linear_ce(hidden, weight, targets=None, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor(1.0)
+
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
+    linear_ce_mod.FusedLinearCrossEntropy()(
+        torch.randn(1, 2, 3), torch.zeros(1, 2, dtype=torch.long), torch.randn(5, 3)
+    )
+
+    assert captured["accum_e_fp32"] is True
+    assert captured["filter_eps"] is None
+    assert captured["impl"] == "cce"
+
+
+def test_fused_cross_entropy_torch_compile_impl_omits_cce_options(monkeypatch):
+    """impl='torch_compile' is forwarded without the cce-only kernel options."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    captured = {}
+
+    def _fake_linear_ce(hidden, weight, targets=None, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor(1.0)
+
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
+    linear_ce_mod.FusedLinearCrossEntropy(impl="torch_compile")(
+        torch.randn(1, 2, 3), torch.zeros(1, 2, dtype=torch.long), torch.randn(5, 3)
+    )
+
+    assert captured["impl"] == "torch_compile"
+    assert "accum_e_fp32" not in captured
+    assert "filter_eps" not in captured
+
+
+def test_fused_cross_entropy_rejects_unknown_impl():
+    with pytest.raises(ValueError, match="impl must be"):
+        FusedLinearCrossEntropy(impl="cce_exact")
+
+
+@pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY or not torch.cuda.is_available(), reason="requires fused CE on CUDA")
+@pytest.mark.parametrize("impl", ["cce", "torch_compile"])
+def test_fused_weighted_cross_entropy_matches_pytorch_gradient(impl):
+    """A real fused kernel must match the weighted PyTorch loss and gradients."""
+    torch.manual_seed(3)
+    hidden = torch.randn(2, 3, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(13, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.tensor([[1, 2, -100], [3, 4, 5]], device="cuda")
+    loss_weights = torch.tensor([[0.5] * 3, [1.5] * 3], device="cuda")
+
+    loss = FusedLinearCrossEntropy(impl=impl)(
+        hidden,
+        labels,
+        weight,
+        num_label_tokens=5,
+        loss_weights=loss_weights,
+    )
+    reference_hidden = hidden.detach().float().requires_grad_()
+    reference_weight = weight.detach().float().requires_grad_()
+    logits = reference_hidden @ reference_weight.T
+    if impl == "torch_compile":
+        # torch_compile materializes BF16 logits before the fp32 CE, like MaskedCrossEntropy.
+        logits = logits.bfloat16().float()
+    per_token = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        labels.reshape(-1),
+        reduction="none",
+    ).reshape_as(labels)
+    reference = (per_token * loss_weights).sum() / 5
+
+    torch.testing.assert_close(loss, reference)
+    loss.backward()
+    reference.backward()
+    torch.testing.assert_close(hidden.grad.float(), reference_hidden.grad, rtol=2.0e-2, atol=3.0e-3)
+    torch.testing.assert_close(weight.grad.float(), reference_weight.grad, rtol=2.0e-2, atol=3.0e-3)

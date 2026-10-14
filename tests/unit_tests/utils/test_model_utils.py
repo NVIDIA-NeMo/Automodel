@@ -93,6 +93,27 @@ def test_print_trainable_parameters_custom_name(dummy_model, caplog):
     assert "Model summary:" not in caplog.text
 
 
+@pytest.mark.parametrize("packed_dtype", [torch.int8, torch.uint8])
+def test_model_param_stats_skips_packed_weight_norm(packed_dtype, monkeypatch):
+    """Packed weights still count, but their storage bytes are not a weight norm."""
+    model = nn.Module()
+    model.register_parameter("adapter", nn.Parameter(torch.tensor([3.0, 4.0])))
+    packed = nn.Parameter(torch.ones(8, dtype=packed_dtype), requires_grad=False)
+    model.register_parameter("packed", packed)
+    norm_dtypes = []
+    original_norm = torch.Tensor.norm
+
+    def record_norm(tensor, *args, **kwargs):
+        norm_dtypes.append(tensor.dtype)
+        return original_norm(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "norm", record_norm)
+    total, trainable, local_sq_norm = model_utils._get_model_param_stats(model)
+
+    assert norm_dtypes == [torch.float32]
+    assert (total, trainable, local_sq_norm) == (10, 2, 25.0)
+
+
 def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypatch):
     """
     Helper must stay silent for non-zero ranks.
@@ -248,6 +269,32 @@ def test_legacy_freeze_alias_uses_substring_matching(dummy_model):
 
     assert not _any_requires_grad(dummy_model.vision_tower)
     assert not _any_requires_grad(dummy_model.visual_extra)
+
+
+def test_legacy_freeze_alias_skips_none_attributes():
+    """Optional tower attributes set to None do not prevent pattern-based freezing."""
+
+    class ModelWithOptionalTowers(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.vision_tower = None
+            self.audio_tower = None
+            self.language_model = None
+            self.audio_encoder = nn.Linear(4, 4)
+            self.other = nn.Linear(4, 4)
+
+    model = ModelWithOptionalTowers()
+    model_utils.apply_parameter_freezing(
+        model,
+        model_utils.FreezeConfig(
+            freeze_vision_tower=True,
+            freeze_audio_tower=True,
+            freeze_language_model=True,
+        ),
+    )
+
+    assert not _any_requires_grad(model.audio_encoder)
+    assert _all_requires_grad(model.other)
 
 
 def test_generic_selectors_disable_implicit_legacy_vision_freeze(dummy_model):

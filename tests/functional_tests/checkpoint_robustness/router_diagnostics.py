@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import MethodType
 from typing import Iterator
@@ -138,18 +138,31 @@ def capture_glm_hf_routers(model: torch.nn.Module, output_path: Path) -> Iterato
         return
 
     captures: dict[int, dict[str, object]] = {}
-    patched_modules: list[tuple[torch.nn.Module, bool, object | None]] = []
-    completed = False
-    try:
+    with ExitStack() as stack:
         for module, layer_index in matched_modules:
-            original_route = module.route_tokens_to_experts
-            had_instance_override = "route_tokens_to_experts" in module.__dict__
-            original_instance_value = module.__dict__.get("route_tokens_to_experts")
 
-            def capture_route(self, router_logits, *args, _original=original_route, _layer=layer_index, **kwargs):
-                result = _original(router_logits, *args, **kwargs)
-                indices, _weights = result
-                correction_bias = self.gate.e_score_correction_bias
+            def capture_route(
+                gate: torch.nn.Module,
+                inputs: tuple[torch.Tensor, ...],
+                output: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                *,
+                _layer: int = layer_index,
+                _n_groups: int = module.config.n_group,
+            ) -> None:
+                """Observe the Transformers gate's actual routing outputs.
+
+                Args:
+                    gate: HF router with correction bias of shape [experts].
+                    inputs: Positional gate inputs, containing hidden states of shape [..., hidden]
+                        with arbitrary leading dimensions, or empty when passed by keyword.
+                    output: Router logits of shape [tokens, experts], mixture weights of shape
+                        [tokens, top_k], and selected expert indices of shape [tokens, top_k].
+                        Leading hidden-state dimensions are flattened into tokens. Outputs are not modified.
+                    _layer: Transformer layer index captured when the hook is registered.
+                    _n_groups: Number of expert groups for this router.
+                """
+                router_logits, _weights, indices = output
+                correction_bias = gate.e_score_correction_bias
                 if correction_bias is None:
                     correction_bias = torch.zeros(router_logits.shape[-1], device=router_logits.device)
                 captures[_layer] = {
@@ -157,22 +170,12 @@ def capture_glm_hf_routers(model: torch.nn.Module, output_path: Path) -> Iterato
                     "correction_bias": correction_bias.detach(),
                     "indices": indices.detach(),
                     "score_func": "sigmoid",
-                    "n_groups": int(getattr(self.config, "n_group", 1)),
+                    "n_groups": _n_groups,
                 }
-                return result
 
-            module.route_tokens_to_experts = MethodType(capture_route, module)
-            patched_modules.append((module, had_instance_override, original_instance_value))
+            stack.callback(module.gate.register_forward_hook(capture_route).remove)
         yield
-        completed = True
-    finally:
-        for module, had_instance_override, original_instance_value in patched_modules:
-            if had_instance_override:
-                module.route_tokens_to_experts = original_instance_value
-            else:
-                delattr(module, "route_tokens_to_experts")
-        if completed:
-            _persist_capture(output_path, "hf", model_family, captures)
+    _persist_capture(output_path, "hf", model_family, captures)
 
 
 @contextmanager

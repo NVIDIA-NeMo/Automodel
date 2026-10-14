@@ -197,8 +197,9 @@ PREDS=<runs>/oh3_sft/preds.json  SUBSET=verified RUN_TAG=grade_sft  sbatch grade
 **1. Why `NOPARSER=1`:** A tool call is only usable if something parses the model's raw
 text into a structured `{name, arguments}` call. Both the raw base and the CoderForge
 SFT emit their arguments in the **base model's pretrained JSON prior** —
-`call:name{"command":"...","path":"..."}` (quoted JSON) — because 800 SFT steps don't
-overwrite that prior. vLLM's `--tool-call-parser gemma4` expects the *native* unquoted
+`call:name{{"command":"...","path":"..."}}` — the gemma4 `call:name{...}` envelope
+wrapping a quoted-JSON object — because 800 SFT steps don't overwrite that prior.
+vLLM's `--tool-call-parser gemma4` expects the *native* unquoted
 syntax that the **gemma4-`it` (instruction-tuned)** model emits (`{command:<value>}`),
 and **mangles** the JSON form: it folds the
 leading `{"` into the key (`{"command"`), so every argument comes out corrupted
@@ -206,10 +207,12 @@ leading `{"` into the key (`{"command"`), so every argument comes out corrupted
 0% usable). `NOPARSER=1` disables that parser (and sets `tool_choice=none`, so vLLM
 still renders the tool schemas into the prompt but doesn't try to parse/force a call);
 the raw `call:name{...}` then reaches the response `content`, where `oh3_run.py`'s
-`json.loads`-first fallback recovers the JSON dict cleanly. Because base and SFT share
-the same JSON prior, **both** must run with `NOPARSER=1` — and serving them identically
-is what makes the base-vs-SFT comparison fair. (An `-it`/instruct checkpoint that emits
-Gemma-native args is the opposite case: leave the parser **on**, i.e. omit `NOPARSER`.)
+`json.loads`-first fallback recovers the JSON dict cleanly: the balanced-brace
+extract strips the envelope brace, leaving the inner `{"command":...}` object for
+`json.loads`. Because base and SFT share the same JSON prior, **both** must run with
+`NOPARSER=1` — and serving them identically is what makes the base-vs-SFT comparison
+fair. (An `-it`/instruct checkpoint that emits Gemma-native args is the opposite
+case: leave the parser **on**, i.e. omit `NOPARSER`.)
 
 **2. Base serve note:** The raw base checkpoint is missing the `-it` model's serving
 fields, so two things must be set up before it can tool-call at all:

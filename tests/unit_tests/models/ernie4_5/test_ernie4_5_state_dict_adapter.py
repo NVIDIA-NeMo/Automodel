@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -290,3 +291,24 @@ class TestErnie4_5_MoeStateDictAdapter:
         # gate bias should be renamed back to moe_statics in HF
         assert "model.layers.1.mlp.moe_statics.e_score_correction_bias" in out
         assert "model.embed_tokens.weight" in out
+
+    def test_grouped_expert_bias_does_not_break_hf_key_discovery(
+        self, moe_hf_config, moe_config, backend_config
+    ):
+        biased_hf_config = SimpleNamespace(**{**vars(moe_hf_config), "use_bias": True})
+        biased_moe_config = replace(moe_config, expert_bias=True)
+        adapter = Ernie4_5_MoeStateDictAdapter(biased_hf_config, biased_moe_config, backend_config)
+        state = {
+            "model.layers.1.mlp.experts.gate_and_up_projs": torch.zeros(4, 64, 64),
+            "model.layers.1.mlp.experts.down_projs": torch.zeros(4, 32, 64),
+            "model.layers.1.mlp.experts.gate_up_proj_bias": torch.zeros(4, 64),
+            "model.layers.1.mlp.experts.down_proj_bias": torch.zeros(4, 64),
+        }
+
+        keys = set(adapter.get_hf_state_dict_keys(state))
+
+        assert "model.layers.1.mlp.experts.gate_up_proj_bias" in keys
+        assert "model.layers.1.mlp.experts.down_proj_bias" in keys
+        assert "model.layers.1.mlp.experts.0.gate_proj.weight" in keys
+        assert "model.layers.1.mlp.experts.0.up_proj.weight" in keys
+        assert "model.layers.1.mlp.experts.0.down_proj.weight" in keys

@@ -21,6 +21,7 @@ import pytest
 import torch
 from PIL import Image
 
+from nemo_automodel.components.distributed.activation_checkpointing import apply_submodule_checkpointing
 from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
@@ -62,9 +63,14 @@ from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import Deep
 from nemo_automodel.components.models.deepseek_v4.vision import (
     DeepseekV4VisionAligner,
     DeepseekV4VisionBlock,
+    DeepseekV4VisionRMSNorm,
     DeepseekV4VisionTransformer,
 )
 from nemo_automodel.components.moe.config import MoEConfig
+
+# Over the default 5s budget on purpose: TileLang compilation takes up to about 50s on a cold worker.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(120)
 
 
 def _can_run_tilelang_sparse_attention() -> bool:
@@ -247,23 +253,16 @@ def test_sparse_visual_window_indices_match_released_reference(types):
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.parametrize(
-    ("device", "dtype", "uses_tilelang"),
-    [
-        pytest.param("cpu", torch.float32, False, id="torch_sparse_oracle"),
-        pytest.param(
-            "cuda",
-            torch.bfloat16,
-            True,
-            id="tilelang",
-            marks=pytest.mark.skipif(
-                not _can_run_tilelang_sparse_attention(),
-                reason="TileLang sparse attention requires CUDA compute capability 8.9 or newer",
-            ),
-        ),
-    ],
-)
-def test_visual_sparse_attention_module_matches_dense_forward_backward(monkeypatch, device, dtype, uses_tilelang):
+def test_visual_sparse_attention_module_matches_dense_forward_backward(monkeypatch: pytest.MonkeyPatch) -> None:
+    check_visual_sparse_attention_module_matches_dense_forward_backward(
+        monkeypatch, device="cpu", dtype=torch.float32, uses_tilelang=False
+    )
+
+
+def check_visual_sparse_attention_module_matches_dense_forward_backward(
+    monkeypatch: pytest.MonkeyPatch, *, device: str, dtype: torch.dtype, uses_tilelang: bool
+) -> None:
+    """Check image visibility and all gradients against dense attention on CPU or CUDA."""
     torch.manual_seed(123)
     if uses_tilelang:
         hidden_size, num_heads, head_dim, seq_len, window_size = 128, 16, 512, 192, 128
@@ -670,8 +669,29 @@ def test_vision_blocks_expose_fp32_norm_islands_to_dsv4_fsdp():
     assert fp32_modules == [block.norm1, block.norm2]
 
 
-def test_vision_norm_fsdp_policy_preserves_bf16_activation_dtype(monkeypatch):
+def test_checkpoint_wrapped_vision_norms_are_single_fsdp_units(monkeypatch: pytest.MonkeyPatch) -> None:
     block = DeepseekV4VisionBlock(_vision_config(torch_dtype="bfloat16"))
+    apply_submodule_checkpointing([block], has_kv_sharing=False, context_fn=None)
+    calls = []
+    monkeypatch.setattr(dsv4_fsdp, "fully_shard", lambda child, **kwargs: calls.append((child, kwargs)))
+    policy = torch.distributed.fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+
+    dsv4_fsdp.fully_shard_deepseek_v4(block, mesh=object(), mp_policy=policy)
+
+    assert [child for child, _ in calls] == [block.norm1, block.norm2, block]
+    # The wrapped norms return the bf16 activation dtype expected by attn/mlp.
+    norm_policies = [kwargs["mp_policy"] for _, kwargs in calls[:2]]
+    assert all(norm_policy.param_dtype == torch.float32 for norm_policy in norm_policies)
+    assert all(norm_policy.output_dtype is None for norm_policy in norm_policies)
+    assert all(norm_policy.cast_forward_inputs is False for norm_policy in norm_policies)
+
+
+@pytest.mark.parametrize("whole_tower", [False, True])
+def test_vision_norm_fsdp_policy_preserves_bf16_activation_dtype(
+    monkeypatch: pytest.MonkeyPatch, whole_tower: bool
+) -> None:
+    config = _vision_config(torch_dtype="bfloat16")
+    block = DeepseekV4VisionTransformer(config) if whole_tower else DeepseekV4VisionBlock(config)
     calls = []
 
     def fake_fully_shard(module, **kwargs):
@@ -693,8 +713,11 @@ def test_vision_norm_fsdp_policy_preserves_bf16_activation_dtype(monkeypatch):
         offload_policy=object(),
     )
 
-    norm_policies = [kwargs["mp_policy"] for module, kwargs in calls if module in (block.norm1, block.norm2)]
-    assert len(norm_policies) == 2
+    norms = [module for module in block.modules() if isinstance(module, DeepseekV4VisionRMSNorm)]
+    norm_policies = [kwargs["mp_policy"] for module, kwargs in calls if module in norms]
+    assert len(norm_policies) == len(norms)
+    if whole_tower:
+        assert any(module is block.norm for module, _ in calls)
     assert all(policy.param_dtype == torch.float32 for policy in norm_policies)
     assert all(policy.reduce_dtype == torch.float32 for policy in norm_policies)
     assert all(policy.output_dtype is None for policy in norm_policies)

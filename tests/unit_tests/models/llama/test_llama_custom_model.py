@@ -27,7 +27,6 @@ from nemo_automodel.components.models.llama.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_quack,
 )
-from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 
 set_seed(42)
 
@@ -73,18 +72,32 @@ ROPE_CONFIGS = {
 }
 
 
-def test_quack_rope_layout_matches_torch_for_batch_specific_tables():
-    batch, q_heads, kv_heads, seq_len, head_dim = 2, 4, 2, 8, 64
+@pytest.mark.parametrize("batch", [1, 2])
+def test_quack_rope_layout_matches_torch_for_batch_specific_tables(batch):
+    q_heads, kv_heads, seq_len, head_dim = 4, 2, 8, 64
     q = torch.randn(batch, q_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(batch, kv_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
     angles = torch.randn(batch, seq_len, head_dim // 2, device="cuda", dtype=torch.float32)
-    cos_half = angles.cos().to(torch.bfloat16)
-    sin_half = angles.sin().to(torch.bfloat16)
+    cos_half = angles.cos()
+    sin_half = angles.sin()
     cos = torch.cat((cos_half, cos_half), dim=-1)
     sin = torch.cat((sin_half, sin_half), dim=-1)
 
-    def fake_quack_apply(x, cos_table, sin_table, inplace=False):
-        x0, x1 = x.chunk(2, dim=-1)
+    def fake_quack_apply(
+        x: torch.Tensor, cos_table: torch.Tensor, sin_table: torch.Tensor, inplace: bool = False
+    ) -> torch.Tensor:
+        """Emulate QuACK's FP32 arithmetic and input-dtype output.
+
+        Args:
+            x: BSHD tensor [batch, sequence, heads, head_dim].
+            cos_table: FP32 coefficients [sequence, head_dim // 2].
+            sin_table: FP32 coefficients [sequence, head_dim // 2].
+            inplace: Whether to write the result into x.
+
+        Returns:
+            BSHD tensor with x's dtype, aliasing x only when inplace is true.
+        """
+        x0, x1 = x.float().chunk(2, dim=-1)
         out = torch.cat(
             (
                 x0 * cos_table[None, :, None, :] - x1 * sin_table[None, :, None, :],
@@ -92,6 +105,7 @@ def test_quack_rope_layout_matches_torch_for_batch_specific_tables():
             ),
             dim=-1,
         )
+        out = out.to(x.dtype)
         if inplace:
             x.copy_(out)
             return x
@@ -147,7 +161,7 @@ class TestLlamaModel:
 
     @pytest.mark.parametrize("rope_type", ["default", "llama3"])
     @pytest.mark.parametrize("rms_norm", ["torch_fp32", "te"])
-    def test_model_matches_hf_with_adapter_bidirectional(self, rope_type, rms_norm, tmp_path):
+    def test_model_matches_hf_bidirectional(self, rope_type, rms_norm, tmp_path):
         """Test bidirectional conversion between HF and custom models produces identical outputs.
 
         Parametrized over:
@@ -168,7 +182,6 @@ class TestLlamaModel:
 
         checkpoint = _create_checkpoint(ROPE_CONFIGS[rope_type], tmp_path)
         config = LlamaConfig.from_pretrained(checkpoint)
-        adapter = LlamaStateDictAdapter(config)
 
         # Load HF model
         llama_model_hf = (
@@ -201,13 +214,10 @@ class TestLlamaModel:
 
         # Test forward direction: HF → Custom
         hf_state_dict = llama_model_hf.state_dict()
-        custom_state_dict_from_hf = adapter.from_hf(hf_state_dict)
-        # Use nn.Module.load_state_dict directly to bypass mixin (testing adapter, not mixin)
         # Note: strict=False because HF checkpoints don't have TE's _extra_state keys
-        torch.nn.Module.load_state_dict(llama_model_custom, custom_state_dict_from_hf, strict=False)
+        torch.nn.Module.load_state_dict(llama_model_custom, hf_state_dict, strict=False)
 
-        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
-        s = adapter.to_hf(torch.nn.Module.state_dict(llama_model_custom))
+        s = llama_model_custom.state_dict()
 
         for n1, p1 in hf_state_dict.items():
             p2 = s[n1]
@@ -236,9 +246,7 @@ class TestLlamaModel:
         )
 
         # Test reverse direction: Custom → HF
-        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
-        custom_state_dict = torch.nn.Module.state_dict(llama_model_custom)
-        hf_state_dict_from_custom = adapter.to_hf(custom_state_dict)
+        hf_state_dict_from_custom = llama_model_custom.state_dict()
 
         # Create new HF model and load converted state dict
         llama_model_hf_converted = (
@@ -261,15 +269,14 @@ class TestLlamaModel:
             **tol,
         )
 
-    def test_state_dict_adapter_to_hf(self):
+    def test_model_has_hf_style_projection_keys(self):
         """Test custom model has HF-style separate projection keys."""
-        # Build custom model (which uses adapter internally to load from HF checkpoint)
+        # Build the custom model from an HF checkpoint.
         llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=self.tiny_llama_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
         )
-        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
         custom_state_dict = torch.nn.Module.state_dict(llama_model_custom)
 
         # Separate keys must be present (HF-style passthrough)

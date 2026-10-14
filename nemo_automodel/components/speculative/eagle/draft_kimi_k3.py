@@ -45,7 +45,7 @@ routed experts and the attention-residual mixer stay in the target only). The
 draft itself consumes the shared ``[B, 1, T, T]`` block-causal packed mask like
 the DeepSeek MLA draft, but the recipe rejects sequence packing for a K3 target:
 K3 owns its own packed-attention path, which the EAGLE-3 target wrapper does not
-drive (see ``examples/speculative/eagle3/README_kimi_k3.md``).
+drive (see ``examples/speculative/eagle3/README-kimi-k3.md``).
 """
 
 from __future__ import annotations
