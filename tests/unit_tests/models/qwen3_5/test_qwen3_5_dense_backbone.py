@@ -49,10 +49,6 @@ from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
     install_ssm_gate,
 )
 
-# Over the default 5s budget on purpose: CUDA gated-delta kernels take about 70s to compile on a cold worker.
-# Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(120)
-
 
 def _backend():
     return BackendConfig(
@@ -291,16 +287,28 @@ class TestDenseTextBackbone:
         assert out.past_key_values is None
 
     def test_forward_shape_mixed_layers(self):
-        # The linear_attention block runs FLA's gated-delta-rule / causal_conv1d
-        # kernels, which are CUDA-only (no CPU fallback when CUDA is present), so
-        # build the backbone and inputs on the GPU. Skip when no GPU is available.
-        if not torch.cuda.is_available():
-            pytest.skip("linear_attention forward requires CUDA (FLA kernels)")
-        device = torch.device("cuda")
-        cfg = _tiny_config(layer_types=("full_attention", "linear_attention"))
-        backbone = Qwen3_5DenseTextBackbone(cfg, _backend()).to(device)
-        out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=device))
+        import inspect
+
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_modeling
+
+        cfg = _tiny_config(
+            layer_types=("full_attention", "linear_attention"),
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
+        linear_attn = backbone.layers["1"].linear_attn
+        # Shape coverage uses the real CPU math even when FLA is installed.
+        linear_attn.causal_conv1d_fn = None
+        linear_attn.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
+        with torch.no_grad():
+            linear_attn._fp32_params.A_log.zero_()
+            linear_attn._fp32_params.dt_bias.zero_()
+        out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long))
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
+        assert torch.isfinite(out.last_hidden_state).all()
 
     def test_linear_attention_torch_convolution_fallback_forward_backward(self):
         """HF's convolution fallback matches the local grouped-convolution path."""
