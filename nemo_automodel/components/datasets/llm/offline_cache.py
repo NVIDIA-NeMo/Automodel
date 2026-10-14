@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -112,7 +113,8 @@ def read_manifest(
             f"{cache_name} cache at {cache_dir} has format_version={version}, expected {format_version}. "
             f"Regenerate the cache with the current {producer}."
         )
-    return {**(defaults or {}), **manifest}
+    # Copied so a mutable default (e.g. a dict) is never shared between manifests.
+    return {**copy.deepcopy(defaults or {}), **manifest}
 
 
 def ensure_supervision_options_match(

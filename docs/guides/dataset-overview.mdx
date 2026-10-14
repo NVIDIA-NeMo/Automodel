@@ -101,6 +101,7 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/colum
   - `padding`: padding strategy ("do_not_pad", "max_length", etc.)
   - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
   - `chat_template`: optional override for tokenizer's chat template
+  - `chat_template_kwargs`: optional extra chat template variables passed to every render, for example `{enable_thinking: false}` for Qwen3 or `{thinking_mode: thinking}` for DeepSeek-V4.1; names the dataset sets itself (such as `tools` or `add_generation_prompt`) are rejected
   - `mask_reasoning_content`: optionally exclude rendered `reasoning_content` tokens from loss
   - `mask_generation_prompt`: optionally exclude the template-supplied prefix of each assistant turn (the role header and any empty reasoning block such as `<think></think>`) from loss
   - `skip_invalid_samples`: if `true`, skip malformed JSONL lines when reading local files (warnings log skip counts); default `false` fails fast on a bad line
