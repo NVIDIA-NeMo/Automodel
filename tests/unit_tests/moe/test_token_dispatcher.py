@@ -134,62 +134,61 @@ def test_token_unpermutation_applies_async_setting_to_deepep_combine(enabled):
     manager.combine.assert_called_once_with(hidden_states, enabled, enabled)
 
 
-class TestHybridEPTokenCountEqualization:
-    """dispatch() must pad unequal per-rank token counts up to the EP-group max."""
+class TestHybridEPTokenSlots:
+    """Real rows survive dispatch; common slots need no activation padding."""
 
-    def _run(self, hybrid_ep_manager, monkeypatch, num_tokens, group_max):
+    def _run(self, manager, monkeypatch, num_tokens, group_max):
         import nemo_automodel.components.moe.megatron.token_dispatcher as td
 
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
         monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
-
-        def fake_all_reduce(tensor, op=None, group=None):
-            tensor.fill_(group_max)
-
-        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
-
-        dispatched = {}
-
-        def fake_dispatch(x, routing_map, probs, **kwargs):
-            dispatched.update(x=x, routing_map=routing_map, probs=probs)
-            return x, probs, None, routing_map.sum(dim=0), "handle"
-
-        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
-        monkeypatch.setattr(td, "hybrid_ep_combine", lambda x, **kwargs: dispatched["x"])
-
+        reduce = Mock(side_effect=lambda tensor, **kwargs: tensor.fill_(group_max))
+        monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+        dispatch = Mock(side_effect=lambda **kw: (kw["x"], kw["probs"], None, kw["routing_map"].sum(0), "handle"))
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", dispatch)
+        monkeypatch.setattr(td, "hybrid_ep_combine", lambda x, **kwargs: x)
         hidden = torch.randn(num_tokens, 4)
-        hybrid_ep_manager.routing_map = torch.ones(num_tokens, 8, dtype=torch.bool)
-        hybrid_ep_manager.token_probs = torch.full((num_tokens, 8), 0.125)
-        out = hybrid_ep_manager.dispatch(hidden)
-        combined = hybrid_ep_manager.combine(out)
-        return hidden, dispatched, combined
+        manager.routing_map = torch.ones(num_tokens, 8, dtype=torch.bool)
+        manager.token_probs = torch.full((num_tokens, 8), 0.125)
+        combined = manager.combine(manager.dispatch(hidden))
+        assert combined is hidden
+        assert dispatch.call_args.kwargs["x"] is hidden
+        assert dispatch.call_args.kwargs["routing_map"].shape == (num_tokens, 8)
+        assert dispatch.call_args.kwargs["probs"].shape == (num_tokens, 8)
+        return dispatch.call_args.kwargs["num_of_tokens_per_rank"], reduce
 
-    def test_shorter_rank_pads_to_aligned_group_max_and_slices_back(self, hybrid_ep_manager, monkeypatch):
-        # group max 5 rounds up to the 4-token kernel alignment -> 8.
-        hidden, dispatched, combined = self._run(hybrid_ep_manager, monkeypatch, num_tokens=3, group_max=5)
+    @pytest.mark.parametrize("num_tokens,group_max", [(3, 5), (6, 6), (4, 4), (0, 5), (0, 0)])
+    def test_dynamic_counts_negotiate_without_padding(self, hybrid_ep_manager, monkeypatch, num_tokens, group_max):
+        slots, reduce = self._run(hybrid_ep_manager, monkeypatch, num_tokens, group_max)
+        assert slots == group_max
+        reduce.assert_called_once()
 
-        assert dispatched["x"].shape[0] == 8
-        assert dispatched["routing_map"].shape[0] == 8
-        assert dispatched["probs"].shape[0] == 8
-        # Padded rows carry zero hidden state and route to no expert.
-        assert torch.equal(dispatched["x"][3:], torch.zeros(5, 4))
-        assert not dispatched["routing_map"][3:].any()
-        assert not dispatched["probs"][3:].any()
-        # combine() returns only this rank's real tokens.
-        assert combined.shape[0] == 3
-        assert torch.equal(combined, hidden)
-        assert hybrid_ep_manager.num_unpadded_tokens is None
+    def test_capacity_handles_changing_local_counts_without_collectives(self, hybrid_ep_manager, monkeypatch):
+        from nemo_automodel.components.moe.megatron.token_dispatcher import hybrid_ep_token_capacity
 
-    def test_equal_unaligned_counts_pad_to_alignment(self, hybrid_ep_manager, monkeypatch):
-        hidden, dispatched, combined = self._run(hybrid_ep_manager, monkeypatch, num_tokens=6, group_max=6)
+        with hybrid_ep_token_capacity(32):
+            for count in (8, 3, 0, 17, 32):
+                slots, reduce = self._run(hybrid_ep_manager, monkeypatch, count, 99)
+                assert slots == 32
+                reduce.assert_not_called()
+        slots, reduce = self._run(hybrid_ep_manager, monkeypatch, 3, 5)
+        assert slots == 5
+        reduce.assert_called_once()
 
-        assert dispatched["x"].shape[0] == 8
-        assert combined.shape[0] == 6
-        assert torch.equal(combined, hidden)
+    def test_overflow_raises_without_rank_conditional_collective(self, hybrid_ep_manager, monkeypatch):
+        from nemo_automodel.components.moe.megatron.token_dispatcher import hybrid_ep_token_capacity
 
-    def test_equal_aligned_counts_do_not_pad(self, hybrid_ep_manager, monkeypatch):
-        hidden, dispatched, combined = self._run(hybrid_ep_manager, monkeypatch, num_tokens=4, group_max=4)
+        with hybrid_ep_token_capacity(4), pytest.raises(ValueError, match="exceeding proven capacity"):
+            self._run(hybrid_ep_manager, monkeypatch, 5, 5)
+        torch.distributed.all_reduce.assert_not_called()
+        slots, reduce = self._run(hybrid_ep_manager, monkeypatch, 5, 6)
+        assert slots == 6
+        reduce.assert_called_once()
 
-        assert dispatched["x"].shape[0] == 4
-        assert combined.shape[0] == 4
-        assert torch.equal(combined, hidden)
+    def test_nested_capacity_restores_outer_scope(self, hybrid_ep_manager, monkeypatch):
+        from nemo_automodel.components.moe.megatron.token_dispatcher import hybrid_ep_token_capacity
+
+        with hybrid_ep_token_capacity(32):
+            with hybrid_ep_token_capacity(16):
+                assert self._run(hybrid_ep_manager, monkeypatch, 3, 99)[0] == 16
+            assert self._run(hybrid_ep_manager, monkeypatch, 3, 99)[0] == 32

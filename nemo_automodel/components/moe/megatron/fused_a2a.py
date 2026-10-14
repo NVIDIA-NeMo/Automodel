@@ -399,20 +399,43 @@ class HybridEPDispatch(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
-        x,
-        routing_map,
-        probs,
-        group,
-        num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
-        num_permuted_tokens=None,
-        pad_multiple=None,
-    ):
-        """Forward pass of fused dispatch of the HybridEP backend."""
+        ctx: torch.autograd.function.FunctionCtx,
+        x: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        num_sms_dispatch_api: int = 24,
+        num_sms_combine_api: int = 24,
+        num_permuted_tokens: int | torch.Tensor | None = None,
+        pad_multiple: int | None = None,
+        num_of_tokens_per_rank: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, tuple]:
+        """Dispatch real rows with a group-uniform slot capacity.
+
+        Args:
+            ctx: Autograd context retaining the upstream routing handle.
+            x: Tensor of shape [local_tokens, hidden].
+            routing_map: Boolean tensor of shape [local_tokens, experts].
+            probs: Float32 tensor of shape [local_tokens, experts].
+            group: Expert-parallel process group.
+            num_local_experts: Number of experts on this rank.
+            num_sms_dispatch_api: Dispatch SM count.
+            num_sms_combine_api: Combine SM count.
+            num_permuted_tokens: Optional known receive extent.
+            pad_multiple: Optional per-expert receive alignment.
+            num_of_tokens_per_rank: Common slot capacity, at least every rank's
+                local_tokens. Upstream handles slot alignment and empty inputs.
+
+        Returns:
+            Dispatched hidden states [received_expert_tokens, hidden],
+            probabilities [received_expert_tokens], optional
+            FP8 scales (None for this BF16 path), CPU counts [local_experts],
+            and the opaque upstream routing handle.
+        """
         if _hybrid_ep_buffer is None:
             seq_len, hidden_dim = x.shape[-2:]
+            seq_len = max(16, num_of_tokens_per_rank or seq_len)
             fp8_dispatch = False
             init_hybrid_ep_buffer(
                 group,
@@ -439,6 +462,7 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
+            num_of_tokens_per_rank=num_of_tokens_per_rank,
         )
 
         ctx.handle = handle
@@ -458,7 +482,7 @@ class HybridEPDispatch(torch.autograd.Function):
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
         )
-        return combined_hidden, None, combined_probs, None, None, None, None, None, None
+        return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
 
 
 class HybridEPCombine(torch.autograd.Function):
@@ -492,17 +516,18 @@ class HybridEPCombine(torch.autograd.Function):
 if HAVE_HYBRIDEP:
 
     def hybrid_ep_dispatch(
-        x,
-        routing_map,
-        probs,
-        group,
-        num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
-        num_permuted_tokens=None,
-        pad_multiple=None,
-    ):
-        """Perform fused dispatch for permute + dispatch a2a + permute using the HybridEP backend."""
+        x: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        num_sms_dispatch_api: int = 24,
+        num_sms_combine_api: int = 24,
+        num_permuted_tokens: int | torch.Tensor | None = None,
+        pad_multiple: int | None = None,
+        num_of_tokens_per_rank: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, tuple]:
+        """Dispatch with the tensor and capacity contract of :meth:`HybridEPDispatch.forward`."""
         return HybridEPDispatch.apply(
             x,
             routing_map,
@@ -513,6 +538,7 @@ if HAVE_HYBRIDEP:
             num_sms_combine_api,
             num_permuted_tokens,
             pad_multiple,
+            num_of_tokens_per_rank,
         )
 
     def hybrid_ep_combine(x, handle, num_permuted_tokens=None, pad_multiple=None):

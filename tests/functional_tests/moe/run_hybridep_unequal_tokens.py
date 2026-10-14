@@ -14,12 +14,9 @@
 
 """HybridEP dispatch/combine parity with unequal per-rank token counts.
 
-Every rank in a HybridEP group must dispatch the same token extent; the
-dispatcher now pads shorter ranks up to the group maximum. With identity
-"experts", each token's combined output depends only on its own routing, so
-running the same data once with equal counts (no padding path) and once with
-rank 1 truncated (padding path) must produce identical outputs for the common
-tokens.
+Compare negotiated slots and a larger fixed capacity through the production wrapper.
+Identity experts allow exact output and activation/routing-gradient comparisons
+across unequal and empty ranks. Fixed capacity must never call all_reduce.
 
 Run:
     torchrun --standalone --nproc_per_node=2 \
@@ -34,6 +31,7 @@ import torch.distributed as dist
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
     TokenDispatcherConfig,
+    hybrid_ep_token_capacity,
 )
 
 HIDDEN = 256
@@ -43,9 +41,27 @@ FULL_TOKENS = int(os.environ.get("FULL_TOKENS", "5"))
 SHORT_TOKENS = int(os.environ.get("SHORT_TOKENS", "3"))  # rank 1 in the unequal run
 
 
-def run_dispatch_combine(dispatcher: MoEFlexTokenDispatcher, hidden, indices, probs):
+def run_dispatch_combine(
+    dispatcher: MoEFlexTokenDispatcher,
+    hidden: torch.Tensor,
+    indices: torch.Tensor,
+    probs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run weighted identity experts and differentiate their squared output.
+
+    Args:
+        dispatcher: Production EP dispatcher.
+        hidden: BF16 tensor of shape [local_tokens, hidden].
+        indices: Expert indices of shape [local_tokens, topk].
+        probs: Float32 routing weights of shape [local_tokens, topk].
+
+    Returns:
+        Combined output and activation gradient [local_tokens, hidden], and
+        routing gradient [local_tokens, topk].
+    """
     hidden = hidden.detach().requires_grad_(True)
-    out, _tokens_per_expert, _permuted_probs = dispatcher.token_permutation2(
+    probs = probs.detach().requires_grad_(True)
+    out, _tokens_per_expert, permuted_probs = dispatcher.token_permutation2(
         hidden_states=hidden,
         num_local_tokens=hidden.shape[0],
         token_probs=probs,
@@ -53,9 +69,9 @@ def run_dispatch_combine(dispatcher: MoEFlexTokenDispatcher, hidden, indices, pr
     )
     # Identity experts: combine returns each token's prob-weighted sum of its
     # own dispatched copies, independent of every other token.
-    combined = dispatcher.token_unpermutation(out)
+    combined = dispatcher.token_unpermutation((out.float() * permuted_probs.unsqueeze(-1)).to(out.dtype))
     combined.float().square().sum().backward()
-    return combined.detach(), hidden.grad
+    return combined.detach(), hidden.grad, probs.grad
 
 
 def main():
@@ -85,16 +101,27 @@ def main():
     probs = probs / probs.sum(dim=-1, keepdim=True)
 
     # Reference: every rank dispatches FULL_TOKENS (equal counts).
-    reference, reference_grad = run_dispatch_combine(dispatcher, hidden.clone(), indices, probs)
+    reference, reference_grad, reference_prob_grad = run_dispatch_combine(dispatcher, hidden.clone(), indices, probs)
 
-    # Unequal: rank 1 truncates to SHORT_TOKENS, forcing the padding path.
-    keep = FULL_TOKENS if rank == 0 else SHORT_TOKENS
-    unequal, unequal_grad = run_dispatch_combine(dispatcher, hidden[:keep].clone(), indices[:keep], probs[:keep])
+    original_all_reduce = dist.all_reduce
 
-    assert unequal.shape == (keep, HIDDEN), f"rank {rank}: got {tuple(unequal.shape)}"
-    torch.testing.assert_close(unequal, reference[:keep], rtol=0, atol=0)
-    torch.testing.assert_close(unequal_grad, reference_grad[:keep], rtol=0, atol=0)
-    print(f"[rank {rank}] OK: unequal-count forward AND backward bitwise-match the equal-count run")
+    def unexpected_all_reduce(*args, **kwargs):
+        raise AssertionError("Fixed-capacity dispatch must not negotiate token counts")
+
+    for capacity in (None, max(32, FULL_TOKENS)):
+        with hybrid_ep_token_capacity(capacity):
+            if capacity is not None:
+                dist.all_reduce = unexpected_all_reduce
+            try:
+                for count in (SHORT_TOKENS, 0, FULL_TOKENS):
+                    keep = FULL_TOKENS if rank == 0 else count
+                    actual = run_dispatch_combine(dispatcher, hidden[:keep], indices[:keep], probs[:keep])
+                    for value, expected in zip(actual, (reference, reference_grad, reference_prob_grad)):
+                        torch.testing.assert_close(value, expected[:keep], rtol=0, atol=0)
+                    assert actual[0].shape == (keep, HIDDEN)
+            finally:
+                dist.all_reduce = original_all_reduce
+    print(f"[rank {rank}] PASS: dynamic/fixed slots, unequal/empty ranks, output + hidden/prob gradients")
     dist.destroy_process_group()
 
 

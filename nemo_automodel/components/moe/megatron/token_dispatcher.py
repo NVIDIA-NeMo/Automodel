@@ -14,6 +14,9 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import List, Literal, Tuple
 
@@ -352,9 +355,30 @@ class _HybridEPMetadataProcessor(nn.Module):
         return routing_map, multihot_probs
 
 
-# DeepEP's hybrid-ep metadata allgather asserts bytes_per_rank % 16 == 0 on a
-# 4-byte-per-token array, so per-rank token counts must be multiples of 4.
-_HYBRIDEP_TOKEN_ALIGNMENT = 4
+_hybridep_token_capacity: ContextVar[int | None] = ContextVar("hybridep_token_capacity", default=None)
+
+
+@contextmanager
+def hybrid_ep_token_capacity(num_tokens: int | None) -> Iterator[None]:
+    """Scope a proven group-uniform dispatch capacity across forward and backward.
+
+    Args:
+        num_tokens: Common upper bound on local dispatch rows on every EP rank,
+            established by the caller's input pipeline. None retains per-dispatch
+            negotiation. The bound must remain valid during recomputation and
+            all overlapping pipeline microbatches. Exceeding it raises instead
+            of conditionally entering a collective on only some ranks.
+
+    Yields:
+        None. The previous capacity is restored on exit, including on errors.
+    """
+    if num_tokens is not None and num_tokens < 0:
+        raise ValueError("HybridEP token capacity must be nonnegative")
+    token = _hybridep_token_capacity.set(num_tokens)
+    try:
+        yield
+    finally:
+        _hybridep_token_capacity.reset(token)
 
 
 class _HybridEPManager(_DispatchManager):
@@ -399,9 +423,6 @@ class _HybridEPManager(_DispatchManager):
         # Handle used for combine operation
         self.handle = None
         self.pad_multiple = None
-        # Set by dispatch() when this rank padded its tokens up to the EP-group
-        # maximum; combine() slices the padding back off.
-        self.num_unpadded_tokens: int | None = None
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
@@ -450,6 +471,17 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
+        """Dispatch local real rows using upstream's shared slot layout.
+
+        Args:
+            hidden_states: Tensor of shape [local_tokens, hidden].
+            async_finish: Ignored by HybridEP.
+            allocate_on_comm_stream: Ignored by HybridEP.
+
+        Returns:
+            Tensor of shape [received_expert_tokens, hidden]. Padding slots
+            route nowhere; input activations and probabilities are not padded.
+        """
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
         # Benchmark-only exception: with static routing every dispatch permutes the same
@@ -462,25 +494,19 @@ class _HybridEPManager(_DispatchManager):
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
 
-        # HybridEP's fused all-to-all exchanges fixed-extent buffers, so every rank
-        # in the EP group must dispatch the same number of tokens, and the kernel's
-        # metadata allgather additionally requires that count to be 16-byte aligned
-        # (4 tokens). Unequal or unaligned counts (variable-length or packed dynamic
-        # batches) abort or deadlock the collective. Pad this rank's tokens up to
-        # the aligned group-wide maximum: padded rows route to no expert (all-False
-        # routing map), and combine() slices them back off.
-        self.num_unpadded_tokens = None
-        if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
-            num_tokens = hidden_states.shape[0]
-            group_max = torch.tensor(num_tokens, device=hidden_states.device)
-            torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
-            target_tokens = -(-int(group_max) // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
-            pad_tokens = target_tokens - num_tokens
-            if pad_tokens > 0:
-                self.num_unpadded_tokens = num_tokens
-                hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_tokens))
-                self.routing_map = nn.functional.pad(self.routing_map, (0, 0, 0, pad_tokens))
-                self.token_probs = nn.functional.pad(self.token_probs, (0, 0, 0, pad_tokens))
+        # DeepEP #744 separates real rows from the group-uniform slot layout.
+        # Upstream aligns the slots and pads only routing metadata. A proven
+        # capacity avoids both the scalar collective and its host readback.
+        num_tokens = hidden_states.shape[0]
+        target_tokens = _hybridep_token_capacity.get()
+        if target_tokens is None:
+            target_tokens = num_tokens
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
+                group_max = torch.tensor(num_tokens, device=hidden_states.device)
+                torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
+                target_tokens = int(group_max)
+        elif num_tokens > target_tokens:
+            raise ValueError(f"HybridEP dispatch has {num_tokens} rows, exceeding proven capacity {target_tokens}")
 
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
             x=hidden_states,
@@ -492,6 +518,7 @@ class _HybridEPManager(_DispatchManager):
             num_sms_combine_api=self.moe_hybridep_num_sms,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
+            num_of_tokens_per_rank=target_tokens,
         )
 
         self.tokens_per_expert = tokens_per_expert
@@ -515,9 +542,6 @@ class _HybridEPManager(_DispatchManager):
         )
         self.handle = None
         self.num_permuted_tokens = None
-        if self.num_unpadded_tokens is not None:
-            hidden_states = hidden_states[: self.num_unpadded_tokens]
-            self.num_unpadded_tokens = None
         return hidden_states
 
     def get_dispatched_metadata(self) -> torch.Tensor:

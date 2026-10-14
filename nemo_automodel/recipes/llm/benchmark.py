@@ -19,6 +19,8 @@ import pathlib
 import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDataset
+from nemo_automodel.components.moe.megatron.token_dispatcher import hybrid_ep_token_capacity
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
@@ -281,7 +283,23 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             return flops / (10**12)
         return 0.0
 
-    def run_benchmark(self):
+    def run_benchmark(self) -> None:
+        """Run with an inferred capacity when the input pipeline proves a bound."""
+        capacity = None
+        # The mock text dataset emits fixed-length batches. Restrict this proof
+        # to unsharded token layouts; other layouts retain safe negotiation.
+        if (
+            isinstance(self.dataloader.dataset, MockIterableDataset)
+            and self.cfg.get("distributed.tp_size", 1) == 1
+            and self.cfg.get("distributed.cp_size", 1) == 1
+        ):
+            batch_size = self.pp.pp_microbatch_size if self.pp_enabled else self.dataloader.dataset.batch_size
+            capacity = self.dataloader.dataset.seq_len * batch_size
+            logger.info("HybridEP inferred dispatch capacity: %d tokens", capacity)
+        with hybrid_ep_token_capacity(capacity):
+            self._run_benchmark()
+
+    def _run_benchmark(self):
         """Run the benchmarking loop.
 
         This method implements a simplified training loop focused on benchmarking
