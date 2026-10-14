@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import json
+
 import pytest
 
 from nemo_automodel._transformers.registry import (
@@ -41,6 +43,55 @@ def test_checkpoint_style_nested_config_resolves_hybrid_patterns():
     assert config.text_config.layer_types[-1] == "deepseek_sparse_attention"
     assert config.text_config.linear_lower_bound == -5.0
     assert config.text_config.linear_conv_kernel_dim == 2
+
+
+def _checkpoint_style_config(**linear_attn_overrides):
+    return {
+        "model_type": "glm5_next",
+        "architectures": ["Glm5NextForConditionalGeneration"],
+        "text_config": {
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "q_lora_rank": 8,
+            "qk_rope_head_dim": 0,
+            "qk_nope_head_dim": 4,
+            "v_head_dim": 4,
+            "index_topk": 8,
+            "index_kpool": 4,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            "linear_attn_config": {
+                "head_dim": 4,
+                "num_heads": 2,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+                **linear_attn_overrides,
+            },
+        },
+        "vision_config": {"depth": 1},
+    }
+
+
+@pytest.mark.parametrize(
+    "released_split",
+    [{"kda_layers": [0, 1, 2], "full_attn_layers": [3]}, {}],
+    ids=["released-lists", "derived-from-layer-types"],
+)
+def test_saved_config_keeps_kda_layer_split(tmp_path, released_split):
+    config = Glm5NextConfig.from_dict(_checkpoint_style_config(**released_split))
+    config.save_pretrained(tmp_path)
+
+    saved = json.loads((tmp_path / "config.json").read_text())["text_config"]["linear_attn_config"]
+    assert saved["kda_layers"] == [0, 1, 2]
+    assert saved["full_attn_layers"] == [3]
+    reloaded = Glm5NextConfig.from_pretrained(tmp_path)
+    assert reloaded.text_config.linear_attn_config["kda_layers"] == [0, 1, 2]
+    assert reloaded.text_config.layer_types[-1] == "deepseek_sparse_attention"
+
+
+def test_config_rejects_kda_layers_that_disagree_with_layer_types():
+    with pytest.raises(ValueError, match="kda_layers does not match layer_types"):
+        Glm5NextConfig.from_dict(_checkpoint_style_config(kda_layers=[0, 1, 3], full_attn_layers=[2]))
 
 
 def test_config_rejects_rope_and_invalid_kpool_contracts():

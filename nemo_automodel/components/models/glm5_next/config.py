@@ -171,12 +171,23 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.linear_num_heads = linear_num_heads
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
         self.linear_lower_bound = linear_lower_bound
+        # The released config also lists the layer split as ``kda_layers`` / ``full_attn_layers``
+        # (0-based), which SGLang and Miles read. Keep both lists and derive them from ``layer_types``.
+        kda_layers = [idx for idx, layer_type in enumerate(self.layer_types) if layer_type == "linear_attention"]
+        full_attn_layers = [idx for idx, layer_type in enumerate(self.layer_types) if layer_type != "linear_attention"]
+        for key, layers in (("kda_layers", kda_layers), ("full_attn_layers", full_attn_layers)):
+            if linear_attn_config is not None and key in linear_attn_config:
+                if sorted(linear_attn_config[key]) != layers:
+                    raise ValueError(f"linear_attn_config.{key} does not match layer_types")
         self.linear_attn_config = {
+            **(linear_attn_config or {}),
             "head_dim": linear_head_dim,
             "num_heads": linear_num_heads,
             "short_conv_kernel_size": linear_conv_kernel_dim,
             "gate_lower_bound": linear_lower_bound,
             "safe_gate": linear_lower_bound is not None,
+            "kda_layers": kda_layers,
+            "full_attn_layers": full_attn_layers,
         }
 
         self.hc_mult = hc_mult
