@@ -1,7 +1,10 @@
 # DRAFT: Qwen3-30B-A3B student with a Qwen3-Next-80B-A3B MoE teacher.
-# GPU validation on the current revision is pending; tracked in:
+# Ten-step H100 validation, W&B logs, and reproduction overrides:
+# docs/guides/llm/knowledge-distillation.mdx#moe-knowledge-distillation
+# Convergence and checkpoint/resume are not covered by the short run.
+# Related issue:
 # https://github.com/NVIDIA-NeMo/Automodel/issues/3299
-# Target: two 8-GPU nodes, with one node per model.
+# Target: two 8-GPU nodes, one per model; validated on H100 80GB.
 # Run on both nodes, setting NODE_RANK to 0 or 1 and MASTER_ADDR to node 0:
 #   torchrun --nnodes 2 --nproc-per-node 8 --node-rank "$NODE_RANK" \
 #     --master-addr "$MASTER_ADDR" --master-port 29500 \

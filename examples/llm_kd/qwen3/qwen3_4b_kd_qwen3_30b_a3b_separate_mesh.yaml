@@ -1,7 +1,10 @@
 # DRAFT: Qwen3-4B student with a Qwen3-30B-A3B MoE teacher.
-# GPU validation on the current revision is pending; tracked in:
+# Ten-step H100 validation, W&B logs, and reproduction overrides:
+# docs/guides/llm/knowledge-distillation.mdx#moe-knowledge-distillation
+# Convergence and checkpoint/resume are not covered by the short run.
+# Related issue:
 # https://github.com/NVIDIA-NeMo/Automodel/issues/3299
-# Target: one 8-GPU H200 node, with four ranks per model.
+# Target: one 8-GPU node, with four ranks per model; validated on H100 80GB.
 #   automodel examples/llm_kd/qwen3/qwen3_4b_kd_qwen3_30b_a3b_separate_mesh.yaml --nproc-per-node 8
 
 recipe: KnowledgeDistillationRecipeForNextTokenPrediction
