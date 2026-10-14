@@ -3,19 +3,11 @@ title: "Performance Summary"
 description: "NeMo AutoModel training performance summary by GPU type and task, with benchmark recipes."
 position: 1
 ---
-This document provides training performance measurements for language, vision-language, and image-generation models using NeMo AutoModel with the PyTorch backend. Model names link to YAML recipes pinned to reviewed repository snapshots. The tables record the settings used for each measurement; linked recipes are starting points.
-
-<Note>
-Measurements come from different development commits, workloads, kernels, and timing windows. They are not a benchmark campaign for a single release. **Measurement Source** identifies the run supplying the numbers. **Related NeMo-CI** links to separate recipe validation or benchmark attempts; a completed job does not verify the exact numbers in the row. Pending runs, short smoke tests, and failed jobs are labeled. W&B and internal NeMo-CI links may require access.
-</Note>
+Training performance measurements for language, vision-language, and image-generation models using NeMo AutoModel with the PyTorch backend. Model names link to pinned YAML recipes.
 
 ## Fine-Tuning Performance
 
-Fine-tuning measurements are grouped by training mode and hardware. Dataset-based language and vision-language runs retain the source run's token-count and timing semantics; MedPix rates do not represent full-length synthetic sequences. Image-generation rates use images/sec/GPU.
-
 ### Full Fine-Tuning: NVIDIA H100 80GB, Precision: BF16
-
-These runs use FSDP2. Qwen3.8-27B freezes the vision tower; GLM-5.3-Flash and Nemotron-3.5-Super-VL freeze the vision tower and embeddings. Backend entries describe the recorded configuration.
 
 | Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU | Measurement Source | Related NeMo-CI |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | --- |
@@ -30,24 +22,24 @@ These runs use FSDP2. Qwen3.8-27B freezes the vision tower; GLM-5.3-Flash and Ne
 | [Kimi-Linear-48B-A3B-Instruct](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml) | HellaSwag packed | 8 | 8 | 1 | 1 | 1 | 4096 | 1 | 1 | 1 | 8 | - | NR | eager attention + torch | 2.862 | NR | 11,317 | 1,414.63 | [W&B](https://wandb.ai/Nemo-automodel/automodel-kimi-linear/runs/4jn9qu6v) | [50 steps; unpacked](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694601) |
 | [Laguna-XS-2.1](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml) | HellaSwag packed | 8 | 8 | 1 | 1 | 1 | 1024 | 1 | 1 | 1 | 8 | - | NR | SDPA + torch + torch_mm | 1.323 | NR | 6,174 | 771.73 | [W&B](https://wandb.ai/Nemo-automodel/laguna-xs-2p1-sft/runs/5m7j0boj) | [50 steps; config differs](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694525) |
 
-The Nemotron-3.5-Super-VL row measures checkpoint `nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained` on text-only Tulu-3. Equivalence to the released checkpoint in the linked recipe has not been verified. Nemotron-3.5-Lightning uses all 52 layers with multi-token prediction disabled.
+- FSDP2. Qwen3.8-27B freezes vision; GLM-5.3-Flash and Nemotron-3.5-Super-VL freeze vision and embeddings.
+- Nemotron-3.5-Super-VL uses text-only checkpoint `nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`; equivalence to the linked checkpoint is unverified.
+- Nemotron-3.5-Lightning uses all 52 layers with MTP disabled.
 
 ### Full Fine-Tuning: NVIDIA GB200, Precision: BF16
-
-These runs use FSDP2. The MiMo-V2.6-Pro-RL timing includes profiler overhead.
 
 | Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU | Measurement Source | Related NeMo-CI |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | --- |
 | [DeepSeek-V4.1-Flash](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune/deepseek_v41/deepseek_v41_flash_medpix_4k_ep64.yaml) | MedPix VLM | 64 | 64 | 1 | 1 | 1 | 4096 | 1 | 1 | 1 | 64 | - | NR | TileLang + torch + torch_mm + HybridEP | 3.585 | NR | 5,473 | 85.52 | [W&B](https://wandb.ai/Nemo-automodel/automodel-ds41-medpix-vision-20260915/runs/ds41medpixfull407187622) | [50 steps](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/475371942) |
 | [MiMo-V2.6-Pro-RL](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps.yaml) | Tulu-3 packed | 128 | 16 | 1 | 2 | 1 | 65536 | 1 | 2 | 8 | 64 | NR | NR | TE attention/linear + torch_mm + HybridEP | 16.973 | NR | 58,391 | 456.18 | [W&B](https://wandb.ai/Nemo-automodel/automodel-mimo-v26-pro/runs/mimo26-pro-sft64k-remainders-7588062) | [Failed](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694561) |
 
+FSDP2; MiMo-V2.6-Pro-RL includes profiler overhead.
+
 <a id="fine-tuning-lora-performance" />
 
 ## LoRA Performance
 
 ### LoRA: NVIDIA H100 80GB, Precision: BF16
-
-These LoRA benchmarks use full-length mock sequences with no padding.
 
 | Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU | Measurement Source | Related NeMo-CI |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | --- |
@@ -58,9 +50,9 @@ These LoRA benchmarks use full-length mock sequences with no padding.
 | [Llama3 70B 2-node](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml) | Mock | 16 | 32 | 2 | 2 | 2 | 4096 | 2 | 1 | 1 | - | 1 | 8 | TE + triton + fsdp2_prefetch | 8.32 | 285 | 15,758 | 984.85 | NR | [Completed](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/481018706) |
 | [Qwen2.5 32B 2-node](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml) | Mock | 16 | 32 | 2 | 2 | 2 | 4096 | 2 | 1 | 1 | - | 1 | 8 | TE + triton + fsdp2_prefetch | 3.95 | 277 | 33,166 | 2072.89 | NR | NR |
 
-## Pre-Training Performance
+Full-length mock sequences; no padding.
 
-These benchmarks measure forward and backward passes and the optimizer step using full-length mock sequences, with balanced expert routing for MoE models. The original measurements use DGX-H100 systems; Qwen3.8-Flash-Next uses 64 H100 80GB GPUs.
+## Pre-Training Performance
 
 ### GPU: NVIDIA H100 80GB, Precision: BF16
 
@@ -78,19 +70,18 @@ These benchmarks measure forward and backward passes and the optimizer step usin
 | [Llama3 70B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml) | Mock | 64 | 128 | 1 | 1 | 4 | 8192 | 1 | 1 | 2 | - | - | 32 | TE + fsdp2_prefetch | 18.90 | 389 | 55,473 | 866.77 | NR | [Completed](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/481018704) |
 | [Qwen3.8-Flash-Next](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/qwen/qwen3_8_flash_next_fa4_ep64.yaml) | Mock, balanced routing | 64 | 64 | 1 | 1 | 1 | 8192 | 1 | 1 | 1 | 64 | - | 64 | FA4 QSA (`cute`) + torch + gmm + HybridEP | 3.931 | 86.85 | 133,364 | 2,083.81 | [W&B](https://wandb.ai/Nemo-automodel/bdelta/runs/rfndujyr) | [Benchmark pipeline (pending)](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/pipelines/73893076); [50-step HellaSwag](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694578) |
 
-Qwen3.8-Flash-Next uses FSDP2 with a shard degree of 64 and a synchronized benchmark summary with 30 measured steps after 20 warmup steps. Its token rate counts label tokens. Model TFLOPs/sec/GPU is derived from the reported 8.7815% MFU and the H100 BF16 peak of 989 TFLOPs/sec. A CI benchmark rerun on 64 H100 GPUs is pending on fixed release commit [`ce9d66f8201f`](https://github.com/NVIDIA-NeMo/Automodel/commit/ce9d66f8201f127f1075f0dd78a615d1c654f9ef). The numbers above remain sourced from W&B. A separate 50-step HellaSwag fine-tuning run completed on 64 H100 GPUs; it validates a different workload.
+- Full-length mock sequences; balanced MoE routing.
+- Qwen3.8-Flash-Next: 20 warmup and 30 measured steps; label-token rate; TFLOPs derived from MFU. The HellaSwag CI job uses a different workload.
 
 ### GPU: NVIDIA H100 80GB, Precision: FP8
-
-Moonlight uses Transformer Engine current scaling, with 20 measured steps after 10 warmup steps.
 
 | Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU | Measurement Source | Related NeMo-CI |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | --- |
 | [Moonlight 16B](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/moonlight/moonlight_16b_te_fp8.yaml) | Mock, balanced routing | 8 | 256 | 4 | 4 | 8 | 2048 | 1 | 1 | 1 | 8 | - | 8 | TE FP8 + DeepEP | 3.006 | 324.94 | 174,414 | 21,801.73 | [Benchmark artifact](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/481018712/artifacts/file/benchmark_results.json) | [20 measured steps](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/481018712) |
 
-### GPU: NVIDIA GB200, Precision: MXFP8
+TE current scaling; 10 warmup and 20 measured steps.
 
-These runs use Transformer Engine MXFP8 block scaling. Qwen3 MoE 235B has three measured steps after two warmup steps; the other rows have 20 measured steps after 10 warmup steps.
+### GPU: NVIDIA GB200, Precision: MXFP8
 
 | Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU | Measurement Source | Related NeMo-CI |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | --- |
@@ -100,29 +91,26 @@ These runs use Transformer Engine MXFP8 block scaling. Qwen3 MoE 235B has three 
 | [Qwen3 MoE 235B](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/qwen/qwen3_moe_235b_te_mxfp8_gb200.yaml) | Mock, balanced routing | 32 | 8192 | 4 | 4 | 64 | 4096 | 1 | 1 | 1 | 32 | - | 32 | TE MXFP8 + HybridEP | 194.098 | 799.73 | 172,874 | 5,402.30 | [Benchmark artifact](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/481018727/artifacts/file/benchmark_results.json) | [3 measured steps](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/481018727) |
 | [GPT-OSS 120B](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml) | Mock, balanced routing | 32 | 1280 | 8 | 8 | 5 | 4096 | 1 | 1 | 1 | 16 | - | 32 | TE MXFP8 + HybridEP | 7.840 | 681.95 | 668,735 | 20,897.96 | [Benchmark artifact](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/481018695/artifacts/file/benchmark_results.json) | [20 measured steps](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/481018695) |
 
-For these FP8 and MXFP8 rows, token throughput counts full configured sequences and is calculated from the logged mean iteration time. Model TFLOPs/sec/GPU is derived from mean MFU and the configured peak.
+- TE MXFP8 block scaling; 10 warmup and 20 measured steps, except Qwen3 MoE 235B (two warmup and three measured steps).
+- FP8/MXFP8 token rates count full sequences; TFLOPs derive from MFU and the configured peak.
 
 ## Image Generation Performance
 
 ### Image Generation, Full Fine-Tuning: NVIDIA H100 80GB, Precision: BF16
 
-Qwen-Image-2.1 uses Naruto BLIP captions at 1024 x 1024 resolution and FSDP2.
-
 | Model | Mode | #GPUs | GBS | MBS | LBS | GA | TP | PP | CP | EP | Optimizer | Time per Global Step (s) | Images/sec/GPU | Measurement Source | Related NeMo-CI |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- |
 | [Qwen-Image-2.1](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml) | Full fine-tuning | 8 | 16 | 2 | 2 | 1 | 1 | 1 | 1 | - | TE FusedAdam, FP32 master weights | ~1.38 | ~1.45 | [Author report](https://github.com/NVIDIA-NeMo/Automodel/pull/4027) | [Failed](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694407) |
 
-The timing is the author's approximate report for a 1,000-step run; its warmup exclusion window is not specified.
+Naruto BLIP, 1024 x 1024, FSDP2. Author-reported 1,000-step run; warmup exclusion unspecified.
 
 ### Image Generation, LoRA: NVIDIA H100 80GB, Precision: BF16
-
-HunyuanImage-3.0 uses Naruto BLIP captions at 1024 x 1024 resolution and FSDP2.
 
 | Model | Mode | #GPUs | GBS | MBS | LBS | GA | TP | PP | CP | EP | Optimizer | Time per Global Step (s) | Images/sec/GPU | Measurement Source | Related NeMo-CI |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- |
 | [HunyuanImage-3.0](https://github.com/NVIDIA-NeMo/Automodel/blob/aae8680a20ca5b1deeec218fde64b1dea0286ad3/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) | LoRA, rank 64 | 8 | 8 | 1 | 1 | 1 | 1 | 1 | 1 | 8 | TE FusedAdam, 16-bit remainders | 2.226 | 0.449 | [W&B](https://wandb.ai/Nemo-automodel/automodel-pr-validation/runs/eos6251735hunyuan) | [Failed](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694417) |
 
-The HunyuanImage-3.0 result averages steps 10-99 from a 100-step run on eight H100 80GB HBM3 GPUs on EOS. Its input cache contains all 1,221 Naruto BLIP caption images, preprocessed with the release VAE at 1024 x 1024 resolution. The production recipe synchronizes CUDA and reports the maximum step time across ranks; model loading, VAE preprocessing, and checkpoint I/O are excluded. The [W&B run](https://wandb.ai/Nemo-automodel/automodel-pr-validation/runs/eos6251735hunyuan) imports the original training-log metrics and stores the pinned model and dataset revisions, package versions, and all 100 step measurements in its config, history, and evidence artifact.
+FSDP2; 100 steps, averaging steps 10-99. Cached 1024 x 1024 Naruto BLIP inputs; synchronized maximum-rank timing excludes setup and checkpoint I/O. W&B contains imported metrics and original run metadata.
 
 ## Glossary
 
