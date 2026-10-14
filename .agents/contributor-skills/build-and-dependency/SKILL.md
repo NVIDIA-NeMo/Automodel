@@ -1,7 +1,6 @@
 ---
 name: build-and-dependency
-description: Dev environment setup for NeMo AutoModel — container-based development, uv package management, installation options, environment variables, and common build pitfalls.
-when_to_use: Setting up a dev environment, adding or removing dependencies, switching container images, configuring environment variables, 'uv sync fails', 'ModuleNotFoundError', 'TransformerEngine version mismatch', stale .venv issues.
+description: Dev environment setup for NeMo AutoModel — container-based development, uv package management, installation options, environment variables, and common build pitfalls. Use when setting up a dev environment, adding or removing dependencies, switching container images, configuring environment variables, 'uv sync fails', 'ModuleNotFoundError', 'TransformerEngine version mismatch', stale .venv issues.
 ---
 
 # Build and Dependency
@@ -108,6 +107,14 @@ package's core training dependencies, including PyTorch.
 ## Package Management
 
 Always use `uv`. Do not introduce `pip install` commands in scripts or docs.
+
+When upgrading dependencies, review compatibility backports and their version
+gates. Verify the candidate release contains the upstream fix before removing
+or bypassing a backport; never assume a future or patch release is fixed. If a
+backport remains necessary, validate it on the candidate release before extending
+its gate. Run the affected regression tests with the actual dependency and
+required backends; mocked version strings and skipped tests are not compatibility
+evidence. Record the release evidence and test results in the upgrade PR.
 
 | Task | Command |
 |---|---|
