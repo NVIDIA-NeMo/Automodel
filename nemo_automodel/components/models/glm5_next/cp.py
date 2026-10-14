@@ -54,6 +54,31 @@ class Glm5NextPackedContext:
         compare=False,
     )
 
+    _document_ranges: dict[int, tuple[tuple[int, int], ...]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+
+    def row_document_ranges(self, row: int) -> tuple[tuple[int, int], ...]:
+        """Return cached non-padding document ranges in global row coordinates.
+
+        Document ids are immutable for the lifetime of this per-step context.
+        Materialize the cache before decoder FSDP hooks rebuild the dataclass.
+        """
+        cached = self._document_ranges.get(row)
+        if cached is None:
+            device_boundaries, cpu_boundaries = self.row_cu_seqlens(row)
+            boundaries = cpu_boundaries.tolist()
+            document_ids = self.doc_ids[row].index_select(0, device_boundaries[:-1]).cpu().tolist()
+            cached = tuple(
+                (start, end)
+                for start, end, document_id in zip(boundaries[:-1], boundaries[1:], document_ids, strict=True)
+                if document_id > 0
+            )
+            self._document_ranges[row] = cached
+        return cached
+
     @property
     def cp_enabled(self) -> bool:
         """Return whether the sequence is split across more than one rank."""
@@ -145,7 +170,9 @@ def build_fla_cp_context(
 
     cu_seqlens, cu_seqlens_cpu = packed_context.row_cu_seqlens(row)
     return _build_cp_context(
-        cu_seqlens=cu_seqlens,
+        # Keep FLA's identity cache cold in forward and checkpoint replay,
+        # independent of which PP microbatch ran immediately before this one.
+        cu_seqlens=cu_seqlens.clone(),
         group=cp_group,
         conv1d_kernel_size=conv_kernel_size,
         cu_seqlens_cpu=cu_seqlens_cpu,
@@ -158,17 +185,29 @@ class _AllGatherSequence(torch.autograd.Function):
     @staticmethod
     def forward(ctx, local_tensor: torch.Tensor, group: Any, dim: int) -> torch.Tensor:
         dim = dim if dim >= 0 else local_tensor.ndim + dim
-        gathered = [torch.empty_like(local_tensor) for _ in range(dist.get_world_size(group))]
-        dist.all_gather(gathered, local_tensor.contiguous(), group=group)
+        gathered = local_tensor.new_empty((dist.get_world_size(group), *local_tensor.shape))
+        dist.all_gather_into_tensor(gathered.flatten(0, 1), local_tensor.contiguous(), group=group)
         ctx.group = group
         ctx.dim = dim
         ctx.rank = dist.get_rank(group)
         ctx.local_size = local_tensor.shape[dim]
-        return torch.cat(gathered, dim=dim)
+        return gathered.movedim(0, dim).flatten(dim, dim + 1).contiguous()
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        grad_output = grad_output.contiguous()
+        """Reduce a private copy of the full-sequence gradient.
+
+        Args:
+            grad_output: Tensor of arbitrary rank with the global sequence on
+                ctx.dim. Its dtype matches the forward input, and its storage
+                may still be owned by the caller or another autograd branch.
+
+        Returns:
+            Local sequence-gradient tensor, followed by two None entries for
+            the process group and dimension. The gradient aliases a private
+            reduction buffer, never the caller's upstream-gradient storage.
+        """
+        grad_output = grad_output.clone(memory_format=torch.contiguous_format)
         dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
         start = ctx.rank * ctx.local_size
         return grad_output.narrow(ctx.dim, start, ctx.local_size).contiguous(), None, None
@@ -263,6 +302,7 @@ def shard_batch_for_glm5_next_cp(
     loss_mask=None,
     padding_token_id: int = 0,
     shard_primary: bool = False,
+    num_chunks: int = 1,
 ):
     """Contiguously shard packed GLM-5.3 token streams.
 
@@ -278,6 +318,8 @@ def shard_batch_for_glm5_next_cp(
         loss_mask: Optional loss mask ``[batch, sequence]``.
         padding_token_id: Fill value for padded token ids.
         shard_primary: Whether to shard ``input_ids`` in this function.
+        num_chunks: PP microbatches. With multiple chunks, expose the document
+            map as a tensor in a tuple so Torch splits its batch axis too.
 
     Returns:
         Context factory, mutated local batch, and the global shard layout.
@@ -319,11 +361,13 @@ def shard_batch_for_glm5_next_cp(
 
     batch.setdefault("padding_mask", doc_ids <= _PAD_DOC_ID)
     seq_start = 0 if cp_mesh is None else cp_mesh.get_local_rank() * (padded_seq_len // cp_size)
-    batch["glm5_next_packed_context"] = Glm5NextPackedContext(
-        doc_ids=doc_ids,
-        seq_start=seq_start,
-        cp_size=cp_size,
-        original_seq_len=seq_len,
+    # The PP kwargs splitter treats dataclasses as opaque (replicated) values.
+    # A tuple lets it split doc_ids alongside input_ids and labels, while the
+    # Python scalar offsets remain shared. Forward creates each chunk's cache.
+    batch["glm5_next_packed_context"] = (
+        (doc_ids, seq_start, cp_size, seq_len)
+        if num_chunks > 1
+        else Glm5NextPackedContext(doc_ids, seq_start, cp_size, seq_len)
     )
 
     local_seq_len = padded_seq_len // cp_size

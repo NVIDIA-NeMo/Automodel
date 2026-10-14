@@ -12,7 +12,7 @@ kernel; small pure-Torch fallbacks keep CPU construction and unit tests useful.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -21,9 +21,12 @@ from torch import nn
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.cudnn_sparse_attention import (
+    cudnn_indexer_scores,
     cudnn_sparse_attention,
     is_cudnn_sparse_attention_available,
 )
+from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sinkhorn_normalize
+from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
@@ -31,6 +34,7 @@ from nemo_automodel.components.models.glm5_next.cp import (
     all_gather_sequence,
     build_fla_cp_context,
 )
+from nemo_automodel.components.models.glm5_next.optimized_kernels import hc_cores, rms_norm_core, rms_norm_gated_core
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.shared.import_utils import safe_import_from
@@ -49,17 +53,15 @@ class Glm5NextRMSNorm(nn.Module):
     may be replaced by any token layout as long as hidden is last.
     """
 
-    def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype) -> None:
+    def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype, *, compile_norm: bool = False) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.variance_epsilon = eps
+        self._norm_core = rms_norm_core(compile_norm)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Normalize ``[..., hidden]`` and preserve the input dtype."""
-        input_dtype = hidden_states.dtype
-        states = hidden_states.float()
-        states = states * torch.rsqrt(states.square().mean(-1, keepdim=True) + self.variance_epsilon)
-        return self.weight * states.to(input_dtype)
+        return self._norm_core(hidden_states, self.weight, self.variance_epsilon)
 
     def reset_parameters(self) -> None:
         nn.init.ones_(self.weight)
@@ -82,8 +84,9 @@ class Glm5NextUnweightedRMSNorm(nn.Module):
 class Glm5NextHyperConnectionFp32Params(nn.Module):
     """Own mHC parameters that must remain fp32 under FSDP mixed precision."""
 
-    def __init__(self, mix_size: int) -> None:
+    def __init__(self, mix_size: int, *, sinkhorn_backend: Literal["torch", "tilelang"] = "torch") -> None:
         super().__init__()
+        self.sinkhorn_backend = sinkhorn_backend
         self.base = nn.Parameter(torch.empty(mix_size, dtype=torch.float32))
         self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
@@ -102,11 +105,7 @@ class Glm5NextHyperConnectionFp32Params(nn.Module):
         pre = torch.sigmoid(pre_w * pre_scale + pre_b) + eps
         post = 2 * torch.sigmoid(post_w * post_scale + post_b)
         comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-        comb = torch.softmax(comb_logits, dim=-1) + eps
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-        for _ in range(sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        comb = dsv4_sinkhorn_normalize(comb_logits, backend=self.sinkhorn_backend, repeat=sinkhorn_iters, eps=eps)
         return pre, post, comb
 
 
@@ -118,16 +117,24 @@ class Glm5NextHyperConnection(nn.Module):
     hc_mult, hc_mult]`` and ``collapsed [batch, sequence, hidden]``.
     """
 
-    def __init__(self, config: Glm5NextTextConfig) -> None:
+    def __init__(
+        self,
+        config: Glm5NextTextConfig,
+        *,
+        sinkhorn_backend: Literal["torch", "tilelang"] = "torch",
+        compile_hc: bool = False,
+    ) -> None:
         super().__init__()
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
         self.input_norm = Glm5NextUnweightedRMSNorm(config.rms_norm_eps)
+        self._compile_hc = compile_hc
+        self._project_core, self._collapse_core, _ = hc_cores(compile_hc)
         mix = (2 + self.hc_mult) * self.hc_mult
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * config.hidden_size, dtype=dtype))
-        self._fp32_params = Glm5NextHyperConnectionFp32Params(mix)
+        self._fp32_params = Glm5NextHyperConnectionFp32Params(mix, sinkhorn_backend=sinkhorn_backend)
 
     @property
     def base(self) -> nn.Parameter:
@@ -142,8 +149,12 @@ class Glm5NextHyperConnection(nn.Module):
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build Sinkhorn mixing weights and collapse streams for one sublayer."""
         hc = self.hc_mult
-        flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
-        pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
+        if self._compile_hc:
+            projected = self._project_core(hidden_streams, self.fn, self.input_norm.eps)
+        else:
+            flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+            projected = F.linear(flat, self.fn.float())
+        pre_w, post_w, comb_w = projected.split([hc, hc, hc * hc], dim=-1)
         pre, post, comb = self._fp32_params(
             pre_w,
             post_w,
@@ -152,7 +163,7 @@ class Glm5NextHyperConnection(nn.Module):
             self.hc_eps,
             self.hc_sinkhorn_iters,
         )
-        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+        collapsed = self._collapse_core(hidden_streams, pre)
         return post, comb, collapsed
 
     @torch.no_grad()
@@ -177,6 +188,7 @@ class _TorchShortConvolution(nn.Module):
         x: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
         """Convolve ``[batch, sequence, channels]`` and reset at packed boundaries."""
@@ -189,6 +201,7 @@ class _TorchShortConvolution(nn.Module):
                 output_final_state=kwargs.get("output_final_state", False),
                 activation="silu",
                 cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
                 cp_context=kwargs.get("cp_context"),
             )
         if cu_seqlens is None:
@@ -209,19 +222,23 @@ class _TorchShortConvolution(nn.Module):
 
 
 class _TorchRMSNormGated(Glm5NextRMSNorm):
-    """CPU fallback for FLA's gated per-head RMSNorm."""
+    """Gated per-head RMSNorm with optional model-owned compilation."""
+
+    def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype, *, compile_norm: bool = False) -> None:
+        super().__init__(hidden_size, eps, dtype)
+        self._gated_norm_core = rms_norm_gated_core(compile_norm)
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Normalize ``[batch, sequence, heads, head_dim]`` then sigmoid-gate it."""
-        return super().forward(hidden_states) * torch.sigmoid(gate.float()).to(hidden_states.dtype)
+        return self._gated_norm_core(hidden_states, gate, self.weight, self.variance_epsilon)
 
 
 def _short_conv(hidden_size: int, kernel_size: int, dtype: torch.dtype) -> nn.Module:
     return _TorchShortConvolution(hidden_size, kernel_size, dtype)
 
 
-def _rms_norm_gated(hidden_size: int, eps: float, dtype: torch.dtype) -> nn.Module:
-    return _TorchRMSNormGated(hidden_size, eps, dtype)
+def _rms_norm_gated(hidden_size: int, eps: float, dtype: torch.dtype, *, compile_norm: bool = False) -> nn.Module:
+    return _TorchRMSNormGated(hidden_size, eps, dtype, compile_norm=compile_norm)
 
 
 class Glm5NextKDAFp32Params(nn.Module):
@@ -283,7 +300,7 @@ def _torch_recurrent_kda(
 class Glm5NextLinearAttention(nn.Module):
     """Kimi Delta Attention with released GLM-5.3 checkpoint parameter names."""
 
-    def __init__(self, config: Glm5NextTextConfig, layer_idx: int) -> None:
+    def __init__(self, config: Glm5NextTextConfig, layer_idx: int, *, compile_norm: bool = False) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -305,7 +322,7 @@ class Glm5NextLinearAttention(nn.Module):
         self.b_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False, dtype=dtype)
         self.g_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=dtype)
         self.g_b_proj = nn.Linear(self.head_dim, self.projection_size, bias=False, dtype=dtype)
-        self.o_norm = _rms_norm_gated(self.head_dim, config.rms_norm_eps, dtype)
+        self.o_norm = _rms_norm_gated(self.head_dim, config.rms_norm_eps, dtype, compile_norm=compile_norm)
         self.o_proj = nn.Linear(self.projection_size, config.hidden_size, bias=False, dtype=dtype)
         self._cp_mesh = None
 
@@ -347,8 +364,10 @@ class Glm5NextLinearAttention(nn.Module):
         elif packed_context is not None:
             outputs = []
             for row in range(hidden_states.shape[0]):
-                cu_seqlens, _ = packed_context.row_cu_seqlens(row)
-                outputs.append(self._core(hidden_states[row : row + 1], cu_seqlens=cu_seqlens))
+                cu_seqlens, cu_seqlens_cpu = packed_context.row_cu_seqlens(row)
+                outputs.append(
+                    self._core(hidden_states[row : row + 1], cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu)
+                )
             output = torch.cat(outputs, dim=0)
         else:
             output = self._core(hidden_states)
@@ -361,11 +380,19 @@ class Glm5NextLinearAttention(nn.Module):
         hidden_states: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         cp_context: Any = None,
     ) -> torch.Tensor:
         """Project and execute KDA for one packed row or a regular batch."""
+        if cu_seqlens is not None:
+            # FLA caches metadata by tensor identity. PP interleaves microbatches,
+            # so use a fresh identity on both forward and checkpoint recompute.
+            cu_seqlens = cu_seqlens.clone()
         kernel_kwargs: dict[str, Any] = {} if cp_context is None else {"cp_context": cp_context}
-        conv_kwargs = dict(cache=None, output_final_state=False, cu_seqlens=cu_seqlens, **kernel_kwargs)
+        # Reuse the context's CPU boundaries so FLA need not synchronize for metadata.
+        conv_kwargs = dict(
+            cache=None, output_final_state=False, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, **kernel_kwargs
+        )
         q, _ = self.q_conv1d(x=self.q_proj(hidden_states), **conv_kwargs)
         k, _ = self.k_conv1d(x=self.k_proj(hidden_states), **conv_kwargs)
         v, _ = self.v_conv1d(x=self.v_proj(hidden_states), **conv_kwargs)
@@ -391,6 +418,7 @@ class Glm5NextLinearAttention(nn.Module):
                 initial_state=None,
                 output_final_state=cp_context is None,
                 cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
                 **kernel_options,
                 **kernel_kwargs,
             )
@@ -434,9 +462,17 @@ class Glm5NextLinearAttention(nn.Module):
 class Glm5NextKPoolIndexer(nn.Module):
     """KPool-compressed DSA indexer for training without a KV cache."""
 
-    def __init__(self, config: Glm5NextTextConfig, layer_idx: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        config: Glm5NextTextConfig,
+        layer_idx: int,
+        dtype: torch.dtype,
+        *,
+        backend: Literal["torch", "cudnn"] = "torch",
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.backend = backend
         self.n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.index_topk = config.index_topk
@@ -487,6 +523,8 @@ class Glm5NextKPoolIndexer(nn.Module):
         pool_keys: torch.Tensor,
         pool_indices: torch.Tensor,
         key_length: int,
+        *,
+        query_projection_chunk_size: int | None = None,
     ) -> torch.Tensor:
         """Select raw key indices for one query chunk.
 
@@ -500,6 +538,8 @@ class Glm5NextKPoolIndexer(nn.Module):
             pool_indices: Prepared raw token indices with shape
                 ``[complete_pools, index_kpool]``.
             key_length: Number of tokens in the unpadded document.
+            query_projection_chunk_size: Original projection tile size, preserved
+                when the cuDNN score kernel processes several tiles together.
 
         Returns:
             Int32 raw indices with shape
@@ -508,11 +548,32 @@ class Glm5NextKPoolIndexer(nn.Module):
         """
         complete_pools = pool_keys.shape[0]
 
-        queries = self.wq_b(query_resid).view(1, -1, self.n_heads, self.head_dim)
-        scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
-        scores = F.relu(scores * self.softmax_scale)
-        weights = self.weights_proj(query_hidden).float() * (self.n_heads**-0.5)
-        scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
+        if self.backend == "cudnn":
+            projection_chunk = query_projection_chunk_size or query_hidden.shape[1]
+            queries = torch.cat([self.wq_b(chunk) for chunk in query_resid.split(projection_chunk, dim=1)], dim=1)
+            queries = queries.view(1, -1, self.n_heads, self.head_dim)
+            weights = torch.cat(
+                [self.weights_proj(chunk) for chunk in query_hidden.split(min(512, projection_chunk), dim=1)], dim=1
+            )
+            scores = cudnn_indexer_scores(
+                queries,
+                pool_keys,
+                weights,
+                query_positions,
+                self.index_kpool,
+                self.softmax_scale * (self.n_heads**-0.5),
+            )
+        else:
+            queries = self.wq_b(query_resid).view(1, -1, self.n_heads, self.head_dim)
+            scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
+            scores = F.relu(scores * self.softmax_scale)
+            # Keep the narrow BF16 projection at the validated query tile shape.
+            if query_hidden.shape[1] > 512:
+                weights = torch.cat([self.weights_proj(chunk) for chunk in query_hidden.split(512, dim=1)], dim=1)
+            else:
+                weights = self.weights_proj(query_hidden)
+            weights = weights.float() * (self.n_heads**-0.5)
+            scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
         if complete_pools:
             pool_end = pool_indices[:, -1]
             visible = pool_end.view(1, 1, -1) <= query_positions.view(1, -1, 1)
@@ -571,10 +632,39 @@ class Glm5NextKPoolIndexer(nn.Module):
             self.index_kpool_compress_gate.fill_(1.0)
 
 
+def _dense_prefix_indices(
+    positions: torch.Tensor, index_topk: int, pool_size: int, always_select_tail: bool
+) -> torch.Tensor:
+    """Enumerate every visible key when all complete causal pools fit the budget.
+
+    Args:
+        positions: Document-local query positions [queries].
+        index_topk: Maximum number of tokens selected from complete pools.
+        pool_size: Number of tokens per complete pool.
+        always_select_tail: Whether to include the incomplete causal pool.
+
+    Returns:
+        Int32 indices [1, queries, index_topk + tail_width], with an ascending
+        valid prefix and -1 padding. The caller establishes that the complete
+        pool count of every query is no greater than index_topk // pool_size.
+    """
+    width = index_topk + (pool_size - 1 if always_select_tail else 0)
+    keys = torch.arange(width, dtype=torch.int32, device=positions.device)
+    visible = positions + 1
+    if not always_select_tail:
+        visible = visible.div(pool_size, rounding_mode="floor") * pool_size
+    return (
+        keys.view(1, 1, -1)
+        .expand(1, positions.numel(), -1)
+        .masked_fill(keys.view(1, 1, -1) >= visible.view(1, -1, 1), -1)
+    )
+
+
 class Glm5NextSparseAttention(nn.Module):
     """NoPE MLA whose visibility is selected by the GLM KPool indexer."""
 
     query_chunk_size = 32
+    indexer_query_chunk_size = 2048
 
     def __init__(self, config: Glm5NextTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
@@ -609,7 +699,8 @@ class Glm5NextSparseAttention(nn.Module):
             dtype=dtype,
         )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False, dtype=dtype)
-        self.indexer = Glm5NextKPoolIndexer(config, layer_idx, dtype)
+        indexer_backend = backend.indexer if isinstance(backend, Glm5NextBackendConfig) else "torch"
+        self.indexer = Glm5NextKPoolIndexer(config, layer_idx, dtype, backend=indexer_backend)
         self._cp_mesh = None
 
     def setup_cp_attention(self, cp_mesh) -> None:
@@ -633,16 +724,18 @@ class Glm5NextSparseAttention(nn.Module):
             full_hidden = all_gather_sequence(hidden_states, self._cp_mesh.get_group(), dim=1)
         else:
             full_hidden = hidden_states
+        if self.backend.attn == "cudnn":
+            output = self._forward_packed_cudnn(full_hidden, packed_context, hidden_states.shape[1])
+            if packed_context.cp_enabled:
+                output = output + all_gather_backward_anchor(full_hidden)
+            if padding_mask is not None:
+                output = output.masked_fill(padding_mask.unsqueeze(-1), 0)
+            return output
         output = torch.zeros_like(hidden_states)
         local_start = packed_context.seq_start
         local_end = local_start + hidden_states.shape[1]
         for row in range(hidden_states.shape[0]):
-            doc_ids = packed_context.doc_ids[row]
-            starts = torch.nonzero(doc_ids[1:] != doc_ids[:-1], as_tuple=False).flatten().add(1).tolist()
-            boundaries = [0, *starts, doc_ids.numel()]
-            for doc_start, doc_end in zip(boundaries[:-1], boundaries[1:]):
-                if int(doc_ids[doc_start]) <= 0:
-                    continue
+            for doc_start, doc_end in packed_context.row_document_ranges(row):
                 query_start, query_end = max(doc_start, local_start), min(doc_end, local_end)
                 if query_end <= query_start:
                     continue
@@ -676,16 +769,6 @@ class Glm5NextSparseAttention(nn.Module):
         length = full_hidden.shape[1]
         latent = self.kv_a_layernorm(self.kv_a_proj_with_mqa(full_hidden))
         pool_keys, pool_indices = self.indexer.prepare_pools(full_hidden)
-        if self.backend.attn == "cudnn":
-            return self._forward_document_cudnn(
-                full_hidden,
-                latent,
-                pool_keys,
-                pool_indices,
-                query_start,
-                query_end,
-            )
-
         expanded = self.kv_b_proj(latent).view(1, length, self.num_heads, self.qk_head_dim + self.v_head_dim)
         key, value = expanded.split([self.qk_head_dim, self.v_head_dim], dim=-1)
         key, value = key.transpose(1, 2), value.transpose(1, 2)
@@ -720,73 +803,145 @@ class Glm5NextSparseAttention(nn.Module):
             chunks.append(attn.transpose(1, 2).reshape(1, end - start, -1))
         return self.o_proj(torch.cat(chunks, dim=1))
 
-    def _forward_document_cudnn(
+    def _forward_packed_cudnn(
         self,
         full_hidden: torch.Tensor,
-        latent: torch.Tensor,
+        packed_context: Glm5NextPackedContext,
+        local_sequence_length: int,
+    ) -> torch.Tensor:
+        """Batch document-isolated attention after gathering global hidden states.
+
+        Preserve the original per-document K/V projection, indexer and query
+        projection order and shapes. Concatenate only the attention inputs.
+
+        Args:
+            full_hidden: Gathered states [batch, global_sequence, hidden].
+            packed_context: Global document map and this rank's query offset.
+            local_sequence_length: Number of tokens owned by this CP rank.
+
+        Returns:
+            Attention states [batch, local_sequence, hidden], zero at padding.
+        """
+        if not is_cudnn_sparse_attention_available():
+            raise RuntimeError("Packed cuDNN attention requires the FlashMLA/cuDNN runtimes.")
+        weight = self.kv_b_proj.weight.view(self.num_heads, self.qk_head_dim + self.v_head_dim, self.kv_lora_rank)
+        w_kc, w_vc = weight.split([self.qk_head_dim, self.v_head_dim], dim=1)
+        local_start = packed_context.seq_start
+        local_end = local_start + local_sequence_length
+        output = torch.zeros_like(full_hidden[:, local_start:local_end])
+        for row in range(full_hidden.shape[0]):
+            queries = []
+            selected = []
+            latents = []
+            intervals = []
+            key_offset = 0
+            for doc_start, doc_end in packed_context.row_document_ranges(row):
+                start, end = max(doc_start, local_start), min(doc_end, local_end)
+                if end <= start:
+                    continue
+                begin = start - local_start
+                length = end - start
+                document = full_hidden[row : row + 1, doc_start:doc_end]
+                query_hidden = document[:, start - doc_start : end - doc_start]
+                latent = self.kv_a_layernorm(self.kv_a_proj_with_mqa(document))
+                pool_keys, pool_indices = self.indexer.prepare_pools(document)
+                q_resid = self.q_a_layernorm(self.q_a_proj(query_hidden))
+                indices = self._select_document_indices_cudnn(
+                    query_hidden,
+                    q_resid,
+                    pool_keys,
+                    pool_indices,
+                    start - doc_start,
+                    end - doc_start,
+                    doc_end - doc_start,
+                )
+                query = self.q_b_proj(q_resid).view(1, length, self.num_heads, self.qk_head_dim)
+                queries.append(torch.einsum("bqhd,hdc->bqhc", query, w_kc.to(query.dtype)).squeeze(0))
+                latents.append(latent.squeeze(0))
+                selected.append(torch.where(indices >= 0, indices + key_offset, indices))
+                key_offset += doc_end - doc_start
+                intervals.append((begin, length))
+            if not intervals:
+                continue
+            query = torch.cat(queries, dim=0).contiguous()
+            indices = torch.cat(selected, dim=0).contiguous()
+            latent = torch.cat(latents, dim=0)
+            del queries, selected, latents
+            latent_output = cudnn_sparse_attention(
+                query,
+                latent.unsqueeze(1).contiguous(),
+                indices,
+                self.scaling,
+                all_rows_nonempty=self.indexer.always_select_tail,
+            )
+            chunks = latent_output.split([length for _, length in intervals], dim=0)
+            for chunk, (begin, length) in zip(chunks, intervals, strict=True):
+                attention_output = torch.einsum("qhc,hvc->qhv", chunk, w_vc.to(chunk.dtype))
+                output[row : row + 1, begin : begin + length] = self.o_proj(attention_output.reshape(1, length, -1))
+        return output
+
+    def _select_document_indices_cudnn(
+        self,
+        query_hidden: torch.Tensor,
+        q_resid: torch.Tensor,
         pool_keys: torch.Tensor,
         pool_indices: torch.Tensor,
         query_start: int,
         query_end: int,
+        length: int,
     ) -> torch.Tensor:
-        """Run absorbed latent attention through FlashMLA/cuDNN for one document.
+        """Select document-local keys using the original indexer projection tiles.
 
         Args:
-            full_hidden: Unpadded document states with shape ``[1, key_tokens, hidden]``.
-            latent: Normalized shared latent K/V with shape
-                ``[1, key_tokens, 512]``.
-            pool_keys: KPool-compressed index keys with shape
-                ``[complete_pools, index_head_dim]``.
-            pool_indices: Document-local token indices with shape
-                ``[complete_pools, index_kpool]``.
-            query_start: Inclusive document-local index of the first local query.
-            query_end: Exclusive document-local index of the final local query.
+            query_hidden: Local query states [1, queries, hidden].
+            q_resid: Normalized low-rank queries [1, queries, q_lora_rank].
+            pool_keys: Compressed index keys [complete_pools, index_head_dim].
+            pool_indices: Document-local indices [complete_pools, index_kpool].
+            query_start: First local query's position within the document.
+            query_end: Exclusive document-local query end.
+            length: Full document length.
 
         Returns:
-            Projected attention output with shape
-            ``[1, query_end - query_start, hidden]``.
+            Selected document-local indices [queries, 1, selection_width].
+            Invalid entries retain the -1 sentinel.
         """
-        if not is_cudnn_sparse_attention_available():
-            raise RuntimeError(
-                "backend.attn='cudnn' requires the optional cuDNN sparse-attention "
-                "and FlashMLA runtimes, but they are unavailable in this environment."
-            )
-
-        weight = self.kv_b_proj.weight.view(
-            self.num_heads,
-            self.qk_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        w_kc, w_vc = weight.split([self.qk_head_dim, self.v_head_dim], dim=1)
-        absorbed_queries = []
         selected_indices = []
-        length = full_hidden.shape[1]
-        for start in range(query_start, query_end, self.query_chunk_size):
-            end = min(start + self.query_chunk_size, query_end)
-            query_hidden = full_hidden[:, start:end]
-            q_resid = self.q_a_layernorm(self.q_a_proj(query_hidden))
-            query = self.q_b_proj(q_resid).view(1, end - start, self.num_heads, self.qk_head_dim)
-            absorbed_queries.append(torch.einsum("bqhd,hdc->bqhc", query, w_kc.to(query.dtype)).squeeze(0))
-            positions = torch.arange(start, end, device=full_hidden.device)
-            indices = self.indexer.select(
-                query_hidden,
-                q_resid,
-                positions,
-                pool_keys,
-                pool_indices,
-                length,
-            )
+
+        # Bound the FP32 [queries, index_heads, pools] score tensor to 256 MiB.
+        # At 256K/KPool4 this retains the original 32-query score workspace.
+        def chunk_size(score_heads: int) -> int:
+            bytes_per_query = max(1, pool_keys.shape[0]) * score_heads * 4
+            size = min(self.indexer_query_chunk_size, max(1, (256 * 1024**2) // bytes_per_query))
+            return 1 << (size.bit_length() - 1) if size > 512 else size
+
+        projection_chunk = chunk_size(self.indexer.n_heads)
+        indexer_chunk = projection_chunk
+        if self.indexer.backend == "cudnn":
+            indexer_chunk = (chunk_size(1) // projection_chunk) * projection_chunk
+        for start in range(query_start, query_end, indexer_chunk):
+            end = min(start + indexer_chunk, query_end)
+            positions = torch.arange(start, end, device=query_hidden.device)
+            # Skip only complete original chunks; sparse GEMM shapes stay unchanged.
+            if end // self.indexer.index_kpool <= self.indexer.index_topk // self.indexer.index_kpool:
+                indices = _dense_prefix_indices(
+                    positions,
+                    self.indexer.index_topk,
+                    self.indexer.index_kpool,
+                    self.indexer.always_select_tail,
+                )
+            else:
+                indices = self.indexer.select(
+                    query_hidden[:, start - query_start : end - query_start],
+                    q_resid[:, start - query_start : end - query_start],
+                    positions,
+                    pool_keys,
+                    pool_indices,
+                    length,
+                    query_projection_chunk_size=projection_chunk,
+                )
             selected_indices.append(indices.squeeze(0).unsqueeze(1))
 
-        latent_output = cudnn_sparse_attention(
-            torch.cat(absorbed_queries, dim=0).contiguous(),
-            latent.squeeze(0).unsqueeze(1).contiguous(),
-            torch.cat(selected_indices, dim=0).contiguous(),
-            self.scaling,
-            all_rows_nonempty=self.indexer.always_select_tail,
-        )
-        attention_output = torch.einsum("qhc,hvc->qhv", latent_output, w_vc.to(latent_output.dtype))
-        return self.o_proj(attention_output.reshape(1, query_end - query_start, -1))
+        return torch.cat(selected_indices, dim=0).contiguous()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:
@@ -815,7 +970,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.is_linear_attn = self.block_type == "linear_attention"
         self.is_moe_layer = config.mlp_layer_types[layer_idx] == "sparse"
         self.self_attn = (
-            Glm5NextLinearAttention(config, layer_idx)
+            Glm5NextLinearAttention(config, layer_idx, compile_norm=backend.compile_norm)
             if self.is_linear_attn
             else Glm5NextSparseAttention(config, layer_idx, backend)
         )
@@ -831,10 +986,16 @@ class Glm5NextDecoderLayer(nn.Module):
                 swiglu_limit=config.swiglu_limit,
             )
         )
-        self.input_layernorm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
-        self.post_attention_layernorm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
-        self.attn_hc = Glm5NextHyperConnection(config)
-        self.ffn_hc = Glm5NextHyperConnection(config)
+        self.input_layernorm = Glm5NextRMSNorm(
+            config.hidden_size, config.rms_norm_eps, dtype, compile_norm=backend.compile_norm
+        )
+        self.post_attention_layernorm = Glm5NextRMSNorm(
+            config.hidden_size, config.rms_norm_eps, dtype, compile_norm=backend.compile_norm
+        )
+        sinkhorn_backend = backend.sinkhorn if isinstance(backend, Glm5NextBackendConfig) else "torch"
+        self.attn_hc = Glm5NextHyperConnection(config, sinkhorn_backend=sinkhorn_backend, compile_hc=backend.compile_hc)
+        self.ffn_hc = Glm5NextHyperConnection(config, sinkhorn_backend=sinkhorn_backend, compile_hc=backend.compile_hc)
+        _, _, self._expand_core = hc_cores(backend.compile_hc)
 
     def forward(
         self,
@@ -845,7 +1006,6 @@ class Glm5NextDecoderLayer(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         """Transform residual streams ``[batch, local_sequence, hc_mult, hidden]``."""
-        dtype = hidden_streams.dtype
         residual = hidden_streams
         post, comb, collapsed = self.attn_hc(hidden_streams)
         update = self.self_attn(
@@ -854,16 +1014,12 @@ class Glm5NextDecoderLayer(nn.Module):
             padding_mask=padding_mask,
             **kwargs,
         )
-        hidden_streams = post.to(dtype).unsqueeze(-1) * update.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), residual
-        )
+        hidden_streams = self._expand_core(update, residual, post, comb)
         residual = hidden_streams
         post, comb, collapsed = self.ffn_hc(hidden_streams)
         update = self.post_attention_layernorm(collapsed)
         update = self.mlp(update, padding_mask) if self.is_moe_layer else self.mlp(update)
-        return post.to(dtype).unsqueeze(-1) * update.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), residual
-        )
+        return self._expand_core(update, residual, post, comb)
 
     def update_moe_gate_bias(self) -> None:
         """Update the correction bias for this layer's learned MoE router."""
