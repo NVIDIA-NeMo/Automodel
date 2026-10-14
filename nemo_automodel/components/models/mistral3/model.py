@@ -552,7 +552,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
         if quant_method == "fp8":
-            self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_causal_lm()
+            self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_causal_lm(config)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

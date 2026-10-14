@@ -15,7 +15,7 @@ The latest Automodel container can be found: [here](https://catalog.ngc.nvidia.c
 The container can be run with the following docker command:
 
 ```bash
-docker run --gpus all --network=host -it --rm --shm-size=32g nvcr.io/nvidia/nemo-automodel:26.06.00 /bin/bash
+docker run --gpus all --network=host -it --rm --shm-size=32g nvcr.io/nvidia/nemo-automodel:26.10.00 /bin/bash
 ```
 
 #### Mounting local Automodel directory into the container
@@ -24,7 +24,7 @@ To sync local Automodel directory into the container, mount the local directory 
 Example docker command:
 
 ```bash
-docker run --gpus all --network=host -it --rm -v <local-Automodel-path>:/opt/Automodel --shm-size=32g nvcr.io/nvidia/nemo-automodel:26.06.00 /bin/bash
+docker run --gpus all --network=host -it --rm -v <local-Automodel-path>:/opt/Automodel --shm-size=32g nvcr.io/nvidia/nemo-automodel:26.10.00 /bin/bash
 ```
 
 Within the container, cd into `/opt/Automodel/` and update the pyproject.toml and uv.lock file by running the following command:
@@ -74,6 +74,17 @@ For developers building a custom docker container with Automodel, please refer t
 
 If [Nvidia PyTorch](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/index.html) container is used as a base image, please review [Developing with Automodel container](#1-developing-with-automodel-container).
 
+The image includes a pinned [Mixture-of-Kittens](https://github.com/cursor/mixture-of-kittens)
+build for GB200 (SM100) and GB300 (SM103). Pass `--build-arg MOK_ARCH=SM100` or
+`--build-arg MOK_ARCH=SM103` to build for a single target. MoK recipes require
+Blackwell GPUs; H100 GPUs are unsupported.
+Outside the image, install it with `MOK_ARCH=ALL uv sync --extra mok` on Linux
+with Python 3.12+, CUDA-enabled PyTorch 2.10+ and the matching CUDA 13 toolkit.
+Use `MOK_ARCH=SM100` or `MOK_ARCH=SM103` for a single target. Run
+`uv cache clean mixture-of-kittens` before switching architectures in an existing
+installation, then add
+`--reinstall-package mixture-of-kittens` to the sync command.
+
 Command to build Automodel's Dockerfile:
 
 ```bash
@@ -104,7 +115,6 @@ pip install transformer-engine[pytorch]==2.8.0
 # Flash-attn version should be selected to satisfy TE requirements
 # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
 pip install flash-attn==2.7.4.post1
-pip install grouped_gemm
 ```
 
 ## Development Dependencies
@@ -165,6 +175,52 @@ Format:
 ruff check --fix .
 ruff format .
 ```
+
+Ruff does not cover every rule we enforce. `tools/lint_no_globals.py` rejects `globals()`
+and its equivalents (module-scope `vars()`, `sys.modules[__name__].__dict__`,
+`setattr(sys.modules[__name__], ...)`). These are usually used to swap a module-level
+function so that another function picks up the replacement — a process-wide mutation that
+changes behavior for every concurrent or nested caller. Pass the collaborator in, or expose
+a method subclasses can override, instead. The one exception is the PEP 562 lazy-import
+cache: `globals()[name] = attr` written directly inside a module-level `def __getattr__(name)`.
+The check covers the same paths as Bandit (`app.py`, `nemo_automodel/`, `examples/`,
+`scripts/`, `tools/`, `tutorials/`); `tests/` is excluded, as it is for Ruff. Run it with:
+
+```bash
+python tools/lint_no_globals.py
+```
+
+## Unit-test runtime
+
+Unit-test time limits are enforced at **three times the configured value** to
+allow for CI load. The configured default runtime budget is 30 seconds, so new
+and modified tests have an effective 90-second budget, including setup, the test
+body, and teardown. A configured 15-second marker allows 45 seconds. If every
+phase passes but the test exceeds its effective budget, pytest runs it once more
+in the same worker with fresh function-scoped
+fixtures. Shared fixtures and compiler caches can remain warm. Both attempts
+must exceed the budget to fail the runtime gate; assertion failures, fixture
+errors, and hard timeouts are never retried. A warning records every confirmation.
+
+Keep model shapes small and avoid downloads or unnecessary compilation. Tests
+that consistently need more than the effective budget should be optimized or moved to
+functional tests. An exact `@pytest.mark.runtime_budget(...)` may tighten the
+limit, but cannot raise it for a new or modified test. A changed test with a
+marker above 30 seconds stops collection with a usage error; update its marker
+and optimize the test, or move it to functional coverage. Existing larger allowances
+retain their hard watchdog on unrelated changes; they do not impose a runtime
+gate on those changes. The configured default hard watchdog is 70 seconds,
+enforced at 210 seconds. The same multiplier applies once to resolved pytest
+timeout markers and CLI, environment, or ini timeout settings, preserving their
+usual precedence, timeout method, and function-only scope. A zero timeout stays
+disabled. Global pytest timeout options still bypass the soft runtime policy.
+Diagnostics show both configured and effective soft budgets. These rules apply
+only under `tests/unit_tests`; workflow and subprocess timeouts are unchanged.
+
+Changed tests are identified relative to the PR merge base (or `origin/main`
+locally). Set `AUTOMODEL_RUNTIME_BUDGET_BASE=<commit>` to explicitly select a base
+when reproducing a CI result. CPU and GPU unit-test jobs both limit host math
+libraries to one thread per process to avoid oversubscription by spawned ranks.
 
 ## Pre-commit
 

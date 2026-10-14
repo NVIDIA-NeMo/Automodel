@@ -85,6 +85,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
 )
+from nemo_automodel.components.models.deepseek_v4.parallelization import PARALLELIZER
 from nemo_automodel.components.models.deepseek_v4.processing import (
     COMPRESS_PAD_TO,
     IMAGE,
@@ -1043,6 +1044,9 @@ class DeepseekV4Model(nn.Module):
         return h
 
     def update_moe_gate_bias(self) -> None:
+        """Update routing biases only when enabled by the model's MoE configuration."""
+        if not self.moe_config.train_gate or self.moe_config.gate_bias_update_factor <= 0:
+            return
         with torch.no_grad():
             for block in self.layers.values():
                 if isinstance(block.mlp, MoE):
@@ -1543,4 +1547,5 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         cast_model_to_dtype(self, dtype)
 
 
+DeepseekV4ForCausalLM.parallelizer = PARALLELIZER
 ModelClass = DeepseekV4ForCausalLM

@@ -442,6 +442,27 @@ class TestLRSchedulerConfig:
         scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
         assert scheds[0].lr_decay_steps == 20  # min(num_epochs*epoch_len=1000, max_steps=20)
 
+    def test_build_keeps_caller_param_group_lr_and_weight_decay(self):
+        # The retrieval recipes build a no-decay group and a projection group with its own lr this way.
+        decay, no_decay, projection = (torch.nn.Parameter(torch.zeros(2)) for _ in range(3))
+        opt = AdamWConfig(lr=1e-5, weight_decay=0.01).build_from_param_groups(
+            [
+                {"params": [decay]},
+                {"params": [no_decay], "weight_decay": 0.0},
+                {"params": [projection], "weight_decay": 0.0, "lr": 1e-3},
+            ]
+        )
+        ss = self._step_scheduler(epoch_len=100, num_epochs=1, max_steps=None)
+        scheduler = LRSchedulerConfig(lr_warmup_steps=10).build(opt, ss)[0]
+        scheduler.step(10)  # end of warmup: group 0 is at the optimizer's lr
+        decay_group, no_decay_group, projection_group = opt.param_groups
+
+        assert decay_group["lr"] == pytest.approx(1e-5)
+        assert decay_group["weight_decay"] == pytest.approx(0.01)
+        assert no_decay_group["weight_decay"] == 0.0
+        assert projection_group["weight_decay"] == 0.0
+        assert projection_group["lr"] == pytest.approx(1e-3)
+
 
 # ---------------------------------------------------------------------------
 # Per-parameter-group LR overrides (issue #2961)

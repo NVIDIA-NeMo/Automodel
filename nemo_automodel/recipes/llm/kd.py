@@ -45,7 +45,12 @@ from dataclasses import replace
 from typing import Any, Dict
 
 import torch
-import wandb
+
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -53,11 +58,17 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.loss.utils import calculate_loss
-from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
+from nemo_automodel.components.loss.utils import (
+    _count_label_tokens,
+    _get_loss_ignore_index,
+    _normalize_kd_labels,
+    calculate_loss,
+)
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
@@ -75,6 +86,7 @@ from nemo_automodel.recipes.kd_utils import (
     RUN_TEACHER,
     STOP_TEACHER,
     KDMeshBridge,
+    configure_kd_teacher_packing,
     create_kd_distributed_setups,
     materialize_teacher_logits,
 )
@@ -99,6 +111,8 @@ def _build_teacher_model(
     has_packed_sequence,
     distributed_setup: DistributedSetup | None = None,
     device=None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ):
     """Build and initialize the teacher model for knowledge distillation.
 
@@ -111,6 +125,7 @@ def _build_teacher_model(
         has_packed_sequence: Whether using packed sequences.
         distributed_setup: Resolved distributed topology and policy object.
         device: Device to place the teacher model on.
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
 
     Returns:
         The frozen teacher model ready for inference.
@@ -128,6 +143,7 @@ def _build_teacher_model(
         kwargs: Dict[str, Any] = {
             "has_packed_sequence": has_packed_sequence,
             "distributed_setup": distributed_setup,
+            "load_metadata_with_gloo": load_metadata_with_gloo,
         }
 
         teacher_model = cfg_teacher.instantiate(**kwargs)
@@ -150,6 +166,8 @@ def _build_teacher_model_with_pp(
     pipeline_config: PipelineConfig,
     distributed_setup: DistributedSetup,
     activation_checkpointing: bool,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> Any:
     """Build a frozen teacher model with the supplied distributed setup.
 
@@ -165,6 +183,7 @@ def _build_teacher_model_with_pp(
         pipeline_config: Pipeline configuration for the teacher.
         distributed_setup: Distributed setup for the teacher.
         activation_checkpointing: Whether to enable activation checkpointing.
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
 
     Returns:
         The frozen teacher AutoPipeline with a ``_teacher_logits_capture`` attribute.
@@ -230,6 +249,7 @@ def _build_teacher_model_with_pp(
             cfg_quantization=None,
             distributed_setup=teacher_distributed_setup,
             cfg_qat=None,
+            load_metadata_with_gloo=load_metadata_with_gloo,
         )
 
     # Freeze all teacher parameters.
@@ -305,19 +325,37 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             pp_microbatch_size=pp_microbatch_size,
         )
 
+    def _configure_packing(self) -> PackingCapabilities:
+        """Emit metadata for both KD consumers, including a teacher built later."""
+        return replace(super()._configure_packing(), requires_packed_sequence_metadata=True)
+
+    def _configure_teacher_packing(self) -> None:
+        """Adapt teacher stages and reject incompatible student/teacher mask layouts.
+
+        All separate-mesh ranks participate in the layout check before either
+        side starts training. Metadata is always emitted by the KD dataloader,
+        since the teacher is constructed after the student loader.
+        """
+        if (
+            self.cfg.get("packed_sequence.packed_sequence_size", 0) <= 0
+            or self.cfg.get("packed_sequence.packing_strategy", "thd") != "neat"
+        ):
+            return
+        teacher_parts = []
+        if self.teacher_model is not None:
+            teacher_parts = self.teacher_pp.parts if self.teacher_pp is not None else [self.teacher_model]
+        student_parts = self.model_parts if not self.separate_meshes or self.kd_mesh_bridge.is_student else []
+        configure_kd_teacher_packing(
+            teacher_parts,
+            student_parts,
+            control_group=self.kd_mesh_bridge.control_group if self.separate_meshes else None,
+        )
+
     def setup(self):  # noqa: C901 – same complexity as parent
         """Build student & teacher, dataloaders, optimizers, etc."""
         # Right now, we only support tokenizer compatibility for the same tokenizer.
         # We will add support for different tokenizers in the future.
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
-
-        resolve_storage_dtype(
-            self.cfg.get("model"),
-            self.cfg.get("optimizer"),
-            is_peft=self.cfg.get("peft", None) is not None,
-            context="llm-kd",
-            logger=logger,
-        )
 
         # Let the parent class build *everything* for the student first.
         super().setup()
@@ -337,6 +375,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         pipeline_config=self.pipeline_config,
                         distributed_setup=self.distributed_setup,
                         activation_checkpointing=self.activation_checkpointing,
+                        load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
                     )
                     self.teacher_pp = self.teacher_model
                 else:
@@ -346,6 +385,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
                         distributed_setup=self.distributed_setup,
                         device=self.dist_env.device,
+                        load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
                     )
                     self.teacher_pp = None
             else:
@@ -355,17 +395,18 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     schedule = self.pp.info.schedule
                     self._original_pp_loss_fn = getattr(schedule, "_loss_fn", None)
                     schedule._loss_fn = self._make_pp_kd_loss_wrapper()
+            self._configure_teacher_packing()
             self.kd_mesh_bridge.synchronize()
             return
 
         teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
 
         if self.pp_enabled:
-            # FusedLinearCrossEntropy needs hidden_states; the last PP stage only has logits.
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+            # Linear CE needs hidden_states; the last PP stage only has logits.
+            if isinstance(self.loss_fn, LinearCrossEntropy):
                 raise ValueError(
                     "Pipeline parallelism with KD requires a loss that uses only logits and labels "
-                    "(e.g. MaskedCrossEntropy). FusedLinearCrossEntropy is not supported for PP KD."
+                    f"(e.g. MaskedCrossEntropy). {type(self.loss_fn).__name__} is not supported for PP KD."
                 )
             self.teacher_model = _build_teacher_model_with_pp(
                 cfg_teacher=self.cfg.get("teacher_model", None),
@@ -374,6 +415,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 pipeline_config=self.pipeline_config,
                 distributed_setup=self.distributed_setup,
                 activation_checkpointing=self.activation_checkpointing,
+                load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
             )
             self.teacher_pp = self.teacher_model
         else:
@@ -383,9 +425,11 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
                 distributed_setup=self.distributed_setup,
                 device=teacher_device,
+                load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
             )
             self.teacher_pp = None
 
+        self._configure_teacher_packing()
         logger.info("Teacher Model: " + str(self.teacher_model))
 
         # KD
@@ -450,10 +494,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     labels=target,
                     num_label_tokens=None,
                 )
+            kd_labels = _normalize_kd_labels(
+                target,
+                loss_ignore_index=_get_loss_ignore_index(recipe_ref.loss_fn),
+                kd_ignore_index=_get_loss_ignore_index(recipe_ref.kd_loss_fn),
+            )
             kd_loss = recipe_ref.kd_loss_fn(
                 logits,
                 teacher_logits,
-                target,
+                kd_labels,
                 num_batch_labels=1,
             )
             recipe_ref._ce_loss_buffer.append(ce_loss.detach().clone())
@@ -600,7 +649,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         separate_teacher_logits = (
             self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None
         )
-        batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+        batch = {
+            k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
         if separate_teacher_logits is not None:
             batch["teacher_logits"] = separate_teacher_logits
         labels = batch.pop("labels")
@@ -641,7 +693,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 teacher_logits = separate_teacher_logits
 
             # Student forward.
-            student_batch = filter_forward_kwargs(model, batch)
+            student_batch = dict(batch)
+            if self.kd_ratio < 1.0 and isinstance(self.loss_fn, LinearCrossEntropy):
+                student_batch["output_hidden_states"] = True
+            student_batch = filter_forward_kwargs(model, student_batch)
             student_out = model(**student_batch)
 
             student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
@@ -665,10 +720,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             # Reminder: kd_loss is normalized by num_label_tokens, which is typically
             # larger than the number of labels in this batch alone because it covers all
             # batches in one optimizer step (grad_acc_steps = gbs / mbs).
+            kd_labels = _normalize_kd_labels(
+                labels,
+                loss_ignore_index=_get_loss_ignore_index(self.loss_fn),
+                kd_ignore_index=_get_loss_ignore_index(self.kd_loss_fn),
+            )
             kd_loss = self.kd_loss_fn(
                 student_logits,
                 teacher_logits,
-                labels,
+                kd_labels,
                 num_batch_labels=num_label_tokens,
             )
             local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss
@@ -791,8 +851,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if self.pp_enabled:
             return self._run_train_optim_step_pp(batches, max_grad_norm)
 
+        ignore_index = _get_loss_ignore_index(self.loss_fn)
         num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
@@ -813,6 +874,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self._ce_loss_buffer.append(ce_loss)
             self._kd_loss_buffer.append(kd_loss)
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
@@ -884,7 +946,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
     def _run_train_optim_step_pp(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step when pipeline parallelism is enabled."""
-        num_label_tokens = torch.tensor(sum((b["labels"] != -100).sum().item() for b in batches), dtype=torch.long)
+        ignore_index = _get_loss_ignore_index(self.loss_fn)
+        num_label_tokens = torch.tensor(
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
+        )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
 
@@ -911,6 +976,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if i == 0:
                 prepare_after_first_microbatch()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
@@ -1086,9 +1152,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             total_ce_loss = 0.0
             total_kd_loss = 0.0
             total_num_label_tokens = 0
+            ignore_index = _get_loss_ignore_index(self.loss_fn)
 
             for batch in val_dataloader:
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                num_label_tokens = _count_label_tokens(batch["labels"], ignore_index)
                 local_loss, _kd_loss, _ce_loss = self._forward_backward_step(
                     0,
                     batch,
@@ -1135,7 +1202,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if not self.dist_env.is_main or log_data is None:
             return
 
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
 
         if not metric_logger is None:
@@ -1188,7 +1255,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         # Log to remote services (WandB) according to step_scheduler frequency.
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
 
         # JSONL training log (always log for detailed local records).

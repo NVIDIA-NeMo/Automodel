@@ -68,7 +68,7 @@ recipe_args:
   # --- frozen GLM-5.2 target backend (mirrors the online GLM DSpark backend) ---
   target_attn_backend: sdpa        # switch to `tilelang` for the fused sparse kernels when available
   target_dispatcher: hybridep      # MoE token dispatcher for the sharded experts
-  target_experts: torch_mm         # grouped-expert GEMM backend
+  target_experts: torch_mm         # native grouped-expert GEMM backend
   target_enable_fsdp_optimizations: true
 
   # target_num_hidden_layers: 4    # single-node validation only (see header); set target_layer_ids to match

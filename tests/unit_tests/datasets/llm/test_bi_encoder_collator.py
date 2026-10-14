@@ -161,10 +161,10 @@ def test_collator_emits_passage_doc_ids_for_complete_nonempty_ids():
 
     expected = torch.tensor(
         [
-            rc._doc_id_str_to_int64("positive-0"),
-            rc._doc_id_str_to_int64("negative-0"),
-            rc._doc_id_str_to_int64("positive-1"),
-            rc._doc_id_str_to_int64("negative-1"),
+            3258356477587863190,
+            5914043119314688128,
+            8193369221281001877,
+            2309675609176336901,
         ],
         dtype=torch.long,
     )

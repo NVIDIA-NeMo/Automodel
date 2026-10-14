@@ -154,6 +154,8 @@ class Glm4MoeAttention(nn.Module):
         linear_list = [self.q_proj, self.k_proj, self.v_proj, self.o_proj]
         for linear in linear_list:
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+            if linear.bias is not None:
+                nn.init.zeros_(linear.bias)
         if self.use_qk_norm:
             for norm in (self.q_norm, self.k_norm):
                 norm.reset_parameters()

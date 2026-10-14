@@ -656,9 +656,9 @@ class GPTDataset(torch.utils.data.Dataset):
                 # Write the description
                 with open(path_to_description, "wt") as writer:
                     writer.write(self.unique_description)
-                numpy.save(path_to_document_index, document_index, allow_pickle=True)
-                numpy.save(path_to_sample_index, sample_index, allow_pickle=True)
-                numpy.save(path_to_shuffle_index, shuffle_index, allow_pickle=True)
+                numpy.save(path_to_document_index, document_index, allow_pickle=False)
+                numpy.save(path_to_sample_index, sample_index, allow_pickle=False)
+                numpy.save(path_to_shuffle_index, shuffle_index, allow_pickle=False)
             else:
                 logger.warning(f"Unable to save {type(self).__name__} indexes because path_to_cache is None")
 
@@ -674,19 +674,19 @@ class GPTDataset(torch.utils.data.Dataset):
 
         logger.info(f"\tLoad the document index from {os.path.basename(path_to_document_index)}")
         t_beg = time.time()
-        document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode="r")
+        document_index = numpy.load(path_to_document_index, allow_pickle=False, mmap_mode="r")
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
         logger.info(f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}")
         t_beg = time.time()
-        sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
+        sample_index = numpy.load(path_to_sample_index, allow_pickle=False, mmap_mode="r")
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
         logger.info(f"\tLoad the shuffle index from {os.path.basename(path_to_shuffle_index)}")
         t_beg = time.time()
-        shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode="r")
+        shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=False, mmap_mode="r")
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 

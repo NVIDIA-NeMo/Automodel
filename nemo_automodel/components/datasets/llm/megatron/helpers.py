@@ -16,6 +16,8 @@
 # Explicit imports for readability
 import numpy
 
+from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper
+
 
 def build_sample_idx(
     sizes: numpy.ndarray,
@@ -25,8 +27,8 @@ def build_sample_idx(
     tokens_per_epoch: int,
     drop_last_partial_sequence: bool = True,
     add_extra_token_to_sequence: bool = True,
-):
-    """Build the 2-D sample index using the properly typed templated C++ function from helpers.cpp
+) -> numpy.ndarray:
+    """Build the 2-D sample index using the properly typed templated C++ helper function
 
     Args:
         sizes (numpy.ndarray): The 1-D array of document lengths
@@ -48,14 +50,11 @@ def build_sample_idx(
     Returns:
         numpy.ndarray: The 2-D sample index
     """
-    from nemo_automodel.components.datasets.llm.megatron.helpers_cpp import (
-        build_sample_idx_int32,
-        build_sample_idx_int64,
-    )
+    helpers_cpp = compile_helper()
 
     sample_idx_max = max(document_indices.shape[0], sizes.max())
     if sample_idx_max <= numpy.iinfo(numpy.int32).max:
-        sample_idx = build_sample_idx_int32(
+        sample_idx = helpers_cpp.build_sample_idx_int32(
             sizes,
             document_indices,
             sequence_length,
@@ -66,7 +65,7 @@ def build_sample_idx(
         )
         assert sample_idx.min() >= 0 and sample_idx.max() <= sample_idx_max
     else:
-        sample_idx = build_sample_idx_int64(
+        sample_idx = helpers_cpp.build_sample_idx_int64(
             sizes,
             document_indices,
             sequence_length,

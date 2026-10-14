@@ -14,11 +14,13 @@
 
 import sys
 
-import mlflow
 import pytest
+
+mlflow = pytest.importorskip("mlflow")
 import torch
 import torch.distributed as dist
 
+from nemo_automodel.components.loggers.loggers import MLflowConfig
 from nemo_automodel.components.loggers.mlflow_utils import (
     _install_mlflow_failure_hook,
     configure_mlflow,
@@ -26,6 +28,52 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     flatten_params_for_mlflow,
     to_float_metrics,
 )
+
+
+@pytest.mark.runtime_budget(20, reason="Initialize MLflow's real SQLite schema and run its Alembic migrations")
+def test_default_sqlite_tracking_persists_and_resumes_run(tmp_path, monkeypatch):
+    """The shipped MLflow extra must support the unconfigured local backend."""
+    previous_tracking_uri = mlflow.get_tracking_uri()
+    # Track this variable for teardown: set_tracking_uri() also writes to os.environ.
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", previous_tracking_uri)
+    for name in ("MLFLOW_TRACKING_URI", "MLFLOW_REGISTRY_URI", "MLFLOW_RUN_ID", "MLFLOW_EXPERIMENT_ID"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    mlflow.set_tracking_uri(None)
+    checkpoint_dir = tmp_path / "checkpoints"
+    config = MLflowConfig(experiment_name="sqlite-default", tags={"source": "automodel-test"})
+
+    try:
+        run = config.build(checkpoint_dir=str(checkpoint_dir), run_config={"learning_rate": 0.001})
+        mlflow.log_metric("train_loss", 0.5, step=10)
+        mlflow.end_run()
+
+        assert (tmp_path / "mlflow.db").is_file()
+        stored = mlflow.get_run(run.info.run_id)
+        assert stored.info.status == "FINISHED"
+        assert stored.data.params["learning_rate"] == "0.001"
+        assert stored.data.metrics["train_loss"] == 0.5
+        assert stored.data.tags["source"] == "automodel-test"
+        client = mlflow.MlflowClient()
+        history = client.get_metric_history(run.info.run_id, "train_loss")
+        assert [(metric.step, metric.value) for metric in history] == [(10, 0.5)]
+        assert "config.yaml" in [artifact.path for artifact in client.list_artifacts(run.info.run_id)]
+        assert (checkpoint_dir / "mlflow_run_id").read_text() == run.info.run_id
+
+        resumed = config.build(checkpoint_dir=str(checkpoint_dir))
+        assert resumed.info.run_id == run.info.run_id
+        mlflow.log_metric("train_loss", 0.25, step=11)
+        mlflow.end_run()
+        stored = mlflow.get_run(run.info.run_id)
+        assert stored.info.status == "FINISHED"
+        assert stored.data.metrics["train_loss"] == 0.25
+    finally:
+        if mlflow.active_run() is not None:
+            mlflow.end_run()
+        mlflow.set_tracking_uri(previous_tracking_uri)
 
 
 class _DictWithToDict(dict):
@@ -83,7 +131,8 @@ class TestConfigureMlflow:
         monkeypatch.delenv("MLFLOW_RUN_ID", raising=False)
 
         self.tmp_path = tmp_path
-        self.tracking_uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        self.tracking_uri = (tmp_path / "mlruns").as_uri()
         mlflow.set_tracking_uri(self.tracking_uri)
         if mlflow.active_run() is not None:
             mlflow.end_run()
@@ -155,7 +204,7 @@ class TestConfigureMlflow:
         run2 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
         assert run2.info.run_id == run1.info.run_id
         # And mlflow only sees one run, not two
-        runs = mlflow.search_runs(experiment_names=["test-exp"])
+        runs = mlflow.search_runs(experiment_names=["test-exp"], output_format="list")
         assert len(runs) == 1
 
     def test_resumes_from_env_var(self, monkeypatch):
@@ -259,8 +308,9 @@ class TestConfigureMlflow:
 
 class TestEndMlflowActiveRunAsKilled:
     @pytest.fixture(autouse=True)
-    def _setup(self, tmp_path):
-        mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
+    def _setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        mlflow.set_tracking_uri((tmp_path / "mlruns").as_uri())
         if mlflow.active_run() is not None:
             mlflow.end_run()
         yield
@@ -287,17 +337,23 @@ class TestEndMlflowActiveRunAsKilled:
         # must swallow it so the SIGTERM path doesn't crash.
         mlflow.start_run()
 
+        real_end_run = mlflow.end_run
+
         def _raises(*args, **kwargs):
             raise RuntimeError("simulated reentrancy failure")
 
         monkeypatch.setattr(mlflow, "end_run", _raises)
-        end_mlflow_active_run_as_killed()  # must not raise
+        try:
+            end_mlflow_active_run_as_killed()  # must not raise
+        finally:
+            monkeypatch.setattr(mlflow, "end_run", real_end_run)
 
 
 class TestInstallMlflowFailureHook:
     @pytest.fixture(autouse=True)
-    def _setup(self, tmp_path):
-        mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
+    def _setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        mlflow.set_tracking_uri((tmp_path / "mlruns").as_uri())
         if mlflow.active_run() is not None:
             mlflow.end_run()
 

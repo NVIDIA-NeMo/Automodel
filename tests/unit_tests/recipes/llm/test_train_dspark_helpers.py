@@ -15,8 +15,6 @@
 """CPU unit tests for the DSpark recipe's V4-Flash helper knobs.
 
 Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
-- ``_apply_draft_activation_checkpointing``: the distributed AC setting wraps
-  the trainable draft's attention, MLP, and norm modules before FSDP.
 - ``_apply_target_chat_template``: a target whose tokenizer ships no chat
   template (V4-Flash) must take one from ``recipe_args.chat_template`` or fail
   fast, and an explicit template overrides whatever the tokenizer carries.
@@ -68,7 +66,6 @@ from nemo_automodel.recipes.llm.train_dspark import (
     _DSPARK_WINDOW_SCALARS,
     TrainDSparkRecipe,
     _add_accept_rate_per_position,
-    _apply_draft_activation_checkpointing,
     _apply_target_chat_template,
     _build_dspark_optimizer,
     _DSparkMetricWindow,
@@ -102,38 +99,6 @@ def _tok(chat_template=None):
     """A minimal tokenizer stub: ``_has_chat_template`` needs a ``chat_template``
     attribute plus a callable ``apply_chat_template``."""
     return SimpleNamespace(chat_template=chat_template, apply_chat_template=lambda *a, **k: None)
-
-
-class _DraftLayer(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.self_attn = torch.nn.Linear(4, 4)
-        self.mlp = torch.nn.Linear(4, 4)
-        self.input_layernorm = torch.nn.LayerNorm(4)
-        self.post_attention_layernorm = torch.nn.LayerNorm(4)
-
-
-class _Draft(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.layers = torch.nn.ModuleList([_DraftLayer(), _DraftLayer()])
-
-
-def test_draft_activation_checkpointing_wraps_trainable_submodules():
-    draft = _Draft()
-    _apply_draft_activation_checkpointing(draft, True)
-    for layer in draft.layers:
-        assert hasattr(layer.self_attn, "_checkpoint_wrapped_module")
-        assert hasattr(layer.mlp, "_checkpoint_wrapped_module")
-        assert hasattr(layer.input_layernorm, "_checkpoint_wrapped_module")
-        assert hasattr(layer.post_attention_layernorm, "_checkpoint_wrapped_module")
-
-
-def test_draft_activation_checkpointing_false_is_noop():
-    draft = _Draft()
-    original_attention = draft.layers[0].self_attn
-    _apply_draft_activation_checkpointing(draft, False)
-    assert draft.layers[0].self_attn is original_attention
 
 
 def test_save_checkpoint_applies_retention_after_sync_save(tmp_path, monkeypatch):
@@ -639,7 +604,8 @@ _TINY_GLM_CONFIG = {
 }
 
 
-def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeypatch, enabled):
     """Regression: ``from_pretrained`` re-read the checkpoint's own config, silently
     rebuilding the full-depth target and discarding ``target_num_hidden_layers`` (OOM
     on one node). The GLM target build must hand the reduced, repaired config to
@@ -657,12 +623,13 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
         captured.update(kwargs)
         return "target-model"
 
+    monkeypatch.setattr(tb.NeMoAutoConfig, "resolve_revision", lambda *args, **kwargs: None)
     monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
     monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
 
     recipe_cfg = _opt_cfg(target_num_hidden_layers=2)
     target_config, target_model, distributed_setup = tb.build_glm_5_2_target(
-        cfg=SimpleNamespace(),
+        cfg=ConfigNode({"checkpoint": {"load_metadata_with_gloo": enabled}}),
         world_size=8,
         device=SimpleNamespace(type="cuda"),
         compute_dtype=torch.bfloat16,
@@ -679,6 +646,7 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
     # The attribute-map clobber is repaired back to the raw checkpoint value.
     assert target_config.qk_rope_head_dim == 8
     assert captured["load_base_model"] is True
+    assert captured["load_metadata_with_gloo"] is enabled
     assert captured["distributed_setup"] == "distributed-setup"
     assert captured["torch_dtype"] == torch.bfloat16
 
@@ -698,7 +666,8 @@ def test_build_glm_5_2_target_requires_cuda(tmp_path):
         )
 
 
-def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch, enabled):
     """The V4 build must hand the (reduced) config to ``from_config`` with the sharded
     distributed_setup and ``load_base_model=True`` (the full 43-layer target OOMs on
     one node, so ``target_num_hidden_layers`` must survive to ``from_config``)."""
@@ -712,13 +681,14 @@ def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
         return "target-model"
 
     monkeypatch.setattr(
-        tb.DeepseekV4Config, "from_pretrained", staticmethod(lambda *a, **k: SimpleNamespace(num_hidden_layers=43))
+        tb.NeMoAutoConfig, "from_pretrained", staticmethod(lambda *a, **k: SimpleNamespace(num_hidden_layers=43))
     )
+    monkeypatch.setattr(tb.NeMoAutoConfig, "resolve_revision", lambda *args, **kwargs: None)
     monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
     monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
 
     target_config, target_model, distributed_setup = tb.build_deepseek_v4_target(
-        cfg=SimpleNamespace(),
+        cfg=ConfigNode({"checkpoint": {"load_metadata_with_gloo": enabled}}),
         world_size=8,
         device=SimpleNamespace(type="cuda"),
         compute_dtype=torch.bfloat16,
@@ -732,6 +702,7 @@ def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
     assert target_config.num_hidden_layers == 4
     assert captured["config"] is target_config
     assert captured["load_base_model"] is True
+    assert captured["load_metadata_with_gloo"] is enabled
     assert captured["distributed_setup"] == "distributed-setup"
     assert captured["torch_dtype"] == torch.bfloat16
 

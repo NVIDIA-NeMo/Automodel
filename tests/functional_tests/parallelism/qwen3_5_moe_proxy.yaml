@@ -22,8 +22,8 @@
 #
 # The expert counts are not scaled down, since that is what EP shards.
 #
-# Backends: `attn` matches the recipe. `experts` is torch_mm because the
-# recipe's `gmm` only works with a deepep dispatcher. `dispatcher` is torch
+# Backends: `attn` matches the recipe, and both use the native `torch_mm`
+# expert backend. `dispatcher` is torch
 # because deepep falls back to plain experts at world_size 1, which would make
 # the PP test's 1-rank baseline run different code than its 2-rank leg.
 

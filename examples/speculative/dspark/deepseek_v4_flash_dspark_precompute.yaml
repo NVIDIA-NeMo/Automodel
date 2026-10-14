@@ -74,7 +74,7 @@ recipe_args:
   # --- frozen DeepSeek V4 target backend (mirrors the online V4 DSpark backend) ---
   target_attn_backend: eager       # reliable everywhere; switch to `tilelang` for speed if your build supports it
   target_dispatcher: hybridep      # MoE token dispatcher for the sharded experts (needs DeepEP)
-  target_experts: torch_mm         # grouped-expert GEMM backend
+  target_experts: torch_mm         # native grouped-expert GEMM backend
   target_enable_fsdp_optimizations: true
 
   # mask_reasoning_content: true   # exclude <think>...</think> traces from loss (non-thinking data)

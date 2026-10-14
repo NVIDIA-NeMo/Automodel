@@ -225,6 +225,7 @@ async def _run_summary(args: argparse.Namespace) -> dict[str, Any] | None:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
     )
     prompts = _load_prompts(args)
     if not prompts:
@@ -305,6 +306,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-new-tokens", type=int, default=256, help="max_tokens per request.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Default 0.0 = greedy.")
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=0, help="0 disables top-k truncation.")
     parser.add_argument(
         "--num-steps",
         type=int,

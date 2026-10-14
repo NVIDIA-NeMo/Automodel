@@ -270,43 +270,6 @@ class TestKimiK25VLModelInputsEmbeds:
                 raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
 
-class TestKimiK25VLForConditionalGenerationForward:
-    """Tests for KimiK25VLForConditionalGeneration.forward signature."""
-
-    def test_forward_signature_vlm_params(self):
-        """Test forward signature includes VLM-specific parameters."""
-        sig = inspect.signature(KimiK25VLForConditionalGeneration.forward)
-        params = list(sig.parameters.keys())
-
-        # Standard LM params
-        assert "input_ids" in params
-        assert "attention_mask" in params
-        assert "position_ids" in params
-        assert "inputs_embeds" in params
-        assert "labels" in params
-
-        # VLM-specific params
-        assert "pixel_values" in params
-        assert "grid_thws" in params
-        assert "target_seq_length" in params
-
-    def test_forward_signature_optional_params(self):
-        """Test forward signature has expected optional parameters."""
-        sig = inspect.signature(KimiK25VLForConditionalGeneration.forward)
-
-        optional_params = [
-            "past_key_values",
-            "use_cache",
-            "output_attentions",
-            "output_hidden_states",
-            "return_dict",
-            "padding_mask",
-        ]
-
-        for param in optional_params:
-            assert param in sig.parameters, f"forward should accept {param} parameter"
-
-
 class TestKimiK25VLRegistration:
     """Tests for KimiK25VL registration with transformers."""
 

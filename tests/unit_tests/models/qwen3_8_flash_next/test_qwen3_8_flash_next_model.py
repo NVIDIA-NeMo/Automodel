@@ -17,7 +17,9 @@
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.backend import Qwen3_8_FlashNextBackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.config import (
     Qwen3_8_FlashNextConfig,
     Qwen3_8_FlashNextTextConfig,
@@ -112,28 +114,49 @@ def test_multimodal_configuration_fails_closed() -> None:
         )
 
 
-def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout() -> None:
+@pytest.mark.parametrize("backend_source", ["shared", "cute_yaml", "cute_typed"])
+def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout(backend_source: str) -> None:
     config = _tiny_config()
-    backend = BackendConfig(
+    settings = dict(
         linear="torch",
-        attn="sdpa",
+        attn="sdpa" if backend_source == "shared" else "cute",
         rms_norm="torch",
         experts="torch",
         dispatcher="torch",
         enable_hf_state_dict_adapter=False,
     )
+    if backend_source == "shared":
+        backend = BackendConfig(**settings)
+    elif backend_source == "cute_yaml":
+        backend = ConfigNode(
+            {
+                "_target_": "nemo_automodel.components.models.qwen3_8_flash_next.backend.Qwen3_8_FlashNextBackendConfig",
+                **settings,
+            }
+        ).instantiate()
+    else:
+        backend = Qwen3_8_FlashNextBackendConfig(**settings)
+    if backend_source != "shared":
+        assert isinstance(backend, Qwen3_8_FlashNextBackendConfig)
+        assert backend.attn == "cute"
     model = Qwen3_8_FlashNextForConditionalGeneration.from_config(
         config,
         moe_config=_tiny_moe_config(config.text_config),
         backend=backend,
     )
+    assert model.backend is not backend
+    assert model.backend.attn == settings["attn"]
+    assert model.model.language_model.layers["0"].self_attn.backend.attn == settings["attn"]
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.train()
 
     input_ids = torch.randint(2, config.text_config.vocab_size, (2, 6))
-    output = model(input_ids=input_ids, output_hidden_states=True)
-    loss = output.logits.square().mean()
-    loss.backward()
+    # This CPU test checks configuration wiring and model math. Avoid spending
+    # its runtime budget compiling the model's internal pointwise helpers.
+    with torch.compiler.set_stance("force_eager"):
+        output = model(input_ids=input_ids, output_hidden_states=True)
+        loss = output.logits.square().mean()
+        loss.backward()
 
     assert output.logits.shape == (2, 6, config.text_config.vocab_size)
     assert output.hidden_states[0].shape == (2, 6, config.text_config.hidden_size)

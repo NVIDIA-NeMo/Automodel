@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import pathlib
 import time
 from collections import deque
@@ -27,8 +28,10 @@ from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncoderCollator
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import (
@@ -66,9 +69,12 @@ def _unwrap_model_for_attrs(model):
     return getattr(model, "module", model)
 
 
-def _configure_sentence_transformer_export(model, collate_fn) -> None:
-    """Bind the training collator's exact static prompts to bi-encoder export metadata."""
+def _configure_sentence_transformer_export(model, collate_fn, *, tokenizer=None) -> None:
+    """Bind static prompts and validate export against the runtime tokenizer or processor."""
     model = _unwrap_model_for_attrs(model)
+    if isinstance(collate_fn, CrossEncoderCollator):
+        collate_fn.configure_tokenizer_for_export()
+        return
     configure_prompts = getattr(model, "configure_sentence_transformer_prompts", None)
     if configure_prompts is None:
         return
@@ -97,7 +103,7 @@ def _configure_sentence_transformer_export(model, collate_fn) -> None:
         query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
         document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
 
-    configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
+    configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt, tokenizer=tokenizer)
 
 
 def _get_autocast_ctx(distributed_config):
@@ -114,6 +120,9 @@ def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
         "distributed_setup": distributed_setup,
         "peft_config": peft_config,
     }
+    freeze_config = cfg.get("freeze_config", None)
+    if freeze_config is not None:
+        kwargs["freeze_config"] = cfg.freeze_config
     if cfg.get("compile", None) is not None:
         kwargs["compile_config"] = build_compile_config(cfg.compile)
     return kwargs
@@ -228,6 +237,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
         self.temperature = self.cfg.get("temperature", 1.0)
+        if not math.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError(f"temperature must be finite and greater than 0, got {self.temperature!r}")
 
     def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
         """Build optimizer parameter groups for trainable model parameters."""
@@ -298,8 +309,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
-        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
-
         checkpoint_config = self.cfg.checkpoint
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
@@ -321,6 +330,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 **kwargs,
             )
 
+        self._validate_model(_unwrap_model_for_attrs(model))
         self.model_parts = [model]
         self.pp = None
 
@@ -364,7 +374,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 )
 
         self.dataloader = materialize_loader(dataloader_config)
-        _configure_sentence_transformer_export(self.model_parts[0], self.dataloader.collate_fn)
+        _configure_sentence_transformer_export(
+            self.model_parts[0], self.dataloader.collate_fn, tokenizer=self.tokenizer
+        )
         self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None
@@ -412,6 +424,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.load_checkpoint(restore_from)
         self._log_step_scheduler_details(self.step_scheduler)
+
+    def _validate_model(self, model: torch.nn.Module) -> None:
+        """Validate recipe-specific model settings before constructing the optimizer.
+
+        Args:
+            model: Constructed retrieval model, including infrastructure wrappers.
+        """
 
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches."""
@@ -525,6 +544,12 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
                 preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
+                passage_doc_ids = batch.get("passage_doc_ids")
+                if world_size > 1:
+                    ranks_with_ids = torch.tensor(int(passage_doc_ids is not None), device=q_reps.device)
+                    torch.distributed.all_reduce(ranks_with_ids)
+                    if 0 < ranks_with_ids.item() < world_size:
+                        raise ValueError("Every rank must use the same present or absent passage_doc_ids policy")
 
                 if use_multi_vector_scoring:
                     all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
@@ -550,7 +575,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
                 if attr_model.l2_normalize:
                     scores = scores / self.temperature
-                passage_doc_ids = batch.get("passage_doc_ids")
                 if passage_doc_ids is not None:
                     all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
                     mask_gathered_passages_same_doc_as_positive(
@@ -588,6 +612,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         for idx, batch in enumerate(batches):
             self._forward_backward_step(idx, batch, loss_buffer=loss_buffer, num_batches=len(batches), is_train=True)
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
