@@ -334,14 +334,14 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
         tok,
         seq_length=16,
         start_of_turn_token="<|sot|>",
-        chat_template="OVERRIDE",
+        chat_template="{{ override }}",
         mask_reasoning_content=True,
         mask_generation_prompt=True,
     )
 
     # init effects
     assert ds.pad_token_id == 3  # from _add_pad_token
-    assert tok.chat_template == "OVERRIDE"
+    assert tok.chat_template == "{{ override }}"
     assert len(ds) == 3
 
     item0 = ds[0]
@@ -456,12 +456,20 @@ def test_resolve_chat_template_json_file(tmp_path):
     assert _resolve_chat_template(str(f)) == template
 
 
-def test_resolve_chat_template_json_file_without_key(tmp_path):
-    data = {"model_type": "llama", "vocab_size": 32000}
-    f = tmp_path / "config.json"
-    raw = json.dumps(data)
-    f.write_text(raw, encoding="utf-8")
-    assert _resolve_chat_template(str(f)) == raw
+@pytest.mark.parametrize(
+    "content",
+    [
+        json.dumps({"model_type": "llama", "vocab_size": 32000}),
+        json.dumps({"chat_template": [{"name": "default", "template": "{{ messages }}"}]}),
+        "",
+    ],
+    ids=["json-without-key", "json-named-templates", "empty-file"],
+)
+def test_resolve_chat_template_file_without_a_template_raises(tmp_path, content):
+    f = tmp_path / "template.json"
+    f.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match="holds no Jinja template"):
+        _resolve_chat_template(str(f))
 
 
 def test_resolve_chat_template_literal_string():
@@ -469,8 +477,9 @@ def test_resolve_chat_template_literal_string():
     assert _resolve_chat_template(template) == template
 
 
-def test_resolve_chat_template_nonexistent_path():
-    assert _resolve_chat_template("/no/such/file/template.jinja") == "/no/such/file/template.jinja"
+def test_resolve_chat_template_nonexistent_path_raises():
+    with pytest.raises(ValueError, match="neither an existing file nor a Jinja template"):
+        _resolve_chat_template("/no/such/file/template.jinja")
 
 
 def test_tool_calling_chat_dataset_errors(monkeypatch):
@@ -610,6 +619,7 @@ def test_getitem_auto_converts_conversations(monkeypatch):
     ds.mask_history = False
     ds.unshifted = False
     ds.mask_generation_prompt = False
+    ds.chat_template_kwargs = {}
 
     out = ds[0]
     assert out == {"input_ids": [1], "labels": [1]}
@@ -662,4 +672,8 @@ def test_chat_dataset_config_positional_layout_is_unchanged():
     assert cfg.unshifted is True
     assert cfg.skip_invalid_samples is True
     assert cfg.mask_generation_prompt is False
-    assert [f.name for f in dataclasses.fields(tcd.ChatDatasetConfig)][-1] == "mask_generation_prompt"
+    assert cfg.chat_template_kwargs is None
+    assert [f.name for f in dataclasses.fields(tcd.ChatDatasetConfig)][-2:] == [
+        "mask_generation_prompt",
+        "chat_template_kwargs",
+    ]
