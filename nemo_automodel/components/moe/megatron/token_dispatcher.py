@@ -16,8 +16,8 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
+from threading import RLock
 from typing import List, Literal, Tuple
 
 import torch
@@ -355,12 +355,19 @@ class _HybridEPMetadataProcessor(nn.Module):
         return routing_map, multihot_probs
 
 
-_hybridep_token_capacity: ContextVar[int | None] = ContextVar("hybridep_token_capacity", default=None)
+# CUDA checkpoint recomputation runs on an autograd thread, so this scoped
+# capacity must be process-wide. Serialize scope owners; dispatch only reads it.
+_hybridep_token_capacity: int | None = None
+_hybridep_capacity_lock = RLock()
 
 
 @contextmanager
 def hybrid_ep_token_capacity(num_tokens: int | None) -> Iterator[None]:
     """Scope a proven group-uniform dispatch capacity across forward and backward.
+
+    Scopes are process-wide and serialized between owner threads. This keeps the
+    capacity visible to CUDA autograd workers during checkpoint recomputation.
+    The owner must retain the scope until all associated backward work completes.
 
     Args:
         num_tokens: Common upper bound on local dispatch rows on every EP rank,
@@ -374,11 +381,14 @@ def hybrid_ep_token_capacity(num_tokens: int | None) -> Iterator[None]:
     """
     if num_tokens is not None and num_tokens < 0:
         raise ValueError("HybridEP token capacity must be nonnegative")
-    token = _hybridep_token_capacity.set(num_tokens)
-    try:
-        yield
-    finally:
-        _hybridep_token_capacity.reset(token)
+    global _hybridep_token_capacity
+    with _hybridep_capacity_lock:
+        previous_capacity = _hybridep_token_capacity
+        _hybridep_token_capacity = num_tokens
+        try:
+            yield
+        finally:
+            _hybridep_token_capacity = previous_capacity
 
 
 class _HybridEPManager(_DispatchManager):
@@ -498,7 +508,7 @@ class _HybridEPManager(_DispatchManager):
         # Upstream aligns the slots and pads only routing metadata. A proven
         # capacity avoids both the scalar collective and its host readback.
         num_tokens = hidden_states.shape[0]
-        target_tokens = _hybridep_token_capacity.get()
+        target_tokens = _hybridep_token_capacity
         if target_tokens is None:
             target_tokens = num_tokens
             if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:

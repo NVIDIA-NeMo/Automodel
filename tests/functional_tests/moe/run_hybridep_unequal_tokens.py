@@ -27,6 +27,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
@@ -46,6 +47,8 @@ def run_dispatch_combine(
     hidden: torch.Tensor,
     indices: torch.Tensor,
     probs: torch.Tensor,
+    *,
+    checkpointed: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run weighted identity experts and differentiate their squared output.
 
@@ -54,6 +57,7 @@ def run_dispatch_combine(
         hidden: BF16 tensor of shape [local_tokens, hidden].
         indices: Expert indices of shape [local_tokens, topk].
         probs: Float32 routing weights of shape [local_tokens, topk].
+        checkpointed: Recompute the dispatch on the CUDA autograd worker.
 
     Returns:
         Combined output and activation gradient [local_tokens, hidden], and
@@ -61,15 +65,22 @@ def run_dispatch_combine(
     """
     hidden = hidden.detach().requires_grad_(True)
     probs = probs.detach().requires_grad_(True)
-    out, _tokens_per_expert, permuted_probs = dispatcher.token_permutation2(
-        hidden_states=hidden,
-        num_local_tokens=hidden.shape[0],
-        token_probs=probs,
-        token_indices=indices,
-    )
-    # Identity experts: combine returns each token's prob-weighted sum of its
-    # own dispatched copies, independent of every other token.
-    combined = dispatcher.token_unpermutation((out.float() * permuted_probs.unsqueeze(-1)).to(out.dtype))
+
+    def forward(hidden: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+        """Map [local_tokens, hidden] activations and [local_tokens, topk] weights
+        to combined [local_tokens, hidden] activations through identity experts.
+        """
+        out, _tokens_per_expert, permuted_probs = dispatcher.token_permutation2(
+            hidden_states=hidden,
+            num_local_tokens=hidden.shape[0],
+            token_probs=probs,
+            token_indices=indices,
+        )
+        # Identity experts: combine returns each token's prob-weighted sum of its
+        # own dispatched copies, independent of every other token.
+        return dispatcher.token_unpermutation((out.float() * permuted_probs.unsqueeze(-1)).to(out.dtype))
+
+    combined = checkpoint(forward, hidden, probs, use_reentrant=False) if checkpointed else forward(hidden, probs)
     combined.float().square().sum().backward()
     return combined.detach(), hidden.grad, probs.grad
 
@@ -115,13 +126,15 @@ def main():
             try:
                 for count in (SHORT_TOKENS, 0, FULL_TOKENS):
                     keep = FULL_TOKENS if rank == 0 else count
-                    actual = run_dispatch_combine(dispatcher, hidden[:keep], indices[:keep], probs[:keep])
+                    actual = run_dispatch_combine(
+                        dispatcher, hidden[:keep], indices[:keep], probs[:keep], checkpointed=True
+                    )
                     for value, expected in zip(actual, (reference, reference_grad, reference_prob_grad)):
                         torch.testing.assert_close(value, expected[:keep], rtol=0, atol=0)
                     assert actual[0].shape == (keep, HIDDEN)
             finally:
                 dist.all_reduce = original_all_reduce
-    print(f"[rank {rank}] PASS: dynamic/fixed slots, unequal/empty ranks, output + hidden/prob gradients")
+    print(f"[rank {rank}] PASS: dynamic/fixed slots, unequal/empty ranks, checkpoint output + hidden/prob gradients")
     dist.destroy_process_group()
 
 

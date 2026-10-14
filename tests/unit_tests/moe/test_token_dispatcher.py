@@ -192,3 +192,13 @@ class TestHybridEPTokenSlots:
             with hybrid_ep_token_capacity(16):
                 assert self._run(hybrid_ep_manager, monkeypatch, 3, 99)[0] == 16
             assert self._run(hybrid_ep_manager, monkeypatch, 3, 99)[0] == 32
+
+    def test_capacity_is_visible_on_autograd_worker_thread(self, hybrid_ep_manager, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from nemo_automodel.components.moe.megatron.token_dispatcher import hybrid_ep_token_capacity
+
+        with hybrid_ep_token_capacity(32), ThreadPoolExecutor(max_workers=1) as executor:
+            slots, reduce = executor.submit(self._run, hybrid_ep_manager, monkeypatch, 3, 99).result()
+            assert slots == 32
+            reduce.assert_not_called()
