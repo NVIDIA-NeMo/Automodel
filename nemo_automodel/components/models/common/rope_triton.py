@@ -207,20 +207,19 @@ class _FusedRope(torch.autograd.Function):
         return _launch(grad_output, frequencies, negate_sin=not ctx.inverse), None, None
 
 
-def _apply_rope_torch(values: torch.Tensor, angles: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
+def _apply_rope_torch(values: torch.Tensor, frequencies: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
     """Eager rotation, mirroring ``attention._apply_rope`` so the fallback needs no circular import.
 
     Args:
         values: Tensor of shape [batch, sequence, channels] or [batch, sequence, heads, channels].
-        angles: FP32 tensor of shape [batch, sequence, rotary_pairs].
+        frequencies: Complex tensor of shape [batch, sequence, rotary_pairs].
         inverse: Conjugate the rotation.
 
     Returns:
         Tensor with the shape and dtype of ``values``, in independent storage.
     """
-    rotary_dim = angles.shape[-1] * 2
+    rotary_dim = frequencies.shape[-1] * 2
     pairs = torch.view_as_complex(values[..., -rotary_dim:].float().unflatten(-1, (-1, 2)).contiguous())
-    frequencies = torch.polar(torch.ones_like(angles), angles)
     if values.ndim == 4:
         frequencies = frequencies.unsqueeze(2)
     if inverse:
@@ -229,12 +228,22 @@ def _apply_rope_torch(values: torch.Tensor, angles: torch.Tensor, *, inverse: bo
     return torch.cat((values[..., :-rotary_dim], rotated), dim=-1)
 
 
-def _uses_fused_kernel(values: torch.Tensor, angles: torch.Tensor) -> bool:
+def _uses_fused_kernel(values: torch.Tensor, frequencies: torch.Tensor) -> bool:
+    """Check the shared kernel's device, layout, dtype, and autograd contract.
+
+    Args:
+        values: Tensor of shape [batch, sequence, channels] or [batch, sequence, heads, channels].
+        frequencies: Complex tensor of shape [batch, sequence, rotary_pairs].
+
+    Returns:
+        Whether the inputs can use the Triton implementation.
+    """
     return (
-        values.is_cuda
-        and angles.is_cuda
-        and not angles.requires_grad
-        and angles.dtype == torch.float32
+        HAVE_TRITON
+        and values.is_cuda
+        and frequencies.is_cuda
+        and not frequencies.requires_grad
+        and frequencies.dtype == torch.complex64
         and values.dtype in _FUSED_DTYPES
         and values.ndim in (3, 4)
     )
@@ -259,20 +268,34 @@ def apply_rope_triton(values: torch.Tensor, angles: torch.Tensor, *, inverse: bo
         New contiguous tensor with the shape and dtype of ``values``.
 
     Raises:
-        RuntimeError: ``values`` is on CUDA but Triton is not importable.
         ValueError: ``angles`` does not describe an even rotary width within ``values``.
     """
-    if not _uses_fused_kernel(values, angles):
-        return _apply_rope_torch(values, angles, inverse=inverse)
-    if not HAVE_TRITON:
-        raise RuntimeError(
-            "apply_rope_triton needs Triton for CUDA tensors; install triton or disable the Triton RoPE path"
-        )
     rotary_dim = 2 * angles.shape[-1]
     if angles.ndim != 3 or angles.shape[:2] != values.shape[:2] or not 0 < rotary_dim <= values.shape[-1]:
         raise ValueError(
             f"angles of shape {tuple(angles.shape)} do not fit values of shape {tuple(values.shape)}: expected "
             "[batch, sequence, rotary_pairs] with 0 < 2 * rotary_pairs <= channels"
         )
-    frequencies = torch.view_as_real(torch.polar(torch.ones_like(angles), angles)).contiguous()
-    return _FusedRope.apply(values, frequencies, inverse)
+    frequencies = torch.polar(torch.ones_like(angles), angles)
+    return apply_complex_rope(values, frequencies, inverse=inverse)
+
+
+def apply_complex_rope(values: torch.Tensor, frequencies: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
+    """Rotate trailing channel pairs using a model's cached complex frequencies.
+
+    Args:
+        values: Tensor of shape [batch, sequence, channels]
+            or [batch, sequence, heads, channels]. Leading dimensions may be strided.
+        frequencies: Complex tensor of shape [batch, sequence, rotary_pairs].
+            The rotary width must fit within channels. CUDA BF16/FP16/FP32 values
+            and cached complex64 frequencies use Triton; other inputs use eager
+            operations, preserving frequency gradients when required.
+        inverse: Whether to conjugate the rotation.
+
+    Returns:
+        New contiguous tensor with the shape and dtype of ``values``. Its input
+        gradient uses the conjugate rotation with the same FP32 rounding order.
+    """
+    if _uses_fused_kernel(values, frequencies):
+        return _FusedRope.apply(values, torch.view_as_real(frequencies.resolve_conj()).contiguous(), inverse)
+    return _apply_rope_torch(values, frequencies, inverse=inverse)
