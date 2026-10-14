@@ -102,34 +102,6 @@ HunyuanImage-3.0 uses Naruto BLIP captions at 1024 x 1024 resolution and FSDP2.
 
 The HunyuanImage-3.0 result averages steps 10-99 from a 100-step run on eight H100 80GB HBM3 GPUs on EOS. Its input cache contains all 1,221 Naruto BLIP caption images, preprocessed with the release VAE at 1024 x 1024 resolution. The production recipe synchronizes CUDA and reports the maximum step time across ranks; model loading, VAE preprocessing, and checkpoint I/O are excluded. The [W&B run](https://wandb.ai/Nemo-automodel/automodel-pr-validation/runs/eos6251735hunyuan) imports the original training-log metrics and stores the pinned model and dataset revisions, package versions, and all 100 step measurements in its config, history, and evidence artifact.
 
-## Measurement Methods and Recipe Differences
-
-For language and vision-language rows with a W&B source, except Qwen3.8-Flash-Next, step time is reconstructed from each logged pair of `num_tokens_per_step` and `tps`. Mean step time is the arithmetic mean of those reconstructed times. Tokens/sec/GPU is total logged tokens divided by total reconstructed time and physical GPU count. This includes any overhead in the source timer.
-
-These W&B aggregates use training steps 10-99 inclusive, with three exceptions:
-
-- MiMo-V2.5-Pro uses steps 10-19 from a short 20-update run with validation every five steps. Its reconstructed time can include validation overhead.
-- Nemotron-3.5-Lightning uses steps 10-299.
-- Kimi-Linear uses steps 10-49.
-
-Recipe and CI differences that affect reproduction include:
-
-- GLM-5.3 was measured with prepacked Tulu-3 data and MoE `reshard_after_forward: false`; the linked recipe and CI use online packing and `true`.
-- MiMo-V2.5-Pro's related CI run changes validation frequency and logs 21 updates.
-- MiMo-V2.6-Flash-RL was measured with CP1 and LBS1; the linked recipe uses CP2 and LBS2.
-- Nemotron-3.5-Lightning was measured with CP1 and 8,192-token sequences; the linked Tulu-3 recipe uses CP8 and 65,536-token sequences. Its related CI link is a separate HellaSwag LoRA run.
-- Kimi-Linear was measured with 4,096-token packing; the linked recipe and CI use unpacked sequences.
-- Laguna-XS-2.1's source used zero dataloader workers; its related CI run uses four.
-- Several CI jobs override the recipe's step limit. The Qwen3.8-27B and GLM-5.3-Flash links contain only 10 and five initial training steps, respectively.
-
-The related CI links were checked on October 13 and 14, 2026. They cover different source commits and do not certify a single release snapshot. Failed MiMo-V2.6 Tulu-3 attempts require a newer cuDNN version; the Nemotron Super VL attempt could not retrieve the released checkpoint. The linked NeMo-CI image-generation attempts produced no throughput measurement.
-
-Total Tokens/sec is calculated as `Tokens/sec/GPU * #GPUs` using the displayed per-GPU rates and rounded to the nearest whole token/sec. Image-generation rates are calculated as `GBS / step_time / physical_GPU_count`. Language and image-generation rates use different units.
-
-`NR` means not recorded or not verified; `-` means not applicable. The numeric FSDP column reports shard degree. Historical onboarding rows with an unverified shard degree use `NR`, even when FSDP2 is recorded. GA is derived as `GBS / (LBS * DP)`, where `DP = #GPUs / (TP * PP * CP)`; EP overlaps these mesh axes and is not an additional divisor. MBS is the recorded pipeline micro-batch size for PP runs and equals LBS otherwise. Unverified model FLOP estimates are `NR`.
-
-The original mock-data benchmark rows have no recorded measurement-source link. Their related CI links identify later runs of the recipes. Those original measurements disable gradient clipping and calculate MFU using an H100 BF16 peak of 989 TFLOPs/sec; these assumptions do not apply to the W&B rows.
-
 ## Glossary
 
 - **MFU**: Model FLOPs Utilization - ratio of achieved compute to peak hardware capability
