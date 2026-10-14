@@ -17,4 +17,4 @@ set -xeuo pipefail
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 TRANSFORMERS_OFFLINE=1 python3 -m pytest -q \
-    tests/functional_tests/models/test_glm5_indexer_scores.py
+    tests/functional_tests/moe/test_glm5_indexer_scores.py
