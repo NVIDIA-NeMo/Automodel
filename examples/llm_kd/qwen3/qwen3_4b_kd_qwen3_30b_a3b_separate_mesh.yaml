@@ -6,12 +6,20 @@
 
 recipe: KnowledgeDistillationRecipeForNextTokenPrediction
 
+# Enable with --wandb.enable true; set WANDB_API_KEY and WANDB_ENTITY.
+wandb:
+  enable: false
+  project: automodel-moe-kd
+  name: qwen3_4b_from_qwen3_30b_a3b
+  tags: [knowledge-distillation, moe, separate-meshes]
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 1
   ckpt_every_steps: 200
   val_every_steps: 100
   num_epochs: 2
+  log_remote_every_steps: 1
 
 dist_env:
   backend: nccl
