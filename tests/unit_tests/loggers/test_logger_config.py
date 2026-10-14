@@ -108,6 +108,10 @@ class TestTrackioConfig:
         assert (cfg.project, cfg.space_id) == ("p", "me/runs")
         assert cfg.extra == {"resume": "allow", "private": True}
 
+    def test_from_kwargs_merges_an_explicit_extra_mapping(self):
+        cfg = TrackioConfig.from_kwargs(project="p", private=True, extra={"resume": "allow"})
+        assert cfg.extra == {"private": True, "resume": "allow"}
+
     def test_build_forwards_fields_extra_and_run_config(self, monkeypatch):
         captured = {}
         _fake_trackio(monkeypatch, captured)
