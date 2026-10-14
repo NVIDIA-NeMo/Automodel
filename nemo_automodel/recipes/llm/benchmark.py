@@ -202,7 +202,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         mtp_tflops = self._mtp_tflops(global_batch_size, seq_len)
         self.tflops += mtp_tflops
         if self.dist_env.is_main:
-            logger.info(f"MTP TFLOPs/GPU: {mtp_tflops:.6f} (backbone {backbone_tflops:.6f}, total {self.tflops:.6f})")
+            logger.info(
+                f"MTP TFLOPs/global step: {mtp_tflops:.6f} (backbone {backbone_tflops:.6f}, total {self.tflops:.6f})"
+            )
 
         if hasattr(self.cfg, "peft"):
             # Calculate trainable vs non-trainable parameters
@@ -236,7 +238,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 logger.info(f"TFLOPS multiplier for PEFT: (2 + {param_ratio:.4f}) / 3 = {tflops_multiplier:.4f}")
 
         if self.dist_env.is_main:
-            logger.info(f"TFLOPs/GPU: {self.tflops:.6f} | FLOPs scope: {self._bench_flops_scope}")
+            logger.info(
+                f"TFLOPs/global step: {self.tflops:.6f} | "
+                f"TFLOPs/GPU/step: {self.tflops / self.dist_env.world_size:.6f} | "
+                f"FLOPs scope: {self._bench_flops_scope}"
+            )
 
         # Log setup time to wandb
         if self._wandb_enabled:
@@ -572,7 +578,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "avg_iter_time_seconds": avg_iter_time,
                 "avg_mfu_percent": mfu,
                 "flops_scope": self._bench_flops_scope,
-                "tflops_per_gpu": self.tflops,
+                "tflops_total": self.tflops,
+                "tflops_per_gpu": self.tflops / self.dist_env.world_size,
                 "peak_tflops": peak_tflops,
                 "world_size": self.dist_env.world_size,
                 "global_batch_size": self.cfg.step_scheduler.global_batch_size,
@@ -613,7 +620,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         "summary/avg_mfu_percent": mfu,
                         "summary/flops_scope": self._bench_flops_scope,
                         "summary/training_time_seconds": iter_time,
-                        "summary/tflops_per_gpu": self.tflops,
+                        "summary/tflops_total": self.tflops,
+                        "summary/tflops_per_gpu": self.tflops / self.dist_env.world_size,
                     }
                 )
 

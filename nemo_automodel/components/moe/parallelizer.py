@@ -586,6 +586,19 @@ def _uses_hybridep_dispatch(model: nn.Module) -> bool:
     )
 
 
+def _uses_hybridep_capacity_mode(model: nn.Module) -> bool:
+    """Return whether any HybridEP expert module runs capacity mode (``dispatcher_capacity_factor``)."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return False
+    return any(
+        isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsTE))
+        and getattr(module, "dispatcher_backend", None) == "hybridep"
+        and getattr(module, "dispatcher_capacity_factor", None) is not None
+        for module in modules()
+    )
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
@@ -629,6 +642,16 @@ def apply_ac(
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
     uses_hybridep_dispatch = checkpoint_decoder and _uses_hybridep_dispatch(model)
+    if checkpoint_decoder and not ignore_router and not selective and _uses_hybridep_capacity_mode(model):
+        # Without a replay recorder the recompute dispatch runs in capacity mode (``capacity`` rows)
+        # while the first forward dispatch was the blocking calibration (``actual`` rows), and
+        # non-reentrant checkpointing fails on the shape mismatch on every run.
+        raise ValueError(
+            "dispatcher_capacity_factor needs the routing pinned across the activation-checkpoint recompute: "
+            "set distributed.moe.ignore_router_for_ac=true (the default) or use selective activation "
+            "checkpointing; with ignore_router_for_ac=false and full checkpointing the recompute dispatch "
+            "is sized to the capacity while the forward calibration dispatch was not"
+        )
     repeated_mtp_moe_block_ids = _repeated_mtp_moe_block_ids(model) if checkpoint_decoder else set()
     if repeated_mtp_moe_block_ids:
         logger.info(

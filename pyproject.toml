@@ -213,6 +213,10 @@ mlflow-full = [
 ]
 wandb = ["wandb>=0.30.0"]
 trackio = ["trackio[gpu]>=0.40.0"]  # [gpu] adds nvidia-ml-py for automatic GPU metrics
+# SwanLab mirrors the W&B run, so it needs the wandb extra as well.
+# Lower bound: swanlab<0.10.2 imports wandb.sdk.internal.datastore, which wandb>=0.30 removed.
+# Upper bound: the mirror relies on how swanlab 0.10's ``sync_wandb`` forwards values.
+swanlab = ["nemo-automodel[wandb]", "swanlab>=0.10.2,<0.11"]
 tracking = [
     # Convenience meta-extra: installs the experiment-tracking backends.
     "nemo-automodel[mlflow]",
@@ -274,6 +278,9 @@ test = [
     "ruamel.yaml",
     "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "sentence-transformers>=5.6.0",
+    # Real-SDK check of the SwanLab mirror (tests/unit_tests/loggers/test_swanlab_logger.py).
+    "swanlab>=0.10.2,<0.11",
+    "wandb>=0.30.0",
 ]
 dev = [
     "cut-cross-entropy",
