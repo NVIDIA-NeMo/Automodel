@@ -1,0 +1,34 @@
+---
+title: "Qwen3-4B"
+description: "Configure Qwen3-4B as a knowledge-distillation student with a Qwen3-30B-A3B teacher, separate GPU meshes, and W&B logging in NeMo AutoModel."
+slug: model-coverage/large-language-models/qwen/Qwen3-4B
+---
+
+The [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) checkpoint is the dense
+student in the draft [MoE knowledge-distillation example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_kd/qwen3/qwen3_4b_kd_qwen3_30b_a3b_separate_mesh.yaml).
+The teacher is Qwen3-30B-A3B. See the
+[knowledge-distillation guide](/recipes-e2e-examples/knowledge-distillation#moe-knowledge-distillation)
+for validation status, EP sizing, and offload constraints.
+
+## Run Knowledge Distillation
+
+Follow the [installation instructions](/get-started/installation), then run
+from the repository root on an 8-GPU node:
+
+```bash
+automodel examples/llm_kd/qwen3/qwen3_4b_kd_qwen3_30b_a3b_separate_mesh.yaml \
+  --nproc-per-node 8
+```
+
+| Setting | Configuration |
+| --- | --- |
+| Student | Qwen/Qwen3-4B; ranks 0-3; FSDP2 with DP4 |
+| Teacher | Qwen/Qwen3-30B-A3B; ranks 4-7; FSDP2 with DP4/EP4 |
+| Precision | FP32 student master weights, BF16 compute and teacher weights |
+| Attention | Transformer Engine |
+| Objective | Equal CE and forward-KL weights, temperature 1.0 |
+| Logging | Add `--wandb.enable true` after setting `WANDB_API_KEY` and `WANDB_ENTITY` |
+
+This recipe uses `Qwen/Qwen3-4B`. The
+[Qwen3-4B-Base recipes](/model-coverage/large-language-models/qwen/Qwen3-4B-Base)
+use a different checkpoint.
