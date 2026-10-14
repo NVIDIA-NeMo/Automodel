@@ -25,6 +25,50 @@ import torch.distributed
 from torch.distributed.elastic.rendezvous import RendezvousParameters, c10d_rendezvous_backend
 
 
+@pytest.mark.parametrize("resolver_exit_code", [0, 1])
+def test_benchmark_launch_requires_resolved_config(tmp_path: Path, resolver_exit_code: int) -> None:
+    """Pass the config as one argument, and never launch after resolution fails."""
+    launcher = Path(__file__).resolve().parents[3] / "tests/ci_tests/scripts/finetune_launcher.sh"
+    argv_log = tmp_path / "torchrun.argv"
+    stubs = tmp_path / "stubs.sh"
+    stubs.write_text(
+        "cd() { return 0; }\n"
+        'python3() { return "$RESOLVER_EXIT_CODE"; }\n'
+        'torchrun() { printf "%s\\0" "$@" > "$TEST_ARGV"; }\n'
+    )
+    env = {
+        **os.environ,
+        "BASH_ENV": str(stubs),
+        "TEST_ARGV": str(argv_log),
+        "RESOLVER_EXIT_CODE": str(resolver_exit_code),
+        "CONFIG_PATH": "examples/vlm_benchmark/mimo_v2_flash/mimo_v2_6_pro_rl_lora_gb200.yaml",
+        "PIPELINE_DIR": str(tmp_path / "pipeline with spaces"),
+        "TEST_NAME": "mimo_v2_6_pro_rl_lora_gb200",
+        "TEST_LEVEL": "performance",
+        "TEST_SCRIPT_PATH": "nemo_automodel/recipes/llm/benchmark.py",
+        "TEST_NODE_COUNT": "8",
+        "CONFIG_NPROC_PER_NODE": "4",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "29500",
+        "SLURM_JOB_ID": "1234",
+        "EXEC_CMD": "",
+        "FINETUNE_ARGS": "",
+        "HAS_ROBUSTNESS": "false",
+        "REQUIRE_FINITE_METRICS": "false",
+    }
+    result = subprocess.run(["bash", str(launcher)], env=env, capture_output=True, text=True, timeout=10)
+    if resolver_exit_code:
+        assert result.returncode != 0
+        assert "Failed to resolve config" in result.stderr
+        assert not argv_log.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        argv = argv_log.read_bytes().decode().split("\0")[:-1]
+        assert argv[argv.index("--config") + 1 :] == [
+            str(Path(env["PIPELINE_DIR"]) / env["TEST_NAME"] / "finetune_config.yaml")
+        ]
+
+
 @pytest.mark.parametrize("timeout", ["", "37"])
 def test_finetune_and_checkpoint_launches_apply_connection_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: str

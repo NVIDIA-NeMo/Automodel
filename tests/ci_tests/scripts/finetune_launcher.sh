@@ -44,10 +44,14 @@ TEST_DIR="$PIPELINE_DIR/$TEST_NAME"
 mkdir -p "$TEST_DIR"
 
 # --- Resolve finetune config ---
-RESOLVED_FINETUNE_CONFIG=$($CONFIG_RESOLVER \
+RESOLVED_FINETUNE_CONFIG="$TEST_DIR/finetune_config.yaml"
+if ! $CONFIG_RESOLVER \
   --base "/opt/Automodel/${CONFIG_PATH}" \
   --phase "${TEST_LEVEL}" \
-  --output "$TEST_DIR/finetune_config.yaml")
+  --output "$RESOLVED_FINETUNE_CONFIG"; then
+  echo "[finetune] Failed to resolve config: ${CONFIG_PATH}" >&2
+  exit 1
+fi
 
 # WANDB_API_KEY is a runtime secret, not a config key.
 if [ "$TEST_LEVEL" = "convergence" ]; then
@@ -78,13 +82,13 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   esac
   FINETUNE_ENTRYPOINT="-m tests.ci_tests.scripts.recorded_finetune"
 fi
-RUN_CMD="${CMD} ${FINETUNE_ENTRYPOINT} --config ${RESOLVED_FINETUNE_CONFIG} ${FINETUNE_ARGS:-}"
+RUN_CMD="${CMD} ${FINETUNE_ENTRYPOINT} --config \"${RESOLVED_FINETUNE_CONFIG}\" ${FINETUNE_ARGS:-}"
 echo "============================================"
 echo "[finetune] Running finetune..."
 echo "============================================"
 FINETUNE_START=$SECONDS
 
-eval $RUN_CMD
+eval "$RUN_CMD"
 FINETUNE_EXIT_CODE=$?
 
 if [[ "$FINETUNE_EXIT_CODE" -eq 0 && "${REQUIRE_FINITE_METRICS:-false}" == "true" ]]; then
