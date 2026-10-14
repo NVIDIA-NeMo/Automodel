@@ -837,6 +837,35 @@ class TestGroupedExpertsForwardLoopDTensorBias:
         assert len(to_local_calls) >= 2, f"Expected .to_local() called for both biases, got {len(to_local_calls)} calls"
 
 
+class TestGroupedExpertsDeepEPCapacityMode:
+    """BackendConfig.dispatcher_capacity_factor / dispatcher_equal_token_counts reach GroupedExpertsDeepEP."""
+
+    def test_capacity_knobs_are_read_from_backend(self, moe_config):
+        backend = BackendConfig(
+            dispatcher="hybridep",
+            experts="torch_mm",
+            dispatcher_capacity_factor=1.5,
+            dispatcher_equal_token_counts=True,
+        )
+        experts = GroupedExpertsDeepEP(moe_config, backend=backend)
+        assert experts.dispatcher_capacity_factor == 1.5
+        assert experts.dispatcher_equal_token_counts is True
+
+    def test_capacity_knobs_default_off_without_backend(self, moe_config):
+        experts = GroupedExpertsDeepEP(moe_config)
+        assert experts.dispatcher_capacity_factor is None
+        assert experts.dispatcher_equal_token_counts is False
+
+    def test_capacity_factor_rejects_expert_bias(self, moe_config):
+        """Capacity mode pads the dispatched buffer past the routed rows; the bias add cannot size itself to that."""
+        moe_config.expert_bias = True
+        backend = BackendConfig(dispatcher="hybridep", experts="torch_mm", dispatcher_capacity_factor=1.5)
+        with pytest.raises(
+            ValueError, match="dispatcher_capacity_factor is not supported for experts with expert_bias"
+        ):
+            GroupedExpertsDeepEP(moe_config, backend=backend)
+
+
 class TestGroupedExpertsDeepEP:
     """Test GroupedExpertsDeepEP module."""
 
@@ -1004,6 +1033,46 @@ class TestGroupedExpertsDeepEP:
         torch.testing.assert_close(output, expected)
         for actual, reference in zip(actual_grads, expected_grads):
             torch.testing.assert_close(actual, reference)
+
+    @pytest.mark.parametrize(
+        ("backend_kwargs", "skips_host_read"),
+        [
+            ({"dispatcher": "deepep"}, False),
+            ({"dispatcher": "hybridep", "dispatcher_capacity_factor": 1.5}, True),
+            ({"dispatcher": "hybridep", "fake_balanced_gate": True, "benchmark_static_routing": True}, True),
+        ],
+        ids=["blocking", "capacity", "static-routing"],
+    )
+    def test_grouped_experts_deepep_forward_skips_count_nonzero_when_rows_are_never_empty(
+        self, moe_config, monkeypatch, backend_kwargs, skips_host_read
+    ):
+        """Capacity mode and static routing never dispatch an empty buffer: the per-microbatch
+        ``count_nonzero`` device-to-host read is skipped; the blocking path still performs it."""
+        config = replace(
+            moe_config, n_routed_experts=1, n_activated_experts=1, dim=4, moe_inter_dim=3, dtype=torch.float32
+        )
+        torch.manual_seed(42)
+        backend = BackendConfig(experts="torch_mm", **backend_kwargs)
+        experts = GroupedExpertsDeepEP(config, backend=backend)
+        assert experts.dispatch_rows_never_empty is skips_host_read
+        for parameter in experts.parameters():
+            torch.nn.init.normal_(parameter, std=0.1)
+        args = self._prepare_forward_path(experts, num_tokens=5)
+        experts.expert_activation = lambda value, probabilities: value.chunk(2, dim=-1)[0] * probabilities
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: lambda v, w, offs: v @ w[0]
+        )
+        host_reads = []
+        real_count_nonzero = torch.count_nonzero
+
+        def counting_count_nonzero(*a, **kw):
+            host_reads.append(1)
+            return real_count_nonzero(*a, **kw)
+
+        monkeypatch.setattr(torch, "count_nonzero", counting_count_nonzero)
+        output = experts(*args[:4])
+        assert output.shape == (5, config.dim)
+        assert (len(host_reads) == 0) is skips_host_read
 
     def test_grouped_experts_deepep_forward_preserves_bias_free_mxfp8_backend(self, moe_config, monkeypatch):
         """Bias-free whole-dispatch execution forwards the requested MXFP8 backend."""
