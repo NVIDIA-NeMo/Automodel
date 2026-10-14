@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 
 import datasets
@@ -48,7 +49,7 @@ def test_uno_smoke():
     - build the dLLM recipe from a config that selects the Uno strategy on a LoRA model
     - assert: the Uno strategy and loss are the ones wired up, the model carries the LoRA adapter the
       gate needs, and the block-size curriculum is parsed from the config
-    - run the training loop and assert the curriculum reached its last stage
+    - run the training loop and assert every step's loss is finite and the curriculum reached its last stage
     """
     cfg = parse_args_and_load_config(_get_cfg_path())
     recipe = DiffusionLMSFTRecipe(cfg)
@@ -60,6 +61,17 @@ def test_uno_smoke():
     assert recipe.dllm_strategy.block_size == 2, "the curriculum starts at its first stage"
 
     # Per-step loss/gradient correctness is asserted by the CPU unit tests in
-    # tests/unit_tests/recipes/dllm/test_uno_recipe_smoke.py; here the loop itself is the check.
+    # tests/unit_tests/recipes/dllm/test_uno_recipe_smoke.py; here the loop must run and stay finite.
+    losses = []
+    original_train_step = recipe._run_train_optim_step
+
+    def train_step(batches, *args, **kwargs):
+        log_data = original_train_step(batches, *args, **kwargs)
+        losses.append(float(log_data.metrics["loss"]))
+        return log_data
+
+    recipe._run_train_optim_step = train_step
     recipe.run_train_validation_loop()
+    assert len(losses) == 6, losses
+    assert all(math.isfinite(loss) for loss in losses), losses
     assert recipe.dllm_strategy.block_size == 8, "the curriculum did not reach its last stage"
