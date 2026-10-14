@@ -51,12 +51,8 @@ These runs use FSDP2. Qwen3.8-27B freezes the vision tower; GLM-5.3-Flash and Ne
 | [Nemotron-3.5-Super-VL-120B-A12B-BF16](https://github.com/NVIDIA-NeMo/Automodel/blob/1e13f16700ea7f44766f271a9c6fe77a7dce19e9/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_cp8_100steps.yaml) (pre-release) | Tulu-3 packed (text only) | 64 | 32 | 1 | 1 | 4 | 8192 | 1 | 1 | 8 | 64 | - | NR | TE attention/linear | 12.355 | NR | 230.26 | [W&B](https://wandb.ai/Nemo-automodel/huiyingl_workspace/runs/a1fq93po) | [Failed; released checkpoint](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479695013) |
 | [Kimi-Linear-48B-A3B-Instruct](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml) | HellaSwag packed | 8 | 8 | 1 | 1 | 1 | 4096 | 1 | 1 | 1 | 8 | - | NR | eager attention + torch | 2.862 | NR | 1,414.63 | [W&B](https://wandb.ai/Nemo-automodel/automodel-kimi-linear/runs/4jn9qu6v) | [50 steps; unpacked](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694601) |
 | [Laguna-XS-2.1](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml) | HellaSwag packed | 8 | 8 | 1 | 1 | 1 | 1024 | 1 | 1 | 1 | 8 | - | NR | SDPA + torch + torch_mm | 1.323 | NR | 771.73 | [W&B](https://wandb.ai/Nemo-automodel/laguna-xs-2p1-sft/runs/5m7j0boj) | [50 steps; config differs](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694525) |
-| [Inkling-Small](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml) | MedPix VLM | 64 | 64 | 1 | 1 | 1 | Variable | 1 | 1 | 1 | 64 | - | NR | SDPA + torch + torch_mm + HybridEP | NR | NR | 67.16 | [CI log](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694994) | [50 steps](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694994) |
-| [T5-small](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/t5/t5_small_squad.yaml) | SQuAD (seq2seq) | 8 | 32 | 4 | 4 | 1 | Variable | 1 | 1 | 1 | - | - | NR | NR | NR | NR | 259.11 | [CI log](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694592) | [50 steps](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694592) |
 
 The Nemotron-3.5-Super-VL row measures the pre-release checkpoint `nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained` on text-only Tulu-3. Equivalence to the released checkpoint in the linked recipe has not been verified. Nemotron-3.5-Lightning uses all 52 layers with multi-token prediction disabled.
-
-Inkling-Small and T5-small use the linked CI logs as their measurement source. Their throughput is the arithmetic mean of logged total TPS divided by physical GPU count over steps 10-49. A precise step-time aggregate was not recorded, so that field is `NR`. T5-small measures a seq2seq workload.
 
 ### Full Fine-Tuning: NVIDIA GB200, Precision: BF16
 
@@ -126,9 +122,9 @@ The related CI links were checked on October 13, 2026. They cover different sour
 
 Image-generation rates are calculated as `GBS / step_time / physical_GPU_count`. Language and image-generation rates use different units.
 
-`NR` means not recorded or not verified; `-` means not applicable. For the historical onboarding and CI-sourced rows, FSDP2 is the recorded strategy but its shard degree was not verified, so the numeric FSDP column is `NR`. GA is derived as `GBS / (LBS * DP)`, where `DP = #GPUs / (TP * PP * CP)`; EP overlaps these mesh axes and is not an additional divisor. MBS is the recorded pipeline micro-batch size for PP runs and equals LBS otherwise. Unverified model FLOP estimates are `NR`.
+`NR` means not recorded or not verified; `-` means not applicable. For the historical onboarding rows, FSDP2 is the recorded strategy but its shard degree was not verified, so the numeric FSDP column is `NR`. GA is derived as `GBS / (LBS * DP)`, where `DP = #GPUs / (TP * PP * CP)`; EP overlaps these mesh axes and is not an additional divisor. MBS is the recorded pipeline micro-batch size for PP runs and equals LBS otherwise. Unverified model FLOP estimates are `NR`.
 
-The original mock-data benchmark rows have no recorded measurement-source link. Their related CI links identify later runs of the recipes. Those original measurements disable gradient clipping and calculate MFU using an H100 BF16 peak of 989 TFLOPs/sec; these assumptions do not apply to the W&B or CI-sourced rows.
+The original mock-data benchmark rows have no recorded measurement-source link. Their related CI links identify later runs of the recipes. Those original measurements disable gradient clipping and calculate MFU using an H100 BF16 peak of 989 TFLOPs/sec; these assumptions do not apply to the W&B rows.
 
 ## Models Without Verified Throughput
 
