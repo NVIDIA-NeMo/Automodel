@@ -444,6 +444,9 @@ class BackendConfig:
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
             else falls back to torch._grouped_mm at runtime).
+        te_grouped_tensor: Prefer TE 2.19 native grouped-tensor GEMMs for ``experts="te"``.
+            Device and precision support follows TE's ``GroupedLinear`` contract.
+            Parameters and checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
@@ -529,6 +532,7 @@ class BackendConfig:
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
+    te_grouped_tensor: bool = False
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
@@ -664,6 +668,9 @@ class BackendConfig:
                 )
             self.dispatcher = "torch"
             self.experts = "torch_mm"
+
+        if self.te_grouped_tensor and self.experts != "te":
+            raise ValueError("te_grouped_tensor=True requires experts='te'.")
 
         graph_modules = self.cuda_graph.modules
         attention_graph_modules = {"attn", "te_dpa"}.intersection(graph_modules)

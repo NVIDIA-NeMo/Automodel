@@ -506,3 +506,14 @@ class TestBackendConfigPartialCudaGraphs:
                 dispatcher="deepep",
                 cuda_graph=CudaGraphConfig(modules=["moe_router", "moe_preprocess"]),
             )
+
+
+@pytest.mark.parametrize("experts,dispatcher", [("torch", "torch"), ("torch_mm", "deepep"), ("te", "torch")])
+def test_native_te_grouped_tensor_rejects_other_expert_backends(experts, dispatcher):
+    with pytest.raises(ValueError, match="te_grouped_tensor=True requires experts='te'"):
+        BackendConfig(experts=experts, dispatcher=dispatcher, te_grouped_tensor=True)
+
+
+def test_native_te_grouped_tensor_is_opt_in():
+    assert not BackendConfig(experts="te", dispatcher="deepep").te_grouped_tensor
+    assert BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=True).te_grouped_tensor
