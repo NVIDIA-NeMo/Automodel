@@ -35,7 +35,7 @@ Qwen3.8-Flash-Next uses a synchronized benchmark summary with 30 measured steps 
 
 Fine-tuning measurements are grouped by training mode and hardware. Dataset-based language and vision-language runs retain the source run's token-count and timing semantics; MedPix rates do not represent full-length synthetic sequences. Image-generation rates use images/sec/GPU.
 
-### Without LoRA: NVIDIA H100 80GB
+### Full Fine-Tuning: NVIDIA H100 80GB
 
 These runs use FSDP2. Qwen3.8-27B freezes the vision tower; GLM-5.3-Flash and Nemotron-3.5-Super-VL freeze the vision tower and embeddings. Backend entries describe the recorded configuration.
 
@@ -58,7 +58,7 @@ The Nemotron-3.5-Super-VL row measures the pre-release checkpoint `nvidia/NVIDIA
 
 Inkling-Small and T5-small use the linked CI logs as their measurement source. Their throughput is the arithmetic mean of logged total TPS divided by physical GPU count over steps 10-49. A precise step-time aggregate was not recorded, so that field is `NR`. T5-small measures a seq2seq workload.
 
-### Without LoRA: NVIDIA GB200, Precision: BF16
+### Full Fine-Tuning: NVIDIA GB200, Precision: BF16
 
 These runs use FSDP2. The MiMo-V2.6-Pro-RL timing includes profiler overhead.
 
@@ -69,7 +69,7 @@ These runs use FSDP2. The MiMo-V2.6-Pro-RL timing includes profiler overhead.
 
 <a id="fine-tuning-lora-performance" />
 
-### LoRA: DGX-H100, Precision: BF16
+### LoRA: NVIDIA H100 80GB, Precision: BF16
 
 These LoRA benchmarks use full-length mock sequences with no padding.
 
