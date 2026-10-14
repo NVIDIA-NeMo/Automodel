@@ -51,7 +51,7 @@ model:
     _target_: nemo_automodel.components.models.mimo_v2_flash.config.MiMoV2Config.from_pretrained
     pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.6-Pro-RL
     name_or_path: XiaomiMiMo/MiMo-V2.6-Pro-RL
-    revision: 73875d00b30a89ef8cc353a0b60b0e9f9561952d
+    revision: 73875d00b30a89ef8cc353a0b60b0e9f9561952d  # pragma: allowlist secret - HF checkpoint commit
     use_cache: false
     output_hidden_states: true
     num_nextn_predict_layers: 0

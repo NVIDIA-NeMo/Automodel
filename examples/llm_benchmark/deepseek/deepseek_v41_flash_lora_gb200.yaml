@@ -54,7 +54,7 @@ model:
     _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41Config.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
     name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
-    revision: df42c109f1defefcbfcedbe7d905718a12266e40
+    revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret - HF checkpoint commit
     vision_config:
       _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41VisionConfig
       num_hidden_layers: 0
