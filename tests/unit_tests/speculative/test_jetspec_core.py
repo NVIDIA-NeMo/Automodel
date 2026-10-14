@@ -77,6 +77,26 @@ def _inputs(bsz=2, seq_len=24):
     return input_ids, hidden, loss_mask, target_logits
 
 
+def test_forward_routes_student_logits_through_compute_logits(monkeypatch):
+    """A target with ``output_multiplier`` / ``final_logit_softcapping`` (Muse Glimmer)
+    must have its transform applied here too: ``spec_generate`` reads both fields off
+    the saved draft config regardless of trainer type, so decoding always transforms
+    the logits. Calling ``self.lm_head`` directly (bypassing ``compute_logits``) would
+    silently train on the untransformed distribution while serving the transformed one."""
+    trainer = _build_trainer()
+    calls = []
+    original = type(trainer.draft_model).compute_logits
+
+    def spy(self, hidden, output_head):
+        calls.append(output_head)
+        return original(self, hidden, output_head)
+
+    monkeypatch.setattr(type(trainer.draft_model), "compute_logits", spy)
+    input_ids, hidden, loss_mask, target_logits = _inputs()
+    trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask, target_logits=target_logits)
+    assert calls == [trainer.lm_head]
+
+
 def test_init_builds_kd_loss():
     trainer = _build_trainer(kd_temperature=2.0, kd_chunk_size=128)
     assert isinstance(trainer.kd_loss_fn, KDLoss)

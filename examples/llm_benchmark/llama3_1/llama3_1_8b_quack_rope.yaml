@@ -37,7 +37,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
   trust_remote_code: true
   output_hidden_states: true

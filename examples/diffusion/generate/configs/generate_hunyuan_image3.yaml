@@ -1,0 +1,47 @@
+# HunyuanImage-3.0 text-to-image generation with the native Automodel transformer.
+#
+# The 80B MoE transformer is sharded across the launched ranks like in training (experts over ep_size ranks,
+# the rest with FSDP2), so launch one rank per GPU; every rank samples the same prompts:
+#   uv run torchrun --nproc-per-node 8 examples/diffusion/generate/generate.py \
+#     -c examples/diffusion/generate/configs/generate_hunyuan_image3.yaml
+#
+# The release's own VAE, prompt format and flow_shift come from the checkpoint, and sampling follows the release
+# pipeline (Euler, classifier-free guidance on a [prompt, <cfg>] batch).
+
+model:
+  pretrained_model_name_or_path: "tencent/HunyuanImage-3.0"
+  checkpoint: null      # full fine-tune: a checkpoint step directory (holding model/)
+  lora_weights: null    # LoRA: the model/ directory of a checkpoint step (adapter_model.safetensors)
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: torch
+    gate_precision: float32
+    enable_hf_state_dict_adapter: true
+
+inference:
+  num_inference_steps: 50
+  guidance_scale: 5.0
+  # Snapped to the release's 33 resolutions around 1024x1024.
+  height: 1024
+  width: 1024
+  dtype: "bfloat16"
+  max_samples: 10
+  prompts:
+    - "A cat sitting on a windowsill watching the rain"
+  pipeline_kwargs: {}
+
+output:
+  output_dir: "./inference_outputs"
+
+distributed:
+  backend: "nccl"
+  timeout_minutes: 30
+  parallelism:
+    ep_size: 8
+
+seed: 42

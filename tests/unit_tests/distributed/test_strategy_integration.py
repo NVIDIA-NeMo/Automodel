@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Integration tests to verify the strategy pattern maintains backward compatibility."""
+"""Integration tests for model-owned parallelization."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -20,11 +20,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch.nn as nn
 
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-    NemotronHParallelizationStrategy,
-    fsdp2_strategy_parallelize,
-    get_parallelization_strategy,
+from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
+from nemo_automodel.components.distributed.parallelizer import fsdp2_strategy_parallelize
+from nemo_automodel.components.models.nemotron_v3.parallelization import (
+    PARALLELIZER as NEMOTRON_PARALLELIZER,
+)
+from nemo_automodel.components.models.nemotron_v3.parallelization import (
+    NemotronHModelParallelizer,
 )
 
 
@@ -43,6 +46,8 @@ class MockStandardModel(nn.Module):
 
 class MockNemotronModel(nn.Module):
     """Mock NemotronH model."""
+
+    parallelizer = NEMOTRON_PARALLELIZER
 
     def __init__(self):
         super().__init__()
@@ -95,22 +100,21 @@ def mock_device_mesh():
     return mesh
 
 
-def test_strategy_selection_standard_model():
-    """Test that standard models use DefaultParallelizationStrategy."""
+def test_parallelizer_selection_standard_model():
+    """Test that standard models use the default model parallelizer."""
     model = MockStandardModel()
-    strategy = get_parallelization_strategy(model)
+    parallelizer = get_model_parallelizer(model)
 
-    assert isinstance(strategy, DefaultParallelizationStrategy)
-    assert not isinstance(strategy, NemotronHParallelizationStrategy)
+    assert isinstance(parallelizer, ModelParallelizer)
 
 
-def test_strategy_selection_nemotron_model():
-    """Test that NemotronH models use NemotronHParallelizationStrategy."""
+def test_parallelizer_selection_nemotron_model():
+    """Test that NemotronH models own their specialized parallelizer."""
     model = MockNemotronModel()
-    strategy = get_parallelization_strategy(model)
+    parallelizer = get_model_parallelizer(model)
 
-    assert isinstance(strategy, NemotronHParallelizationStrategy)
-    assert not isinstance(strategy, DefaultParallelizationStrategy)
+    assert parallelizer is NEMOTRON_PARALLELIZER
+    assert isinstance(parallelizer, NemotronHModelParallelizer)
 
 
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
@@ -128,12 +132,16 @@ def test_backward_compatibility_standard_model(
 
     model = MockStandardModel()
 
-    result = fsdp2_strategy_parallelize(
-        model=model,
-        device_mesh=mock_device_mesh,
-        sequence_parallel=False,
-        activation_checkpointing=False,
-    )
+    with patch(
+        "nemo_automodel.components.distributed.fsdp2.fsdp2_sharding_enabled",
+        return_value=True,
+    ):
+        result = fsdp2_strategy_parallelize(
+            model=model,
+            device_mesh=mock_device_mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+        )
 
     # Should return the model unchanged
     assert result is model
@@ -145,20 +153,28 @@ def test_backward_compatibility_standard_model(
 
 
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
-@patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-@patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
-def test_backward_compatibility_nemotron_model(mock_parallelize_module, mock_fully_shard, mock_gpgr, mock_device_mesh):
+@patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype")
+@patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+@patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
+def test_backward_compatibility_nemotron_model(
+    mock_parallelize_module, mock_fully_shard, mock_fully_shard_by_dtype, mock_gpgr, mock_device_mesh
+):
     """Test that the refactored code maintains backward compatibility for NemotronH models."""
     mock_fully_shard.side_effect = lambda model, **kwargs: model
+    mock_fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
 
     model = MockNemotronModel()
 
-    result = fsdp2_strategy_parallelize(
-        model=model,
-        device_mesh=mock_device_mesh,
-        sequence_parallel=False,
-        activation_checkpointing=False,
-    )
+    with patch(
+        "nemo_automodel.components.distributed.fsdp2.fsdp2_sharding_enabled",
+        return_value=True,
+    ):
+        result = fsdp2_strategy_parallelize(
+            model=model,
+            device_mesh=mock_device_mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+        )
 
     # Should return the model unchanged
     assert result is model
@@ -207,7 +223,15 @@ def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
         patch(
             "nemo_automodel.components.distributed.parallelizer.fully_shard", side_effect=lambda model, **kwargs: model
         ),
-        patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"),
+        patch(
+            "nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard",
+            side_effect=lambda model, **kwargs: model,
+        ),
+        patch(
+            "nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype",
+            side_effect=lambda model, **kwargs: model,
+        ),
+        patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module"),
     ):
         with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
             with patch(

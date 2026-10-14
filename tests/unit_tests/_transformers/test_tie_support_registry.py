@@ -34,6 +34,8 @@ _TIE_SUPPORT_EXEMPT: dict[str, str] = {
     "LlamaBidirectionalModel": "retrieval bidirectional encoder; no lm_head",
     "LlamaBidirectionalForSequenceClassification": "retrieval; sequence-classification head, not an lm_head",
     "Ministral3BidirectionalModel": "retrieval bidirectional encoder; no lm_head",
+    "Mistral3BidirectionalModel": "retrieval VL bidirectional encoder; no causal lm_head",
+    "Mistral3VLBidirectionalForSequenceClassification": "retrieval VL scoring head; no causal lm_head",
     "LlamaNemotronVLModel": "retrieval VL encoder; no causal lm_head",
 }
 

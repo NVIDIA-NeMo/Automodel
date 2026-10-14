@@ -1,7 +1,7 @@
 ---
 title: "Qwen3.8-Flash-Next"
-description: "Fine-tune the language-only Qwen3.8-Flash-Next Engram MoE checkpoint with FSDP2, expert parallelism, and context parallelism."
-slug: model-coverage/large-language-models/qwen/qwen3-8-flash-next
+description: "Fine-tune Qwen3.8-Flash-Next for text generation with NeMo AutoModel using checked-in expert- and context-parallel recipes."
+slug: model-coverage/large-language-models/qwen/Qwen3.8-Flash-Next
 ---
 
 Qwen3.8-Flash-Next is a hybrid-attention Mixture-of-Experts (MoE) model with four
@@ -12,9 +12,11 @@ persistent HyperConnection streams and an Engram N-gram Embedding table (named
 reference path exposes discrete top-k IDs but no auxiliary loss or
 straight-through gradient.
 
-<Info>
+## Model Reference
 
-| | |
+### Model Architecture
+
+| Property | Value |
 |---|---|
 | **Task** | Text generation (MoE, hybrid attention, Engram N-gram Embedding) |
 | **Architecture** | `Qwen3_8_FlashNextForConditionalGeneration` |
@@ -23,8 +25,6 @@ straight-through gradient.
 | **Experts** | 512 routed experts, top-10 routing, plus one shared expert per layer |
 | **Engram** | One 51.2B-parameter N-gram Embedding table in decoder layer 2 |
 | **Sequence length** | 262,144 native; validated here at 4,096 tokens |
-
-</Info>
 
 ## Architecture
 

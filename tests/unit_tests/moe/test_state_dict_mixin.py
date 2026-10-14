@@ -24,6 +24,10 @@ skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA 
 
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin, get_world_size_safe
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(70)
+
 
 def test_get_world_size_safe_uses_initialized_process_group():
     with (
@@ -1074,7 +1078,13 @@ class TestInplaceLoadViews:
     @pytest.mark.parametrize("dispatcher", ["deepep", "hybridep", "uccl_ep"])
     @pytest.mark.parametrize(
         ("experts", "expected"),
-        [("gmm", True), ("torch_mm", True), ("torch_mm_mxfp8", True), ("te", False), ("torch", False)],
+        [
+            ("gmm", True),
+            ("torch_mm", True),
+            ("torch_mm_mxfp8", True),
+            ("te", False),
+            ("torch", False),
+        ],
     )
     def test_expert_checkpoint_storage_capability_matches_grouped_storage_aliasing(self, dispatcher, experts, expected):
         mixin = MockMoEStateDictMixin()
@@ -1108,12 +1118,13 @@ class TestInplaceLoadViews:
 
         assert mixin.supports_low_memory_dcp_load is False
         hf_state = mixin._to_hf_w_split_experts(dict(native))
-        assert hf_state["model.layers.0.mlp.experts.gate_up_proj_bias"] is native[
-            "model.layers.0.mlp.experts.gate_up_proj_bias"
-        ]
-        assert hf_state["model.layers.0.mlp.experts.down_proj_bias"] is native[
-            "model.layers.0.mlp.experts.down_proj_bias"
-        ]
+        assert (
+            hf_state["model.layers.0.mlp.experts.gate_up_proj_bias"]
+            is native["model.layers.0.mlp.experts.gate_up_proj_bias"]
+        )
+        assert (
+            hf_state["model.layers.0.mlp.experts.down_proj_bias"] is native["model.layers.0.mlp.experts.down_proj_bias"]
+        )
 
         restored = mixin._from_hf_w_merged_experts(dict(hf_state))
         assert set(restored) == set(native)
@@ -1125,9 +1136,7 @@ class TestInplaceLoadViews:
         mixin.moe_config.expert_bias = True
 
         with pytest.raises(NotImplementedError, match="per-expert bias"):
-            mixin._from_hf_w_merged_experts(
-                {"model.layers.0.mlp.experts.0.gate_proj.bias": torch.randn(3)}
-            )
+            mixin._from_hf_w_merged_experts({"model.layers.0.mlp.experts.0.gate_proj.bias": torch.randn(3)})
 
     def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits, *, for_checkpoint_load=False):
         mixin._split_experts_weights = Mock(return_value=splits)
@@ -1165,6 +1174,35 @@ class TestInplaceLoadViews:
             assert v.untyped_storage().data_ptr() == src_ptr, f"in-place view for {k} should alias model storage"
             assert not v.is_contiguous(), f"in-place view for {k} must be the strided transpose, not a copy"
         assert "model.layers.0.mlp.experts.gate_and_up_projs" in mixin._inplace_loaded_native_keys
+
+    @pytest.mark.parametrize("projection", ["gate_and_up_projs", "down_projs"])
+    def test_export_materializes_expert_tensors_without_registering_loaded_keys(self, projection):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        shape = (2, 4, 6) if projection == "gate_and_up_projs" else (2, 3, 4)
+        local_storage = torch.arange(48 if projection == "gate_and_up_projs" else 24).reshape(shape).float()
+        mock_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
+        mock_dtensor.ndim = 3
+        mock_dtensor.shape = shape
+        mock_dtensor.is_meta = False
+
+        result = self._run_inplace_conversion(
+            mixin,
+            f"model.layers.0.mlp.experts.{projection}",
+            mock_dtensor,
+            list(local_storage.unbind()),
+            for_checkpoint_load=False,
+        )
+
+        assert result is not None
+        for key, tensor in result:
+            assert tensor.is_contiguous()
+            assert tensor.untyped_storage().data_ptr() != local_storage.untyped_storage().data_ptr()
+            expert_id = int(key.split(".")[-3])
+            expected = local_storage[expert_id]
+            if projection == "gate_and_up_projs":
+                expected = expected[:, :3] if key.endswith("gate_proj.weight") else expected[:, 3:]
+            torch.testing.assert_close(tensor, expected.T)
+        assert not getattr(mixin, "_inplace_loaded_native_keys", set())
 
     def test_inplace_load_down_projs_returns_views(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)

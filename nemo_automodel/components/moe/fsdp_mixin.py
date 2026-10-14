@@ -21,8 +21,8 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.pipelining._backward import stage_backward, stage_backward_input, stage_backward_weight
 from torch.nn.parallel import DistributedDataParallel
 
+from nemo_automodel.components.distributed.multimodal_fsdp import iter_multimodal_modules
 from nemo_automodel.components.models.common.utils import get_is_optim_step
-from nemo_automodel.shared.multimodal_fsdp import iter_multimodal_modules
 
 logger = logging.getLogger(__name__)
 

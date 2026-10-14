@@ -42,6 +42,10 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: zai-org/GLM-5.2
+  # Adapter checkpoints omit router buffers; keep the pretrained correction bias fixed.
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
