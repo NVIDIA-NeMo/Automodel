@@ -1,0 +1,150 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# DeepSeek-V4.1-Flash LoRA: 8 nodes x 4 GB200, EP32, rank 8 / alpha 32.
+# Load the released base checkpoint; benchmark full-length 4K mock text with
+# balanced expert routing. This is not the HellaSwag fine-tuning measurement.
+# Run 20 warmup + 30 measured optimizer steps, with checkpointing disabled.
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
+seed: 1234
+
+benchmark:
+  warmup_steps: 20
+  peak_tflops: 2500
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 8
+  flops_scope: text
+  json_output_path: training_logs/deepseek_v41_flash_lora_gb200.json
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 10
+  num_epochs: 1
+  max_steps: 50
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+prewarm:
+  cublas_backward: true
+  comm_groups: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41Config.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+    name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+    revision: df42c109f1defefcbfcedbe7d905718a12266e40
+    vision_config:
+      _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41VisionConfig
+      num_hidden_layers: 0
+  trust_remote_code: false
+  load_base_model: true
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang
+    linear: torch
+    rms_norm: te
+    experts: torch_mm
+    dispatcher: hybridep
+    gate_precision: float32
+    rope_fusion: false
+    fake_balanced_gate: true
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "model.layers.*.attn.wq_a"
+    - "model.layers.*.attn.wq_b"
+    - "model.layers.*.attn.wkv"
+    - "model.layers.*.attn.wo_b"
+    - "model.layers.*.ffn.experts"
+  dim: 8
+  alpha: 32
+  use_triton: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  pp_size: 1
+  cp_size: 1
+  ep_size: 32
+  defer_fsdp_grad_sync: true
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    lm_head_precision: float32
+    mp_policy:
+      _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+      param_dtype: bfloat16
+      reduce_dtype: float32
+      output_dtype: null
+      cast_forward_inputs: false
+
+checkpoint:
+  enabled: false
+  dequantize_base_checkpoint: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  seq_len: 4096
+  num_samples: 100000
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null
+  num_workers: 0
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+lr_scheduler:
+  lr_decay_style: constant
+
+ci:
+  recipe_owner: huiyingl
+  nodes: 8
+  nproc_per_node: 4
+  cluster_tag: gb200
+  time: "01:00:00"
+  max_steps: 50

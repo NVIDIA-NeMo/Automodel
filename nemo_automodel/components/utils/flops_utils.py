@@ -2059,6 +2059,11 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
 
         class_name_to_formula[config_class_name] = model_flops
 
+    if config_class_name in {"MiMoV2FlashConfig", "MiMoV2Config"}:
+        from nemo_automodel.components.models.mimo_v2_flash.flops import model_flops
+
+        class_name_to_formula[config_class_name] = model_flops
+
     # Try exact match first
     formula = class_name_to_formula.get(config_class_name)
 
