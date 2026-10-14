@@ -1156,10 +1156,15 @@ class UnoDistillLoss(nn.Module):
 
         Returns:
             :class:`DLLMLossOutput` with the weighted ``total_loss`` and ``dllm_loss`` set to the
-            detached TV term.
+            detached TV term. This is the paper's ``L_TV``, the full L1 distance, i.e.
+            ``2 * (1 - acceptance)`` rather than the half-L1 total-variation distance.
         """
+        if isinstance(logits, DTensor):
+            logits = logits.full_tensor()
         supervise = answer_mask.bool() & valid_mask.bool()
         student_logits = logits[:, :seq_len, :][supervise]  # [tokens, vocab]
+        # x_0 queries attend only x_0 keys and that half runs with the adapter gated off, so it
+        # already carries no adapter gradient; the detach just keeps the teacher explicit.
         teacher_logits = logits[:, seq_len : 2 * seq_len, :][supervise].detach()  # [tokens, vocab]
         denom = max(int(num_diffusion_tokens), 1) if num_diffusion_tokens is not None else max(int(supervise.sum()), 1)
 

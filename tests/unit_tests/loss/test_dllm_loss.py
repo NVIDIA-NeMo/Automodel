@@ -761,6 +761,57 @@ class TestUnoDistillLoss:
         assert out.total_loss.item() == 0.0
         assert torch.count_nonzero(logits.grad) == 0
 
+    def test_hand_computed_value_is_the_full_l1_distance(self):
+        """Student [1/3, 1/3, 1/3] vs teacher [1/2, 1/4, 1/4] is L1 = 1/3 (half-L1 TV would be 1/6)."""
+        from nemo_automodel.components.loss.dllm_loss import UnoDistillLoss
+
+        L = 2
+        logits = torch.zeros(1, 2 * L, 3)  # [x_t | x_0]; position 1 has identical halves (L1 = 0)
+        logits[0, L] = torch.tensor([2.0, 1.0, 1.0]).log()
+        answer_mask = torch.ones(1, L, dtype=torch.bool)
+        valid_mask = torch.ones(1, L, dtype=torch.long)
+        out = UnoDistillLoss()(logits, answer_mask, valid_mask, seq_len=L)
+        torch.testing.assert_close(out.total_loss, torch.tensor((1 / 3) / 2))
+
+    def test_bf16_logits_give_fp32_loss_close_to_fp64_reference(self):
+        from nemo_automodel.components.loss.dllm_loss import UnoDistillLoss
+
+        logits, answer_mask, valid_mask, L = self._inputs()
+        logits = logits.to(torch.bfloat16)
+        ref, _ = self._reference(logits.double(), answer_mask, valid_mask, L, tv_weight=1.0, kl_weight=0.0)
+
+        bf16_logits = logits.clone().requires_grad_(True)
+        out = UnoDistillLoss(chunk_size=5)(bf16_logits, answer_mask, valid_mask, seq_len=L)
+        out.total_loss.backward()
+        assert out.total_loss.dtype == torch.float32
+        assert bf16_logits.grad.dtype == torch.bfloat16
+        torch.testing.assert_close(out.total_loss.double(), ref, rtol=1e-5, atol=1e-6)
+
+
+class TestUnoDistillLossDTensor:
+    """UnoDistillLoss on a DTensor must match the plain-tensor result.
+
+    Single-process (world_size=1) gloo group, as in ``TestIDLMLossDTensor``: the shard is trivial,
+    but this exercises the DTensor path that FSDP2/TP training hits.
+    """
+
+    @pytest.mark.parametrize("placement", ["shard", "replicate"])
+    def test_dtensor_matches_plain(self, trivial_pg, placement):
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+
+        from nemo_automodel.components.loss.dllm_loss import UnoDistillLoss
+
+        logits, answer_mask, valid_mask, L = TestUnoDistillLoss._inputs()
+        loss_fn = UnoDistillLoss(tv_weight=1.0, kl_weight=0.5, chunk_size=5)
+        plain = loss_fn(logits, answer_mask, valid_mask, seq_len=L).total_loss
+
+        mesh = init_device_mesh("cpu", (1,))
+        dlogits = distribute_tensor(logits, mesh, [Shard(-1) if placement == "shard" else Replicate()])
+        sharded = loss_fn(dlogits, answer_mask, valid_mask, seq_len=L).total_loss
+
+        torch.testing.assert_close(sharded, plain)
+
 
 class TestDFlashNormalizeMean:
     """``normalize="mean"`` divides by the effective weight sum (decay-weighted mean)."""
