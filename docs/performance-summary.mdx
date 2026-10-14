@@ -88,15 +88,15 @@ Qwen-Image-2.1 uses Naruto BLIP captions at 1024 x 1024 resolution and FSDP2.
 
 The timing is the author's approximate report for a 1,000-step run; its warmup exclusion window is not specified.
 
-### Image Generation, LoRA: GPU Type Not Recorded
+### Image Generation, LoRA: NVIDIA H100 80GB, Precision: BF16
 
 HunyuanImage-3.0 uses Naruto BLIP captions at 1024 x 1024 resolution and FSDP2.
 
 | Model | Mode | #GPUs | GBS | MBS | LBS | GA | TP | PP | CP | EP | Optimizer | Time per Global Step (s) | Images/sec/GPU | Measurement Source | Related NeMo-CI |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- |
-| [HunyuanImage-3.0](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) | LoRA, rank 64 | 8 | 8 | 1 | 1 | 1 | 1 | 1 | 1 | 8 | torch AdamW | 6.529 | 0.153 | [Author report](https://github.com/NVIDIA-NeMo/Automodel/pull/4129#issuecomment-5971325129) | [Failed](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694417) |
+| [HunyuanImage-3.0](https://github.com/NVIDIA-NeMo/Automodel/blob/aae8680a20ca5b1deeec218fde64b1dea0286ad3/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) | LoRA, rank 64 | 8 | 8 | 1 | 1 | 1 | 1 | 1 | 1 | 8 | TE FusedAdam, 16-bit remainders | 2.226 | 0.449 | [EOS H100 benchmark](https://github.com/NVIDIA-NeMo/Automodel/blob/c1f1c8f7bc39cca9176b5f5bfff5787ecf8d9fe6/docs/performance-results/hunyuan-image3-h100-20261014.json) | [Failed](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694417) |
 
-The HunyuanImage-3.0 result averages steps 10-999 from four published training-log comments. These logs predate the linked recipe's switch from torch AdamW to FusedAdam. The GPU type is not recorded in the source logs. The related H100 CI attempt does not establish the hardware used for this historical measurement.
+The HunyuanImage-3.0 result averages steps 10-99 from a 100-step run on eight H100 80GB HBM3 GPUs on EOS. Its input cache contains all 1,221 Naruto BLIP caption images, preprocessed with the release VAE at 1024 x 1024 resolution. The production recipe synchronizes CUDA and reports the maximum step time across ranks; model loading, VAE preprocessing, and checkpoint I/O are excluded. The measurement source records the pinned model and dataset revisions, package versions, and all 100 step measurements.
 
 ## Measurement Methods and Recipe Differences
 
@@ -118,7 +118,7 @@ Recipe and CI differences that affect reproduction include:
 - Laguna-XS-2.1's source used zero dataloader workers; its related CI run uses four.
 - Several CI jobs override the recipe's step limit. The Qwen3.8-27B and GLM-5.3-Flash links contain only 10 and five initial training steps, respectively.
 
-The related CI links were checked on October 13, 2026. They cover different source commits and do not certify a single release snapshot. Failed MiMo-V2.6 Tulu-3 attempts require a newer cuDNN version; the Nemotron Super VL attempt could not retrieve the released checkpoint. The image-generation attempts produced no throughput measurement.
+The related CI links were checked on October 13, 2026. They cover different source commits and do not certify a single release snapshot. Failed MiMo-V2.6 Tulu-3 attempts require a newer cuDNN version; the Nemotron Super VL attempt could not retrieve the released checkpoint. The linked NeMo-CI image-generation attempts produced no throughput measurement.
 
 Image-generation rates are calculated as `GBS / step_time / physical_GPU_count`. Language and image-generation rates use different units.
 
@@ -150,6 +150,6 @@ Model names in the tables link directly to their YAML recipes. Mock-data benchma
 
 ## Version Information
 
-- **Last Updated**: 2026-10-13
+- **Last Updated**: 2026-10-14
 - **Default Recipe Snapshot**: [`b203f3f9`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856)
 - **Measurements**: Historical development runs and separately identified NeMo-CI runs; source commits vary.
