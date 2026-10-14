@@ -32,7 +32,9 @@ unequal run then dispatches non-blocking into capacity-sized buffers (rows
 past the routed count are padding), and the checkpoint replay reuses the host
 extent. The pytest launcher uses --all-variants to run the complete matrix,
 including dense and compact capacity-mode variants, in one worker launch and
-process group.
+process group. It also runs the dynamic-batch regression from PR #3641 with no
+fixed capacity: counts change between calls, the larger rank swaps, and either
+rank can be empty, with and without checkpointing.
 """
 
 import argparse
@@ -205,6 +207,53 @@ def _run_variant(
         )
 
 
+def _run_dynamic_token_counts(ep_group: dist.ProcessGroup) -> None:
+    """Exercise PR #3641's negotiated path across changing two-rank batches.
+
+    Reuse one dispatcher so a stale group maximum or shape cannot be hidden by
+    reconstructing it between steps. No fixed/equal-count/static-routing shortcut
+    is enabled; the production NCCL collective and HybridEP kernels run normally.
+    """
+    assert dist.get_world_size(ep_group) == 2
+    rank = dist.get_rank(ep_group)
+    torch.manual_seed(3641 + rank)
+    num_local = NUM_EXPERTS // 2
+    dispatcher = MoEFlexTokenDispatcher(
+        num_local_experts=num_local,
+        local_expert_indices=list(range(rank * num_local, (rank + 1) * num_local)),
+        config=TokenDispatcherConfig(
+            moe_flex_dispatcher_backend="hybridep",
+            num_moe_experts=NUM_EXPERTS,
+            moe_router_topk=TOPK,
+            moe_share_token_dispatcher=False,
+            moe_hybridep_equal_token_counts=False,
+            moe_benchmark_static_routing=False,
+        ),
+        ep_group=ep_group,
+    )
+    # Original unequal/unaligned cases, then changing the max-owning rank,
+    # crossing upstream's 16-token slot boundary, empty ranks, and aligned counts.
+    token_counts = ((8, 3), (6, 6), (5, 3), (13, 7), (3, 13), (17, 5), (5, 17), (0, 7), (7, 0), (4, 4))
+    with hybrid_ep_token_capacity(None):
+        for counts in token_counts:
+            num_tokens = counts[rank]
+            hidden = torch.randn(num_tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
+            indices = (torch.arange(num_tokens * TOPK, device="cuda").reshape(num_tokens, TOPK) + rank) % NUM_EXPERTS
+            indices[:1] = -1
+            probs = torch.rand(num_tokens, TOPK, dtype=torch.float32, device="cuda").softmax(dim=-1)
+            # Each execution also checks output and both gradients against the
+            # local FP32 oracle with distinct expert scales.
+            eager = run_dispatch_combine(dispatcher, hidden, indices, probs)
+            recomputed = run_dispatch_combine(dispatcher, hidden, indices, probs, activation_checkpointing=True)
+            for actual, expected in zip(recomputed, eager):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            print(
+                f"[rank {rank}] OK: PR #3641 dynamic counts={counts}; negotiated slots, "
+                "output, hidden/router gradients, and checkpoint replay",
+                flush=True,
+            )
+
+
 def main() -> None:
     """Run individual diagnostics or the complete CI matrix in one worker launch."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -231,6 +280,8 @@ def main() -> None:
     else:
         variants = [(args.compact_routing, args.permute_fusion, args.activation_checkpointing, args.capacity_factor)]
     try:
+        if args.all_variants:
+            _run_dynamic_token_counts(ep_group)
         for compact, fusion, activation_checkpointing, capacity_factor in variants:
             start = time.perf_counter()
             for slot_capacity in (None, max(32, FULL_TOKENS)):
