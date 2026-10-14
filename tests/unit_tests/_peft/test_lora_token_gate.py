@@ -209,8 +209,77 @@ def test_gate_is_removed_on_exit_and_on_error():
 def test_gate_shape_mismatch_raises():
     model = _lora_model(use_triton=False)
     with lora_token_gate(model, torch.ones(B, S + 1, dtype=torch.bool)):
-        with pytest.raises(ValueError, match="lora_token_gate has"):
+        with pytest.raises(ValueError, match="does not match the LoRA input"):
             model(torch.randn(B, S, H))
+
+
+def test_gate_rejects_a_permuted_layout_with_the_same_token_count():
+    """A [batch, sequence] gate on a sequence-first [sequence, batch, hidden] input would misroute tokens."""
+    linear = patch_linear_module(nn.Linear(H, H), dim=4, alpha=8, use_triton=False)
+    with lora_token_gate(linear, _gate()):
+        with pytest.raises(ValueError, match="does not match the LoRA input"):
+            linear(torch.randn(S, B, H))
+
+
+@pytest.mark.parametrize("dropout_position", ["pre", "post"])
+def test_gate_with_dropout_keeps_off_tokens_on_the_base_and_on_tokens_on_the_adapter(dropout_position):
+    torch.manual_seed(0)
+    linear = patch_linear_module(
+        nn.Linear(H, H), dim=4, alpha=8, dropout=0.5, dropout_position=dropout_position, use_triton=False
+    )
+    nn.init.normal_(linear.lora_B.weight, std=0.1)
+    linear.train()
+    gate = _gate()
+    x = torch.randn(B, S, H)
+    torch.manual_seed(1)
+    adapted = linear(x)
+    torch.manual_seed(1)
+    with lora_token_gate(linear, gate):
+        out = linear(x)
+    torch.testing.assert_close(out[gate], adapted[gate])
+    assert torch.equal(out[~gate], F.linear(x, linear.weight, linear.bias)[~gate])
+
+
+def test_float_gate_scales_the_adapter_update_on_a_bf16_module():
+    torch.manual_seed(0)
+    linear = patch_linear_module(nn.Linear(H, H), dim=4, alpha=8, use_triton=False).to(torch.bfloat16)
+    nn.init.normal_(linear.lora_B.weight, std=0.1)
+    x = torch.randn(B, S, H, dtype=torch.bfloat16)
+    with torch.no_grad():
+        base = F.linear(x, linear.weight, linear.bias).float()
+        full_delta = linear(x).float() - base
+        with lora_token_gate(linear, torch.full((B, S), 0.5)):
+            half_delta = linear(x).float() - base
+    torch.testing.assert_close(half_delta, 0.5 * full_delta, rtol=2e-2, atol=2e-2)
+
+
+def test_gate_rejects_lora_on_moe_experts():
+    from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
+    from nemo_automodel.components.moe.config import MoEConfig
+    from nemo_automodel.components.moe.layers import GroupedExperts
+
+    moe_config = MoEConfig(
+        n_routed_experts=2,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=H,
+        inter_dim=INTER,
+        moe_inter_dim=INTER,
+        norm_topk_prob=False,
+        expert_activation="swiglu",
+        dtype=torch.float32,
+    )
+    model = nn.Sequential(GroupedExpertsLoRA(GroupedExperts(moe_config), lora_dim=4, alpha=8))
+    with pytest.raises(NotImplementedError, match="MoE expert modules"):
+        with lora_token_gate(model, torch.ones(B, S)):
+            pass
 
 
 def test_gate_rejects_model_without_lora_and_dora():

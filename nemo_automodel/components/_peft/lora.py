@@ -111,6 +111,8 @@ class LinearLoRA(nn.Linear):
 
     # Per-token adapter gate installed by :func:`lora_token_gate`; ``None`` applies LoRA to every token.
     _lora_token_gate: torch.Tensor | None = None
+    # Module path set by ``patch_linear_module`` when a ``layer_name`` is given; used in error messages.
+    _layer_name: str | None = None
 
     def __init__(
         self,
@@ -403,9 +405,9 @@ class LinearLoRA(nn.Linear):
         receive no update and contribute no gradient to ``lora_A``/``lora_B``.
 
         Args:
-            x: Input activations, Tensor of shape [..., in_features]. The leading dimensions must
-                hold exactly as many tokens as the installed gate (e.g. ``[batch, sequence]`` or
-                flattened ``[tokens]``). DTensor inputs are not supported.
+            x: Input activations, Tensor of shape [batch, sequence, in_features] whose leading
+                dimensions equal the installed gate's shape, or flattened [batch * sequence,
+                in_features]. DTensor inputs are not supported.
 
         Returns:
             Tensor of shape [..., out_features] with the same leading dimensions as ``x``: the
@@ -416,11 +418,13 @@ class LinearLoRA(nn.Linear):
         if isinstance(x, DTensor):
             raise NotImplementedError("lora_token_gate does not support DTensor activations (tensor parallelism).")
         gate = self._lora_token_gate
-        if gate.numel() != x.shape[:-1].numel():
+        # Only the exact leading shape or the flattened 2-D form: a permuted layout (e.g. a [batch, sequence]
+        # gate on a sequence-first input) has the same token count but would route the wrong tokens.
+        if gate.shape != x.shape[:-1] and not (x.dim() == 2 and gate.numel() == x.shape[0]):
             raise ValueError(
-                f"lora_token_gate has {gate.numel()} entries (shape {tuple(gate.shape)}) but the LoRA input "
-                f"{getattr(self, '_layer_name', type(self).__name__)} has {x.shape[:-1].numel()} tokens "
-                f"(shape {tuple(x.shape)})."
+                f"lora_token_gate of shape {tuple(gate.shape)} does not match the LoRA input "
+                f"{self._layer_name or type(self).__name__} of shape {tuple(x.shape)}; expected leading "
+                f"dimensions {tuple(gate.shape)} or a flattened [{gate.numel()}, in_features] input."
             )
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
@@ -782,7 +786,8 @@ def lora_token_gate(model: nn.Module, gate: torch.Tensor) -> Iterator[None]:
             values scale the adapter update per token.
 
     Yields:
-        None. The gate is removed from every module on exit, including on error.
+        None. The gate is removed from every module on exit, including on error. The context is not
+        re-entrant: nesting it leaves the outer gate removed after the inner one exits.
 
     Raises:
         ValueError: If ``model`` has no LoRA-patched linear layers.
