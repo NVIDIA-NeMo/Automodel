@@ -126,17 +126,6 @@ Image-generation rates are calculated as `GBS / step_time / physical_GPU_count`.
 
 The original mock-data benchmark rows have no recorded measurement-source link. Their related CI links identify later runs of the recipes. Those original measurements disable gradient clipping and calculate MFU using an H100 BF16 peak of 989 TFLOPs/sec; these assumptions do not apply to the W&B rows.
 
-## Models Without Verified Throughput
-
-The following models have no usable throughput aggregate in the reviewed evidence. This describes measurement availability, not model support or performance.
-
-| Model | Measurement Status | Related NeMo-CI |
-| --- | --- | --- |
-| [Qwen3.8-2.4T-A95B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/qwen/qwen3_8_2_4t_a95b_hellaswag_ep32_pp8.yaml) | Onboarding candidate runs could not be matched to the public checkpoint; the CI candidate failed without training metrics. | [Failed](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479694577) |
-| [Qwen3-Reranker-4B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/retrieval/cross_encoder/qwen3_4b_reranker_agentir.yaml) | No comparable full-model throughput measurement located. | NR |
-| [Muse-Glimmer-30B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix.yaml) | Located CI runs contain only two to five training steps; no measurement window after warmup. | [5-step smoke](https://gitlab-master.nvidia.com/dl/JoC/nemo-ci/-/jobs/479695007) |
-| [North-Micro-Vision-Instruct](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_full.yaml) | No verified throughput measurement or matching CI run located. | NR |
-
 ## Glossary
 
 - **MFU**: Model FLOPs Utilization - ratio of achieved compute to peak hardware capability
