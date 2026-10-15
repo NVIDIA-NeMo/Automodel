@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Preserved job 20089678 benchmark: full92, mock/fake-balanced, 128 H100, M24.
+# Step 5 Preview full92 benchmark: mock data, fake-balanced routing, 128 H100.
 # Run the native module from the repository root; see README.md.
 
 benchmark:
@@ -41,8 +41,7 @@ dataset:
   seq_len: 8192
   tokenizer:
     _target_: transformers.PreTrainedTokenizerFast.from_pretrained
-    local_files_only: true
-    pretrained_model_name_or_path: /workspace/checkpoints/first4-native-view
+    pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16
   vocab_size: 128896
 dist_env:
   backend: nccl
@@ -229,24 +228,4 @@ step_scheduler:
   save_checkpoint_every_epoch: false
   val_every_steps: 1000
 wandb:
-  dir: outputs/step5-full92-mock-h100
-  enable: true
-  entity: Nemo-automodel
-  group: step5-native-schedule1f1b-vpp1
-  mode: online
-  name: step5-full92-mock-cp1-ep32-pp4-vpp1-m24-unprofiled-v3-benchmark
-  project: huiyingl_workspace
-  resume: never
-  tags:
-  - full92
-  - random-init
-  - mock8k
-  - fakebalanced-static
-  - PP4-VPP1-DP32-EP32-CP1
-  - M24-GB768-GA1
-  - compact-off
-  - unprofiled-benchmark
-  - swa-varlen
-  - csa-forward-full-blocks
-  - qnorm-layout
-  - indexer-int32
+  enable: false
