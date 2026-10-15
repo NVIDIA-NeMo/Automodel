@@ -107,7 +107,23 @@ uv run --no-sync python -m tools.diffusion.preprocessing_multiprocess image \
 
 ### Train for 100 steps
 
-The proposed LoRA workflow uses two GPUs, native attention, activation checkpointing, global batch size 2, and a 10-step warmup. See [PR #4369](https://github.com/NVIDIA-NeMo/Automodel/pull/4369) for the training instructions until the recipe is merged.
+The following overrides adapt the LoRA recipe to two GPUs, with native attention, activation checkpointing, global batch size 2, and a 10-step warmup. This configuration was validated on two NVIDIA H100 80GB GPUs.
+
+```bash
+uv run --no-sync torchrun --nproc-per-node=2 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/flux3_t2i_flow_lora.yaml \
+  --model.pretrained_model_name_or_path /data/models/flux3-image-klein-base \
+  --model.attention_backend native \
+  --fsdp.dp_size 2 \
+  --fsdp.activation_checkpointing true \
+  --fsdp.enable_fsdp2_prefetch false \
+  --data.dataloader.cache_dir /data/cache/flux3-klein-t2i \
+  --step_scheduler.global_batch_size 2 \
+  --step_scheduler.max_steps 100 \
+  --step_scheduler.ckpt_every_steps 50 \
+  --lr_scheduler.lr_warmup_steps 10 \
+  --checkpoint.checkpoint_dir /data/checkpoints/flux3-klein-t2i
 
 Keep the text-to-image recipe's LoRA target list: it excludes the inactive reference-image stream. The recipe uses rank-4 BF16 adapters.
 
