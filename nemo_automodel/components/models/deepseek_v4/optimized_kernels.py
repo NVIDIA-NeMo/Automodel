@@ -488,7 +488,9 @@ def indexer_scores_torch(
     softmax_scale: float,
 ) -> torch.Tensor:
     """Torch reference for the Miles DSV4 C4 indexer score kernel."""
-    scores = torch.matmul(q.float(), pooled_kv.transpose(-1, -2).float().unsqueeze(1))
+    # Preserve the explicit compute dtype inside recipe autocast.
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        scores = torch.matmul(q.float(), pooled_kv.transpose(-1, -2).float().unsqueeze(1))
     scores = torch.relu(scores) * softmax_scale
     return (scores * weights.float().unsqueeze(-1)).sum(dim=2)
 

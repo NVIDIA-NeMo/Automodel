@@ -21,6 +21,7 @@ tiny Qwen3 with Automodel LoRA. The GPU counterpart is ``tests/functional_tests/
 """
 
 import types
+from contextlib import nullcontext
 
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
@@ -78,6 +79,7 @@ def _recipe(model, loss_fn, step: int, seed: int):
         )
 
     recipe = types.SimpleNamespace(
+        _autocast_context=nullcontext,
         dist_env=types.SimpleNamespace(device=torch.device("cpu")),
         model_parts=[model],
         distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),

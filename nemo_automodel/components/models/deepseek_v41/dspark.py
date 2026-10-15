@@ -639,7 +639,9 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         Returns:
             FP32 tensor of shape [batch, sequence, vocab].
         """
-        return F.linear(hidden_states.float(), self.lm_head.weight.float())
+        # Preserve the explicit compute dtype inside recipe autocast.
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            return F.linear(hidden_states.float(), self.lm_head.weight.float())
 
     def forward(
         self,

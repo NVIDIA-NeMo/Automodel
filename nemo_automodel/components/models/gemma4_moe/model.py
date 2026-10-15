@@ -259,7 +259,9 @@ class Gemma4Gate(nn.Module):
         x_norm = self.norm(x).to(torch.float32)
         x_norm = x_norm * self.scale.to(torch.float32) * self.scalar_root_size
 
-        expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
+        # Preserve the explicit compute dtype inside recipe autocast.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
 
         weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)

@@ -407,47 +407,43 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             else nullcontext()
         )
 
-        autocast_dtype = getattr(self.distributed_config, "autocast_dtype", None)
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
-        )
+        with train_ctx(), sync_ctx, fp8_ctx:
+            with self._autocast_context():
+                # Hook for model families that need extra forward inputs derived from
+                # the (clean) batch — e.g. block_diffusion builds the block-causal
+                # attention masks + canvas position ids here. No-op by default.
+                batch = self._augment_batch_for_model(batch, clean_input_ids=clean_input_ids, loss_mask=loss_mask)
+                batch = filter_forward_kwargs(model, batch)
+                out = model(**batch)
+                logits = getattr(out, "logits", out)
+                # Hybrid models (e.g. Nemotron-Labs-Diffusion in block_diff mode)
+                # also return causal_logits for the AR branch of the loss.  When
+                # absent (e.g. pure-MDLM models like LLaDA), the AR branch is
+                # silently skipped by HybridDiffusionLLMLoss / MDLMCrossEntropyLoss.
+                causal_logits = getattr(out, "causal_logits", None)
+                del out
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
-            # Hook for model families that need extra forward inputs derived from
-            # the (clean) batch — e.g. block_diffusion builds the block-causal
-            # attention masks + canvas position ids here. No-op by default.
-            batch = self._augment_batch_for_model(batch, clean_input_ids=clean_input_ids, loss_mask=loss_mask)
-            batch = filter_forward_kwargs(model, batch)
-            out = model(**batch)
-            logits = getattr(out, "logits", out)
-            # Hybrid models (e.g. Nemotron-Labs-Diffusion in block_diff mode)
-            # also return causal_logits for the AR branch of the loss.  When
-            # absent (e.g. pure-MDLM models like LLaDA), the AR branch is
-            # silently skipped by HybridDiffusionLLMLoss / MDLMCrossEntropyLoss.
-            causal_logits = getattr(out, "causal_logits", None)
-            del out
+                # Compute dLLM loss (unified interface via DLLMLossOutput)
+                has_causal = causal_logits is not None
+                loss_result = self.dllm_loss_fn(
+                    logits=logits,
+                    target_ids=clean_input_ids,
+                    noise_mask=noise_mask,
+                    p_mask=p_mask,
+                    loss_mask=loss_mask,
+                    loss_mask_ar=loss_mask if has_causal else None,
+                    num_diffusion_tokens=num_diffusion_tokens,
+                    num_ar_tokens=num_ar_tokens if has_causal else None,
+                    causal_logits=causal_logits,
+                    # Mixed forward kernels (scdd) score the corrupted token itself,
+                    # which noise_mask alone cannot recover; absorbing losses ignore it.
+                    noisy_input_ids=noisy_input_ids,
+                )
+                microbatch_loss = loss_result.total_loss
+                dllm_loss = loss_result.dllm_loss.detach().clone()
 
-            # Compute dLLM loss (unified interface via DLLMLossOutput)
-            has_causal = causal_logits is not None
-            loss_result = self.dllm_loss_fn(
-                logits=logits,
-                target_ids=clean_input_ids,
-                noise_mask=noise_mask,
-                p_mask=p_mask,
-                loss_mask=loss_mask,
-                loss_mask_ar=loss_mask if has_causal else None,
-                num_diffusion_tokens=num_diffusion_tokens,
-                num_ar_tokens=num_ar_tokens if has_causal else None,
-                causal_logits=causal_logits,
-                # Mixed forward kernels (scdd) score the corrupted token itself,
-                # which noise_mask alone cannot recover; absorbing losses ignore it.
-                noisy_input_ids=noisy_input_ids,
-            )
-            microbatch_loss = loss_result.total_loss
-            dllm_loss = loss_result.dllm_loss.detach().clone()
-
-            loss_buffer.append(microbatch_loss.clone().detach())
-            self._dllm_loss_buffer.append(dllm_loss)
+                loss_buffer.append(microbatch_loss.clone().detach())
+                self._dllm_loss_buffer.append(dllm_loss)
 
             if is_train:
                 (microbatch_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1193,56 +1189,53 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
             if is_train
             else nullcontext()
         )
-        autocast_dtype = getattr(self.distributed_config, "autocast_dtype", None)
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
-        )
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
-            batch = filter_forward_kwargs(model, batch)
-            out = model(**batch)
-            logits = getattr(out, "logits", out)
-            encoder_logits = getattr(out, "encoder_logits", None)
-            del out
+        with train_ctx(), sync_ctx, fp8_ctx:
+            with self._autocast_context():
+                batch = filter_forward_kwargs(model, batch)
+                out = model(**batch)
+                logits = getattr(out, "logits", out)
+                encoder_logits = getattr(out, "encoder_logits", None)
+                del out
 
-            loss_result = self.dllm_loss_fn(
-                logits=logits,
-                target_ids=target_ids,
-                noise_mask=noise_mask,
-                p_mask=p_mask,
-                loss_mask=loss_mask,
-                loss_mask_ar=None,
-                num_diffusion_tokens=num_diffusion_tokens,
-                num_ar_tokens=None,
-                causal_logits=None,
-            )
-            microbatch_loss = loss_result.total_loss
-            dllm_loss = loss_result.dllm_loss.detach().clone()
-
-            # Co-trained autoregressive encoder loss: next-token CE over the clean
-            # sequence, added at encoder_loss_weight, only when training (encoder_logits
-            # is produced by the forward only then). The SCOPE matches Google (full_valid:
-            # prompt + canvas + EOS-fill, via attention_mask); the REDUCTION does NOT —
-            # we use token-normalization (Σ CE / Σ tokens over the global count) whereas
-            # Google takes a per-example mean (Σ_b CE_b / N_b, then mean over B).
-            # Token-norm weights long examples more; it is kept deliberately (#4 decision)
-            # for consistency with the diffusion loss's global-token normalization and the
-            # recipe's `* dp_group_size` backward scaling.
-            if is_train and encoder_logits is not None and self._encoder_loss_weight > 0.0:
-                # Normalize by the GLOBAL supervised-token count (num_ar_tokens),
-                # exactly like the diffusion loss uses num_diffusion_tokens, so the
-                # recipe's `* dp_group_size` backward scaling is correct for both
-                # terms (a local mean here would be over-scaled by dp_group_size).
-                ar_loss = encoder_ar_loss(
-                    encoder_logits,
-                    clean_input_ids,
-                    valid_mask=ar_full_loss_mask,
-                    num_tokens=num_ar_tokens,
+                loss_result = self.dllm_loss_fn(
+                    logits=logits,
+                    target_ids=target_ids,
+                    noise_mask=noise_mask,
+                    p_mask=p_mask,
+                    loss_mask=loss_mask,
+                    loss_mask_ar=None,
+                    num_diffusion_tokens=num_diffusion_tokens,
+                    num_ar_tokens=None,
+                    causal_logits=None,
                 )
-                microbatch_loss = microbatch_loss + self._encoder_loss_weight * ar_loss
+                microbatch_loss = loss_result.total_loss
+                dllm_loss = loss_result.dllm_loss.detach().clone()
 
-            loss_buffer.append(microbatch_loss.clone().detach())
-            self._dllm_loss_buffer.append(dllm_loss)
+                # Co-trained autoregressive encoder loss: next-token CE over the clean
+                # sequence, added at encoder_loss_weight, only when training (encoder_logits
+                # is produced by the forward only then). The SCOPE matches Google (full_valid:
+                # prompt + canvas + EOS-fill, via attention_mask); the REDUCTION does NOT —
+                # we use token-normalization (Σ CE / Σ tokens over the global count) whereas
+                # Google takes a per-example mean (Σ_b CE_b / N_b, then mean over B).
+                # Token-norm weights long examples more; it is kept deliberately (#4 decision)
+                # for consistency with the diffusion loss's global-token normalization and the
+                # recipe's `* dp_group_size` backward scaling.
+                if is_train and encoder_logits is not None and self._encoder_loss_weight > 0.0:
+                    # Normalize by the GLOBAL supervised-token count (num_ar_tokens),
+                    # exactly like the diffusion loss uses num_diffusion_tokens, so the
+                    # recipe's `* dp_group_size` backward scaling is correct for both
+                    # terms (a local mean here would be over-scaled by dp_group_size).
+                    ar_loss = encoder_ar_loss(
+                        encoder_logits,
+                        clean_input_ids,
+                        valid_mask=ar_full_loss_mask,
+                        num_tokens=num_ar_tokens,
+                    )
+                    microbatch_loss = microbatch_loss + self._encoder_loss_weight * ar_loss
+
+                loss_buffer.append(microbatch_loss.clone().detach())
+                self._dllm_loss_buffer.append(dllm_loss)
 
             if is_train:
                 (microbatch_loss * self._get_dp_group_size(include_cp=True)).backward()

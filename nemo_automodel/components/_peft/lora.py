@@ -313,6 +313,7 @@ class LinearLoRA(nn.Linear):
 
         Applies LoRA either before or after the dropout, depending on the configuration.
         The result of the original linear transformation is combined with the LoRA output.
+        Mixed input and adapter dtypes require caller-owned ``torch.autocast``.
 
         Args:
             x (Tensor): Input activations of shape ``[B, S, in_features]``
@@ -446,19 +447,6 @@ class LinearLoRA(nn.Linear):
         return lora_res
 
 
-class _TELinearLoRA(LinearLoRA):
-    """Use TE's mixed-storage path while preserving the activation compute dtype."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Map [..., in_features] to [..., out_features] through TE's base and adapters."""
-        if torch.is_autocast_enabled(x.device.type) or x.dtype not in (torch.bfloat16, torch.float16):
-            return super().forward(x)
-        # TE checks all child parameters against the input dtype outside autocast.
-        # Its autocast path casts GEMM operands without changing parameter storage.
-        with torch.autocast(device_type=x.device.type, dtype=x.dtype):
-            return super().forward(x)
-
-
 class TritonLinearLoRA(LinearLoRA):
     """
     Subclass of LinearLoRA that uses triton kernels for forward and backward passes.
@@ -568,10 +556,7 @@ def patch_linear_module(
             raise ValueError("DoRA is not supported for quantized linear layers (e.g., BitsAndBytes).")
         use_triton = False
 
-    if is_te_linear:
-        linear_lora_cls = _TELinearLoRA
-    else:
-        linear_lora_cls = TritonLinearLoRA if use_triton else LinearLoRA
+    linear_lora_cls = TritonLinearLoRA if use_triton else LinearLoRA
     linear_lora_cls._init_adapter(
         orig_linear,
         dim=dim,
@@ -882,10 +867,7 @@ class LoRATritonFunction(torch.autograd.Function):
         if use_triton_kernel:
             lora_res = lora_forward_wrapper(x, lora_A.t(), lora_B.t(), res=None, scale=scale, dtype=dtype)
         else:
-            compute_dtype = (
-                torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
-            )
-            lora_res = F.linear(F.linear(x, lora_A.to(compute_dtype)) * scale, lora_B.to(compute_dtype))
+            lora_res = F.linear(F.linear(x, lora_A) * scale, lora_B)
 
         if res is not None:
             lora_res.add_(res)

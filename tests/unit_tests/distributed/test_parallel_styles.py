@@ -511,16 +511,16 @@ def test_adapter_projection_survives_tp_conversion(style_cls, native, compile_fo
     assert type(module.lora_A) is type(module.lora_B) is LoRAProjection is _LoRAProjection
     assert module.lora_A.weight is original_weight
     assert module.lora_A.bias is module.lora_B.bias is None
-    x = torch.randn(2, 3, 16, dtype=torch.float32 if autocast else torch.bfloat16, requires_grad=True)
+    x = torch.randn(2, 3, 16, dtype=torch.float32, requires_grad=True)
     ref_x = x.detach().clone().requires_grad_()
     run = torch.compile(module.lora_A, backend="aot_eager", fullgraph=True) if compile_forward else module.lora_A
     with torch.autocast("cpu", dtype=torch.bfloat16) if autocast else nullcontext():
         actual = run(x)
-        expected = torch.nn.functional.linear(ref_x, reference_weight.bfloat16())
+        expected = torch.nn.functional.linear(ref_x, reference_weight)
     upstream = torch.randn_like(actual)
     actual.backward(upstream)
     expected.backward(upstream)
-    assert actual.dtype == torch.bfloat16
+    assert actual.dtype == (torch.bfloat16 if autocast else torch.float32)
     assert original_weight.dtype == original_weight.grad.dtype == torch.float32
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(x.grad, ref_x.grad)

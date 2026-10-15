@@ -15,6 +15,7 @@
 """Tests for dLLM strategies (MDLMStrategy, SCDDStrategy, HybridStrategy, DFlashStrategy) and get_dllm_strategy."""
 
 import types
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -327,6 +328,7 @@ class TestIDLMStrategy:
 
     def test_setup_extra_validates_mask_token_id(self, strategy):
         recipe = types.SimpleNamespace(
+            _autocast_context=nullcontext,
             distributed_config=types.SimpleNamespace(cp_size=1),
             model_parts=[
                 types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=1000))
@@ -361,6 +363,7 @@ class TestIDLMStrategy:
 
     def test_setup_extra_rejects_context_parallel(self, strategy):
         recipe = types.SimpleNamespace(
+            _autocast_context=nullcontext,
             distributed_config=types.SimpleNamespace(cp_size=2),
             model_parts=[
                 types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=1000))
@@ -372,6 +375,7 @@ class TestIDLMStrategy:
 
     def test_setup_extra_rejects_flash_attention_2(self, strategy):
         recipe = types.SimpleNamespace(
+            _autocast_context=nullcontext,
             distributed_config=types.SimpleNamespace(cp_size=1),
             model_parts=[
                 types.SimpleNamespace(
@@ -412,6 +416,7 @@ class TestIDLMStrategy:
 
         model = _TinyModel()
         recipe = types.SimpleNamespace(
+            _autocast_context=nullcontext,
             dist_env=types.SimpleNamespace(device=torch.device("cpu")),
             model_parts=[model],
             distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
@@ -546,6 +551,7 @@ class TestUnoStrategy:
         model = _TinyModel()
         apply_lora_to_linear_modules(model, PeftConfig(target_modules=["q_proj"], dim=4, alpha=8, use_triton=False))
         recipe = types.SimpleNamespace(
+            _autocast_context=nullcontext,
             dist_env=types.SimpleNamespace(device=torch.device("cpu")),
             model_parts=[model],
             distributed_config=types.SimpleNamespace(
@@ -599,6 +605,7 @@ class TestUnoStrategy:
             return loss_fn(logits, *args, **kwargs)
 
         recipe = types.SimpleNamespace(
+            _autocast_context=nullcontext,
             dist_env=types.SimpleNamespace(device=torch.device("cpu")),
             model_parts=[model],
             distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
@@ -871,6 +878,7 @@ def test_dflash_setup_extra_resolves_fake_target_and_config(monkeypatch):
     draft_cfg = types.SimpleNamespace(block_size=8, num_target_layers=12, num_hidden_layers=3)
     draft = types.SimpleNamespace(config=draft_cfg)
     recipe = types.SimpleNamespace(
+        _autocast_context=nullcontext,
         cfg={
             "dflash": {
                 "target_model_id": "fake-target",
@@ -999,6 +1007,7 @@ def test_dflash_forward_backward_uses_precomputed_multiblock_tensors(use_fused_l
     strategy.target_head = torch.nn.Linear(5, 11)
     strategy.dflash_loss_fn = DFlashDecayLoss(loss_gamma=2.0, use_fused_linear_ce=use_fused_linear_ce, chunk_size=2)
     recipe = types.SimpleNamespace(
+        _autocast_context=nullcontext,
         dist_env=types.SimpleNamespace(device=torch.device("cpu")),
         model_parts=[draft],
         distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
@@ -1051,6 +1060,7 @@ def test_dflash_forward_backward_fallback_skips_mask_for_single_sdpa_block():
     strategy.dflash_loss_fn = DFlashDecayLoss(loss_gamma=2.0)
     strategy._run_target_forward = lambda input_ids, attention_mask, start: torch.ones(input_ids.size(0), start, 2)
     recipe = types.SimpleNamespace(
+        _autocast_context=nullcontext,
         mask_token_id=31,
         dist_env=types.SimpleNamespace(device=torch.device("cpu")),
         model_parts=[draft],

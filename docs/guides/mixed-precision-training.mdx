@@ -121,6 +121,19 @@ This is usually negligible. When bringing up a new model, fp32 storage (Pattern 
 
 For LoRA fine-tuning, use bf16 storage for frozen base weights and fp32 storage for trainable adapters. This applies to dense layers and MoE experts. Under the default FSDP2 mixed-precision policy, base and adapter matrix multiplications compute in bf16 while adapter storage remains fp32. Frozen base weights require no optimizer state; with `torch.optim.AdamW`, adapter gradients and Adam EMA buffers are fp32.
 
+Recipes own the autocast context around forward and loss computation; backward runs outside it. For FSDP2 PEFT recipes, an unset `distributed.autocast_dtype` defaults to `distributed.mp_policy.param_dtype`, including single-device runs that skip FSDP. Set `distributed.autocast_dtype` explicitly to override this default. DDP requires an explicit value, such as `bfloat16`. Full-parameter training keeps autocast opt-in.
+
+Direct calls to components with mixed input and parameter dtypes must supply autocast. For example, a bf16 linear layer with fp32 LoRA adapters requires:
+
+```python
+with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    output = lora_layer(inputs)
+    loss = loss_fn(output, targets)
+loss.backward()
+```
+
+Grouped expert kernels and custom backward implementations still handle their own operand casts because those operations are not covered by forward autocast.
+
 The following settings can be added to a LoRA recipe with the appropriate target modules:
 
 ```yaml

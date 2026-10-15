@@ -210,6 +210,7 @@ class _ScoreModel(torch.nn.Module):
 def test_recipe_loss_and_gradients_use_float32_before_temperature(monkeypatch, temperature):
     model = _ScoreModel()
     recipe = SimpleNamespace(
+        _autocast_context=nullcontext,
         model_parts=[model],
         temperature=temperature,
         train_n_passages=3,
@@ -219,7 +220,6 @@ def test_recipe_loss_and_gradients_use_float32_before_temperature(monkeypatch, t
         step_scheduler=SimpleNamespace(step=0, epoch=0),
         _acc_buffer=[],
     )
-    monkeypatch.setattr(recipe_module, "_get_autocast_ctx", lambda _: nullcontext())
     monkeypatch.setattr(recipe_module, "get_sync_ctx", lambda *args, **kwargs: nullcontext())
     batch = {"input_ids": torch.ones(6, 2, dtype=torch.long), "labels": torch.zeros(2, dtype=torch.long)}
     scores = model.scores.detach().float().view(2, 3) / temperature

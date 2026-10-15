@@ -208,6 +208,7 @@ def test_cp_vision_frame_sharding_context_resets_published_group_after_failure(m
 
 class _ScheduleSpy:
     def __init__(self):
+        self._loss_fn = None
         self.calls = []
 
     def step(self, model_input=None, *, target=None, losses=None, **batch):
@@ -262,6 +263,7 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(
     recipe.model_parts = [model]
     recipe.pp_enabled = True
     recipe.pp = _PPSpy(
+        parts=[model],
         pp_batch_size=2,
         pp_microbatch_size=pp_microbatch_size,
         info=SimpleNamespace(
@@ -322,10 +324,11 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(
     assert torch.equal(loss_buffer[0], torch.tensor(1.25))
 
 
-class _SunkSpyVLM:
+class _SunkSpyVLM(torch.nn.Module):
     """Sunk VLM: sharder-only CP hook (embeds/shards in forward, consumes nothing)."""
 
     def __init__(self):
+        super().__init__()
         self.calls = []
 
     def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
@@ -333,7 +336,7 @@ class _SunkSpyVLM:
         self.calls.append({"batch": dict(batch), "num_chunks": num_chunks})
         return {}
 
-    def __call__(self, **kwargs):
+    def forward(self, **kwargs):
         raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
 
 
@@ -350,6 +353,7 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model, *, pp_microbatch_size):
     recipe.model_parts = [model]
     recipe.pp_enabled = True
     recipe.pp = _PPSpy(
+        parts=[model],
         pp_batch_size=2,
         pp_microbatch_size=pp_microbatch_size,
         info=SimpleNamespace(

@@ -124,7 +124,7 @@ def tp_linear_forward(
 
 
 class LoRAProjection(torch.nn.Linear):
-    """Adapter projection with independent storage and activation compute dtypes."""
+    """TP-safe adapter projection; mixed storage requires caller-owned autocast."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply a bias-free projection while preserving parameter storage dtype.
@@ -138,5 +138,4 @@ class LoRAProjection(torch.nn.Linear):
         Returns:
             Tensor of shape [..., out_features] in the activation/autocast dtype.
         """
-        dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
-        return tp_linear_forward(x, self.weight.to(dtype), None, mm_for_2d_compile=True)
+        return tp_linear_forward(x, self.weight, None, mm_for_2d_compile=True)

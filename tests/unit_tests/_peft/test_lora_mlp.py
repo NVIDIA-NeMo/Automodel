@@ -434,12 +434,13 @@ def test_fused_mlp_mixed_dtype_matches_unfused(case, act_dtype, lora_dtype, acti
 
 
 @pytest.mark.parametrize("activation", ["swiglu", "relu2"])
-def test_fused_mlp_fp32_storage_bf16_compute_without_autocast(activation):
+def test_fused_mlp_fp32_storage_bf16_compute_with_autocast(activation):
     fused = _mixed_precision_mlp(activation, memory_efficient=True)
     unfused = _mixed_precision_mlp(activation, memory_efficient=False)
     x = torch.randn(2, 8, 32, dtype=torch.bfloat16, requires_grad=True)
     ref_x = x.detach().clone().requires_grad_(True)
-    actual, expected = fused(x), unfused(ref_x)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual, expected = fused(x), unfused(ref_x)
     assert actual.dtype == expected.dtype == torch.bfloat16
     actual.float().square().sum().backward()
     expected.float().square().sum().backward()

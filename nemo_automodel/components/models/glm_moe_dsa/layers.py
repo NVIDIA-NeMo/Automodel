@@ -380,14 +380,20 @@ class GlmMoeDsaIndexer(nn.Module):
         # floating point allows.
         if qkv_format == "thd":
             # q: [T, H, D], k: [T, D]  ->  [T, H, T]
-            scores = torch.matmul(q.float(), k.float().transpose(-1, -2))
+            # Preserve the explicit compute dtype inside recipe autocast.
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                scores = torch.matmul(q.float(), k.float().transpose(-1, -2))
         else:
             # q: [B, S, H, D], k: [B, S, D]  ->  [B, S, H, T]
-            scores = torch.matmul(q.float(), k.float().transpose(-1, -2).unsqueeze(1))
+            # Preserve the explicit compute dtype inside recipe autocast.
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                scores = torch.matmul(q.float(), k.float().transpose(-1, -2).unsqueeze(1))
         scores = torch.relu(scores * self.softmax_scale)
 
         # Head-weighted sum via matmul: weights[..., 1, H] @ scores[..., H, T] -> [..., 1, T].
-        scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
+        # Preserve the explicit compute dtype inside recipe autocast.
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
 
         # Apply attention mask if provided. Convert a {0,1} keep-mask to an additive key mask
         # (kept -> 0, padding -> finfo.min) so padding keys are excluded from the top-k selection,

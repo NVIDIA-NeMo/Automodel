@@ -205,7 +205,7 @@ def _distributed_storage_worker(rank, world_size, rendezvous):
             for name, p in model.named_parameters():
                 full = p.full_tensor() if isinstance(p, DTensor) else p
                 torch.testing.assert_close(full, reference.get_parameter(name), rtol=0.03, atol=0.001)
-        # TP rewrites adapter projection classes; their compute casts must survive that rewrite.
+        # TP rewrites adapter projection classes; caller-owned autocast must still apply.
         from nemo_automodel.components.distributed.parallel_styles import ColwiseParallelLora, RowwiseParallelLora
 
         torch.manual_seed(29)
@@ -218,7 +218,8 @@ def _distributed_storage_worker(rank, world_size, rendezvous):
         reference = copy.deepcopy(model)
         parallelize_module(model, flat_mesh, {"0": ColwiseParallelLora(), "1": RowwiseParallelLora()})
         x = torch.randn(2, 4, 16, dtype=torch.bfloat16)
-        actual, expected = model(x), reference(x)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            actual, expected = model(x), reference(x)
         torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.004)
         actual.sum().backward()
         expected.sum().backward()
@@ -289,7 +290,8 @@ def test_qwen_moe_meta_initialization_and_checkpoint_round_trip(tmp_path):
     model = build()
     inputs = torch.arange(8).view(1, -1)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=0.001)
-    logits = model(inputs).logits
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        logits = model(inputs).logits
     assert logits.dtype == torch.bfloat16
     logits.float().square().mean().backward()
     for name, parameter in model.named_parameters():
@@ -307,7 +309,8 @@ def test_qwen_moe_meta_initialization_and_checkpoint_round_trip(tmp_path):
     restored_optimizer.load_state_dict(checkpoint["optimizer"])
     for name, parameter in restored.named_parameters():
         torch.testing.assert_close(parameter, model.get_parameter(name), rtol=0, atol=0)
-    torch.testing.assert_close(restored(inputs).logits, model(inputs).logits, rtol=0, atol=0)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        torch.testing.assert_close(restored(inputs).logits, model(inputs).logits, rtol=0, atol=0)
     for state in restored_optimizer.state.values():
         assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
 
@@ -331,7 +334,7 @@ def test_lora_storage_default_and_overrides(options, expected):
     "mode",
     ["memory_efficient", "plain", "dora", pytest.param("compile", marks=pytest.mark.run_only_on("GPU"))],
 )
-def test_default_dense_lora_bf16_compute_without_autocast(mode):
+def test_default_dense_lora_bf16_compute_with_autocast(mode):
     from torch.utils._python_dispatch import TorchDispatchMode
 
     class MatmulDtypes(TorchDispatchMode):
@@ -384,12 +387,14 @@ def test_default_dense_lora_bf16_compute_without_autocast(mode):
             bw_compiler=partial(compile_graph, phase="backward"),
         )
         run = torch.compile(module, backend=backend, fullgraph=True)
-        actual = run(x)
+        with torch.autocast(device, dtype=torch.bfloat16):
+            actual = run(x)
         actual.sum().backward()
         assert all(count > 0 for count in graph_gemms.values()), graph_gemms
     else:
         with audit:
-            actual = module(x)
+            with torch.autocast(device, dtype=torch.bfloat16):
+                actual = module(x)
             actual.sum().backward()
     expected.sum().backward()
     assert audit.calls > 0
@@ -402,3 +407,15 @@ def test_default_dense_lora_bf16_compute_without_autocast(mode):
             torch.testing.assert_close(p.grad.bfloat16(), reference.get_parameter(name).grad, rtol=0.02, atol=0.002)
         else:
             assert p.dtype == torch.bfloat16 and p.grad is None
+
+
+@pytest.mark.parametrize("memory_efficient", [False, True])
+def test_mixed_dtype_dense_direct_call_requires_autocast(memory_efficient):
+    """BF16 inputs and FP32 adapters require the caller to select compute precision."""
+    module = LinearLoRA(
+        nn.Linear(16, 16, bias=False, dtype=torch.bfloat16),
+        dim=4,
+        use_memory_efficient_lora=memory_efficient,
+    )
+    with pytest.raises(RuntimeError, match="same dtype"):
+        module(torch.randn(2, 16, dtype=torch.bfloat16))

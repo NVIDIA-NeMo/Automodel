@@ -1297,7 +1297,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
-            with train_ctx(), fp8_ctx:
+            with train_ctx(), fp8_ctx, self._pipeline_autocast_context(self.pp):
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -1362,87 +1362,90 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx, fp8_ctx:
-                batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, LinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            f"{type(self.loss_fn).__name__} requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
-                        )
-                else:
-                    out = model(**batch)
+                with self._autocast_context():
+                    batch = filter_forward_kwargs(model, batch)
+                    if isinstance(self.loss_fn, LinearCrossEntropy):
+                        # use num_logits_to_keep to avoid full logits matrix in memory
+                        out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
+                        if "hidden_states" not in out:
+                            raise ValueError(
+                                f"{type(self.loss_fn).__name__} requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                            )
+                    else:
+                        out = model(**batch)
 
-                # Gather the LM head once and share it across the main loss and
-                # all MTP depths (linear CE path) to avoid redundant
-                # full_tensor() gathers that accumulate on-device and OOM.
-                loss_distributed_kwargs = {}
-                shared_lm_weight = None
-                if isinstance(self.loss_fn, LinearCrossEntropy):
-                    grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
-                    shared_lm_weight = prepare_lm_weight(
-                        self.loss_fn,
-                        model,
-                        grad_reduce_group=grad_reduce_group,
-                    )
-                    loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
-                    if isinstance(self.loss_fn, ChunkedCrossEntropy):
-                        loss_distributed_kwargs["logits_dtype"] = out.logits.dtype
-                # Only forward the domain-mixture weights when configured, so
-                # loss paths that predate them keep their original signature.
-                if loss_weights is not None:
-                    loss_distributed_kwargs["loss_weights"] = loss_weights
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=get_final_hidden_states(out),
-                    lm_weight=shared_lm_weight,
-                    num_label_tokens=num_label_tokens,
-                    **loss_distributed_kwargs,
-                )
-                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
-                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
-                    if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
-                        # CP targets or NEAT document IDs already define the boundaries.
-                        mtp_cu_seqlens = None
-                    elif mtp_is_packed and mtp_cu_seqlens is None:
-                        raise ValueError(
-                            "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
-                            "including padding; cu_seqlens alone is insufficient."
+                    # Gather the LM head once and share it across the main loss and
+                    # all MTP depths (linear CE path) to avoid redundant
+                    # full_tensor() gathers that accumulate on-device and OOM.
+                    loss_distributed_kwargs = {}
+                    shared_lm_weight = None
+                    if isinstance(self.loss_fn, LinearCrossEntropy):
+                        grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
+                        shared_lm_weight = prepare_lm_weight(
+                            self.loss_fn,
+                            model,
+                            grad_reduce_group=grad_reduce_group,
                         )
-                    mtp_cfg = self.cfg.mtp
-                    if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
-                        raise NotImplementedError(
-                            f"{type(model).__name__} produced MTP outputs under context parallelism "
-                            "without globally prepared targets"
-                        )
-                    scaling_factor = (
-                        mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
-                    )
-                    local_loss = local_loss + calculate_mtp_loss(
+                        loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
+                        if isinstance(self.loss_fn, ChunkedCrossEntropy):
+                            loss_distributed_kwargs["logits_dtype"] = out.logits.dtype
+                    # Only forward the domain-mixture weights when configured, so
+                    # loss paths that predate them keep their original signature.
+                    if loss_weights is not None:
+                        loss_distributed_kwargs["loss_weights"] = loss_weights
+                    local_loss = calculate_loss(
                         self.loss_fn,
-                        mtp_per_depth_h=mtp_per_depth_h,
-                        mtp_per_depth_logits=mtp_per_depth_logits,
-                        mtp_per_depth_targets=mtp_per_depth_targets,
-                        seq_idx=mtp_seq_idx,
+                        logits=getattr(out, "logits", out),
                         labels=labels,
                         model=model,
-                        scaling_factor=scaling_factor,
-                        num_label_tokens=num_label_tokens,
-                        ignore_index=ignore_index,
-                        # MTP shifts index physical token slots, including internal THD padding.
-                        cu_seqlens=mtp_cu_seqlens,
+                        hidden_states=get_final_hidden_states(out),
                         lm_weight=shared_lm_weight,
+                        num_label_tokens=num_label_tokens,
                         **loss_distributed_kwargs,
                     )
-                # Autograd retains tensors needed by the losses. Release the
-                # output container and auxiliary aliases before backward so
-                # unused full-vocabulary logits do not overlap its allocations.
-                del out, mtp_per_depth_h, mtp_per_depth_logits
-                loss_buffer.append(local_loss.clone().detach())
+                    mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                    mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                    if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                        if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
+                            # CP targets or NEAT document IDs already define the boundaries.
+                            mtp_cu_seqlens = None
+                        elif mtp_is_packed and mtp_cu_seqlens is None:
+                            raise ValueError(
+                                "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
+                                "including padding; cu_seqlens alone is insufficient."
+                            )
+                        mtp_cfg = self.cfg.mtp
+                        if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
+                            raise NotImplementedError(
+                                f"{type(model).__name__} produced MTP outputs under context parallelism "
+                                "without globally prepared targets"
+                            )
+                        scaling_factor = (
+                            mtp_cfg.scaling_factor
+                            if mtp_cfg.scaling_factor is not None
+                            else out.mtp_loss_scaling_factor
+                        )
+                        local_loss = local_loss + calculate_mtp_loss(
+                            self.loss_fn,
+                            mtp_per_depth_h=mtp_per_depth_h,
+                            mtp_per_depth_logits=mtp_per_depth_logits,
+                            mtp_per_depth_targets=mtp_per_depth_targets,
+                            seq_idx=mtp_seq_idx,
+                            labels=labels,
+                            model=model,
+                            scaling_factor=scaling_factor,
+                            num_label_tokens=num_label_tokens,
+                            ignore_index=ignore_index,
+                            # MTP shifts index physical token slots, including internal THD padding.
+                            cu_seqlens=mtp_cu_seqlens,
+                            lm_weight=shared_lm_weight,
+                            **loss_distributed_kwargs,
+                        )
+                    # Autograd retains tensors needed by the losses. Release the
+                    # output container and auxiliary aliases before backward so
+                    # unused full-vocabulary logits do not overlap its allocations.
+                    del out, mtp_per_depth_h, mtp_per_depth_logits
+                    loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 

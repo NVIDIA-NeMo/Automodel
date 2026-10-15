@@ -495,9 +495,6 @@ class IDLMStrategy(DLLMStrategy):
             else nullcontext()
         )
         autocast_dtype = getattr(recipe.distributed_config, "autocast_dtype", None)
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
-        )
         fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
         cp_sharder = ContextParallelSharder(None, recipe.device_mesh, {})
         train_ctx, _ = cp_sharder.shard({})
@@ -515,20 +512,27 @@ class IDLMStrategy(DLLMStrategy):
             mask_dtype = autocast_dtype or getattr(mp_policy, "param_dtype", None) or torch.float32
             block_mask = create_idlm_sdpa_mask(L, self.block_size, attn, device=device, dtype=mask_dtype)
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx, self._forward_context(model, noisy_input_ids):
-            out = model(
-                input_ids=concat_input_ids,
-                attention_mask=block_mask,
-                position_ids=concat_position_ids,
-                use_cache=False,
-            )
-            logits = out.logits if not torch.is_tensor(out) else out
-            loss_result = self._compute_loss(
-                recipe, logits, clean_input_ids, noise_mask, attn, seq_len=L, num_diffusion_tokens=num_diffusion_tokens
-            )
-            microbatch_loss = loss_result.total_loss
-            loss_buffer.append(microbatch_loss.detach().clone())
-            recipe._dllm_loss_buffer.append(loss_result.dllm_loss)
+        with train_ctx(), sync_ctx, fp8_ctx, self._forward_context(model, noisy_input_ids):
+            with recipe._autocast_context():
+                out = model(
+                    input_ids=concat_input_ids,
+                    attention_mask=block_mask,
+                    position_ids=concat_position_ids,
+                    use_cache=False,
+                )
+                logits = out.logits if not torch.is_tensor(out) else out
+                loss_result = self._compute_loss(
+                    recipe,
+                    logits,
+                    clean_input_ids,
+                    noise_mask,
+                    attn,
+                    seq_len=L,
+                    num_diffusion_tokens=num_diffusion_tokens,
+                )
+                microbatch_loss = loss_result.total_loss
+                loss_buffer.append(microbatch_loss.detach().clone())
+                recipe._dllm_loss_buffer.append(loss_result.dllm_loss)
 
             if is_train:
                 (microbatch_loss * recipe._get_dp_group_size(include_cp=True)).backward()
@@ -1229,60 +1233,59 @@ class DFlashStrategy(DLLMStrategy):
             if is_train
             else nullcontext()
         )
-        autocast_dtype = getattr(recipe.distributed_config, "autocast_dtype", None)
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
-        )
         fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
         cp_sharder = ContextParallelSharder(None, recipe.device_mesh, {})
         train_ctx, _ = cp_sharder.shard({})
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
-            draft_kwargs = dict(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=position_ids,
-                use_cache=False,
-                is_causal=False,
-            )
-            if attn_mask is not None:
-                draft_kwargs["attention_mask"] = attn_mask
-
-            draft_hidden = draft(**draft_kwargs)
-            if not torch.is_tensor(draft_hidden):
-                draft_hidden = getattr(draft_hidden, "last_hidden_state", draft_hidden[0])
-
-            # Extract predicted positions (skip the anchor token at index 0 of
-            # each block). draft_hidden: [B, N*block_size, dim] → [B, N*(block_size-1), dim].
-            pred = draft_hidden.view(B, N, self.block_size, -1)[:, :, 1:, :].reshape(B, N * (self.block_size - 1), -1)
-            if self.use_fused_linear_ce:
-                # Fuse the LM-head projection into the CE — avoids materialising
-                # the [B, N*(block_size-1), vocab] logits tensor (the main OOM
-                # source at large N on a full-vocab target).
-                loss_result = self.dflash_loss_fn.forward_fused(
-                    hidden=pred,
-                    lm_head_weight=self.target_head.weight,
-                    target_ids=block_targets,
-                    block_mask=block_mask,
-                    num_tokens=num_diffusion_tokens,
-                    block_size=self.block_size if N > 1 else None,
-                    lm_head_bias=getattr(self.target_head, "bias", None),
+        with train_ctx(), sync_ctx, fp8_ctx:
+            with recipe._autocast_context():
+                draft_kwargs = dict(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    is_causal=False,
                 )
-            else:
-                logits = self.target_head(pred)
-                loss_result = self.dflash_loss_fn(
-                    logits=logits,
-                    target_ids=block_targets,
-                    block_mask=block_mask,
-                    num_tokens=num_diffusion_tokens,
-                    block_size=self.block_size if N > 1 else None,
+                if attn_mask is not None:
+                    draft_kwargs["attention_mask"] = attn_mask
+
+                draft_hidden = draft(**draft_kwargs)
+                if not torch.is_tensor(draft_hidden):
+                    draft_hidden = getattr(draft_hidden, "last_hidden_state", draft_hidden[0])
+
+                # Extract predicted positions (skip the anchor token at index 0 of
+                # each block). draft_hidden: [B, N*block_size, dim] → [B, N*(block_size-1), dim].
+                pred = draft_hidden.view(B, N, self.block_size, -1)[:, :, 1:, :].reshape(
+                    B, N * (self.block_size - 1), -1
                 )
-            microbatch_loss = loss_result.total_loss
-            loss_buffer.append(microbatch_loss.detach().clone())
-            recipe._dllm_loss_buffer.append(loss_result.dllm_loss)
-            if loss_result.draft_correct_per_pos is not None:
-                recipe._dflash_correct_per_pos_buffer.append(loss_result.draft_correct_per_pos.detach())
-                recipe._dflash_count_per_pos_buffer.append(loss_result.draft_count_per_pos.detach())
+                if self.use_fused_linear_ce:
+                    # Fuse the LM-head projection into the CE — avoids materialising
+                    # the [B, N*(block_size-1), vocab] logits tensor (the main OOM
+                    # source at large N on a full-vocab target).
+                    loss_result = self.dflash_loss_fn.forward_fused(
+                        hidden=pred,
+                        lm_head_weight=self.target_head.weight,
+                        target_ids=block_targets,
+                        block_mask=block_mask,
+                        num_tokens=num_diffusion_tokens,
+                        block_size=self.block_size if N > 1 else None,
+                        lm_head_bias=getattr(self.target_head, "bias", None),
+                    )
+                else:
+                    logits = self.target_head(pred)
+                    loss_result = self.dflash_loss_fn(
+                        logits=logits,
+                        target_ids=block_targets,
+                        block_mask=block_mask,
+                        num_tokens=num_diffusion_tokens,
+                        block_size=self.block_size if N > 1 else None,
+                    )
+                microbatch_loss = loss_result.total_loss
+                loss_buffer.append(microbatch_loss.detach().clone())
+                recipe._dllm_loss_buffer.append(loss_result.dllm_loss)
+                if loss_result.draft_correct_per_pos is not None:
+                    recipe._dflash_correct_per_pos_buffer.append(loss_result.draft_correct_per_pos.detach())
+                    recipe._dflash_count_per_pos_buffer.append(loss_result.draft_count_per_pos.detach())
 
             if is_train:
                 (microbatch_loss * recipe._get_dp_group_size(include_cp=True)).backward()

@@ -1473,6 +1473,7 @@ class MockSchedule:
     """Mock PP schedule that tracks step/eval calls."""
 
     def __init__(self):
+        self._loss_fn = None
         self.step_calls = []
         self.eval_calls = []
 
@@ -1531,10 +1532,12 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
     object.__setattr__(recipe, "device_mesh", None)
     object.__setattr__(recipe, "pp_enabled", True)
+    object.__setattr__(recipe, "model_parts", [DummyModel()])
     object.__setattr__(
         recipe,
         "pp",
         SimpleNamespace(
+            parts=recipe.model_parts,
             info=pp_info,
             pp_batch_size=1,
             pp_microbatch_size=1,
@@ -2381,6 +2384,7 @@ class TestRunTrainOptimStepSetsMoEScale:
                 recipe,
                 "pp",
                 SimpleNamespace(
+                    parts=recipe.model_parts,
                     info=pp_info,
                     pp_batch_size=pp_microbatches,
                     pp_microbatch_size=1,
@@ -3473,6 +3477,7 @@ def test_recipe_profiles_model_and_loss_without_full_logits(tied):
     reference = LlamaForCausalLM(config)
     reference.load_state_dict(model.state_dict())
     recipe = SimpleNamespace(
+        _autocast_context=nullcontext,
         model_parts=[model],
         loss_fn=ChunkedCrossEntropy(8, compile=False),
         dist_env=SimpleNamespace(device=torch.device("cpu")),
@@ -3581,6 +3586,7 @@ def test_qwen35_hidden_state_request_in_recipe(monkeypatch, loss_kind):
     )
     reference = deepcopy(model)
     recipe = SimpleNamespace(
+        _autocast_context=nullcontext,
         model_parts=[model],
         loss_fn=ChunkedCrossEntropy(2, compile=False)
         if loss_kind == "chunked"
@@ -3674,6 +3680,7 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
     assert _maybe_downgrade_loss_fn(loss_fn, model, False) is loss_fn
 
     recipe = SimpleNamespace(
+        _autocast_context=nullcontext,
         model_parts=[model],
         loss_fn=loss_fn,
         dist_env=SimpleNamespace(device=torch.device("cpu")),
@@ -4039,6 +4046,7 @@ def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is
         pp_batch_size=1,
         pp_microbatch_size=1,
         update_seq_len=lambda seq_len: None,
+        parts=[model],
         info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=Schedule()),
     )
     recipe.tokenizer = None
