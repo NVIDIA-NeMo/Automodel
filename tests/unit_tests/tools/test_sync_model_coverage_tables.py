@@ -502,7 +502,7 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                 index_document = index_path.read_text(encoding="utf-8")
                 for label, href in re.findall(r"^- \[`([^`]+)`\]\(([^)]+)\)$", index_document, re.MULTILINE):
                     checkpoint_name = href.rstrip("/").rsplit("/", 1)[-1]
-                    expected_label = display_titles.get(href.strip("/"), checkpoint_name)
+                    expected_label = display_titles.get(href.strip("/"), checkpoint_name).replace(" ", "-")
                     if label != expected_label:
                         offenders.append(
                             f"{provider_slug}: provider index label {label!r} does not match {expected_label!r}"
@@ -544,11 +544,12 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                     continue
                 model_id = frontmatter_slug.rsplit("/", 1)[1]
                 expected_title = display_titles.get(frontmatter_slug, model_id)
+                expected_sidebar = expected_title.replace(" ", "-")
                 sidebar_label = page.get("page")
                 if not isinstance(sidebar_label, str) or not sidebar_label:
                     offenders.append(f"{path}: model entry has no sidebar label")
-                elif sidebar_label != expected_title:
-                    offenders.append(f"{path}: sidebar label {sidebar_label!r} does not match {expected_title!r}")
+                elif sidebar_label != expected_sidebar:
+                    offenders.append(f"{path}: sidebar label {sidebar_label!r} does not match {expected_sidebar!r}")
                 document = model_path.read_text(encoding="utf-8")
                 title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
                 if title_match is None or title_match.group(1) != expected_title:
@@ -654,9 +655,15 @@ def test_model_card_commands_use_checked_in_recipes():
             if "<recipe-path>" in command:
                 offenders.append(f"{path.relative_to(repo_root)}: contains a recipe placeholder")
                 continue
-            if "--model.pretrained_model_name_or_path" in command:
+            checkpoint_override = re.search(r"--model\.pretrained_model_name_or_path\s+(\S+)", command)
+            if checkpoint_override and not Path(checkpoint_override.group(1)).is_absolute():
                 offenders.append(f"{path.relative_to(repo_root)}: substitutes a checkpoint into a different recipe")
             recipe_paths = re.findall(r"examples/[A-Za-z0-9_./-]+\.yaml", command)
+            if not recipe_paths and re.search(r"-c /[A-Za-z0-9_./-]+\.yaml", command):
+                # A local edited config must name its checked-in source recipe in the instructions.
+                recipe_paths = re.findall(
+                    r"Copy `(examples/[A-Za-z0-9_./-]+\.yaml)` to a local configuration", document
+                )
             if len(recipe_paths) != 1:
                 offenders.append(
                     f"{path.relative_to(repo_root)}: command must reference exactly one recipe, found {recipe_paths}"

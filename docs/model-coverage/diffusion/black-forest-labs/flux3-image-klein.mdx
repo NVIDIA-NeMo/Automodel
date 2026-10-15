@@ -1,6 +1,6 @@
 ---
 title: "FLUX 3 Image Klein Base"
-description: "Fine-tune FLUX 3 Image Klein Base for text-to-image generation and instruction-based image editing with NeMo AutoModel."
+description: "Fine-tune FLUX 3 Image Klein Base for text-to-image generation and instruction-based image editing using NeMo AutoModel."
 slug: model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base
 ---
 
@@ -33,10 +33,10 @@ The training workflow below covers **FLUX 3 Image Klein Base**, the non-distille
 
 | Recipe | Description |
 |---|---|
-| [flux3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) | Text-to-image LoRA fine-tuning |
-| [flux3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_t2i_flow.yaml) | Text-to-image full fine-tuning template |
-| [flux3_i2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_i2i_flow.yaml) | Image-editing full fine-tuning template; add the LoRA configuration below for adapter training |
-| [generate_flux3.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/generate/configs/generate_flux3.yaml) | Native image generation with optional trained LoRA weights |
+| [flux3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) | Text-to-image LoRA fine-tuning |
+| [flux3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow.yaml) | Text-to-image full fine-tuning template |
+| [flux3_i2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_i2i_flow.yaml) | Image-editing full fine-tuning template; add the LoRA configuration below for adapter training |
+| [generate_flux3.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_flux3.yaml) | Native image generation with optional trained LoRA weights |
 
 The 100-step validation covers LoRA training. The full fine-tuning templates have not undergone the same end-to-end validation.
 
@@ -124,6 +124,7 @@ uv run --no-sync torchrun --nproc-per-node=2 \
   --step_scheduler.ckpt_every_steps 50 \
   --lr_scheduler.lr_warmup_steps 10 \
   --checkpoint.checkpoint_dir /data/checkpoints/flux3-klein-t2i
+```
 
 Keep the text-to-image recipe's LoRA target list: it excludes the inactive reference-image stream. The recipe uses rank-4 BF16 adapters.
 
@@ -189,7 +190,28 @@ peft:
     - x_embedders.image_cond
 ```
 
-The image-editing training instructions are in [PR #4369](https://github.com/NVIDIA-NeMo/Automodel/pull/4369); they require the proposed implementation and your edited configuration.
+Run the same native training entry point, using your edited configuration:
+
+```bash
+uv run --no-sync torchrun --nproc-per-node=2 \
+  examples/diffusion/finetune/finetune.py \
+  -c /data/configs/flux3_klein_i2i_lora.yaml \
+  --model.pretrained_model_name_or_path /data/models/flux3-image-klein-base \
+  --model.model_type flux3 \
+  --model.attention_backend native \
+  --fsdp.dp_size 2 \
+  --fsdp.activation_checkpointing true \
+  --fsdp.enable_fsdp2_prefetch false \
+  --data.dataloader.cache_dir /data/cache/flux3-klein-i2i \
+  --data.dataloader.num_workers 0 \
+  --optimizer.lr 1e-4 \
+  --lr_scheduler.lr_warmup_steps 10 \
+  --step_scheduler.global_batch_size 2 \
+  --step_scheduler.max_steps 100 \
+  --step_scheduler.ckpt_every_steps 50 \
+  --checkpoint.save_consolidated false \
+  --checkpoint.checkpoint_dir /data/checkpoints/flux3-klein-i2i
+```
 
 For generation, use the same native generation entry point with the image-editing LoRA checkpoint. In a copy of `generate_flux3.yaml`, set `inference.prompts` to editing instructions and `inference.input_images` to the corresponding source-image paths, one per prompt. Use output dimensions that preserve the source image's aspect ratio, with height and width divisible by 16. The tested editing workflow uses one reference image per prompt.
 
