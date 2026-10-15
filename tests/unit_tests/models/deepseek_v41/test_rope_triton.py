@@ -19,9 +19,10 @@ import math
 import pytest
 import torch
 
-from nemo_automodel.components.models.deepseek_v41 import attention, rope_triton
+from nemo_automodel.components.models.common import rope_triton
+from nemo_automodel.components.models.common.rope_triton import HAVE_TRITON, apply_rope_triton
+from nemo_automodel.components.models.deepseek_v41 import attention
 from nemo_automodel.components.models.deepseek_v41.attention import _apply_rope, use_triton_rope
-from nemo_automodel.components.models.deepseek_v41.rope_triton import HAVE_TRITON, apply_rope_triton
 
 _CUDA_AND_TRITON = pytest.mark.skipif(
     not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA and Triton are required for the fused RoPE kernel"
@@ -125,7 +126,7 @@ def test_use_triton_rope_toggles_dispatch(monkeypatch):
 def test_eager_mirror_matches_attention_apply_rope(shape, inverse, dtype):
     values, angles, _ = _inputs(shape, 4, dtype, "cpu")
     assert torch.equal(
-        rope_triton._apply_rope_torch(values, angles, inverse=inverse), _apply_rope(values, angles, inverse=inverse)
+        rope_triton.apply_rope_triton(values, angles, inverse=inverse), _apply_rope(values, angles, inverse=inverse)
     )
 
 

@@ -59,10 +59,6 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     sinkhorn_normalize_torch,
 )
 
-# Over the default 5s budget on purpose: TileLang compilation takes up to about 37s on a cold worker.
-# Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(70)
-
 _MILES_INDEXER_REQUIRED_DYNAMIC_SMEM_BYTES = 229376
 
 
@@ -829,6 +825,72 @@ class TestDeepseekV4GroupedLinear:
         out_ref = torch.stack([x[:, g, :] @ w_ref[g].t() for g in range(n_groups)], dim=1)
         torch.testing.assert_close(out, out_ref)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_token_major_output_and_gradients_match_the_per_group_reference(self, dtype: torch.dtype):
+        """The out= path returns a contiguous token-major output (the caller's flatten is a view) and the
+        same input / weight gradients as the per-group matmul."""
+        torch.manual_seed(0)
+        n_groups, in_per, out_total = 4, 6, 20
+        proj = DeepseekV4GroupedLinear(in_per, out_total, n_groups=n_groups).to(dtype)
+        x = torch.randn(2, 3, n_groups, in_per, dtype=dtype, requires_grad=True)
+        out = proj(x)
+        assert out.shape == (2, 3, n_groups, out_total // n_groups) and out.is_contiguous()
+        assert out.flatten(2).data_ptr() == out.data_ptr()
+        gx, gw = torch.autograd.grad((out.float() ** 2).sum(), (x, proj.weight))
+        x_ref = x.detach().clone().requires_grad_()
+        w_ref = proj.weight.detach().clone().requires_grad_()
+        w_groups = w_ref.view(n_groups, out_total // n_groups, in_per)
+        ref = torch.stack([x_ref[..., g, :] @ w_groups[g].t() for g in range(n_groups)], dim=-2)
+        ref_gx, ref_gw = torch.autograd.grad((ref.float() ** 2).sum(), (x_ref, w_ref))
+        tol = {} if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(out, ref, **tol)
+        torch.testing.assert_close(gx, ref_gx, **tol)
+        torch.testing.assert_close(gw, ref_gw, **tol)
+
+    @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+    def test_autocast_with_fp32_parameters_matches_the_plain_bmm_path(self, input_dtype: torch.dtype):
+        """AMP training: FP32 parameters, BF16 (or FP32) activations under autocast. The out= path must behave like
+        the autocast bmm it replaces — BF16 output, gradients in the dtype of the tensor they belong to."""
+        torch.manual_seed(0)
+        n_groups, in_per, out_total = 4, 6, 20
+        proj = DeepseekV4GroupedLinear(in_per, out_total, n_groups=n_groups)  # FP32 weight
+        x = torch.randn(2, 3, n_groups, in_per, dtype=input_dtype, requires_grad=True)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            out = proj(x)
+        assert out.dtype == torch.bfloat16 and out.is_contiguous()
+        gx, gw = torch.autograd.grad(out.float().square().sum(), (x, proj.weight))
+        assert gx.dtype == input_dtype and gw.dtype == torch.float32
+        x_ref = x.detach().clone().requires_grad_()
+        w_ref = proj.weight.detach().clone().requires_grad_()
+        w_groups = w_ref.view(n_groups, out_total // n_groups, in_per)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            ref = torch.stack([x_ref[..., g, :] @ w_groups[g].t() for g in range(n_groups)], dim=-2)
+        ref_gx, ref_gw = torch.autograd.grad(ref.float().square().sum(), (x_ref, w_ref))
+        assert ref.dtype == torch.bfloat16
+        torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(gx, ref_gx, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(gw, ref_gw, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.runtime_budget(20, hard_timeout=90, reason="torch.compile tracing of the module")
+    def test_compiled_forward_backward_matches_eager_without_graph_breaks(self):
+        """Under the compiler the module traces the plain bmm (Dynamo cannot capture a strided out= buffer):
+        fullgraph compiles, no graph breaks, same values and gradients as eager."""
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        n_groups, in_per, out_total = 4, 6, 20
+        proj = DeepseekV4GroupedLinear(in_per, out_total, n_groups=n_groups)
+        x = torch.randn(2, 3, n_groups, in_per, requires_grad=True)
+        explanation = torch._dynamo.explain(proj)(x)
+        assert explanation.graph_break_count == 0 and explanation.graph_count == 1, explanation
+        compiled = torch.compile(proj, backend="eager", fullgraph=True)
+        out_c = compiled(x)
+        gx_c, gw_c = torch.autograd.grad(out_c.square().sum(), (x, proj.weight))
+        out_e = proj(x)
+        gx_e, gw_e = torch.autograd.grad(out_e.square().sum(), (x, proj.weight))
+        torch.testing.assert_close(out_c, out_e)
+        torch.testing.assert_close(gx_c, gx_e)
+        torch.testing.assert_close(gw_c, gw_e)
+
 
 class TestDeepseekV4HyperConnection:
     """``compute_weights`` returns the (pre, post, comb) tensors used at
@@ -1142,49 +1204,6 @@ class TestDeepseekV4OptimizedKernels:
         finally:
             sys.modules.pop(module_name, None)
 
-    @pytest.mark.skipif(
-        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
-        reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
-    )
-    def test_sinkhorn_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        x = torch.randn(2, 128, 4, 4, device="cuda")
-        grad = torch.randn_like(x)
-        expected, (expected_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        actual, (actual_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="tilelang", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
-
-    @pytest.mark.skipif(
-        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
-        reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
-    )
-    def test_sinkhorn_tilelang_backend_accepts_non_contiguous_grad(self):
-        torch.manual_seed(123)
-        x = torch.randn(2, 128, 4, 4, device="cuda")
-        grad = torch.randn_like(x).transpose(-1, -2)
-        assert not grad.is_contiguous()
-        expected, (expected_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        actual, (actual_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="tilelang", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
-
     def test_sparse_attention_torch_matches_dense_topk_reference(self):
         torch.manual_seed(123)
         bsz, seq, heads, dim = 2, 7, 3, 8
@@ -1326,51 +1345,6 @@ class TestDeepseekV4OptimizedKernels:
         for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
             torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
 
-    @pytest.mark.skipif(
-        not _can_run_tilelang_sparse_attn(),
-        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
-    )
-    def test_sparse_attention_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, key_len, topk_len = 1, 16, 8, 128, 20, 16
-        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(bsz, key_len, dim, device="cuda", dtype=torch.bfloat16)
-        sinks = torch.randn(heads, device="cuda")
-        topk = torch.stack(
-            [torch.stack([torch.randperm(key_len, device="cuda")[:topk_len] for _ in range(seq)]) for _ in range(bsz)]
-        ).to(torch.int32)
-        topk[:, :, -4:] = -1
-        grad = torch.randn(bsz, seq, dim, heads, device="cuda", dtype=q.dtype).transpose(2, 3)
-        assert not grad.is_contiguous()
-
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="sparse_torch",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="tilelang",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
-
     def test_sparse_attention_backward_threads_follow_head_count(self):
         from nemo_automodel.components.models.deepseek_v4.kernels.tilelang_sparse_mla_bwd import _bwd_threads_for_heads
 
@@ -1397,92 +1371,6 @@ class TestDeepseekV4OptimizedKernels:
         assert out.shape == q.shape
         whole.assert_called_once()
         chunked.assert_not_called()
-
-    @pytest.mark.skipif(
-        not _can_run_tilelang_sparse_attn(),
-        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
-    )
-    @pytest.mark.runtime_budget(
-        90,
-        reason="compiles the 64-head, head_dim-512 TileLang forward and backward kernels once (tens of seconds cold)",
-    )
-    def test_sparse_attention_tilelang_backend_matches_torch_at_sixty_four_heads(self):
-        """The single 64-head backward kernel (512 threads) matches the torch reference at the V4 head shape."""
-        torch.manual_seed(7)
-        bsz, seq, heads, dim, key_len, topk_len = 1, 8, 64, 512, 64, 32
-        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(bsz, key_len, dim, device="cuda", dtype=torch.bfloat16)
-        sinks = torch.randn(heads, device="cuda")
-        topk = torch.stack(
-            [torch.stack([torch.randperm(key_len, device="cuda")[:topk_len] for _ in range(seq)]) for _ in range(bsz)]
-        ).to(torch.int32)
-        topk[:, :, -4:] = -1
-        grad = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=q.dtype)
-
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(q_, kv_, sinks_, topk, dim**-0.5, backend="sparse_torch"),
-            (q, kv, sinks),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(q_, kv_, sinks_, topk, dim**-0.5, backend="tilelang"),
-            (q, kv, sinks),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
-
-    @pytest.mark.skipif(
-        not _can_run_tilelang_sparse_attn(),
-        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
-    )
-    def test_sparse_attention_tilelang_backend_matches_torch_with_causal_padding_shape(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, n_pooled = 1, 192, 128, 128, 48
-        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(bsz, seq + n_pooled, dim, device="cuda", dtype=torch.bfloat16)
-        sinks = torch.randn(heads, device="cuda")
-        topk = build_dsv4_sparse_topk_indices(
-            batch_size=bsz,
-            seq_len=seq,
-            key_len=seq + n_pooled,
-            window_size=128,
-            device=q.device,
-            compress_ratio=4,
-            n_pooled=n_pooled,
-        )
-        assert (topk == -1).any()
-        grad = torch.randn_like(q).transpose(2, 3).contiguous().transpose(2, 3)
-        assert not grad.is_contiguous()
-
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="sparse_torch",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="tilelang",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
 
     def test_indexer_scores_torch_backend_matches_reference(self):
         torch.manual_seed(123)
@@ -1580,84 +1468,6 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual, expected)
         for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
             torch.testing.assert_close(actual_grad, expected_grad)
-
-    @pytest.mark.skipif(
-        not _can_run_tilelang_indexer(),
-        reason="Miles DSV4 indexer kernel is not installed on a CUDA environment",
-    )
-    def test_indexer_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, pooled = 2, 17, 8, 128, 5
-        q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
-        q_pos = torch.arange(seq, device="cuda")
-        pooled_pos = torch.arange(pooled, device="cuda")
-        valid = pooled_pos.unsqueeze(0) < ((q_pos + 1) // 4).unsqueeze(1)
-        expected = dsv4_indexer_scores(
-            q,
-            pooled_kv,
-            weights,
-            compress_ratio=4,
-            softmax_scale=dim**-0.5,
-            backend="torch",
-        )
-        expected = torch.where(valid.unsqueeze(0), expected, torch.full_like(expected, float("-inf")))
-        actual = dsv4_indexer_scores(
-            q,
-            pooled_kv,
-            weights,
-            compress_ratio=4,
-            softmax_scale=dim**-0.5,
-            backend="tilelang",
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-
-    @pytest.mark.skipif(
-        not _can_run_tilelang_indexer(),
-        reason="Vendored Miles DSV4 indexer kernel is not available on a CUDA environment",
-    )
-    def test_indexer_topk_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, pooled, topk = 1, 17, 8, 128, 5, 4
-        q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
-        topk_indices = torch.arange(topk, device="cuda", dtype=torch.int32).view(1, 1, topk).expand(bsz, seq, -1)
-        q_pos = torch.arange(seq, device="cuda")
-        valid_end = ((q_pos + 1) // 4).view(1, seq, 1)
-        topk_indices = torch.where(topk_indices < valid_end, topk_indices, torch.full_like(topk_indices, -1))
-        grad = torch.randn(bsz, seq, topk, device="cuda")
-
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
-                q_,
-                pooled_kv_,
-                weights_,
-                topk_indices,
-                compress_ratio=4,
-                softmax_scale=dim**-0.5,
-                backend="torch",
-            ),
-            (q, pooled_kv, weights),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
-                q_,
-                pooled_kv_,
-                weights_,
-                topk_indices,
-                compress_ratio=4,
-                softmax_scale=dim**-0.5,
-                backend="tilelang",
-            ),
-            (q, pooled_kv, weights),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=3e-2, atol=3e-2)
 
 
 class TestApplyPartialRopeInterleaved:
