@@ -777,6 +777,8 @@ navigation:
                 path: ../../model-coverage/diffusion/black-forest-labs/flux.mdx
               - page: "FLUX.2-dev"
                 path: ../../model-coverage/diffusion/black-forest-labs/flux2.mdx
+              - page: "FLUX 3 Image Klein Base"
+                path: ../../model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx
           - section: "Diffusers"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRuACAABXRUJQVlA4TNMCAAAvE8AEAA8GO7Jt09aaa+Pq2U7g/Tn/aK7NrTXTgB3Jtqpq1tkHhwT4IwbyT4QE5LnLkb0g17abMPqSHWZYUf/F5GSfEpJhHoOkP/9BsxhoEBEBgcQgEA2EDHCQkFFCcCIBCBBQIiBAACgAAgEoNujGDBbQuqNJ+GMD6gSpAxYAkUDNQICYKiJEsm4BOPEWrEKlzsK5AajdsBn+Uhugg9SdX0CJf+lfVA0oqmRghlMW6KLHL78iRYFk99bU6fIyYYAhmgGTuHT7Si6K6dIk7rrhJl0YcEqoWXWfVFdzsQRUdUlAqN6125Y3g/hmm2JgM+9VuQ4cGVFl6qVZgcMCrjTjn258QK7/ZnMlW0kktVOxo5wpVCdsClO4+OMdOJvuQkETi9IlMrRGDM6/NhqQo6khmhJmddA3bSoRLkpxz47f/umVNf1PdDFyZMwkzF22Qbhjgp0UJHI68VAqpq2/EdgPhywswybDPp8ZIk36DPewzmIs5DFTQ0y/x762GxdSh+WvcNkLbiZeACP/i6vyoq7OL8Jh5KMeQGvb/7HnzUYcZy5U1J7PGa+FWVtZvF/E36r8ECTYtm3a0U5efmyeF9u2bdu2bdu2bduoattXFyL6PwHgKxMepgQhJRiPqmpDMAIxgFZZrjarTAKIw7sy0B2Cc+BT2tXqSqT/P5gPB74tdSWdASxCH/MlwQLgwK+hqb0jCLJSBnkhDMsCHPg3Nvf0xwDZ97G6IHB71rb19kUBOUUzIyaKzM/7N9zqi7sHo4Gs0bmHW1vg6+kTRhUDNZFA5tDSxI0TrO29/hwZ6JVHQD1jeHl83hzOV5vxohogANL/ZlfGFsxgdfl6eqGjQmDkmbipwulFU1iu7Zw9J8mzAIiM7yYLTGG5ur17lAgxcBPs0i3gsr61d5gsogDeBOD37Xr/IAWqLB+QJqWdv5ykQo0gIJHDxvGHiKoGBCbYJMgRgScA"/></svg>'
             slug: diffusers
