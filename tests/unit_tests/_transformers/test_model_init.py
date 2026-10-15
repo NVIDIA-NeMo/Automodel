@@ -793,6 +793,7 @@ def test_remote_code_cache_serialization_uses_model_process_group(tmp_path):
     first_rank.assert_called_once_with(group=process_group)
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestGetHfConfigNestedKwargs:
     """get_hf_config should filter nested dict kwargs from AutoConfig.from_pretrained."""
 
@@ -837,6 +838,7 @@ class TestGetHfConfigNestedKwargs:
         assert "config" not in call_kwargs
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestGetHfConfigCustomRegistry:
     """get_hf_config should prefer Automodel's config registry over Transformers AutoConfig."""
 
@@ -923,6 +925,7 @@ class TestResolveCustomConfigRegistry:
         assert reg.resolve_custom_config_cls("bert") is FakeConfig
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestDictConfigOverrideKeepsCustomPath:
     """NVBugs 6259955 Defect 2: --model.config.* overrides must not flip dispatch off the
     custom model path, and the dict ``config`` must not reach the model constructor."""
@@ -978,7 +981,6 @@ class TestDictConfigOverrideKeepsCustomPath:
         self, mock_resolve_cls, mock_get_hf_config, mock_download, mock_restore
     ):
         hf_config = self._make_config()
-        hf_config._commit_hash = "a" * 40
         mock_get_hf_config.return_value = hf_config
         captured_kwargs = {}
 
@@ -1002,6 +1004,7 @@ class TestDictConfigOverrideKeepsCustomPath:
             force_download=True,
             subfolder="nested",
             code_revision="code-main",
+            revision="a" * 40,
         )
 
         assert is_custom is True
@@ -1013,7 +1016,6 @@ class TestDictConfigOverrideKeepsCustomPath:
                 "force_download",
                 "subfolder",
                 "revision",
-                "_commit_hash",
                 "code_revision",
             }
             & captured_kwargs.keys()
@@ -1397,12 +1399,13 @@ class TestLayerTypesFix:
         mock_get_dict.return_value = (cfg_dict, {})
 
         fake_cls = MagicMock()
-        fake_cls.from_dict.return_value = "built"
+        built = PretrainedConfig()
+        fake_cls.from_dict.return_value = built
         mock_mapping.get.side_effect = lambda k: fake_cls if k == "step3p5" else None
 
         result = _load_config_with_layer_types_fix("some/model", "flash_attention_2", trust_remote_code=False)
 
-        assert result == "built"
+        assert result is built
         passed_dict = fake_cls.from_dict.call_args[0][0]
         assert len(passed_dict["layer_types"]) == 45
         mock_mapping.get.assert_called_once_with("step3p5")
@@ -1436,6 +1439,7 @@ class TestLayerTypesFix:
             _load_config_with_layer_types_fix("some/model", "sdpa", trust_remote_code=False)
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestGetHfConfigLayerTypesRetry:
     """get_hf_config should retry via the layer_types fix helper when AutoConfig raises."""
 
@@ -1620,9 +1624,9 @@ def test_direct_config_and_weights_keep_one_revision(hf_config_hub, monkeypatch)
     from nemo_automodel._transformers import model_init
 
     root, cache, ref, requests = hf_config_hub
-    config = get_hf_config("test/config-race", "eager", cache_dir=str(root))
+    revision = model_init.AutoConfig.resolve_revision("test/config-race", cache_dir=str(root))
+    config = get_hf_config("test/config-race", "eager", cache_dir=str(root), revision=revision)
     assert config.n_embd == 64
-    assert config._commit_hash == "b" * 40
     # Another caller advances or rewrites main after this model chose its config.
     ref.write_text("a" * 40)
     selected = []
@@ -1633,7 +1637,9 @@ def test_direct_config_and_weights_keep_one_revision(hf_config_hub, monkeypatch)
         return path
 
     monkeypatch.setattr(model_init, "snapshot_download", download)
-    model_init._download_model_weights(config, "test/config-race", cache_dir=str(root), local_files_only=True)
+    model_init._download_model_weights(
+        config, "test/config-race", revision=revision, cache_dir=str(root), local_files_only=True
+    )
     assert selected == [str(cache / "snapshots" / ("b" * 40))]
     assert ref.read_text() == "a" * 40
 
@@ -1648,10 +1654,49 @@ def test_registered_config_keeps_resolved_commit(hf_config_hub, monkeypatch):
     config = get_hf_config("test/config-race", "eager", cache_dir=str(root))
     assert isinstance(config, GPT2Config)
     assert config.n_embd == 64
-    assert config._commit_hash == "b" * 40
+    assert not hasattr(config, "_commit_hash")
 
 
 def test_streaming_directory_uses_config_snapshot_and_subfolder(hf_config_hub):
     root, cache, _, _ = hf_config_hub
     result = _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root), subfolder="nested")
     assert result == str(cache / "snapshots" / ("b" * 40) / "nested")
+
+
+def test_model_owned_metadata_reads_keep_explicit_revision(hf_config_hub, monkeypatch):
+    import json
+    from pathlib import Path
+
+    from huggingface_hub import hf_hub_download
+
+    from nemo_automodel._transformers import model_init
+
+    root, _, ref, _ = hf_config_hub
+    revision = model_init.AutoConfig.resolve_revision("test/config-race", cache_dir=root)
+    config = get_hf_config("test/config-race", "eager", cache_dir=root, revision=revision)
+    ref.write_text("a" * 40)
+
+    config.architectures = ["MetadataModel"]
+
+    class MetadataModel(nn.Module):
+        def __init__(self, config, *, revision):
+            super().__init__()
+            self.config = config
+            metadata = hf_hub_download("test/config-race", "config.json", revision=revision, cache_dir=root)
+            self.width = json.loads(Path(metadata).read_text())["n_embd"]
+
+    monkeypatch.setattr(model_init, "_resolve_custom_model_cls_for_config", lambda *args: MetadataModel)
+    is_custom, model = _init_model(
+        cls=MagicMock(),
+        pretrained_model_name_or_path_or_config=config,
+        attn_implementation="eager",
+        torch_dtype="auto",
+        quantization_config=None,
+        force_hf=False,
+        revision=revision,
+        cache_dir=root,
+        local_files_only=True,
+    )
+    assert is_custom
+    assert model.width == config.n_embd == 64
+    assert ref.read_text() == "a" * 40

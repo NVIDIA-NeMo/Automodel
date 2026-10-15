@@ -28,4 +28,4 @@ fi
 TRANSFORMERS_OFFLINE=1 python3 \
     -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 \
     -m coverage run \
-    tests/functional_tests/moe/run_hybridep_unequal_tokens.py --all-variants --prepared-extent
+    tests/functional_tests/moe/run_hybridep_unequal_tokens.py --all-variants

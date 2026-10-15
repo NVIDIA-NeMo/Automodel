@@ -553,13 +553,20 @@ def _replay_hybridep_dispatch_on_recompute(
         def scoped(mode: str, inner: AbstractContextManager):
             if mode == "replay":
                 recorder.rewind()
+                # Read the dispatch extents here, before the recompute op context
+                # opens: the copies started at the end of the checkpoint forward
+                # have normally completed by now, so this is at most a wait on an
+                # event that has already fired (once per microbatch, never once per
+                # layer), and no aten op enters the recompute trace.
+                recorder.resolve()
             with hybridep_dispatch_replay_scope(recorder, mode):
                 with inner:
                     yield
                 if mode == "record":
-                    # Cache the dispatch extents only after the selective-op
-                    # context exits. Recompute can then reuse them without an
-                    # extra aten.sum that would diverge from the forward trace.
+                    # Start the extent copies only after the selective-op context
+                    # exits (no extra aten.sum in the forward trace) and without a
+                    # host synchronization — reading them per block stalled the
+                    # launch queue once per layer per microbatch.
                     recorder.finalize()
 
         return scoped("record", forward_context), scoped("replay", recompute_context)
@@ -575,6 +582,19 @@ def _uses_hybridep_dispatch(model: nn.Module) -> bool:
     return any(
         isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsTE))
         and getattr(module, "dispatcher_backend", None) == "hybridep"
+        for module in modules()
+    )
+
+
+def _uses_hybridep_capacity_mode(model: nn.Module) -> bool:
+    """Return whether any HybridEP expert module runs capacity mode (``dispatcher_capacity_factor``)."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return False
+    return any(
+        isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsTE))
+        and getattr(module, "dispatcher_backend", None) == "hybridep"
+        and getattr(module, "dispatcher_capacity_factor", None) is not None
         for module in modules()
     )
 
@@ -622,6 +642,16 @@ def apply_ac(
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
     uses_hybridep_dispatch = checkpoint_decoder and _uses_hybridep_dispatch(model)
+    if checkpoint_decoder and not ignore_router and not selective and _uses_hybridep_capacity_mode(model):
+        # Without a replay recorder the recompute dispatch runs in capacity mode (``capacity`` rows)
+        # while the first forward dispatch was the blocking calibration (``actual`` rows), and
+        # non-reentrant checkpointing fails on the shape mismatch on every run.
+        raise ValueError(
+            "dispatcher_capacity_factor needs the routing pinned across the activation-checkpoint recompute: "
+            "set distributed.moe.ignore_router_for_ac=true (the default) or use selective activation "
+            "checkpointing; with ignore_router_for_ac=false and full checkpointing the recompute dispatch "
+            "is sized to the capacity while the forward calibration dispatch was not"
+        )
     repeated_mtp_moe_block_ids = _repeated_mtp_moe_block_ids(model) if checkpoint_decoder else set()
     if repeated_mtp_moe_block_ids:
         logger.info(
@@ -1256,8 +1286,6 @@ def parallelize_model(
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
-        parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
-        parallelizer_utils.reject_unsupported_mtp_cp(model)
         apply_cp(model, world_mesh[cp_axis_name])
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1

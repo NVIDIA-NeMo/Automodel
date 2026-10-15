@@ -140,41 +140,77 @@ logger = logging.getLogger(__name__)
 
 
 class HybridEPDispatchReplayRecorder:
-    """Record HybridEP layouts from checkpoint forward for deterministic replay."""
+    """Record HybridEP layouts from checkpoint forward for deterministic replay.
+
+    HybridEP's sync-free replay API expects the dispatched-token extent as a host
+    integer. Reading it with ``.item()`` right after every checkpointed block
+    stalls the host until the GPU has drained that block, once per layer per
+    microbatch; on a pipeline-parallel step those stalls surface as idle GPU time.
+    The recorder therefore splits the read in two: :meth:`finalize` (called when
+    the checkpoint-forward op context exits) runs the reduction and starts an
+    asynchronous device-to-host copy, and :meth:`resolve` (called when the
+    recompute context opens, long after the copy completed) turns the pinned
+    scalars into integers. Neither step runs inside a checkpoint op context, so
+    the forward and recompute traces stay identical.
+    """
 
     def __init__(self) -> None:
         self._records: list = []
+        self._copies: list = []
         self._cursor = 0
         self.replay_misses = 0
 
-    def record(
-        self,
-        handle: object,
-        tokens_per_expert: torch.Tensor,
-        num_permuted_tokens: int | torch.Tensor | None = None,
-    ) -> None:
-        """Record the dispatch layout and any exact host-known output extent.
+    def record(self, handle, tokens_per_expert, num_permuted_tokens=None) -> None:
+        """Log one checkpoint-forward dispatch.
+
+        When the forward already ran with a host ``int`` extent (capacity mode), that integer is
+        the extent its output was sized to and the one the replay must reuse; recording it also
+        spares ``finalize`` the device-to-host copy for that dispatch (a pre-filled extent is skipped).
 
         Args:
-            handle: Opaque HybridEP dispatch handle retained for recomputation.
-            tokens_per_expert: Integer counts with shape [local_experts].
-            num_permuted_tokens: Exact host integer for static routing, or a scalar
-                tensor with shape [] or None when finalization must derive the
-                count from metadata.
+            handle: HybridEP dispatch handle the recompute replays from.
+            tokens_per_expert: ``[num_local_experts]`` integer tensor of rows per local expert; when no
+                host extent is recorded, ``finalize`` copies its sum to the host asynchronously and
+                ``resolve`` reads it when the recompute opens.
+            num_permuted_tokens: Host ``int`` extent the forward output was sized to (capacity mode), or
+                a tensor / ``None`` (blocking path, static-routing pin) when ``finalize`` must reduce it.
         """
         extent = num_permuted_tokens if isinstance(num_permuted_tokens, int) else None
         self._records.append([handle, tokens_per_expert, extent])
+        self._copies.append(None)
 
     def finalize(self) -> None:
-        """Cache each layout extent after the checkpoint-forward op context exits."""
-        for entry in self._records:
-            if entry[2] is None:
-                # HybridEP's sync-free replay API expects a host integer.  Do
-                # both the reduction and device-to-host scalar conversion only
-                # after the selective-checkpoint context exits; otherwise the
-                # replay-only conversion adds aten._local_scalar_dense to the
-                # recompute trace.
-                entry[2] = int(entry[1].sum().item())
+        """Start the device-to-host copy of each layout extent (no host synchronization).
+
+        Runs after the checkpoint-forward op context exits, so the reduction does
+        not enter the forward trace; CPU tensors are converted immediately.
+        """
+        for index, entry in enumerate(self._records):
+            if entry[2] is not None or self._copies[index] is not None:
+                continue
+            extent = entry[1].sum()
+            if extent.is_cuda:
+                host = torch.empty((), dtype=extent.dtype, device="cpu", pin_memory=True)
+                host.copy_(extent, non_blocking=True)
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(extent.device))
+                self._copies[index] = (host, ready)
+            else:
+                entry[2] = int(extent)
+
+    def resolve(self) -> None:
+        """Turn the copied extents into host integers, waiting only for copies still in flight.
+
+        Called when the recompute context opens — outside its op context, so the
+        conversion never enters the recompute trace.
+        """
+        self.finalize()
+        for index, entry in enumerate(self._records):
+            if entry[2] is None and self._copies[index] is not None:
+                host, ready = self._copies[index]
+                ready.synchronize()
+                entry[2] = int(host)
+                self._copies[index] = None
 
     def take(self):
         """Return the next forward dispatch record, or ``None`` on divergence."""
@@ -183,6 +219,8 @@ class HybridEPDispatchReplayRecorder:
             return None
         entry = self._records[self._cursor]
         self._cursor += 1
+        if entry[2] is None:
+            self.resolve()
         return entry
 
     def rewind(self) -> None:
@@ -975,6 +1013,11 @@ class HybridEPCombine(torch.autograd.Function):
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
             fuse_permute_dispatch=ctx.fuse_permute,
+            # Capacity mode hands a host int: the backward dispatch then needs no stream drain either.
+            # The static-routing pin is a 0-d tensor (``tokens_per_expert.sum()``): the forward treats
+            # any non-None extent as non-blocking, but the backward keeps that pin on the blocking path
+            # as before this change, which only moves the capacity path off the drain.
+            non_blocking=isinstance(ctx.num_permuted_tokens, int),
         )
         return dispatched_hidden, None, None, None, None
 

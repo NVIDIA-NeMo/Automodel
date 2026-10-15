@@ -14,10 +14,9 @@
 # limitations under the License.
 
 import logging
+import math
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Literal, Tuple
 
@@ -375,16 +374,41 @@ class _HybridEPMetadataProcessor(nn.Module):
 # DeepEP's hybrid-ep metadata allgather asserts bytes_per_rank % 16 == 0 on a
 # 4-byte-per-token array, so per-rank token counts must be multiples of 4.
 _HYBRIDEP_TOKEN_ALIGNMENT = 4
+
+
+def _align_up(count: int, multiple: int) -> int:
+    """Round ``count`` up to the next multiple of ``multiple``."""
+    return -(-count // multiple) * multiple
+
+
 # Benchmark A/B switch for the static-routing pad-size pin (default on); see _HybridEPManager.dispatch.
 _STATIC_ROUTING_PAD_PIN = os.environ.get("NEMO_STATIC_ROUTING_PAD_PIN", "1") != "0"
 
 
-@dataclass(frozen=True)
-class _HybridEPDispatchExtent:
-    """EP-negotiated input extent valid only within one pipeline schedule."""
+def _assert_no_hybridep_overflow(handle, capacity: int) -> None:
+    """Device-side guard: HybridEP truncates silently when the capacity is exceeded and sets
+    ``overflow_flag``, the last handle item; fail loudly instead of training on dropped tokens.
 
-    num_tokens: int
-    device: torch.device
+    Args:
+        handle: HybridEP dispatch handle (tuple). Its last item is the one-element device
+            ``overflow_flag`` tensor, non-zero after a truncated dispatch. DeepEP keeps the flag last
+            precisely so callers read it as ``handle[-1]`` (the slot count changed at 10d4dd7, which
+            inserted ``num_of_valid_tokens`` before it).
+        capacity: Permuted-row capacity the dispatch buffers were sized to (quoted in the message).
+    """
+    if not isinstance(handle, (tuple, list)) or not handle or not torch.is_tensor(handle[-1]):
+        # The guard is the only thing standing between a truncated dispatch and silently dropped
+        # tokens, so an unexpected handle layout is an error here, not a no-op.
+        raise RuntimeError(
+            "HybridEP dispatch handle does not end with the overflow_flag tensor (expected the DeepEP 10d4dd7 "
+            f"layout, got {type(handle).__name__} of length {len(handle) if hasattr(handle, '__len__') else '?'}); "
+            "the capacity-mode overflow guard cannot run on this HybridEP build"
+        )
+    flag = handle[-1]
+    torch._assert_async(
+        (flag == 0).reshape(()),
+        f"HybridEP dispatch overflowed its capacity of {capacity} permuted rows; raise BackendConfig.dispatcher_capacity_factor",
+    )
 
 
 class _HybridEPManager(_DispatchManager):
@@ -416,6 +440,8 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_num_blocks_permute: int | None = None,
         moe_hybridep_num_blocks_unpermute: int | None = None,
         benchmark_static_routing: bool = False,
+        moe_hybridep_capacity_factor: float | None = None,
+        moe_hybridep_equal_token_counts: bool = False,
     ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
@@ -428,6 +454,17 @@ class _HybridEPManager(_DispatchManager):
         self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
         self.moe_hybridep_num_blocks_permute = moe_hybridep_num_blocks_permute
         self.moe_hybridep_num_blocks_unpermute = moe_hybridep_num_blocks_unpermute
+        # Capacity mode (dynamic routing): after one blocking calibration dispatch, later dispatches
+        # pass this many rows as num_permuted_tokens and run non-blocking (see dispatch()).
+        if moe_hybridep_capacity_factor is not None and benchmark_static_routing:
+            raise ValueError(
+                "moe_hybridep_capacity_factor cannot be combined with benchmark_static_routing "
+                "(BackendConfig rejects this pairing as well)"
+            )
+        self.hybridep_capacity_factor = moe_hybridep_capacity_factor
+        self._hybridep_capacity: int | None = None
+        # Equal row counts across the EP group: the pad size is the aligned local count, no collective.
+        self.equal_token_counts = moe_hybridep_equal_token_counts
         # Benchmark-only (TokenDispatcherConfig.moe_benchmark_static_routing):
         # persist num_permuted_tokens across dispatches, see dispatch()/reset.
         self.benchmark_static_routing = benchmark_static_routing
@@ -436,8 +473,6 @@ class _HybridEPManager(_DispatchManager):
         # routing every dispatch pads to the same size, so the per-dispatch MAX all-reduce + host sync
         # that computes it runs once. NEMO_STATIC_ROUTING_PAD_PIN=0 keeps the per-dispatch path (A/B).
         self._static_target_tokens: int | None = None
-        self._static_num_permuted_tokens: int | None = None
-        self._pipeline_extent: _HybridEPDispatchExtent | None = None
 
         # Metadata
         self.token_probs: torch.Tensor | None = None
@@ -493,11 +528,30 @@ class _HybridEPManager(_DispatchManager):
         else:
             self.routing_map, self.token_probs = self._indices_to_multihot(token_indices, token_probs)
 
+    def _resolve_num_permuted_tokens(self, capacity_mode: bool):
+        """The ``num_permuted_tokens`` this dispatch hands to HybridEP, decided in one place.
+
+        ``None`` is the blocking path (HybridEP reads the count on the device and drains the compute
+        stream); a host value keeps the dispatch non-blocking. The static-routing pin is the first
+        dispatch's count (a 0-d tensor); capacity mode passes the calibrated capacity (a host ``int``)
+        once calibration has happened. Nothing is cached across dispatches otherwise: a stale value
+        would be reused under non-reentrant activation checkpointing.
+        """
+        if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is not None:
+            return self._static_num_permuted_tokens
+        if capacity_mode and self._hybridep_capacity is not None:
+            # Non-blocking HybridEP dispatch: the buffers are sized to the calibrated capacity, the
+            # real counts stay on the device, and no compute-stream drain happens on this call.
+            return self._hybridep_capacity
+        return None
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
+        *,
+        capacity_mode: bool | None = None,
     ) -> torch.Tensor:
         """Dispatch hidden states using compact top-k metadata when available.
 
@@ -505,19 +559,16 @@ class _HybridEPManager(_DispatchManager):
             hidden_states: Hidden states with shape [tokens, hidden].
             async_finish: Ignored because HybridEP does not expose asynchronous completion here.
             allocate_on_comm_stream: Ignored because HybridEP owns its communication stream.
+            capacity_mode: ``None`` (default) derives it from ``hybridep_capacity_factor``; ``False``
+                forces one blocking dispatch that neither uses nor calibrates the capacity (the
+                runtime warmup).
 
         Returns:
             Dispatched hidden states with shape [dispatched_tokens, hidden].
         """
-        # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
-        # This can happen in non-reentrant activation checkpointing mode.
-        # Benchmark-only exception: with static routing every dispatch permutes the same
-        # count, so reusing the first dispatch's value keeps hybrid_ep_dispatch on its
-        # non-blocking path and removes a per-microbatch host wait on a device-side flag.
-        if self.benchmark_static_routing and self._static_num_permuted_tokens is not None:
-            self.num_permuted_tokens = self._static_num_permuted_tokens
-        else:
-            self.num_permuted_tokens = None
+        if capacity_mode is None:
+            capacity_mode = self.hybridep_capacity_factor is not None
+        self.num_permuted_tokens = self._resolve_num_permuted_tokens(capacity_mode)
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
 
@@ -532,22 +583,16 @@ class _HybridEPManager(_DispatchManager):
         if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
             num_tokens = hidden_states.shape[0]
             pin = self.benchmark_static_routing and _STATIC_ROUTING_PAD_PIN
-            if self._pipeline_extent is not None:
-                # Prepared on every EP rank before the schedule. Never fall back
-                # to a collective based on a rank-local shape check: peers would
-                # remain on the prepared path and deadlock.
-                target_tokens = self._pipeline_extent.num_tokens
-                if hidden_states.device != self._pipeline_extent.device or num_tokens > target_tokens:
-                    raise RuntimeError(
-                        f"HybridEP dispatch exceeds its prepared pipeline extent: got {num_tokens} tokens "
-                        f"on {hidden_states.device}, prepared {target_tokens} on {self._pipeline_extent.device}"
-                    )
+            if self.equal_token_counts:
+                # Every rank holds the same row count by construction (fixed-shape batches): the
+                # group-wide maximum is the local count, so only align it. No collective, no host sync.
+                target_tokens = _align_up(num_tokens, _HYBRIDEP_TOKEN_ALIGNMENT)
             elif pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
                 target_tokens = self._static_target_tokens
             else:
                 group_max = torch.tensor(num_tokens, device=hidden_states.device)
                 torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
-                target_tokens = -(-int(group_max) // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
+                target_tokens = _align_up(int(group_max), _HYBRIDEP_TOKEN_ALIGNMENT)
                 if pin:
                     self._static_target_tokens = target_tokens
                     if torch.distributed.get_rank() == 0:
@@ -585,17 +630,52 @@ class _HybridEPManager(_DispatchManager):
         )
 
         self.tokens_per_expert = tokens_per_expert
-        if self.benchmark_static_routing:
-            if self._static_num_permuted_tokens is None:
-                # The first blocking dispatch already sized this output exactly.
-                # Its host-known extent avoids a GPU count read in combine backward
-                # and does not add scalar tensor operations inside checkpointing.
-                self._static_num_permuted_tokens = dispatched_hidden.shape[0]
-            self.num_permuted_tokens = self._static_num_permuted_tokens
-        else:
-            self.num_permuted_tokens = self.tokens_per_expert.sum()
+        if capacity_mode:
+            # num_permuted_tokens already holds the capacity for a non-blocking dispatch; only the
+            # one blocking calibration dispatch and the overflow check happen after the call.
+            if self._hybridep_capacity is None:
+                self._calibrate_hybridep_capacity(tokens_per_expert, dispatched_hidden.device)
+            else:
+                _assert_no_hybridep_overflow(self.handle, self._hybridep_capacity)
+            return dispatched_hidden
+        self.num_permuted_tokens = self.tokens_per_expert.sum()
+        if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is None:
+            self._static_num_permuted_tokens = self.num_permuted_tokens
 
         return dispatched_hidden
+
+    def _calibrate_hybridep_capacity(self, tokens_per_expert: torch.Tensor, device: torch.device) -> None:
+        """Turn the one blocking calibration dispatch into the capacity every later dispatch uses.
+
+        The blocking dispatch already brought ``tokens_per_expert`` to the host, so reading its sum is
+        free; the capacity is that count times ``hybridep_capacity_factor``, rounded up to a multiple of
+        ``pad_multiple`` when one is set (HybridEP's only requirement on the extent in non-blocking mode)
+        and otherwise to the 4-token alignment as slack, taken as the EP-group maximum once so every rank
+        allocates the same buffers.
+
+        Args:
+            tokens_per_expert: ``[num_local_experts]`` integer tensor of routed rows per local expert, as
+                returned by the blocking calibration dispatch; its sum is read on the host here.
+            device: Device for the EP-group max all-reduce of the capacity.
+        """
+        actual = int(tokens_per_expert.sum())
+        align = max(int(self.pad_multiple or 0), _HYBRIDEP_TOKEN_ALIGNMENT)
+        cap = _align_up(int(math.ceil(actual * self.hybridep_capacity_factor)), align)
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
+            cap_t = torch.tensor(cap, device=device)
+            torch.distributed.all_reduce(cap_t, op=torch.distributed.ReduceOp.MAX, group=self.group)
+            cap = int(cap_t)
+        self._hybridep_capacity = cap
+        # This dispatch itself was blocking: its combine (and the combine's backward dispatch) can
+        # use the exact host-side count.
+        self.num_permuted_tokens = actual
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logging.getLogger(__name__).info(
+                "HybridEP capacity mode: calibrated %d permuted rows x %.2f -> capacity %d; later dispatches run non-blocking",
+                actual,
+                self.hybridep_capacity_factor,
+                cap,
+            )
 
     def combine(
         self,
@@ -647,7 +727,11 @@ class _HybridEPManager(_DispatchManager):
 
         The synthetic tensors are local to the dispatcher and no model parameter
         participates in autograd.  Manager fields used by a real dispatch are
-        restored even if initialization fails.
+        restored even if initialization fails.  Capacity mode
+        (``hybridep_capacity_factor``) is suspended for the synthetic dispatch: its
+        capacity is calibrated from the first *real* batch, whose routing skew a
+        balanced synthetic batch cannot stand in for, so the factor and any
+        calibrated capacity are restored untouched.
         """
         if num_tokens <= 0:
             raise ValueError(f"num_tokens must be positive, got {num_tokens}")
@@ -692,7 +776,9 @@ class _HybridEPManager(_DispatchManager):
                     self.setup_metadata(routing_map, token_probs)
 
                 hidden = torch.ones((num_tokens, hidden_dim), dtype=dtype, device=device, requires_grad=True)
-                dispatched = self.dispatch(hidden)
+                # The warmup dispatch must not become capacity mode's calibration dispatch (see the
+                # docstring): run it on the blocking path, leaving the factor and capacity untouched.
+                dispatched = self.dispatch(hidden, capacity_mode=False)
                 dispatched_probs = self.dispatched_probs
                 if dispatched_probs is None or dispatched_probs.numel() != dispatched.shape[0]:
                     raise RuntimeError(
@@ -719,7 +805,6 @@ class HybridEPPipelineRuntimeInitializer:
         self.manager = manager
         self.hidden_dim = hidden_dim
         self.dtype = dtype
-        self._prepared_extent: _HybridEPDispatchExtent | None = None
 
     @property
     def resource_key(self) -> tuple[type["HybridEPPipelineRuntimeInitializer"], str]:
@@ -764,14 +849,15 @@ class HybridEPPipelineRuntimeInitializer:
         combine_chunk = int(os.environ.get("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "64"))
         return capacity if combine_chunk <= 0 else -(-capacity // combine_chunk) * combine_chunk
 
-    def _resolve_group_tokens(self, *, num_tokens: int, device: torch.device) -> int:
-        """Negotiate raw input extent before deriving dispatch and JIT alignment."""
+    def _resolve_group_capacity(self, *, num_tokens: int, device: torch.device) -> int:
+        """Return the EP-group maximum JIT capacity for this batch."""
+        capacity = self.required_capacity(num_tokens)
         if not torch.distributed.is_initialized() or torch.distributed.get_world_size(self.manager.group) == 1:
-            return num_tokens
+            return capacity
 
-        group_tokens = torch.tensor(num_tokens, dtype=torch.int64, device=device)
-        torch.distributed.all_reduce(group_tokens, op=torch.distributed.ReduceOp.MAX, group=self.manager.group)
-        return int(group_tokens.item())
+        group_capacity = torch.tensor(capacity, dtype=torch.int64, device=device)
+        torch.distributed.all_reduce(group_capacity, op=torch.distributed.ReduceOp.MAX, group=self.manager.group)
+        return int(group_capacity.item())
 
     def prepare(
         self,
@@ -779,11 +865,7 @@ class HybridEPPipelineRuntimeInitializer:
         num_tokens: int,
         device: torch.device,
     ) -> None:
-        """Negotiate this step's extent and initialize kernels when capacity grows.
-
-        Every EP rank participates on every step, even if its local shape did
-        not change. The pending extent is consumed once by ``step_context``;
-        dispatch outside that scope retains per-call collective negotiation.
+        """Initialize the group capacity when the upcoming pipeline shape grows.
 
         Args:
             num_tokens: Maximum number of tokens in the upcoming pipeline microbatch.
@@ -793,26 +875,17 @@ class HybridEPPipelineRuntimeInitializer:
             ValueError: If the token capacity is not positive.
             RuntimeError: If the process-global resource signature conflicts or initialization fails.
         """
-        if self.manager._pipeline_extent is not None:
-            raise RuntimeError("Cannot prepare HybridEP during an active pipeline schedule")
-        self._prepared_extent = None
         if num_tokens <= 0:
             raise ValueError(f"HybridEP runtime preparation requires a positive token capacity, got {num_tokens}")
 
         if device.type == "cuda" and device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
         active_signature = (*self.signature, device)
-        group_tokens = self._resolve_group_tokens(
+        required_capacity = self._resolve_group_capacity(
             num_tokens=num_tokens,
             device=device,
         )
-        required_capacity = self.required_capacity(group_tokens)
-        extent = _HybridEPDispatchExtent(
-            num_tokens=-(-group_tokens // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT,
-            device=device,
-        )
         if required_capacity <= get_hybrid_ep_initialized_capacity(active_signature):
-            self._prepared_extent = extent
             return
 
         try:
@@ -835,29 +908,6 @@ class HybridEPPipelineRuntimeInitializer:
                 self.hidden_dim,
                 self.dtype,
             )
-
-        self._prepared_extent = extent
-
-    @contextmanager
-    def step_context(self) -> Iterator[None]:
-        """Use the prepared input extent for one complete PP schedule execution.
-
-        All EP ranks must enter after ``prepare`` and dispatch at most the
-        prepared number of input tokens on its device. This includes backward
-        recomputation. Routing and dispatched expert row counts remain dynamic.
-        The manager and pending extent reset even when the schedule raises.
-        Other, unshared managers retain normal per-dispatch negotiation.
-        """
-        if self.manager._pipeline_extent is not None:
-            raise RuntimeError("HybridEP pipeline schedule scopes cannot overlap")
-        if self._prepared_extent is None:
-            raise RuntimeError("HybridEP prepare must run before each pipeline schedule scope")
-        self.manager._pipeline_extent = self._prepared_extent
-        self._prepared_extent = None
-        try:
-            yield
-        finally:
-            self.manager._pipeline_extent = None
 
 
 @dataclass
@@ -891,6 +941,15 @@ class TokenDispatcherConfig:
 
     moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep"] = "deepep"
     """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
+
+    moe_hybridep_capacity_factor: float | None = None
+    """HybridEP capacity mode (mirrors BackendConfig.dispatcher_capacity_factor): after one blocking
+    calibration dispatch, size every later dispatch to the calibrated permuted row count times this
+    factor and run it non-blocking. None keeps the blocking path."""
+
+    moe_hybridep_equal_token_counts: bool = False
+    """HybridEP (mirrors BackendConfig.dispatcher_equal_token_counts): every EP rank dispatches the
+    same row count, so the per-dispatch pad-size all-reduce and its host sync are skipped."""
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP backend."""
@@ -1032,6 +1091,8 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                         moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                         benchmark_static_routing=self.config.moe_benchmark_static_routing,
+                        moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
+                        moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
                 if (
@@ -1040,15 +1101,20 @@ class MoEFlexTokenDispatcher:
                     self._comm_manager.moe_hybridep_num_sms_preprocessing,
                     self._comm_manager.moe_hybridep_num_blocks_permute,
                     self._comm_manager.moe_hybridep_num_blocks_unpermute,
+                    self._comm_manager.hybridep_capacity_factor,
+                    self._comm_manager.equal_token_counts,
                 ) != (
                     self.config.moe_hybridep_compact_routing,
                     self.config.moe_hybridep_permute_fusion,
                     self.config.moe_hybridep_num_sms_preprocessing,
                     self.config.moe_hybridep_num_blocks_permute,
                     self.config.moe_hybridep_num_blocks_unpermute,
+                    self.config.moe_hybridep_capacity_factor,
+                    self.config.moe_hybridep_equal_token_counts,
                 ):
                     raise ValueError(
-                        "Shared HybridEP dispatchers must use identical routing, fusion, and kernel tuning settings"
+                        "Shared HybridEP dispatchers must use identical routing, fusion, kernel tuning, and sync-free "
+                        "dispatch settings"
                     )
             else:
                 self._comm_manager = _HybridEPManager(
@@ -1064,6 +1130,8 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                     benchmark_static_routing=self.config.moe_benchmark_static_routing,
+                    moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
+                    moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,

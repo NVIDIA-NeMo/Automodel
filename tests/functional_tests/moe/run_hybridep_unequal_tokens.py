@@ -29,25 +29,24 @@ Repeat with --compact-routing, --permute-fusion, and both flags to exercise
 all routing/fusion combinations. Each variant checks a local reference with
 different expert scales and compares equal and unequal token extents. Add
 --activation-checkpointing to compare checkpoint replay with the same unequal
-computation without checkpointing. The pytest launcher uses --all-variants to
-run the complete matrix in one worker launch and process group. Add
---prepared-extent to exercise a PP-prepared dispatch bound with changing and
-empty rank extents, multiple microbatches, checkpoint replay, and scope reset.
-Add --static-routing to compare fixed, all-valid balanced dispatch against the
-normal dynamic path, including actual combine backward and checkpoint replay.
+computation without checkpointing. Add --capacity-factor F to run HybridEP
+capacity mode: the equal-count run is the blocking calibration dispatch, the
+unequal run then dispatches non-blocking into capacity-sized buffers (rows
+past the routed count are padding), and the checkpoint replay reuses the host
+extent. The pytest launcher uses --all-variants to run the complete matrix,
+including dense and compact capacity-mode variants, in one worker launch and
+process group.
 """
 
 import argparse
 import os
 import time
 from contextlib import nullcontext
-from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
-from nemo_automodel.components.moe.megatron import fused_a2a
 from nemo_automodel.components.moe.megatron.fused_a2a import reset_hybrid_ep_buffer, store_hybrid_ep_jit_cache
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
@@ -109,6 +108,10 @@ def run_dispatch_combine(
         # changes the output rather than being hidden by identical experts.
         expert_scales = torch.tensor(dispatcher.local_expert_indices, device=out.device, dtype=out.dtype) + 1
         row_scales = expert_scales.repeat_interleave(tokens_per_expert.to(device=out.device, dtype=torch.int64))
+        # Capacity mode hands back capacity-sized buffers: rows past the routed count are padding that the
+        # combine never reads, so scale them by zero like a grouped GEMM that stops at offs[-1].
+        if row_scales.shape[0] < out.shape[0]:
+            row_scales = torch.nn.functional.pad(row_scales, (0, out.shape[0] - row_scales.shape[0]))
         return dispatcher.token_unpermutation(out * (permuted_probs * row_scales.float()).unsqueeze(-1).to(out.dtype))
 
     if activation_checkpointing:
@@ -134,9 +137,18 @@ def run_dispatch_combine(
 
 
 def _run_variant(
-    ep_group: dist.ProcessGroup, *, compact_routing: bool, permute_fusion: bool, activation_checkpointing: bool
+    ep_group: dist.ProcessGroup,
+    *,
+    compact_routing: bool,
+    permute_fusion: bool,
+    activation_checkpointing: bool,
+    capacity_factor: float | None = None,
 ) -> None:
-    """Check one routing/fusion variant using the existing two-rank process group."""
+    """Check one routing/fusion variant using the existing two-rank process group.
+
+    With ``capacity_factor`` the first (equal-count) run calibrates HybridEP capacity mode and the
+    unequal run dispatches non-blocking into buffers of that capacity.
+    """
     rank = dist.get_rank()
     torch.manual_seed(1234 + rank)
     config = TokenDispatcherConfig(
@@ -146,6 +158,7 @@ def _run_variant(
         moe_share_token_dispatcher=False,
         moe_hybridep_compact_routing=compact_routing,
         moe_hybridep_permute_fusion=permute_fusion,
+        moe_hybridep_capacity_factor=capacity_factor,
     )
     num_local = NUM_EXPERTS // dist.get_world_size()
     dispatcher = MoEFlexTokenDispatcher(
@@ -176,7 +189,7 @@ def _run_variant(
     torch.testing.assert_close(unequal_grad, reference_grad[:keep], rtol=0, atol=0)
     torch.testing.assert_close(unequal_prob_grad, reference_prob_grad[:keep], rtol=0, atol=0)
     print(
-        f"[rank {rank}] OK: compact={compact_routing}, fusion={permute_fusion}; "
+        f"[rank {rank}] OK: compact={compact_routing}, fusion={permute_fusion}, capacity={capacity_factor}; "
         "output, hidden gradient, and router gradient match the local oracle and equal-count run",
         flush=True,
     )
@@ -194,150 +207,40 @@ def _run_variant(
         )
 
 
-def _run_prepared_extent(ep_group: dist.ProcessGroup) -> None:
-    """Exercise changing PP step bounds, empty ranks, and checkpoint recomputation."""
-    rank = dist.get_rank()
-    config = TokenDispatcherConfig(
-        moe_flex_dispatcher_backend="hybridep",
-        num_moe_experts=NUM_EXPERTS,
-        moe_router_topk=TOPK,
-        moe_share_token_dispatcher=False,
-        moe_hybridep_compact_routing=True,
-        moe_hybridep_permute_fusion=True,
-    )
-    num_local = NUM_EXPERTS // dist.get_world_size()
-    dispatcher = MoEFlexTokenDispatcher(
-        num_local_experts=num_local,
-        local_expert_indices=list(range(rank * num_local, (rank + 1) * num_local)),
-        config=config,
-        ep_group=ep_group,
-    )
-    (initializer,) = dispatcher.get_pipeline_runtime_initializers(hidden_dim=HIDDEN, dtype=torch.bfloat16)
-    torch.manual_seed(5678 + rank)
-    # Fixed local shape while the peer grows detects unsafe local-shape caching.
-    # Shrink must discard the previous step's extent; an empty rank still joins.
-    for step_index, rank_tokens in enumerate(((3, 5), (3, 13), (3, 3), (1, 0))):
-        count = rank_tokens[rank]
-        hidden = torch.randn(count, HIDDEN, device="cuda", dtype=torch.bfloat16)
-        indices = torch.stack([torch.randperm(NUM_EXPERTS, device="cuda")[:TOPK] for _ in range(max(count, 1))])[:count]
-        probs = torch.rand(count, TOPK, device="cuda", dtype=torch.float32)
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        reference = run_dispatch_combine(dispatcher, hidden, indices, probs)
-        with patch.object(dist, "all_reduce", wraps=dist.all_reduce) as collectives:
-            initializer.prepare(num_tokens=max(count, 1), device=torch.device("cuda", torch.cuda.current_device()))
-            assert collectives.call_count >= 1
-            calls_before_scope = collectives.call_count
-            with initializer.step_context():
-                actual = run_dispatch_combine(dispatcher, hidden, indices, probs, activation_checkpointing=True)
-                # A second microbatch has different routing probabilities and
-                # fewer valid tokens but uses the same pre-negotiated upper bound.
-                shorter = count // 2
-                run_dispatch_combine(
-                    dispatcher,
-                    hidden[:shorter],
-                    indices[:shorter],
-                    probs[:shorter] * 0.75,
-                    activation_checkpointing=True,
-                )
-            assert collectives.call_count == calls_before_scope
-        for result, expected in zip(actual, reference, strict=True):
-            torch.testing.assert_close(result, expected, rtol=0, atol=0)
-        # Exiting scope must restore the real dynamic all-reduce path.
-        with patch.object(dist, "all_reduce", wraps=dist.all_reduce) as collectives:
-            after = run_dispatch_combine(dispatcher, hidden, indices, probs)
-            assert collectives.call_count == 1
-        for result, expected in zip(after, reference, strict=True):
-            torch.testing.assert_close(result, expected, rtol=0, atol=0)
-        print(f"[rank {rank}] prepared extent step {step_index}: tokens={count}, parity/AC/reset OK", flush=True)
-
-
-def _run_static_routing(ep_group: dist.ProcessGroup, *, compact_routing: bool) -> None:
-    """Compare static and dynamic communication on the same fixed routing.
-
-    Args:
-        ep_group: Existing two-rank NCCL expert-parallel group.
-        compact_routing: Whether the actual dispatcher consumes compact indices.
-    """
-    rank = dist.get_rank(ep_group)
-    num_local = NUM_EXPERTS // dist.get_world_size(ep_group)
-    dispatchers = []
-    for static in (False, True):
-        config = TokenDispatcherConfig(
-            moe_flex_dispatcher_backend="hybridep",
-            num_moe_experts=NUM_EXPERTS,
-            moe_router_topk=TOPK,
-            moe_share_token_dispatcher=False,
-            moe_hybridep_compact_routing=compact_routing,
-            moe_benchmark_static_routing=static,
-        )
-        dispatchers.append(
-            MoEFlexTokenDispatcher(
-                num_local_experts=num_local,
-                local_expert_indices=list(range(rank * num_local, (rank + 1) * num_local)),
-                config=config,
-                ep_group=ep_group,
-            )
-        )
-    indices = torch.arange(FULL_TOKENS * TOPK, device="cuda").reshape(FULL_TOKENS, TOPK) % NUM_EXPERTS
-    probs = torch.full((FULL_TOKENS, TOPK), 1.0 / TOPK, device="cuda", dtype=torch.float32)
-    torch.manual_seed(4321 + rank)
-    hidden = torch.randn(FULL_TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    calls: list[tuple[int | None, int, bool]] = []
-    for step in range(2):
-        data = hidden + step * 0.125
-        for ac in (False, True):
-            reference = run_dispatch_combine(dispatchers[0], data, indices, probs, activation_checkpointing=ac)
-            original_dispatch = fused_a2a._hybrid_ep_buffer.dispatch_with_permute
-
-            def observe_dispatch(
-                **kwargs: object,
-            ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, object]:
-                """Observe exact dispatched row counts without retaining CUDA tensors."""
-                extent = kwargs.get("num_permuted_tokens")
-                assert extent is None or type(extent) is int, "static FW/replay/BW extent must stay on host"
-                result = original_dispatch(**kwargs)
-                assert extent is None or result[0].shape[0] == extent, "static mode must not add capacity rows"
-                handle = kwargs.get("handle") or result[4]
-                torch._assert_async((handle[-1] == 0).reshape(()), "static dispatch overflow")
-                calls.append((extent, result[0].shape[0], kwargs.get("handle") is not None))
-                return result
-
-            with patch.object(fused_a2a._hybrid_ep_buffer, "dispatch_with_permute", observe_dispatch):
-                actual = run_dispatch_combine(dispatchers[1], data, indices, probs, activation_checkpointing=ac)
-            for observed, expected in zip(actual, reference):
-                torch.testing.assert_close(observed, expected, rtol=0, atol=0)
-    assert calls[0][0] is None
-    assert all(type(extent) is int for extent, _, _ in calls[1:])
-    assert any(cached for _, _, cached in calls), "backward and AC must exercise cached handles"
-    print(f"[rank {rank}] static host extent: compact={compact_routing}, calls={calls}; exact FW/BW", flush=True)
-
-
 def main() -> None:
     """Run individual diagnostics or the complete CI matrix in one worker launch."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compact-routing", action="store_true")
     parser.add_argument("--permute-fusion", action="store_true")
     parser.add_argument("--activation-checkpointing", action="store_true")
+    parser.add_argument(
+        "--capacity-factor",
+        type=float,
+        default=None,
+        help="HybridEP capacity mode: calibrate on the first dispatch, then dispatch non-blocking at this factor",
+    )
     parser.add_argument("--all-variants", action="store_true")
-    parser.add_argument("--prepared-extent", action="store_true")
-    parser.add_argument("--static-routing", action="store_true")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     ep_group = dist.new_group(ranks=list(range(dist.get_world_size())))
-    variants = (
-        [(compact, fusion, compact and fusion) for compact in (False, True) for fusion in (False, True)]
-        if args.all_variants
-        else [(args.compact_routing, args.permute_fusion, args.activation_checkpointing)]
-    )
+    if args.all_variants:
+        variants = [
+            (compact, fusion, compact and fusion, None) for compact in (False, True) for fusion in (False, True)
+        ]
+        # Capacity mode, dense and compact routing, with checkpoint replay of the host extent.
+        variants += [(compact, False, True, 1.5) for compact in (False, True)]
+    else:
+        variants = [(args.compact_routing, args.permute_fusion, args.activation_checkpointing, args.capacity_factor)]
     try:
-        for compact, fusion, activation_checkpointing in variants:
+        for compact, fusion, activation_checkpointing, capacity_factor in variants:
             start = time.perf_counter()
             _run_variant(
                 ep_group,
                 compact_routing=compact,
                 permute_fusion=fusion,
                 activation_checkpointing=activation_checkpointing,
+                capacity_factor=capacity_factor,
             )
             # Reuse the buffer: routing/fusion are per-call options, and all variants share its shape.
             # Keep the native buffer and loaded kernels alive until all variants finish.
@@ -345,16 +248,10 @@ def main() -> None:
             dist.barrier(group=ep_group)
             store_hybrid_ep_jit_cache()
             print(
-                f"HybridEP parity: compact={compact} fusion={fusion} elapsed={time.perf_counter() - start:.2f}s",
+                f"HybridEP parity: compact={compact} fusion={fusion} capacity={capacity_factor} "
+                f"elapsed={time.perf_counter() - start:.2f}s",
                 flush=True,
             )
-        if args.static_routing:
-            for compact in (False, True):
-                _run_static_routing(ep_group, compact_routing=compact)
-        if args.prepared_extent:
-            _run_prepared_extent(ep_group)
-            torch.cuda.synchronize()
-            dist.barrier(group=ep_group)
     finally:
         reset_hybrid_ep_buffer()
         dist.destroy_process_group()

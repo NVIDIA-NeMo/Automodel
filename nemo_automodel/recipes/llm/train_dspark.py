@@ -65,6 +65,7 @@ from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
@@ -138,6 +139,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
     raise_if_peft_configured,
+    read_load_metadata_with_gloo,
 )
 
 logger = logging.getLogger(__name__)
@@ -649,6 +651,7 @@ class TrainDSparkRecipe(BaseRecipe):
         if self.cached_target_path is None or chat_template is not None:
             _apply_target_chat_template(self.tokenizer, chat_template)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        load_metadata_with_gloo = read_load_metadata_with_gloo(self.cfg.get("checkpoint", None))
 
         if is_deepseek_v4_target:
             if self.cached_target_path is None:
@@ -758,6 +761,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     trust_remote_code=trust_remote_code,
                     torch_dtype=self.compute_dtype,
                     distributed_setup=self.distributed_setup,
+                    load_metadata_with_gloo=load_metadata_with_gloo,
                     backend=backend,
                     # The released bf16 checkpoint ships no real MTP weights despite the
                     # config declaring some, and DSpark trains its own separate draft
@@ -845,6 +849,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     torch_dtype=self.compute_dtype,
                     force_hf=bool(recipe_cfg.get("target_force_hf", False)),
                     distributed_setup=self.distributed_setup,
+                    load_metadata_with_gloo=load_metadata_with_gloo,
                     **target_kwargs,
                 )
                 if self.distributed_setup is None:
@@ -1239,6 +1244,13 @@ class TrainDSparkRecipe(BaseRecipe):
             default_name="dspark_" + str(target_path).rstrip("/").split("/")[-1],
         )
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
+            trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
+            trackio_cfg.name = trackio_cfg.name or "dspark_" + str(target_path).rstrip("/").split("/")[-1]
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
+            logger.info("Trackio experiment tracking enabled")
+
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
         """Resolve and validate the MASK token id filling non-anchor block positions.
@@ -1604,12 +1616,23 @@ class TrainDSparkRecipe(BaseRecipe):
         return eval_metrics
 
     def _wandb_log(self, data: dict, step: int) -> None:
-        """Log rank-zero metrics when a W&B run is active."""
+        """Log rank-zero metrics when a W&B or Trackio run is active."""
         run = getattr(self, "wandb_run", None)
         if run is not None:
             run.log(data, step=step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(data, step=step)
 
     def _finish_wandb(self) -> None:
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            try:
+                trackio_logger.finish()
+            except Exception:
+                logger.warning("Failed to finish Trackio run cleanly.", exc_info=True)
+            finally:
+                self.trackio_logger = None
         run = getattr(self, "wandb_run", None)
         if run is None:
             return

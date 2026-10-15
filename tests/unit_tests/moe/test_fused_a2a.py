@@ -201,6 +201,34 @@ def test_hybridep_permute_fusion_is_used_in_forward_and_backward(monkeypatch):
     torch.testing.assert_close(probs.grad, torch.ones_like(probs))
 
 
+@pytest.mark.parametrize(
+    ("extent", "expect_non_blocking"),
+    [(24, True), (torch.tensor(24), False), (None, False)],
+    ids=["capacity-int", "static-pin-tensor", "blocking"],
+)
+def test_hybridep_combine_backward_dispatch_is_non_blocking_only_for_a_host_int_extent(
+    monkeypatch, extent, expect_non_blocking
+):
+    """Capacity mode's host int keeps the backward dispatch off the stream drain; a tensor pin or None does not."""
+    seen = {}
+
+    class FakeHybridEPBuffer:
+        def combine_with_unpermute(self, *, hidden, handle, pad_multiple, fuse_unpermute_combine=False):
+            return hidden, None
+
+        def dispatch_with_permute(self, **kwargs):
+            seen.update(kwargs)
+            return kwargs["hidden"], None, None, torch.tensor([1, 1]), ("unused",)
+
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", FakeHybridEPBuffer())
+    hidden = torch.randn(2, 4, requires_grad=True)
+
+    fused_a2a.HybridEPCombine.apply(hidden, ("handle",), extent, None, False).sum().backward()
+
+    assert seen["non_blocking"] is expect_non_blocking
+    assert seen["num_permuted_tokens"] is extent
+
+
 def test_hybridep_combine_permute_fusion_is_used_in_forward_and_backward(monkeypatch):
     """Combine autograd must pair fused unpermute forward with fused permute backward."""
 
@@ -268,7 +296,7 @@ class _DriftingHybridEPBuffer:
         return combined_hidden, combined_probs
 
 
-def _run_checkpointed_hybridep(context_fn, *, fuse_permute=False):
+def _run_checkpointed_hybridep(context_fn, num_permuted_tokens=None, *, fuse_permute=False):
     x = torch.randn(4, 3, requires_grad=True)
     routing_map = torch.ones(4, 2, dtype=torch.bool)
     probs = torch.full((4, 2), 0.5, requires_grad=True)
@@ -282,7 +310,7 @@ def _run_checkpointed_hybridep(context_fn, *, fuse_permute=False):
             1,
             24,
             24,
-            None,
+            num_permuted_tokens,
             None,
             None,
             None,
@@ -342,6 +370,61 @@ def test_hybridep_checkpoint_replay_preserves_selective_op_trace():
     assert isinstance(buffer.replayed_num_permuted_tokens, int)
 
 
+def test_hybridep_replay_recorder_reads_extents_lazily_and_once():
+    """finalize() only starts the extent read; take()/resolve() turn it into an int, idempotently."""
+    recorder = fused_a2a.HybridEPDispatchReplayRecorder()
+    recorder.record("layout-a", torch.tensor([2, 3]))
+    recorder.record("layout-b", torch.tensor([1, 2]))
+    recorder.finalize()
+    recorder.resolve()
+    recorder.resolve()  # a second resolve has nothing left to do
+    first = recorder.take()
+    assert first[0] == "layout-a" and first[2] == 5 and isinstance(first[2], int)
+    second = recorder.take()
+    assert second[0] == "layout-b" and second[2] == 3 and isinstance(second[2], int)
+    assert recorder.take() is None and recorder.replay_misses == 1
+    # take() without an explicit resolve() still yields a host integer
+    lazy = fused_a2a.HybridEPDispatchReplayRecorder()
+    lazy.record("layout-c", torch.tensor([4]))
+    lazy.finalize()
+    assert lazy.take()[2] == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.runtime_budget(15, reason="may create the process's CUDA context")
+def test_hybridep_replay_recorder_copies_cuda_extents_asynchronously():
+    """On CUDA, finalize() leaves a pinned scalar and an event in flight; resolve()/take() yield the int."""
+    recorder = fused_a2a.HybridEPDispatchReplayRecorder()
+    recorder.record("layout-a", torch.tensor([2, 3], device="cuda"))
+    recorder.finalize()
+    entry = recorder._records[0]
+    assert entry[2] is None
+    host, ready = recorder._copies[0]
+    assert host.device.type == "cpu" and host.is_pinned() and isinstance(ready, torch.cuda.Event)
+    recorder.resolve()
+    assert entry[2] == 5 and isinstance(entry[2], int)
+    assert recorder._copies[0] is None
+    # take() without an explicit resolve() still yields a host integer
+    lazy = fused_a2a.HybridEPDispatchReplayRecorder()
+    lazy.record("layout-b", torch.tensor([4], device="cuda"))
+    lazy.finalize()
+    assert lazy.take()[2] == 4
+
+
+def test_hybridep_recorder_keeps_a_host_extent_without_reducing_tokens_per_expert():
+    recorder = fused_a2a.HybridEPDispatchReplayRecorder()
+    tokens_per_expert = mock.MagicMock(spec=torch.Tensor)
+    # capacity mode: the forward already ran with a host-side extent
+    recorder.record("layout", tokens_per_expert, 24)
+    # blocking dispatch: the extent comes from the reduction, after the checkpoint context exits
+    recorder.record("layout", torch.tensor([2, 3]))
+    recorder.finalize()
+
+    assert recorder.take() == ["layout", tokens_per_expert, 24]
+    assert recorder.take()[2] == 5
+    tokens_per_expert.sum.assert_not_called()
+
+
 def test_hybridep_checkpoint_replay_preserves_permute_fusion():
     from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
 
@@ -354,3 +437,18 @@ def test_hybridep_checkpoint_replay_preserves_permute_fusion():
     assert buffer.cached_dispatches == 1
     assert buffer.replayed_fuse_permute is True
     assert buffer.combined_fuse_permute is True
+
+
+def test_hybridep_checkpoint_replay_reuses_the_forward_capacity_extent():
+    from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
+
+    buffer = _DriftingHybridEPBuffer()
+    fused_a2a._hybrid_ep_buffer = buffer
+    context_fn = _replay_hybridep_dispatch_on_recompute(lambda: (nullcontext(), nullcontext()))
+
+    _run_checkpointed_hybridep(context_fn, num_permuted_tokens=24)
+
+    assert buffer.full_dispatches == 1
+    assert buffer.cached_dispatches == 1
+    # the recompute output must be sized like the forward's (capacity rows), not to this dispatch's token count
+    assert buffer.replayed_num_permuted_tokens == 24

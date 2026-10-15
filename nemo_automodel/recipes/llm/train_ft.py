@@ -28,7 +28,6 @@ except ImportError:
 import gc
 import inspect
 import logging
-import math
 import pathlib
 import time
 from contextlib import nullcontext
@@ -229,14 +228,14 @@ def _supports_loss_weights(loss_fn: nn.Module) -> bool:
     return any(parameter.name == "loss_weights" for parameter in parameters)
 
 
-def _validate_domain_sampling_weights(domain_mixture, dataloader_config: DataloaderConfig) -> None:
-    """Check explicit Megatron blend weights against the objective declaration."""
+def _get_domain_mixture_blend(dataloader_config: DataloaderConfig) -> tuple[list[str], list[float]]:
+    """Extract the explicit Megatron training blend for domain-mixture construction."""
     from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
 
     dataset_config = dataloader_config.dataset_config
     if not isinstance(dataset_config, MegatronPretrainingConfig):
         raise ValueError("domain_mixture currently requires a MegatronPretraining dataset")
-    paths = getattr(dataset_config, "paths", None)
+    paths = dataset_config.paths
     if isinstance(paths, dict):
         paths = paths.get("train")
     if not isinstance(paths, (list, tuple)):
@@ -244,21 +243,10 @@ def _validate_domain_sampling_weights(domain_mixture, dataloader_config: Dataloa
 
     from nemo_automodel.components.datasets.llm.megatron.megatron_utils import get_blend_from_list
 
-    _, blend_weights = get_blend_from_list(list(paths))
+    blend_paths, blend_weights = get_blend_from_list(list(paths))
     if blend_weights is None:
         raise ValueError("domain_mixture requires explicit sampling weights in dataset.paths")
-    blend_total = sum(blend_weights)
-    if blend_total <= 0:
-        raise ValueError(f"dataset.paths blend weights must have a positive sum, got {blend_weights}")
-    normalized = tuple(weight / blend_total for weight in blend_weights)
-    if len(normalized) != len(domain_mixture.sampling_weights) or any(
-        not math.isclose(actual, declared, rel_tol=1.0e-6, abs_tol=1.0e-8)
-        for actual, declared in zip(normalized, domain_mixture.sampling_weights)
-    ):
-        raise ValueError(
-            "domain_mixture sampling weights must match the explicit weights in dataset.paths; "
-            f"got dataset weights {normalized} and domain_mixture weights {domain_mixture.sampling_weights}"
-        )
+    return blend_paths, blend_weights
 
 
 def build_model(
@@ -274,6 +262,8 @@ def build_model(
     cfg_freeze: ConfigNode | dict[str, Any] | FreezeConfig | None = None,
     sdpa_method: list[str] | None = None,
     device_mesh=None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -292,6 +282,7 @@ def build_model(
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
         device_mesh: Pre-created device mesh forwarded when ``distributed_setup`` is not provided.
     """
     with ScopedRNG(seed=seed, ranked=True):
@@ -302,6 +293,7 @@ def build_model(
             # plain mappings or typed FreezeConfig objects.
             "freeze_config": cfg_freeze.to_dict() if isinstance(cfg_freeze, ConfigNode) else cfg_freeze,
             "sdpa_method": sdpa_method,
+            "load_metadata_with_gloo": load_metadata_with_gloo,
         }
         if distributed_setup is not None:
             kwargs["distributed_setup"] = distributed_setup
@@ -385,6 +377,7 @@ def build_model(
                 freeze_config=kwargs.get("freeze_config"),
                 pretrained_model_name_or_path=None,
                 load_base_model=False,
+                load_metadata_with_gloo=load_metadata_with_gloo,
                 cache_dir=hf_constants.HF_HUB_CACHE,
             )
 
@@ -609,6 +602,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=_get_model_name(self.cfg.model)
+            )
+            logging.info("Trackio experiment tracking enabled")
+
         if self.dist_env.is_main and self.cfg.mlflow is not None:
             run_config = self.cfg.to_yaml_dict(use_orig_values=True)
             checkpoint_dir = self.cfg.get("checkpoint.checkpoint_dir", None)
@@ -628,8 +628,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Build loss_fn (will be set on pipeline_config if PP enabled)
         self.loss_fn = self.cfg.loss_fn.build()
         domain_mixture_config = self.cfg.domain_mixture
-        self.domain_mixture = domain_mixture_config.build() if domain_mixture_config is not None else None
-        if self.domain_mixture is not None:
+        self.domain_mixture = None
+        if domain_mixture_config is not None:
             if self.pp_enabled:
                 raise ValueError(
                     "domain_mixture does not currently support pipeline parallelism because the pipeline "
@@ -672,7 +672,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 raise ValueError(
                     f"domain_mixture requires a loss function with explicit reduction='sum'; got {reduction!r}"
                 )
-            _validate_domain_sampling_weights(self.domain_mixture, self.cfg.dataloader)
+            self.domain_mixture = domain_mixture_config.build(blend=_get_domain_mixture_blend(self.cfg.dataloader))
         if self.magi.hf_dispatch and isinstance(self.loss_fn, LinearCrossEntropy):  # pragma: no cover
             raise ValueError(
                 "The magi HF backend needs full logits and is incompatible with "
@@ -762,6 +762,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_freeze=self.cfg.get("freeze_config", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         self.embedding_row_repair_report = None
         embedding_row_repair = self.cfg.embedding_row_repair
@@ -1330,19 +1331,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if isinstance(pp_loss_fn, PipelineCausalLMLoss):
                     pp_loss_fn.cu_seqlens = cu_seqlens
                     pp_loss_fn.is_packed = mtp_is_packed or mtp_seq_idx is not None
-                with self.pp.runtime_context():
-                    if is_train:
-                        # Use step for training (forward + backward)
-                        if self.pp.info.has_first_stage:
-                            self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
-                        else:
-                            self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
+                if is_train:
+                    # Use step for training (forward + backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
                     else:
-                        # Use eval for validation (forward only, no backward)
-                        if self.pp.info.has_first_stage:
-                            self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
-                        else:
-                            self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
+                else:
+                    # Use eval for validation (forward only, no backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
+                    else:
+                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1438,6 +1438,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )
+                # Autograd retains tensors needed by the losses. Release the
+                # output container and auxiliary aliases before backward so
+                # unused full-vocabulary logits do not overlap its allocations.
+                del out, mtp_per_depth_h, mtp_per_depth_logits
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1794,6 +1798,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
                 wandb.log(metrics, step=log_data.step)
 
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            if val_name == "default":
+                trackio_logger.log_metrics(log_data.metrics, step=log_data.step)
+            else:
+                metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
+                trackio_logger.log_metrics(metrics, step=log_data.step)
+
         if _HAS_MLFLOW and mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
 
@@ -1845,10 +1857,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB, MLflow, Comet) according to step_scheduler frequency
+        # Log to remote services (WandB, Trackio, MLflow, Comet) according to step_scheduler frequency
+        trackio_logger = getattr(self, "trackio_logger", None)
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
             if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
             if self.comet_logger is not None:
@@ -1858,6 +1873,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+            if trackio_logger is not None:
+                self._log_moe_metrics(self.step_scheduler.step, trackio_logger.log_metrics)
             if self.comet_logger is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)

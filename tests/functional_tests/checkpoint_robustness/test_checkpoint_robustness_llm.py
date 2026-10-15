@@ -45,6 +45,8 @@ from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import patch
 
 if TYPE_CHECKING:
+    from peft import PeftModel
+
     from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 import datasets
@@ -624,6 +626,30 @@ def _peft_adapter_load_kwargs(hf_kwargs: dict[str, object]) -> dict[str, object]
         "autocast_adapter_dtype": True,
         **{key: hf_kwargs[key] for key in ("device_map", "max_memory") if key in hf_kwargs},
     }
+
+
+def _redispatch_peft_model(model: PeftModel) -> None:
+    """Restore input placement on adapter wrappers spanning multiple GPUs.
+
+    PEFT replaces dispatched linear layers with adapter wrappers, leaving the
+    original Accelerate hooks on their base layers. At a GPU boundary, only the
+    base-layer input moves; the adapter still receives the previous GPU's input.
+    Reapply the existing device map to attach hooks to the new wrappers, without
+    changing the chosen placement. PEFT already redispatches CPU/disk offloads.
+
+    Args:
+        model: Reloaded PEFT model whose base model may have an HF device map.
+    """
+    base_model = model.get_base_model()
+    device_map = getattr(base_model, "hf_device_map", None)
+    if not device_map or len(set(device_map.values())) < 2:
+        return
+    if any(str(device) in {"cpu", "disk"} for device in device_map.values()):
+        return
+
+    from accelerate import dispatch_model
+
+    dispatch_model(base_model, device_map=device_map)
 
 
 def _patch_remote_masking_api_compatibility() -> None:
@@ -2924,6 +2950,7 @@ def _run_vanilla_hf_reload(
                     str(ckpt_step_dir / "model"),
                     **_peft_adapter_load_kwargs(hf_kwargs),
                 )
+            _redispatch_peft_model(peft_model)
             adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
             matched_adapter_tensors, ignored_adapter_tensors = _assert_peft_adapter_matches_checkpoint(
                 peft_model,

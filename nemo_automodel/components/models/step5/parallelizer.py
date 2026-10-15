@@ -25,7 +25,6 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
-from nemo_automodel.components.distributed.pipelining.runtime import collect_pipeline_runtime_initializers
 from nemo_automodel.components.models.step5.backend import Step5BackendConfig
 from nemo_automodel.components.models.step5.layers import Step5DecoderLayer
 
@@ -120,11 +119,4 @@ class Step5Parallelizer(ModelParallelizer):
         model = cast("Step5ForCausalLM", super().parallelize(model, mesh_context))
         if isinstance(model.backend, Step5BackendConfig):
             _retain_bf16_fsdp_units(model.model, budget_mib=model.backend.bf16_fsdp_retention_mib_per_part)
-            if (
-                model.backend.prepare_hybridep_extent
-                and mesh_context.pp_size == 1
-                and mesh_context.cp_size > 1
-                and mesh_context.ep_size > 1
-            ):
-                model.cp_runtime_initializers = tuple(collect_pipeline_runtime_initializers([model]))
         return model

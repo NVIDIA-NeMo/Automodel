@@ -48,9 +48,9 @@ from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callab
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_pp_collate_wrapper,
+    _get_domain_mixture_blend,
     _should_pack_validation,
     _supports_loss_weights,
-    _validate_domain_sampling_weights,
     build_model,
     compute_trust_remote_code_from_model,
 )
@@ -318,8 +318,8 @@ def test_recipe_config_resolves_typed_domain_mixture():
             {
                 "domain_mixture": {
                     "domains": [
-                        {"name": "web", "sampling_weight": 0.75, "objective_weight": 0.5},
-                        {"name": "code", "sampling_weight": 0.25, "objective_weight": 0.5},
+                        {"name": "web", "path": "/data/web", "sampling_weight": 0.75, "objective_weight": 0.5},
+                        {"name": "code", "path": "/data/code", "sampling_weight": 0.25, "objective_weight": 0.5},
                     ]
                 }
             }
@@ -329,6 +329,7 @@ def test_recipe_config_resolves_typed_domain_mixture():
     mixture = cfg.domain_mixture.build()
 
     assert mixture.names == ("web", "code")
+    assert mixture.paths == ("/data/web", "/data/code")
     assert mixture.loss_multipliers == pytest.approx((2.0 / 3.0, 2.0))
 
 
@@ -336,19 +337,19 @@ def test_domain_mixture_sampling_weights_match_megatron_blend():
     from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
     from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
 
-    mixture = DomainMixtureConfig(
+    mixture_config = DomainMixtureConfig(
         domains=(
-            DomainWeightConfig(name="web", sampling_weight=0.75, objective_weight=0.5),
-            DomainWeightConfig(name="code", sampling_weight=0.25, objective_weight=0.5),
+            DomainWeightConfig(name="web", sampling_weight=0.75, objective_weight=0.5, path="/data/web"),
+            DomainWeightConfig(name="code", sampling_weight=0.25, objective_weight=0.5, path="/data/code"),
         )
-    ).build()
+    )
     dataloader = DataloaderConfig(dataset_config=MegatronPretrainingConfig(paths=["3", "/data/web", "1", "/data/code"]))
 
-    _validate_domain_sampling_weights(mixture, dataloader)
+    mixture_config.build(blend=_get_domain_mixture_blend(dataloader))
 
     mismatched = DataloaderConfig(dataset_config=MegatronPretrainingConfig(paths=["1", "/data/web", "1", "/data/code"]))
     with pytest.raises(ValueError, match="sampling weights must match"):
-        _validate_domain_sampling_weights(mixture, mismatched)
+        mixture_config.build(blend=_get_domain_mixture_blend(mismatched))
 
 
 def test_validation_dataloaders_no_validation_keys():
@@ -1013,7 +1014,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     )
 
     def _stub_build_checkpoint_config(*a, **k):
-        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None, load_metadata_with_gloo=False)
         cfg.build = lambda **kw: SimpleNamespace(
             config=cfg,
             load_base_model=lambda *a, **k: None,
@@ -1538,7 +1539,6 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
             pp_batch_size=1,
             pp_microbatch_size=1,
             update_seq_len=lambda seq_len: None,
-            runtime_context=nullcontext,
         ),
     )
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
@@ -2173,6 +2173,51 @@ def _make_trainer_for_moe(moe_cfg_dict, layer_loads=None):
     return trainer
 
 
+def _make_trainer_for_trackio(monkeypatch):
+    """Bare main-rank recipe with a mock Trackio logger and the other remote loggers disabled."""
+    import nemo_automodel.recipes.llm.train_ft as train_ft
+
+    monkeypatch.setattr(train_ft, "_HAS_WANDB", False)
+    monkeypatch.setattr(train_ft, "_HAS_MLFLOW", False)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)  # CPU-only test
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief"}, _make_moe_layer_loads([[100.0, 300.0]]))
+    trainer.dist_env = SimpleNamespace(is_main=True)
+    trainer.step_scheduler = SimpleNamespace(is_remote_logging_step=True, step=7)
+    trainer.trackio_logger = MagicMock()
+    trainer.comet_logger = None
+    trainer.metric_logger_train = MagicMock()
+    return trainer
+
+
+def test_log_train_metrics_sends_metrics_and_moe_loads_to_trackio(monkeypatch):
+    from nemo_automodel.components.loggers.metric_logger import MetricsSample
+
+    trainer = _make_trainer_for_trackio(monkeypatch)
+    metrics = {"loss": 1.5, "grad_norm": 0.5, "lr": 1e-4, "mem": 1.0, "tps": 10.0, "tps_per_gpu": 10.0}
+    log_data = MetricsSample(step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8})
+
+    trainer.log_train_metrics(log_data)
+
+    first, second = trainer.trackio_logger.log_metrics.call_args_list
+    assert first.args[0] == log_data.to_dict() and first.kwargs == {"step": 7}
+    assert any(key.startswith("moe/") for key in second.args[0]) and second.kwargs == {"step": 7}
+    trainer.metric_logger_train.log.assert_called_once_with(log_data)
+
+
+@pytest.mark.parametrize(("val_name", "key"), [("default", "val_loss"), ("squad", "val_squad/val_loss")])
+def test_log_val_metrics_sends_metrics_to_trackio(monkeypatch, val_name, key):
+    from nemo_automodel.components.loggers.metric_logger import MetricsSample
+
+    trainer = _make_trainer_for_trackio(monkeypatch)
+    log_data = MetricsSample(step=3, epoch=0, metrics={"val_loss": 2.0, "lr": 1e-4, "num_label_tokens": 8})
+
+    trainer.log_val_metrics(val_name, log_data)
+
+    trainer.trackio_logger.log_metrics.assert_called_once()
+    logged, kwargs = trainer.trackio_logger.log_metrics.call_args
+    assert logged[0][key] == 2.0 and kwargs == {"step": 3}
+
+
 def test_log_moe_metrics_skips_when_no_loads():
     """wandb_log_fn should not be called when _moe_layer_loads is None."""
     trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief"}, layer_loads=None)
@@ -2340,7 +2385,6 @@ class TestRunTrainOptimStepSetsMoEScale:
                     pp_batch_size=pp_microbatches,
                     pp_microbatch_size=1,
                     update_seq_len=lambda seq_len: None,
-                    runtime_context=nullcontext,
                 ),
             )
             # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe
@@ -3189,19 +3233,78 @@ def test_domain_mixture_order_validation_does_not_infer_names_from_paths():
     from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
     from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
 
-    mixture = DomainMixtureConfig(
+    mixture_config = DomainMixtureConfig(
         domains=(
-            DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.5),
-            DomainWeightConfig(name="web", sampling_weight=0.5, objective_weight=0.5),
+            DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.5, path="/data/python/train"),
+            DomainWeightConfig(
+                name="web", sampling_weight=0.5, objective_weight=0.5, path="/data/web/encoded_text_document"
+            ),
         )
-    ).build()
+    )
     dataloader = DataloaderConfig(
         dataset_config=MegatronPretrainingConfig(
             paths=["1", "/data/python/train", "1", "/data/web/encoded_text_document"]
         )
     )
 
-    _validate_domain_sampling_weights(mixture, dataloader)
+    mixture_config.build(blend=_get_domain_mixture_blend(dataloader))
+
+
+@pytest.mark.parametrize("split_paths", [False, True])
+@pytest.mark.parametrize("num_domains", [2, 3])
+def test_domain_mixture_rejects_swapped_corpora_with_equal_sampling_weights(split_paths, num_domains):
+    from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+    domains = [
+        DomainWeightConfig(name="web", sampling_weight=1, objective_weight=1, path="/data/web"),
+        DomainWeightConfig(name="code", sampling_weight=1, objective_weight=3, path="/data/code"),
+    ]
+    paths = ["50", "/data/web", "50", "/data/code"]
+    if num_domains == 3:
+        domains.append(DomainWeightConfig(name="books", sampling_weight=1, objective_weight=2, path="/data/books"))
+        paths.extend(["50", "/data/books"])
+    if split_paths:
+        paths = {"train": paths, "validation": ["/data/held_out"]}
+    dataloader = DataloaderConfig(dataset_config=MegatronPretrainingConfig(paths=paths))
+
+    blend = _get_domain_mixture_blend(dataloader)
+    mixture = DomainMixtureConfig(domains=tuple(domains)).build(blend=blend)
+    if num_domains == 2:
+        # Training's positional IDs and validation's names refer to the same objective.
+        labels = torch.tensor([[1, 2], [3, 4]])
+        torch.testing.assert_close(
+            mixture.loss_weights(torch.tensor([0, 1]), labels), torch.tensor([[0.5, 0.5], [1.5, 1.5]])
+        )
+        assert mixture.weighted_validation_loss({"web": 2.0, "code": 4.0}) == pytest.approx(3.5)
+
+    domains[0], domains[1] = domains[1], domains[0]
+    with pytest.raises(ValueError, match="paths must match.*same order") as exc:
+        DomainMixtureConfig(domains=tuple(domains)).build(blend=blend)
+    assert "('code', '/data/code')" in str(exc.value)
+    assert "('/data/web', '/data/code'" in str(exc.value)
+
+
+def test_domain_mixture_compares_exact_prefixes_after_trimming_whitespace():
+    from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+    mixture_config = DomainMixtureConfig(
+        domains=(
+            DomainWeightConfig(name="web", sampling_weight=1, objective_weight=1, path=" /data/web "),
+            DomainWeightConfig(name="code", sampling_weight=1, objective_weight=3, path="/data/code"),
+        )
+    )
+    dataloader = DataloaderConfig(
+        dataset_config=MegatronPretrainingConfig(paths=["1", "/data/web", "1", " /data/code "])
+    )
+    mixture_config.build(blend=_get_domain_mixture_blend(dataloader))
+
+    mismatched = DataloaderConfig(
+        dataset_config=MegatronPretrainingConfig(paths=["1", "/data/web-other", "1", "/data/code"])
+    )
+    with pytest.raises(ValueError, match="paths must match.*same order"):
+        mixture_config.build(blend=_get_domain_mixture_blend(mismatched))
 
 
 _DOMAIN_MIXTURE_EXAMPLE = Path(__file__).parents[3] / "examples/llm_pretrain/megatron_pretrain_gpt2_domain_mixture.yaml"
@@ -3245,7 +3348,33 @@ def test_domain_mixture_example_setup_smoke(monkeypatch):
     trainer.setup()
 
     assert trainer.domain_mixture.names == ("web", "code")
+    assert trainer.domain_mixture.paths == ("/data/web/processed_text_document", "/data/code/processed_text_document")
     assert set(trainer.val_dataloaders) == {"web", "code"}
+
+
+@pytest.mark.parametrize("missing_indices", [(0,), (0, 1)])
+def test_domain_mixture_example_requires_explicit_corpus_paths(monkeypatch, missing_indices):
+    config = load_yaml_config(_DOMAIN_MIXTURE_EXAMPLE).to_dict()
+    for index in missing_indices:
+        del config["domain_mixture"]["domains"][index]["path"]
+    cfg = ConfigNode(config)
+    typed_cfg = _patch_domain_mixture_example_setup(monkeypatch, cfg, _LossWithWeights())
+
+    with pytest.raises(ValueError, match="requires a path for every domain.*domains\\[i\\].path"):
+        TrainFinetuneRecipeForNextTokenPrediction(typed_cfg).setup()
+
+
+def test_domain_mixture_example_setup_rejects_equal_weight_domain_swap(monkeypatch):
+    cfg = load_yaml_config(_DOMAIN_MIXTURE_EXAMPLE)
+    cfg.dataset.paths[0] = cfg.dataset.paths[2] = "50"
+    cfg.domain_mixture.domains[0].sampling_weight = cfg.domain_mixture.domains[1].sampling_weight = 0.5
+    cfg.domain_mixture.domains[0].objective_weight = 0.25
+    cfg.domain_mixture.domains[1].objective_weight = 0.75
+    cfg.domain_mixture.domains.reverse()
+    typed_cfg = _patch_domain_mixture_example_setup(monkeypatch, cfg, _LossWithWeights())
+
+    with pytest.raises(ValueError, match="paths must match.*same order"):
+        TrainFinetuneRecipeForNextTokenPrediction(typed_cfg).setup()
 
 
 @pytest.mark.parametrize(
@@ -3910,7 +4039,6 @@ def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is
         pp_batch_size=1,
         pp_microbatch_size=1,
         update_seq_len=lambda seq_len: None,
-        runtime_context=nullcontext,
         info=SimpleNamespace(has_first_stage=True, has_last_stage=True, schedule=Schedule()),
     )
     recipe.tokenizer = None

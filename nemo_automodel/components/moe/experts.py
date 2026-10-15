@@ -25,6 +25,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.moe import swiglu_triton
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_geglu_impl,
@@ -51,7 +52,7 @@ _BIAS_CHUNK_THRESHOLD = 12288
 # can exhaust memory even when bias additions themselves are bounded. Recompute
 # row chunks during backward instead of retaining full expert-MLP activations.
 # Bias-free experts retain whole-dispatch GEMMs for throughput.
-_EXPERT_MLP_CHUNK_BYTES = 256 * 1024 * 1024
+_EXPERT_MLP_CHUNK_BYTES = 512 * 1024 * 1024
 
 
 if _HAVE_TRITON and _HAVE_TRITON_LANGUAGE:
@@ -1210,7 +1211,7 @@ def relu2_deepep(x, permuted_probs):
 
 
 @torch.compile(fullgraph=True, options={"max_autotune": True})
-def swiglu_clamped_deepep(
+def _swiglu_clamped_deepep_compiled(
     x: torch.Tensor,
     permuted_probs: torch.Tensor,
     limit: float,
@@ -1241,6 +1242,19 @@ def swiglu_clamped_deepep(
     up = up.float().clamp(min=-limit, max=limit)
     activated = F.silu(gate).clamp(max=limit) if clamp_after_activation else F.silu(gate.clamp(max=limit))
     return (activated * up * permuted_probs).to(x.dtype)
+
+
+def swiglu_clamped_deepep(x, permuted_probs, limit: float, *, clamp_after_activation: bool = False):
+    """Clamped SwiGLU (DeepSeek V4 style) for DeepEP: Triton kernels on CUDA, the compiled function elsewhere.
+
+    See :mod:`nemo_automodel.components.moe.swiglu_triton` for the kernels and the layout guard.
+    The Triton kernels implement DeepSeek V4 order only; Step-5's clamp after SiLU uses the compiled path.
+    """
+    if clamp_after_activation:
+        return _swiglu_clamped_deepep_compiled(x, permuted_probs, limit, clamp_after_activation=True)
+    if swiglu_triton.uses_triton_kernel(x, permuted_probs):
+        return swiglu_triton.swiglu_clamped_triton(x, permuted_probs, limit)
+    return _swiglu_clamped_deepep_compiled(x, permuted_probs, limit)
 
 
 def get_expert_activation_for_deepep(config: MoEConfig):
@@ -1485,6 +1499,25 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
         )
+        # HybridEP capacity mode (BackendConfig.dispatcher_capacity_factor): the dispatcher returns
+        # device-side tokens_per_expert and buffers of a fixed capacity, so the per-microbatch
+        # count_nonzero host read in forward is skipped as well (rows are never empty).
+        self.dispatcher_capacity_factor = backend.dispatcher_capacity_factor if backend is not None else None
+        self.dispatcher_equal_token_counts = backend.dispatcher_equal_token_counts if backend is not None else False
+        # One flag for the four expert classes' forward: with static routing (forced balance, no noise)
+        # every expert receives tokens by construction, and capacity mode never dispatches an empty
+        # buffer, so the count_nonzero device-to-host read (one per microbatch, and again per
+        # activation-checkpoint recompute) can be skipped. The wrappers copy it with the other
+        # HybridEP settings.
+        self.dispatch_rows_never_empty = self.static_routing or self.dispatcher_capacity_factor is not None
+        if self.dispatcher_capacity_factor is not None and self.expert_bias:
+            # Capacity mode pads the dispatched buffer past the routed row count while tokens_per_expert
+            # still sums to the routed rows; _apply_bias sizes its repeat_interleave from the buffer rows,
+            # so the bias add would trip a device-side size assert. Keep such models on the blocking path.
+            raise ValueError(
+                "dispatcher_capacity_factor is not supported for experts with expert_bias=True; "
+                "leave it at None (blocking HybridEP dispatch) for this model."
+            )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -1523,6 +1556,8 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
+            moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -1640,11 +1675,9 @@ class GroupedExpertsDeepEP(nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
-        # With static routing (forced balance, no noise) every expert receives tokens by
-        # construction, so the count_nonzero device-to-host read (one per microbatch, and
-        # again per activation-checkpoint recompute) can be skipped.
+        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read.
         router_weight_already_applied = False
-        if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
+        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             gate_up_output_bytes = (
                 permuted_local_hidden_states.shape[0]

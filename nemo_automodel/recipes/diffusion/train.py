@@ -516,6 +516,22 @@ class TrainDiffusionRecipe(BaseRecipe):
             if run is not None:
                 logging.info("🚀 View run at {}".format(run.url))
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            # Same two-stage Wan2.2 suffix as the wandb run name.
+            stage = self.cfg.get("model.stage", None)
+            if (
+                stage is not None
+                and self.cfg.trackio.name
+                and not self.cfg.trackio.name.endswith(f"_{str(stage).lower()}")
+            ):
+                self.cfg.trackio.name = f"{self.cfg.trackio.name}_{str(stage).lower()}"
+            model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=model_name
+            )
+            logging.info("Trackio experiment tracking enabled")
+
         self.seed = self.cfg.get("seed", 42)
         self.rng = StatefulRNG(seed=self.seed, ranked=True)
 
@@ -867,7 +883,14 @@ class TrainDiffusionRecipe(BaseRecipe):
             self.val_dataloader = validation_build.dataloader
             self.val_sampler = validation_build.sampler
             if len(self.val_dataloader) == 0:
-                raise RuntimeError("Validation dataloader is empty; remove data.validation_dataloader or fix its path")
+                raise RuntimeError(
+                    f"Validation dataloader is empty (dataset_size={len(self.val_dataloader.dataset)}, "
+                    f"local_batch_size={self.cfg.get('step_scheduler.local_batch_size')}, "
+                    f"dp_size={self._get_dp_group_size()}, drop_last={validation_build.drop_last}). "
+                    "Check the validation cache path and contents. If drop_last is true, set "
+                    "data.validation_dataloader.drop_last: false to retain incomplete per-rank batches "
+                    "in each resolution bucket."
+                )
             if val_every_steps is None:
                 # is_val_step is also true on checkpoint steps, so validation is not dead here.
                 logging.warning(
@@ -981,12 +1004,12 @@ class TrainDiffusionRecipe(BaseRecipe):
                 its periodic diagnostics.
 
         Returns:
-            Mean loss over the validation batches of the data-parallel group, comparable to the
-            logged ``train_loss``.
+            Sample-weighted mean loss over the data-parallel group, including any samples
+            repeated by distributed sampler padding.
         """
         self.model.eval()
         local_loss_sum = 0.0
-        local_num_batches = 0
+        local_num_samples = 0
         try:
             with (
                 ScopedRNG(seed=self.seed + self._get_dp_rank(), ranked=False),
@@ -1003,24 +1026,25 @@ class TrainDiffusionRecipe(BaseRecipe):
                         collect_metrics=False,
                         check_loss=False,
                     )
-                    local_loss_sum += float(average_weighted_loss.detach())
-                    local_num_batches += 1
+                    batch_size = _get_diffusion_microbatch_size(batch)
+                    local_loss_sum += float(average_weighted_loss.detach()) * batch_size
+                    local_num_samples += batch_size
         finally:
             self.model.train()
 
-        # Ranks can hold a different number of batches, so reduce sum and count and divide once.
+        # Weight short and dynamically sized batches by their actual sample counts.
         # CP peers all compute the same full-sequence loss, so the reduction excludes the cp axis.
         totals = torch.tensor(
-            [local_loss_sum, float(local_num_batches)],
+            [local_loss_sum, float(local_num_samples)],
             device=self._get_collective_device(),
             dtype=torch.float64,
         )
         if dist.is_initialized():
             dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=self._get_dp_group())
-        global_loss_sum, global_num_batches = totals.tolist()
-        if global_num_batches == 0:
-            raise RuntimeError("Validation produced no batches; cannot compute validation loss")
-        return global_loss_sum / global_num_batches
+        global_loss_sum, global_num_samples = totals.tolist()
+        if global_num_samples == 0:
+            raise RuntimeError("Validation produced no samples; cannot compute validation loss")
+        return global_loss_sum / global_num_samples
 
     def run_train_validation_loop(self):
         logging.info("[INFO] Starting T2V training with Flow Matching")
@@ -1180,6 +1204,8 @@ class TrainDiffusionRecipe(BaseRecipe):
                     }
                     if _HAS_WANDB and wandb.run is not None:
                         wandb.log(log_dict, step=global_step)
+                    if self.trackio_logger is not None:
+                        self.trackio_logger.log_metrics(log_dict, step=global_step)
                     logging.info(
                         "[TRAIN] step=%s epoch=%s loss=%.6f avg_loss=%.6f lr=%.3e grad_norm=%.3f "
                         "step_time=%.3fs samples_per_sec=%.2f samples_per_sec_per_gpu=%.2f mem=%.2fGB",
@@ -1213,6 +1239,8 @@ class TrainDiffusionRecipe(BaseRecipe):
                     if self.dist_env.is_main:
                         if _HAS_WANDB and wandb.run is not None:
                             wandb.log({"val_loss": val_loss}, step=global_step)
+                        if self.trackio_logger is not None:
+                            self.trackio_logger.log_metrics({"val_loss": val_loss}, step=global_step)
                         logging.info(
                             "[VAL] step=%s epoch=%s val_loss=%.6f",
                             global_step,
@@ -1231,11 +1259,15 @@ class TrainDiffusionRecipe(BaseRecipe):
 
             if self.dist_env.is_main and _HAS_WANDB and wandb.run is not None:
                 wandb.log({"epoch/avg_loss": avg_loss, "epoch/num": epoch + 1}, step=global_step)
+            if self.dist_env.is_main and self.trackio_logger is not None:
+                self.trackio_logger.log_metrics({"epoch/avg_loss": avg_loss, "epoch/num": epoch + 1}, step=global_step)
 
         if self.dist_env.is_main:
             logging.info(f"[INFO] Saved final checkpoint at step {global_step}")
             if _HAS_WANDB and wandb.run is not None:
                 wandb.finish()
+            if self.trackio_logger is not None:
+                self.trackio_logger.finish()
 
         self._finalize_and_close_checkpointer()
         logging.info("[INFO] Training complete!")

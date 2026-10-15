@@ -190,6 +190,38 @@ The check covers the same paths as Bandit (`app.py`, `nemo_automodel/`, `example
 python tools/lint_no_globals.py
 ```
 
+## Unit-test runtime
+
+Unit-test time limits are enforced at **three times the configured value** to
+allow for CI load. The configured default runtime budget is 30 seconds, so new
+and modified tests have an effective 90-second budget, including setup, the test
+body, and teardown. A configured 15-second marker allows 45 seconds. If every
+phase passes but the test exceeds its effective budget, pytest runs it once more
+in the same worker with fresh function-scoped
+fixtures. Shared fixtures and compiler caches can remain warm. Both attempts
+must exceed the budget to fail the runtime gate; assertion failures, fixture
+errors, and hard timeouts are never retried. A warning records every confirmation.
+
+Keep model shapes small and avoid downloads or unnecessary compilation. Tests
+that consistently need more than the effective budget should be optimized or moved to
+functional tests. An exact `@pytest.mark.runtime_budget(...)` may tighten the
+limit, but cannot raise it for a new or modified test. A changed test with a
+marker above 30 seconds stops collection with a usage error; update its marker
+and optimize the test, or move it to functional coverage. Existing larger allowances
+retain their hard watchdog on unrelated changes; they do not impose a runtime
+gate on those changes. The configured default hard watchdog is 70 seconds,
+enforced at 210 seconds. The same multiplier applies once to resolved pytest
+timeout markers and CLI, environment, or ini timeout settings, preserving their
+usual precedence, timeout method, and function-only scope. A zero timeout stays
+disabled. Global pytest timeout options still bypass the soft runtime policy.
+Diagnostics show both configured and effective soft budgets. These rules apply
+only under `tests/unit_tests`; workflow and subprocess timeouts are unchanged.
+
+Changed tests are identified relative to the PR merge base (or `origin/main`
+locally). Set `AUTOMODEL_RUNTIME_BUDGET_BASE=<commit>` to explicitly select a base
+when reproducing a CI result. CPU and GPU unit-test jobs both limit host math
+libraries to one thread per process to avoid oversubscription by spawned ranks.
+
 ## Pre-commit
 
 We recommand to use [prek](https://github.com/j178/prek) to ensure code quality. It is a faster and more modern alternative to [pre-commit](https://github.com/pre-commit/pre-commit).

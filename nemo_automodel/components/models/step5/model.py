@@ -34,7 +34,6 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
     shard_batch_contiguous,
 )
-from nemo_automodel.components.distributed.pipelining.runtime import PipelineRuntimeInitializer
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -55,62 +54,6 @@ from nemo_automodel.components.models.step5.vision import Step5VisionEncoder
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.utils import dtype_from_str
-
-
-def _shard_batch_with_hybridep_extent(
-    cp_mesh: DeviceMesh,
-    tp_mesh: DeviceMesh | None,
-    batch: dict[str, torch.Tensor],
-    *,
-    runtime_initializers: tuple[PipelineRuntimeInitializer, ...],
-    loss_mask: torch.Tensor | None = None,
-    padding_token_id: int = 0,
-) -> tuple[Callable[[], AbstractContextManager[None]], dict[str, torch.Tensor], ShardLayout]:
-    """Scope a shared input-token bound around one native CP forward/backward.
-
-    Args:
-        cp_mesh: Active contiguous context-parallel mesh with more than one rank.
-        tp_mesh: Tensor-parallel mesh passed unchanged to the original sharder.
-        batch: Mapping with token/label/document tensors [batch, global_sequence]
-            or inputs_embeds [batch, global_sequence, hidden]. The original
-            contiguous sharder pads and slices these tensors in place. Image
-            tensors, when present, retain their original layout.
-        runtime_initializers: Compatible shared resources collected after native
-            parallelization. Only input extents are scoped; routing and dispatched
-            expert row counts remain dynamic for every layer and recomputation.
-        loss_mask: Optional mask [batch, global_sequence] passed to the sharder.
-        padding_token_id: Sentinel passed unchanged to the original sharder.
-
-    Returns:
-        Context factory, the original sharded batch and its original layout.
-        Token-aligned tensors have shape [batch, local_sequence, ...]. Each
-        context entry negotiates the physical input extent across EP ranks and
-        retains it through the caller's backward, then clears it even on error.
-        The factory captures only CPU shape/device metadata, not batch tensors.
-    """
-    original_context, batch, layout = shard_batch_contiguous(
-        cp_mesh,
-        tp_mesh,
-        batch,
-        loss_mask=loss_mask,
-        padding_token_id=padding_token_id,
-        extra_seq_keys={"_packed_seq_ids": 1},
-    )
-    primary = batch["input_ids"] if "input_ids" in batch else batch["inputs_embeds"]
-    # Empty local inputs still join the same MAX collective. A positive upper
-    # bound satisfies the existing initializer contract without changing data.
-    num_tokens = max(1, primary.shape[0] * primary.shape[1])
-    device = primary.device
-
-    @contextmanager
-    def train_context() -> Iterator[None]:
-        with original_context(), ExitStack() as stack:
-            for initializer in runtime_initializers:
-                initializer.prepare(num_tokens=num_tokens, device=device)
-                stack.enter_context(initializer.step_context())
-            yield
-
-    return train_context, batch, layout
 
 
 class Step5TextModel(nn.Module):
@@ -267,7 +210,6 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         )
         dtype = dtype_from_str(text.dtype, torch.bfloat16)
         self.cp_mesh: DeviceMesh | None = None
-        self.cp_runtime_initializers: tuple[PipelineRuntimeInitializer, ...] = ()
         moe_config = moe_config or MoEConfig(
             dim=text.hidden_size,
             inter_dim=text.intermediate_size,
@@ -418,11 +360,7 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             raise ValueError("Step5 packed inputs require document-local position_ids")
         updates: dict[str, ContextParallelSharder | torch.Tensor] = {
             "cp_sharder": ContextParallelSharder(
-                shard_batch=(
-                    partial(_shard_batch_with_hybridep_extent, runtime_initializers=self.cp_runtime_initializers)
-                    if self.cp_runtime_initializers
-                    else partial(shard_batch_contiguous, extra_seq_keys={"_packed_seq_ids": 1})
-                ),
+                shard_batch=partial(shard_batch_contiguous, extra_seq_keys={"_packed_seq_ids": 1}),
                 local_token_global_indices=contiguous_local_indices,
             )
         }

@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import logging
-from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -156,23 +154,6 @@ class AutoPipeline:
 
         validate_hf_model_for_pipeline_support(model)
 
-        if self.pp_recv_buffer_pool:
-            from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
-                install_recv_buffer_pool,
-                schedule_supports_recv_pool,
-            )
-
-            # Only 1F1B's bounded in-flight depth makes the ring size proof valid;
-            # schedules with unbounded in-flight microbatches would silently
-            # corrupt gradients through reused recv buffers.
-            if self.pp_schedule_csv is None and schedule_supports_recv_pool(self.pp_schedule):
-                install_recv_buffer_pool(slack=self.pp_recv_buffer_pool_slack)
-            else:
-                logger.warning(
-                    "pp_recv_buffer_pool ignored: schedule %s has no bounded in-flight depth proof",
-                    self.pp_schedule_csv or self.pp_schedule,
-                )
-
         pp_schedule_obj, model_parts, pp_has_first_stage, pp_has_last_stage, stages = pipeline_model(
             model,
             world_mesh=self.world_mesh,
@@ -201,6 +182,25 @@ class AutoPipeline:
             seq_len=self.pp_seq_len,
             tensor_dtype=self.dtype,
         )
+
+        if self.pp_recv_buffer_pool:
+            from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B
+
+            from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
+                install_interleaved_recv_pool,
+                install_recv_buffer_pool,
+                schedule_supports_recv_pool,
+            )
+
+            if self.pp_schedule_csv is None and type(pp_schedule_obj) is ScheduleInterleaved1F1B:
+                install_interleaved_recv_pool(pp_schedule_obj, slack=self.pp_recv_buffer_pool_slack)
+            elif self.pp_schedule_csv is None and schedule_supports_recv_pool(self.pp_schedule):
+                install_recv_buffer_pool(slack=self.pp_recv_buffer_pool_slack)
+            else:
+                logger.warning(
+                    "pp_recv_buffer_pool ignored: schedule %s has no validated receive-lifetime plan",
+                    self.pp_schedule_csv or self.pp_schedule,
+                )
 
         # Update PipelineInfo state
         self._info.enabled = True
@@ -257,19 +257,6 @@ class AutoPipeline:
                 num_tokens=self._pp_runtime_num_tokens,
                 device=self.device,
             )
-
-    @contextmanager
-    def runtime_context(self) -> Iterator[None]:
-        """Activate model-owned prepared resources during one schedule execution.
-
-        Call ``update_seq_len`` on every rank before entering. The context must
-        enclose the complete synchronous schedule, including backward and any
-        activation recomputation. State is released on both success and error.
-        """
-        with ExitStack() as stack:
-            for initializer in self._runtime_initializers:
-                stack.enter_context(initializer.step_context())
-            yield
 
     def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
         """Build pipeline microbatch chunking metadata for keyword inputs.
@@ -345,16 +332,15 @@ class AutoPipeline:
 
         schedule_args = (model_input,) if self._info.has_first_stage else ()
         kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
-        with self.runtime_context():
-            if kwargs_chunk_spec is None:
-                return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+        if kwargs_chunk_spec is None:
+            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
 
-            previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
-            schedule._kwargs_chunk_spec = kwargs_chunk_spec
-            try:
-                return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
-            finally:
-                schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
+        previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
+        schedule._kwargs_chunk_spec = kwargs_chunk_spec
+        try:
+            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+        finally:
+            schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
 
     @property
     def parts(self) -> list[nn.Module]:
