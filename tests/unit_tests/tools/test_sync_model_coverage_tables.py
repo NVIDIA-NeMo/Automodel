@@ -669,6 +669,33 @@ def test_missing_recipe_requires_matching_commit_permalink(tmp_path, revision, l
         _read_documented_recipe(tmp_path, "examples/model.yaml", document)
 
 
+def _is_local_checkpoint_override(value: str, document: str) -> bool:
+    """Recognize literal local paths and paths exported earlier in the example."""
+    value = value.strip("\"'")
+    variable = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
+    if variable:
+        assignment = re.search(rf"^export {variable.group(1)}=([^\r\n]+)$", document, re.MULTILINE)
+        if assignment is None:
+            return False
+        value = assignment.group(1).strip().strip("\"'")
+    return Path(value).is_absolute()
+
+
+@pytest.mark.parametrize(
+    "value,document,expected",
+    [
+        ("/data/model", "", True),
+        ('"/data/model"', "", True),
+        ('"${MODEL}"', "export MODEL=/data/model", True),
+        ('"${MODEL}"', "", False),
+        ('"${MODEL}"', "export MODEL=other/model", False),
+        ("other/model", "", False),
+    ],
+)
+def test_local_checkpoint_override(value, document, expected):
+    assert _is_local_checkpoint_override(value, document) is expected
+
+
 def test_model_card_commands_use_checked_in_recipes():
     repo_root = Path(__file__).parents[3]
     offenders: list[str] = []
@@ -693,7 +720,7 @@ def test_model_card_commands_use_checked_in_recipes():
                 offenders.append(f"{path.relative_to(repo_root)}: contains a recipe placeholder")
                 continue
             checkpoint_override = re.search(r"--model\.pretrained_model_name_or_path\s+(\S+)", command)
-            if checkpoint_override and not Path(checkpoint_override.group(1)).is_absolute():
+            if checkpoint_override and not _is_local_checkpoint_override(checkpoint_override.group(1), document):
                 offenders.append(f"{path.relative_to(repo_root)}: substitutes a checkpoint into a different recipe")
             recipe_paths = re.findall(r"examples/[A-Za-z0-9_./-]+\.yaml", command)
             if not recipe_paths and re.search(r"-c /[A-Za-z0-9_./-]+\.yaml", command):
