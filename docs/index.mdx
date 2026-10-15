@@ -1,6 +1,6 @@
 ---
 title: "NeMo AutoModel Documentation"
-description: "NeMo AutoModel is a PyTorch DTensor-native SPMD open-source training library for scalable LLM and VLM training and fine-tuning with day-0 Hugging Face model support"
+description: "NeMo AutoModel is a PyTorch DTensor-native SPMD open source training library for scalable LLM and VLM training and fine-tuning with day-0 Hugging Face model support."
 hide-nav-links: true
 ---
 
@@ -31,7 +31,7 @@ PyTorch-native training that scales from 1 GPU to thousands with a single config
 <Button small outlined href="/get-started/hf-compatibility">🤗 HF Compatible</Button>
 <Button small outlined href="/performance/performance-summary">🚀 Performance</Button>
 <Button small outlined href="/get-started/key-features">📐 Scalability</Button>
-<Button small outlined href="/recipes-e2e-examples/sft-peft">🎯 SFT & PEFT</Button>
+<Button small outlined href="/recipes-e2e-examples/sft-peft">🎯 SFT and PEFT</Button>
 <Button small outlined href="/recipes-e2e-examples/diffusion-fine-tuning">🎨 Diffusion</Button>
 <Button small outlined href="/recipes-e2e-examples/gemma-4">👁️ VLM</Button>
 <Button small outlined href="/recipes-e2e-examples/gemma-3-3n">🌐 Omni</Button>
@@ -69,7 +69,7 @@ uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-p
 
 See the [installation guide](/get-started/installation) for Docker, source builds, and multi-node setup.
 See the [configuration guide](/get-started/configuration) for YAML recipes and CLI overrides.
-Launch on a [local workstation](/job-launchers/local-workstation) or [SLURM cluster](/job-launchers/slurm-cluster).
+Launch on a [local workstation](/job-launchers/local-workstation) or [Slurm cluster](/job-launchers/slurm-cluster).
 
 ## 10 Most Recently Supported Models
 
@@ -85,7 +85,7 @@ Find the right guide for your task: fine-tuning, pretraining, distillation, diff
 | I want to...                | Choose this when...                                                                 | Input Data                                        | Model     | Guide                                                     |
 | --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- | --------- | --------------------------------------------------------- |
 | **SFT (full fine-tune)**    | You need maximum accuracy and have the GPU budget to update all weights             | Instruction / chat dataset                        | LLM       | [Start fine-tuning](/recipes-e2e-examples/sft-peft)               |
-| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates &lt;1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](/recipes-e2e-examples/sft-peft)        |
+| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates &lt;1% of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](/recipes-e2e-examples/sft-peft)        |
 | **Tool / function calling** | Your model needs to call APIs or tools with structured arguments                    | Function-calling dataset (queries + tool schemas) | LLM       | [Add tool calling](/recipes-e2e-examples/function-calling)             |
 | **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](/recipes-e2e-examples/gemma-3-3n)                 |
 | **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](/recipes-e2e-examples/gemma-4)                 |
@@ -133,8 +133,8 @@ Mixed-precision FP8 training with torchao.
 </Card>
 
 <Card title="Mixed-Precision Training" href="/development/mixed-precision-training">
-fp32 master weights, bf16 compute, and the precision traps to avoid.
-<Badge>bf16</Badge> <Badge>mixed-precision</Badge>
+FP32 master weights, BF16 compute, and the precision traps to avoid.
+<Badge>BF16</Badge> <Badge>mixed-precision</Badge>
 </Card>
 
 <Card title="Checkpointing" href="/development/checkpointing">
@@ -153,7 +153,7 @@ Train with quantization for deployment-ready models.
 </Card>
 
 <Card title="Experiment Tracking" href="/development/mlflow-logging">
-Track experiments and metrics with MLflow and Wandb.
+Track experiments and metrics with MLflow and W&B.
 <Badge>MLflow</Badge> <Badge>Wandb</Badge>
 </Card>
 
