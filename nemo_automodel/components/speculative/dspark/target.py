@@ -67,19 +67,19 @@ class _PackedActivationLayout(Protocol):
         """Map a tensor of shape [batch, model_sequence, ...] to [batch, sequence, ...]."""
 
 
-@runtime_checkable
-class _DSparkPackedTarget(Protocol):
-    """Optional model-owned forward for targets that isolate packed documents themselves.
+class _DSparkPackedForward(Protocol):
+    """Model-owned frozen forward for targets that isolate packed documents themselves.
 
     The generic packing path masks attention with a block-causal ``[batch, 1, sequence,
     sequence]`` mask. Targets whose attention also mixes tokens through other state, such
     as compressed KV or sparse indexers, run packed rows through their own metadata instead.
     """
 
-    def dspark_packed_forward(self, input_ids: torch.Tensor, *, seq_lens: torch.Tensor) -> _PackedActivationLayout:
+    def __call__(self, model: nn.Module, input_ids: torch.Tensor, *, seq_lens: torch.Tensor) -> _PackedActivationLayout:
         """Run the frozen forward on packed rows.
 
         Args:
+            model: Target model whose activations the wrapper hooks.
             input_ids: Tensor of shape [batch, sequence] holding packed documents.
             seq_lens: Tensor of shape [batch, documents] with document lengths; each row
                 sums to ``sequence`` and zero entries pad the document axis.
@@ -97,12 +97,18 @@ class HFDSparkTargetModel:
     HuggingFace ``output_hidden_states`` offset-1 convention); a hook on the final
     norm captures the post-norm last hidden state. Models with a nonstandard
     feature contract can expose ``get_dspark_target_feature_modules``; the wrapper
-    then captures the first input of each returned module instead. Models that
-    isolate packed documents with their own metadata expose ``dspark_packed_forward``,
-    which replaces the generic block-causal mask on the packing path.
+    then captures the first input of each returned module instead. Targets that
+    isolate packed documents with their own metadata pass a model-owned
+    ``packed_forward``, which replaces the generic block-causal mask on the packing path.
     """
 
-    def __init__(self, model: nn.Module, target_layer_ids: Sequence[int], cp_mesh=None):
+    def __init__(
+        self,
+        model: nn.Module,
+        target_layer_ids: Sequence[int],
+        cp_mesh=None,
+        packed_forward: _DSparkPackedForward | None = None,
+    ):
         self.model = model.eval()
         self._num_layers = len(self._get_transformer_layers())
         # ``-1`` (the embedding output) is accepted, matching
@@ -116,7 +122,7 @@ class HFDSparkTargetModel:
         )
         if self._target_feature_modules is not None and len(self._target_feature_modules) != len(self.target_layer_ids):
             raise ValueError("get_dspark_target_feature_modules must return one module for each requested target layer")
-        self._owns_packing = isinstance(self.model, _DSparkPackedTarget)
+        self._packed_forward = packed_forward
         # Context parallelism shards this frozen forward along the sequence dim;
         # generate_batch gathers the captured hidden states back to the full
         # sequence so the draft's anchor/block masks stay CP-unaware. cp_mesh is the
@@ -275,8 +281,8 @@ class HFDSparkTargetModel:
         extra_kwargs: dict[str, torch.Tensor] = {}
         if seq_lens is not None and position_ids is None:
             raise ValueError("DSpark sequence packing requires per-document position_ids, but none were provided.")
-        model_owned_packing = seq_lens is not None and self._owns_packing
-        if seq_lens is not None and not model_owned_packing:
+        use_packed_forward = seq_lens is not None and self._packed_forward is not None
+        if seq_lens is not None and not use_packed_forward:
             # Packing: run the frozen target block-causal (SDPA/eager consume the
             # [B, 1, S, S] additive mask; FlashAttention infers boundaries from the
             # per-document position_ids at batch size 1) so the captured context
@@ -335,8 +341,8 @@ class HFDSparkTargetModel:
             captured = dict(zip(keys, gathered))
         else:
             try:
-                if model_owned_packing:
-                    layout = self.model.dspark_packed_forward(input_ids, seq_lens=seq_lens)
+                if use_packed_forward:
+                    layout = self._packed_forward(self.model, input_ids, seq_lens=seq_lens)
                 else:
                     self.model(
                         **filter_forward_kwargs(

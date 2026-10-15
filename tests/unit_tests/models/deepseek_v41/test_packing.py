@@ -29,9 +29,9 @@ from torch.distributed.tensor import DTensor
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
-from nemo_automodel.components.models.common.aligned_packing import packed_layout
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
+from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 from nemo_automodel.components.moe.parallelizer import apply_ac
 from tests.unit_tests.models.deepseek_v41.test_engram import _tokenizer
 from tests.unit_tests.models.deepseek_v41.test_model import _backend, _tiny_config

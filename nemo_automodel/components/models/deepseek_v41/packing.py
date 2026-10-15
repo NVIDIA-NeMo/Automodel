@@ -12,16 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Packed text rows whose documents start on compression-group boundaries.
-
-Compressed attention pools fixed groups of tokens, so a group must not span two
-documents. The layout serves direct forwards and contiguous context parallelism.
-"""
+"""One packed text layout for direct forwards and contiguous context parallelism."""
 
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 
 
 @dataclass(frozen=True)
@@ -70,31 +65,6 @@ class PackedSequenceLayout:
         valid = self.input_positions >= 0
         valid = valid.reshape(*valid.shape, *([1] * (values.ndim - 2)))
         return result.masked_fill(~valid, 0)
-
-
-def aligned_packed_length(
-    seq_lens: torch.Tensor, *, alignment: int, minimum_length: int, sync_across_ranks: bool
-) -> int:
-    """Return the physical row length after every document is aligned.
-
-    Args:
-        seq_lens: Integer document lengths [batch, documents]; zero and -1000 entries
-            denote absent documents.
-        alignment: Positive multiple for each document's physical span.
-        minimum_length: Lower bound, typically the caller's row width.
-        sync_across_ranks: Max-reduce the length over the default process group.
-            HybridEP needs the same token count from every rank, and rows of the same
-            width need different amounts of alignment padding.
-
-    Returns:
-        The longest aligned row of the batch, or of all ranks, and at least
-        ``minimum_length``.
-    """
-    lengths = seq_lens.clamp_min(0)
-    length = ((lengths + alignment - 1) // alignment * alignment).sum(-1).max().clamp_min(minimum_length)
-    if sync_across_ranks and dist.is_available() and dist.is_initialized():
-        dist.all_reduce(length, op=dist.ReduceOp.MAX)
-    return int(length)
 
 
 def packed_layout(

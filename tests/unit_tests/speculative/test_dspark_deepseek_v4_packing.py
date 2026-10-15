@@ -25,8 +25,10 @@ import pytest
 import torch
 from torch import nn
 
-from nemo_automodel.components.models.common import BackendConfig, aligned_packing
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.deepseek_v4 import dspark_target as v4_dspark_target
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
+from nemo_automodel.components.models.deepseek_v41 import dspark_target as v41_dspark_target
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 from nemo_automodel.components.speculative.dspark import Qwen3DSparkModel
 from nemo_automodel.components.speculative.dspark.config import build_deepseek_v4_draft_config
@@ -97,8 +99,15 @@ def _v41_target():
 
 
 @pytest.mark.parametrize("hybridep", [False, True], ids=["local", "hybridep"])
-@pytest.mark.parametrize("build_target", [_v4_target, _v41_target], ids=["deepseek_v4", "deepseek_v41"])
-def test_packed_target_features_match_each_document_alone(build_target, hybridep, monkeypatch):
+@pytest.mark.parametrize(
+    ("build_target", "packed_forward"),
+    [
+        (_v4_target, v4_dspark_target.dspark_packed_forward),
+        (_v41_target, v41_dspark_target.dspark_packed_forward),
+    ],
+    ids=["deepseek_v4", "deepseek_v41"],
+)
+def test_packed_target_features_match_each_document_alone(build_target, packed_forward, hybridep, monkeypatch):
     model = build_target()
     # Both rows align to 28 tokens (4-token alignment): 8 + 12 + 8 and 12 + 16.
     aligned_width = 28
@@ -106,10 +115,10 @@ def test_packed_target_features_match_each_document_alone(build_target, hybridep
         # HybridEP pads every rank to the longest aligned row; pretend another rank's
         # row is 16 tokens longer.
         model.backend = dataclasses.replace(model.backend, dispatcher="hybridep")
-        monkeypatch.setattr(aligned_packing.dist, "is_initialized", lambda: True)
-        monkeypatch.setattr(aligned_packing.dist, "all_reduce", lambda tensor, op: tensor.add_(16))
+        monkeypatch.setattr(v41_dspark_target.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(v41_dspark_target.dist, "all_reduce", lambda tensor, op: tensor.add_(16))
         aligned_width += 16
-    wrapper = HFDSparkTargetModel(model, target_layer_ids=[1, 3])
+    wrapper = HFDSparkTargetModel(model, target_layer_ids=[1, 3], packed_forward=packed_forward)
     vocab_size = getattr(model.config, "text_config", model.config).vocab_size
     documents, input_ids, position_ids, doc_remaining, seq_lens = _pack(
         ROW_DOCUMENTS, vocab_size=vocab_size, generator=torch.Generator().manual_seed(1)
@@ -132,18 +141,37 @@ def test_packed_target_features_match_each_document_alone(build_target, hybridep
         torch.testing.assert_close(packed.target_last_hidden_states[row : row + 1], expected_last, atol=2e-5, rtol=2e-5)
     assert packed.seq_lens is seq_lens and packed.position_ids is position_ids
     with torch.no_grad():
-        layout = model.dspark_packed_forward(input_ids, seq_lens=seq_lens)
+        layout = packed_forward(model, input_ids, seq_lens=seq_lens)
     assert layout.sequence_ids.shape == (len(ROW_DOCUMENTS), aligned_width)
 
 
-def test_aligned_packed_length_skips_absent_documents_and_keeps_the_row_width():
+def test_aligned_packed_layout_skips_absent_documents_and_keeps_the_row_width():
     seq_lens = torch.tensor([[7, 12, 5], [10, 14, -1000]])
-    assert (
-        aligned_packing.aligned_packed_length(seq_lens, alignment=4, minimum_length=24, sync_across_ranks=False) == 28
+    layout = v41_dspark_target.aligned_packed_layout(
+        seq_lens, input_shape=(2, 24), alignment=4, sync_across_ranks=False
     )
-    assert (
-        aligned_packing.aligned_packed_length(seq_lens, alignment=4, minimum_length=32, sync_across_ranks=False) == 32
+    assert layout.sequence_ids.shape == (2, 28)
+    assert layout.sequence_ids[1].tolist() == [1] * 10 + [0] * 2 + [2] * 14 + [0] * 2
+    layout = v41_dspark_target.aligned_packed_layout(
+        seq_lens, input_shape=(2, 32), alignment=4, sync_across_ranks=False
     )
+    assert layout.sequence_ids.shape == (2, 32)
+
+
+def test_aligned_packed_layout_syncs_the_aligned_width_across_ranks(monkeypatch):
+    seq_lens = torch.tensor([[7, 12, 5], [10, 14, -1000]])
+    reduced = []
+
+    def all_reduce(tensor, op):
+        reduced.append(int(tensor))
+        tensor.add_(4)  # Another rank's aligned row is one alignment unit longer.
+
+    monkeypatch.setattr(v41_dspark_target.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(v41_dspark_target.dist, "all_reduce", all_reduce)
+    layout = v41_dspark_target.aligned_packed_layout(seq_lens, input_shape=(2, 24), alignment=4, sync_across_ranks=True)
+    # The absent -1000 document adds no span, so this rank contributes 28 tokens.
+    assert reduced == [28]
+    assert layout.sequence_ids.shape == (2, 32)
 
 
 def _v4_draft() -> DeepseekV4DSparkModel:

@@ -70,7 +70,13 @@ from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppre
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.dspark_target import (
+    dspark_packed_forward as deepseek_v4_dspark_packed_forward,
+)
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41DSparkTargetConfig
+from nemo_automodel.components.models.deepseek_v41.dspark_target import (
+    dspark_packed_forward as deepseek_v41_dspark_packed_forward,
+)
 from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
 from nemo_automodel.components.optim.optimizer import build_optimizer
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
@@ -662,7 +668,11 @@ class TrainDSparkRecipe(BaseRecipe):
             _apply_target_chat_template(self.tokenizer, chat_template)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
+        # V4 and V4.1 isolate packed documents through their own packing metadata
+        # instead of the generic block-causal mask.
+        target_packed_forward = None
         if is_deepseek_v4_target:
+            target_packed_forward = deepseek_v4_dspark_packed_forward
             if self.cached_target_path is None:
                 # Full V4-Flash target loaded with the same expert-parallel / FSDP and
                 # FP8-dequant path as the V4 finetune recipe, so the 256 experts shard
@@ -688,6 +698,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["DeepseekV4ForCausalLM"])
         elif is_deepseek_v41_target:
+            target_packed_forward = deepseek_v41_dspark_packed_forward
             if self.cached_target_path is None:
                 target_options = DeepseekV41DSparkTargetConfig(
                     target_path=target_path,
@@ -888,7 +899,12 @@ class TrainDSparkRecipe(BaseRecipe):
         # -1 (the embedding output) and enforces strictly-increasing ids.
         self.target_layer_ids = target_layer_ids
         self.target_wrapper = (
-            HFDSparkTargetModel(self.target_model, target_layer_ids=target_layer_ids, cp_mesh=self.cp_mesh)
+            HFDSparkTargetModel(
+                self.target_model,
+                target_layer_ids=target_layer_ids,
+                cp_mesh=self.cp_mesh,
+                packed_forward=target_packed_forward,
+            )
             if self.target_model is not None
             else None
         )
