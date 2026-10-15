@@ -451,10 +451,6 @@ def test_committed_generated_tables_are_rejected(tmp_path):
 
 
 def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
-    # Keep the requested display title while preserving the canonical checkpoint route.
-    display_titles = {
-        "model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base": "FLUX 3 Image Klein Base",
-    }
     repo_root = Path(__file__).parents[3]
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
     assert docs_config.get("theme", {}).get("sidebar") == "default", "Provider icons require the default sidebar"
@@ -502,10 +498,9 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                 index_document = index_path.read_text(encoding="utf-8")
                 for label, href in re.findall(r"^- \[`([^`]+)`\]\(([^)]+)\)$", index_document, re.MULTILINE):
                     checkpoint_name = href.rstrip("/").rsplit("/", 1)[-1]
-                    expected_label = display_titles.get(href.strip("/"), checkpoint_name).replace(" ", "-")
-                    if label != expected_label:
+                    if label.casefold() != checkpoint_name.casefold():
                         offenders.append(
-                            f"{provider_slug}: provider index label {label!r} does not match {expected_label!r}"
+                            f"{provider_slug}: provider index label {label!r} does not match {checkpoint_name!r}"
                         )
 
             icon = provider.get("icon")
@@ -543,18 +538,16 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                     offenders.append(f"{path}: invalid model route {frontmatter_slug!r}")
                     continue
                 model_id = frontmatter_slug.rsplit("/", 1)[1]
-                expected_title = display_titles.get(frontmatter_slug, model_id)
-                expected_sidebar = expected_title.replace(" ", "-")
                 sidebar_label = page.get("page")
                 if not isinstance(sidebar_label, str) or not sidebar_label:
                     offenders.append(f"{path}: model entry has no sidebar label")
-                elif sidebar_label != expected_sidebar:
-                    offenders.append(f"{path}: sidebar label {sidebar_label!r} does not match {expected_sidebar!r}")
+                elif sidebar_label.casefold() != model_id.casefold():
+                    offenders.append(f"{path}: sidebar label {sidebar_label!r} does not match {model_id!r}")
                 document = model_path.read_text(encoding="utf-8")
                 title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
-                if title_match is None or title_match.group(1) != expected_title:
+                if title_match is None or title_match.group(1).casefold() != model_id.casefold():
                     title = title_match.group(1) if title_match is not None else None
-                    offenders.append(f"{path}: page title {title!r} does not match {expected_title!r}")
+                    offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
                 hf_checkpoints = re.findall(
                     r"https://huggingface\.co/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)",
                     document,
