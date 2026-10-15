@@ -61,6 +61,7 @@ jobs:
           uv run --no-project --isolated --python 3.12 \
             --with pytest --with pytest-timeout --with pyyaml --with pillow \
             python -m pytest -q --noconftest \
+            tests/unit_tests/ci_tests/test_docs_workflows.py \
             tests/unit_tests/tools/test_sync_model_coverage_tables.py \
             tests/unit_tests/_transformers/test_doc_coverage.py::test_every_model_card_has_architecture_reference_table
 
