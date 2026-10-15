@@ -156,6 +156,34 @@ Repository source paths like `examples/llm_finetune/foo.yaml` or `nemo_automodel
 [foo.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/foo.yaml)
 ```
 
+### Model cards whose recipes are in another PR
+
+Keep ordinary `blob/main/examples/...yaml` recipe links in the card. If a recipe
+has not reached main, associate the card with its implementation PR in frontmatter:
+
+```yaml
+recipe-pr: https://github.com/NVIDIA-NeMo/Automodel/pull/4369
+```
+
+The model-coverage generator and command checks use the checked-in YAML when it
+exists. Otherwise, they resolve that PR's head commit and read the recipe at that
+revision, including for fork PRs. Invalid PR references, missing recipe files, and
+invalid YAML fail validation. Recipe files are read as data; PR code is not run.
+
+During generation, missing main-branch recipe links become commit permalinks.
+The generated `?recipe-pr=NUMBER` suffix records their origin so `--clean` can
+restore the source links. A `tree/main` link on the same card also resolves to
+the recipe revision. Once the recipes exist in the checkout, the build uses main
+links without another card edit. Explicit commit permalinks in cards remain pinned.
+
+The homepage, full support log, and per-type tables include published model cards
+as well as checked-in recipes. Cards without recipes have an empty Recipe cell.
+Documentation-first entries use the card's original Git date; cards annotated
+with `recipe-pr` retain that date when their recipes arrive. Source aliases do not
+create duplicate entries. Keep the `recipe-pr` field after merge to preserve this
+history. Run `python tests/ci_tests/utils/sync_model_coverage_tables.py --clean`
+after local generation and commit the source links rather than generated output.
+
 ## Versioning
 
 `docs.yml` `versions:` lists three entries (matching the published version dropdown):
