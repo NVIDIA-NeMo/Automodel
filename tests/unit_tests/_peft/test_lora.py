@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.graph import saved_tensors_hooks
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard, distribute_tensor
 
 from nemo_automodel.components._peft.lora import (
@@ -30,6 +31,7 @@ from nemo_automodel.components._peft.lora import (
     apply_memory_efficient_lora,
     patch_linear_module,
 )
+from nemo_automodel.components.distributed.activation_checkpointing import make_selective_checkpoint_context_fn
 from nemo_automodel.components.distributed.parallel_styles import TPLinear
 from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.tp_linear import _async_tp_linear
@@ -256,6 +258,32 @@ def test_memory_efficient_lora_with_residual_matches_legacy_forward_and_backward
     assert torch.allclose(lora_A.grad, lora_A_ref.grad)
     assert torch.allclose(lora_B.grad, lora_B_ref.grad)
     assert torch.allclose(res.grad, res_ref.grad)
+
+
+def test_memory_efficient_lora_with_residual_is_selective_checkpoint_safe():
+    """A tiny LoRA module must preserve selective-AC's cached matmul output."""
+    torch.manual_seed(1234)
+    projection = patch_linear_module(
+        nn.Linear(16, 16, bias=False),
+        dim=4,
+        alpha=8,
+        use_triton=False,
+        use_memory_efficient_lora=True,
+    )
+    with torch.no_grad():
+        projection.lora_A.weight.normal_()
+        projection.lora_B.weight.normal_()
+
+    model = checkpoint_wrapper(
+        nn.Sequential(projection, nn.SiLU()),
+        context_fn=make_selective_checkpoint_context_fn(),
+    )
+    x = torch.randn(2, 8, 16, requires_grad=True)
+    model(x).square().mean().backward()
+
+    for tensor in (x, projection.lora_A.weight, projection.lora_B.weight):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
 
 
 def test_memory_efficient_lora_saves_less_forward_state():
