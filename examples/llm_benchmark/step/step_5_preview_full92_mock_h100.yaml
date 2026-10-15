@@ -20,6 +20,8 @@
 # To run this recipe:
 #   automodel examples/llm_benchmark/step/step_5_preview_full92_mock_h100.yaml --nproc-per-node 8
 
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
 benchmark:
   flops_scope: model
   json_output_path: outputs/step5-full92-mock-h100/benchmark.json
@@ -217,7 +219,6 @@ optimizer:
   master_weights: true
   store_param_remainders: true
   weight_decay: 0.1
-recipe: BenchmarkingRecipeForNextTokenPrediction
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
   ranked: true

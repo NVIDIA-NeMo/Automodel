@@ -67,7 +67,7 @@ def _rms_norm(hidden: torch.Tensor, weight: torch.Tensor, eps: float, output_dty
 @torch.compile(
     fullgraph=True,
     dynamic=True,
-    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+    options={"emulate_precision_casts": True},
 )
 def _residual_rms_norm(
     hidden: torch.Tensor, weight: torch.Tensor, eps: float, output_dtype: torch.dtype
@@ -78,7 +78,7 @@ def _residual_rms_norm(
 @torch.compile(
     fullgraph=True,
     dynamic=True,
-    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+    options={"emulate_precision_casts": True},
 )
 def _activation_rms_norm(
     hidden: torch.Tensor, weight: torch.Tensor, eps: float, output_dtype: torch.dtype
@@ -92,7 +92,7 @@ def _activation_rms_norm(
 @torch.compile(
     fullgraph=True,
     dynamic=True,
-    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+    options={"emulate_precision_casts": True},
 )
 def _grouped_rms_norm(
     hidden: torch.Tensor, weight: torch.Tensor, eps: float, output_dtype: torch.dtype

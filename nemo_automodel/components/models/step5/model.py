@@ -21,13 +21,11 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
@@ -48,6 +46,7 @@ from nemo_automodel.components.models.step5.configuration import (
     Step5VLConfig,
 )
 from nemo_automodel.components.models.step5.cp import gather_metadata
+from nemo_automodel.components.models.step5.parallelization import PARALLELIZER
 from nemo_automodel.components.models.step5.layers import Step5DecoderLayer, Step5RMSNorm
 from nemo_automodel.components.models.step5.sparse import region_metadata
 from nemo_automodel.components.models.step5.state_dict_adapter import Step5StateDictAdapter
@@ -55,50 +54,6 @@ from nemo_automodel.components.models.step5.vision import Step5VisionEncoder
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.utils import dtype_from_str
-
-_FP32_NORM_POLICY = MixedPrecisionPolicy(
-    param_dtype=torch.float32,
-    reduce_dtype=torch.float32,
-    cast_forward_inputs=False,
-)
-
-
-class Step5ModelParallelizer(ModelParallelizer):
-    """Keep the final decoder norm in its own FP32 FSDP unit."""
-
-    _customizes_moe_fsdp = True
-
-    def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
-        """Shard a module, first giving any contained final norm an FP32 unit.
-
-        Decoder blocks already group their strict-FP32 norms by dtype. The
-        final norm is owned by the root unit, which uses the BF16 parameter
-        policy, so it is wrapped separately before that root.
-
-        Args:
-            module: Module to shard in place.
-            **kwargs: ``fully_shard`` keyword arguments (mesh, mp_policy,
-                offload_policy, reshard_after_forward, ignored_params).
-
-        Returns:
-            The input module with FSDP applied.
-        """
-        from nemo_automodel.components.models.step5.model import Step5TextModel
-
-        # The root unit may be the text model itself or its outer CausalLM/VLM wrapper.
-        norm_kwargs = {key: value for key, value in kwargs.items() if key != "ignored_params"}
-        for submodule in module.modules():
-            if (
-                isinstance(submodule, Step5TextModel)
-                and submodule.norm is not None
-                and not isinstance(submodule.norm, FSDPModule)
-            ):
-                fully_shard(submodule.norm, **{**norm_kwargs, "mp_policy": _FP32_NORM_POLICY})
-        return fully_shard(module, **kwargs)
-
-
-PARALLELIZER = Step5ModelParallelizer()
-
 
 class Step5TextModel(nn.Module):
     """Embedding, decoder stack and final normalization."""

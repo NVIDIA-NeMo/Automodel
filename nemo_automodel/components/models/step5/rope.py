@@ -32,7 +32,7 @@ def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, span: i
 @torch.compile(
     fullgraph=True,
     dynamic=True,
-    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+    options={"emulate_precision_casts": True},
 )
 def _apply_full_rotary_compiled(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     return _apply_rotary(x, cos, sin, x.shape[-1])
@@ -41,7 +41,7 @@ def _apply_full_rotary_compiled(x: torch.Tensor, cos: torch.Tensor, sin: torch.T
 @torch.compile(
     fullgraph=True,
     dynamic=True,
-    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+    options={"emulate_precision_casts": True},
 )
 def _apply_partial_rotary_compiled(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, span: int) -> torch.Tensor:
     return _apply_rotary(x, cos, sin, span)
@@ -50,7 +50,7 @@ def _apply_partial_rotary_compiled(x: torch.Tensor, cos: torch.Tensor, sin: torc
 @torch.compile(
     fullgraph=True,
     dynamic=True,
-    options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+    options={"emulate_precision_casts": True},
 )
 def _apply_single_head_rotary_compiled(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, span: int
