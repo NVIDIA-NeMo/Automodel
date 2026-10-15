@@ -265,7 +265,7 @@ def _distributed_storage_worker(rank, world_size, rendezvous):
 
 @pytest.mark.timeout(120)
 @pytest.mark.run_only_on("GPU")
-@pytest.mark.skipif(not is_torch_min_version("2.8.0"), reason="Mixed frozen storage needs PyTorch >= 2.8")
+@pytest.mark.skipif(not is_torch_min_version("2.8.0"), reason="CPU FSDP validation needs PyTorch >= 2.8")
 def test_storage_and_gradients_with_ep_and_fsdp(tmp_path):
     # Four CPU ranks exercise the smallest genuine EP=2 + FSDP=2 composition.
     import torch.multiprocessing as mp

@@ -1121,8 +1121,7 @@ def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
     assert compute_dtype_of(attention.proj.weight) == torch.bfloat16
 
 
-@pytest.mark.parametrize("modern_torch", [True, False])
-def test_frozen_bf16_base_with_fp32_adapter_storage(monkeypatch, modern_torch):
+def test_frozen_bf16_base_with_fp32_adapter_storage(monkeypatch):
     from nemo_automodel.components.distributed import parallelizer_utils
 
     class MixedStorage(nn.Module):
@@ -1133,19 +1132,56 @@ def test_frozen_bf16_base_with_fp32_adapter_storage(monkeypatch, modern_torch):
 
     model = MixedStorage()
     calls = []
-    monkeypatch.setattr(parallelizer_utils, "is_torch_min_version", lambda version: modern_torch)
+    install_patch = Mock()
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_mixed_frozen_storage", install_patch)
     monkeypatch.setattr(parallelizer_utils, "fully_shard", lambda module, **kwargs: calls.append((module, kwargs)))
-    if not modern_torch:
-        with pytest.raises(ValueError, match="could not isolate parameters"):
-            fully_shard_by_dtype(model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=None)
-        assert not calls
-        return
     fully_shard_by_dtype(model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=None)
+    install_patch.assert_called_once_with()
     assert len(calls) == 1
     assert calls[0][0] is model
     assert calls[0][1]["mp_policy"].param_dtype == torch.bfloat16
     assert model.base.dtype == torch.bfloat16
     assert model.adapter.dtype == torch.float32
+
+
+@pytest.mark.parametrize("modern_torch", [False, True])
+@pytest.mark.parametrize("trainable_dtypes", [[], [torch.float32], [torch.float32, torch.bfloat16]])
+def test_fsdp_mixed_frozen_storage_patch(monkeypatch, modern_torch, trainable_dtypes):
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    from nemo_automodel.components.distributed.fsdp_patches import patch_fsdp_mixed_frozen_storage
+    from nemo_automodel.shared import import_utils
+
+    original = FSDPParamGroup._init_mp_dtypes
+    # Record the class attribute so monkeypatch restores the process-global patch.
+    monkeypatch.setattr(FSDPParamGroup, "_init_mp_dtypes", original)
+    monkeypatch.setattr(import_utils, "is_torch_min_version", lambda version: modern_torch)
+    patch_fsdp_mixed_frozen_storage()
+    installed = FSDPParamGroup._init_mp_dtypes
+    patch_fsdp_mixed_frozen_storage()
+    assert FSDPParamGroup._init_mp_dtypes is installed
+    if modern_torch:
+        assert installed is original
+        return
+
+    class Param:
+        def __init__(self, dtype, requires_grad):
+            self.sharded_param = nn.Parameter(torch.ones(2, dtype=dtype), requires_grad=requires_grad)
+
+        def init_dtype_attrs(self, policy):
+            self.orig_dtype = self.sharded_param.dtype
+            self.reduce_dtype = policy.reduce_dtype
+
+    params = [Param(torch.bfloat16, False), *(Param(dtype, True) for dtype in trainable_dtypes)]
+    group = SimpleNamespace(fsdp_params=params, mp_policy=_make_mp_policy())
+    if len(trainable_dtypes) > 1:
+        with pytest.raises(AssertionError, match="uniform original parameter dtype"):
+            installed(group)
+    else:
+        installed(group)
+        assert group._orig_dtype == (torch.float32 if trainable_dtypes else None)
+        assert group._reduce_dtype == (group.mp_policy.reduce_dtype if trainable_dtypes else None)
+        assert all(param.orig_dtype == param.sharded_param.dtype for param in params)
 
 
 def test_mixed_lora_storage_keeps_fp32_compute_unit_separate(monkeypatch):
@@ -1157,7 +1193,6 @@ def test_mixed_lora_storage_keeps_fp32_compute_unit_separate(monkeypatch):
     model.experts.adapter = nn.Parameter(torch.ones(4, 4, dtype=torch.float32))
     model.router = nn.Linear(4, 4, dtype=torch.float32)
     calls = []
-    monkeypatch.setattr(parallelizer_utils, "is_torch_min_version", lambda version: True)
     monkeypatch.setattr(parallelizer_utils, "fully_shard", lambda module, **kwargs: calls.append((module, kwargs)))
     fully_shard_by_dtype(
         model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=None, fp32_compute_module_names=("router",)

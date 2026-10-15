@@ -27,12 +27,14 @@ from torch.distributed.fsdp import (
 )
 
 from nemo_automodel.components.distributed.fsdp_patches import (
+    patch_fsdp_mixed_frozen_storage as _patch_fsdp_mixed_frozen_storage,
+)
+from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
 from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_unused_param_reduction as _patch_fsdp_unused_param_reduction,
 )
-from nemo_automodel.shared.import_utils import is_torch_min_version
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
@@ -414,21 +416,21 @@ def fully_shard_by_dtype(
         ignored_params=ignored_params,
     )
 
-    # PyTorch >= 2.8 requires uniform *trainable* storage dtype per FSDP unit.
+    # Backport the trainable-only dtype check on PyTorch 2.6/2.7.
+    _patch_fsdp_mixed_frozen_storage()
+    # FSDP requires uniform *trainable* storage dtype per FSDP unit.
     # Frozen bases may join adapters with different storage but identical compute.
     # Normalize frozen grouping keys only when that compute group has one trainable
-    # dtype; retain the old isolation behavior for mixed trainable dtypes/older torch.
+    # dtype; retain storage isolation for mixed trainable dtypes.
     trainable_dtypes_by_compute: dict[torch.dtype, set[torch.dtype]] = defaultdict(set)
-    allow_mixed_frozen_storage = is_torch_min_version("2.8.0")
-    if allow_mixed_frozen_storage:
-        for param in module.parameters():
-            if id(param) not in ignored_param_ids and param.requires_grad:
-                trainable_dtypes_by_compute[compute_dtype_of(param)].add(param.dtype)
+    for param in module.parameters():
+        if id(param) not in ignored_param_ids and param.requires_grad:
+            trainable_dtypes_by_compute[compute_dtype_of(param)].add(param.dtype)
 
     def group_key_of(tensor: torch.Tensor) -> tuple[torch.dtype, torch.dtype]:
         compute_dtype = compute_dtype_of(tensor)
         storage_dtype = tensor.dtype
-        if allow_mixed_frozen_storage and not tensor.requires_grad:
+        if not tensor.requires_grad:
             trainable_dtypes = trainable_dtypes_by_compute[compute_dtype]
             if len(trainable_dtypes) == 1:
                 storage_dtype = next(iter(trainable_dtypes))

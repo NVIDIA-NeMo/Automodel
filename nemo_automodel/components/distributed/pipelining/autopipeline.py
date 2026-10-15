@@ -19,10 +19,11 @@ from typing import Any, Callable, Literal
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.pipelining.microbatch import BlockMask, TensorChunkSpec
+from torch.distributed.pipelining.microbatch import TensorChunkSpec
 from torch.distributed.pipelining.microbatch import _Replicate as ReplicateChunkSpec
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 from torch.distributed.pipelining.stage import PipelineStage
+from torch.nn.attention.flex_attention import BlockMask
 from torch.utils._pytree import tree_map
 
 from nemo_automodel.components.distributed.pipelining.functional import (
