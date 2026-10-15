@@ -36,6 +36,26 @@ multi-token prediction layers. Activated parameters count all non-routed
 parameters plus eight routed experts per MoE layer, including the full input
 embedding matrix. Excluding that matrix gives approximately 26.6B.
 
+## Recipes
+
+| Recipe | Hardware and parallelism | Data |
+| --- | --- | --- |
+| [Full SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml) | 11 nodes x 4 GB200; EP44; global batch 44 | Tulu3, 4,096 tokens |
+| [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_lora.yaml) | 2 nodes x 4 GB200; EP8; global batch 8; rank 32 | Tulu3, 4,096 tokens |
+| [Long-context SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_packed128k_cp32.yaml) | 16 nodes x 8 H100; PP4 / CP32 / EP32, interleaved 1F1B; global batch 8 | Tulu3 packed to 131,072 tokens |
+| [Benchmark](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/step/step_5_preview_full92_mock_h100.yaml) | 16 nodes x 8 H100; PP4 / EP32; global batch 768 | Mock, 8,192 tokens |
+
+The recipes load the model and tokenizer from
+[`stepfun-ai/Step-5-Preview-BF16`](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
+and Tulu3 from `allenai/tulu-3-sft-mixture`. Launch a recipe on each node with:
+
+```bash
+automodel examples/llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml --nproc-per-node 4
+```
+
+Use `--nproc-per-node 8` on H100 nodes, and the
+[Slurm launcher guide](/job-launchers/slurm-cluster) for multi-node allocations.
+
 ## Attention and Precision
 
 **SWA** uses causal grouped-query attention with a 512-token window, including
@@ -123,17 +143,13 @@ The recipe covers the full language backbone's forward, backward, and
 optimizer steps with mock data. It does not exercise pretrained checkpoint
 loading or context parallelism.
 
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node
-allocation. Select fresh output directories and your own W&B project before
-launching.
 
 ## Checkpoints and Validation Scope
 
-Pretrained training uses the native AutoModel distributed loading path with a
-local copy of
+The fine-tuning recipes load
 [`stepfun-ai/Step-5-Preview-BF16`](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
-and its tokenizer. The benchmark above creates weights from configuration and
-does not exercise checkpoint loading.
+through the native AutoModel distributed loading path. The benchmark creates
+weights from configuration and does not exercise checkpoint loading.
 
 The forward pass is compared with StepFun's standalone reference
 implementation on the first four checkpoint layers and one 8,192-token
@@ -150,10 +166,9 @@ Region-selection differences occur at near-tied indexer scores. This
 comparison covers the forward pass of four layers; it is not full-depth
 reference parity or a gradient comparison.
 
-The
-[CP checks](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/context_parallel/run_step5_cp.py)
-compare CP1 and CP2 logits, losses and gradients on single and packed
-documents, and verify SWA halo exchange against an exact oracle.
+CP1 and CP2 produce identical logits, losses and gradients on single and
+packed documents, and SWA halo exchange matches an exact forward/backward
+oracle.
 The checkpoint's one-million-position limit is not a claim of full-depth
 long-context validation.
 
