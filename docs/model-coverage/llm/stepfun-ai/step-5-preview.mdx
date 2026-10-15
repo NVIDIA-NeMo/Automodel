@@ -1,0 +1,171 @@
+---
+title: "Step 5 Preview"
+description: "Step 5 Preview architecture, sparse attention, context parallelism, and the full-depth H100 benchmark in NeMo AutoModel."
+slug: model-coverage/large-language-models/stepfun-ai/Step-5-Preview
+---
+
+[Step 5 Preview](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16) is
+StepFun's Mixture-of-Experts (MoE) model with alternating sliding-window
+attention (SWA) and learned region-selected attention (CSA). NeMo AutoModel
+implements its language backbone as `Step5ForCausalLM`. The multimodal
+checkpoint also contains a perception encoder; see the
+[vision-language coverage](/model-coverage/vision-language-models/stepfun-ai/Step-5-Preview)
+for that path and its preprocessing requirements.
+
+## Model Reference
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Step5ForCausalLM` |
+| Checkpoint | [`stepfun-ai/Step-5-Preview-BF16`](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16) |
+| Model type | `step5` |
+| Decoder | 92 layers, hidden size 4,096 |
+| Text-backbone parameters | Approximately 598.5B total; 27.1B activated under the counting convention below |
+| Attention pattern | Three SWA layers followed by one CSA layer: 69 SWA and 23 CSA layers |
+| Attention heads | 64 query heads, 4 key/value heads, head dimension 192 |
+| MoE | 88 layers, 352 routed experts per layer, top-8 routing, one shared expert |
+| Expert intermediate size | 1,536 for each routed expert and the shared expert |
+| Dense feed-forward layers | Zero-based layers 0, 1, 2, and 91; intermediate size 13,824 |
+| Vocabulary | 128,896; untied input embeddings and output head |
+| Checkpoint context limit | 1,048,576 positions; this is a configuration limit, not a validated training length |
+| Multi-token prediction | The checkpoint contains three additional prediction layers; the benchmark excludes them |
+
+The parameter count includes the learned router, the indexers, and both
+embedding/output matrices; it excludes vision, the projector, buffers, and
+multi-token prediction layers. Activated parameters count all non-routed
+parameters plus eight routed experts per MoE layer, including the full input
+embedding matrix. Excluding that matrix gives approximately 26.6B.
+
+## Attention and Precision
+
+**SWA** uses causal grouped-query attention with a 512-token window, including
+the current token. The optimized H100 path uses FlashAttention-4 (FA4)
+variable-length window attention where its input-layout checks permit it.
+Packed or padded inputs that do not meet those checks use the masked path.
+
+**CSA** compresses index keys into eight-token regions. A separate indexer with
+16 query heads, one key head, and four provider groups selects up to 512
+completed causal regions per group. Attention also includes the causal portion
+of the current region. The main attention operates on the original token-level
+K/V within those selected regions, rather than on the compressed index keys.
+Selection stays within each packed document.
+
+The FA4 backend constructs sparse block metadata and applies an exact
+token-level mask within admitted tiles. A tile containing any selected keys
+can still contain unselected keys, so block sparsity does not imply that every
+computed tile is fully selected. The implementation preserves head dimension
+192. It does not pad attention heads to 256 or materialize a dense
+sequence-by-sequence attention mask on this path.
+
+Q/K normalization, the FP32 residual stream, router precision, and per-layer
+rotary settings follow the model configuration. SWA rotates all 192 head
+dimensions with theta 10,000; CSA rotates 64 dimensions with theta 10,000,000.
+Each attention head has an output gate. The language-model loss has no
+differentiable path through discrete region selection, so the CSA indexers
+are frozen.
+
+## Distributed Training
+
+| Feature | Language-backbone implementation |
+| --- | --- |
+| Parameter sharding | FSDP2 |
+| Expert parallelism | Supported; the benchmark uses HybridEP and EP32, giving 11 routed experts per rank per MoE layer |
+| Pipeline parallelism | Supported, including FP32 residuals between stages |
+| Context parallelism | Model-owned contiguous sequence shards |
+| Tensor parallelism | Not supported |
+| Packed sequences | Document positions, boundaries, padding, and loss masks must be preserved |
+
+CP splits a sequence into consecutive, equal-sized query shards. The native
+contiguous sharder pads to an even local shard length (a global multiple of
+`cp_size * 2`). An eight-token CSA region can cross a shard boundary;
+region selection uses the global document coordinates. Padding positions are
+excluded from attention and loss.
+
+- **SWA communication:** exchange only the preceding window halo, up to 511
+  tokens of K/V per query shard. If a shard is shorter than the halo, exchange
+  the required slices with multiple preceding ranks. Backward sends the
+  corresponding K/V gradients back to their owners. SWA does not all-gather
+  the global K/V sequence.
+- **CSA communication:** gather token K/V across the CP group, then evaluate
+  the local queries against their selected keys. Backward reduce-scatters K/V
+  gradients to their source shards. Sparse attention compute therefore does
+  not make this transport sparse.
+- **Packed documents:** reset positions and document identity constrain both
+  SWA and CSA. A CP boundary can fall inside a document; a document boundary
+  still prevents cross-document attention and next-token supervision.
+
+For CP comparisons, reuse one frozen packed dataset and the same logical
+global-batch order. Use the native recipe's globally shifted loss rather than
+passing local, unshifted labels directly to the CP model. See
+[distributed setup](/development/distributed-setup) and
+[pipeline parallelism](/development/pipeline-parallelism).
+
+## Full-Depth H100 Benchmark
+
+The
+[benchmark recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/step/step5_full92_mock_h100/benchmark.yaml)
+uses the native `nemo_automodel.recipes.llm.benchmark` entry point. Its
+[README](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/step/step5_full92_mock_h100/README.md)
+contains the launch command and environment.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 16 nodes, 128 NVIDIA H100 80GB GPUs |
+| Model | All 92 decoder layers; random initialization through `from_config` |
+| Parallelism | EP32 / PP4 / CP1 / TP1; DP32 with EP over the data-parallel ranks |
+| Pipeline | 1F1B, one local stage per rank, 24 microbatches; layer partitions [0,24), [24,46), [46,70), [70,92) |
+| Sequence / global batch | 8,192 tokens / 768 sequences |
+| Data and MoE routing | Mock documents; fake balanced static expert routing |
+| Attention | Learned CSA selection; SWA varlen and CSA forward/backward full-block paths enabled |
+| Precision | BF16 compute and Adam moments; FP32 norms and residuals |
+| Measurement | 17 steps; seven warmup steps and ten measured steps |
+| Mean step time | 41.86 seconds |
+| Model FLOPs utilization | 20.5% |
+
+The MFU denominator is 128 GPUs times 989 TFLOP/s per GPU times the measured
+step time. Useful FLOPs exclude activation recomputation and physical
+attention tile padding. This measurement covers the full language backbone's
+forward, backward, and optimizer steps. It does not measure real-data SFT
+throughput, pretrained checkpoint loading, or a CP run.
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node
+allocation. Select fresh output directories and your own W&B project before
+launching.
+
+## Checkpoints and Validation Scope
+
+Pretrained training uses the native AutoModel distributed loading path with a
+local copy of
+[`stepfun-ai/Step-5-Preview-BF16`](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
+and its tokenizer. The benchmark above creates weights from configuration and
+does not exercise checkpoint loading.
+
+The forward pass is compared with StepFun's standalone reference
+implementation on the first four checkpoint layers and one 8,192-token
+document, using the FA4 backend with SWA varlen and CSA full-block paths
+enabled. Positions from 4,104 onward have more causal history than the
+indexer's top-k budget, so selection drops regions there.
+
+| Query positions | Tokens | Mean logits KL | Maximum logits KL | Selected-region overlap |
+| --- | ---: | ---: | ---: | ---: |
+| 0–4,103 | 4,104 | 2.13e-6 | 2.36e-4 | 100% |
+| 4,104–8,191, where selection drops history | 4,088 | 2.36e-6 | 2.47e-4 | 99.11% |
+
+Region-selection differences occur at near-tied indexer scores. This
+comparison covers the forward pass of four layers; it is not full-depth
+reference parity or a gradient comparison.
+
+The implementation includes
+[text CP checks](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/context_parallel/run_step5_cp.py),
+[halo checks](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/context_parallel/run_step5_halo.py),
+and
+[packed image/crop CP checks](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/context_parallel/run_step5_vlm_packed_cp.py).
+The checkpoint's one-million-position limit is not a claim of full-depth
+long-context validation.
+
+## Related Resources
+
+- [Hugging Face checkpoint](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
+- [Model implementation](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/components/models/step5)
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+- [Vision-language coverage](/model-coverage/vision-language-models/stepfun-ai/Step-5-Preview)
