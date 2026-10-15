@@ -1,0 +1,75 @@
+---
+title: "speechcolab/gigaspeech"
+description: "Explore speechcolab/gigaspeech: English speech recognition, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/speechcolab/gigaspeech
+---
+
+GigaSpeech provides English speech and transcripts. The AutoModel mixture selects the small configuration. The source is hosted as [speechcolab/gigaspeech](https://huggingface.co/datasets/speechcolab/gigaspeech).
+
+## Task
+
+**English speech recognition.** The example uses the `s` configuration. The waveform is omitted from the illustrative record.
+
+| Property | Description |
+| --- | --- |
+| Input | A segment of speech audio. |
+| Target | The corresponding transcript. |
+| Modality | Audio and text |
+| Language | English (`en`) |
+| License Metadata | Apache-2.0; separate access terms apply. |
+
+### Access
+
+The dataset is gated. The [upstream access terms](https://huggingface.co/datasets/speechcolab/gigaspeech/blob/63c0836b643dc6136a608de041e56b67c12649b3/README.md) restrict use to non-commercial research and educational purposes and require the linked access-request form. Complete that form, accept the Hub terms, and authenticate with an account that has access before loading the dataset.
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. The `audio` object shows the undecoded representation. Its path stands in for audio data and does not refer to a downloadable file.
+
+```json
+{
+  "audio": {
+    "path": "synthetic-speech.wav",
+    "bytes": null
+  },
+  "text": "THE MEETING BEGINS AT NINE"
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `audio` | audio | Audio segment; decoding yields a waveform and sampling rate. |
+| `text` | string | Transcript for the audio segment. |
+
+The table shows the `s` Hub configuration. Other configurations, when available, are listed on the [Hub dataset page](https://huggingface.co/datasets/speechcolab/gigaspeech).
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `s` | `train` | 230,068 |
+| `s` | `validation` | 6,750 |
+| `s` | `test` | 25,619 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/speechcolab/gigaspeech/blob/63c0836b643dc6136a608de041e56b67c12649b3/README.md) before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Mixed-Corpus Speech Fine-Tuning | Qwen2.5-Omni 3B; six English sources | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml) |
+
+**Adapter:** [`make_multi_en_asr_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/multi_en.py).
+
+The mixture retains the `text` field, adds the source label `gigaspeech_s`, normalizes transcripts to uppercase, and removes bracketed tags and punctuation except apostrophes. It decodes audio lazily at 16,000 Hz and passes `trust_remote_code=True` when loading this source. The recipe uses AMI, Earnings22, VoxPopuli, GigaSpeech, SPGISpeech, and LibriSpeech together. Override `dataset.sources` to change the mixture.
+
+The mixture uses the `train` split of the `s` configuration. The recipe does not configure a validation dataset. It drops empty normalized transcripts, clips shorter than 1 second or longer than 30 seconds, and audio whose duration cannot be read; these filters can reduce the loaded count.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/speechcolab/gigaspeech)
+- [Upstream card at revision `63c0836b`](https://huggingface.co/datasets/speechcolab/gigaspeech/blob/63c0836b643dc6136a608de041e56b67c12649b3/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/multi_en.py)
+- [Dataset catalog](/dataset-coverage/overview)

@@ -1,0 +1,71 @@
+---
+title: "HuggingFaceFW/fineweb"
+description: "FineWeb English web text for language model pretraining, with source fields, sample-10BT split metadata, and the NeMo AutoModel nanoGPT recipe."
+slug: dataset-coverage/HuggingFaceFW/fineweb
+---
+
+FineWeb provides cleaned, deduplicated English web text from Common Crawl for language model pretraining. The source is hosted as [HuggingFaceFW/fineweb](https://huggingface.co/datasets/HuggingFaceFW/fineweb).
+
+## Task
+
+**Causal language modeling.** The record shows raw Hub fields before any tokenizer-specific preprocessing.
+
+| Property | Description |
+| --- | --- |
+| Input | The preceding tokens in a web document. |
+| Target | The next token; source rows contain documents rather than instruction and answer pairs. |
+| Modality | Text |
+| Language | English (`en`) |
+| License Metadata | `odc-by` |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row.
+
+```json
+{
+  "text": "A bicycle uses gears to trade pedaling force for speed.",
+  "url": "https://example.org/synthetic-article",
+  "language": "en"
+}
+```
+
+## Schema and Splits
+
+The table describes the fields shown in the example. Source rows also include identifiers, crawl metadata, a language score, and a token count.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `text` | string | Web document used for language modeling. |
+| `url` | string | Source document URL. |
+| `language` | string | Language annotation. |
+
+The `sample-10BT` Hub configuration contains approximately 10 billion GPT-2 tokens. Other configurations are listed on the [Hub dataset page](https://huggingface.co/datasets/HuggingFaceFW/fineweb).
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `sample-10BT` | `train` | 14,868,862 |
+
+Counts come from [Hub viewer metadata, retrieved 2026-10-05](https://datasets-server.huggingface.co/info?dataset=HuggingFaceFW%2Ffineweb) before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Pretraining | GPT-2-style model; nanoGPT binary shards | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_pretrain/nanogpt_pretrain.yaml) |
+
+**Adapter:** [`NanogptDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/nanogpt_dataset.py).
+
+The example expects modded-nanoGPT shards at `modded-nanogpt/data/fineweb_10BT_max_500M/fineweb_train_*.bin`. Alternatively, follow [the nanoGPT preparation guide](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/docs/guides/llm/nanogpt-pretraining.mdx) to run [the bundled preprocessor](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/tools/nanogpt_data_processor.py). Its `--max-tokens 500M` example writes `tools/fineweb_max_tokens_500M/dataset.bin`; set `dataset.file_pattern` to that file when using this preparation path.
+
+The model vocabulary and special-token IDs must match the tokenizer used for preprocessing. `NanogptDataset` does not accept raw Hub Parquet files or Megatron `.bin/.idx` pairs.
+
+The example reads local files matching `fineweb_train_*.bin`. It does not select a Hub split at runtime or configure validation data.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/HuggingFaceFW/fineweb)
+- [Upstream card at revision `9bb295dd`](https://huggingface.co/datasets/HuggingFaceFW/fineweb/blob/9bb295ddab0e05d785b879661af7260fed5140fc/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/nanogpt_dataset.py)
+- [Preparation reference](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/docs/guides/llm/nanogpt-pretraining.mdx)
+- [Dataset catalog](/dataset-coverage/overview)

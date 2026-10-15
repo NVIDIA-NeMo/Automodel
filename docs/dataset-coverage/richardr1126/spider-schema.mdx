@@ -1,0 +1,72 @@
+---
+title: "richardr1126/spider-schema"
+description: "Database schemas that accompany Spider text-to-SQL questions, with source fields, a synthetic example, and NeMo AutoModel recipe links."
+slug: dataset-coverage/richardr1126/spider-schema
+---
+
+Spider Schema supplies the database descriptions used alongside Spider questions and SQL queries. The source is hosted as [richardr1126/spider-schema](https://huggingface.co/datasets/richardr1126/spider-schema).
+
+## Task
+
+**Database-schema lookup for text-to-SQL.** This companion corpus provides schema context for the questions and SQL queries stored in the Spider dataset.
+
+| Property | Description |
+| --- | --- |
+| Input | The database ID attached to a Spider question. |
+| Target | No independent supervision; the schema supplies context for SQL generation. |
+| Modality | Text |
+| Language | English |
+| License Metadata | `cc-by-4.0` |
+
+The [upstream card](https://huggingface.co/datasets/richardr1126/spider-schema/blob/e383e6f78716d2e50db5e80f084ece642ecb150f/README.md) lists CC BY 4.0 in its metadata and cites CC BY-SA 4.0 for Spider in its licensing section. It does not explain this discrepancy.
+
+## Example Record
+
+This **synthetic example** contains invented values for the four source fields; it is not a copied dataset row.
+
+```json
+{
+  "db_id": "synthetic_library",
+  "Schema (values (type))": "books : id (number) , title (text)",
+  "Primary Keys": "books : id",
+  "Foreign Keys": ""
+}
+```
+
+## Schema and Splits
+
+The upstream metadata defines these four string fields.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `db_id` | string | Database identifier. |
+| `Schema (values (type))` | string | Tables, columns, and column types. |
+| `Primary Keys` | string | Table and primary-key column pairs. |
+| `Foreign Keys` | string | Relations between tables. |
+
+The pinned Hub file listing contains the following source file.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| - | `spider_schema_rows_v2.json` | - |
+
+A dash means the pinned metadata does not specify the configuration or split row count. The upstream card describes 166 databases, but does not publish split row counts.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Schema-Conditioned Fine-Tuning | Companion to `xlangai/spider`; expert parallelism size 8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_spider_peft.yaml) |
+
+**Adapter:** [`make_spider_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
+
+`make_spider_dataset` loads the schema table, indexes it by `db_id`, and renders the matching schema as `CREATE TABLE` statements in each Spider prompt. The question and supervised SQL answer come from `xlangai/spider`.
+
+The schema loader reads this source as `train` for both training and validation. The recipe's `split` setting selects question rows from `xlangai/spider`.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/richardr1126/spider-schema)
+- [Upstream card at revision `e383e6f7`](https://huggingface.co/datasets/richardr1126/spider-schema/blob/e383e6f78716d2e50db5e80f084ece642ecb150f/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py)
+- [Dataset catalog](/dataset-coverage/overview)

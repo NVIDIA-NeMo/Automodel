@@ -1,0 +1,76 @@
+---
+title: "sanchit-gandhi/earnings22_split"
+description: "Explore sanchit-gandhi/earnings22_split: earnings-call speech recognition, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/sanchit-gandhi/earnings22_split
+---
+
+Earnings22 Split partitions earnings-call speech by `source_id`, keeping recordings separate across the training, validation, and test sets. The source is hosted as [sanchit-gandhi/earnings22_split](https://huggingface.co/datasets/sanchit-gandhi/earnings22_split).
+
+## Task
+
+**Earnings-call speech recognition.** The dataset benchmarks automatic speech recognition (ASR) on English speech with varied accents.
+
+| Property | Description |
+| --- | --- |
+| Input | A segment of speech audio. |
+| Target | The corresponding transcript. |
+| Modality | Audio and text |
+| Language | English |
+| License Metadata | Not declared in Hub metadata; consult the upstream source |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. The audio path is a placeholder, and the audio data is omitted.
+
+```json
+{
+  "audio": {
+    "path": "synthetic-speech.wav",
+    "bytes": null
+  },
+  "sentence": "REVENUE INCREASED THIS QUARTER"
+}
+```
+
+## Schema and Splits
+
+The source schema includes the following fields. The example above shows only `audio` and `sentence`.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `source_id` | string | Recording identifier used to assign disjoint splits. |
+| `audio` | audio | Audio segment with a declared sampling rate of 16,000 Hz. |
+| `segment_id` | string | Segment identifier. |
+| `sentence` | string | Transcript for the audio segment. |
+| `start_ts` | float32 | Segment start timestamp. |
+| `end_ts` | float32 | Segment end timestamp. |
+| `id` | string | Example identifier. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 52,006 |
+| `default` | `validation` | 2,650 |
+| `default` | `test` | 2,735 |
+
+Counts, schema, and the language description come from the [upstream dataset metadata at revision `f9fb35f4`](https://huggingface.co/datasets/sanchit-gandhi/earnings22_split/blob/f9fb35f4134e32b9c8100199d949398fd6d08a5f/dataset_infos.json), before local filtering. The Hub viewer response retrieved on 2026-10-05 is marked partial and reports a smaller training count.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Mixed-Corpus Speech Fine-Tuning | Qwen2.5-Omni 3B; six English sources | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml) |
+
+**Adapter:** [`make_multi_en_asr_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/multi_en.py).
+
+The mixture maps `sentence` to `text`, adds a source label, normalizes transcripts to uppercase, and removes punctuation except apostrophes. On access, it decodes audio to a mono waveform at 16,000 Hz and creates a conversation with the instruction and audio in the user turn and the transcript in the assistant turn. The recipe uses AMI, Earnings22, VoxPopuli, GigaSpeech, SPGISpeech, and LibriSpeech together. Override `dataset.sources` to change the mixture.
+
+The mixture uses `train` from this source. It drops empty normalized transcripts and retains clips between 1 and 30 seconds, inclusive; clips whose audio headers cannot be read are also dropped. These filters can reduce the loaded count. The recipe does not configure a validation dataset.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/sanchit-gandhi/earnings22_split)
+- [Upstream card at revision `f9fb35f4`](https://huggingface.co/datasets/sanchit-gandhi/earnings22_split/blob/f9fb35f4134e32b9c8100199d949398fd6d08a5f/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/audio/multi_en.py)
+- [Dataset catalog](/dataset-coverage/overview)

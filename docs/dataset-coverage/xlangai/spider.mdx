@@ -1,0 +1,72 @@
+---
+title: "xlangai/spider"
+description: "Explore xlangai/spider: text-to-SQL generation, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/xlangai/spider
+---
+
+Spider pairs natural-language questions with SQL queries. The source is hosted as [xlangai/spider](https://huggingface.co/datasets/xlangai/spider).
+
+## Task
+
+**Text-to-SQL generation.** The question dataset identifies the database but does not embed its complete schema in each row. The AutoModel example uses a companion schema source.
+
+| Property | Description |
+| --- | --- |
+| Input | A natural-language question and the schema of the identified database. |
+| Target | A SQL query answering the question. |
+| Modality | Text |
+| Language | English (`en`) |
+| License Metadata | `cc-by-sa-4.0` |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. Assume the invented `synthetic_library` database has a `books` table with one row per book.
+
+```json
+{
+  "db_id": "synthetic_library",
+  "question": "How many books are in the library?",
+  "query": "SELECT count(*) FROM books"
+}
+```
+
+## Schema and Splits
+
+The source includes the three fields shown in the example and tokenized versions of the question and query.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `db_id` | string | Database identifier used to look up the schema. |
+| `question` | string | Natural-language database question. |
+| `query` | string | Reference SQL query. |
+| `query_toks` | list of strings | Tokenized reference query. |
+| `query_toks_no_value` | list of strings | Query tokens in the source's no-value representation. |
+| `question_toks` | list of strings | Tokenized natural-language question. |
+
+The pinned source defines one Hub configuration, `spider`, with the following splits.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `spider` | `train` | 7,000 |
+| `spider` | `validation` | 1,034 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/xlangai/spider/blob/0c350918f3f29ec754f1181c65cdce76cd6c133c/README.md) before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | Nemotron 3.5 Super VL; text-only; expert parallelism size 8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_spider_peft.yaml) |
+
+**Adapter:** [`make_spider_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
+
+The loader looks up each row's `db_id` in the companion [richardr1126/spider-schema dataset](/dataset-coverage/richardr1126/spider-schema), renders the schema as SQL `CREATE TABLE` statements, and uses the reference query as the assistant response after collapsing whitespace. The recipe freezes the vision tower and supplies text-only conversations.
+
+The recipe uses upstream `train` and `validation`. The schema source is loaded from its own `train` split for both.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/xlangai/spider)
+- [Upstream card at revision `0c350918`](https://huggingface.co/datasets/xlangai/spider/blob/0c350918f3f29ec754f1181c65cdce76cd6c133c/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py)
+- [Dataset catalog](/dataset-coverage/overview)

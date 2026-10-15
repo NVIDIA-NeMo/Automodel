@@ -1,0 +1,88 @@
+---
+title: "nvidia/Nemotron-Post-Training-Dataset-v2"
+description: "Explore nvidia/Nemotron-Post-Training-Dataset-v2: instruction following and reasoning, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/nvidia/Nemotron-Post-Training-Dataset-v2
+---
+
+Nemotron Post-Training Dataset v2 provides domain-specific conversation splits. The source is hosted as [nvidia/Nemotron-Post-Training-Dataset-v2](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2).
+
+## Task
+
+**Instruction following and reasoning.** The Hub repository includes chat, STEM, math, code, and multilingual splits. The AutoModel examples select a subset of these domains.
+
+| Property | Description |
+| --- | --- |
+| Input | A prompt or conversation from a domain-specific split. |
+| Target | Assistant responses, with reasoning content depending on the source. |
+| Modality | Text |
+| Language | English, German, Italian, French, Spanish, and Japanese |
+| License Metadata | `cc-by-4.0`; individual records can carry other licenses. |
+
+The [upstream license section](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2/blob/5c89e01dd720ae0f4058445ed49c5fb68a03c76e/README.md#licenseterms-of-use) identifies ODC-BY for some Wildchat prompts and CC-BY-SA for some StackOverflow prompts. Check each record's `license` field. The same section describes possible redistribution and use requirements from the models that generated the responses.
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row.
+
+```json
+{
+  "category": "math",
+  "messages": [
+    {
+      "role": "user",
+      "content": "A box holds 6 pencils. How many pencils are in 3 boxes?"
+    },
+    {
+      "role": "assistant",
+      "content": "There are 6 * 3 = 18 pencils."
+    }
+  ]
+}
+```
+
+## Schema and Splits
+
+The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `category` | string | Task or domain category. |
+| `messages` | list of objects | Chat turns with string `role` and `content` fields. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `stem` | 355,000 |
+| `default` | `chat` | 627,720 |
+| `default` | `math` | 239,467 |
+| `default` | `code` | 175,000 |
+| `default` | `multilingual_ja` | 975,202 |
+| `default` | `multilingual_de` | 1,015,314 |
+| `default` | `multilingual_it` | 1,016,503 |
+| `default` | `multilingual_es` | 935,704 |
+| `default` | `multilingual_fr` | 1,001,504 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2/blob/5c89e01dd720ae0f4058445ed49c5fb68a03c76e/README.md) before local filtering.
+
+## Use with NeMo AutoModel
+
+The Hub marks this dataset as gated. Request access on the [dataset page](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2), then authenticate your environment with a Hugging Face account that has access before running these recipes.
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| I-DLM Training | Qwen3 8B; math and code | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/dllm_sft/qwen3_8b_idlm.yaml) |
+| DFlash Training | Nemotron; chat, math, and code | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/dllm_sft/nemotron_nano30b_dflash.yaml) |
+
+**Adapter:** [`ChatDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py).
+
+The Qwen example concatenates `math+code`, sets a 4,096-token length limit, and requests unshifted labels for the diffusion objective. The Nemotron example selects `chat+math+code`. Follow each recipe's target-model response regeneration guidance when reproducing its intended training setup.
+
+The table lists the domain splits selected by these examples. Neither listed recipe configures a separate validation dataset.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2)
+- [Upstream card at revision `5c89e01d`](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2/blob/5c89e01dd720ae0f4058445ed49c5fb68a03c76e/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py)
+- [Dataset catalog](/dataset-coverage/overview)

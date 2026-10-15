@@ -804,7 +804,8 @@ def test_retired_model_routes_redirect_to_provider_indexes():
         assert redirects_by_source.get(source) == destination
 
 
-def test_internal_links_from_model_coverage_resolve_to_nightly_routes():
+@pytest.mark.parametrize("directory", ["model-coverage", "dataset-coverage"])
+def test_internal_links_from_catalogs_resolve_to_nightly_routes(directory: str) -> None:
     repo_root = Path(__file__).parents[3]
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
     redirects = {redirect["source"]: redirect["destination"] for redirect in docs_config["redirects"]}
@@ -813,7 +814,9 @@ def test_internal_links_from_model_coverage_resolve_to_nightly_routes():
     routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
     broken_links: list[tuple[Path, str]] = []
 
-    for page in (repo_root / "docs" / "model-coverage").rglob("*.mdx"):
+    for page in (repo_root / "docs" / directory).rglob("*"):
+        if page.suffix not in {".md", ".mdx"}:
+            continue
         document = page.read_text(encoding="utf-8")
         for link in re.findall(r"\]\((/[^)#?]+)", document):
             # Fern serves a generated llms.txt index at every navigation level;
@@ -825,7 +828,7 @@ def test_internal_links_from_model_coverage_resolve_to_nightly_routes():
             if route not in routes and redirected not in routes:
                 broken_links.append((page.relative_to(repo_root), link))
 
-    assert not broken_links, "Model coverage pages link to missing nightly routes:\n" + "\n".join(
+    assert not broken_links, f"{directory} pages link to missing nightly routes:\n" + "\n".join(
         f"  - {page}: {link}" for page, link in broken_links
     )
 

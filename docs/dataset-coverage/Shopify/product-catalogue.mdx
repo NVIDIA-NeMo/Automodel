@@ -1,0 +1,77 @@
+---
+title: "Shopify/product-catalogue"
+description: "Explore Shopify/product-catalogue: product taxonomy classification, a synthetic record, source schema, Hub splits, and NeMo AutoModel recipe links."
+slug: dataset-coverage/Shopify/product-catalogue
+---
+
+Shopify Product Catalogue contains product images and taxonomy labels. The source is hosted as [Shopify/product-catalogue](https://huggingface.co/datasets/Shopify/product-catalogue).
+
+## Task
+
+**Product taxonomy classification.** The upstream benchmark predicts a category from a product's image and title, optionally using its description and brand. Additional fields include candidate categories and secondhand status. The AutoModel adapter uses only the image to predict the category.
+
+| Property | Description |
+| --- | --- |
+| Input | A product image and title, optionally with a description and brand. |
+| Target | A hierarchical category path from Shopify's product taxonomy. |
+| Modality | Image and text |
+| Language | Not declared in Hub metadata |
+| License Metadata | apache-2.0 |
+
+## Example Record
+
+This **synthetic example** uses invented values in selected source fields; it is not a copied dataset row. The image path is a placeholder and does not refer to a downloadable file.
+
+```json
+{
+  "product_title": "Ceramic tea mug",
+  "product_image": {
+    "path": "synthetic-mug.png",
+    "bytes": null
+  },
+  "ground_truth_category": "Home & Garden > Kitchen & Dining > Tableware > Drinkware > Mugs"
+}
+```
+
+## Schema and Splits
+
+The upstream schema contains the following fields. The example above shows a subset.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `product_title` | string | Product title. |
+| `product_description` | string | Product description; may be empty. |
+| `product_image` | image | Product photo. |
+| `potential_product_categories` | list of strings | Candidate category paths. |
+| `ground_truth_brand` | string | Reference brand name; may be empty. |
+| `ground_truth_is_secondhand` | boolean | Whether the product is secondhand. |
+| `ground_truth_category` | string | Reference taxonomy category path. |
+
+These are upstream splits or source files, before any AutoModel sampling or preprocessing.
+
+| Configuration | Split or Source | Rows |
+| --- | --- | --- |
+| `default` | `train` | 38,631 |
+| `default` | `test` | 9,658 |
+
+Counts come from [upstream metadata at the linked revision](https://huggingface.co/datasets/Shopify/product-catalogue/blob/002ca15536bb015ebc47b99cc2d716d7040bb09e/README.md) before local filtering.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | North Micro Vision; full training split | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_full.yaml) |
+| LoRA Fine-Tuning | North Micro Vision; 2,000 training rows | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_lora.yaml) |
+
+**Adapter:** [`make_shopify_product_catalogue_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py).
+
+The loader uses the image and a fixed classification prompt, then supervises the `ground_truth_category` text. Other catalog fields are not included in this prompt. Images stay undecoded until data access; bound image-token growth through the recipe processor or collator.
+
+Both examples use low-rank adaptation (LoRA). The full-dataset example trains on `train` and evaluates at most 500 rows of upstream `test`. The smaller example limits training to 2,000 rows and evaluation to 200. Here, the test split is used during training as validation.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/Shopify/product-catalogue)
+- [Upstream card at revision `002ca155`](https://huggingface.co/datasets/Shopify/product-catalogue/blob/002ca15536bb015ebc47b99cc2d716d7040bb09e/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/vlm/datasets.py)
+- [Dataset catalog](/dataset-coverage/overview)

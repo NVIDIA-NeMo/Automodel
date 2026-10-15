@@ -1,0 +1,79 @@
+---
+title: "llamafactory/glaive_toolcall_en"
+description: "English function-calling conversations, their JSON schema, a synthetic example, and Qwen2.5 3B fine-tuning recipes in NeMo AutoModel."
+slug: dataset-coverage/llamafactory/glaive_toolcall_en
+---
+
+[llamafactory/glaive_toolcall_en](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en) provides English function-calling conversations in a ShareGPT-style format. NeMo AutoModel uses it in the Qwen2.5 3B fine-tuning examples linked below.
+
+## Task
+
+**Function calling.** Train an assistant to select a function and produce its arguments from a user's request and the available tool definitions. Records can also include tool results and assistant follow-up responses.
+
+| Property | Description |
+| --- | --- |
+| Input | A conversation and the available tool definitions. |
+| Target | The assistant tool call and, when present, its follow-up response. |
+| Modality | Text |
+| Language | English |
+| License Metadata | `apache-2.0` |
+| Access | Public and ungated in the reviewed Hub metadata. |
+
+## Example Record
+
+This **synthetic example** uses invented values in the source fields; it is not a copied dataset row. The `tools` field and the `value` of the `function_call` turn contain serialized JSON strings, which the AutoModel loader decodes.
+
+```json
+{
+  "conversations": [
+    {
+      "from": "human",
+      "value": "What is 4 plus 5?"
+    },
+    {
+      "from": "function_call",
+      "value": "{\"name\":\"add\",\"arguments\":{\"a\":4,\"b\":5}}"
+    }
+  ],
+  "tools": "[{\"name\":\"add\",\"description\":\"Add two integers.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"}},\"required\":[\"a\",\"b\"]}}]"
+}
+```
+
+## Schema and Splits
+
+The pinned upstream metadata lists these fields.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `conversations` | list of objects | ShareGPT-style turns with string `from` and `value` fields, including tool-call turns. |
+| `tools` | JSON string | Available function definitions. |
+
+The pinned Hub repository contains the following data file. Its card does not declare split counts.
+
+| Source File | Rows |
+| --- | --- |
+| `glaive_toolcall_en_1k.json` | - |
+
+The filename comes from the [Hub file listing at the reviewed revision](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en/tree/8e31881f7a149e3fab97e829a2958f8433c5d997). A dash means this page does not assert a row count; the filename is not used as a count.
+
+## Use with NeMo AutoModel
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Qwen2.5 3B; `seq_length: 4096` | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml) |
+| LoRA Fine-Tuning | Qwen2.5 3B; `seq_length: 4096` | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml) |
+
+Both examples leave truncation disabled, so `seq_length: 4096` does not enforce a token limit. Set `truncation: true` in the training and validation dataset blocks if you need that limit.
+
+**Adapter:** [`make_agent_chat_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/agent_chat.py).
+
+The agent-chat loader normalizes ShareGPT-style conversation turns and tool definitions before rendering the tokenizer chat template. Use the agent-chat loader for this source instead of treating its serialized tool calls as plain prompt/completion pairs.
+
+Both examples train on `train` and evaluate `train[:256]`. This is an overlapping diagnostic slice, not an independent held-out split.
+
+## Related Resources
+
+- [Hub dataset and source files](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en)
+- [Upstream card at revision `8e31881f`](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en/blob/8e31881f7a149e3fab97e829a2958f8433c5d997/README.md)
+- [AutoModel loader source](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/agent_chat.py)
+- [Dataset catalog](/dataset-coverage/overview)
