@@ -14,6 +14,8 @@
 
 """Step-5 RMSNorm with optional fusion and unchanged FP32 scale semantics."""
 
+import contextlib
+
 import torch
 
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
@@ -119,19 +121,31 @@ class Step5RMSNorm(Step3p5RMSNorm):
         """
         dtype = hidden.dtype if output_dtype is None else output_dtype
         if self.compile_norm and hidden.is_cuda:
-            if hidden.ndim == 5:
-                # Preserve each contiguous run of query heads. Flattening all
-                # rows would copy across the interleaved K/V gap in each group.
-                rows = hidden.reshape(-1, hidden.shape[-2], hidden.shape[-1])
-                output, _ = _grouped_rms_norm(rows, self.weight, self.variance_epsilon, dtype)
-                return output.reshape(hidden.shape)
-            # Normalize the leading layout so decoder, Q/K, and final norms
-            # share a compiled rank. Interleaved key projections stay strided
-            # views: only the normalized feature axis must remain last.
-            rows = hidden.reshape(-1, hidden.shape[-1])
-            if hidden.dtype == torch.float32:
-                output = _residual_rms_norm(rows, self.weight, self.variance_epsilon, dtype)
-            else:
-                output, _ = _activation_rms_norm(rows, self.weight, self.variance_epsilon, dtype)
-            return output.reshape(hidden.shape)
+            # Under no_grad, AOTAutograd compiles a separate inference graph whose
+            # reductions may round differently. Reuse the training graph so grad,
+            # no_grad and checkpoint replay produce identical outputs.
+            training_graph = (
+                not torch.is_grad_enabled() and not torch.is_inference_mode_enabled() and self.weight.requires_grad
+            )
+            with torch.enable_grad() if training_graph else contextlib.nullcontext():
+                output = self._compiled_forward(hidden, dtype)
+            return output.detach() if training_graph else output
         return _rms_norm(hidden, self.weight, self.variance_epsilon, dtype)
+
+    def _compiled_forward(self, hidden: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Run the compiled CUDA norm on [..., hidden_size] and restore the input shape."""
+        if hidden.ndim == 5:
+            # Preserve each contiguous run of query heads. Flattening all
+            # rows would copy across the interleaved K/V gap in each group.
+            rows = hidden.reshape(-1, hidden.shape[-2], hidden.shape[-1])
+            output, _ = _grouped_rms_norm(rows, self.weight, self.variance_epsilon, dtype)
+            return output.reshape(hidden.shape)
+        # Normalize the leading layout so decoder, Q/K, and final norms
+        # share a compiled rank. Interleaved key projections stay strided
+        # views: only the normalized feature axis must remain last.
+        rows = hidden.reshape(-1, hidden.shape[-1])
+        if hidden.dtype == torch.float32:
+            output = _residual_rms_norm(rows, self.weight, self.variance_epsilon, dtype)
+        else:
+            output, _ = _activation_rms_norm(rows, self.weight, self.variance_epsilon, dtype)
+        return output.reshape(hidden.shape)
