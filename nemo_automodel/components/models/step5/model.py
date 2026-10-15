@@ -46,14 +46,15 @@ from nemo_automodel.components.models.step5.configuration import (
     Step5VLConfig,
 )
 from nemo_automodel.components.models.step5.cp import gather_metadata
-from nemo_automodel.components.models.step5.parallelization import PARALLELIZER
 from nemo_automodel.components.models.step5.layers import Step5DecoderLayer, Step5RMSNorm
+from nemo_automodel.components.models.step5.parallelization import PARALLELIZER
 from nemo_automodel.components.models.step5.sparse import region_metadata
 from nemo_automodel.components.models.step5.state_dict_adapter import Step5StateDictAdapter
 from nemo_automodel.components.models.step5.vision import Step5VisionEncoder
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.utils import dtype_from_str
+
 
 class Step5TextModel(nn.Module):
     """Embedding, decoder stack and final normalization."""

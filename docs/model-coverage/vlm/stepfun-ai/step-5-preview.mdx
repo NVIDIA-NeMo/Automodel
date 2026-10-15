@@ -1,6 +1,6 @@
 ---
-title: "Step 5 Preview"
-description: "Step 5 Preview vision-language architecture, packed context-parallel inputs, and current preprocessing scope in NeMo AutoModel."
+title: "Step-5-Preview"
+description: "Step-5-Preview vision-language architecture, packed context-parallel inputs, and current preprocessing scope in NeMo AutoModel."
 slug: model-coverage/vision-language-models/stepfun-ai/Step-5-Preview
 ---
 
@@ -12,10 +12,12 @@ with a perception encoder and an image-token projector.
 
 ## Model Reference
 
+### Model Architecture
+
 | Property | Value |
 | --- | --- |
 | **Architecture** | `Step5ForConditionalGeneration` |
-| Checkpoint | [`stepfun-ai/Step-5-Preview-BF16`](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16) |
+| Checkpoint | [`stepfun-ai/Step-5-Preview-BF16`](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16), used by the recipes; the FP8 release is [`stepfun-ai/Step-5-Preview`](https://huggingface.co/stepfun-ai/Step-5-Preview) |
 | Language backbone | 92-layer MoE decoder with SWA and CSA |
 | Vision encoder | 47 layers, width 1,536, 16 attention heads |
 | Configured image / patch size | 728 / 14 pixels |

@@ -418,7 +418,7 @@ navigation:
             contents:
               - page: "Step-3.5-Flash"
                 path: ../../model-coverage/llm/stepfun-ai/step-3-5.mdx
-              - page: "Step 5 Preview"
+              - page: "Step-5-Preview"
                 path: ../../model-coverage/llm/stepfun-ai/step-5-preview.mdx
                 slug: Step-5-Preview
           - section: "Tencent"
@@ -649,7 +649,7 @@ navigation:
             contents:
               - page: "Step-3.7-Flash"
                 path: ../../model-coverage/vlm/stepfun-ai/step-3-7-flash.mdx
-              - page: "Step 5 Preview"
+              - page: "Step-5-Preview"
                 path: ../../model-coverage/vlm/stepfun-ai/step-5-preview.mdx
                 slug: Step-5-Preview
           - section: "Thinking Machines"
