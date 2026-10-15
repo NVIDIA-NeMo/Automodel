@@ -526,7 +526,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
             peft_model = PeftModel.from_pretrained(
                 base,
                 Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model",
-                autocast_adapter_dtype=False,
+                autocast_adapter_dtype=True,
             )
 
             for source_key, source_param in model_state_dict.items():
@@ -628,7 +628,7 @@ def test_hf_peft_dora_checkpoint(force_hf):
             )
             with warnings.catch_warnings(record=True) as caught_warnings:
                 warnings.simplefilter("always")
-                peft_model = PeftModel.from_pretrained(base, checkpoint_path, autocast_adapter_dtype=False)
+                peft_model = PeftModel.from_pretrained(base, checkpoint_path, autocast_adapter_dtype=True)
             missing_key_warnings = [w for w in caught_warnings if "missing adapter keys" in str(w.message).lower()]
             assert not missing_key_warnings, (
                 f"HF PEFT reported missing adapter keys:\n{missing_key_warnings[0].message}"

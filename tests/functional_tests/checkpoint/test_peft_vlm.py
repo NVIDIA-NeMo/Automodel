@@ -935,10 +935,14 @@ def test_hf_peft_checkpoint():
 
     # finally check if the adapters loaded into the PEFT module are the same as the model we have trained
     if torch.distributed.get_rank() == 0:
-        base = AutoModelForImageTextToText.from_pretrained(cfg.model.pretrained_model_name_or_path)
+        base = AutoModelForImageTextToText.from_pretrained(cfg.model.pretrained_model_name_or_path).to(
+            trainer.model_parts[0].dtype
+        )
         peft_model = PeftModel.from_pretrained(
-            base, Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model"
-        ).to(trainer.model_parts[0].dtype)
+            base,
+            Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "model",
+            autocast_adapter_dtype=True,
+        )
 
         for source_key, source_param in model_state_dict.items():
             # source key example: 'base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight'
