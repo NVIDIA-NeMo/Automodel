@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import base64
+import io
 import os
 import re
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,7 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     DATED_SUPPORT_TABLE_HEADER,
     HOMEPAGE_END_MARKER,
     HOMEPAGE_START_MARKER,
+    MODEL_CARD_PATH_ALIASES,
     MODEL_TYPE_OVERVIEW_PATHS,
     REGISTRY_END_MARKER,
     REGISTRY_START_MARKER,
@@ -450,6 +453,18 @@ def test_committed_generated_tables_are_rejected(tmp_path):
         _validate_generated_tables_are_not_committed(tmp_path)
 
 
+def test_model_card_path_aliases_preserve_published_paths():
+    repo_root = Path(__file__).parents[3]
+    _, _, catalog = _load_model_doc_catalog(repo_root / "docs")
+    source_paths = [model.source_path for model in catalog]
+    for alias, canonical in MODEL_CARD_PATH_ALIASES.items():
+        assert (repo_root / alias).is_file(), f"Published source URL must remain available: {alias}"
+        assert (repo_root / canonical).is_file(), f"Published source URL must remain available: {canonical}"
+        assert _frontmatter_slug(repo_root / alias) == _frontmatter_slug(repo_root / canonical)
+        assert alias not in source_paths
+        assert source_paths.count(canonical) == 1
+
+
 def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     repo_root = Path(__file__).parents[3]
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
@@ -576,7 +591,7 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
         path.resolve()
         for category_directory in category_directories.values()
         for path in (repo_root / "docs" / "model-coverage" / category_directory).glob("*/*.mdx")
-        if path.name != "index.mdx"
+        if path.name != "index.mdx" and path.relative_to(repo_root).as_posix() not in MODEL_CARD_PATH_ALIASES
     }
     if set(navigated_model_pages) != expected_model_pages:
         offenders.append("nightly navigation does not contain every model card exactly once")
@@ -625,6 +640,75 @@ def test_model_card_descriptions_meet_seo_contract():
     assert not offenders, "Invalid model-card descriptions:\n" + "\n".join(f"  - {item}" for item in offenders)
 
 
+def _read_documented_recipe(repo_root: Path, recipe_path: str, document: str) -> str:
+    """Read the recipe at its documented commit, or from the current checkout."""
+    permalink = re.search(
+        rf"https://github\.com/NVIDIA-NeMo/Automodel/blob/([0-9a-f]{{40}})/{re.escape(recipe_path)}(?=[)#?])",
+        document,
+    )
+    if permalink:
+        url = f"https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/{permalink.group(1)}/{recipe_path}"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return response.read().decode("utf-8")
+    return (repo_root / recipe_path).read_text(encoding="utf-8")
+
+
+def test_documented_recipe_reads_current_checkout(tmp_path):
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text("model: {}\n", encoding="utf-8")
+    assert _read_documented_recipe(tmp_path, "recipe.yaml", "") == "model: {}\n"
+
+
+def test_documented_recipe_reads_permalink_instead_of_current_checkout(tmp_path, monkeypatch):
+    revision = "a" * 40
+    recipe_path = "examples/model.yaml"
+    (tmp_path / "examples").mkdir()
+    (tmp_path / recipe_path).write_text("current checkout", encoding="utf-8")
+    document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/{recipe_path})"
+
+    def open_recipe(url, *, timeout):
+        assert url == f"https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/{revision}/{recipe_path}"
+        assert timeout == 10
+        return io.BytesIO(b"model: {pretrained_model_name_or_path: org/model}\n")
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_recipe)
+    assert "org/model" in _read_documented_recipe(tmp_path, recipe_path, document)
+
+
+@pytest.mark.parametrize("revision,linked_path", [("main", "examples/model.yaml"), ("a" * 40, "examples/other.yaml")])
+def test_missing_recipe_requires_matching_commit_permalink(tmp_path, revision, linked_path):
+    document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/{linked_path})"
+    with pytest.raises(FileNotFoundError):
+        _read_documented_recipe(tmp_path, "examples/model.yaml", document)
+
+
+def _is_local_checkpoint_override(value: str, document: str) -> bool:
+    """Recognize literal local paths and paths exported earlier in the example."""
+    value = value.strip("\"'")
+    variable = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
+    if variable:
+        assignment = re.search(rf"^export {variable.group(1)}=([^\r\n]+)$", document, re.MULTILINE)
+        if assignment is None:
+            return False
+        value = assignment.group(1).strip().strip("\"'")
+    return Path(value).is_absolute()
+
+
+@pytest.mark.parametrize(
+    "value,document,expected",
+    [
+        ("/data/model", "", True),
+        ('"/data/model"', "", True),
+        ('"${MODEL}"', "export MODEL=/data/model", True),
+        ('"${MODEL}"', "", False),
+        ('"${MODEL}"', "export MODEL=other/model", False),
+        ("other/model", "", False),
+    ],
+)
+def test_local_checkpoint_override(value, document, expected):
+    assert _is_local_checkpoint_override(value, document) is expected
+
+
 def test_model_card_commands_use_checked_in_recipes():
     repo_root = Path(__file__).parents[3]
     offenders: list[str] = []
@@ -649,7 +733,7 @@ def test_model_card_commands_use_checked_in_recipes():
                 offenders.append(f"{path.relative_to(repo_root)}: contains a recipe placeholder")
                 continue
             checkpoint_override = re.search(r"--model\.pretrained_model_name_or_path\s+(\S+)", command)
-            if checkpoint_override and not Path(checkpoint_override.group(1)).is_absolute():
+            if checkpoint_override and not _is_local_checkpoint_override(checkpoint_override.group(1), document):
                 offenders.append(f"{path.relative_to(repo_root)}: substitutes a checkpoint into a different recipe")
             recipe_paths = re.findall(r"examples/[A-Za-z0-9_./-]+\.yaml", command)
             if not recipe_paths and re.search(r"-c /[A-Za-z0-9_./-]+\.yaml", command):
@@ -662,11 +746,12 @@ def test_model_card_commands_use_checked_in_recipes():
                     f"{path.relative_to(repo_root)}: command must reference exactly one recipe, found {recipe_paths}"
                 )
                 continue
-            recipe_path = repo_root / recipe_paths[0]
-            if not recipe_path.is_file():
-                offenders.append(f"{path.relative_to(repo_root)}: recipe does not exist: {recipe_paths[0]}")
+            try:
+                recipe_source = _read_documented_recipe(repo_root, recipe_paths[0], document)
+            except OSError as error:
+                offenders.append(f"{path.relative_to(repo_root)}: cannot read recipe {recipe_paths[0]}: {error}")
                 continue
-            recipe = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
+            recipe = yaml.safe_load(recipe_source)
             recipe_model_ids = _iter_pretrained_model_ids(recipe.get("model", {}))
             documented_model_ids_by_case = {model_id.casefold() for model_id in documented_model_ids}
             recipe_model_ids_by_case = {model_id.casefold() for model_id in recipe_model_ids}
