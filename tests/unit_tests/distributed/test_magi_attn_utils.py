@@ -16,8 +16,7 @@
 
 The mask-spec builders and the MagiState/setup_magi wiring are pure Python and
 need neither a GPU nor the optional ``magi_attention`` package, so they run on a
-CPU CI runner. The FFA kernel parity tests at the bottom are gated behind CUDA +
-``magi_attention``.
+CPU CI runner. CUDA kernel parity lives in ``tests/functional_tests/kernel_parity``.
 """
 
 from __future__ import annotations
@@ -30,10 +29,6 @@ import torch.nn as nn
 
 import nemo_automodel.components.distributed.context_parallel.magi as mu
 from nemo_automodel.components.distributed.context_parallel.magi import AttnMaskSpec, MagiState, setup_magi
-
-# Over the default 5s budget on purpose: the MagiAttention CUDA parity test spends about 205s in cold compilation.
-# Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(300)
 
 
 class _FakeCfg:
@@ -351,56 +346,3 @@ class TestActiveStateAccessors:
 
     def test_is_magi_available_returns_bool(self):
         assert isinstance(mu.is_magi_available(), bool)
-
-
-# --------------------------------------------------------------------------- #
-# FFA kernel parity (requires CUDA + magi_attention)
-# --------------------------------------------------------------------------- #
-def _init_single_rank_cp_group():
-    import os
-
-    import torch.distributed as dist
-
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29591")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", rank=0, world_size=1)
-    return dist.new_group([0], backend="nccl")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_make_magi_attn_func_matches_sdpa_causal():
-    """The custom-factory attn_func (cp=1 causal self-key) matches SDPA causal."""
-    pytest.importorskip("magi_attention")
-    import torch.distributed as dist
-    import torch.nn.functional as F
-    from einops import rearrange
-
-    torch.cuda.set_device(0)
-    cp_group = _init_single_rank_cp_group()
-    try:
-        mu.set_active_cp_group(cp_group)
-        mu.set_active_attn_spec(None)
-        nh_q, nh_kv, hd, S = 16, 4, 128, 384
-        torch.manual_seed(0)
-        q = torch.randn(S, nh_q, hd, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(S, nh_kv, hd, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(S, nh_kv, hd, device="cuda", dtype=torch.bfloat16)
-
-        attn = mu.make_magi_attn_func(softmax_scale=hd**-0.5)
-        out = attn(q, k, v)  # thd layout [S, nh, hd]
-
-        qh = rearrange(q, "s nh hd -> 1 nh s hd")
-        kh = rearrange(k, "s nh hd -> 1 nh s hd").repeat_interleave(nh_q // nh_kv, 1)
-        vh = rearrange(v, "s nh hd -> 1 nh s hd").repeat_interleave(nh_q // nh_kv, 1)
-        ref = rearrange(F.scaled_dot_product_attention(qh, kh, vh, is_causal=True), "1 nh s hd -> s nh hd")
-
-        rel = (out.float() - ref.float()).abs().max() / (ref.float().abs().max() + 1e-6)
-        assert rel.item() < 5e-3, f"magi vs sdpa rel={rel.item()}"
-        assert not torch.isnan(out).any()
-    finally:
-        mu.set_active_cp_group(None)
-        if dist.is_initialized():
-            dist.destroy_process_group()

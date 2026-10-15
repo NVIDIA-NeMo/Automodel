@@ -51,8 +51,9 @@ the vision implementation supplied by each checkpoint. It constructs `sound_enco
 ### LoRA on CORD-v2
 
 `nemotron_3_5_super_vl_cord_v2_peft.yaml` fine-tunes the model on CORD-v2 receipt field extraction
-(the same task as the [NemotronOmni CORD-v2 guide](/recipes-e2e-examples/nemotron-omni)) with LoRA adapters
-instead of full supervised fine-tuning (SFT). Freezing the base weights removes their FP32 master
+with LoRA adapters instead of full supervised fine-tuning (SFT). Follow the
+[CORD-v2 guide](/recipes-e2e-examples/nemotron-3-5-super-vl) for data preparation, training,
+and evaluation. Freezing the base weights removes their FP32 master
 weights and optimizer states. The documented LoRA example uses one node with 8 H100 GPUs
 (`cp_size: 1`, `ep_size: 8`); the full SFT example uses four nodes. These are example configurations.
 
@@ -109,4 +110,6 @@ for its data, backend, and checkpoint settings. It saves adapters under
 
 ## Related Resources
 
-[VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+- [CORD-v2 SFT and LoRA](/recipes-e2e-examples/nemotron-3-5-super-vl)
+- [Text-to-SQL with LoRA](/recipes-e2e-examples/nemotron-3-5-super-vl-text-to-sql)
+- [Continued Pretraining on FineWeb](/recipes-e2e-examples/nemotron-3-5-super-vl-continued-pretraining)

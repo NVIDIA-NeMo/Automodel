@@ -24,6 +24,11 @@ from pathlib import Path
 import yaml
 
 TABLE_ROW_COUNT = 10
+# Both Muse source paths are linked by published NVIDIA and Meta blog posts.
+# Keep the compatibility copy on disk, but catalog only the canonical card.
+MODEL_CARD_PATH_ALIASES = {
+    "docs/model-coverage/vlm/muse/muse_spark_open.mdx": "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx",
+}
 HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
 HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"
 SUPPORT_LOG_START_MARKER = "{/* BEGIN GENERATED MODEL SUPPORT LOG */}"
@@ -340,7 +345,7 @@ def _load_model_doc_catalog(
     model_coverage_root = docs_root / "model-coverage"
     for directory, model_type in directory_types.items():
         for path in sorted((model_coverage_root / directory).glob("*/*.mdx")):
-            if path.name == "index.mdx":
+            if path.name == "index.mdx" or path.relative_to(docs_root.parent).as_posix() in MODEL_CARD_PATH_ALIASES:
                 continue
             document = path.read_text(encoding="utf-8")
             slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
