@@ -42,6 +42,7 @@ from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 from nemo_automodel.components.models.step5.backend import Step5BackendConfig
 from nemo_automodel.components.models.step5.configuration import ConfigValue, Step5Config, Step5VLConfig
 from nemo_automodel.components.models.step5.cp import gather_metadata
+from nemo_automodel.components.models.step5.fsdp import PARALLELIZER
 from nemo_automodel.components.models.step5.layers import Step5DecoderLayer
 from nemo_automodel.components.models.step5.norm import Step5RMSNorm
 from nemo_automodel.components.models.step5.sparse import region_metadata
@@ -149,6 +150,7 @@ class Step5TextModel(nn.Module):
 class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
     """Step-5 causal LM with native grouped experts and model-owned CP."""
 
+    parallelizer = PARALLELIZER
     config_class = Step5Config
     base_model_prefix = "model"
     _pp_keep_self_forward: bool = True

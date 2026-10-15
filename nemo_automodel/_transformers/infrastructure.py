@@ -567,21 +567,13 @@ def apply_model_infrastructure(
         is_peft=peft_config is not None,
         load_metadata_with_gloo=load_metadata_with_gloo,
     )
-    checkpoint_process_group = mesh.process_group
-    if autopipeline is not None:
-        # Pipeline stages own different parameters and can load a different number
-        # of bounded checkpoint parts. Only ranks in the same stage may participate
-        # in each load collective; keep all DP, CP, TP, and EP shards together.
-        assert mesh.device_mesh is not None
-        non_pp_axes = tuple(axis for axis in mesh.device_mesh.mesh_dim_names if axis != "pp")
-        checkpoint_process_group = mesh.device_mesh[non_pp_axes]._flatten().get_group()
     checkpointer = Checkpointer(
         ckpt_config,
         0,
         0,
         0,
         model_wrapper.moe_mesh if isinstance(model_wrapper, MeshContext) else getattr(model_wrapper, "moe_mesh", None),
-        process_group=checkpoint_process_group,
+        process_group=getattr(mesh, "process_group", None),
     )
 
     # Apply PEFT and lower precision if configured

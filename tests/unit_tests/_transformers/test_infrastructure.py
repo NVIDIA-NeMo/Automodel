@@ -1035,7 +1035,6 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
 
     model = _DummyModel()
     mesh = SimpleNamespace(
-        process_group=None,
         cp_size=2,
         pp_size=1,
         tp_size=1,
@@ -1088,7 +1087,6 @@ def test_apply_model_infrastructure_configures_dense_thd_te_and_bshd_sdpa_cp():
     model = _DummyModel()
     cp_mesh = SimpleNamespace(size=lambda: 2)
     mesh = SimpleNamespace(
-        process_group=None,
         cp_size=2,
         pp_size=1,
         tp_size=1,
@@ -1140,7 +1138,6 @@ def test_apply_model_infrastructure_configures_dense_thd_te_for_tp_without_cp():
     model = _DummyModel()
     tp_mesh = SimpleNamespace(size=lambda: 2)
     mesh = SimpleNamespace(
-        process_group=None,
         cp_size=1,
         pp_size=1,
         tp_size=2,
@@ -1258,79 +1255,3 @@ def test_checkpoint_load_order_includes_cp_sharding(dp_shard_size: int, cp_size:
         ["initialize", "load", "shard"] if (dp_shard_size, cp_size) == (1, 1) else ["shard", "initialize", "load"]
     )
     assert [event[0] for event in events.mock_calls] == expected
-
-
-def _run_pipeline_checkpoint_parts(rank: int, world_size: int, init_file: str, checkpoint_dir: str) -> None:
-    """Load different part counts on two stages using real distributed collectives."""
-    import torch.distributed as dist
-    import torch.distributed.checkpoint as dcp
-    from torch.distributed.device_mesh import init_device_mesh
-
-    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
-    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig, ModelState
-    from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart
-    from nemo_automodel.components.distributed import MeshContext
-
-    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
-    dist.init_process_group(
-        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
-    )
-    try:
-        device_mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("pp", "cp"))
-        mesh = MeshContext(device_mesh=device_mesh)
-        expected = {"weight": torch.arange(4, dtype=torch.float32).reshape(2, 2), "bias": torch.tensor([3.0, 7.0])}
-        dcp.save(expected, checkpoint_id=checkpoint_dir)
-        stage = rank // 2
-        model = torch.nn.Linear(2, 2, bias=stage == 1)
-
-        class CheckpointerCaptured(Exception):
-            pass
-
-        # Stop immediately after infrastructure chooses the loading group, before
-        # unrelated pipeline construction. The actual checkpoint load below uses it.
-        with patch(f"{_INFRA_MODULE}.Checkpointer", side_effect=CheckpointerCaptured) as constructor:
-            with pytest.raises(CheckpointerCaptured):
-                apply_model_infrastructure(
-                    model,
-                    is_meta_device=False,
-                    device=torch.device("cpu"),
-                    model_wrapper=mesh,
-                    mesh=mesh,
-                    autopipeline=object(),
-                )
-        group = constructor.call_args.kwargs["process_group"]
-        assert dist.get_process_group_ranks(group) == [2 * stage, 2 * stage + 1]
-
-        checkpointer = Checkpointer(
-            CheckpointingConfig(enabled=True, checkpoint_dir="", save_consolidated=False),
-            dp_rank=rank % 2,
-            tp_rank=0,
-            pp_rank=stage,
-            process_group=group,
-        )
-        state = ModelState(model, is_peft=False)
-        destinations = state.state_dict()
-
-        def parts():
-            for name, tensor in destinations.items():
-                yield CheckpointLoadPart({name: tensor}, frozenset((name,)), frozenset(), lambda: None)
-
-        checkpointer._load_model_in_parts(
-            state, parts(), destinations, checkpoint_dir, dcp.FileSystemReader(checkpoint_dir)
-        )
-        for name, actual in model.state_dict().items():
-            torch.testing.assert_close(actual, expected[name], rtol=0, atol=0)
-        dist.barrier()
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.runtime_budget(60, reason="Four real CPU process groups exercise stage-local DCP loading")
-def test_pipeline_checkpoint_parts_use_stage_local_group(tmp_path: Path) -> None:
-    """A stage with one load part cannot strand a stage with two load parts."""
-    torch.multiprocessing.spawn(
-        _run_pipeline_checkpoint_parts,
-        args=(4, str(tmp_path / "init"), str(tmp_path / "checkpoint")),
-        nprocs=4,
-        join=True,
-    )
