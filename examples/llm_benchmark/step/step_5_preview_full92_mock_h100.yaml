@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Step 5 Preview full92 benchmark: mock data, fake-balanced routing, 128 H100.
-# Run the native module from the repository root; see README.md.
+# Benchmarking config for the full 92-layer Step 5 Preview language backbone.
+# 16 nodes x 8 H100: EP32 / PP4 / CP1, 1F1B with 24 microbatches, 8K mock
+# sequences, fake balanced static MoE routing and learned CSA selection.
+# Multi-token prediction layers are disabled; weights are randomly initialized.
+#
+# To run this recipe:
+#   automodel examples/llm_benchmark/step/step_5_preview_full92_mock_h100.yaml --nproc-per-node 8
 
 benchmark:
   flops_scope: model
@@ -196,8 +201,9 @@ model:
     swa_varlen: true
     csa_backward_full_blocks: true
   config:
-    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
-    pretrained_model_name_or_path: examples/llm_benchmark/step/step5_full92_mock_h100/model-config
+    _target_: nemo_automodel.components.models.step5.configuration.Step5Config.from_pretrained
+    pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16
+    num_nextn_predict_layers: 0
   torch_dtype: bfloat16
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.FusedAdam
@@ -229,3 +235,9 @@ step_scheduler:
   val_every_steps: 1000
 wandb:
   enable: false
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 16
+  cluster_tag: h100
+  time: "00:40:00"
