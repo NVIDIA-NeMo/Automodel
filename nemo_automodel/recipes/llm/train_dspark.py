@@ -55,6 +55,7 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
     build_cached_dspark_dataloader,
     read_manifest,
     read_target_weight_modules,
+    tokenizer_chat_template_sha256,
 )
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
@@ -303,8 +304,13 @@ def _validate_cached_dspark_manifest(
     target_model_type: str,
     seq_length: int,
     compute_dtype: torch.dtype,
+    chat_template_sha256: str | None,
 ) -> None:
-    """Validate that a DSpark offline cache matches the configured target/draft run."""
+    """Validate that a DSpark offline cache matches the configured target/draft run.
+
+    ``chat_template_sha256`` is the hash of the template the run configured, or ``None`` when it
+    configured none and so has no framing to compare against the cache's.
+    """
     if str(manifest["target_model"]) != str(target_model):
         logger.warning(
             "DSpark cache at %s was built for target_model=%r, but this run configured target_model=%r. "
@@ -313,6 +319,17 @@ def _validate_cached_dspark_manifest(
             cache_dir,
             manifest["target_model"],
             target_model,
+        )
+    # A cache written before the manifest recorded the template has nothing to compare (None).
+    recorded_template_sha256 = manifest.get("chat_template_sha256")
+    if chat_template_sha256 is not None and recorded_template_sha256 not in (None, chat_template_sha256):
+        logger.warning(
+            "DSpark cache at %s was tokenized with a chat template (sha256 %s) that differs from this run's "
+            "(sha256 %s). Cached samples keep the framing they were built with; rebuild the cache with "
+            "precompute_dspark to train on the current template.",
+            cache_dir,
+            recorded_template_sha256,
+            chat_template_sha256,
         )
     if str(manifest["target_model_type"]) != str(target_model_type):
         raise ValueError(
@@ -970,6 +987,8 @@ class TrainDSparkRecipe(BaseRecipe):
                 target_model_type=target_model_type,
                 seq_length=recipe_cfg.seq_length,
                 compute_dtype=self.compute_dtype,
+                # Without a configured template the tokenizer keeps the checkpoint's, which this run never renders.
+                chat_template_sha256=None if chat_template is None else tokenizer_chat_template_sha256(self.tokenizer),
             )
             # The cached loss masks are used as stored, so the options that shaped them must match.
             ensure_supervision_options_match(
