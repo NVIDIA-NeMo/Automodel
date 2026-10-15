@@ -283,6 +283,10 @@ def _fusible(module) -> bool:
         return False
     if getattr(module, "dropout_p", 0.0) and module.training:
         return False
+    # A per-token gate (``lora_token_gate``) is applied only by the per-linear path. Only ``LinearLoRA`` carries
+    # ``lora_A``/``lora_B``, so the class default ``_lora_token_gate = None`` is always present here.
+    if module._lora_token_gate is not None:
+        return False
     # The fused forward calls ``F.linear(x, base_weight)`` with no bias term, so a biased base
     # projection would train on silently wrong math. Models plumb this from the HF config
     # (``nn.Linear(..., bias=config.mlp_bias)``), so decline and let the per-linear path add it.
