@@ -1,23 +1,23 @@
 ---
-title: "FLUX 3 Image Klein Base"
-description: "Fine-tune FLUX 3 Image Klein Base for text-to-image generation and instruction-based image editing with NeMo AutoModel."
+title: "FLUX-3-Image-Klein-Base"
+description: "Fine-tune FLUX-3-Image-Klein-Base for text-to-image generation and instruction-based image editing using NeMo AutoModel."
 slug: model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base
 ---
 
 FLUX 3 Image Klein Base is Black Forest Labs' open-weight image model. NeMo AutoModel integrates its image-only `Flux3Transformer2DModel` for text-to-image generation and instruction-based image editing, using flow matching and Qwen3-VL text conditioning.
 
-<Info>
+## Model Reference
 
-| | |
+### Model Architecture
+
+| Property | Value |
 |---|---|
 | **Task** | Text-to-Image, Image-to-Image (instruction editing) |
 | **Architecture** | Image DiT (Flow Matching) |
 | **Parameters** | 5.6B in the image transformer, excluding the text encoder and VAE |
 | **Developer** | [Black Forest Labs](https://huggingface.co/black-forest-labs) |
 
-</Info>
-
-## Available Models
+### Available Models
 
 | Checkpoint | Format | Usage |
 |---|---|---|
@@ -31,12 +31,14 @@ The training workflow below covers **FLUX 3 Image Klein Base**, the non-distille
 
 ## Example Recipes
 
+Run the commands below from [the linked recipe revision](https://github.com/NVIDIA-NeMo/Automodel/tree/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c).
+
 | Recipe | Description |
 |---|---|
-| [flux3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) | Text-to-image LoRA fine-tuning |
-| [flux3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow.yaml) | Text-to-image full fine-tuning template |
-| [flux3_i2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_i2i_flow.yaml) | Image-editing full fine-tuning template; add the LoRA configuration below for adapter training |
-| [generate_flux3.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_flux3.yaml) | Native image generation with optional trained LoRA weights |
+| [flux3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) | Text-to-image LoRA fine-tuning |
+| [flux3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_t2i_flow.yaml) | Text-to-image full fine-tuning template |
+| [flux3_i2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_i2i_flow.yaml) | Image-editing full fine-tuning template; add the LoRA configuration below for adapter training |
+| [generate_flux3.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/generate/configs/generate_flux3.yaml) | Native image generation with optional trained LoRA weights |
 
 The 100-step validation covers LoRA training. The full fine-tuning templates have not undergone the same end-to-end validation.
 
@@ -140,7 +142,7 @@ uv run --no-sync python examples/diffusion/generate/generate.py \
   --output.output_dir /data/outputs/flux3-klein-t2i
 ```
 
-The generation config supplies a prompt, seed 42, 50 denoising steps, guidance scale 3.5, and a 1024 × 1024 output. Edit its `inference.prompts` list for your task. Omit the LoRA override to generate with the base checkpoint.
+The generation config supplies a prompt, seed 42, 50 denoising steps, guidance scale 3.5, and a 1024 x 1024 output. Edit its `inference.prompts` list for your task. Omit the LoRA override to generate with the base checkpoint.
 
 ## Image-Editing LoRA Fine-Tuning
 

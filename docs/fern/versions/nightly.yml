@@ -418,7 +418,7 @@ navigation:
             contents:
               - page: "Step-3.5-Flash"
                 path: ../../model-coverage/llm/stepfun-ai/step-3-5.mdx
-              - page: "Step 5 Preview"
+              - page: "Step-5-Preview"
                 path: ../../model-coverage/llm/stepfun-ai/step-5-preview.mdx
                 slug: Step-5-Preview
           - section: "Tencent"
@@ -560,6 +560,8 @@ navigation:
             contents:
               - page: "Muse-Glimmer-30B"
                 path: ../../model-coverage/vlm/meta-models/muse_glimmer.mdx
+              - page: "Muse-Spark-open-816B-A42B"
+                path: ../../model-coverage/vlm/meta-models/muse_spark_open.mdx
           - section: "MiniMax AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRtwCAABXRUJQVlA4TNACAAAvE8AEAAEFbdswSvfHn/E0DhH9nwBFdyv0wx40UNQ2khMUW66GP7Z7HxYlkSQ5DQ++f1kRn4JHERJI2vj17/z+xwMwPhKUYSKhKA0ZzIdqdWp+EGJ3Zv/PpJClbZNpO39V9ep1bNs+J/YAsu9iOwM4g8hMNAXrKpe2bRsLvSqYRD1PILWRJEhyZN/z+FM8FDclt7ZtVcvWPp9kuGQUQAuWWkYdtEFKU/Ti7vxyvrt35NDfJYXLElyimrM0fEhNG+7FZdKSZZGGsDwcawD/oMDf+/rRN5Uf+/l+X2SwcDEOCRHAIAawgBg7drpxR2G95o62deYOFh5czAwHYEaVqF91axul9rq23bqN0g577Og5fy0rCQ4zBB04iNLJ3kLGA9dPu6+19Ljrp598Ti7hYiQQAIcGpZBrse/3akG8RdzcmxUlNvcSTtuP2avKT0GgIAAdRB/+v/qWTOqbOEm1BqCRoqNEqxdqfPULLCAkLYT1P/ufVT4XVZaAf6Dv/CUpADO6MH6lZdNKfFWONBmDABgRk4OZmU6mOITLq5NH1aJBSBAmCOPHAegXFTOzguJ0f9qP7CH09aiMU/yhOPlZLXqpPk4at6h8FABwIGnE1IC8JGXVZk9XpTeNUdb0lNkjnDl+Pv0UUoAh6IJDQzRt1F1Pv8nZsvf+Txo3X47c9Mn5ddBMBDEAh66QALch/usc1hV1VWNRvrLxaVWV3cRDAYAgAIRQIJ3rNDdQl9WUP89VT8z4RsQFyxUpAIRElGO2SVX+aETn5OWH1D5asqTq844lXFZdLf7fy/wjAHTRxFQDhm8Svu762U6XN1WFRZHfu12yowO7WN25LwmIQLqCuHS4PNzNCru5/vBe++Zg8bRFvszf/vvd1Fv/1vN7qiAFxEAhnRvxKvSXsx/a/6hFPLuX0B/JvuLl0oMPBYADME8yR8z5v6tF8+AlEhlcZPHQBBg="/></svg>'
             slug: minimax
@@ -649,7 +651,7 @@ navigation:
             contents:
               - page: "Step-3.7-Flash"
                 path: ../../model-coverage/vlm/stepfun-ai/step-3-7-flash.mdx
-              - page: "Step 5 Preview"
+              - page: "Step-5-Preview"
                 path: ../../model-coverage/vlm/stepfun-ai/step-5-preview.mdx
                 slug: Step-5-Preview
           - section: "Thinking Machines"
@@ -773,12 +775,12 @@ navigation:
             slug: black-forest-labs
             path: ../../model-coverage/diffusion/black-forest-labs/index.mdx
             contents:
+              - page: "FLUX-3-Image-Klein-Base"
+                path: ../../model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx
               - page: "FLUX.1-dev"
                 path: ../../model-coverage/diffusion/black-forest-labs/flux.mdx
               - page: "FLUX.2-dev"
                 path: ../../model-coverage/diffusion/black-forest-labs/flux2.mdx
-              - page: "FLUX 3 Image Klein Base"
-                path: ../../model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx
           - section: "Diffusers"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRuACAABXRUJQVlA4TNMCAAAvE8AEAA8GO7Jt09aaa+Pq2U7g/Tn/aK7NrTXTgB3Jtqpq1tkHhwT4IwbyT4QE5LnLkb0g17abMPqSHWZYUf/F5GSfEpJhHoOkP/9BsxhoEBEBgcQgEA2EDHCQkFFCcCIBCBBQIiBAACgAAgEoNujGDBbQuqNJ+GMD6gSpAxYAkUDNQICYKiJEsm4BOPEWrEKlzsK5AajdsBn+Uhugg9SdX0CJf+lfVA0oqmRghlMW6KLHL78iRYFk99bU6fIyYYAhmgGTuHT7Si6K6dIk7rrhJl0YcEqoWXWfVFdzsQRUdUlAqN6125Y3g/hmm2JgM+9VuQ4cGVFl6qVZgcMCrjTjn258QK7/ZnMlW0kktVOxo5wpVCdsClO4+OMdOJvuQkETi9IlMrRGDM6/NhqQo6khmhJmddA3bSoRLkpxz47f/umVNf1PdDFyZMwkzF22Qbhjgp0UJHI68VAqpq2/EdgPhywswybDPp8ZIk36DPewzmIs5DFTQ0y/x762GxdSh+WvcNkLbiZeACP/i6vyoq7OL8Jh5KMeQGvb/7HnzUYcZy5U1J7PGa+FWVtZvF/E36r8ECTYtm3a0U5efmyeF9u2bdu2bdu2bduoattXFyL6PwHgKxMepgQhJRiPqmpDMAIxgFZZrjarTAKIw7sy0B2Cc+BT2tXqSqT/P5gPB74tdSWdASxCH/MlwQLgwK+hqb0jCLJSBnkhDMsCHPg3Nvf0xwDZ97G6IHB71rb19kUBOUUzIyaKzM/7N9zqi7sHo4Gs0bmHW1vg6+kTRhUDNZFA5tDSxI0TrO29/hwZ6JVHQD1jeHl83hzOV5vxohogANL/ZlfGFsxgdfl6eqGjQmDkmbipwulFU1iu7Zw9J8mzAIiM7yYLTGG5ur17lAgxcBPs0i3gsr61d5gsogDeBOD37Xr/IAWqLB+QJqWdv5ykQo0gIJHDxvGHiKoGBCbYJMgRgScA"/></svg>'
             slug: diffusers

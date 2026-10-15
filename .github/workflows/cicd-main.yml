@@ -57,6 +57,8 @@ jobs:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
   linting:
+    needs: [pre-flight]
+    if: needs.pre-flight.outputs.docs_only != 'true'
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
@@ -109,6 +111,8 @@ jobs:
           uv run --active python tools/lint_model_parallelizer_contract.py
 
   import_linting:
+    needs: [pre-flight]
+    if: needs.pre-flight.outputs.docs_only != 'true'
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
@@ -149,6 +153,8 @@ jobs:
           uv run --active python tests/ci_tests/test_import_contracts.py
 
   type_checking:
+    needs: [pre-flight]
+    if: needs.pre-flight.outputs.docs_only != 'true'
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
@@ -202,12 +208,14 @@ jobs:
           uv run --active ty check --verbose $TY_DIRS
 
   Nemo_Linting_Test:
-    needs: [linting, import_linting, type_checking]
+    needs: [pre-flight, linting, import_linting, type_checking]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Main
         env:
+          PRE_FLIGHT_RESULT: ${{ needs.pre-flight.result }}
+          DOCS_ONLY: ${{ needs.pre-flight.outputs.docs_only }}
           LINTING_RESULT: ${{ toJson(needs.linting) }}
           IMPORT_LINTING_RESULT: ${{ toJson(needs.import_linting) }}
           TYPE_CHECKING_RESULT: ${{ toJson(needs.type_checking) }}
@@ -215,6 +223,15 @@ jobs:
           LINTING=$(echo "$LINTING_RESULT" | jq -r '.result')
           IMPORT_LINTING=$(echo "$IMPORT_LINTING_RESULT" | jq -r '.result')
           TYPE_CHECKING=$(echo "$TYPE_CHECKING_RESULT" | jq -r '.result')
+
+          if [[ "$PRE_FLIGHT_RESULT" != "success" ]]; then
+            echo "Pre-flight failed; cannot determine whether code linting may be skipped."
+            exit 1
+          fi
+          if [[ "$DOCS_ONLY" == "true" ]] && [[ "$LINTING" == "skipped" ]] && [[ "$IMPORT_LINTING" == "skipped" ]] && [[ "$TYPE_CHECKING" == "skipped" ]]; then
+            echo "Code linting skipped for docs-only changes."
+            exit 0
+          fi
 
           if [[ "$LINTING" == "success" ]] && [[ "$IMPORT_LINTING" == "success" ]] && [[ "$TYPE_CHECKING" == "success" ]]; then
             echo "All linting checks passed."
@@ -788,10 +805,13 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [pre-flight, Nemo_CICD_Test]
+    needs: [pre-flight, Nemo_CICD_Test, cicd-unit-tests, cicd-e2e-tests]
+    # The summary permits failures on CI workloads; publish only complete test runs.
     if: |
       !cancelled()
       && needs.Nemo_CICD_Test.result == 'success'
+      && needs.cicd-unit-tests.result == 'success'
+      && needs.cicd-e2e-tests.result == 'success'
       && vars.ENABLE_CODECOV == 'true'
     strategy:
       matrix:
@@ -805,6 +825,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.8.22
+
       - name: Download coverage reports of current branch
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
@@ -813,18 +838,20 @@ jobs:
 
       - name: Get total coverage of current branch
         shell: bash -x -e -u -o pipefail {0}
-        if: always()
         run: |
-          pip install coverage[toml]
-
-          if ! [ -d coverage-downloads ] || [ -z "$(ls -A coverage-downloads)" ]; then
-            echo "No coverage artifacts found for ${{ matrix.flag }}, skipping."
-            exit 0
+          if ! [ -d coverage-downloads ]; then
+            echo "::error::No coverage artifacts found for ${{ matrix.flag }}."
+            exit 1
+          fi
+          mapfile -d '' coverage_files < <(find coverage-downloads -name '.coverage' -type f -print0)
+          if [ "${#coverage_files[@]}" -eq 0 ]; then
+            echo "::error::No coverage data found for ${{ matrix.flag }}."
+            exit 1
           fi
           ls -al coverage-downloads/
-          coverage combine --keep $(find coverage-downloads -name '.coverage')
-          coverage report -i
-          coverage xml -i
+          uvx --from 'coverage[toml]' coverage combine --keep "${coverage_files[@]}"
+          uvx --from 'coverage[toml]' coverage report -i
+          uvx --from 'coverage[toml]' coverage xml -i
           rm -rf coverage-downloads
           ls -al
 
@@ -834,6 +861,9 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
+          files: coverage.xml
+          disable_search: true
+          fail_ci_if_error: true
           base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
           override_pr: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           override_commit: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
