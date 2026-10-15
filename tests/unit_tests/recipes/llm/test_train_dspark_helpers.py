@@ -782,11 +782,27 @@ def _validate_cached_manifest(manifest=None, target_config=None, target_layer_id
         target_model_type=kwargs.pop("target_model_type", "qwen3"),
         seq_length=kwargs.pop("seq_length", 8),
         compute_dtype=kwargs.pop("compute_dtype", torch.float32),
+        chat_template_sha256=kwargs.pop("chat_template_sha256", "sha-current"),
     )
 
 
 def test_cached_dspark_manifest_accepts_matching_shapes():
     _validate_cached_manifest()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "configured", "warns"),
+    [
+        ({}, "sha-current", False),
+        ({"chat_template_sha256": "sha-current"}, "sha-current", False),
+        ({"chat_template_sha256": "sha-old"}, None, False),
+        ({"chat_template_sha256": "sha-old"}, "sha-current", True),
+    ],
+)
+def test_cached_dspark_manifest_warns_only_on_a_chat_template_mismatch(caplog, overrides, configured, warns):
+    caplog.set_level("WARNING")
+    _validate_cached_manifest(manifest=_cached_manifest(**overrides), chat_template_sha256=configured)
+    assert ("chat template (sha256 sha-old)" in caplog.text) == warns
 
 
 def test_cached_dspark_manifest_warns_on_target_path_mismatch(caplog):
