@@ -29,6 +29,7 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     DATED_SUPPORT_TABLE_HEADER,
     HOMEPAGE_END_MARKER,
     HOMEPAGE_START_MARKER,
+    MODEL_CARD_PATH_ALIASES,
     MODEL_TYPE_OVERVIEW_PATHS,
     REGISTRY_END_MARKER,
     REGISTRY_START_MARKER,
@@ -452,6 +453,18 @@ def test_committed_generated_tables_are_rejected(tmp_path):
         _validate_generated_tables_are_not_committed(tmp_path)
 
 
+def test_model_card_path_aliases_preserve_published_paths():
+    repo_root = Path(__file__).parents[3]
+    _, _, catalog = _load_model_doc_catalog(repo_root / "docs")
+    source_paths = [model.source_path for model in catalog]
+    for alias, canonical in MODEL_CARD_PATH_ALIASES.items():
+        assert (repo_root / alias).is_file(), f"Published source URL must remain available: {alias}"
+        assert (repo_root / canonical).is_file(), f"Published source URL must remain available: {canonical}"
+        assert _frontmatter_slug(repo_root / alias) == _frontmatter_slug(repo_root / canonical)
+        assert alias not in source_paths
+        assert source_paths.count(canonical) == 1
+
+
 def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     repo_root = Path(__file__).parents[3]
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
@@ -578,7 +591,7 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
         path.resolve()
         for category_directory in category_directories.values()
         for path in (repo_root / "docs" / "model-coverage" / category_directory).glob("*/*.mdx")
-        if path.name != "index.mdx"
+        if path.name != "index.mdx" and path.relative_to(repo_root).as_posix() not in MODEL_CARD_PATH_ALIASES
     }
     if set(navigated_model_pages) != expected_model_pages:
         offenders.append("nightly navigation does not contain every model card exactly once")
