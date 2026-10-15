@@ -1,6 +1,6 @@
 ---
-title: "Step 5 Preview"
-description: "Step 5 Preview architecture, sparse attention, context parallelism, and the full-depth H100 benchmark in NeMo AutoModel."
+title: "Step-5-Preview"
+description: "Step-5-Preview architecture, sparse attention, context parallelism, and the full-depth H100 benchmark in NeMo AutoModel."
 slug: model-coverage/large-language-models/stepfun-ai/Step-5-Preview
 ---
 
@@ -13,6 +13,8 @@ checkpoint also contains a perception encoder; see the
 for that path and its preprocessing requirements.
 
 ## Model Reference
+
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -159,8 +161,8 @@ indexer's top-k budget, so selection drops regions there.
 
 | Query positions | Tokens | Mean logits KL | Maximum logits KL | Selected-region overlap |
 | --- | ---: | ---: | ---: | ---: |
-| 0–4,103 | 4,104 | 2.13e-6 | 2.36e-4 | 100% |
-| 4,104–8,191, where selection drops history | 4,088 | 2.36e-6 | 2.47e-4 | 99.11% |
+| 0-4,103 | 4,104 | 2.13e-6 | 2.36e-4 | 100% |
+| 4,104-8,191, where selection drops history | 4,088 | 2.36e-6 | 2.47e-4 | 99.11% |
 
 Region-selection differences occur at near-tied indexer scores. This
 comparison covers the forward pass of four layers; it is not full-depth
@@ -174,6 +176,7 @@ long-context validation.
 
 ## Related Resources
 
+- [Step-5-Preview](https://huggingface.co/stepfun-ai/Step-5-Preview)
 - [Hugging Face checkpoint](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
 - [Model implementation](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/components/models/step5)
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
