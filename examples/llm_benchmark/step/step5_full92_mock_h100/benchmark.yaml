@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Preserved job 20038646 benchmark: full92, mock/fake-balanced, 128 H100.
+# Preserved job 20089678 benchmark: full92, mock/fake-balanced, 128 H100, M24.
 # Run the native module from the repository root; see README.md.
 
 benchmark:
@@ -37,7 +37,7 @@ dataloader:
   num_workers: 0
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  batch_size: 16
+  batch_size: 24
   exclude_token_ids:
   - 1
   num_samples: 100000
@@ -95,8 +95,8 @@ distributed:
       - model.layers.21
       - model.layers.22
       - model.layers.23
-      - model.layers.24
-    - - model.layers.25
+    - - model.layers.24
+      - model.layers.25
       - model.layers.26
       - model.layers.27
       - model.layers.28
@@ -117,8 +117,8 @@ distributed:
       - model.layers.43
       - model.layers.44
       - model.layers.45
-      - model.layers.46
-    - - model.layers.47
+    - - model.layers.46
+      - model.layers.47
       - model.layers.48
       - model.layers.49
       - model.layers.50
@@ -140,8 +140,8 @@ distributed:
       - model.layers.66
       - model.layers.67
       - model.layers.68
-    - - model.layers.69
-      - model.layers.70
+      - model.layers.69
+    - - model.layers.70
       - model.layers.71
       - model.layers.72
       - model.layers.73
@@ -199,6 +199,7 @@ model:
     linear: te
     rms_norm: torch_fp32
     swa_varlen: true
+    csa_backward_full_blocks: true
   config:
     _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: examples/llm_benchmark/step/step5_full92_mock_h100/model-config
@@ -224,8 +225,8 @@ seed: 42
 step_scheduler:
   ckpt_every_steps: 1000
   gc_every_steps: 5
-  global_batch_size: 512
-  local_batch_size: 16
+  global_batch_size: 768
+  local_batch_size: 24
   log_remote_every_steps: 1
   max_steps: 17
   num_epochs: 1
@@ -237,7 +238,7 @@ wandb:
   entity: Nemo-automodel
   group: step5-native-schedule1f1b-vpp1
   mode: online
-  name: step5-full92-mock-cp1-ep32-pp4-vpp1-m16-attention-opt-benchmark
+  name: step5-full92-mock-cp1-ep32-pp4-vpp1-m24-unprofiled-v3-benchmark
   project: huiyingl_workspace
   resume: never
   tags:
@@ -246,7 +247,7 @@ wandb:
   - mock8k
   - fakebalanced-static
   - PP4-VPP1-DP32-EP32-CP1
-  - M16-GB512-GA1
+  - M24-GB768-GA1
   - compact-off
   - unprofiled-benchmark
   - swa-varlen
