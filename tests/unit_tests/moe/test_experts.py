@@ -315,6 +315,32 @@ class TestGroupedExpertsRouteWeightAfterDown:
         )
         torch.testing.assert_close(output, expected)
 
+    def test_post_expert_output_runs_before_route_reduction(self):
+        """A per-expert transform is applied before top-k weighting/combine."""
+        config = self._tiny_config()
+        experts = GroupedExperts(config)
+        with torch.no_grad():
+            experts.gate_and_up_projs.fill_(0.25)
+            experts.down_projs.fill_(0.5)
+            experts.gate_up_proj_bias.zero_()
+            experts.down_proj_bias.zero_()
+
+        x = torch.tensor([[1.0, -2.0], [0.5, 1.5]])
+        weights = torch.tensor([[0.2, 0.7], [0.4, 0.3]])
+        indices = torch.tensor([[0, 1], [1, 0]])
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool)
+
+        baseline = experts(x, token_mask, weights, indices)
+        transformed = experts(
+            x,
+            token_mask,
+            weights,
+            indices,
+            post_expert_output=lambda expert_output: expert_output * 2,
+        )
+
+        torch.testing.assert_close(transformed, baseline * 2)
+
 
 class TestGroupedExpertsZeroActiveExperts:
     """Test GroupedExperts handling of zero active local experts.
@@ -1123,6 +1149,54 @@ class TestGroupedExpertsDeepEP:
         outer_router_weight.assert_not_called()
         expected = permuted_probs.unsqueeze(-1).expand_as(hidden_states)
         torch.testing.assert_close(output, expected)
+
+    def test_chunked_nonlinear_post_expert_precedes_router_weight(self, moe_config, monkeypatch):
+        """Chunking preserves nonlinear postprocessing and routing gradients."""
+        moe_config.apply_router_weight_after_down = True
+        moe_config.expert_bias = True
+        experts = GroupedExpertsDeepEP(moe_config)
+        args = self._prepare_forward_path(experts, num_tokens=3)
+        hidden, probabilities = args[4], args[5]
+        hidden.div_(hidden.numel()).requires_grad_()
+        probabilities.requires_grad_()
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(std=0.01)
+            experts.down_projs.normal_(std=0.01)
+            experts.gate_up_proj_bias.zero_()
+            experts.down_proj_bias.zero_()
+
+        def grouped_mm(value, weights, offs):
+            """Multiply [tokens, input] by expert weights [experts, input, output].
+
+            Args:
+                value: Tensor of shape [tokens, input] grouped by expert.
+                weights: Tensor of shape [experts, input, output].
+                offs: Tensor of shape [experts] with cumulative token offsets.
+
+            Returns:
+                Tensor of shape [tokens, output].
+            """
+            starts = [0, *offs.tolist()]
+            return torch.cat([value[starts[i] : starts[i + 1]] @ weights[i] for i in range(weights.shape[0])])
+
+        monkeypatch.setattr("nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: grouped_mm)
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES", 0)
+        reference_inputs = [
+            tensor.detach().clone().requires_grad_()
+            for tensor in (hidden, experts.gate_and_up_projs, experts.down_projs, probabilities)
+        ]
+        result = experts(*args[:4], post_expert_output=torch.tanh)
+        ref_hidden, ref_up, ref_down, ref_probs = reference_inputs
+        unweighted = experts.expert_activation(ref_hidden @ ref_up[0], torch.ones(3, 1)) @ ref_down[0]
+        expected = torch.tanh(unweighted) * ref_probs[:, None]
+        gradient = torch.randn_like(result)
+        result.backward(gradient)
+        expected.backward(gradient)
+        torch.testing.assert_close(result, expected)
+        for actual, reference in zip(
+            (hidden, experts.gate_and_up_projs, experts.down_projs, probabilities), reference_inputs
+        ):
+            torch.testing.assert_close(actual.grad, reference.grad)
 
     def test_grouped_experts_provides_dispatcher_pipeline_runtime_initializers(self, moe_config):
         experts = GroupedExpertsDeepEP(moe_config)
