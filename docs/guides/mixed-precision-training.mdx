@@ -125,7 +125,7 @@ The following settings can be added to a LoRA recipe with the appropriate target
 
 ```yaml
 model:
-  dtype: bfloat16
+  dtype: bfloat16            # model-required FP32 param islands retained
 
 peft:
   lora_dtype: float32         # default; shown explicitly for clarity
