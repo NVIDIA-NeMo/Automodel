@@ -121,3 +121,22 @@ def tp_linear_forward(
     else:
         return F.linear(x, weight, bias)
     return out + bias if bias is not None else out
+
+
+class LoRAProjection(torch.nn.Linear):
+    """Adapter projection with independent storage and activation compute dtypes."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply a bias-free projection while preserving parameter storage dtype.
+
+        Args:
+            x: Activations of shape [..., in_features], with arbitrary leading
+                dimensions in eager mode, or [tokens, in_features] / [batch,
+                sequence, in_features] under compile. DTensor layouts follow
+                :func:`tp_linear_forward`.
+
+        Returns:
+            Tensor of shape [..., out_features] in the activation/autocast dtype.
+        """
+        dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
+        return tp_linear_forward(x, self.weight.to(dtype), None, mm_for_2d_compile=True)

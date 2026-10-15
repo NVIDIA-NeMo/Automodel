@@ -41,6 +41,7 @@ from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
+from nemo_automodel.shared.tp_linear import LoRAProjection as _LoRAProjection
 from nemo_automodel.shared.tp_linear import tp_linear_forward
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -99,15 +100,6 @@ def _extract_base_dtype(quantization_config, default_dtype=torch.bfloat16) -> to
     if hasattr(quantization_config, "bnb_4bit_compute_dtype"):
         return quantization_config.bnb_4bit_compute_dtype
     return default_dtype
-
-
-class _LoRAProjection(nn.Linear):
-    """Adapter projection with independent storage and activation compute dtypes."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Map [..., in_features] to [..., out_features], preserving FP32 parameter storage."""
-        dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
-        return tp_linear_forward(x, self.weight.to(dtype), None, mm_for_2d_compile=True)
 
 
 class LinearLoRA(nn.Linear):
@@ -567,15 +559,16 @@ def patch_linear_module(
     if not isinstance(orig_linear, tuple(linear_types)):
         raise NotImplementedError("Expected isinstance(orig_linear, nn.Linear)")
     assert not hasattr(orig_linear, "super_fwd"), orig_linear.super_fwd
+    is_te_linear = HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear)
 
     if use_dora:
-        if HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear):
+        if is_te_linear:
             raise ValueError("DoRA is not supported for transformer_engine.pytorch.Linear layers.")
         if getattr(orig_linear, "quant_state", None) is not None:
             raise ValueError("DoRA is not supported for quantized linear layers (e.g., BitsAndBytes).")
         use_triton = False
 
-    if HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear):
+    if is_te_linear:
         linear_lora_cls = _TELinearLoRA
     else:
         linear_lora_cls = TritonLinearLoRA if use_triton else LinearLoRA
@@ -598,12 +591,9 @@ def patch_linear_module(
         getattr(orig_linear, "quant_state", None) is not None
         and orig_linear.quant_state.__class__ == bitsandbytes.functional.QuantState
     ):
-        if HAS_TE:
-            assert not isinstance(orig_linear, transformer_engine.pytorch.Linear), (
-                "quant_state is not supported with transformer_engine.pytorch.Linear"
-            )
+        assert not is_te_linear, "quant_state is not supported with transformer_engine.pytorch.Linear"
         orig_linear.super_fwd = orig_linear.forward
-    elif HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear):
+    elif is_te_linear:
         # Delegate base computation to TE's forward so TE kernels (including FP8)
         # are used instead of falling back to F.linear().
         orig_linear.super_fwd = orig_linear.forward

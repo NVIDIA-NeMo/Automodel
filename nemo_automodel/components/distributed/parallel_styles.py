@@ -28,7 +28,7 @@ from torch.distributed.tensor.parallel import (
 )
 
 from nemo_automodel.components.distributed.tp_replicas import mark_tp_replica_gradient_reduction
-from nemo_automodel.shared.tp_linear import tp_linear_forward
+from nemo_automodel.shared.tp_linear import LoRAProjection, tp_linear_forward
 
 __all__ = ["ReplicatedWithGradAllReduce", "translate_to_lora"]
 
@@ -97,12 +97,7 @@ class TPLinear(nn.Linear):
             leading dimensions as ``x``; a DTensor if ``x`` and the weight
             are DTensors.
         """
-        weight = self.weight
-        # LoRA projections keep FP32 storage even in TP-only execution without FSDP.
-        if "weight" in getattr(self, "_preserve_parameter_dtypes", ()):
-            dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
-            weight = weight.to(dtype)
-        return tp_linear_forward(x, weight, self.bias, mm_for_2d_compile=True)
+        return tp_linear_forward(x, self.weight, self.bias, mm_for_2d_compile=True)
 
 
 class ColwiseParallelLora(ColwiseParallel):
@@ -135,12 +130,11 @@ class ColwiseParallelLora(ColwiseParallel):
 
         if hasattr(module, "lora_A"):
             module.lora_A.register_forward_hook(lora_a_output_hook)
-            # lora_A/lora_B are nn.Linear sub-modules whose weights are now DTensors.
-            # Convert to TPLinear so torch.compile sees matmul-based forward and
-            # avoids the aten.view recursion in the backward.
-            module.lora_A.__class__ = TPLinear
+            # Native adapters retain their TP-safe forward; TE adapters switch to
+            # the same bias-free projection, preserving compute casts under TP.
+            module.lora_A.__class__ = LoRAProjection
         if hasattr(module, "lora_B"):
-            module.lora_B.__class__ = TPLinear
+            module.lora_B.__class__ = LoRAProjection
 
         # Plain nn.Linear (not a LinearLoRA subclass): same conversion needed.
         # LinearLoRA already uses _dtensor_linear (matmul) in its own forward.
@@ -175,8 +169,8 @@ class RowwiseParallelLora(RowwiseParallel):
         if hasattr(module, "lora_A"):
             _distribute_param(module.lora_A, "weight", device_mesh, self.src_data_rank, [Shard(1)])
             _distribute_param(module.lora_B, "weight", device_mesh, self.src_data_rank, [Shard(1)])
-            module.lora_A.__class__ = TPLinear
-            module.lora_B.__class__ = TPLinear
+            module.lora_A.__class__ = LoRAProjection
+            module.lora_B.__class__ = LoRAProjection
         # Plain nn.Linear: convert to TPLinear for compile safety.
         # LinearLoRA subclasses are already handled by their own _dtensor_linear forward.
         if type(module) is nn.Linear:

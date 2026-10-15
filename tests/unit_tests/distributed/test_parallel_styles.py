@@ -14,6 +14,7 @@
 
 """Tests for parallel_styles.py - LoRA-aware tensor parallel strategies."""
 
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -88,7 +89,6 @@ class TestDistributeParam:
         """Test basic parameter distribution."""
         module = nn.Linear(10, 20)
         original_param = module.weight.clone()
-        original_requires_grad = module.weight.requires_grad
 
         with patch("nemo_automodel.components.distributed.parallel_styles.distribute_tensor") as mock_distribute:
             # Mock distribute_tensor to return a tensor-like object
@@ -484,3 +484,45 @@ class TestIntegration:
         # Should not raise an error
         with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param"):
             colwise._partition_linear_fn("test", mock_linear_module, mock_device_mesh)
+
+
+@pytest.mark.parametrize("style_cls", [ColwiseParallelLora, RowwiseParallelLora])
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("compile_forward", [True, False])
+@pytest.mark.parametrize("autocast", [True, False])
+def test_adapter_projection_survives_tp_conversion(style_cls, native, compile_forward, autocast, mock_device_mesh):
+    from nemo_automodel.components._peft.lora import _LoRAProjection
+    from nemo_automodel.shared.tp_linear import LoRAProjection
+
+    class ExternalProjection(nn.Linear):
+        def forward(self, x):
+            """Reject activations of shape [batch, sequence, in_features] until TP converts the adapter."""
+            raise AssertionError("TP must replace the external adapter forward")
+
+    torch.manual_seed(17)
+    projection_cls = _LoRAProjection if native else ExternalProjection
+    module = nn.Linear(16, 16, bias=False, dtype=torch.bfloat16)
+    module.lora_A = projection_cls(16, 4, bias=False)
+    module.lora_B = projection_cls(4, 16, bias=False)
+    original_weight = module.lora_A.weight
+    reference_weight = original_weight.detach().clone().requires_grad_()
+    with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param"):
+        style_cls()._partition_linear_fn("linear", module, mock_device_mesh)
+    assert type(module.lora_A) is type(module.lora_B) is LoRAProjection is _LoRAProjection
+    assert module.lora_A.weight is original_weight
+    assert module.lora_A.bias is module.lora_B.bias is None
+    x = torch.randn(2, 3, 16, dtype=torch.float32 if autocast else torch.bfloat16, requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    run = torch.compile(module.lora_A, backend="aot_eager", fullgraph=True) if compile_forward else module.lora_A
+    with torch.autocast("cpu", dtype=torch.bfloat16) if autocast else nullcontext():
+        actual = run(x)
+        expected = torch.nn.functional.linear(ref_x, reference_weight.bfloat16())
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream)
+    assert actual.dtype == torch.bfloat16
+    assert original_weight.dtype == original_weight.grad.dtype == torch.float32
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x.grad, ref_x.grad)
+    # Compiled bmm reduces per-batch BF16 gradients; eager linear flattens tokens.
+    torch.testing.assert_close(original_weight.grad, reference_weight.grad, rtol=0.03, atol=0.02)
