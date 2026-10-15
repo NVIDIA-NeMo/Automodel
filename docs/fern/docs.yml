@@ -272,6 +272,10 @@ redirects:
     destination: "/nemo/automodel/model-coverage/vision-language-models/meta-models/Muse-Glimmer-30B"
   - source: "/nemo/automodel/nightly/model-coverage/vision-language-models/meta/Muse-Glimmer-30B"
     destination: "/nemo/automodel/nightly/model-coverage/vision-language-models/meta-models/Muse-Glimmer-30B"
+  - source: "/nemo/automodel/model-coverage/vision-language-models/muse/muse-spark-1-2"
+    destination: "/nemo/automodel/model-coverage/vision-language-models/muse/muse-spark-open"
+  - source: "/nemo/automodel/nightly/model-coverage/vision-language-models/muse/muse-spark-1-2"
+    destination: "/nemo/automodel/nightly/model-coverage/vision-language-models/muse/muse-spark-open"
   # Exact checkpoint aliases for size-level model cards.
   # Exact checkpoint aliases for size-level model cards.
   # Exact checkpoint aliases for size-level model cards.
