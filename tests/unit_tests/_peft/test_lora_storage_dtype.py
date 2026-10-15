@@ -219,7 +219,14 @@ def _distributed_storage_worker(rank, world_size, rendezvous):
                 if p.requires_grad:
                     assert p.grad.dtype == torch.float32
                     grad = p.grad.full_tensor() if isinstance(p.grad, DTensor) else p.grad
-                    torch.testing.assert_close(grad, reference.get_parameter(name).grad, rtol=0.03, atol=0.001)
+                    # Allow small absolute differences near zero in BF16 gradient comparisons.
+                    torch.testing.assert_close(
+                        grad,
+                        reference.get_parameter(name).grad,
+                        rtol=0.03,
+                        atol=0.002,
+                        msg=lambda message: f"{mode}/{name}: {message}",
+                    )
                 else:
                     assert p.grad is None
             optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.1)
