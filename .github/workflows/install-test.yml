@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - "r0.[0-9]+.0"
       - "pull-request/[0-9]+"
       - "deploy-release/*"
   schedule:
@@ -18,9 +19,8 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
-  # PR updates can supersede stale runs, but main must finish populating the
-  # canonical CUDA wheelhouse cache used by every copied PR branch.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # Let canonical producers finish publishing; newer PR commits can supersede CI.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/r0.') }}
 
 env:
   TORCH_CU_INDEX: https://download.pytorch.org/whl/cu130
@@ -34,13 +34,27 @@ jobs:
 
   setup-install-image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       cuda_image: ${{ steps.cfg.outputs.cuda_image }}
       uv_modes: ${{ steps.modes.outputs.uv_modes }}
+      release_branch: ${{ steps.cache-scope.outputs.release_branch }}
+      cache_writer: ${{ steps.cache-scope.outputs.cache_writer }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+      - name: Select cache scope
+        id: cache-scope
+        env:
+          PR_BASE_REF: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
+        run: bash .github/scripts/select-ci-cache-scope.sh
       - id: cfg
         shell: bash
         run: |
@@ -48,6 +62,7 @@ jobs:
       - name: Select UV source-build coverage
         id: modes
         env:
+          BASE_BRANCH: ${{ steps.cache-scope.outputs.base_branch }}
           BEFORE_SHA: ${{ github.event.before }}
           FORCE_SOURCE_BUILD: ${{ inputs.source-build || false }}
         run: bash .github/scripts/select-uv-install-modes.sh
@@ -95,6 +110,9 @@ jobs:
           python-binary: python
 
   ngc-cuda-test-uv:
+    permissions:
+      contents: read
+      actions: read
     runs-on: linux-amd64-cpu16
     name: UV (${{ matrix.mode }}) - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
     needs: [pre-flight, setup-install-image, cuda-wheelhouse, verify-cuda-wheelhouse]
@@ -144,11 +162,13 @@ jobs:
           key: ${{ needs.cuda-wheelhouse.outputs.cache_key }}
           fail-on-cache-miss: true
 
-      - name: Download newly built CUDA wheelhouse
+      - name: Download CUDA wheelhouse artifact
         if: matrix.mode == 'wheelhouse' && needs.cuda-wheelhouse.outputs.cache_hit != 'true'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           artifact-ids: ${{ needs.cuda-wheelhouse.outputs.artifact_id }}
+          run-id: ${{ needs.cuda-wheelhouse.outputs.artifact_run_id }}
+          github-token: ${{ github.token }}
           merge-multiple: true
           path: /tmp/cuda-wheelhouse
 
@@ -246,8 +266,11 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+      actions: read
     outputs:
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_id: ${{ steps.release-wheelhouse.outputs.artifact_id || steps.upload.outputs.artifact-id }}
+      artifact_run_id: ${{ steps.release-wheelhouse.outputs.run_id || github.run_id }}
+      reused: ${{ steps.cuda-wheelhouse-cache-main.outputs.cache-hit == 'true' || steps.cuda-wheelhouse-cache-branch.outputs.cache-hit == 'true' || steps.release-wheelhouse.outputs.artifact_id != '' }}
       provenance_id: ${{ steps.provenance-upload.outputs.artifact-id }}
       fingerprint: ${{ steps.cuda-wheelhouse-key.outputs.fingerprint }}
       cache_key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
@@ -295,13 +318,13 @@ jobs:
           echo "fingerprint=${fingerprint}" >> "$GITHUB_OUTPUT"
           echo "key=install-test-cuda-wheelhouse-v4-${RUNNER_OS}-py${PYTHON_VERSION}-${fingerprint}" >> "$GITHUB_OUTPUT"
 
-      # Keep the canonical wheelhouse on main. Copied PR branches restore it
+      # Main and release branches own canonical wheelhouses. PRs only restore
       # without creating duplicate branch-scoped multi-GB cache entries.
       # Use exact keys only: pip wheel cannot incrementally consume an older
       # wheelhouse, so a prefix fallback downloads gigabytes before rebuilding.
       - name: Restore and save CUDA wheelhouse cache
         id: cuda-wheelhouse-cache-main
-        if: github.ref == 'refs/heads/main'
+        if: needs.setup-install-image.outputs.cache_writer == 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.WHEELHOUSE_DIR }}
@@ -309,17 +332,69 @@ jobs:
 
       - name: Restore CUDA wheelhouse cache
         id: cuda-wheelhouse-cache-branch
-        if: github.ref != 'refs/heads/main'
+        if: needs.setup-install-image.outputs.cache_writer != 'true'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.WHEELHOUSE_DIR }}
           key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
+
+      # Copied PR push events cannot read another branch's Actions cache. An
+      # immutable artifact bridges that boundary without rebuilding/reuploading.
+      - name: Find release wheelhouse artifact
+        id: release-wheelhouse
+        if: |
+          needs.setup-install-image.outputs.release_branch != ''
+          && (needs.setup-install-image.outputs.cache_writer == 'true'
+              || (steps.cuda-wheelhouse-cache-main.outputs.cache-hit != 'true'
+                  && steps.cuda-wheelhouse-cache-branch.outputs.cache-hit != 'true'))
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          RELEASE_BRANCH: ${{ needs.setup-install-image.outputs.release_branch }}
+          CACHE_KEY: ${{ steps.cuda-wheelhouse-key.outputs.key }}
+        with:
+          script: |
+            const branch = process.env.RELEASE_BRANCH;
+            const name = `cuda-wheelhouse-${branch}-${process.env.CACHE_KEY}`;
+            for await (const {data: artifacts} of github.paginate.iterator(
+              github.rest.actions.listArtifactsForRepo, {...context.repo, name, per_page: 100}
+            )) {
+              for (const artifact of artifacts) {
+                if (artifact.expired || artifact.name !== name ||
+                    artifact.workflow_run?.head_branch !== branch) continue;
+                const {data: run} = await github.rest.actions.getWorkflowRun({
+                  ...context.repo, run_id: artifact.workflow_run.id
+                });
+                if (run.path !== '.github/workflows/install-test.yml' ||
+                    run.head_branch !== branch ||
+                    !['push', 'workflow_dispatch'].includes(run.event) ||
+                    run.head_repository?.full_name !== `${context.repo.owner}/${context.repo.repo}`) continue;
+                core.setOutput('artifact_id', String(artifact.id));
+                core.setOutput('run_id', String(run.id));
+                core.info(`Reusing ${branch} wheelhouse artifact ${artifact.id} from run ${run.id}`);
+                return;
+              }
+            }
+            core.info(`No unexpired wheelhouse artifact matches ${branch} and the exact cache key`);
+
+      - name: Download release wheelhouse
+        if: |
+          steps.cuda-wheelhouse-cache-main.outputs.cache-hit != 'true'
+          && steps.cuda-wheelhouse-cache-branch.outputs.cache-hit != 'true'
+          && steps.release-wheelhouse.outputs.artifact_id != ''
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ steps.release-wheelhouse.outputs.artifact_id }}
+          run-id: ${{ steps.release-wheelhouse.outputs.run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: ${{ env.WHEELHOUSE_DIR }}
 
       - name: Build cached CUDA dependency wheels
         id: build
         if: |
           steps.cuda-wheelhouse-cache-main.outputs.cache-hit != 'true'
           && steps.cuda-wheelhouse-cache-branch.outputs.cache-hit != 'true'
+          && steps.release-wheelhouse.outputs.artifact_id == ''
         shell: bash -x -e -u -o pipefail {0}
         run: .github/scripts/build-cuda-wheelhouse.sh
 
@@ -356,17 +431,20 @@ jobs:
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/mamba_ssm*.whl 2>/dev/null)"
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/transformer_engine_torch*.whl 2>/dev/null)"
 
-      # Consumers restore cache hits directly. Only fresh builds need a full
-      # artifact; the small provenance artifact below is verified on both paths.
-      - name: Upload newly built CUDA wheelhouse artifact
+      # Publish once per release fingerprint. If its artifact expired but the
+      # Actions cache survived, refresh the archive without recompiling wheels.
+      - name: Publish CUDA wheelhouse artifact
         id: upload
-        if: steps.build.outcome == 'success'
+        if: |
+          steps.build.outcome == 'success'
+          || (needs.setup-install-image.outputs.release_branch == github.ref_name
+              && steps.release-wheelhouse.outputs.artifact_id == '')
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: cuda-wheelhouse-py${{ matrix.python-version }}
+          name: ${{ needs.setup-install-image.outputs.release_branch == github.ref_name && format('cuda-wheelhouse-{0}-{1}', github.ref_name, steps.cuda-wheelhouse-key.outputs.key) || format('cuda-wheelhouse-py{0}', matrix.python-version) }}
           path: ${{ env.WHEELHOUSE_DIR }}/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ needs.setup-install-image.outputs.release_branch == github.ref_name && 30 || 1 }}
 
       - name: Upload wheelhouse provenance for verification
         id: provenance-upload
@@ -380,7 +458,7 @@ jobs:
           retention-days: 1
 
   verify-cuda-wheelhouse:
-    needs: [cuda-wheelhouse]
+    needs: [cuda-wheelhouse, setup-install-image]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -398,10 +476,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           WHEELHOUSE_DIR: /tmp/cuda-wheelhouse-provenance
-          WHEELHOUSE_CACHE_HIT: ${{ needs.cuda-wheelhouse.outputs.cache_hit }}
+          WHEELHOUSE_REUSED: ${{ needs.cuda-wheelhouse.outputs.reused }}
+          RELEASE_BRANCH: ${{ needs.setup-install-image.outputs.release_branch }}
         run: bash .github/scripts/verify-cuda-wheelhouse-provenance.sh
 
   ngc-cuda-test-pip:
+    permissions:
+      contents: read
+      actions: read
     runs-on: linux-amd64-cpu16
     name: Pip - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC CUDA
     container:
@@ -431,11 +513,13 @@ jobs:
           key: ${{ needs.cuda-wheelhouse.outputs.cache_key }}
           fail-on-cache-miss: true
 
-      - name: Download newly built CUDA wheelhouse
+      - name: Download CUDA wheelhouse artifact
         if: needs.cuda-wheelhouse.outputs.cache_hit != 'true'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           artifact-ids: ${{ needs.cuda-wheelhouse.outputs.artifact_id }}
+          run-id: ${{ needs.cuda-wheelhouse.outputs.artifact_run_id }}
+          github-token: ${{ github.token }}
           merge-multiple: true
           path: ${{ env.WHEELHOUSE_DIR }}
 

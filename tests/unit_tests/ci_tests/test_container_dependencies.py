@@ -61,6 +61,8 @@ if [[ $4 == example/pytorch:base ]]; then
 elif [[ $REGISTRY_ERROR != none ]]; then
   echo "$REGISTRY_ERROR" >&2
   exit 1
+elif [[ -n ${AVAILABLE_IMAGE:-} && $4 == "$AVAILABLE_IMAGE" ]]; then
+  echo "$DEPS_DIGEST"
 elif [[ $AVAILABLE == own && $4 == *:deps-branch-* ]] || [[ $AVAILABLE == main && $4 == *:deps-main-* ]]; then
   echo "$DEPS_DIGEST"
 else
@@ -204,3 +206,43 @@ def test_every_dependency_copy_input_is_keyed() -> None:
         if line.startswith("COPY ") and "--from=" not in line:
             sources = [token for token in shlex.split(line)[1:-1] if not token.startswith("--")]
             assert set(sources) <= set(_INPUTS)
+
+
+@pytest.mark.parametrize("target", ["r0.7.0", "r0.10.0"])
+@pytest.mark.runtime_budget(15, reason="Runs two real Git/Bash registry lookups, matching existing lookup test budgets")
+def test_cherry_pick_reuses_target_release_image_by_digest(checkout: Path, target: str) -> None:
+    _, release = _prepare(checkout, CACHE_KEY=target)
+    result, pr = _prepare(checkout, RELEASE_BRANCH=target, AVAILABLE_IMAGE=release["image"])
+    assert result.returncode == 0, result.stderr
+    assert pr["cache-hit"] == "true"
+    assert pr["image"] == release["image"]
+    assert pr["digest"] == _DEPS_DIGEST
+
+
+@pytest.mark.runtime_budget(15, reason="Runs three real Git/Bash registry lookups to verify release isolation")
+def test_cherry_pick_cannot_reuse_sibling_release_and_keeps_own_write_scope(checkout: Path) -> None:
+    _, sibling = _prepare(checkout, CACHE_KEY="r0.6.0")
+    _, own = _prepare(checkout)
+    result, pr = _prepare(checkout, RELEASE_BRANCH="r0.7.0", AVAILABLE_IMAGE=sibling["image"])
+    assert result.returncode == 0, result.stderr
+    assert pr["cache-hit"] == "false"
+    assert pr["image"] == own["image"]
+
+
+@pytest.mark.runtime_budget(15, reason="Runs two real Git/Bash registry lookups, matching existing lookup test budgets")
+def test_release_lookup_retains_own_first_and_main_fallback(checkout: Path) -> None:
+    _, own = _prepare(checkout, RELEASE_BRANCH="r0.7.0", AVAILABLE="own")
+    assert own["cache-hit"] == "true"
+    assert ":deps-branch-" in own["image"]
+    assert len((checkout / "lookups").read_text().splitlines()) == 2
+    result, main = _prepare(checkout, RELEASE_BRANCH="r0.7.0", AVAILABLE="main")
+    assert result.returncode == 0, result.stderr
+    assert main["cache-hit"] == "true"
+    assert ":deps-main-" in main["image"]
+
+
+def test_main_does_not_read_release_even_if_target_is_provided(checkout: Path) -> None:
+    result, output = _prepare(checkout, CACHE_KEY="main", RELEASE_BRANCH="r0.7.0", AVAILABLE="own")
+    assert result.returncode == 0, result.stderr
+    assert output["cache-hit"] == "false"
+    assert "deps-branch-" not in (checkout / "lookups").read_text()
