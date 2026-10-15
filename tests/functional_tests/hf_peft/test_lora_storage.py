@@ -14,7 +14,6 @@
 
 """Mixed frozen/trainable storage on real two-GPU FSDP, including PyTorch 2.6/2.7."""
 
-import copy
 from pathlib import Path
 
 import pytest
@@ -23,8 +22,8 @@ from torch import nn
 
 from nemo_automodel.components._peft.lora import LinearLoRA, patch_moe_module
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
-from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts
+from tests.utils.lora_storage import expert_routing_inputs, randomize_and_copy, tiny_moe_config
 
 
 def _storage_worker(rank: int, rendezvous: str) -> None:
@@ -41,34 +40,14 @@ def _storage_worker(rank: int, rendezvous: str) -> None:
         for kind in ("linear", "dora", "experts"):
             torch.manual_seed(17)
             if kind == "experts":
-                config = MoEConfig(
-                    n_routed_experts=4,
-                    n_shared_experts=0,
-                    n_activated_experts=1,
-                    n_expert_groups=1,
-                    n_limited_groups=1,
-                    train_gate=False,
-                    gate_bias_update_factor=0.0,
-                    aux_loss_coeff=0.0,
-                    score_func="softmax",
-                    route_scale=1.0,
-                    dim=16,
-                    inter_dim=32,
-                    moe_inter_dim=32,
-                    norm_topk_prob=False,
-                    dtype=torch.bfloat16,
-                )
-                model = patch_moe_module(GroupedExperts(config).cuda(), dim=4)
+                model = patch_moe_module(GroupedExperts(tiny_moe_config()).cuda(), dim=4)
             else:
                 model = LinearLoRA(
                     nn.Linear(16, 16, bias=False, device="cuda", dtype=torch.bfloat16),
                     dim=4,
                     use_dora=kind == "dora",
                 )
-            with torch.no_grad():
-                for parameter in model.parameters():
-                    parameter.normal_(std=0.05)
-            reference = copy.deepcopy(model)
+            reference = randomize_and_copy(model)
             frozen = {name: p.detach().clone() for name, p in reference.named_parameters() if not p.requires_grad}
             fully_shard_by_dtype(model, mesh, policy, None, reshard_after_forward=True)
             torch.manual_seed(29 + rank)
@@ -77,12 +56,7 @@ def _storage_worker(rank: int, rendezvous: str) -> None:
                 x = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)
                 args = (x,)
                 if kind == "experts":
-                    args = (
-                        x,
-                        torch.ones(8, device="cuda", dtype=torch.bool),
-                        torch.ones(8, 1, device="cuda", dtype=torch.bfloat16),
-                        torch.arange(8, device="cuda").remainder(4).view(-1, 1),
-                    )
+                    args = (x, *expert_routing_inputs(x))
                 actual, expected = model(*args), reference(*args)
                 torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
                 upstream = torch.randn_like(actual)

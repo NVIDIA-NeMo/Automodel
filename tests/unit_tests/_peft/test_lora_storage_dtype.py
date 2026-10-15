@@ -26,30 +26,9 @@ from nemo_automodel.components.models.common.utils import (
     cast_model_to_dtype,
     yield_fp32_model,
 )
-from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.shared.import_utils import is_torch_min_version
-
-
-def _config(*, dtype=torch.bfloat16, bias=False):
-    return MoEConfig(
-        n_routed_experts=4,
-        n_shared_experts=0,
-        n_activated_experts=1,
-        n_expert_groups=1,
-        n_limited_groups=1,
-        train_gate=False,
-        gate_bias_update_factor=0.0,
-        aux_loss_coeff=0.0,
-        score_func="softmax",
-        route_scale=1.0,
-        dim=16,
-        inter_dim=32,
-        moe_inter_dim=32,
-        norm_topk_prob=False,
-        dtype=dtype,
-        expert_bias=bias,
-    )
+from tests.utils.lora_storage import expert_routing_inputs, randomize_and_copy, tiny_moe_config
 
 
 @pytest.mark.parametrize("expert_cls", [GroupedExperts, GroupedExpertsDeepEP])
@@ -58,7 +37,7 @@ def _config(*, dtype=torch.bfloat16, bias=False):
 def test_expert_wrapper_preserves_actual_base_storage(expert_cls, device, dtype):
     # Deliberately disagree with config: wrapping must honor the existing tensor.
     with torch.device(device):
-        original = expert_cls(_config(dtype=torch.float32, bias=True)).to(dtype)
+        original = expert_cls(tiny_moe_config(dtype=torch.float32, bias=True)).to(dtype)
     base_parameters = dict(original.named_parameters())
     wrapped = patch_moe_module(original, dim=4)
     for name, original_parameter in base_parameters.items():
@@ -76,7 +55,7 @@ def test_expert_wrapper_preserves_actual_base_storage(expert_cls, device, dtype)
 
 @pytest.mark.parametrize("expert_cls", [GroupedExperts, GroupedExpertsDeepEP])
 def test_expert_constructor_uses_config_dtype(expert_cls):
-    experts = expert_cls(_config(bias=True))
+    experts = expert_cls(tiny_moe_config(bias=True))
     assert all(parameter.dtype == torch.bfloat16 for parameter in experts.parameters())
 
 
@@ -87,7 +66,7 @@ def test_storage_survives_materialization_init_and_load(kind):
             module = LinearLoRA(nn.Linear(16, 16, dtype=torch.bfloat16), dim=4)
         else:
             expert_cls = GroupedExperts if kind == "grouped" else GroupedExpertsDeepEP
-            module = patch_moe_module(expert_cls(_config()), dim=4)
+            module = patch_moe_module(expert_cls(tiny_moe_config()), dim=4)
     module.to_empty(device="cpu")
     with torch.no_grad():
         for parameter in module.parameters():
@@ -109,15 +88,10 @@ def test_storage_survives_materialization_init_and_load(kind):
 
 def test_mixed_storage_expert_forward_backward_and_step():
     torch.manual_seed(7)
-    module = patch_moe_module(GroupedExperts(_config()), dim=4)
-    with torch.no_grad():
-        for parameter in module.parameters():
-            parameter.normal_(std=0.05)
-    reference = copy.deepcopy(module)
+    module = patch_moe_module(GroupedExperts(tiny_moe_config()), dim=4)
+    reference = randomize_and_copy(module)
     x = torch.randn(8, 16, dtype=torch.bfloat16, requires_grad=True)
-    indices = torch.arange(8).remainder(4).view(-1, 1)
-    weights = torch.ones(8, 1, dtype=torch.bfloat16)
-    mask = torch.ones(8, dtype=torch.bool)
+    mask, weights, indices = expert_routing_inputs(x)
     output = module(x, mask, weights, indices)
     # Explicit BF16 matmuls with FP32 adapter leaves form an independent reference.
     rows = []
@@ -175,11 +149,8 @@ def _distributed_storage_worker(rank, world_size, rendezvous):
         flat_mesh = mesh["fsdp", "ep"]._flatten()
         for mode in ("fsdp", "ep", "ep_fsdp"):
             torch.manual_seed(17)
-            model = patch_moe_module(GroupedExperts(_config()), dim=4)
-            with torch.no_grad():
-                for p in model.parameters():
-                    p.normal_(std=0.05)
-            reference = copy.deepcopy(model)
+            model = patch_moe_module(GroupedExperts(tiny_moe_config()), dim=4)
+            reference = randomize_and_copy(model)
             if mode != "fsdp":
                 ep_mesh = flat_mesh if mode == "ep" else mesh["ep"]
                 parallelize_module(model, ep_mesh, ExpertParallel())
@@ -198,9 +169,7 @@ def _distributed_storage_worker(rank, world_size, rendezvous):
             for name, p in model.named_parameters():
                 assert p.dtype == (torch.float32 if name.startswith("lora_") else torch.bfloat16)
             x = torch.randn(8, 16, dtype=torch.bfloat16)
-            indices = torch.arange(8).remainder(4).view(-1, 1)
-            weights = torch.ones(8, 1, dtype=torch.bfloat16)
-            mask = torch.ones(8, dtype=torch.bool)
+            mask, weights, indices = expert_routing_inputs(x)
             compute_dtypes = []
             hook = model.register_forward_pre_hook(
                 lambda module, inputs: compute_dtypes.extend(p.dtype for p in module.parameters())
@@ -354,7 +323,7 @@ def test_lora_storage_default_and_overrides(options, expected):
     linear = patch_linear_module(nn.Linear(16, 16, dtype=torch.bfloat16), use_triton=False, **options)
     assert linear.lora_A.weight.dtype == linear.lora_B.weight.dtype == expected
     for expert_cls in (GroupedExperts, GroupedExpertsDeepEP):
-        expert = patch_moe_module(expert_cls(_config()), **options)
+        expert = patch_moe_module(expert_cls(tiny_moe_config()), **options)
         assert all(p.dtype == expected for name, p in expert.named_parameters() if name.startswith("lora_"))
 
 
