@@ -18,8 +18,9 @@ Launch with torchrun --standalone --nproc_per_node=2. The small four-layer model
 covers dense FFN, routed/shared experts, SWA, CSA, padding and packed documents.
 The default is the original short sweep. Opt in to --scenario long-packed,
 --scenario long-crossing, or --scenario long-single to exercise 8K native-varlen
-and truly sparse shards. This random-weight component test is not a checkpoint
-loading validation.
+and truly sparse shards. Every launch first checks SWA halo exchange against an
+exact forward/backward oracle. This random-weight component test is not a
+checkpoint loading validation.
 """
 
 import argparse
@@ -28,6 +29,7 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from typing import TypedDict
 
@@ -41,6 +43,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import Conte
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.step5.backend import Step5BackendConfig
 from nemo_automodel.components.models.step5.configuration import Step5Config
+from nemo_automodel.components.models.step5.cp import gather_halo
 from nemo_automodel.components.models.step5.layers import Step5Attention
 from nemo_automodel.components.models.step5.model import Step5ForCausalLM
 from nemo_automodel.components.models.step5.sparse import RegionSelection, Step5SparseIndexer
@@ -333,6 +336,26 @@ def compare_cp(
     return report
 
 
+def check_halo() -> None:
+    """Compare SWA halo exchange with an exact forward/backward oracle on every rank."""
+    rank, world, length = dist.get_rank(), dist.get_world_size(), 7
+    global_input = torch.arange(2 * world * length * 3, device="cuda", dtype=torch.float32).view(2, world * length, 3)
+    # Zero, short, exact-shard, and multi-shard halos exercise different peers.
+    for halo, padding in product((0, 3, 7, 19, world * length), (0, rank + 1)):
+        local = global_input[:, rank * length : (rank + 1) * length].clone().requires_grad_()
+        actual = gather_halo(local, dist.group.WORLD, halo, left_padding=padding)
+        first = max(0, rank * length - halo)
+        torch.testing.assert_close(
+            actual, F.pad(global_input[:, first : (rank + 1) * length], (0, 0, padding, 0)), atol=0, rtol=0
+        )
+        ((rank + 1) * actual.square().sum()).backward()
+        expected = torch.zeros_like(global_input)
+        for consumer in range(world):
+            start, stop = max(0, consumer * length - halo), (consumer + 1) * length
+            expected[:, start:stop] += 2 * (consumer + 1) * global_input[:, start:stop]
+        torch.testing.assert_close(local.grad, expected[:, rank * length : (rank + 1) * length], atol=0, rtol=0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("flex", "fa4"), default="fa4")
@@ -366,6 +389,7 @@ def main() -> None:
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     assert dist.get_world_size() == 2
+    check_halo()
     scenarios: list[tuple[str, tuple[int, ...], int, int, int]] = []
     for scenario in args.scenario or ["short"]:
         if scenario == "short":
