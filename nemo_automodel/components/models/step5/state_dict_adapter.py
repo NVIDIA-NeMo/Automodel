@@ -33,6 +33,8 @@ from nemo_automodel.components.moe.state_dict_utils import (
     get_expert_range_for_rank_from_mesh,
 )
 
+_DECODER_LAYER = re.compile(r"^model\.layers\.(\d+)\.")
+
 _INDEXER_NAMES = {
     "sparse_indexer_q": "indexer.q_proj",
     "sparse_indexer_k": "indexer.k_proj",
@@ -70,6 +72,31 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
         self._unquantized_expert_modules = frozenset(excluded)
 
     def iter_checkpoint_load_parts(
+        self,
+        model_state_dict: dict[str, torch.Tensor],
+        device_mesh: DeviceMesh | None = None,
+    ) -> Iterator[CheckpointLoadPart] | None:
+        """Load in bounded parts unless this rank holds only part of the decoder.
+
+        Every rank issues one load collective per part. Pipeline stages own
+        different decoder layers, so their part counts differ; such ranks use
+        the ordinary checkpoint load instead.
+
+        Args:
+            model_state_dict: Final native storage; see ``_iter_checkpoint_load_parts``.
+            device_mesh: Optional expert mesh used for native/HF conversion.
+
+        Returns:
+            Checkpoint load parts, or ``None`` on a distributed rank whose state
+            dict lacks some of the decoder layers.
+        """
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            present = {int(match.group(1)) for name in model_state_dict if (match := _DECODER_LAYER.match(name))}
+            if not set(range(self.config.num_hidden_layers)) <= present:
+                return None
+        return self._iter_checkpoint_load_parts(model_state_dict, device_mesh)
+
+    def _iter_checkpoint_load_parts(
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: DeviceMesh | None = None,

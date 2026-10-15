@@ -400,3 +400,15 @@ def test_packed_shifted_loss_does_not_cross_documents(first_length: int, padding
         actual.loss.backward()
         assert torch.count_nonzero(embeddings.grad[:, :start]) == 0
         assert embeddings.grad[:, start:].abs().sum() > 0
+
+
+@pytest.mark.parametrize("pipeline_stage", [False, True])
+def test_distributed_pipeline_stage_uses_ordinary_checkpoint_load(monkeypatch, pipeline_stage):
+    adapter = make_model().state_dict_adapter
+    layers = range(adapter.config.num_hidden_layers)
+    owned = list(layers)[1:] if pipeline_stage else list(layers)
+    native = {f"model.layers.{index}.input_layernorm.weight": torch.ones(64) for index in owned}
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    # Each part is a collective load; stages owning different layers would issue different counts.
+    assert (adapter.iter_checkpoint_load_parts(native) is None) is pipeline_stage
