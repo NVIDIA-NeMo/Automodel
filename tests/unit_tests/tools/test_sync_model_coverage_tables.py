@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import base64
+import io
 import os
 import re
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -625,6 +627,48 @@ def test_model_card_descriptions_meet_seo_contract():
     assert not offenders, "Invalid model-card descriptions:\n" + "\n".join(f"  - {item}" for item in offenders)
 
 
+def _read_documented_recipe(repo_root: Path, recipe_path: str, document: str) -> str:
+    """Read the recipe at its documented commit, or from the current checkout."""
+    permalink = re.search(
+        rf"https://github\.com/NVIDIA-NeMo/Automodel/blob/([0-9a-f]{{40}})/{re.escape(recipe_path)}(?=[)#?])",
+        document,
+    )
+    if permalink:
+        url = f"https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/{permalink.group(1)}/{recipe_path}"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return response.read().decode("utf-8")
+    return (repo_root / recipe_path).read_text(encoding="utf-8")
+
+
+def test_documented_recipe_reads_current_checkout(tmp_path):
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text("model: {}\n", encoding="utf-8")
+    assert _read_documented_recipe(tmp_path, "recipe.yaml", "") == "model: {}\n"
+
+
+def test_documented_recipe_reads_permalink_instead_of_current_checkout(tmp_path, monkeypatch):
+    revision = "a" * 40
+    recipe_path = "examples/model.yaml"
+    (tmp_path / "examples").mkdir()
+    (tmp_path / recipe_path).write_text("current checkout", encoding="utf-8")
+    document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/{recipe_path})"
+
+    def open_recipe(url, *, timeout):
+        assert url == f"https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/{revision}/{recipe_path}"
+        assert timeout == 10
+        return io.BytesIO(b"model: {pretrained_model_name_or_path: org/model}\n")
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_recipe)
+    assert "org/model" in _read_documented_recipe(tmp_path, recipe_path, document)
+
+
+@pytest.mark.parametrize("revision,linked_path", [("main", "examples/model.yaml"), ("a" * 40, "examples/other.yaml")])
+def test_missing_recipe_requires_matching_commit_permalink(tmp_path, revision, linked_path):
+    document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/{linked_path})"
+    with pytest.raises(FileNotFoundError):
+        _read_documented_recipe(tmp_path, "examples/model.yaml", document)
+
+
 def test_model_card_commands_use_checked_in_recipes():
     repo_root = Path(__file__).parents[3]
     offenders: list[str] = []
@@ -662,11 +706,12 @@ def test_model_card_commands_use_checked_in_recipes():
                     f"{path.relative_to(repo_root)}: command must reference exactly one recipe, found {recipe_paths}"
                 )
                 continue
-            recipe_path = repo_root / recipe_paths[0]
-            if not recipe_path.is_file():
-                offenders.append(f"{path.relative_to(repo_root)}: recipe does not exist: {recipe_paths[0]}")
+            try:
+                recipe_source = _read_documented_recipe(repo_root, recipe_paths[0], document)
+            except OSError as error:
+                offenders.append(f"{path.relative_to(repo_root)}: cannot read recipe {recipe_paths[0]}: {error}")
                 continue
-            recipe = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
+            recipe = yaml.safe_load(recipe_source)
             recipe_model_ids = _iter_pretrained_model_ids(recipe.get("model", {}))
             documented_model_ids_by_case = {model_id.casefold() for model_id in documented_model_ids}
             recipe_model_ids_by_case = {model_id.casefold() for model_id in recipe_model_ids}
