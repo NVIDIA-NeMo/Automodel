@@ -1,7 +1,7 @@
 ---
-title: "Muse Spark Open"
-description: "Fine-tune meta-models/Muse-Spark-open-816B-A42B with NeMo AutoModel using MedPix vision-language recipes and packed Tulu 3 context parallelism."
-slug: model-coverage/vision-language-models/muse/muse-spark-open
+title: "Muse-Spark-open-816B-A42B"
+description: "Fine-tune Muse-Spark-open-816B-A42B with NeMo AutoModel using MedPix vision-language SFT and LoRA recipes and packed Tulu 3 context parallelism."
+slug: model-coverage/vision-language-models/meta-models/Muse-Spark-open-816B-A42B
 ---
 
 Muse Spark Open is an omni Mixture-of-Experts model with an approximately
@@ -11,6 +11,8 @@ multimodal processor, and checkpoint adapter for
 `meta-models/Muse-Spark-open-816B-A42B`.
 
 ## Model Reference
+
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -55,11 +57,12 @@ Follow the [installation instructions](/get-started/installation) and the
 Transformer Engine, HybridEP, and the fused linear cross-entropy dependency
 installed.
 
-Point `MUSE_SPARK_MODEL` to the checkpoint directory. The model path and run
-directory must be accessible to every worker:
+The recipe loads `meta-models/Muse-Spark-open-816B-A42B` from the Hugging Face
+Hub. To train from a local copy, set `model.pretrained_model_name_or_path` and
+`processor.pretrained_model_name_or_path` in the recipe to the checkpoint
+directory. The checkpoint and run directory must be accessible to every worker:
 
 ```bash
-export MUSE_SPARK_MODEL=/path/to/Muse-Spark-open-816B-A42B
 export MUSE_RUN_DIR=/path/to/shared/training-output
 export WANDB_RUN_ID=muse-spark-open-medpix-lora-001
 export WANDB_ENTITY=your-wandb-entity
@@ -78,8 +81,6 @@ torchrun --nnodes=8 --nproc-per-node=4 \
   --rdzv-backend=c10d --rdzv-endpoint="${MASTER_ADDR}:29500" \
   -m nemo_automodel.cli.app \
   examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_lora_ep32.yaml \
-  --model.pretrained_model_name_or_path "${MUSE_SPARK_MODEL}" \
-  --processor.pretrained_model_name_or_path "${MUSE_SPARK_MODEL}" \
   --wandb.enable=true --wandb.mode=online \
   --wandb.entity="${WANDB_ENTITY}" --wandb.project="${WANDB_PROJECT}" \
   --wandb.name="${WANDB_RUN_ID}" --wandb.dir="${MUSE_RUN_DIR}/wandb"
@@ -132,3 +133,10 @@ relationships when adapting a launch.
 
 See the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared
 training options.
+
+## Related Resources
+
+- [Muse-Spark-open-816B-A42B](https://huggingface.co/meta-models/Muse-Spark-open-816B-A42B)
+- [Model implementation](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/components/models/muse_spark)
+- [Muse-Glimmer-30B](/model-coverage/vision-language-models/meta-models/Muse-Glimmer-30B)
+- [Multimodal dataset guide](/datasets/multi-modal-dataset)
