@@ -33,6 +33,7 @@ from transformers.models.mistral3.modeling_mistral3 import (
 from transformers.utils import logging
 
 from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forward_backport
+from nemo_automodel.shared.utils import sum_rows
 
 if TYPE_CHECKING:
     from .reranker_export import Mistral3RerankerMetadataExporter
@@ -499,7 +500,7 @@ def pool(
     masked_hidden_states = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
 
     if pool_type == "avg":
-        return masked_hidden_states.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+        return sum_rows(masked_hidden_states) / attention_mask.sum(dim=1)[..., None]
     if pool_type == "cls":
         return masked_hidden_states[:, 0]
     if pool_type == "last":

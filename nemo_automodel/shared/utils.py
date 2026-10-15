@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Any
+
 import torch
 
 
@@ -68,3 +70,63 @@ def dtype_from_str(val, default=torch.bfloat16):
     if torch_val in lut:
         return lut[torch_val]
     raise KeyError(f"Unknown dtype string: {val}")
+
+
+class _RowSum(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, values: torch.Tensor) -> torch.Tensor:
+        """Reduce groups of rows, then their partial sums.
+
+        Args:
+            ctx: Autograd context; saves only the input shape.
+            values: Tensor of shape [..., rows, columns], with arbitrary leading dimensions and strides.
+
+        Returns:
+            Tensor of shape [..., columns], with the dtype of ``values.sum(-2)``.
+        """
+        ctx.input_shape = values.shape
+        low_precision = values.dtype in (torch.float16, torch.bfloat16)
+        dtype = torch.float32 if low_precision else None
+        rows = values.shape[-2]
+        full_rows = rows // 256 * 256
+        # Splitting one dimension with unflatten is a view, including for strided inputs.
+        full = values if full_rows == rows else values[..., :full_rows, :]
+        partials = full.unflatten(-2, (-1, 256)).sum(dim=-2, dtype=dtype)
+        result = partials.sum(dim=-2)
+        if full_rows != rows:
+            result = result + values[..., full_rows:, :].sum(dim=-2, dtype=dtype)
+        return result.to(values.dtype) if low_precision else result
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+        """Broadcast the upstream gradient, as for a single sum.
+
+        Args:
+            ctx: Context containing the original [..., rows, columns] shape.
+            grad_output: Tensor of shape [..., columns].
+
+        Returns:
+            One gradient of shape [..., rows, columns], a broadcast view of ``grad_output``.
+        """
+        # Autograd through the sliced tail would otherwise allocate full-size slice gradients.
+        return (grad_output.unsqueeze(-2).expand(ctx.input_shape),)
+
+
+def sum_rows(values: torch.Tensor) -> torch.Tensor:
+    """Sum the penultimate axis with small CUDA reduction intermediates.
+
+    Short row groups keep CUDA from allocating a large cross-block staging buffer
+    for a strided column reduction. FP16/BF16 partials accumulate in FP32 and are
+    cast only after the final sum. Floating-point accumulation order can differ
+    from ``sum(-2)``. CPU, short reductions and contiguous row axes use native sum.
+
+    Args:
+        values: Tensor of shape [..., rows, columns], with arbitrary leading dimensions and strides.
+
+    Returns:
+        Tensor of shape [..., columns], with the dtype of ``values.sum(-2)``.
+        The input is not mutated. Backward broadcasts the upstream gradient.
+    """
+    if not values.is_cuda or values.shape[-2] <= 512 or values.stride(-2) == 1:
+        return values.sum(dim=-2)
+    return _RowSum.apply(values)

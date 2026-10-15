@@ -37,6 +37,7 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 )
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
+from nemo_automodel.shared.utils import sum_rows
 
 
 class MLP(nn.Module):
@@ -739,7 +740,7 @@ class Gate(nn.Module):
         expert_load = expert_load.float()
 
         context_length = token_mask.sum()
-        expert_scores = (original_scores * token_mask.unsqueeze(-1)).sum(dim=0)
+        expert_scores = sum_rows(original_scores * token_mask.unsqueeze(-1))
 
         if cp_mesh is not None:
             context_length = DTensor.from_local(

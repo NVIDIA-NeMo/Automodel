@@ -52,6 +52,7 @@ from unittest.mock import MagicMock
 import torch
 
 from nemo_automodel.shared.import_utils import null_decorator
+from nemo_automodel.shared.utils import sum_rows
 
 try:
     import triton
@@ -393,7 +394,10 @@ def attn_res_bwd_triton(
     """Fused attention-residual mix backward.
 
     Args:
-        prefix_sum, block_residual, norm_weight, proj_weight: the forward inputs.
+        prefix_sum: Tensor of shape [tokens, hidden], with contiguous last dimension.
+        block_residual: Tensor of shape [tokens, k, hidden], where k is the number of prior block entries.
+        norm_weight: Tensor of shape [hidden] containing RMSNorm weights.
+        proj_weight: Tensor of shape [hidden] containing projection weights.
         grad_out: ``[tokens, hidden]`` gradient of the mixed output (contiguous last dim).
         stats: the forward's ``[3, tokens, k+1]`` fp32 statistics.
 
@@ -462,4 +466,4 @@ def attn_res_bwd_triton(
         NB_PAD=nb_pad,
         R=BWD_ROWS,
     )
-    return d_prefix, d_block, dsw_partial.sum(dim=0)
+    return d_prefix, d_block, sum_rows(dsw_partial)

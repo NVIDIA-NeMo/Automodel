@@ -1250,10 +1250,20 @@ class KimiK3MoE(MoE):
         topk_ids: torch.Tensor,
         topk_weight: torch.Tensor,
     ) -> torch.Tensor:
-        """Match the checkpoint implementation's expert-ordered inference loop."""
-        counts = topk_ids.new_zeros((topk_ids.shape[0], self.n_routed_experts))
-        counts.scatter_(1, topk_ids, 1)
-        tokens_per_expert = counts.sum(dim=0).cpu().tolist()
+        """Match the checkpoint implementation's expert-ordered inference loop.
+
+        Args:
+            hidden_states: Tensor of shape [tokens, hidden] containing routed expert inputs.
+            topk_ids: Integer tensor of shape [tokens, activated_experts] containing expert IDs.
+            topk_weight: Tensor of shape [tokens, activated_experts] containing routing weights.
+
+        Returns:
+            Tensor of shape [tokens, hidden] containing the weighted expert outputs.
+        """
+        # Store each expert's token mask contiguously for the reduction (see PR #4365).
+        counts = topk_ids.new_zeros((self.n_routed_experts, topk_ids.shape[0]))
+        counts.scatter_(0, topk_ids.T, 1)
+        tokens_per_expert = counts.sum(dim=1).cpu().tolist()
         sorted_ids = topk_ids.reshape(-1).argsort()
         sorted_tokens = hidden_states[sorted_ids // topk_ids.shape[1]]
 

@@ -26,6 +26,8 @@ from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 from transformers.utils import logging
 
+from nemo_automodel.shared.utils import sum_rows
+
 logger = logging.get_logger(__name__)
 
 # ============================================================================
@@ -221,12 +223,22 @@ def split_model(model_path, device):
 
 
 def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
+    """Pool token hidden states.
+
+    Args:
+        last_hidden_states: Tensor of shape [batch, sequence, hidden].
+        attention_mask: Tensor of shape [batch, sequence], nonzero for valid tokens.
+        pool_type: Pooling mode.
+
+    Returns:
+        Tensor of shape [batch, hidden], or [batch, sequence, hidden] for token-wise pooling.
+    """
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
 
     if pool_type == "avg":
-        emb = last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+        emb = sum_rows(last_hidden) / attention_mask.sum(dim=1)[..., None]
     elif pool_type == "weighted_avg":
-        emb = last_hidden.sum(dim=1)
+        emb = sum_rows(last_hidden)
     elif pool_type == "cls":
         emb = last_hidden[:, 0]
     elif pool_type == "last":
