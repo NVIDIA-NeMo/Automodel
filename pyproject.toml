@@ -462,6 +462,8 @@ omit = [
     "nemo_automodel/components/_peft/lora_kernel.py",
     "nemo_automodel/components/loss/triton/te_cross_entropy.py",
     "nemo_automodel/components/moe/megatron/*.py",
+    # Triton JIT bodies cannot be traced; parity is covered by L2_Rotary_Kernel_Parity.sh.
+    "nemo_automodel/components/models/common/rope_triton.py",
     # Kimi-K3 Triton kernels: coverage.py cannot trace @triton.jit bodies; the Python wrappers
     # are exercised by tests/unit_tests/models/kimi_k3/test_situ_triton.py and test_attn_res_triton.py
     "nemo_automodel/components/models/kimi_k3/situ_triton.py",
