@@ -107,7 +107,7 @@ The
 uses the native `nemo_automodel.recipes.llm.benchmark` entry point; its header
 contains the launch command.
 
-| Setting | Configuration |
+| Setting | Value |
 | --- | --- |
 | Hardware | 16 nodes, 128 NVIDIA H100 80GB GPUs |
 | Model | All 92 decoder layers; random initialization through `from_config` |
@@ -117,15 +117,11 @@ contains the launch command.
 | Data and MoE routing | Mock documents; fake balanced static expert routing |
 | Attention | Learned CSA selection; SWA varlen and CSA forward/backward full-block paths enabled |
 | Precision | BF16 compute and Adam moments; FP32 norms and residuals |
-| Measurement | 17 steps; seven warmup steps and ten measured steps |
-| Mean step time | 41.86 seconds |
-| Model FLOPs utilization | 20.5% |
+| Steps | 17; the first seven are warmup |
 
-The MFU denominator is 128 GPUs times 989 TFLOP/s per GPU times the measured
-step time. Useful FLOPs exclude activation recomputation and physical
-attention tile padding. This measurement covers the full language backbone's
-forward, backward, and optimizer steps. It does not measure real-data SFT
-throughput, pretrained checkpoint loading, or a CP run.
+The recipe covers the full language backbone's forward, backward, and
+optimizer steps with mock data. It does not exercise pretrained checkpoint
+loading or context parallelism.
 
 Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node
 allocation. Select fresh output directories and your own W&B project before
