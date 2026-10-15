@@ -155,11 +155,10 @@ Region-selection differences occur at near-tied indexer scores. This
 comparison covers the forward pass of four layers; it is not full-depth
 reference parity or a gradient comparison.
 
-The implementation includes
-[text CP checks](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/context_parallel/run_step5_cp.py),
-[halo checks](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/context_parallel/run_step5_halo.py),
-and
-[packed image/crop CP checks](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/context_parallel/run_step5_vlm_packed_cp.py).
+The
+[CP checks](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/context_parallel/run_step5_cp.py)
+compare CP1 and CP2 logits, losses and gradients on single and packed
+documents, and verify SWA halo exchange against an exact oracle.
 The checkpoint's one-million-position limit is not a claim of full-depth
 long-context validation.
 

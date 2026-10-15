@@ -37,11 +37,6 @@ sequence into contiguous query ranges. The document mask applies to image
 tokens as well as text tokens, including when an image span or document crosses
 a CP boundary.
 
-The
-[packed image/crop CP test](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/context_parallel/run_step5_vlm_packed_cp.py)
-exercises native packing and CP hooks with a reduced, random-weight model and
-synthetic preprocessed images.
-
 ## Current Scope
 
 The checkpoint does not include a Hugging Face image processor, so raw-image
