@@ -16,11 +16,8 @@
 # Run the native module from the repository root; see README.md.
 
 benchmark:
-  allocator_stats_path: outputs/step5-full92-mock-h100/allocator-stats
-  batch_metadata_path: outputs/step5-full92-mock-h100/batch-metadata
   flops_scope: model
   json_output_path: outputs/step5-full92-mock-h100/benchmark.json
-  loaded_model_audit_path: outputs/step5-full92-mock-h100/random-initialization-audit
   nsys_end: -1
   nsys_ranks: []
   nsys_start: -1
@@ -41,7 +38,6 @@ dataset:
   exclude_token_ids:
   - 1
   num_samples: 100000
-  seed: 42
   seq_len: 8192
   tokenizer:
     _target_: transformers.PreTrainedTokenizerFast.from_pretrained

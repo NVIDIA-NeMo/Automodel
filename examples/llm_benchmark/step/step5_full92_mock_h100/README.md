@@ -1,5 +1,10 @@
 # Step5 full92 mock benchmark on 128 H100 GPUs
 
+> **Re-measurement pending.** The result below was measured at source
+> `77e4eddd`, before this branch adopted upstream's benchmark FLOPs and timing
+> accounting, HybridEP dispatch, and unseeded mock dataset. The configuration
+> is otherwise unchanged; rerun it on the current source before quoting MFU.
+
 This is the native, unprofiled benchmark configuration used by DFW job
 **20089678**, preserved from source
 `77e4eddd3a76d91b80ab614ee0427d1d6d90241a`. It constructs the full 92-layer
@@ -92,14 +97,15 @@ reuse does not guarantee every kernel is warm. Record runtime dependencies and
 cache state for comparisons. The original scheduler used the
 `coreai_dlalgo_nemorl` account, H100 constraint, 16 nodes and a 40-minute limit.
 
-The YAML differs from the original input configuration only in its model
-JSON location and output directories. Outputs default to
+The YAML differs from the original input configuration in its model JSON
+location and output directories, and it omits the measured run's
+batch-hash, initialization-audit and allocator-statistics outputs, which
+recorded provenance without affecting timing. Outputs default to
 `outputs/step5-full92-mock-h100`; select a fresh directory before another run
-by overriding `wandb.dir`, `checkpoint.checkpoint_dir`, and all four benchmark
-output keys: `allocator_stats_path`, `batch_metadata_path`,
-`loaded_model_audit_path` and `json_output_path`. Do not reuse the immutable
-original run directory. The tokenizer, seed, inputs, optimizer, model,
-backends, partitions, batch sizes and measured window are unchanged.
+by overriding `wandb.dir`, `checkpoint.checkpoint_dir` and
+`benchmark.json_output_path`. Do not reuse the immutable original run
+directory. The tokenizer, seed, inputs, optimizer, model, backends,
+partitions, batch sizes and measured window are unchanged.
 
 ## Provenance
 

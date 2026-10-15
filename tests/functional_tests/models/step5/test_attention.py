@@ -141,9 +141,9 @@ def test_fa4_membership_crossover_preserves_native_192_outputs_and_gradients(
     calls = []
     original = fa4._load_fa4
 
-    def load(window, bitmap, slots, provider_groups):
+    def load(window, bitmap, slots, provider_groups, **kwargs):
         calls.append(bitmap)
-        return original(window, bitmap, slots, provider_groups)
+        return original(window, bitmap, slots, provider_groups, **kwargs)
 
     monkeypatch.setattr(fa4, "_load_fa4", load)
     output = fa4.fa4_attention(

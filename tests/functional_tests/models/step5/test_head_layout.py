@@ -66,9 +66,10 @@ def test_long_history_preserves_each_provider_and_query_offset(
         provider_groups: int,
         *,
         heads_per_group: int = 0,
+        **kwargs: int,
     ) -> tuple[Callable, type, Callable]:
         dispatch.append((use_bitmap, heads_per_group))
-        return original(window, use_bitmap, slots, provider_groups, heads_per_group=heads_per_group)
+        return original(window, use_bitmap, slots, provider_groups, heads_per_group=heads_per_group, **kwargs)
 
     monkeypatch.setattr(fa4, "_load_fa4", load)
     actual = fa4.fa4_attention(

@@ -16,10 +16,7 @@
 
 from collections import Counter
 
-import torch
-
 from nemo_automodel.components.models.step5.configuration import Step5Config
-from nemo_automodel.shared.flops import BatchFlops
 
 
 def _sum_history(length: int, region_size: int, cap: int | None) -> int:
@@ -30,7 +27,7 @@ def _sum_history(length: int, region_size: int, cap: int | None) -> int:
     return region_size * cap * (cap - 1) // 2 + cap * (length - cap * region_size)
 
 
-def _document_work(config: Step5Config, lengths: list[int], supervised_tokens: int) -> BatchFlops:
+def _document_work(config: Step5Config, lengths: list[int], supervised_tokens: int) -> float:
     """Count independent documents; each length excludes physical pack padding."""
     sparse = config.sparse_config
     kinds = config.layer_types[: config.num_hidden_layers]
@@ -83,13 +80,7 @@ def _document_work(config: Step5Config, lengths: list[int], supervised_tokens: i
     indexer = 2 * (
         tokens * indexer_weights + csa_layers * sparse.sparse_indexer_num_heads * sparse.proxy_dim * history_pairs
     )
-    flops = float(linear + attention + indexer)
-    return BatchFlops(
-        flops=flops,
-        all_token_head_flops=flops + 6 * (tokens - supervised_tokens) * head_weights,
-        num_tokens=tokens,
-        num_supervised_tokens=supervised_tokens,
-    )
+    return float(linear + attention + indexer)
 
 
 def step5_flops(config: Step5Config, gbs: int = 1, seq_len: int | None = None) -> float:
@@ -108,61 +99,9 @@ def step5_flops(config: Step5Config, gbs: int = 1, seq_len: int | None = None) -
         seq_len: Tokens per document; defaults to max_position_embeddings.
 
     Returns:
-        Effective training FLOPs with all document tokens supervised. Packed
-        batches must use step5_batch_flops to respect document boundaries.
+        Effective training FLOPs with all document tokens supervised.
     """
     length = config.max_position_embeddings if seq_len is None else seq_len
     if gbs < 0 or length < 0:
         raise ValueError("gbs and seq_len must be nonnegative")
-    return _document_work(config, [length] * gbs, gbs * length).flops
-
-
-def step5_batch_flops(config: Step5Config, batch: dict[str, torch.Tensor], *, ignore_index: int) -> BatchFlops:
-    """Count real packed text work from CPU metadata before CP/PP duplication.
-
-    Args:
-        config: Complete text config, retained by each pipeline model part.
-        batch: CPU tensors input_ids and labels of shape [batch, global_sequence],
-            optional position_ids in the same shape (reset to zero per document),
-            and optional attention_mask in the same shape (positive is valid).
-            Missing positions mean one unbroken document per row. Internal and
-            tail padding are excluded. Inputs are not modified.
-        ignore_index: Loss-specific ignored label, in addition to -100.
-
-    Returns:
-        Effective FLOPs using supervised LM-head rows, the all-token-head
-        comparison, and valid input/supervised token counts.
-
-    Raises:
-        ValueError: Metadata is on CUDA, has inconsistent shapes, contains an
-            incomplete document/CP shard, or supervises physical padding.
-    """
-    ids, labels = batch["input_ids"], batch["labels"]
-    if ids.device.type != "cpu" or labels.device.type != "cpu" or ids.ndim != 2 or labels.shape != ids.shape:
-        raise ValueError("FLOPs counting requires CPU input_ids and labels with matching [batch, sequence] shapes")
-    positions = batch.get("position_ids")
-    valid_mask = batch.get("attention_mask")
-    if positions is None:
-        positions = torch.arange(ids.shape[1]).expand_as(ids)
-    if valid_mask is None:
-        valid_mask = torch.ones_like(ids, dtype=torch.bool)
-    for name, tensor in (("position_ids", positions), ("attention_mask", valid_mask)):
-        if tensor.device.type != "cpu" or tensor.shape != ids.shape:
-            raise ValueError(f"{name} must be a CPU tensor with the same [batch, sequence] shape as input_ids")
-    valid_mask = valid_mask > 0
-    supervised = (labels != ignore_index) & (labels != -100)
-    if torch.any(supervised & ~valid_mask):
-        raise ValueError("Physical padding must not contain supervised labels")
-    lengths = []
-    for row_positions, row_valid in zip(positions, valid_mask):
-        valid_positions = row_positions[row_valid]
-        if valid_positions.numel() == 0:
-            continue
-        if valid_positions[0] != 0 or torch.any(
-            (valid_positions[1:] != 0) & (valid_positions[1:] != valid_positions[:-1] + 1)
-        ):
-            raise ValueError("FLOPs counting requires complete documents before context-parallel sharding")
-        starts = (valid_positions == 0).nonzero().flatten()
-        ends = torch.cat((starts[1:], starts.new_tensor([valid_positions.numel()])))
-        lengths.extend((ends - starts).tolist())
-    return _document_work(config, lengths, int(supervised.sum()))
+    return _document_work(config, [length] * gbs, gbs * length)

@@ -12,81 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 import json
 import logging
 import pathlib
-import time
-from dataclasses import asdict, dataclass
 
 import torch
-from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
-from nemo_automodel.components.loss.utils import _count_label_tokens, _get_loss_ignore_index
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
-    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
-    scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.flops_utils import (
-    calculate_mfu,
-    get_batch_flops_counter,
-    get_flops_formula_for_hf_config,
-)
+from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
-from nemo_automodel.shared.flops import BatchFlopsCounter
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class _IterationMetrics:
-    """One global optimizer window, timed by its slowest rank."""
-
-    step: int
-    seconds: float
-    tflops: float
-    all_token_head_tflops: float
-    num_tokens: int
-    num_supervised_tokens: int
-
-
-@dataclass(frozen=True)
-class _CudaMemoryPeak:
-    """One rank's allocator peaks in bytes and process-lifetime pressure counters."""
-
-    rank: int
-    max_allocated_bytes: int
-    max_reserved_bytes: int
-    num_alloc_retries: int
-    num_ooms: int
-
-
-@dataclass(frozen=True)
-class _CudaAllocatorStats:
-    """One rank's public allocator counters, sampled outside iteration timing."""
-
-    step: int
-    rank: int
-    timestamp_ns: int
-    allocated_bytes: int | None
-    peak_allocated_bytes: int | None
-    reserved_bytes: int | None
-    peak_reserved_bytes: int | None
-    num_alloc_retries: int | None
-    num_ooms: int | None
-    num_device_alloc: int | None
-    num_device_free: int | None
-    num_sync_all_streams: int | None
-    phase: str = "after_iteration_timer_before_metrics"
-    peak_scope: str = "since_parent_setup_reset_before_model_construction"
-    counter_scope: str = "process_lifetime_no_benchmark_reset"
 
 
 def _infer_vocab_size(model_cfg):
@@ -192,21 +135,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Infer max_steps from step_scheduler
         self._bench_steps = cfg.step_scheduler.max_steps
 
-        # Prepacked dataset factories do not accept synthetic-data constructor keys.
-        self._bench_seq_len = cfg.get("packed_sequence.packed_sequence_size", cfg.get("dataset.seq_len"))
-        if self._bench_seq_len is None:
-            raise ValueError("Benchmark requires dataset.seq_len or packed_sequence.packed_sequence_size")
-        self._batch_flops_counter: BatchFlopsCounter | None = None
-        self._bench_iterations: list[_IterationMetrics] = []
-        self._bench_all_token_head_tflops = 0.0
-        self._bench_step_tokens = 0
-        self._bench_step_supervised_tokens = 0
-        self._bench_batch_metadata_path = cfg.get("benchmark.batch_metadata_path")
-        self._bench_loaded_model_audit_path = cfg.get("benchmark.loaded_model_audit_path")
-        self._bench_allocator_stats_path: str | None = cfg.get("benchmark.allocator_stats_path")
+        # Get seq_len from dataset config
+        self._bench_seq_len = cfg.dataset.seq_len
 
         # Infer vocab_size from model config and inject it into dataset config
-        if cfg.get("dataset.vocab_size") is not None and hasattr(cfg, "model"):
+        if hasattr(cfg, "dataset") and hasattr(cfg, "model"):
             if hasattr(cfg.model, "config") and hasattr(cfg.model.config, "pretrained_model_name_or_path"):
                 vocab_size = _infer_vocab_size(cfg.model)
                 cfg.dataset.vocab_size = vocab_size
@@ -214,8 +147,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     logger.info(f"Inferred vocab_size={vocab_size} from model config")
 
         # Inject batch_size from step_scheduler into dataset config
-        if cfg.get("dataset.batch_size") is not None:
-            local_batch_size = cfg.get("step_scheduler.local_batch_size", 1)
+        if hasattr(cfg, "dataset") and hasattr(cfg, "step_scheduler"):
+            local_batch_size = getattr(cfg.step_scheduler, "local_batch_size", 1)
             cfg.dataset.batch_size = local_batch_size
             if logger.isEnabledFor(logging.INFO):
                 logger.info(f"Using batch_size={local_batch_size} from step_scheduler.local_batch_size")
@@ -229,16 +162,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         This method calls the parent's setup() but adapts it for benchmarking purposes.
         It skips validation dataloader, checkpointing, and other training-specific features.
         """
-        # The CUDA timer synchronizes its current device before parent setup
-        # initializes distributed state. Select this worker's GPU first so
-        # every local worker does not create an extra context on device zero.
-        if not torch.distributed.is_initialized():
-            torch.cuda.set_device(get_local_rank_preinit())
         with self.timers("setup", log_level=1):
             # Call parent setup
             super().setup()
-
-        self._write_loaded_model_audit()
 
         # Store wandb run object if initialized by parent
         import wandb
@@ -258,9 +184,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             get_text_config = getattr(flops_config, "get_text_config", None)
             if callable(get_text_config):
                 flops_config = get_text_config()
-        self._batch_flops_counter = get_batch_flops_counter(flops_config)
-        if self._batch_flops_counter is not None and self.cfg.get("peft") is not None:
-            raise ValueError("Model-owned batch FLOPs currently require full-parameter training, without PEFT")
         flops_formula = get_flops_formula_for_hf_config(flops_config)
         if flops_formula is None:
             raise ValueError(
@@ -314,15 +237,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 )
                 logger.info(f"TFLOPS multiplier for PEFT: (2 + {param_ratio:.4f}) / 3 = {tflops_multiplier:.4f}")
 
-        self._bench_all_token_head_tflops = self.tflops
         if self.dist_env.is_main:
             logger.info(
                 f"TFLOPs/global step: {self.tflops:.6f} | "
                 f"TFLOPs/GPU/step: {self.tflops / self.dist_env.world_size:.6f} | "
                 f"FLOPs scope: {self._bench_flops_scope}"
             )
-            if self._batch_flops_counter is not None:
-                logger.info("Per-step MFU uses CPU document boundaries and supervised LM-head rows.")
 
         # Log setup time to wandb
         if self._wandb_enabled:
@@ -404,6 +324,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         with timers and profiling support, similar to the original benchmarking script.
         """
         rank = self.dist_env.rank
+        device = self.dist_env.device
 
         # Get benchmarking config
         steps = self._bench_steps
@@ -456,30 +377,28 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
-                # Normalize every microbatch by the whole window's global supervision.
-                batches = [next(dataloader_iter) for _ in range(ga_steps)]
-                ignore_index = _get_loss_ignore_index(self.loss_fn)
-                num_label_tokens = torch.tensor(
-                    sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
-                    dtype=torch.long,
-                )
-                num_label_tokens = self._dp_allreduce(num_label_tokens).item()
-                self._set_moe_aux_loss_backward_scale(num_batches=ga_steps, num_label_tokens=num_label_tokens)
+                # Gradient accumulation loop
+                num_label_tokens = 0
                 loss_buffer = []
                 prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
-                for ga_step_idx, batch in enumerate(batches):
+                for ga_step_idx in range(ga_steps):
                     if ga_step_idx == ga_steps - 1:
                         prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
+                    # Get batch from dataloader
+                    batch = next(dataloader_iter)
                     torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
+
+                    # Accumulate label tokens locally
+                    num_label_tokens += (batch["labels"] != -100).sum().item()
 
                     with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
                         self._forward_backward_step(
                             ga_step_idx,
                             batch,
                             loss_buffer=loss_buffer,
-                            num_label_tokens=num_label_tokens,
+                            num_label_tokens=None,
                             num_batches=ga_steps,
                             is_train=True,
                         )
@@ -492,30 +411,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
                     synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
-                    scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        self.model_parts,
-                        norm_type=2.0,
-                        pp_enabled=self.pp_enabled,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name="pp" if self.pp_enabled else None,
-                        foreach=True,
-                        num_label_tokens=num_label_tokens,
-                        dp_group_size=self._get_dp_group_size(include_cp=True),
-                        expert_tp_replication_factor=get_expert_tp_replication_factor(
-                            self.model_parts, self.device_mesh
-                        ),
-                        grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
-                    )
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")
-
-            self._record_allocator_stats(step=i)
 
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
@@ -523,12 +421,15 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 self.partial_cuda_graph_manager.capture()
                 self._partial_cuda_graph_capture_pending = False
 
-            # Non-pipeline losses were normalized before backward; PP returns sums.
+            # Synchronize num_label_tokens across DP ranks
+            num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
+            num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
+            num_label_tokens = num_label_tokens_tensor.item()
+
+            # Calculate loss - following exact train_ft.py:1059-1071 pattern
             reporting_loss = torch.sum(torch.stack(loss_buffer))
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-            reporting_loss = reporting_loss.to(torch.float32)
-            if self.pp_enabled and num_label_tokens > 0:
-                reporting_loss = reporting_loss / num_label_tokens
+            reporting_loss = reporting_loss.to(torch.float32) / num_label_tokens
 
             if self.pp_enabled:
                 reporting_loss = reporting_loss.to(self.dist_env.device)
@@ -560,10 +461,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if self.trackio_logger is not None:
                 self._log_moe_metrics(i, self.trackio_logger.log_metrics)
 
-            # Count metadata after timing: batches are still global, pre-CP CPU tensors.
-            self._record_batch_flops(batches, num_label_tokens=num_label_tokens)
-            self._record_batch_metadata(batches, step=i)
-
             # Calculate and log MFU
             self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
 
@@ -580,179 +477,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
 
-    def _mesh_coordinates(self) -> dict[str, int]:
-        """Describe this rank's logical mesh without any communication."""
-        if self.device_mesh is None:
-            return {}
-        return {name: self.device_mesh[name].get_local_rank() for name in self.device_mesh.mesh_dim_names}
-
-    def _record_batch_metadata(self, batches: list[dict[str, torch.Tensor]], *, step: int) -> None:
-        """Optionally hash actual CPU [batch, global_sequence] rows outside timing.
-
-        Each rank writes its own JSONL file, preserving CP/PP duplicates as
-        evidence instead of adding an all-gather to the benchmark. The hash
-        concatenates int64 bytes in input/label/position/mask order, matching
-        frozen packed-dataset provenance.
-        """
-        if self._bench_batch_metadata_path is None:
-            return
-        directory = pathlib.Path(self._bench_batch_metadata_path)
-        directory.mkdir(parents=True, exist_ok=True)
-        ignore_index = _get_loss_ignore_index(self.loss_fn)
-        records = []
-        for microbatch, batch in enumerate(batches):
-            keys = [key for key in ("input_ids", "labels", "position_ids", "attention_mask") if key in batch]
-            for key in keys:
-                if batch[key].device.type != "cpu" or batch[key].shape != batch["input_ids"].shape:
-                    raise ValueError("Batch metadata requires matching CPU tensors before context-parallel sharding")
-            for row in range(batch["input_ids"].shape[0]):
-                digest = hashlib.sha256()
-                hashes = {}
-                for key in keys:
-                    raw = batch[key][row].to(torch.int64).contiguous().numpy().tobytes()
-                    digest.update(raw)
-                    hashes[key] = hashlib.sha256(raw).hexdigest()
-                records.append(
-                    {
-                        "microbatch": microbatch,
-                        "row": row,
-                        "sha256": digest.hexdigest(),
-                        "tensor_sha256": hashes,
-                        "sequence_length": batch["input_ids"].shape[1],
-                        "supervised_tokens": _count_label_tokens(batch["labels"][row], ignore_index),
-                    }
-                )
-        payload = {
-            "step": step,
-            "rank": self.dist_env.rank,
-            "world_size": self.dist_env.world_size,
-            "mesh": self._mesh_coordinates(),
-            "dp_rank": self._get_dp_rank(),
-            "sampler": type(self.dataloader.sampler).__qualname__,
-            "shuffle": self.cfg.get("dataloader.shuffle"),
-            "seed": self.cfg.get("seed", 42),
-            "rows": records,
-        }
-        path = directory / f"rank-{self.dist_env.rank}.jsonl"
-        with path.open("x" if step == 0 else "a") as stream:
-            stream.write(json.dumps(payload) + "\n")
-
-    def _write_loaded_model_audit(self) -> None:
-        """Optionally inspect parameters and buffers after native distributed setup.
-
-        No tensor is unsharded, cast or repaired. Large tensors use 16 evenly
-        spaced local elements, avoiding a flatten that could copy a noncontiguous
-        expert tensor. Small tensors include an exact raw-byte hash. This audit
-        records loaded state, but does not itself compare against checkpoint
-        source values.
-        """
-        if self._bench_loaded_model_audit_path is None:
-            return
-        directory = pathlib.Path(self._bench_loaded_model_audit_path)
-        directory.mkdir(parents=True, exist_ok=True)
-        records = []
-        with torch.no_grad():
-            for part_index, model in enumerate(self.model_parts):
-                for kind, tensors in (("parameter", model.named_parameters()), ("buffer", model.named_buffers())):
-                    for name, tensor in tensors:
-                        local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
-                        local = local.detach()
-                        if local.numel() <= 8192:
-                            sampled = local.cpu().contiguous()
-                            full_hash = hashlib.sha256(
-                                sampled.reshape(-1).view(torch.uint8).numpy().tobytes()
-                            ).hexdigest()
-                            values = sampled.reshape(-1)[:16].tolist()
-                            count = local.numel()
-                        else:
-                            indices = torch.linspace(0, local.numel() - 1, 16, dtype=torch.long, device=local.device)
-                            coordinates = torch.unravel_index(indices, local.shape)
-                            sampled = local[coordinates].cpu().contiguous()
-                            full_hash = None
-                            values = sampled.tolist()
-                            count = sampled.numel()
-                        records.append(
-                            {
-                                "part": part_index,
-                                "kind": kind,
-                                "name": name,
-                                "global_shape": list(tensor.shape),
-                                "local_shape": list(local.shape),
-                                "dtype": str(local.dtype),
-                                "device": str(local.device),
-                                "requires_grad": tensor.requires_grad,
-                                "placements": [str(item) for item in tensor.placements]
-                                if isinstance(tensor, DTensor)
-                                else [],
-                                "sample_values": values,
-                                "hashed_elements": count,
-                                "sample_sha256": hashlib.sha256(
-                                    sampled.reshape(-1).view(torch.uint8).numpy().tobytes()
-                                ).hexdigest(),
-                                "full_local_sha256": full_hash,
-                            }
-                        )
-        payload = {
-            "scope": "after_native_distributed_setup_before_first_forward",
-            "rank": self.dist_env.rank,
-            "world_size": self.dist_env.world_size,
-            "mesh": self._mesh_coordinates(),
-            "dp_rank": self._get_dp_rank(),
-            "checkpoint": self.cfg.get("model.pretrained_model_name_or_path"),
-            "tensors": records,
-        }
-        path = directory / f"rank-{self.dist_env.rank}.json"
-        with path.open("x") as stream:
-            json.dump(payload, stream, indent=2)
-
-    def _record_batch_flops(self, batches: list[dict[str, torch.Tensor]], *, num_label_tokens: int) -> None:
-        """Record one accumulation window without duplicating CP or PP work.
-
-        Args:
-            batches: Original CPU input/label/position/mask tensors, each with
-                shape [local_batch, global_sequence], before CP sharding.
-            num_label_tokens: Supervised-token count already reduced over DP.
-        """
-        self._bench_step_supervised_tokens = num_label_tokens
-        if self._batch_flops_counter is None:
-            self._bench_all_token_head_tflops = self.tflops
-            self._bench_step_tokens = self.cfg.step_scheduler.global_batch_size * self._bench_seq_len
-            return
-        ignore_index = _get_loss_ignore_index(self.loss_fn)
-        counts = [self._batch_flops_counter(batch, ignore_index=ignore_index) for batch in batches]
-        totals = torch.tensor(
-            [
-                sum(count.flops for count in counts) / 1e12,
-                sum(count.all_token_head_flops for count in counts) / 1e12,
-                sum(count.num_tokens for count in counts),
-                sum(count.num_supervised_tokens for count in counts),
-            ],
-            dtype=torch.float64,
-            device=self.dist_env.device,
-        )
-        # Each CP rank and PP stage sees the same logical batch. Only DP owns
-        # additional independent examples; the numerator must count them once.
-        totals = self._dp_allreduce(totals, include_cp=False).tolist()
-        self.tflops, self._bench_all_token_head_tflops = totals[:2]
-        self._bench_step_tokens = int(totals[2])
-        if int(totals[3]) != num_label_tokens:
-            raise ValueError("Batch FLOPs supervision count disagrees with the native global loss count")
-
     def _log_iteration_metrics(self, iter_timer, ga_steps, peak_tflops, rank, iteration):
         max_iter_time = self.timers._get_global_min_max_time([iter_timer], reset=False, barrier=False, normalizer=1.0)[
             iter_timer
         ][1]
 
-        self._bench_iterations.append(
-            _IterationMetrics(
-                iteration,
-                max_iter_time,
-                self.tflops,
-                self._bench_all_token_head_tflops,
-                self._bench_step_tokens,
-                self._bench_step_supervised_tokens,
-            )
-        )
         if rank == 0:
             mfu = calculate_mfu(
                 self.tflops,
@@ -762,23 +491,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             )
             logger.info(f"Max iter time: {max_iter_time:.6f} seconds")
             logger.info(f"MFU: {mfu:.6f}% | FLOPs scope: {self._bench_flops_scope}")
-            if self._wandb_enabled and self.wandb_run is not None:
-                self.wandb_run.log(
-                    {
-                        "benchmark/mfu_percent": mfu,
-                        "benchmark/iteration_seconds": max_iter_time,
-                        "benchmark/tflops_per_step": self.tflops,
-                        "benchmark/all_token_head_mfu_percent": calculate_mfu(
-                            self._bench_all_token_head_tflops,
-                            self.dist_env.world_size,
-                            max_iter_time,
-                            reference_mfu=peak_tflops,
-                        ),
-                        "benchmark/valid_tokens": self._bench_step_tokens,
-                        "benchmark/supervised_tokens": self._bench_step_supervised_tokens,
-                    },
-                    step=iteration,
-                )
 
         # Log detailed timers
         timer_names = [iter_timer, "optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)]
@@ -810,62 +522,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             barrier=True,
         )
 
-    def _record_allocator_stats(self, *, step: int) -> None:
-        """Append this rank's counters after the native iteration timer stops.
-
-        ``benchmark.allocator_stats_path`` opts into one JSONL file per rank.
-        This reads public host counters without allocating CUDA tensors, changing
-        allocator policy, resetting statistics, or adding collectives. Missing
-        backend/version-specific counters are JSON null, never fabricated zeros.
-
-        Args:
-            step: Zero-based native optimizer iteration, including warmup.
-        """
-        if self._bench_allocator_stats_path is None:
-            return
-        stats = torch.cuda.memory_stats(self.dist_env.device)
-        record = _CudaAllocatorStats(
-            step=step,
-            rank=self.dist_env.rank,
-            timestamp_ns=time.time_ns(),
-            allocated_bytes=stats.get("allocated_bytes.all.current"),
-            peak_allocated_bytes=stats.get("allocated_bytes.all.peak"),
-            reserved_bytes=stats.get("reserved_bytes.all.current"),
-            peak_reserved_bytes=stats.get("reserved_bytes.all.peak"),
-            num_alloc_retries=stats.get("num_alloc_retries"),
-            num_ooms=stats.get("num_ooms"),
-            num_device_alloc=stats.get("num_device_alloc"),
-            num_device_free=stats.get("num_device_free"),
-            num_sync_all_streams=stats.get("num_sync_all_streams"),
-        )
-        directory = pathlib.Path(self._bench_allocator_stats_path)
-        directory.mkdir(parents=True, exist_ok=True)
-        with (directory / f"rank-{self.dist_env.rank}.jsonl").open("x" if step == 0 else "a") as stream:
-            stream.write(json.dumps(asdict(record)) + "\n")
-
-    def _collect_cuda_memory_peaks(self) -> list[_CudaMemoryPeak]:
-        """Collect allocator peaks after timing, before allocating collective buffers.
-
-        Parent setup resets the peak statistics before constructing the model.
-        Peaks include setup, warmup and measured iterations, with no benchmark reset.
-        CUDA allocations outside the PyTorch allocator are not represented.
-        Retry/OOM counters cover the process lifetime; resetting peak memory
-        statistics does not reset these accumulated counters.
-        """
-        allocated = torch.cuda.max_memory_allocated(self.dist_env.device)
-        reserved = torch.cuda.max_memory_reserved(self.dist_env.device)
-        stats = torch.cuda.memory_stats(self.dist_env.device)
-        local = torch.tensor(
-            [allocated, reserved, stats["num_alloc_retries"], stats["num_ooms"]],
-            dtype=torch.int64,
-            device=self.dist_env.device,
-        )
-        gathered = torch.empty(4 * self.dist_env.world_size, dtype=torch.int64, device=self.dist_env.device)
-        torch.distributed.all_gather_into_tensor(gathered, local)
-        return [_CudaMemoryPeak(rank, *peaks) for rank, peaks in enumerate(gathered.view(-1, 4).cpu().tolist())]
-
     def _log_benchmark_summary(self, steps, warmup_steps, peak_tflops, rank):
-        memory_peaks = self._collect_cuda_memory_peaks()
         torch.distributed.barrier()
         if rank == 0:
             logger.info(f"{'=' * 60}")
@@ -874,22 +531,21 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Get active times for summary
         setup_time = self.timers._timers["setup"].active_time() if "setup" in self.timers._timers else 0
-        measured = [item for item in self._bench_iterations if item.step >= warmup_steps]
-        if not measured:
-            raise ValueError("Benchmark needs at least one measured iteration after warmup")
-        iter_time = sum(item.seconds for item in measured)
-        warmup_time = sum(item.seconds for item in self._bench_iterations if item.step < warmup_steps)
-        measured_tflops = sum(item.tflops for item in measured)
-        all_token_head_tflops = sum(item.all_token_head_tflops for item in measured)
-        mean_step_tflops = measured_tflops / len(measured)
+        iter_time = self.timers._timers["iteration"].active_time() if "iteration" in self.timers._timers else 0
+        warmup_time = (
+            self.timers._timers["iteration_warmup"].active_time() if "iteration_warmup" in self.timers._timers else 0
+        )
 
         if rank == 0:
             logger.info(f"Total setup time: {setup_time:.2f} seconds")
             logger.info(f"Total warmup time ({warmup_steps} steps): {warmup_time:.2f} seconds")
             logger.info(f"Total iteration time ({steps - warmup_steps} steps): {iter_time:.2f} seconds")
 
-            # Aggregate useful work over the sum of per-step slowest-rank times.
-            avg_iter_time = iter_time / len(measured)
+            # Calculate average iteration time
+            if steps > warmup_steps:
+                avg_iter_time = iter_time / (steps - warmup_steps)
+            else:
+                avg_iter_time = iter_time / steps
 
             logger.info(
                 f"Average iteration time: {avg_iter_time:.3f} seconds"
@@ -900,7 +556,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 )
             )
 
-            mfu = calculate_mfu(measured_tflops, self.dist_env.world_size, iter_time, reference_mfu=peak_tflops)
+            mfu = calculate_mfu(self.tflops, self.dist_env.world_size, avg_iter_time, reference_mfu=peak_tflops)
             logger.info(
                 f"Average MFU: {mfu:.6f}% | FLOPs scope: {self._bench_flops_scope}"
                 + (
@@ -922,24 +578,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "avg_iter_time_seconds": avg_iter_time,
                 "avg_mfu_percent": mfu,
                 "flops_scope": self._bench_flops_scope,
-                "tflops_total": mean_step_tflops,
-                "tflops_per_gpu": mean_step_tflops / self.dist_env.world_size,
-                "all_token_head_mfu_percent": calculate_mfu(
-                    all_token_head_tflops,
-                    self.dist_env.world_size,
-                    iter_time,
-                    reference_mfu=peak_tflops,
-                ),
-                "flops_accounting": "actual_documents_supervised_head"
-                if self._batch_flops_counter is not None
-                else "shape_formula",
-                "timing_accounting": "sum_of_per_step_max_rank_seconds",
-                "iterations": [asdict(item) for item in self._bench_iterations],
-                "cuda_memory_peak_scope": "setup_warmup_and_measured_iterations_before_summary_collectives",
-                "cuda_memory_peaks": [asdict(item) for item in memory_peaks],
-                "cuda_allocator_counter_scope": "process_lifetime_before_summary_collectives",
-                "cuda_max_allocated_bytes": max(item.max_allocated_bytes for item in memory_peaks),
-                "cuda_max_reserved_bytes": max(item.max_reserved_bytes for item in memory_peaks),
+                "tflops_total": self.tflops,
+                "tflops_per_gpu": self.tflops / self.dist_env.world_size,
                 "peak_tflops": peak_tflops,
                 "world_size": self.dist_env.world_size,
                 "global_batch_size": self.cfg.step_scheduler.global_batch_size,
@@ -980,10 +620,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         "summary/avg_mfu_percent": mfu,
                         "summary/flops_scope": self._bench_flops_scope,
                         "summary/training_time_seconds": iter_time,
-                        "summary/tflops_total": mean_step_tflops,
-                        "summary/tflops_per_gpu": mean_step_tflops / self.dist_env.world_size,
-                        "summary/cuda_max_allocated_bytes": summary_data["cuda_max_allocated_bytes"],
-                        "summary/cuda_max_reserved_bytes": summary_data["cuda_max_reserved_bytes"],
+                        "summary/tflops_total": self.tflops,
+                        "summary/tflops_per_gpu": self.tflops / self.dist_env.world_size,
                     }
                 )
 

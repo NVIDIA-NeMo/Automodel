@@ -127,8 +127,7 @@ def test_b2_native_varlen_matches_independent_packed_forward_and_gradients(
             # softmax implementation can leave tiny nonzero dQ/dK residuals,
             # whereas a one-key probability is identically one.
             cpu_positions = torch.cat(
-                [torch.arange(n) for n in valid_lengths]
-                + [torch.zeros(keys - sum(valid_lengths), dtype=torch.long)]
+                [torch.arange(n) for n in valid_lengths] + [torch.zeros(keys - sum(valid_lengths), dtype=torch.long)]
             )
             cpu_padding = torch.arange(keys) >= sum(valid_lengths)
             cpu_documents = ((cpu_positions == 0) & ~cpu_padding).cumsum(0)
@@ -141,9 +140,7 @@ def test_b2_native_varlen_matches_independent_packed_forward_and_gradients(
             singleton = torch.nonzero(cpu_allowed[0]).item()
             assert torch.all(cpu_allowed[:, singleton])
             one_value = ref_v[row, singleton].repeat_interleave(heads // groups, dim=0)
-            reference_rows.append(
-                one_value[None].expand(queries, -1, -1) + (ref_q[row].sum() + ref_k[row].sum()) * 0
-            )
+            reference_rows.append(one_value[None].expand(queries, -1, -1) + (ref_q[row].sum() + ref_k[row].sum()) * 0)
         else:
             reference_rows.append(sdpa_reference[row])
     reference = torch.stack(reference_rows)
@@ -214,7 +211,7 @@ def test_b2_unproven_row_dispatches_only_the_existing_fallback(monkeypatch: pyte
     def forbidden_varlen() -> None:
         raise AssertionError("An unproven B2 row must not enter native varlen")
 
-    def existing_fallback(window: int | None, bitmap: bool, slots: int, provider_groups: int) -> None:
+    def existing_fallback(window: int | None, bitmap: bool, slots: int, provider_groups: int, **kwargs: int) -> None:
         raise FallbackObserved
 
     monkeypatch.setattr(fa4, "_load_fa4_varlen", forbidden_varlen)

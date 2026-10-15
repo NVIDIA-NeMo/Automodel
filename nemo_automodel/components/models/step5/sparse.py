@@ -58,24 +58,6 @@ class CausalDocumentLayout:
 
 
 @dataclass(frozen=True)
-class IndexedRegionLayout:
-    """Physical bounds shared across indexed CSA layers in one model call.
-
-    Attributes:
-        starts: Int32 tensor [batch, regions], first physical key in each region.
-            Missing regions use global_keys. Allocated independently of Q/K/V.
-        row_eligible: CPU dispatch decisions per batch row; empty preserves legacy batched dispatch.
-        ends: Int32 tensor [batch, regions], exclusive physical key endpoint.
-            Missing regions use zero. Trailing padding may span more than eight
-            physical keys, but contains no valid key beyond the first eight.
-    """
-
-    starts: torch.Tensor
-    ends: torch.Tensor
-    row_eligible: tuple[bool, ...] = ()
-
-
-@dataclass(frozen=True)
 class RegionSelection:
     """Sparse selection tensors, all local to one CP rank's queries.
 
@@ -92,8 +74,6 @@ class RegionSelection:
             single-batch shards with contiguous document positions.
         causal_batch_layouts: Proven prefix or all-padding layout for both rows
             of a fully selected B2 shard; None if either row needs the fallback.
-        causal_row_layouts: Independent per-row prefix proofs for opt-in mixed B2 dispatch.
-        indexed_layout: Optional physical region bounds for long sparse shards.
         forward_full_block_prefix: Number of initial queries proven to select
             every causal key in one unpadded global B1 document, with CP1 and
             canonical positions starting at zero. Zero disables the proof.
@@ -114,9 +94,7 @@ class RegionSelection:
     all_regions_selected: bool = False
     causal_layout: CausalDocumentLayout | None = None
     all_padding_key: int | None = None
-    indexed_layout: IndexedRegionLayout | None = None
     causal_batch_layouts: tuple[CausalDocumentLayout, ...] | None = None
-    causal_row_layouts: tuple[CausalDocumentLayout | None, ...] = ()
     forward_full_block_prefix: int = 0
     backward_full_block_prefix: int = 0
     canonical_region_size: int = 0
@@ -154,8 +132,6 @@ class RegionMetadata:
             preceding keys. Independent of whether CSA selection is sparse.
         causal_batch_layouts: Prefix or all-padding layouts when both B2 rows
             satisfy native causal attention semantics.
-        causal_row_layouts: Independent per-row prefix proofs for opt-in mixed B2 dispatch.
-        indexed_layout: Optional shared physical bounds for indexed attention.
         forward_full_block_prefix: Initial all-selected query count for opt-in
             forward full blocks, proven only for unpadded B1 CP1 inputs with
             positions exactly equal to global token indices. Zero is fallback.
@@ -185,9 +161,7 @@ class RegionMetadata:
     region_sources: torch.Tensor | None = None
     region_source_valid: torch.Tensor | None = None
     all_padding_key: int | None = None
-    indexed_layout: IndexedRegionLayout | None = None
     causal_batch_layouts: tuple[CausalDocumentLayout, ...] | None = None
-    causal_row_layouts: tuple[CausalDocumentLayout | None, ...] = ()
     forward_full_block_prefix: int = 0
     backward_full_block_prefix: int = 0
     canonical_region_size: int = 0
@@ -232,7 +206,6 @@ def region_metadata(
     region_size: int,
     topk: int,
     window: int | None = None,
-    indexed_csa: bool = False,
     csa_forward_full_blocks: bool = False,
     csa_backward_full_blocks: bool = False,
 ) -> RegionMetadata:
@@ -245,9 +218,6 @@ def region_metadata(
         queries: Number of local queries.
         region_size: Tokens per region, reset at every document boundary.
         topk: Maximum number of selected historical regions.
-        indexed_csa: Preserve independent B2 prefix proofs; prepare physical
-            bounds only for regular sparse shards whose query-weighted
-            historical region span reaches 32K tokens.
         csa_forward_full_blocks: Retain a single-document CP1 proof for FA4
             forward mask skipping, using this call's existing host metadata.
         csa_backward_full_blocks: Retain the same proof independently for
@@ -386,31 +356,8 @@ def region_metadata(
         region_sources.view(batch, -1).scatter_(1, slots, source_tokens)
         source_padding = key_padding.gather(1, region_sources.long().clamp_min(0).view(batch, -1))
         region_source_valid = (region_sources >= 0) & ~source_padding.view_as(region_sources)
-    indexed_layout = None
-    row_history = [0] * batch
-    if indexed_csa:
-        for row, start, stop, region_first, region_last in score_tiles:
-            row_history[row] += (stop - start) * (region_last - region_first) * region_size
-    row_eligible = tuple(work >= 32768 * queries for work in row_history)
-    if (
-        indexed_csa
-        and score_tiles
-        and bool(layout[-1])
-        and region_size == 8
-        and (any(row_eligible) if batch == 2 else sum(row_history) >= 32768 * batch * queries)
-    ):
-        # One integer map per model call, shared by every local CSA layer.
-        # Unlike compression slots, physical bounds cannot lose a document's
-        # first valid key when trailing padding also has position zero.
-        region_starts = torch.full((batch, region_count), keys, device=key_positions.device, dtype=torch.int32)
-        region_ends = torch.zeros_like(region_starts)
-        physical_indices = torch.arange(keys, device=key_positions.device, dtype=torch.int32).expand(batch, -1)
-        region_starts.scatter_reduce_(1, token_regions, physical_indices, reduce="amin")
-        region_ends.scatter_reduce_(1, token_regions, physical_indices + 1, reduce="amax")
-        indexed_layout = IndexedRegionLayout(region_starts, region_ends, row_eligible if batch == 2 else ())
     causal_layout = None
     causal_batch_layouts = None
-    causal_row_layouts = ()
     window_layout = None
     prefix_offset = 2 + 2 * batch * tiles_per_batch
     forward_full_block_prefix = 0
@@ -470,8 +417,6 @@ def region_metadata(
                 )
             else:
                 row_layouts.append(None)
-        if indexed_csa and batch == 2:
-            causal_row_layouts = tuple(row_layouts)
         if batch == 1 and row_layouts:
             causal_layout = row_layouts[0]
         elif batch == 2 and all(row is not None for row in row_layouts):
@@ -524,9 +469,7 @@ def region_metadata(
         region_sources,
         region_source_valid,
         all_padding_key,
-        indexed_layout,
         causal_batch_layouts,
-        causal_row_layouts,
         forward_full_block_prefix,
         backward_full_block_prefix,
         canonical_region_size,
@@ -744,24 +687,7 @@ class Step5SparseIndexer(nn.Module):
             metadata.query_documents,
             metadata.documents,
             region_count,
-            indexed_layout=metadata.indexed_layout,
-            causal_row_layouts=metadata.causal_row_layouts,
             forward_full_block_prefix=metadata.forward_full_block_prefix,
             backward_full_block_prefix=metadata.backward_full_block_prefix,
             canonical_region_size=metadata.canonical_region_size,
         )
-
-
-def freeze_step5_indexer_params(model: nn.Module) -> None:
-    """Preserve the discrete selector's frozen state after model surgery.
-
-    PEFT injection and user trainability policies may introduce or re-enable
-    parameters below an indexer. Its projections still execute without a
-    differentiable loss, so those parameters must remain outside the optimizer.
-
-    Args:
-        model: Model or pipeline part whose current parameters are being bound.
-    """
-    for module in model.modules():
-        if isinstance(module, Step5SparseIndexer):
-            module.requires_grad_(False)

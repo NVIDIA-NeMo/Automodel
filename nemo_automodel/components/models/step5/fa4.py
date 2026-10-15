@@ -629,48 +629,6 @@ def fa4_attention(
             )
         ]
         return torch.stack(outputs, dim=0)
-    if (
-        capability == (9, 0)
-        and dim == 192
-        and query.shape[0] == 2
-        and window is None
-        and selection is not None
-        and not selection.all_regions_selected
-        and len(selection.causal_row_layouts) == 2
-        and sum(proof is not None for proof in selection.causal_row_layouts) == 1
-    ):
-        # The opt-in row proofs also apply below the CSR dispatch threshold.
-        # Split before provider folding: B1 folds are views, while folding B2
-        # copies the full Q/K/V buffers. Unbind once keeps one batch backward.
-        outputs = []
-        for row, (q, k, v, proof) in enumerate(
-            zip(query.unbind(0), key.unbind(0), value.unbind(0), selection.causal_row_layouts, strict=True)
-        ):
-            row_selection = RegionSelection(
-                selection.region_ids[row : row + 1],
-                selection.token_regions[row : row + 1],
-                selection.query_documents[row : row + 1],
-                selection.key_documents[row : row + 1],
-                selection.region_count,
-                all_regions_selected=proof is not None,
-                causal_layout=proof if proof is not None and proof.valid_queries else None,
-                all_padding_key=proof.padding_key if proof is not None and not proof.valid_queries else None,
-            )
-            outputs.append(
-                fa4_attention(
-                    q[None],
-                    k[None],
-                    v[None],
-                    positions[row : row + 1],
-                    key_positions[row : row + 1],
-                    key_padding[row : row + 1],
-                    documents[row : row + 1],
-                    query_start=query_start,
-                    window=None,
-                    selection=row_selection,
-                ).squeeze(0)
-            )
-        return torch.stack(outputs, dim=0)
     bitmap = False
     slots = 0
     regions = 0 if selection is None else selection.region_count

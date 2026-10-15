@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optional Step-5 kernel and distributed memory choices."""
+"""Optional Step-5 kernel choices."""
 
 from dataclasses import dataclass
 
@@ -24,9 +24,6 @@ class Step5BackendConfig(BackendConfig):
     """Model-owned execution options, disabled by default.
 
     Attributes:
-        indexed_csa: Use native-D192 region-indexed attention on SM90 for
-            genuinely sparse shards with at least 32K effective history.
-            Shorter or irregular shards retain FA4. Requires attn="fa4".
         csa_forward_full_blocks: Skip custom masks on proven fully selected
             forward blocks for single-document, unpadded B1 CP1 inputs on SM90
             with head dimension 192. Backward block lists stay unchanged.
@@ -37,26 +34,14 @@ class Step5BackendConfig(BackendConfig):
         swa_varlen: Use native FA4 window attention for valid single-batch
             SM90 D192 query prefixes. Padding keeps its custom-mask path.
             Requires enabled sparse metadata; communication is unchanged.
-        bf16_fsdp_retention_mib_per_part: Maximum padded unsharded parameter
-            payload retained until backward in each local pipeline part, in
-            MiB. Zero disables retention. With two local parts the combined
-            bound is twice this value. Embeddings, heads, routed experts and
-            FP32 groups retain their configured policy. This bounds weights,
-            not total CUDA memory, activations or collective workspaces.
     """
 
-    indexed_csa: bool = False
     csa_forward_full_blocks: bool = False
     csa_backward_full_blocks: bool = False
     swa_varlen: bool = False
-    bf16_fsdp_retention_mib_per_part: int = 0
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if not isinstance(self.indexed_csa, bool):
-            raise TypeError("indexed_csa must be a bool")
-        if self.indexed_csa and self.attn != "fa4":
-            raise ValueError("indexed_csa requires attn=fa4")
         if not isinstance(self.csa_forward_full_blocks, bool):
             raise TypeError("csa_forward_full_blocks must be a bool")
         if self.csa_forward_full_blocks and self.attn != "fa4":
@@ -67,9 +52,3 @@ class Step5BackendConfig(BackendConfig):
             raise ValueError("csa_backward_full_blocks requires attn=fa4")
         if not isinstance(self.swa_varlen, bool):
             raise TypeError("swa_varlen must be a bool")
-        if isinstance(self.bf16_fsdp_retention_mib_per_part, bool) or not isinstance(
-            self.bf16_fsdp_retention_mib_per_part, int
-        ):
-            raise TypeError("bf16_fsdp_retention_mib_per_part must be an int")
-        if self.bf16_fsdp_retention_mib_per_part < 0:
-            raise ValueError("bf16_fsdp_retention_mib_per_part must be nonnegative")

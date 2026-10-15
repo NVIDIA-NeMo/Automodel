@@ -14,15 +14,10 @@
 
 """Regression coverage for the immutable discrete selector training contract."""
 
-import pytest
 import torch
-from torch import nn
 
-from nemo_automodel._transformers.infrastructure import _apply_trainability_policy
-from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
 from nemo_automodel.components.optim.optimizer import _trainable_params_or_groups
-from nemo_automodel.components.utils.model_utils import parse_freeze_config
 from tests.unit_tests.models.step5.test_model import make_model
 
 
@@ -61,47 +56,6 @@ def test_optimizer_exclusion_preserves_indexer_even_with_materialized_zero_gradi
                 assert torch.equal(parameter, initial[name]), name
                 assert parameter not in optimizer.state
     assert not torch.equal(model.model.layers["3"].moe.gate.weight, initial["model.layers.3.moe.gate.weight"])
-
-
-@pytest.mark.parametrize("explicit_unfreeze", [False, True])
-def test_native_trainability_policy_freezes_real_indexer_lora_after_injection(explicit_unfreeze):
-    model = make_model()
-    peft = PeftConfig(
-        target_modules=["*q_proj", "*k_proj", "*w_proj", "*o_proj"],
-        dim=2,
-        alpha=2,
-        use_triton=False,
-        use_memory_efficient_lora=False,
-    )
-    assert apply_lora_to_linear_modules(model, peft, skip_freeze=True) > 0
-    original = {name: (value.dtype, value.detach().clone()) for name, value in model.state_dict().items()}
-    indexer = model.model.layers["3"].self_attn.indexer
-    assert any("lora_" in name and parameter.requires_grad for name, parameter in indexer.named_parameters())
-    freeze = parse_freeze_config({"unfreeze_modules": [{"glob": "*.indexer*"}]}) if explicit_unfreeze else None
-    _apply_trainability_policy(model, peft_enabled=True, freeze_config=freeze, strict=True)
-    assert all(not parameter.requires_grad for parameter in indexer.parameters())
-    assert any(
-        "lora_" in name and parameter.requires_grad
-        for name, parameter in model.named_parameters()
-        if ".indexer." not in name
-    )
-    assert model.state_dict().keys() == original.keys()
-    for name, value in model.state_dict().items():
-        assert value.dtype == original[name][0], name
-        assert torch.equal(value, original[name][1]), name
-
-
-def test_policy_rebinds_replaced_parameters_without_changing_checkpoint_values():
-    model = make_model()
-    indexer = model.model.layers["3"].self_attn.indexer
-    initial = {name: value.detach().clone() for name, value in model.state_dict().items()}
-    indexer.q_proj.weight = nn.Parameter(indexer.q_proj.weight.detach().clone())
-    indexer.q_norm.weight = nn.Parameter(indexer.q_norm.weight.detach().clone())
-    assert indexer.q_proj.weight.requires_grad and indexer.q_norm.weight.requires_grad
-    _apply_trainability_policy(model, peft_enabled=False, freeze_config=None, strict=False)
-    assert all(not parameter.requires_grad for parameter in indexer.parameters())
-    assert model.state_dict().keys() == initial.keys()
-    assert all(torch.equal(value, initial[name]) for name, value in model.state_dict().items())
 
 
 def test_frozen_cast_keeps_strict_indexer_fp32_values_and_rotary_contract():

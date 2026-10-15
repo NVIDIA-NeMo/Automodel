@@ -14,8 +14,6 @@
 
 """Native Step-5 Preview text and vision-language training models."""
 
-from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 
@@ -30,7 +28,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
-    ShardLayout,
     contiguous_local_indices,
     shard_batch_contiguous,
 )
@@ -47,7 +44,6 @@ from nemo_automodel.components.models.step5.configuration import ConfigValue, St
 from nemo_automodel.components.models.step5.cp import gather_metadata
 from nemo_automodel.components.models.step5.layers import Step5DecoderLayer
 from nemo_automodel.components.models.step5.norm import Step5RMSNorm
-from nemo_automodel.components.models.step5.parallelizer import Step5Parallelizer
 from nemo_automodel.components.models.step5.sparse import region_metadata
 from nemo_automodel.components.models.step5.state_dict_adapter import Step5StateDictAdapter
 from nemo_automodel.components.models.step5.vision import Step5VisionEncoder
@@ -64,7 +60,6 @@ class Step5TextModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.indexed_csa = isinstance(backend, Step5BackendConfig) and backend.indexed_csa
         self.csa_forward_full_blocks = isinstance(backend, Step5BackendConfig) and backend.csa_forward_full_blocks
         self.csa_backward_full_blocks = isinstance(backend, Step5BackendConfig) and backend.csa_backward_full_blocks
         self.swa_varlen = isinstance(backend, Step5BackendConfig) and backend.swa_varlen and backend.attn == "fa4"
@@ -132,7 +127,6 @@ class Step5TextModel(nn.Module):
                 region_size=self.config.sparse_config.region_block_size,
                 topk=self.config.sparse_config.topk,
                 window=self.config.sliding_window if self.swa_varlen else None,
-                indexed_csa=self.indexed_csa,
                 csa_forward_full_blocks=self.csa_forward_full_blocks,
                 csa_backward_full_blocks=self.csa_backward_full_blocks,
             )
@@ -155,7 +149,6 @@ class Step5TextModel(nn.Module):
 class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
     """Step-5 causal LM with native grouped experts and model-owned CP."""
 
-    parallelizer: Step5Parallelizer = Step5Parallelizer()
     config_class = Step5Config
     base_model_prefix = "model"
     _pp_keep_self_forward: bool = True

@@ -15,11 +15,10 @@
 """Independent operation-count and packed-boundary checks for Step-5 MFU."""
 
 import pytest
-import torch
 
 from nemo_automodel.components.models.step5.configuration import Step5Config
-from nemo_automodel.components.models.step5.flops import step5_batch_flops, step5_flops
-from nemo_automodel.components.utils.flops_utils import get_batch_flops_counter, get_flops_formula_for_hf_config
+from nemo_automodel.components.models.step5.flops import step5_flops
+from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config
 
 
 def _config(*, sparse_enabled: bool = True) -> Step5Config:
@@ -109,51 +108,8 @@ def test_shape_formula_matches_independently_enumerated_operations(length: int, 
     assert step5_flops(cfg, gbs=3, seq_len=length) == 3 * _enumerated_flops(cfg, length, length)
 
 
-def test_registry_uses_the_model_owned_formula_and_batch_counter() -> None:
-    cfg = _config()
-    assert get_flops_formula_for_hf_config(cfg) is step5_flops
-    counter = get_batch_flops_counter(cfg)
-    assert counter is not None
-    batch = {"input_ids": torch.zeros(1, 7, dtype=torch.long), "labels": torch.zeros(1, 7, dtype=torch.long)}
-    assert counter(batch, ignore_index=-100).flops == _enumerated_flops(cfg, 7, 7)
-
-
-def test_packed_documents_and_supervised_head_ignore_physical_padding() -> None:
-    cfg = _config()
-    positions = torch.tensor([[0, 1, 2, 0, 0, 1, 2, 3, 4, 5, 6], [0, 1, 0, 1, 2, 3, 4, 0, 0, 0, 0]])
-    valid = torch.tensor([[1, 1, 1, 0, 2, 2, 2, 2, 2, 2, 2], [1, 1, 2, 2, 2, 2, 2, 0, 0, 0, 0]])
-    labels = torch.tensor([[1, -100, 2, -100, 1, -7, 2, 1, 2, 1, 1], [1, -7, 2, 1, -100, 2, 1, -100, -100, -100, -100]])
-    batch = {
-        "input_ids": torch.zeros_like(positions),
-        "labels": labels,
-        "position_ids": positions,
-        "attention_mask": valid,
-    }
-    originals = {name: tensor.clone() for name, tensor in batch.items()}
-    result = step5_batch_flops(cfg, batch, ignore_index=-7)
-    assert result.num_tokens == 17
-    assert result.num_supervised_tokens == 13
-    expected = sum(_enumerated_flops(cfg, length, length) for length in [3, 7, 2, 5])
-    assert result.all_token_head_flops == expected
-    assert result.flops == expected - 6 * 4 * cfg.hidden_size * cfg.vocab_size
-    assert result.all_token_head_flops < step5_flops(cfg, seq_len=17)
-    for name, tensor in batch.items():
-        torch.testing.assert_close(tensor, originals[name])
-
-
-def test_counter_rejects_post_cp_fragments_and_supervised_padding() -> None:
-    cfg = _config()
-    batch = {
-        "input_ids": torch.zeros(1, 3, dtype=torch.long),
-        "labels": torch.zeros(1, 3, dtype=torch.long),
-        "position_ids": torch.tensor([[8, 9, 10]]),
-    }
-    with pytest.raises(ValueError, match="before context-parallel"):
-        step5_batch_flops(cfg, batch, ignore_index=-100)
-    batch["position_ids"] = torch.tensor([[0, 1, 2]])
-    batch["attention_mask"] = torch.tensor([[1, 1, 0]])
-    with pytest.raises(ValueError, match="padding"):
-        step5_batch_flops(cfg, batch, ignore_index=-100)
+def test_registry_uses_the_model_owned_formula() -> None:
+    assert get_flops_formula_for_hf_config(_config()) is step5_flops
 
 
 def test_full_checkpoint_geometry_long_single_document_count() -> None:
