@@ -152,6 +152,7 @@ def mock_recipe(mock_config, monkeypatch):
         recipe._bench_json_output_path = None
         recipe._wandb_enabled = False
         recipe.wandb_run = None
+        recipe.trackio_logger = None
         recipe.partial_cuda_graph_manager = None
         recipe._partial_cuda_graph_capture_pending = False
         recipe.step_scheduler = SimpleNamespace(step=0, gc_every_steps=None)

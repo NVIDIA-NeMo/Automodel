@@ -152,19 +152,9 @@ jobs:
             test -z "$(find "pr-source/$ROOT" -type l -print -quit)"
             mkdir -p "$RUNNER_TEMP/fern-preview/$(dirname "$ROOT")"
             cp -R "trusted-source/$ROOT" "$RUNNER_TEMP/fern-preview/$ROOT"
-            # Keep newer main pages as fallbacks, but honor explicit PR deletions.
-            BASE=$(git -C pr-source merge-base HEAD refs/remotes/origin/main)
-            git -C pr-source diff --no-renames --diff-filter=D --name-only -z \
-              "$BASE" HEAD -- "$ROOT/" > "$RUNNER_TEMP/fern-deleted-paths"
-            while IFS= read -r -d '' path; do
-              case "$path" in
-                */.*|*/components/*) continue ;;
-              esac
-              case "$path" in
-                *.md|*.mdx|*.png|*.jpg|*.jpeg|*.gif|*.svg|*.webp|*.ico|*.pdf)
-                  rm -f -- "$RUNNER_TEMP/fern-preview/$path" ;;
-              esac
-            done < "$RUNNER_TEMP/fern-deleted-paths"
+            # Navigation stays on main, so retain its pages and assets when the
+            # PR moves or deletes them. Overlay PR content without removing
+            # fallbacks that trusted navigation or retained pages still reference.
             # Navigation, components and tooling stay on the trusted branch.
             (cd pr-source && find "$ROOT" -regextype posix-extended -type f \
               -regex "$CONTENT" ! -path '*/.*' ! -path '*/components/*' \
