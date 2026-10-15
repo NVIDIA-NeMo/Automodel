@@ -181,7 +181,7 @@ lr_scheduler:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   backend:
-    _target_: nemo_automodel.components.models.step5.backend.Step5BackendConfig
+    _target_: nemo_automodel.components.models.step5.configuration.Step5BackendConfig
     attn: fa4
     benchmark_static_routing: true
     compile_norm: true

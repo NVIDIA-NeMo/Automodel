@@ -21,8 +21,7 @@ from typing import NamedTuple
 import torch
 from torch.nn import functional as F
 
-from nemo_automodel.components.models.step5.kernels import pack_region_bitmap
-from nemo_automodel.components.models.step5.sparse import CausalDocumentLayout, RegionSelection
+from nemo_automodel.components.models.step5.sparse import CausalDocumentLayout, RegionSelection, pack_region_bitmap
 from nemo_automodel.shared.import_utils import safe_import
 
 

@@ -22,7 +22,7 @@ import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.step5 import fa4, sparse
-from nemo_automodel.components.models.step5.backend import Step5BackendConfig
+from nemo_automodel.components.models.step5.configuration import Step5BackendConfig
 from nemo_automodel.components.models.step5.fa4 import (
     _all_padding_attention,
     _BackwardBlockPartition,
@@ -30,7 +30,6 @@ from nemo_automodel.components.models.step5.fa4 import (
     _split_backward_full_blocks,
     _split_forward_full_blocks,
 )
-from nemo_automodel.components.models.step5.kernels import gather_region_payload
 from nemo_automodel.components.models.step5.model import Step5ForCausalLM
 from nemo_automodel.components.models.step5.sparse import (
     CausalDocumentLayout,
@@ -38,6 +37,7 @@ from nemo_automodel.components.models.step5.sparse import (
     Step5SparseIndexer,
     _summarize_region_payload,
     _summary_ranges,
+    gather_region_payload,
     region_metadata,
 )
 from tests.unit_tests.models.step5.test_model import tiny_config

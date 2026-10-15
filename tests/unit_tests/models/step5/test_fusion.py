@@ -24,10 +24,9 @@ from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
-from nemo_automodel.components.models.step5 import norm as norm_module
+from nemo_automodel.components.models.step5 import layers as layers_module
 from nemo_automodel.components.models.step5.configuration import Step5Config
-from nemo_automodel.components.models.step5.layers import Step5Attention
-from nemo_automodel.components.models.step5.norm import Step5RMSNorm
+from nemo_automodel.components.models.step5.layers import Step5Attention, Step5RMSNorm
 from nemo_automodel.components.models.step5.rope import Step5RotaryEmbedding
 
 
@@ -336,7 +335,7 @@ def test_compiled_query_entry_keeps_group_stride_without_materialization(
             (*hidden.shape[:-1], 1)
         )
 
-    monkeypatch.setattr(norm_module, "_grouped_rms_norm", compiled_entry)
+    monkeypatch.setattr(layers_module, "_grouped_rms_norm", compiled_entry)
     with FakeTensorMode(), torch.device("cuda"):
         module = Step5RMSNorm(192, compile_norm=True)
         projection = torch.empty(2, 7, 4, 18, 192, dtype=dtype)

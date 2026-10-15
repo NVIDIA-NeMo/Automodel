@@ -35,10 +35,9 @@ from nemo_automodel._transformers.infrastructure import _apply_trainability_poli
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 from nemo_automodel.components.models.step5 import fa4
-from nemo_automodel.components.models.step5.attention import fused_attention
 from nemo_automodel.components.models.step5.configuration import Step5Config
 from nemo_automodel.components.models.step5.fa4 import _region_tiles, fa4_attention
-from nemo_automodel.components.models.step5.norm import Step5RMSNorm
+from nemo_automodel.components.models.step5.layers import Step5RMSNorm, fused_attention
 from nemo_automodel.components.models.step5.rope import Step5RotaryEmbedding
 from nemo_automodel.components.models.step5.sparse import RegionSelection, Step5SparseIndexer, region_metadata
 from nemo_automodel.components.optim.optimizer import _trainable_params_or_groups
@@ -120,7 +119,7 @@ def test_fused_attention_matches_independent_mask_and_gradients(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_indexer_scores_and_region_bitmap() -> None:
     """Check actual kernels against independent FP32 math and set membership."""
-    from nemo_automodel.components.models.step5.kernels import indexer_score_tile, pack_region_bitmap
+    from nemo_automodel.components.models.step5.sparse import indexer_score_tile, pack_region_bitmap
 
     torch.manual_seed(515)
     query = torch.randn(2, 173, 4, 4, 256, device="cuda").to(torch.float8_e4m3fn).to(torch.bfloat16)
@@ -1535,7 +1534,7 @@ def test_region_tiles_reuse_graph_across_packed_region_counts(queries: int) -> N
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_region_bitmap_reuses_kernel_across_region_counts() -> None:
     """Changing packed region counts must not specialize the bitmap packer."""
-    from nemo_automodel.components.models.step5.kernels import _pack_regions, pack_region_bitmap
+    from nemo_automodel.components.models.step5.sparse import _pack_regions, pack_region_bitmap
 
     generator = torch.Generator().manual_seed(829)
     first_kernels = None

@@ -36,7 +36,7 @@ from nemo_automodel.components.distributed.model_parallelizer import get_model_p
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.packing import PackingCapabilities, configure_packing_for_models
 from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype, cast_model_to_dtype
-from nemo_automodel.components.models.step5 import fsdp as step5_fsdp
+from nemo_automodel.components.models.step5 import model as model_module
 from nemo_automodel.components.models.step5.configuration import ConfigValue, Step5Config, Step5VLConfig
 from nemo_automodel.components.models.step5.flops import step5_flops
 from nemo_automodel.components.models.step5.layers import region_replay
@@ -693,7 +693,7 @@ def _record_sharding(
         module.__class__ = type(f"TestFSDP{type(module).__name__}", (FSDPModule, type(module)), {})
         return module
 
-    for target in (parallelizer_utils, moe_parallelizer, step5_fsdp):
+    for target in (parallelizer_utils, moe_parallelizer, model_module):
         monkeypatch.setattr(target, "fully_shard", shard)
     monkeypatch.setattr(moe_parallelizer, "_patch_fsdp_accumulated_grad_guard", lambda: None)
     monkeypatch.setattr(moe_parallelizer, "_patch_fsdp_uniform_reduce_dtype", lambda: None)
@@ -703,8 +703,8 @@ def _record_sharding(
 
 
 def test_step5_uses_model_owned_parallelizer():
-    assert Step5ForCausalLM.parallelizer is step5_fsdp.PARALLELIZER
-    assert get_model_parallelizer(make_model()) is step5_fsdp.PARALLELIZER
+    assert Step5ForCausalLM.parallelizer is model_module.PARALLELIZER
+    assert get_model_parallelizer(make_model()) is model_module.PARALLELIZER
 
 
 @pytest.mark.parametrize("model_owned", [False, True])
@@ -721,7 +721,7 @@ def test_final_norm_computes_in_fp32_only_with_step5_parallelizer(monkeypatch, m
         ep_shard_enabled=False,
         mp_policy=policy,
         reshard_after_forward=True,
-        model_parallelizer=step5_fsdp.PARALLELIZER if model_owned else None,
+        model_parallelizer=model_module.PARALLELIZER if model_owned else None,
     )
     owners = [(module, mp) for module, params, mp in calls if norm_weight in params]
     assert len(owners) == 1
@@ -739,7 +739,7 @@ def test_pipeline_stage_without_final_norm_wraps_root_once(monkeypatch):
     model = make_model()
     model.model.norm = None
     calls = _record_sharding(monkeypatch)
-    step5_fsdp.PARALLELIZER._fully_shard_module(
+    model_module.PARALLELIZER._fully_shard_module(
         model.model, mesh=object(), mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16)
     )
     assert [module for module, _, _ in calls] == [model.model]
@@ -749,7 +749,7 @@ def test_outer_root_wraps_contained_final_norm_once(monkeypatch):
     model = make_model()
     calls = _record_sharding(monkeypatch)
     policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
-    step5_fsdp.PARALLELIZER._fully_shard_module(model, mesh=object(), mp_policy=policy)
+    model_module.PARALLELIZER._fully_shard_module(model, mesh=object(), mp_policy=policy)
     assert [module for module, _, _ in calls] == [model.model.norm, model]
     assert calls[0][2].param_dtype is torch.float32
     assert model.model.norm.weight not in calls[1][1]

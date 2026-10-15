@@ -16,7 +16,7 @@
 
 The released primary decoder has 92 layers; the perception encoder has 47.
 Checkpoint FP8 expert tensors are dequantized into the selected training dtype.
-MTP auxiliary layers, incremental KV-cache generation, TP, and PP are excluded.
+MTP auxiliary layers, incremental KV-cache generation, and TP are excluded.
 
 The default CUDA attention backend is FA4 on SM90, with native 192-dimensional
 heads. It requires flash-attention revision 3c2c6b31e730fd13e7d6f0d384af22684b24c532
@@ -30,5 +30,5 @@ alignment. CSA gathers original K/V and indexer K/Z; attention backward
 reduce-scatters K/V gradients. Packed documents use resetting position IDs.
 
 Validation entry points live in tests/functional_tests/models/step5 and
-tests/functional_tests/context_parallel/run_step5_{cp,halo}.py.
+tests/functional_tests/context_parallel/run_step5_cp.py.
 """

@@ -41,8 +41,7 @@ from typing_extensions import NotRequired
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.step5.backend import Step5BackendConfig
-from nemo_automodel.components.models.step5.configuration import Step5Config
+from nemo_automodel.components.models.step5.configuration import Step5BackendConfig, Step5Config
 from nemo_automodel.components.models.step5.cp import gather_halo
 from nemo_automodel.components.models.step5.layers import Step5Attention
 from nemo_automodel.components.models.step5.model import Step5ForCausalLM
