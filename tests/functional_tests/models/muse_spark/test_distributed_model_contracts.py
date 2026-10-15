@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Muse PP residual precision over real NCCL sends, receives, and backward."""
+"""Two-GPU distributed model contracts for Muse Spark Open."""
 
 import copy
 import socket
@@ -11,12 +11,61 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch import nn
-
+from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
+from nemo_automodel.components.moe.parallelizer import apply_fsdp
 from tests.unit_tests.models.muse_spark.conftest import tiny_muse_spark_model
+from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
 
 
-def _worker(rank: int, port: int) -> None:
+def _padding_worker(rank: int, port: int) -> None:
+    """Check local padding, CP-added padding, and independent PP microbatch rows."""
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=120),
+    )
+    try:
+        mesh = init_device_mesh("cuda", (2,), mesh_dim_names=("cp",))
+        model = tiny_muse_spark_model()
+        model.cp_mesh = mesh["cp"]
+        tokens = torch.arange(10, device=rank).expand(2, -1).clone()
+        valid = torch.arange(10, device=rank).unsqueeze(0) < torch.tensor([[3], [7]], device=rank)
+        batch = {"input_ids": tokens, "labels": tokens.clone(), "attention_mask": valid}
+        sharder = ContextParallelSharder(model, mesh, batch, num_chunks=2)
+        train_context, batch = sharder.shard(batch)
+        expected_indices = torch.tensor([0, 1, 2, 9, 10, 11] if rank == 0 else [3, 4, 5, 6, 7, 8], device=rank)
+        expected_padding = torch.nn.functional.pad(~valid, (0, 2), value=True)[:, expected_indices]
+        with train_context():
+            assert "attention_mask" not in batch
+            assert batch["input_ids"].shape == (2, 10)
+            assert batch["labels"].shape == batch["padding_mask"].shape == (2, 6)
+            torch.testing.assert_close(batch["padding_mask"], expected_padding)
+            # A PP schedule chunks only the batch dimension. One CP rank's first
+            # microbatch is entirely padding; it must retain that local mask.
+            for row, local_mask in enumerate(batch["padding_mask"].chunk(2, dim=0)):
+                torch.testing.assert_close(local_mask, expected_padding[row : row + 1])
+            valid_count = (~batch["padding_mask"]).sum()
+            dist.all_reduce(valid_count)
+            assert int(valid_count) == int(valid.sum())
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
+def test_cp_padding_matches_local_tokens_and_pipeline_chunks() -> None:
+    """Padding survives attention-mask removal and follows CP then PP partitioning."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_padding_worker, args=(port,), nprocs=2, join=True)
+
+
+def _pipeline_residual_worker(rank: int, port: int) -> None:
     """Compare a two-stage four-layer model with its unpartitioned reference."""
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -117,4 +166,43 @@ def test_fp32_pipeline_residual_values_and_gradients() -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=2, join=True)
+    mp.spawn(_pipeline_residual_worker, args=(port,), nprocs=2, join=True)
+
+
+def _router_checkpoint_worker(rank: int, port: int) -> None:
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=180),
+    )
+    try:
+        model = tiny_muse_spark_model().to(device=rank)
+        mesh = init_device_mesh("cuda", (2,), mesh_dim_names=("dp",))
+        apply_fsdp(model, mesh, ep_enabled=False, ep_shard_enabled=False, reshard_after_forward=True)
+        model.initialize_weights(torch.device("cuda", rank), dtype=torch.bfloat16)
+        for layer in model.model.layers:
+            gate = layer.feed_forward.gate
+            assert gate.weight.dtype == torch.float32
+            assert gate.weight.to_local().dtype == torch.float32
+            assert gate.e_score_correction_bias.dtype == torch.float32
+            # DCP copies checkpoint values into these existing local destinations.
+            # A BF16 destination would silently round this value to exactly 1.
+            with torch.no_grad():
+                gate.weight.to_local().fill_(1.0001)
+            expected = torch.full(gate.weight.shape, 1.0001, device=rank)
+            torch.testing.assert_close(gate.weight.full_tensor(), expected, rtol=0, atol=0)
+            assert layer.self_attn.q_proj.weight.dtype == torch.bfloat16
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
+def test_router_fp32_survives_sharded_initialization() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_router_checkpoint_worker, args=(port,), nprocs=2, join=True)
