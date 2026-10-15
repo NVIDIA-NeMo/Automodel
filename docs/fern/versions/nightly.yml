@@ -773,7 +773,7 @@ navigation:
             slug: black-forest-labs
             path: ../../model-coverage/diffusion/black-forest-labs/index.mdx
             contents:
-              - page: "FLUX 3 Image Klein Base"
+              - page: "FLUX-3-Image-Klein-Base"
                 path: ../../model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx
               - page: "FLUX.1-dev"
                 path: ../../model-coverage/diffusion/black-forest-labs/flux.mdx
