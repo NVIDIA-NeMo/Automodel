@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
@@ -50,7 +51,16 @@ def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) ->
     return F.pad(lora_A, (0, padding)), F.pad(lora_B, (0, 0, 0, padding))
 
 
-def _init_expert_adapter(obj, n_experts, lora_dim, alpha, lora_A_init_method, lora_dtype, init_lora_weights):
+def _init_expert_adapter(
+    obj,
+    *,
+    n_experts: int,
+    lora_dim: int,
+    alpha: int,
+    lora_A_init_method: str,
+    lora_dtype: torch.dtype | str | None,
+    init_lora_weights: Callable[[nn.Module, str], None],
+) -> None:
     """Allocate adapters using the caller's expert count and initializer owner."""
     obj.lora_dim = lora_dim
     obj.scale = alpha / lora_dim
@@ -87,7 +97,7 @@ def _init_expert_adapter(obj, n_experts, lora_dim, alpha, lora_A_init_method, lo
 
 
 @torch.no_grad
-def _init_expert_lora_weights(self, init_method):
+def _init_expert_lora_weights(self, init_method: str) -> None:
     """Initialize LoRA weights.
 
     Exposed as ``init_lora_weights`` on both expert wrappers: the PEFT framework's
@@ -160,12 +170,12 @@ class GroupedExpertsLoRA(GroupedExperts):
     ):
         _init_expert_adapter(
             obj,
-            obj.n_routed_experts,
-            lora_dim,
-            alpha,
-            lora_A_init_method,
-            lora_dtype,
-            GroupedExpertsLoRA.init_lora_weights,
+            n_experts=obj.n_routed_experts,
+            lora_dim=lora_dim,
+            alpha=alpha,
+            lora_A_init_method=lora_A_init_method,
+            lora_dtype=lora_dtype,
+            init_lora_weights=GroupedExpertsLoRA.init_lora_weights,
         )
 
     init_lora_weights = _init_expert_lora_weights
@@ -476,12 +486,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     ):
         _init_expert_adapter(
             obj,
-            obj.config.n_routed_experts,
-            lora_dim,
-            alpha,
-            lora_A_init_method,
-            lora_dtype,
-            GroupedExpertsDeepEPLoRA.init_lora_weights,
+            n_experts=obj.config.n_routed_experts,
+            lora_dim=lora_dim,
+            alpha=alpha,
+            lora_A_init_method=lora_A_init_method,
+            lora_dtype=lora_dtype,
+            init_lora_weights=GroupedExpertsDeepEPLoRA.init_lora_weights,
         )
 
     init_lora_weights = _init_expert_lora_weights
