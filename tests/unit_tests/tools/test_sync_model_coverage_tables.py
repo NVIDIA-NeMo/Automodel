@@ -647,11 +647,19 @@ def test_documented_recipe_reads_current_checkout(tmp_path):
     assert _read_documented_recipe(tmp_path, "recipe.yaml", "") == "model: {}\n"
 
 
-def test_documented_recipe_reads_permalink_instead_of_current_checkout(tmp_path, monkeypatch):
+def test_documented_recipe_rejects_permalink_for_checked_in_recipe(tmp_path):
     revision = "a" * 40
     recipe_path = "examples/model.yaml"
     (tmp_path / "examples").mkdir()
-    (tmp_path / recipe_path).write_text("current checkout", encoding="utf-8")
+    (tmp_path / recipe_path).write_text("model: {}\n", encoding="utf-8")
+    document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/{recipe_path})"
+    with pytest.raises(ValueError, match="replace its commit permalink with.*blob/main/examples/model.yaml"):
+        _read_documented_recipe(tmp_path, recipe_path, document)
+
+
+def test_documented_recipe_reads_permalink_when_absent_from_checkout(tmp_path, monkeypatch):
+    revision = "a" * 40
+    recipe_path = "examples/model.yaml"
     document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/{recipe_path})"
 
     def open_recipe(url, *, timeout):
@@ -1234,156 +1242,89 @@ def test_dated_support_tables_must_be_generated(tmp_path, table_header):
         _validate_dated_support_tables_are_generated(tmp_path)
 
 
-def test_recipe_pr_links_generate_and_clean_then_use_merged_recipe(tmp_path, monkeypatch):
+def test_recipe_pr_requires_main_links_when_its_recipe_arrives(tmp_path, monkeypatch):
     from tests.ci_tests.utils import sync_model_coverage_tables as coverage
 
-    revision = "b" * 40
     recipe_path = "examples/llm_finetune/new.yaml"
+    permalink = f"https://github.com/NVIDIA-NeMo/Automodel/blob/{'b' * 40}/{recipe_path}"
     main_url = f"{coverage.REPOSITORY_URL}/{recipe_path}"
-    document = (
-        "---\nrecipe-pr: https://github.com/NVIDIA-NeMo/Automodel/pull/42\n---\n"
-        f"[Recipe]({main_url})\n[Checkout](https://github.com/NVIDIA-NeMo/Automodel/tree/main)\n"
+    document = f"[Recipe]({permalink})\n"
+    monkeypatch.setattr(
+        coverage, "_read_remote_recipe", lambda url: "model: {pretrained_model_name_or_path: org/new}\n"
     )
-    calls = []
+    # The docs PR can publish a validated recipe from another PR.
+    assert coverage._validate_recipe_links(tmp_path, document) == permalink
+    with pytest.raises(FileNotFoundError):
+        coverage._validate_recipe_links(tmp_path, document + f"[Main]({main_url})")
 
-    def resolve_pr(url):
-        assert url == "https://github.com/NVIDIA-NeMo/Automodel/pull/42"
-        return revision
-
-    def open_recipe(url, *, timeout):
-        calls.append(url)
-        assert url == f"https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/{revision}/{recipe_path}"
-        assert timeout == 10
-        return io.BytesIO(b"model: {pretrained_model_name_or_path: org/new}\n")
-
-    monkeypatch.setattr(coverage, "_recipe_pr_revision", resolve_pr)
-    monkeypatch.setattr(urllib.request, "urlopen", open_recipe)
-    coverage._read_remote_recipe.cache_clear()
-    generated, recipe_url = coverage._prepare_recipe_links(tmp_path, document)
-    assert f"/blob/{revision}/{recipe_path}?recipe-pr=42" in recipe_url
-    assert f"[Recipe]({recipe_url})" in generated
-    assert f"/tree/{revision}?recipe-pr=42" in generated
-    assert coverage._prepare_recipe_links(tmp_path, generated) == (generated, recipe_url)
-    assert len(calls) == 1
-    card = tmp_path / "docs/model.mdx"
-    card.parent.mkdir()
-    card.write_text(generated)
-    with pytest.raises(ValueError, match="must not be committed"):
-        coverage._validate_generated_tables_are_not_committed(tmp_path)
-    assert coverage._strip_generated_tables(tmp_path) == [card]
-    assert card.read_text() == document
-
+    # The implementation PR contains the recipe, so it must fix every pinned link.
     local_recipe = tmp_path / recipe_path
     local_recipe.parent.mkdir(parents=True)
     local_recipe.write_text("model: {pretrained_model_name_or_path: org/new}\n")
 
-    def unexpected_remote(*args, **kwargs):
-        pytest.fail("A merged recipe must not fetch the PR or its contents")
+    def unexpected_remote(url):
+        pytest.fail("A checked-in recipe must never be read from a permalink")
 
-    monkeypatch.setattr(coverage, "_recipe_pr_revision", unexpected_remote)
-    monkeypatch.setattr(urllib.request, "urlopen", unexpected_remote)
-    assert coverage._prepare_recipe_links(tmp_path, generated) == (document, main_url)
-    assert coverage._read_documented_recipe(tmp_path, recipe_path, document) == local_recipe.read_text()
-
-
-@pytest.mark.parametrize("pr", ["https://github.com/other/repo/pull/42", "https://example.com/42", "42"])
-def test_recipe_pr_requires_upstream_pull_request_url(tmp_path, pr):
-    from tests.ci_tests.utils.sync_model_coverage_tables import _prepare_recipe_links
-
-    document = f"---\nrecipe-pr: {pr}\n---\n"
-    with pytest.raises(ValueError, match="recipe-pr must be"):
-        _prepare_recipe_links(tmp_path, document)
-
-
-def test_recipe_pr_must_link_the_requested_recipe(tmp_path):
-    document = (
-        "---\nrecipe-pr: https://github.com/NVIDIA-NeMo/Automodel/pull/42\n---\n"
-        "[Other](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/other.yaml)"
-    )
-    with pytest.raises(FileNotFoundError, match="examples/missing.yaml"):
-        _read_documented_recipe(tmp_path, "examples/missing.yaml", document)
-
-
-@pytest.mark.parametrize("output", ["", "not-a-commit\trefs/pull/42/head\n"])
-def test_recipe_pr_rejects_missing_or_invalid_head(monkeypatch, output):
-    from tests.ci_tests.utils.sync_model_coverage_tables import _recipe_pr_revision
-
-    def ls_remote(args, **kwargs):
-        assert args == ["git", "ls-remote", "https://github.com/NVIDIA-NeMo/Automodel.git", "refs/pull/42/head"]
-        assert kwargs["timeout"] == 30
-        return subprocess.CompletedProcess(args, 0, stdout=output)
-
-    monkeypatch.setattr(subprocess, "run", ls_remote)
-    with pytest.raises(ValueError, match="Could not resolve recipe PR"):
-        _recipe_pr_revision.__wrapped__("https://github.com/NVIDIA-NeMo/Automodel/pull/42")
+    monkeypatch.setattr(coverage, "_read_remote_recipe", unexpected_remote)
+    with pytest.raises(ValueError, match="exists in this checkout"):
+        coverage._validate_recipe_links(tmp_path, document)
+    # Adding a main link does not excuse a leftover permalink in the same card.
+    with pytest.raises(ValueError, match="exists in this checkout"):
+        coverage._validate_recipe_links(tmp_path, document + f"[Main]({main_url})")
+    assert coverage._validate_recipe_links(tmp_path, document.replace(permalink, main_url)) == main_url
 
 
 @pytest.mark.parametrize("source,error", [("[", yaml.YAMLError), ("[]", ValueError)])
-def test_recipe_pr_validates_linked_yaml(tmp_path, monkeypatch, source, error):
+def test_linked_recipe_yaml_is_validated(tmp_path, monkeypatch, source, error):
     from tests.ci_tests.utils import sync_model_coverage_tables as coverage
 
-    document = (
-        "---\nrecipe-pr: https://github.com/NVIDIA-NeMo/Automodel/pull/42\n---\n"
-        "[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/new.yaml)"
-    )
-    monkeypatch.setattr(coverage, "_recipe_pr_revision", lambda url: "c" * 40)
+    document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'c' * 40}/examples/new.yaml)"
     monkeypatch.setattr(coverage, "_read_remote_recipe", lambda url: source)
     with pytest.raises(error):
-        coverage._prepare_recipe_links(tmp_path, document)
+        coverage._validate_recipe_links(tmp_path, document)
 
 
-def test_recent_support_includes_cards_and_keeps_date_after_recipe_merge(tmp_path, monkeypatch):
-    from tests.ci_tests.utils import sync_model_coverage_tables as coverage
-
-    card_path = "docs/model-coverage/llm/org/new.mdx"
-    card = tmp_path / card_path
-    card.parent.mkdir(parents=True)
-    card.write_text("---\nrecipe-pr: https://github.com/NVIDIA-NeMo/Automodel/pull/42\n---\n")
-    model = coverage._ModelDoc("LLM", "/model-coverage/large-language-models/org/new", (), "New", card_path)
-    recipe_url = f"https://github.com/NVIDIA-NeMo/Automodel/blob/{'a' * 40}/examples/llm_finetune/new.yaml"
-    monkeypatch.setattr(coverage, "_load_file_addition_date", lambda root, path: "2026-10-15")
-    old_releases = [
-        coverage._ModelRelease("2026-10-01", f"org/old-{i}", f"/models/old-{i}", "LLM", f"examples/old-{i}.yaml")
-        for i in range(10)
-    ]
-    before = coverage._collect_support_entries(tmp_path, old_releases, [model], {model.docs_page: recipe_url})
-    homepage = coverage._render_homepage_table(before)
-    full_log = coverage._render_support_log_table(before)
-    typed = coverage._render_support_log_table(before, include_type=False)
-    for output in (homepage, full_log, typed):
-        assert f"[New]({model.docs_page})" in output
-        assert f"[recipe]({recipe_url})" in output
-    assert homepage.count("| 2026-") == 10
-    assert full_log.count("| 2026-") == 11
-    assert before[0].date == "2026-10-15"
-
-    merged = coverage._ModelRelease("2026-10-16", "org/new", model.docs_page, "LLM", "examples/llm_finetune/new.yaml")
-    after = coverage._collect_support_entries(tmp_path, [*old_releases, merged], [model], {})
-    assert len(after) == len(before)
-    assert after[0].date == "2026-10-15"
-    assert after[0].model_link == before[0].model_link
-    assert "/blob/main/examples/llm_finetune/new.yaml" in after[0].recipe_link
-
-    # A card without a recipe is still discoverable, with no invented recipe link.
-    card.write_text("---\ntitle: New\n---\n")
-    without_recipe = coverage._collect_support_entries(tmp_path, old_releases, [model], {})
-    assert without_recipe[0].recipe_link == ""
-
-
-def test_recipe_pr_missing_remote_yaml_fails(tmp_path, monkeypatch):
+def test_missing_permalink_target_fails(tmp_path, monkeypatch):
     from urllib.error import HTTPError
 
     from tests.ci_tests.utils import sync_model_coverage_tables as coverage
 
-    document = (
-        "---\nrecipe-pr: https://github.com/NVIDIA-NeMo/Automodel/pull/42\n---\n"
-        "[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/missing.yaml)"
-    )
-    monkeypatch.setattr(coverage, "_recipe_pr_revision", lambda url: "d" * 40)
+    document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'d' * 40}/examples/missing.yaml)"
 
     def missing(url):
         raise HTTPError(url, 404, "Not Found", {}, None)
 
     monkeypatch.setattr(coverage, "_read_remote_recipe", missing)
     with pytest.raises(HTTPError):
-        coverage._prepare_recipe_links(tmp_path, document)
+        coverage._validate_recipe_links(tmp_path, document)
+
+
+def test_recent_support_uses_permalink_for_documented_card(tmp_path, monkeypatch):
+    from tests.ci_tests.utils import sync_model_coverage_tables as coverage
+
+    model = coverage._ModelDoc("LLM", "/models/new", (), "New", "docs/model-coverage/llm/org/new.mdx")
+    recipe_url = f"https://github.com/NVIDIA-NeMo/Automodel/blob/{'a' * 40}/examples/llm_finetune/new.yaml"
+    monkeypatch.setattr(coverage, "_load_file_addition_date", lambda root, path: "2026-10-15")
+    old_releases = [
+        coverage._ModelRelease("2026-10-01", f"org/old-{i}", f"/models/old-{i}", "LLM", f"examples/old-{i}.yaml")
+        for i in range(10)
+    ]
+    entries = coverage._collect_support_entries(tmp_path, old_releases, [model], {model.docs_page: recipe_url})
+    for output in (
+        coverage._render_homepage_table(entries),
+        coverage._render_support_log_table(entries),
+        coverage._render_support_log_table(entries, include_type=False),
+    ):
+        assert "[New](/models/new)" in output
+        assert f"[recipe]({recipe_url})" in output
+    assert coverage._render_homepage_table(entries).count("| 2026-") == 10
+    assert coverage._render_support_log_table(entries).count("| 2026-") == 11
+    assert entries[0].date == "2026-10-15"
+
+    merged = coverage._ModelRelease("2026-10-16", "org/new", model.docs_page, "LLM", "examples/llm_finetune/new.yaml")
+    after = coverage._collect_support_entries(tmp_path, [*old_releases, merged], [model], {})
+    assert len(after) == len(entries)
+    assert "/blob/main/examples/llm_finetune/new.yaml" in after[0].recipe_link
+
+    without_recipe = coverage._collect_support_entries(tmp_path, old_releases, [model], {})
+    assert without_recipe[0].recipe_link == ""

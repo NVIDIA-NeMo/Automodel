@@ -43,11 +43,7 @@ MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
 RECIPE_LINK_PATTERN = re.compile(
     r"https://github\.com/NVIDIA-NeMo/Automodel/blob/(?:main|[0-9a-f]{40})/"
-    r"(examples/[A-Za-z0-9_./-]+\.yaml)(?:\?recipe-pr=[1-9][0-9]*)?"
-)
-GENERATED_RECIPE_LINK_PATTERN = re.compile(
-    r"https://github\.com/NVIDIA-NeMo/Automodel/(blob|tree)/[0-9a-f]{40}"
-    r"(/examples/[A-Za-z0-9_./-]+\.yaml)?\?recipe-pr=[1-9][0-9]*"
+    r"(examples/[A-Za-z0-9_./-]+\.yaml)"
 )
 DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model | Recipe |"
 DATED_MODEL_TABLE_HEADER = "| Date | Model | Architectures | Recipe |"
@@ -136,64 +132,21 @@ class _SupportEntry:
     recipe_link: str
 
 
-def _recipe_pr(document: str) -> str | None:
-    if not document.startswith("---\n"):
-        return None
-    frontmatter = yaml.safe_load(document.split("---", 2)[1]) or {}
-    if not isinstance(frontmatter, dict):
-        raise ValueError("Model-card frontmatter must be a YAML mapping")
-    pr_url = frontmatter.get("recipe-pr")
-    if pr_url is not None and (
-        not isinstance(pr_url, str)
-        or re.fullmatch(r"https://github\.com/NVIDIA-NeMo/Automodel/pull/[1-9][0-9]*", pr_url) is None
-    ):
-        raise ValueError("recipe-pr must be an NVIDIA-NeMo/Automodel pull request URL")
-    return pr_url
-
-
-@cache
-def _recipe_pr_revision(pr_url: str) -> str:
-    # GitHub keeps pull refs in the base repository, including fork PR heads.
-    ref = f"refs/pull/{pr_url.rsplit('/', 1)[1]}/head"
-    result = subprocess.run(
-        ["git", "ls-remote", "https://github.com/NVIDIA-NeMo/Automodel.git", ref],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    match = re.fullmatch(r"([0-9a-f]{40})\s+" + re.escape(ref) + r"\s*", result.stdout)
-    if match is None:
-        raise ValueError(f"Could not resolve recipe PR: {pr_url}")
-    return match.group(1)
-
-
-def _restore_recipe_links(document: str) -> str:
-    return GENERATED_RECIPE_LINK_PATTERN.sub(
-        lambda match: f"https://github.com/NVIDIA-NeMo/Automodel/{match[1]}/main{match[2] or ''}", document
-    )
-
-
 def _documented_recipe_url(repo_root: Path, recipe_path: str, document: str) -> str:
     if ".." in Path(recipe_path).parts or Path(recipe_path).is_absolute():
         raise ValueError(f"Recipe path must stay inside the checkout: {recipe_path}")
-    document = _restore_recipe_links(document)
     permalink = re.search(
-        rf"https://github\.com/NVIDIA-NeMo/Automodel/blob/([0-9a-f]{{40}})/{re.escape(recipe_path)}(?=[)#?])",
+        rf"https://github\.com/NVIDIA-NeMo/Automodel/blob/([0-9a-f]{{40}})/{re.escape(recipe_path)}(?=$|[)#?\s])",
         document,
     )
-    if permalink:
-        return f"https://github.com/NVIDIA-NeMo/Automodel/blob/{permalink[1]}/{recipe_path}"
     main_url = f"{REPOSITORY_URL}/{recipe_path}"
     if (repo_root / recipe_path).is_file():
+        if permalink:
+            raise ValueError(f"{recipe_path} exists in this checkout; replace its commit permalink with {main_url}")
         return main_url
-    pr_url = _recipe_pr(document)
-    if pr_url is None or main_url not in {match[0] for match in RECIPE_LINK_PATTERN.finditer(document)}:
-        raise FileNotFoundError(f"{recipe_path}: add a commit permalink or a main link with recipe-pr frontmatter")
-    revision = _recipe_pr_revision(pr_url)
-    return (
-        f"https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/{recipe_path}?recipe-pr={pr_url.rsplit('/', 1)[1]}"
-    )
+    if permalink:
+        return f"https://github.com/NVIDIA-NeMo/Automodel/blob/{permalink[1]}/{recipe_path}"
+    raise FileNotFoundError(f"{recipe_path}: recipe is missing from this checkout; use a matching commit permalink")
 
 
 @cache
@@ -212,28 +165,18 @@ def _read_documented_recipe(repo_root: Path, recipe_path: str, document: str) ->
     return _read_remote_recipe(url)
 
 
-def _prepare_recipe_links(repo_root: Path, document: str) -> tuple[str, str]:
-    """Resolve a card's recipe links and return its first recipe URL for tables."""
-    document = _restore_recipe_links(document)
-    pr_url = _recipe_pr(document)
+def _validate_recipe_links(repo_root: Path, document: str) -> str:
+    """Validate every linked recipe and return the first URL for support tables."""
     first_url = ""
-    generated = document
     for match in RECIPE_LINK_PATTERN.finditer(document):
-        url = _documented_recipe_url(repo_root, match[1], document)
+        url = _documented_recipe_url(repo_root, match[1], match[0])
         if not first_url:
             first_url = url
-        if pr_url:
-            # Validate data only: never import or execute code from a recipe PR.
-            recipe = yaml.safe_load(_read_documented_recipe(repo_root, match[1], document))
-            if not isinstance(recipe, dict):
-                raise ValueError(f"Recipe must be a YAML mapping: {match[1]}")
-            generated = generated.replace(match[0], url)
-    if pr_url and "?recipe-pr=" in generated:
-        generated = generated.replace(
-            "https://github.com/NVIDIA-NeMo/Automodel/tree/main",
-            f"https://github.com/NVIDIA-NeMo/Automodel/tree/{_recipe_pr_revision(pr_url)}?recipe-pr={pr_url.rsplit('/', 1)[1]}",
-        )
-    return generated, first_url
+        # Validate data only: never import or execute code from a recipe PR.
+        recipe = yaml.safe_load(_read_documented_recipe(repo_root, match[1], match[0]))
+        if not isinstance(recipe, dict):
+            raise ValueError(f"Recipe must be a YAML mapping: {match[1]}")
+    return first_url
 
 
 def _collect_support_entries(
@@ -247,10 +190,6 @@ def _collect_support_entries(
         date = release.release_date
         if model is not None:
             represented_pages.add((model.docs_page, release.model_type))
-            document = (repo_root / model.source_path).read_text(encoding="utf-8")
-            # Documentation-first support keeps its date after the recipe merges.
-            if _recipe_pr(document):
-                date = min(date, _load_file_addition_date(repo_root, model.source_path) or date)
         entries.append(
             _SupportEntry(
                 date,
@@ -297,7 +236,7 @@ def _strip_generated_tables(repo_root: Path) -> list[Path]:
     changed_paths = []
     for path in (repo_root / "docs").rglob("*.mdx"):
         document = path.read_text(encoding="utf-8")
-        stripped = _restore_recipe_links(document)
+        stripped = document
         for start_marker, end_marker in GENERATED_MARKER_PAIRS:
             if start_marker in stripped or end_marker in stripped:
                 stripped = _replace_generated_block(
@@ -316,8 +255,6 @@ def _validate_generated_tables_are_not_committed(repo_root: Path) -> None:
     populated_paths = []
     for path in (repo_root / "docs").rglob("*.mdx"):
         document = path.read_text(encoding="utf-8")
-        if GENERATED_RECIPE_LINK_PATTERN.search(document):
-            populated_paths.append(path.relative_to(repo_root))
         for start_marker, end_marker in GENERATED_MARKER_PAIRS:
             start = document.find(start_marker)
             end = document.find(end_marker)
@@ -893,22 +830,15 @@ def _generate_tables(repo_root: Path, *, validate_model_cards: bool = True) -> d
             replace(release, docs_page=model_card_routes[(release.hf_model_id, release.model_type)])
             for release in releases
         ]
-    generated_cards = {}
     recipe_urls = {}
     for model in documented_models:
         path = repo_root / model.source_path
-        document = path.read_text(encoding="utf-8")
-        generated, recipe_urls[model.docs_page] = _prepare_recipe_links(repo_root, document)
-        if generated != document:
-            generated_cards[path] = generated
-    # Source aliases remain readable and use the same recipe resolution as cards.
+        recipe_urls[model.docs_page] = _validate_recipe_links(repo_root, path.read_text(encoding="utf-8"))
+    # Compatibility copies must follow the same link policy as canonical cards.
     for alias in MODEL_CARD_PATH_ALIASES:
         path = repo_root / alias
         if path.is_file():
-            document = path.read_text(encoding="utf-8")
-            generated, _ = _prepare_recipe_links(repo_root, document)
-            if generated != document:
-                generated_cards[path] = generated
+            _validate_recipe_links(repo_root, path.read_text(encoding="utf-8"))
     entries = _collect_support_entries(repo_root, releases, documented_models, recipe_urls)
     generated_support_log = _render_support_log_table(entries)
     generated_homepage = _render_homepage_table(entries)
@@ -940,7 +870,7 @@ def _generate_tables(repo_root: Path, *, validate_model_cards: bool = True) -> d
             overview, REGISTRY_START_MARKER, REGISTRY_END_MARKER, generated_registry
         ),
     }
-    return {**generated_documents, **generated_cards}
+    return generated_documents
 
 
 def _sync_tables(repo_root: Path, *, check: bool, validate_model_cards: bool = True) -> list[Path]:
