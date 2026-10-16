@@ -835,6 +835,35 @@ class TestGroupedExpertsForwardLoopDTensorBias:
         assert len(to_local_calls) >= 2, f"Expected .to_local() called for both biases, got {len(to_local_calls)} calls"
 
 
+class TestGroupedExpertsDeepEPCapacityMode:
+    """BackendConfig.dispatcher_capacity_factor / dispatcher_equal_token_counts reach GroupedExpertsDeepEP."""
+
+    def test_capacity_knobs_are_read_from_backend(self, moe_config):
+        backend = BackendConfig(
+            dispatcher="hybridep",
+            experts="torch_mm",
+            dispatcher_capacity_factor=1.5,
+            dispatcher_equal_token_counts=True,
+        )
+        experts = GroupedExpertsDeepEP(moe_config, backend=backend)
+        assert experts.dispatcher_capacity_factor == 1.5
+        assert experts.dispatcher_equal_token_counts is True
+
+    def test_capacity_knobs_default_off_without_backend(self, moe_config):
+        experts = GroupedExpertsDeepEP(moe_config)
+        assert experts.dispatcher_capacity_factor is None
+        assert experts.dispatcher_equal_token_counts is False
+
+    def test_capacity_factor_rejects_expert_bias(self, moe_config):
+        """Capacity mode pads the dispatched buffer past the routed rows; the bias add cannot size itself to that."""
+        moe_config.expert_bias = True
+        backend = BackendConfig(dispatcher="hybridep", experts="torch_mm", dispatcher_capacity_factor=1.5)
+        with pytest.raises(
+            ValueError, match="dispatcher_capacity_factor is not supported for experts with expert_bias"
+        ):
+            GroupedExpertsDeepEP(moe_config, backend=backend)
+
+
 class TestGroupedExpertsDeepEP:
     """Test GroupedExpertsDeepEP module."""
 
@@ -920,44 +949,131 @@ class TestGroupedExpertsDeepEP:
             mock_init_buffer.assert_called_once_with(mock_mesh.get_group.return_value)
 
     @pytest.mark.parametrize(
-        ("threshold_delta", "expect_chunked"),
+        ("threshold_delta", "above_chunk_threshold"),
         [pytest.param(0, False, id="at-threshold"), pytest.param(-1, True, id="above-threshold")],
     )
+    @pytest.mark.parametrize("expert_bias", [False, True])
+    @pytest.mark.parametrize("use_mxfp8", [False, True])
     def test_grouped_experts_deepep_forward_selects_chunked_path_at_byte_threshold(
         self,
         moe_config,
         monkeypatch,
         threshold_delta,
-        expect_chunked,
+        above_chunk_threshold,
+        expert_bias,
+        use_mxfp8,
     ):
-        """Production forward uses chunking only when the gate/up allocation exceeds the byte limit."""
-        experts = GroupedExpertsDeepEP(moe_config)
-        args = self._prepare_forward_path(experts, num_tokens=2)
-        hidden_states = args[4]
+        """Only biased experts split large GEMMs, preserving outputs and every input/parameter gradient."""
+        config = replace(
+            moe_config,
+            n_routed_experts=1,
+            n_activated_experts=1,
+            dim=4,
+            moe_inter_dim=3,
+            expert_bias=expert_bias,
+            dtype=torch.float32,
+        )
+        torch.manual_seed(42)
+        backend = BackendConfig(experts="torch_mm_mxfp8" if use_mxfp8 else "torch_mm", dispatcher="deepep")
+        experts = GroupedExpertsDeepEP(config, backend=backend)
+        for parameter in experts.parameters():
+            torch.nn.init.normal_(parameter, std=0.1)
+        args = self._prepare_forward_path(experts, num_tokens=5)
+        hidden_states, probs = args[4], args[5]
+        hidden_states.requires_grad_()
+        probs.requires_grad_()
+        gemm_rows = []
+
+        def dense_mm(value, weights, offs):
+            """Multiply the single expert's contiguous rows.
+
+            Args:
+                value: Tensor of shape [tokens, input_features].
+                weights: Tensor of shape [1, input_features, output_features].
+                offs: Tensor of shape [1] containing the token count.
+
+            Returns:
+                Tensor of shape [tokens, output_features].
+            """
+            gemm_rows.append(value.shape[0])
+            return value @ weights[0]
+
+        def activation(value, probabilities):
+            """Apply a gated activation to concatenated gate/up values.
+
+            Args:
+                value: Tensor of shape [tokens, 2 * intermediate].
+                probabilities: Tensor of shape [tokens, 1].
+
+            Returns:
+                Tensor of shape [tokens, intermediate].
+            """
+            gate, up = value.chunk(2, dim=-1)
+            return torch.nn.functional.silu(gate) * up * probabilities
+
+        experts.expert_activation = activation
+        monkeypatch.setattr("nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: dense_mm)
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._BIAS_CHUNK_ROWS", 2)
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES", 2**30)
+        targets = (hidden_states, probs, *experts.parameters())
+        expected = experts(*args[:4])
+        upstream = torch.randn_like(expected)
+        expected_grads = torch.autograd.grad(expected, targets, upstream)
+        gemm_rows.clear()
         gate_up_bytes = hidden_states.shape[0] * experts.gate_and_up_projs.shape[-1] * hidden_states.element_size()
         monkeypatch.setattr(
             "nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES",
             gate_up_bytes + threshold_delta,
         )
-
-        chunked = Mock(side_effect=lambda hidden, *_args: hidden.new_full(hidden.shape, 11.0))
-        whole_dispatch = Mock(side_effect=lambda hidden, *_args, **_kwargs: hidden.new_full(hidden.shape, 7.0))
-        monkeypatch.setattr("nemo_automodel.components.moe.experts._checkpointed_chunked_expert_mlp", chunked)
-        monkeypatch.setattr("nemo_automodel.components.moe.experts._torch_mm_experts_fwd", whole_dispatch)
-
         output = experts(*args[:4])
+        assert gemm_rows == ([2, 2, 2, 2, 1, 1] if expert_bias and not use_mxfp8 and above_chunk_threshold else [5, 5])
+        actual_grads = torch.autograd.grad(output, targets, upstream)
+        torch.testing.assert_close(output, expected)
+        for actual, reference in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual, reference)
 
-        if expect_chunked:
-            chunked.assert_called_once()
-            whole_dispatch.assert_not_called()
-            torch.testing.assert_close(output, torch.full_like(hidden_states, 11.0))
-        else:
-            chunked.assert_not_called()
-            whole_dispatch.assert_called_once()
-            torch.testing.assert_close(output, torch.full_like(hidden_states, 7.0))
+    @pytest.mark.parametrize(
+        ("backend_kwargs", "skips_host_read"),
+        [
+            ({"dispatcher": "deepep"}, False),
+            ({"dispatcher": "hybridep", "dispatcher_capacity_factor": 1.5}, True),
+            ({"dispatcher": "hybridep", "fake_balanced_gate": True, "benchmark_static_routing": True}, True),
+        ],
+        ids=["blocking", "capacity", "static-routing"],
+    )
+    def test_grouped_experts_deepep_forward_skips_count_nonzero_when_rows_are_never_empty(
+        self, moe_config, monkeypatch, backend_kwargs, skips_host_read
+    ):
+        """Capacity mode and static routing never dispatch an empty buffer: the per-microbatch
+        ``count_nonzero`` device-to-host read is skipped; the blocking path still performs it."""
+        config = replace(
+            moe_config, n_routed_experts=1, n_activated_experts=1, dim=4, moe_inter_dim=3, dtype=torch.float32
+        )
+        torch.manual_seed(42)
+        backend = BackendConfig(experts="torch_mm", **backend_kwargs)
+        experts = GroupedExpertsDeepEP(config, backend=backend)
+        assert experts.dispatch_rows_never_empty is skips_host_read
+        for parameter in experts.parameters():
+            torch.nn.init.normal_(parameter, std=0.1)
+        args = self._prepare_forward_path(experts, num_tokens=5)
+        experts.expert_activation = lambda value, probabilities: value.chunk(2, dim=-1)[0] * probabilities
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: lambda v, w, offs: v @ w[0]
+        )
+        host_reads = []
+        real_count_nonzero = torch.count_nonzero
 
-    def test_grouped_experts_deepep_forward_excludes_mxfp8_from_chunked_path(self, moe_config, monkeypatch):
-        """Large MXFP8 dispatches retain their quantized whole-dispatch implementation."""
+        def counting_count_nonzero(*a, **kw):
+            host_reads.append(1)
+            return real_count_nonzero(*a, **kw)
+
+        monkeypatch.setattr(torch, "count_nonzero", counting_count_nonzero)
+        output = experts(*args[:4])
+        assert output.shape == (5, config.dim)
+        assert (len(host_reads) == 0) is skips_host_read
+
+    def test_grouped_experts_deepep_forward_preserves_bias_free_mxfp8_backend(self, moe_config, monkeypatch):
+        """Bias-free whole-dispatch execution forwards the requested MXFP8 backend."""
         backend = BackendConfig(experts="torch_mm_mxfp8", dispatcher="deepep")
         experts = GroupedExpertsDeepEP(moe_config, backend=backend)
         args = self._prepare_forward_path(experts, num_tokens=2)
@@ -983,6 +1099,7 @@ class TestGroupedExpertsDeepEP:
     ):
         """Chunked apply-after-down output bypasses the outer router-weight multiply."""
         moe_config.apply_router_weight_after_down = True
+        moe_config.expert_bias = True
         experts = GroupedExpertsDeepEP(moe_config)
         args = self._prepare_forward_path(experts, num_tokens=3)
         hidden_states, permuted_probs = args[4], args[5]
@@ -1173,11 +1290,21 @@ class TestGroupedExpertsDeepEP:
         if permuted_probs is not None:
             torch.testing.assert_close(permuted_probs.grad, expected_probs.grad)
 
-    @pytest.mark.parametrize("dispatcher,chunked", [("torch", False), ("deepep", False), ("deepep", True)])
+    @pytest.mark.parametrize(
+        "dispatcher,above_chunk_threshold", [("torch", False), ("deepep", False), ("deepep", True)]
+    )
     @pytest.mark.parametrize("checkpoint_mode", ["full", "selective"])
     @pytest.mark.parametrize("apply_router_weight_after_down", [False, True])
+    @pytest.mark.parametrize("expert_bias", [False, True])
     def test_forward_checkpoint_preserves_outputs_and_gradients(
-        self, moe_config, monkeypatch, dispatcher, chunked, checkpoint_mode, apply_router_weight_after_down
+        self,
+        moe_config,
+        monkeypatch,
+        dispatcher,
+        above_chunk_threshold,
+        checkpoint_mode,
+        apply_router_weight_after_down,
+        expert_bias,
     ):
         """Production dispatch preserves every gradient under full and selective checkpointing."""
         config = replace(
@@ -1186,7 +1313,7 @@ class TestGroupedExpertsDeepEP:
             n_activated_experts=1,
             dim=8,
             moe_inter_dim=4,
-            expert_bias=True,
+            expert_bias=expert_bias,
             expert_activation="quick_geglu",
             dtype=torch.float32,
             apply_router_weight_after_down=apply_router_weight_after_down,
@@ -1252,7 +1379,9 @@ class TestGroupedExpertsDeepEP:
             experts.token_dispatcher.token_unpermutation.side_effect = lambda output: output
         monkeypatch.setattr("nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: dense_mm)
         monkeypatch.setattr("nemo_automodel.components.moe.experts._BIAS_CHUNK_ROWS", 3)
-        monkeypatch.setattr("nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES", 0 if chunked else 2**30)
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES", 0 if above_chunk_threshold else 2**30
+        )
         hidden = torch.randn(11, 8, requires_grad=True)
         probs = torch.rand(11, 1, requires_grad=True)
         mask = torch.ones(11, dtype=torch.bool)

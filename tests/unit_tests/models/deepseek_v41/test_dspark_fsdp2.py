@@ -93,6 +93,8 @@ def _fully_shard_model(model: DeepseekV41DSparkModel, mesh: DeviceMesh, dtype: t
 
 
 def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir: str) -> None:
+    # Each spawned rank runs tiny CPU tensors; avoid competing intra-op pools.
+    torch.set_num_threads(1)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)

@@ -36,6 +36,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.common.rope_triton import apply_rope_triton
 from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Parameter, DeepseekV4GroupedLinear
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sparse_attention
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
@@ -140,6 +141,21 @@ class _RotaryEmbedding(nn.Module):
         return positions.float().unsqueeze(-1) * frequencies
 
 
+_ROPE_IMPL = "torch"
+
+
+def use_triton_rope(enabled: bool) -> None:
+    """Route ``_apply_rope`` through the fused Triton kernel.
+
+    The Triton path is opt-in and off by default; the eager path stays the reference.
+
+    Args:
+        enabled: Use :func:`apply_rope_triton` when True, the eager implementation when False.
+    """
+    global _ROPE_IMPL
+    _ROPE_IMPL = "triton" if enabled else "torch"
+
+
 def _apply_rope(values: torch.Tensor, angles: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
     """Rotate the final channels without changing the input storage.
 
@@ -153,6 +169,8 @@ def _apply_rope(values: torch.Tensor, angles: torch.Tensor, *, inverse: bool = F
     Returns:
         Tensor with the shape and dtype of values, in independent storage.
     """
+    if _ROPE_IMPL == "triton":
+        return apply_rope_triton(values, angles, inverse=inverse)
     rotary_dim = angles.shape[-1] * 2
     pairs = torch.view_as_complex(values[..., -rotary_dim:].float().unflatten(-1, (-1, 2)).contiguous())
     # Preserve the released complex-multiply rounding. Separate real-valued
@@ -163,7 +181,13 @@ def _apply_rope(values: torch.Tensor, angles: torch.Tensor, *, inverse: bool = F
     if inverse:
         frequencies = frequencies.conj()
     rotated = torch.view_as_real(pairs * frequencies).flatten(-2).to(values.dtype)
-    return torch.cat((values[..., :-rotary_dim], rotated), dim=-1)
+    # Assemble the result as a contiguous copy of the input plus one narrow slice write. The values are
+    # bitwise those of ``torch.cat((values[..., :-rotary_dim], rotated), dim=-1)``; the batched-concat
+    # kernel that cat launches for a [batch, sequence, heads, 512] query reads and writes the whole tensor
+    # through 128-byte chunks (1.9 ms per call on GB200), the clone streams it (0.4 ms).
+    output = values.clone(memory_format=torch.contiguous_format)
+    output[..., -rotary_dim:] = rotated
+    return output
 
 
 class _CompressorLinear(nn.Linear):
@@ -344,7 +368,8 @@ class _Indexer(nn.Module):
                 raise ValueError("Packed CSA2 state requires compressed document IDs")
             allowed = allowed & (packed_seq_ids.unsqueeze(-1) == state.compressed_seq_ids.unsqueeze(1))
             allowed = allowed & (packed_seq_ids.unsqueeze(-1) > 0)
-        if self.attn_backend == "tilelang":
+        if self.attn_backend in ("tilelang", "cudnn"):
+            # The cuDNN sparse backend keeps the TileLang indexer: cuDNN replaces the attention core only.
             scores = indexer_scores(queries, keys, weights, allowed)
         else:
             # Preserve the reference's BF16 matmul result and reduction boundaries.
@@ -429,6 +454,38 @@ class _Indexer(nn.Module):
         return replace(state, topk_indices=indices, candidates=candidates)
 
 
+def validate_attention_inputs(
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    packed_seq_ids: torch.Tensor | None,
+    *,
+    sequence: int,
+    cp_group: dist.ProcessGroup | None = None,
+) -> None:
+    """Run the host-synchronising checks on the per-forward inputs once.
+
+    Each check reads a device tensor on the host (``torch.equal`` / ``torch.all`` / ``torch.any``), which drains the
+    CUDA launch queue. The model calls this once per forward and passes ``inputs_validated=True`` to every layer;
+    a layer called directly (``inputs_validated=False``) still validates its own inputs. Shape checks stay in the
+    layer because they cost nothing.
+    """
+    cp_size = 1 if cp_group is None else dist.get_world_size(cp_group)
+    cp_rank = 0 if cp_group is None else dist.get_rank(cp_group)
+    positions = torch.arange(sequence, device=position_ids.device) + cp_rank * sequence
+    if packed_seq_ids is None and not torch.equal(position_ids, positions.expand_as(position_ids)):
+        raise ValueError("DeepSeek V4.1 attention supports only contiguous zero-based full-sequence position_ids")
+    if attention_mask is not None:
+        if not torch.all((attention_mask == 0) | (attention_mask == 1)):
+            raise ValueError("DeepSeek V4.1 attention_mask must contain only zero and one")
+        valid_tokens = attention_mask.bool()
+        if packed_seq_ids is None and torch.any(valid_tokens[:, 1:] & ~valid_tokens[:, :-1]):
+            raise ValueError("DeepSeek V4.1 compression supports right padding only")
+        if packed_seq_ids is None and cp_size > 1:
+            global_valid = gather_sequence(valid_tokens, cp_group)
+            if torch.any(global_valid[:, 1:] & ~global_valid[:, :-1]):
+                raise ValueError("DeepSeek V4.1 compression supports right padding only across CP ranks")
+
+
 class DeepseekV41Attention(nn.Module):
     """Full-sequence CSA2 with local KV, shared compressed KV, and an attention sink.
 
@@ -441,10 +498,10 @@ class DeepseekV41Attention(nn.Module):
 
     def __init__(self, config: DeepseekV41TextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
-        if backend.attn not in ("eager", "sdpa", "tilelang"):
-            raise ValueError("DeepSeek V4.1 attention supports backend.attn='eager', 'sdpa', or 'tilelang'")
-        if backend.attn == "tilelang" and config.attention_dropout:
-            raise ValueError("The TileLang sparse attention backend requires attention_dropout=0")
+        if backend.attn not in ("eager", "sdpa", "tilelang", "cudnn"):
+            raise ValueError("DeepSeek V4.1 attention supports backend.attn='eager', 'sdpa', 'tilelang', or 'cudnn'")
+        if backend.attn in ("tilelang", "cudnn") and config.attention_dropout:
+            raise ValueError("The sparse attention kernels (tilelang, cudnn) require attention_dropout=0")
         if backend.linear != "torch" or backend.rms_norm not in ("torch_fp32", "te"):
             raise ValueError("DeepSeek V4.1 attention requires torch linear layers and torch_fp32 or te RMSNorm")
         self.backend = backend
@@ -537,6 +594,7 @@ class DeepseekV41Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         cp_group: dist.ProcessGroup | None = None,
         packed_seq_ids: torch.Tensor | None = None,
+        inputs_validated: bool = False,
     ) -> DeepseekV41AttentionOutput:
         """Apply attention and publish immutable state for the next layer.
 
@@ -553,6 +611,9 @@ class DeepseekV41Attention(nn.Module):
                 [batch, local_sequence], with one for tokens and zero for padding.
             cp_group: Optional CP group, overriding setup_cp_attention. Hidden
                 states and positions are local shards; shared KV state is global.
+            inputs_validated: True when the caller already ran validate_attention_inputs
+                on these position_ids / attention_mask / packed_seq_ids (the model does, once per
+                forward); the layer then skips its own host-synchronising checks.
 
         Returns:
             Output with hidden_states [batch, sequence, hidden] and the new state,
@@ -571,22 +632,21 @@ class DeepseekV41Attention(nn.Module):
         positions = torch.arange(sequence, device=hidden_states.device) + cp_rank * sequence
         if position_ids.shape not in ((1, sequence), (batch, sequence)):
             raise ValueError("DeepSeek V4.1 position_ids must have shape [batch, sequence] or [1, sequence]")
-        if packed_seq_ids is None and not torch.equal(position_ids, positions.expand_as(position_ids)):
-            raise ValueError("DeepSeek V4.1 attention supports only contiguous zero-based full-sequence position_ids")
         if packed_seq_ids is not None and packed_seq_ids.shape != (batch, sequence):
             raise ValueError("packed_seq_ids must have shape [batch, local_sequence]")
-        valid_tokens = torch.ones(batch, sequence, dtype=torch.bool, device=hidden_states.device)
-        if attention_mask is not None:
-            if attention_mask.shape != (batch, sequence):
-                raise ValueError("DeepSeek V4.1 attention_mask must have shape [batch, sequence]")
-            if not torch.all((attention_mask == 0) | (attention_mask == 1)):
-                raise ValueError("DeepSeek V4.1 attention_mask must contain only zero and one")
-            valid_tokens = attention_mask.bool()
-            if packed_seq_ids is None and torch.any(valid_tokens[:, 1:] & ~valid_tokens[:, :-1]):
-                raise ValueError("DeepSeek V4.1 compression supports right padding only")
+        if attention_mask is not None and attention_mask.shape != (batch, sequence):
+            raise ValueError("DeepSeek V4.1 attention_mask must have shape [batch, sequence]")
+        if not inputs_validated:
+            # Host-synchronising checks; the model runs them once per forward for all layers.
+            validate_attention_inputs(
+                position_ids, attention_mask, packed_seq_ids, sequence=sequence, cp_group=cp_group
+            )
+        valid_tokens = (
+            torch.ones(batch, sequence, dtype=torch.bool, device=hidden_states.device)
+            if attention_mask is None
+            else attention_mask.bool()
+        )
         global_valid = gather_sequence(valid_tokens, cp_group)
-        if packed_seq_ids is None and torch.any(global_valid[:, 1:] & ~global_valid[:, :-1]):
-            raise ValueError("DeepSeek V4.1 compression supports right padding only across CP ranks")
         global_seq_ids = None if packed_seq_ids is None else gather_sequence(packed_seq_ids, cp_group)
         angles = self.rotary_emb(position_ids)
         query_latent = self.q_norm(self.wq_a(hidden_states))
@@ -642,9 +702,10 @@ class DeepseekV41Attention(nn.Module):
             ):
                 raise ValueError("CSA2 state belongs to a different batch or sequence")
             kv = torch.cat((kv, next_state.compressed_kv), dim=1)
-        if self.backend.attn == "tilelang":
+        if self.backend.attn in ("tilelang", "cudnn"):
             # Preserve the released sparse slot order and reuse V4's trainable
-            # online-softmax kernel, including its BF16 probability boundary.
+            # online-softmax kernel (TileLang), or the cuDNN Frontend DSA kernels
+            # with the same indices, sink and scale (backend.attn="cudnn").
             starts = (positions - self.window_size + 1).clamp_min(0).expand(batch, -1)
             if packed_seq_ids is not None:
                 starts = torch.maximum(starts, positions.unsqueeze(0) - position_ids)
@@ -667,8 +728,11 @@ class DeepseekV41Attention(nn.Module):
                 self.sinks_param(query),
                 indices,
                 self.head_dim**-0.5,
-                backend="tilelang",
+                backend=self.backend.attn,
                 reference_rounding=True,
+                # Without a padding mask every query sees at least its own slot; the cuDNN backward then skips
+                # its empty-row scan (a torch.nonzero, one host synchronisation per layer per step).
+                all_rows_nonempty=attention_mask is None,
             )
             return DeepseekV41AttentionOutput(self._project_output(attended, angles, valid_tokens), next_state)
         # Dense masks are needed only by the eager/SDPA fallback; TileLang uses sparse indices.

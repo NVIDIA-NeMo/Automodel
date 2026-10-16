@@ -42,6 +42,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
     Qwen3_8_FlashNextPLELayer,
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.layers import (
+    Qwen3_8_FlashNextDecoderLayer,
     Qwen3_8_FlashNextGatedDeltaNet,
     Qwen3_8_FlashNextQSAAttention,
 )
@@ -210,6 +211,7 @@ def _cp_context(
     world_size: int,
     group: dist.ProcessGroup,
     global_input_ids: torch.Tensor,
+    global_cu_seqlens: torch.Tensor | None = None,
 ) -> Qwen3_8_FlashNextCPContext:
     """Build contiguous CP metadata for a replicated raw sequence.
 
@@ -218,6 +220,7 @@ def _cp_context(
         world_size: Number of contiguous sequence shards.
         group: Gloo CP process group.
         global_input_ids: Replicated IDs of shape ``[batch, global_sequence]``.
+        global_cu_seqlens: Optional global packed boundaries ``[documents + 1]``.
 
     Returns:
         Context whose local interval has length ``global_sequence / world_size``.
@@ -231,6 +234,7 @@ def _cp_context(
         global_padding_mask=torch.zeros_like(global_input_ids, dtype=torch.bool),
         local_sequence_start=rank * local_length,
         local_sequence_length=local_length,
+        global_cu_seqlens=global_cu_seqlens,
     )
 
 
@@ -527,6 +531,62 @@ def _distributed_cp_parity_worker(rank: int, world_size: int, store_path: str) -
             # gradient therefore came exclusively from rank one's nine-token
             # convolution halo through the autograd-aware collective.
             assert torch.count_nonzero(local_ple_hidden.grad) > 0
+
+        # Packed PLE CP2 versus separate documents (rank one starts at token 6).
+        # - [0, 3, 10, 12]: document [3, 10) straddles the rank boundary, so tokens
+        #   6-9 keep halo taps into tokens 3-5 on rank zero; document [10, 12) must
+        #   drop every halo tap.
+        # - [0, 2, 6, 12]: document [6, 12) starts exactly at the rank boundary, and
+        #   rank one's halo holds only other documents, one of them ([0, 2)) whole.
+        packed_ids = torch.tensor([[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]], dtype=torch.long)
+        for boundaries in (torch.tensor([0, 3, 10, 12]), torch.tensor([0, 2, 6, 12])):
+            reference_ple = _tiny_ple()
+            cp_ple = _tiny_ple()
+            cp_ple.load_state_dict(reference_ple.state_dict())
+            packed_context = _cp_context(
+                rank=rank,
+                world_size=world_size,
+                group=dist.group.WORLD,
+                global_input_ids=packed_ids,
+                global_cu_seqlens=boundaries,
+            )
+            packed_start = packed_context.local_sequence_start
+            packed_end = packed_context.local_sequence_end
+            global_document_ids = Qwen3_8_FlashNextDecoderLayer._ple_sequence_ids(
+                packed_ids[:, packed_start:packed_end], packed_context, None
+            )
+            full_packed_hidden = torch.randn(1, 12, 4).requires_grad_(True)
+            local_packed_hidden = full_packed_hidden.detach()[:, packed_start:packed_end].clone().requires_grad_(True)
+            reference_packed_output = torch.cat(
+                [
+                    reference_ple(full_packed_hidden[:, start:end], packed_ids[:, start:end])
+                    for start, end in zip(boundaries.tolist(), boundaries.tolist()[1:])
+                ],
+                dim=1,
+            )
+            cp_packed_output = cp_ple(
+                local_packed_hidden,
+                packed_ids[:, packed_start:packed_end],
+                cp_context=packed_context,
+                sequence_ids=global_document_ids,
+            )
+            torch.testing.assert_close(
+                cp_packed_output,
+                reference_packed_output[:, packed_start:packed_end],
+                rtol=2e-5,
+                atol=2e-6,
+            )
+            packed_upstream = torch.linspace(-0.5, 0.75, reference_packed_output.numel())
+            packed_upstream = packed_upstream.view_as(reference_packed_output)
+            reference_packed_output.backward(packed_upstream)
+            cp_packed_output.backward(packed_upstream[:, packed_start:packed_end])
+            torch.testing.assert_close(
+                local_packed_hidden.grad,
+                full_packed_hidden.grad[:, packed_start:packed_end],
+                rtol=2e-5,
+                atol=2e-6,
+            )
+            _compare_parameter_gradients(cp_ple, reference_ple, dist.group.WORLD)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

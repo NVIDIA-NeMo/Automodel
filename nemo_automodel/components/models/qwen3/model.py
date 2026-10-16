@@ -25,14 +25,14 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention as HFQwen3Attention,
 )
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3DecoderLayer as HFQwen3DecoderLayer,
 )
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
@@ -92,8 +92,9 @@ class Qwen3Attention(HFQwen3Attention):
                 ``[T, H]``. ``B`` is batch, ``S`` is sequence, ``T`` is local
                 total tokens, and ``H`` is hidden size.
             position_embeddings: RoPE tensors ``(cos, sin)`` or fused
-                ``(cos, sin, freqs_cis)``. Local tensors use ``[B, S, D]`` or
-                ``[T, D]`` and the fused raw table uses ``[S, 1, 1, D]``.
+                ``(cos, sin, freqs_cis)`` with FP32 coefficients. Local tensors
+                use ``[B, S, D]`` or ``[T, D]`` and the fused raw table uses
+                ``[S, 1, 1, D]``.
             attention_mask: Padded attention mask for BSHD; THD uses cumulative
                 document lengths from ``kwargs``.
             past_key_values: Optional BSHD KV cache; unsupported for THD.
@@ -106,13 +107,34 @@ class Qwen3Attention(HFQwen3Attention):
         """
         is_thd = kwargs.get("qkv_format") == "thd"
         if not is_thd:
-            return super().forward(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings[:2],
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, self.head_dim)
+            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+            # Keep FP32 RoPE arithmetic while restoring Q/K dtypes before attention.
+            cos, sin = position_embeddings[:2]
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if past_key_values is not None:
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, eager_attention_forward
+            )
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
                 **kwargs,
             )
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            return self.o_proj(attn_output), attn_weights
         if hidden_states.ndim != 2:
             raise ValueError(f"THD attention requires hidden_states [T, H], got {tuple(hidden_states.shape)}.")
         if past_key_values is not None:
