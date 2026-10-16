@@ -131,6 +131,34 @@ def test_initialization_copy_error_restores_dispatch(cpu_mesh):
         model.weight.copy_(torch.zeros(3))
 
 
+def test_fp32_initialization_restores_fsdp_storage_and_placements(cpu_mesh):
+    from nemo_automodel.components.models.common.utils import yield_fp32_model
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.bfloat16), requires_grad=False)
+            self.adapter = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.float32))
+
+        @torch.no_grad()
+        def initialize_weights(self, dtype=None):
+            with yield_fp32_model(self, dtype):
+                assert self.base.dtype == self.adapter.dtype == torch.float32
+                self.base.fill_(0.25)
+                self.adapter.fill_(1.001)
+
+    model = fully_shard(Model(), mesh=cpu_mesh)
+    before = dict(model.named_parameters())
+    placements = {name: parameter.placements for name, parameter in before.items()}
+    Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+    for name, parameter in model.named_parameters():
+        assert parameter is before[name]
+        assert parameter.placements == placements[name]
+        assert parameter.device_mesh == cpu_mesh
+    torch.testing.assert_close(model.base.full_tensor(), torch.full((4, 4), 0.25, dtype=torch.bfloat16), rtol=0, atol=0)
+    torch.testing.assert_close(model.adapter.full_tensor(), torch.full((4, 4), 1.001), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("custom_code", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
 def test_fsdp_initialization_uses_original_code_classification(cpu_mesh, custom_code, fail):

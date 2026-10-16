@@ -437,7 +437,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = torch.bfloat16,
     ) -> None:
         """Initialize all tensors for checkpoint-free construction."""
         buffer_device = buffer_device or torch.device(

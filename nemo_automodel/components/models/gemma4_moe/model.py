@@ -1635,8 +1635,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = torch.bfloat16,
     ) -> None:
+        """Initialize weights; ``dtype=None`` preserves existing storage dtypes."""
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
             for p in self.parameters():

@@ -1103,6 +1103,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
 
     @torch.no_grad()
     def initialize_weights(self, buffer_device=None, dtype=torch.bfloat16):
+        """Initialize weights; ``dtype=None`` preserves existing storage dtypes."""
         self.model.language_model.init_weights(buffer_device=buffer_device)
 
 

@@ -580,8 +580,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     @torch.no_grad()
     def initialize_weights(
-        self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
+        self, buffer_device: torch.device | None = None, dtype: torch.dtype | None = torch.bfloat16
     ) -> None:
+        """Initialize weights; ``dtype=None`` preserves existing storage dtypes."""
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
 

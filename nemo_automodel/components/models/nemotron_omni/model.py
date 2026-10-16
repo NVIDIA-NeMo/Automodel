@@ -1426,13 +1426,14 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = torch.bfloat16,
     ) -> None:
         """Initialize model weights.
 
         Args:
             buffer_device: Device to use for buffer initialization
             dtype: Target dtype for model weights
+                None preserves each parameter and buffer's storage dtype.
         """
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         with buffer_device:

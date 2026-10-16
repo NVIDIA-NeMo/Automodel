@@ -723,7 +723,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
 
     @torch.no_grad()
     def initialize_weights(
-        self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
+        self, buffer_device: torch.device | None = None, dtype: torch.dtype | None = torch.bfloat16
     ) -> None:
         """Initialize every trainable backbone weight after meta materialization."""
         if buffer_device is None:

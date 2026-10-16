@@ -127,6 +127,50 @@ class TestDeepseekV3GatePrecision:
         assert backend.gate_precision is None
 
 
+def test_fp32_initialization_restores_moe_lora_storage():
+    from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+    from nemo_automodel.components.models.common.utils import BackendConfig, prepare_frozen_parameters_for_sharding
+
+    config = DeepseekV3Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=1,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+        n_routed_experts=2,
+        n_shared_experts=1,
+        num_experts_per_tok=1,
+        n_group=1,
+        topk_group=1,
+        first_k_dense_replace=0,
+        q_lora_rank=16,
+        kv_lora_rank=8,
+        qk_nope_head_dim=12,
+        qk_rope_head_dim=4,
+        v_head_dim=16,
+        max_position_embeddings=32,
+    )
+    model = DeepseekV3ForCausalLM(
+        config,
+        backend=BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch"),
+    ).float()
+    apply_lora_to_linear_modules(model, PeftConfig(target_modules=["*"], lora_dtype=torch.float32))
+    prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+    dtypes = {name: param.dtype for name, param in model.named_parameters()}
+    adapters = {name: param.detach().clone() for name, param in model.named_parameters() if param.requires_grad}
+    assert any("experts.lora_" in name for name in adapters)
+
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=None)
+
+    for name, parameter in model.named_parameters():
+        assert parameter.dtype == dtypes[name], name
+        assert torch.isfinite(parameter).all(), name
+        if parameter.requires_grad:
+            torch.testing.assert_close(parameter, adapters[name], rtol=0, atol=0)
+
+
 # NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
 
 
