@@ -176,6 +176,13 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
 
+        if self.reset_attention_mask and not self.create_attention_mask:
+            raise ValueError(
+                "reset_attention_mask=True requires create_attention_mask=True: "
+                "without an attention mask the dataset cannot represent document "
+                "boundaries, so the option would silently do nothing."
+            )
+
 
 def parse_and_normalize_split(split: str) -> List[float]:
     """Parse the dataset split ratios from a string
@@ -324,6 +331,31 @@ class GPTDataset(torch.utils.data.Dataset):
                 self._eos_token_id,
             )
 
+        # Resolve the single EOD token id used for document-boundary features
+        # (reset_position_ids, reset_attention_mask, eod_mask_loss). Megatron's
+        # _get_ltor_masks_and_position_ids expects one int; when the tokenizer
+        # does not expose a usable EOS id we keep the historical -10000 sentinel
+        # (which never matches), preserving previous behavior.
+        eod_token_id = self._eos_token_id
+        if isinstance(eod_token_id, (list, tuple)):
+            eod_token_id = eod_token_id[0] if len(eod_token_id) > 0 else None
+        self._eod_token_id = eod_token_id if isinstance(eod_token_id, int) else None
+        if self._eod_token_id is None and any(
+            [
+                self.config.reset_position_ids,
+                self.config.reset_attention_mask,
+                self.config.eod_mask_loss,
+            ]
+        ):
+            logger.warning(
+                "Document-boundary features (reset_position_ids=%s, reset_attention_mask=%s, "
+                "eod_mask_loss=%s) are enabled but the tokenizer exposes no usable eos_token_id, "
+                "so no document boundaries will be detected.",
+                self.config.reset_position_ids,
+                self.config.reset_attention_mask,
+                self.config.eod_mask_loss,
+            )
+
         (self.document_index, self.sample_index, self.shuffle_index) = self._build_document_sample_shuffle_indices()
 
     @staticmethod
@@ -385,13 +417,19 @@ class GPTDataset(torch.utils.data.Dataset):
         return min(self.num_samples, total)
 
     def __getitem__(self, idx: int | None) -> dict[str, torch.Tensor]:
-        """Abstract method implementation
+        """Return a next-token training sample.
 
         Args:
-            idx (Optioal[int]): The index into the dataset
+            idx: Dataset index, or None for a batch-padding sample.
 
         Returns:
-            dict[str, torch.Tensor]: The sample information wrapped in a dictionary
+            Mapping with integer input_ids and labels of shape [sequence] and
+            floating loss_mask of shape [sequence]. EOD-masked labels contain
+            -100. When requested, position_ids has shape [sequence] and
+            attention_mask has shape [1, sequence, sequence]. Reset attention
+            masks are additive float32 masks: zero permits attention and
+            negative infinity blocks it. Without reset_attention_mask, the
+            legacy boolean mask uses True to block attention.
         """
         if idx is None:
             # Batch padding sequence so the index does not matter
@@ -411,8 +449,7 @@ class GPTDataset(torch.utils.data.Dataset):
         if not self.masks_and_position_ids_are_cacheable or not self.masks_and_position_ids_are_cached:
             attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
                 tokens,
-                # eod loss mask is not supported for now
-                -10000,
+                self._eod_token_id if self._eod_token_id is not None else -10000,
                 self.config.reset_position_ids,
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
@@ -435,25 +472,39 @@ class GPTDataset(torch.utils.data.Dataset):
         tokens[tokens_pad_mask] = 0
         labels[labels_pad_mask] = 0
 
+        if self.config.eod_mask_loss and self._eod_token_id is not None:
+            # Mirror the EOD masking into labels: the training recipes consume
+            # labels with ignore_index=-100 and never see loss_mask, so without
+            # this the masked positions still produce gradients and are counted
+            # by _count_label_tokens during loss normalization.
+            eod_positions = (tokens == self._eod_token_id) & ~tokens_pad_mask
+            # Shifted tokens and labels can share storage; masking labels in
+            # place would also overwrite the next input token with -100.
+            labels = labels.masked_fill(eod_positions, -100)
+
         # Batch padding sequence so we mask the loss
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
 
+        sample = {
+            "input_ids": tokens,
+            "labels": labels,
+            "loss_mask": loss_mask,
+        }
         if self.config.create_attention_mask:
-            return {
-                "input_ids": tokens,
-                "labels": labels,
-                "attention_mask": attention_mask,
-                "loss_mask": loss_mask,
-                # "position_ids": position_ids,
-            }
-        else:
-            return {
-                "input_ids": tokens,
-                "labels": labels,
-                "loss_mask": loss_mask,
-                # "position_ids": position_ids,
-            }
+            if self.config.reset_attention_mask:
+                # The helper uses Megatron's True=blocked convention. HF eager
+                # attention and SDPA accept an additive mask without differing
+                # boolean conventions.
+                attention_mask = torch.zeros_like(attention_mask, dtype=torch.float32).masked_fill(
+                    attention_mask, float("-inf")
+                )
+            sample["attention_mask"] = attention_mask
+        if self.config.reset_position_ids:
+            # Expose the document-relative positions computed above; without
+            # this the option has no effect on the model input.
+            sample["position_ids"] = position_ids
+        return sample
 
     def _query_document_sample_shuffle_indices(self, idx: int) -> Tuple[numpy.ndarray, numpy.ndarray]:
         """Get the text (token ids) and document ids for a given index
