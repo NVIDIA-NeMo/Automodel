@@ -102,6 +102,52 @@ def test_lora_wrapping_preserves_base_storage(moe_config, expert_cls, device, dt
     assert all(parameter.device.type == device and parameter.requires_grad for parameter in adapters)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen rotary embedding construction requires CUDA")
+def test_qwen_moe_lora_preserves_bf16_base_storage(device):
+    from transformers import Qwen3MoeConfig
+
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+    from nemo_automodel.components.models.qwen3_moe.model import Qwen3MoeForCausalLM
+
+    config = Qwen3MoeConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        moe_intermediate_size=32,
+        num_experts=4,
+        num_experts_per_tok=1,
+        max_position_embeddings=32,
+        torch_dtype=torch.float32,
+    )
+    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", experts="torch", dispatcher="torch")
+    with torch.device("meta"):
+        # Loading in BF16 may leave the original model config specifying FP32.
+        model = Qwen3MoeForCausalLM(config, backend=backend).to(torch.bfloat16)
+        apply_lora_to_linear_modules(model, PeftConfig(target_modules=["*"], dim=4))
+
+    assert any(isinstance(module, GroupedExpertsLoRA) for module in model.modules())
+    base_names = {name for name, _ in model.named_parameters() if "lora_" not in name}
+    assert base_names
+    # Check before initialization, whose final cast could hide wrapper promotion.
+    for name in base_names:
+        parameter = model.get_parameter(name)
+        assert not parameter.requires_grad, name
+        assert parameter.dtype == torch.bfloat16, name
+
+    Checkpointer.initialize_model_weights(model, device, peft_init_method="xavier")
+
+    for name in base_names:
+        parameter = model.get_parameter(name)
+        assert not parameter.requires_grad, name
+        assert parameter.device == device, name
+        assert parameter.dtype == torch.bfloat16, name
+        assert parameter.untyped_storage().nbytes() == parameter.numel() * 2, name
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_grouped_experts_lora_init(moe_config, device):
     """Test initialization of GroupedExpertsLoRA, verifying shapes and frozen weights."""
