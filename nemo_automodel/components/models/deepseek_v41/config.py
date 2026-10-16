@@ -123,6 +123,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         dtype: str = "bfloat16",
         compile_cache_quant: bool = False,
         engram_strict_validation: bool = False,
+        compile_engram: bool = False,
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
@@ -221,6 +222,10 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # device-to-host synchronisations and seven small collectives per lookup); False keeps the same invariants as
         # device-side asserts. See Qwen3_8_FlashNextEngramTableConfig.strict_validation.
         self.engram_strict_validation = engram_strict_validation
+        # torch.compile the Engram gate core (fp32 casts, the stream / key RMS reductions, the signed-square-root sigmoid
+        # gate and the gated residual add) once per process (engram.compile_engram_gate): allclose to eager, not
+        # bitwise. A DeepSeek-V4.1 knob like compile_cache_quant, so it lives here rather than on the shared BackendConfig.
+        self.compile_engram = compile_engram
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,

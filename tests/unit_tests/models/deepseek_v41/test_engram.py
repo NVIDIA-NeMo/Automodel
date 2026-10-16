@@ -30,6 +30,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 from transformers import PreTrainedTokenizerFast
 
+import nemo_automodel.components.models.deepseek_v41.engram as v41_engram
 from nemo_automodel.components.distributed.multimodal_fsdp import ignored_params_for_root
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import (
@@ -156,8 +157,30 @@ def test_hash_rejects_mismatched_compressed_vocabulary() -> None:
         DeepseekV41NgramHash(config, _tokenizer())
 
 
+def _eager_engram_gate(monkeypatch) -> None:
+    """Pin the module-level gate dispatcher to eager for this test (restored by monkeypatch)."""
+    monkeypatch.setattr(v41_engram, "_engram_gate", v41_engram._engram_gate_core)
+    monkeypatch.setattr(v41_engram, "_ENGRAM_GATE_COMPILED", False)
+
+
+def test_compile_engram_is_a_config_knob_that_defaults_off(monkeypatch) -> None:
+    _eager_engram_gate(monkeypatch)
+    assert DeepseekV41TextConfig().compile_engram is False
+    assert v41_engram._engram_gate is v41_engram._engram_gate_core and not v41_engram._ENGRAM_GATE_COMPILED
+    v41_engram.compile_engram_gate()
+    assert v41_engram._ENGRAM_GATE_COMPILED and v41_engram._engram_gate is not v41_engram._engram_gate_core
+    compiled = v41_engram._engram_gate
+    v41_engram.compile_engram_gate()  # idempotent: the second hook keeps the first wrapper
+    assert v41_engram._engram_gate is compiled
+
+
+@pytest.mark.runtime_budget(30, reason="the compiled cases build the Engram gate core with torch.compile")
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 @pytest.mark.parametrize("all_masked", [False, True])
-def test_residual_and_parameter_gradients_match_reference(all_masked: bool) -> None:
+def test_residual_and_parameter_gradients_match_reference(monkeypatch, all_masked: bool, compiled: bool) -> None:
+    _eager_engram_gate(monkeypatch)
+    if compiled:
+        v41_engram.compile_engram_gate()
     torch.manual_seed(17)
     config = _tiny_config()
     model = DeepseekV41Engram(config, 1, BackendConfig(linear="torch"))
