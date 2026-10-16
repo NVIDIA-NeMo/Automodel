@@ -22,9 +22,13 @@ Call `apply_te_patches()` early in the process, before TE optimizers are used.
 
 from __future__ import annotations
 
+import copy
+import itertools
 import logging
+from typing import Any
 
 import torch
+from torch.distributed.tensor import DTensor
 
 _logger = logging.getLogger(__name__)
 
@@ -198,6 +202,84 @@ def _apply_fused_adam_empty_shard_patch() -> None:
     _apply_without_empty_shards._nemo_empty_shard_patch = True
     fused_adam.multi_tensor_applier = _apply_without_empty_shards
     _logger.info("Applied FusedAdam empty-shard monkey-patch.")
+
+
+def _apply_fused_adam_in_place_load_patch() -> None:
+    """Load FusedAdam state into the optimizer's existing state buffers.
+
+    TE's ``FusedAdam.load_state_dict`` first runs ``torch.optim.Optimizer.load_state_dict``, which casts a copy of
+    every state tensor to the parameter dtype, and then resets each parameter's state and allocates new buffers while
+    the loaded tensors are still referenced. With fp32 master weights (bf16 parameter plus int16 remainder) and fp32
+    moments, a resume then holds about 22 bytes per parameter instead of the 10 bytes of optimizer state, which does
+    not fit large sharded models. The patched method restores the parameter-group hyperparameters, including
+    FusedAdam's per-group ``step``, and copies each loaded state into the existing buffer with ``set_scaled_state``;
+    a buffer is allocated only for a state that does not exist yet.
+    """
+    from nemo_automodel.shared.import_utils import safe_import, safe_import_te
+
+    have_te, _ = safe_import_te()
+    available, fused_adam = (
+        safe_import("transformer_engine.pytorch.optimizers.fused_adam") if have_te else (False, None)
+    )
+    if not available:
+        _logger.debug("Skipping FusedAdam in-place load patch: Transformer Engine is unavailable")
+        return
+    fused_adam_cls = fused_adam.FusedAdam
+    if getattr(fused_adam_cls.load_state_dict, "_nemo_in_place_load_patch", False) is True:
+        return
+
+    def _load_state_dict_in_place(self: Any, state_dict: dict[str, Any]) -> None:
+        """Load an optimizer state dict produced by ``FusedAdam.state_dict``.
+
+        Args:
+            state_dict: Mapping with ``param_groups`` (hyperparameters and parameter ids) and ``state`` (parameter id
+                to state-name mapping). State values are tensors or DTensors with the parameter's shape and
+                placements: ``exp_avg`` / ``exp_avg_sq`` and ``master_param`` in fp32, except ``master_param`` of a
+                bf16 parameter with ``store_param_remainders``, which is the int16 remainder. A value may alias the
+                optimizer's current buffer, as when Distributed Checkpointing loaded it in place.
+        """
+        for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
+            hook_result = pre_hook(self, state_dict)
+            if hook_result is not None:
+                state_dict = hook_result
+        groups = self.param_groups
+        saved_groups = state_dict["param_groups"]
+        if len(groups) != len(saved_groups):
+            raise ValueError(
+                f"Loaded FusedAdam state has {len(saved_groups)} parameter groups; the optimizer has {len(groups)}."
+            )
+        for index, (group, saved) in enumerate(zip(groups, saved_groups)):
+            if len(group["params"]) != len(saved["params"]):
+                raise ValueError(
+                    f"Loaded FusedAdam parameter group {index} has {len(saved['params'])} parameters; "
+                    f"the optimizer group has {len(group['params'])}."
+                )
+        id_map = dict(
+            zip(
+                itertools.chain.from_iterable(saved["params"] for saved in saved_groups),
+                itertools.chain.from_iterable(group["params"] for group in groups),
+            )
+        )
+        for group, saved in zip(groups, saved_groups):
+            group.update({key: copy.deepcopy(value) for key, value in saved.items() if key != "params"})
+        for key, saved_state in state_dict["state"].items():
+            param = id_map.get(key)
+            if param is None:
+                continue
+            for name, value in saved_state.items():
+                if value is None:
+                    continue
+                local = value._local_tensor if isinstance(value, DTensor) else value
+                keeps_remainder = (
+                    self.store_param_remainders and name == "master_param" and param.dtype == torch.bfloat16
+                )
+                self.set_scaled_state(param, name, local if keeps_remainder else local.float())
+        for post_hook in self._optimizer_load_state_dict_post_hooks.values():
+            post_hook(self)
+
+    _load_state_dict_in_place._nemo_in_place_load_patch = True
+    fused_adam_cls.load_state_dict = _load_state_dict_in_place
+    _logger.info("Applied FusedAdam in-place load_state_dict patch.")
 
 
 # Sentinel stored in place of a plan for a group that can never take the cached path (FP8 parameters, fp16
@@ -434,6 +516,10 @@ def _apply_fused_adam_cached_lists_patch() -> None:
         self.__dict__.pop("_nemo_fused_adam_plans", None)
         return original_load_state_dict(self, state_dict)
 
+    # the wrapper delegates to whatever loader is installed (the in-place loader when that patch ran first):
+    # keep its marker so a repeated in-place patch does not replace this wrapper
+    load_state_dict._nemo_in_place_load_patch = getattr(original_load_state_dict, "_nemo_in_place_load_patch", False)
+
     def add_param_group(self, param_group):
         self.__dict__.pop("_nemo_fused_adam_plans", None)
         return original_add_param_group(self, param_group)
@@ -457,6 +543,7 @@ def apply_te_patches() -> None:
 
     _apply_fused_adam_quantized_tensor_patch()
     _apply_fused_adam_empty_shard_patch()
+    _apply_fused_adam_in_place_load_patch()
     _apply_fused_adam_cached_lists_patch()
 
     _TE_PATCHES_APPLIED = True

@@ -45,6 +45,7 @@ from typing import Any, Iterable, Optional
 import torch
 from safetensors import SafetensorError, safe_open
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
@@ -96,6 +97,43 @@ def _block_scale_placeholder(weight: Any) -> torch.Tensor:
         ),
         dtype=torch.bfloat16,
         device=local.device,
+    )
+
+
+def _mtp_block_scale_placeholder(weight: torch.Tensor) -> torch.Tensor:
+    """Create FP32 MTP scale destinations with the weight's residual DCP placements.
+
+    Args:
+        weight: FP8 weight of shape [out, in], optionally sharded on block-aligned boundaries.
+
+    Returns:
+        Scale tensor of shape [ceil(out / 128), ceil(in / 128)]. A DTensor retains the weight's mesh and
+        placements, with local storage covering only its local 128x128 blocks.
+
+    Raises:
+        ValueError: A weight shard boundary cuts through an FP8 block.
+    """
+    local = weight.to_local() if isinstance(weight, DTensor) else weight
+    local_shape = tuple((size + _FP8_BLOCK_SIZE - 1) // _FP8_BLOCK_SIZE for size in local.shape)
+    scale = torch.empty(local_shape, dtype=torch.float32, device=local.device)
+    if not isinstance(weight, DTensor):
+        return scale
+
+    shard_shape = list(weight.shape)
+    for mesh_dim, placement in enumerate(weight.placements):
+        if isinstance(placement, Shard):
+            mesh_size = weight.device_mesh.size(mesh_dim)
+            chunk = (shard_shape[placement.dim] + mesh_size - 1) // mesh_size
+            if mesh_size > 1 and chunk % _FP8_BLOCK_SIZE:
+                raise ValueError("MTP FP8 weight shards must align to 128-element block boundaries")
+            shard_shape[placement.dim] = chunk
+    shape = tuple((size + _FP8_BLOCK_SIZE - 1) // _FP8_BLOCK_SIZE for size in weight.shape)
+    return DTensor.from_local(
+        scale,
+        device_mesh=weight.device_mesh,
+        placements=weight.placements,
+        shape=torch.Size(shape),
+        stride=(shape[1], 1),
     )
 
 
@@ -282,6 +320,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         self.mtp_expert_hf_layout = mtp_expert_hf_layout
         self.text_only = text_only
         self._expert_hf_layout: str | None = None
+        self._mtp_fp8_weight_keys: set[str] | None = None
         self._inferred_mtp_expert_hf_layout: str | None = None
         self._local_checkpoint_layout_checked = False
         self._uses_model_prefix = True
@@ -372,6 +411,36 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
 
         return "grouped"
 
+    def _get_mtp_fp8_weight_keys(self) -> set[str]:
+        """Identify quantized MTP weights from safetensors headers, independently of decoder layout."""
+        if self._mtp_fp8_weight_keys is None:
+            self._mtp_fp8_weight_keys = set()
+            model_path = self.pretrained_model_name_or_path or self.config._name_or_path
+            if model_path:
+                checkpoint_dir = Path(model_path)
+                index_paths = sorted(checkpoint_dir.glob("*.safetensors.index.json"))
+                if index_paths:
+                    # A large decoder can span thousands of shards; inspect only
+                    # files containing MTP weights, and never materialize tensors.
+                    shard_names = set()
+                    for index_path in index_paths:
+                        with index_path.open() as index_file:
+                            weight_map = json.load(index_file)["weight_map"]
+                        shard_names.update(
+                            filename for key, filename in weight_map.items() if _MTP_SPLIT_EXPERT_KEY.fullmatch(key)
+                        )
+                    shard_paths = sorted(checkpoint_dir / name for name in shard_names)
+                else:
+                    shard_paths = sorted(checkpoint_dir.glob("*.safetensors"))
+                for shard_path in shard_paths:
+                    with safe_open(str(shard_path), framework="pt", device="cpu") as shard:
+                        for key in shard.keys():
+                            if _MTP_SPLIT_EXPERT_KEY.fullmatch(key) and shard.get_slice(key).get_dtype().startswith(
+                                "F8"
+                            ):
+                                self._mtp_fp8_weight_keys.add(key)
+        return self._mtp_fp8_weight_keys
+
     def _apply_key_mapping(self, state_dict: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
         """Apply key substring mappings to state dict keys."""
         new_state_dict = {}
@@ -417,6 +486,11 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         reassembled without applying EP-shard slicing again.
         Plain tensors (init path): slice to local EP shard, transpose, create DTensor.
         """
+        self._mtp_fp8_weight_keys = {
+            key
+            for key, value in hf_state_dict.items()
+            if _MTP_SPLIT_EXPERT_KEY.fullmatch(key) and str(value.dtype).startswith("torch.float8_")
+        }
         checkpoint_keys = set(hf_state_dict)
         self._get_expert_hf_layout(checkpoint_keys)
         self._get_mtp_expert_hf_layout(checkpoint_keys)
@@ -509,6 +583,22 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 which = mtp_split_match.group(3)
                 if not state_dict_utils.should_load_expert_for_rank(expert_num, device_mesh, n_experts):
                     continue
+                scale_key = f"{key}_scale_inv"
+                if scale_key in hf_state_dict:
+                    dequantized = _dequantize_block_fp8(value, hf_state_dict[scale_key], self.dtype)
+                    if state_dict_utils.is_dtensor(value):
+                        # Keep residual DCP placements so the MTP packing path
+                        # does not slice an already-local ep_shard a second time.
+                        dequantized = DTensor.from_local(
+                            dequantized,
+                            device_mesh=value.device_mesh,
+                            placements=value.placements,
+                            shape=value.shape,
+                            stride=value.stride(),
+                        )
+                    value = dequantized
+                elif str(value.dtype).startswith("torch.float8_"):
+                    raise RuntimeError(f"Missing FP8 scale for MTP expert weight {key}")
                 parts = mtp_expert_parts.setdefault(layer_num, {"gate_proj": {}, "up_proj": {}, "down_proj": {}})
                 parts[which][expert_num] = value
                 continue
@@ -645,8 +735,10 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         exclude_key_regex = kwargs.get("exclude_key_regex")
         quantization = kwargs.get("quantization", False)
 
-        base_gate_up_match = re.match(r"(.+layers\.(\d+)\.mlp\.experts)\.gate_and_up_projs$", fqn)
-        base_down_match = re.match(r"(.+layers\.(\d+)\.mlp\.experts)\.down_projs$", fqn)
+        base_gate_up_match = re.match(
+            r"((?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts)\.gate_and_up_projs$", fqn
+        )
+        base_down_match = re.match(r"((?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts)\.down_projs$", fqn)
         if quantization and self._get_expert_hf_layout() == "split-fp8":
             if base_gate_up_match:
                 expert_prefix = base_gate_up_match.group(1)
@@ -696,6 +788,9 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         if mtp_expert_hf_layout is None:
             mtp_expert_hf_layout = self._get_mtp_expert_hf_layout()
         if mtp_expert_hf_layout == "split":
+            fp8_keys = (
+                self._get_mtp_fp8_weight_keys() if quantization and (mtp_gate_up_match or mtp_down_match) else set()
+            )
             if mtp_gate_up_match:
                 layer_num = mtp_gate_up_match.group(1)
                 splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
@@ -710,8 +805,12 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                         gate = gate.contiguous()
                     if not state_dict_utils.is_dtensor(up):
                         up = up.contiguous()
-                    result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.gate_proj.weight", gate))
-                    result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight", up))
+                    for projection, weight in (("gate_proj", gate), ("up_proj", up)):
+                        key = f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.{projection}.weight"
+                        if key in fp8_keys:
+                            weight = weight.to(dtype=torch.float8_e4m3fn)
+                            result.append((f"{key}_scale_inv", _mtp_block_scale_placeholder(weight)))
+                        result.append((key, weight))
                 return _filter_excluded(result, exclude_key_regex)
             if mtp_down_match:
                 layer_num = mtp_down_match.group(1)
@@ -723,7 +822,11 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                     down = expert_tensor.transpose(0, 1)
                     if not state_dict_utils.is_dtensor(down):
                         down = down.contiguous()
-                    result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight", down))
+                    key = f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight"
+                    if key in fp8_keys:
+                        down = down.to(dtype=torch.float8_e4m3fn)
+                        result.append((f"{key}_scale_inv", _mtp_block_scale_placeholder(down)))
+                    result.append((key, down))
                 return _filter_excluded(result, exclude_key_regex)
 
         # Qwen3.6 stores MTP experts in the same grouped layout as decoder experts,
