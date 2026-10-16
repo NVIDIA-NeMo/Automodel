@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+from nemo_automodel.components.config import loader as loader_module
 from nemo_automodel.components.config.loader import (
     ConfigNode,
     _resolve_target,
@@ -458,8 +459,15 @@ def test_resolve_target_non_string_passthrough():
     assert _resolve_target(42) == 42
 
 
-def test_resolve_target_file_colon(tmp_path):
+def test_safe_base_dir_defaults_to_repo_root():
+    """File-based target resolution should default to the repository root boundary."""
+    assert loader_module.SAFE_BASE_DIR == Path(__file__).resolve().parents[3]
+
+
+def test_resolve_target_file_colon(tmp_path, monkeypatch):
     """`path/to/file.py:object_name` is resolved correctly."""
+    monkeypatch.setattr(loader_module, "ENABLE_USER_MODULES", False)
+    monkeypatch.setattr(loader_module, "SAFE_BASE_DIR", tmp_path)
     script = tmp_path / "tools.py"
     script.write_text(
         textwrap.dedent(
@@ -474,6 +482,27 @@ def test_resolve_target_file_colon(tmp_path):
     # We get back the function object itself
     assert callable(target)
     assert target() == 42
+
+
+def test_resolve_target_file_colon_blocks_out_of_tree_file(tmp_path, monkeypatch):
+    """Out-of-tree file targets should be rejected unless user modules are enabled."""
+    monkeypatch.setattr(loader_module, "ENABLE_USER_MODULES", False)
+    monkeypatch.setattr(loader_module, "SAFE_BASE_DIR", tmp_path)
+    script = tmp_path.parent / "outside_tools.py"
+    script.write_text("meaning = 42\n")
+
+    with pytest.raises(ImportError, match="out-of-tree code"):
+        _resolve_target(f"{script}:meaning")
+
+
+def test_resolve_target_file_colon_allows_out_of_tree_file_when_opted_in(tmp_path, monkeypatch):
+    """Out-of-tree file targets should still work when the opt-in is enabled."""
+    monkeypatch.setattr(loader_module, "ENABLE_USER_MODULES", True)
+    monkeypatch.setattr(loader_module, "SAFE_BASE_DIR", tmp_path)
+    script = tmp_path.parent / "outside_tools.py"
+    script.write_text("meaning = 42\n")
+
+    assert _resolve_target(f"{script}:meaning") == 42
 
 
 def test_instantiate_skips_kwargs_overridden_nested(tmp_module):
