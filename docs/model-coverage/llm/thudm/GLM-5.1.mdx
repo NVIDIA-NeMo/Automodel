@@ -1,0 +1,74 @@
+---
+title: "zai-org/GLM-5.1"
+description: "Fine-tune zai-org/GLM-5.1 on HellaSwag with NeMo AutoModel using LoRA or full fine-tuning recipes and documented distributed settings."
+slug: model-coverage/large-language-models/thudm/GLM-5.1
+---
+
+[GLM-5.1](https://huggingface.co/zai-org/GLM-5.1) has NeMo AutoModel recipes for low-rank adaptation (LoRA) and full fine-tuning on HellaSwag.
+The Hugging Face configuration declares the `GlmMoeDsaForCausalLM` architecture.
+
+## Quick Start
+
+Launch LoRA fine-tuning on HellaSwag with the recipe's example topology: 16 nodes with 8 GPUs each. After [installation](/get-started/installation) and [recipe setup](#recipe-setup), run this command from the repository root on every node:
+
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/glm/glm_5.1_lora.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | HellaSwag; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_lora.yaml) |
+| Full Fine-Tuning | HellaSwag; 32 nodes; PP4; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml) |
+
+## Model Context
+
+GLM-5.1 is used for text generation. Its model size is 753.86B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `GlmMoeDsaForCausalLM` |
+| Parameters | 753.86B checkpoint parameters |
+| Decoder Layers | 78 |
+| Hidden Size | 6,144 |
+| Attention | 64 attention heads / 64 key-value heads |
+| Context Length | 202,752 tokens (checkpoint configuration) |
+| Vocabulary Size | 154,880 |
+| Experts | 256 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+The following settings describe the LoRA recipe's example topology. In the workflow table, PP denotes pipeline parallelism and EP denotes expert parallelism.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 H100 GPUs per node (recipe CI example) |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=4`, `cp_size=1`, `ep_size=32` |
+| Nodes | 16 |
+| Features | LoRA, HybridEP (`dispatcher=hybridep`) |
+| Advanced | `attn=sdpa`, `linear=torch`, `experts=torch_mm`, `dispatcher=hybridep` |
+
+### Recipe Setup
+
+Both recipes require a DeepEP installation with HybridEP support (`deep_ep.HybridEPBuffer`) and its multi-node dependencies. DeepEP is in the `moe` extra, which the base installation and standard `all` extra omit. See the [container build](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile) for HybridEP, RDMA, and NVSHMEM setup. The full fine-tuning recipe also selects Transformer Engine linear layers, supplied by the `cuda` extra.
+
+Both recipes load the pretrained `zai-org/GLM-5.1` checkpoint and use the `rowan/hellaswag` dataset. They set `checkpoint.enabled: false`, so neither recipe saves trained weights or adapters. The LoRA example runs for 100 steps.
+
+For the Quick Start, set `NODE_RANK` to a unique value from `0` to `15` on each node and set `MASTER_ADDR` to the rank-zero node's hostname or IP address, reachable from every node on port `29500`. Use the same checkout and environment on all nodes. The [Slurm launcher guide](/job-launchers/slurm-cluster) explains how to prepare the distributed allocation.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`zai-org/GLM-5.1`](https://huggingface.co/zai-org/GLM-5.1) | Pretrained checkpoint for both fine-tuning recipes |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/zai-org/GLM-5.1/blob/26e1bd6e011feb778d25ae34b09b07074139d92d/config.json)

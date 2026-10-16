@@ -14,7 +14,7 @@
 
 # Single-node fine-tune of Gemma4 31B with TP=4 and PP=2.
 # Topology: 1 node x 8 GPUs = 8 GPUs total (TP4 x PP2, DP1).
-# Gemma4 31B has 46 decoder layers, split evenly: 23 layers on each PP rank.
+# Gemma4 31B has 60 decoder layers across 2 pipeline stages.
 #
 # torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
 #          -c examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp2.yaml

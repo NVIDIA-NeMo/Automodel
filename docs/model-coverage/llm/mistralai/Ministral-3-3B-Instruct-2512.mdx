@@ -1,0 +1,58 @@
+---
+title: "mistralai/Ministral-3-3B-Instruct-2512"
+description: "Fine-tune mistralai/Ministral-3-3B-Instruct-2512 with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/large-language-models/mistralai/Ministral-3-3B-Instruct-2512
+---
+
+[Ministral 3 3B Instruct](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512/blob/b35d4dfe56c142746f54dbd64f579faab2744308/README.md) is Mistral AI's instruction-tuned model with text and vision capabilities. This page covers text-only fine-tuning on SQuAD with NeMo AutoModel.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+On a host with eight GPUs, run from the repository root:
+
+```bash
+uv run automodel examples/llm_finetune/mistral/ministral3_3b_squad.yaml \
+  --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning (Language Model) | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/ministral3_3b_squad.yaml) |
+
+## Model Context
+
+The upstream model card reports a 3.4B-parameter language model and a 0.4B-parameter vision encoder. The recipe on this page trains the language model for text generation.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `Mistral3ForConditionalGeneration` |
+| Parameters | 3.4B language model; 0.4B vision encoder (upstream rounded counts) |
+| Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
+| Decoder Layers | 26 |
+| Hidden Size | 3,072 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+| Checkpoint Quantization | FP8 |
+
+### Workflow Notes
+
+The SQuAD recipe freezes `model.vision_tower` and `model.multi_modal_projector`. It uses fully sharded data parallelism (FSDP2), with tensor and context parallel sizes of 1. AutoModel dequantizes the FP8 checkpoint weights to `bfloat16` during loading.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Ministral-3 3B Instruct | [`mistralai/Ministral-3-3B-Instruct-2512`](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512/blob/b35d4dfe56c142746f54dbd64f579faab2744308/config.json)

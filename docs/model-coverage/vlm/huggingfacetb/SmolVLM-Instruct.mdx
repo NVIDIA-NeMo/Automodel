@@ -1,0 +1,58 @@
+---
+title: "HuggingFaceTB/SmolVLM-Instruct"
+description: "Fine-tune HuggingFaceTB/SmolVLM-Instruct with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/vision-language-models/huggingfacetb/SmolVLM-Instruct
+---
+
+[SmolVLM](https://huggingface.co/blog/smolvlm) is Hugging Face's compact vision language model designed for on-device and memory-constrained deployment, featuring an efficient image token compression strategy.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/vlm_finetune/huggingfacetb/smolvlm_instruct_medpix_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | MedPix-VQA; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/huggingfacetb/smolvlm_instruct_medpix_peft.yaml) |
+
+## Model Context
+
+SmolVLM-Instruct is used for image-text-to-text. Its model size is 2.25B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| **Architecture** | `Idefics3ForConditionalGeneration` (pinned checkpoint configuration) |
+| Parameters | 2.25B |
+| Hugging Face Organization | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB) |
+| Decoder Layers | 24 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads / 32 key-value heads |
+| Context Length | 16,384 tokens (checkpoint configuration) |
+| Vocabulary Size | 49,155 |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Setup
+
+Read [smolvlm_instruct_medpix_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/huggingfacetb/smolvlm_instruct_medpix_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| SmolVLM Instruct | [`HuggingFaceTB/SmolVLM-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-Instruct) |
+
+## Related Resources
+
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/HuggingFaceTB/SmolVLM-Instruct/blob/81cd9a775a4d644f2faf4e7becff4559b46b14c7/config.json)

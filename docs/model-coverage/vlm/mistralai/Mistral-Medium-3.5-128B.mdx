@@ -1,0 +1,70 @@
+---
+title: "mistralai/Mistral-Medium-3.5-128B"
+description: "Use NeMo AutoModel to fine-tune mistralai/Mistral-Medium-3.5-128B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/mistralai/Mistral-Medium-3.5-128B
+---
+
+[Mistral-Medium-3.5-128B](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Fine-tune the language model on MedPix-VQA with the vision tower frozen. Follow the [installation instructions](/get-started/installation) and complete [Recipe Setup](#recipe-setup). From the repository root on each of 8 nodes with 8 GPUs each, run:
+
+```bash
+uv run torchrun --nnodes 8 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 8 nodes; TP8; PP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml) |
+| LoRA Fine-Tuning | MedPix-VQA; 8 nodes; TP8; PP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix_lora.yaml) |
+
+## Model Context
+
+Mistral-Medium-3.5-128B is used for image-text-to-text. Its model size is 127.70B checkpoint parameters. Both recipes load pretrained weights and limit input sequences to 2,048 tokens. They set `checkpoint.enabled: false`, so they do not save fine-tuned checkpoints.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `Mistral3ForConditionalGeneration` |
+| NeMo AutoModel FP8 Architecture | `Mistral3FP8VLMForConditionalGeneration` |
+| Parameters | 127.70B checkpoint parameters |
+| Decoder Layers | 88 |
+| Hidden Size | 12,288 |
+| Attention | 96 attention heads and 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Example Hardware | 8 H100 80 GB GPUs per node (64 GPUs total) |
+| Strategy | Fully Sharded Data Parallel (FSDP2); tensor parallelism (TP): `tp_size=8`; pipeline parallelism (PP): `pp_size=8`; `cp_size=1`, `ep_size=1` |
+| Nodes | 8 |
+| Features | Activation checkpointing (`activation_checkpointing=true`) |
+| Training Dtype | `torch.bfloat16` |
+
+### Recipe Setup
+
+The hardware above is the recipes' example topology. Changing the GPU count requires compatible parallelism and batch settings. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+On every node, use the same repository checkout and environment. Set `NODE_RANK` to a unique value from `0` through `7`, and set `MASTER_ADDR` to the same reachable address of node `0`. Port `29500` must be reachable between nodes. The recipes load the checkpoint and `mmoukouba/MedPix-VQA` training and validation splits from Hugging Face.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`mistralai/Mistral-Medium-3.5-128B`](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Fine-Tune Gemma 3n (Related VLM Example)](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B/blob/22b2b868a15677cfa6061277ed2f653d1349a9ab/config.json)

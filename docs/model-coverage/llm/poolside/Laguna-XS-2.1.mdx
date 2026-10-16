@@ -1,0 +1,66 @@
+---
+title: "poolside/Laguna-XS-2.1"
+description: "Use NeMo AutoModel to fine-tune poolside/Laguna-XS-2.1 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/poolside/Laguna-XS-2.1
+---
+
+[Laguna-XS-2.1](https://huggingface.co/poolside/Laguna-XS-2.1) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `LagunaForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then launch full fine-tuning on HellaSwag from the repository root using eight GPUs on one node. Review [Workflow Notes](#workflow-notes) to configure checkpoint saving before running:
+
+```bash
+automodel examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | HellaSwag; 1 node; 8 GPUs; EP8; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml) |
+
+## Model Context
+
+Laguna-XS-2.1 is used for text generation. Its model size is 33.44B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `LagunaForCausalLM` |
+| Parameters | 33.44B checkpoint parameters |
+| Decoder Layers | 40 |
+| Hidden Size | 2,048 |
+| Attention | 48 query heads in global-attention layers and 64 in sliding-window layers; 8 key-value heads in both |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 100,352 |
+| Experts | 256 routed experts; 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+The recipe uses eight-way expert parallelism (EP8) and Fully Sharded Data Parallel version 2 (FSDP2).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs; the CI example uses H100 GPUs |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=8` |
+| Nodes | 1 |
+| Features | Activation checkpointing (`activation_checkpointing=true`); packed sequences (`packed_sequence_size=1024`) |
+| Advanced | `bfloat16`, `attn=sdpa`, `linear=torch`, `experts=torch_mm`, `dispatcher=torch` |
+
+### Workflow Notes
+
+The recipe loads pretrained weights and fine-tunes on HellaSwag. It sets `checkpoint.enabled=false`, so the run does not save fine-tuned weights. Set `checkpoint.enabled=true` in the YAML before training if you need an output checkpoint.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`poolside/Laguna-XS-2.1`](https://huggingface.co/poolside/Laguna-XS-2.1) | Pretrained checkpoint for the HellaSwag fine-tuning recipe |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+- [Checkpoint Configuration](https://huggingface.co/poolside/Laguna-XS-2.1/blob/c5f36269bbdbd3f27fddc9a9f9dbae0cf2cf57db/config.json)

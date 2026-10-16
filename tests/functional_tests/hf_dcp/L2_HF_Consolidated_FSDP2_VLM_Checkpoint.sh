@@ -20,7 +20,7 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
 -m pytest tests/functional_tests/checkpoint/test_hf_consolidated_vlm.py \
-  --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
+  --config tests/functional_tests/hf_transformer_vlm/configs/gemma3_vl_4b_cord_v2.yaml \
   --freeze_config.freeze_language_model false \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma3_2l/ \
   --step_scheduler.max_steps 10 \

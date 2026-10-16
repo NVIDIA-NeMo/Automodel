@@ -22,8 +22,8 @@ row order and of which other groups happen to be present.
 import pytest
 
 from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import (
-    _group_aware_split,
     ContextAwareRetrievalDatasetConfig,
+    _group_aware_split,
 )
 
 SEED = 42

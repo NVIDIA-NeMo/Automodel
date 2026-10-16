@@ -1,0 +1,78 @@
+---
+title: "meta-llama/Llama-3.1-8B"
+description: "Use NeMo AutoModel to fine-tune meta-llama/Llama-3.1-8B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/meta/Llama-3.1-8B
+---
+
+[Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), obtain access to the [gated checkpoint](https://huggingface.co/meta-llama/Llama-3.1-8B), and authenticate with an approved Hugging Face token (`HF_TOKEN`). Install `bitsandbytes` with the `cuda_source` extra, then run this quantized low-rank adaptation (QLoRA) example on SQuAD from the repository root, using eight GPUs on one node:
+
+```bash
+uv pip install "nemo-automodel[cuda_source]"
+automodel examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| QLoRA Fine-Tuning | SQuAD; 8-GPU example launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml) |
+| LoRA Benchmark | Synthetic data; 10 steps | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_1/llama3_1_8b_peft_benchmark.yaml) |
+
+## Model Context
+
+Llama-3.1-8B is used for text generation. Its model size is 8.03B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `LlamaForCausalLM` |
+| Parameters | 8.03B checkpoint parameters |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+These settings describe the SQuAD QLoRA recipe and the Quick Start launch.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs for the example launch; GPU model unspecified |
+| Strategy | FSDP2; `tp_size: 1`, `cp_size: 1` |
+| Nodes | 1 (Quick Start launch) |
+| Features | QLoRA: LoRA adapters with 4-bit NF4 quantization |
+| Advanced | Quantization compute and storage: `bfloat16`; double quantization enabled |
+
+### More Recipes for This Model
+
+- [`llama3_1_8b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_1/llama3_1_8b_peft_benchmark.yaml)
+- [`llama3_1_8b_quack_rope.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_1/llama3_1_8b_quack_rope.yaml)
+- [`llama3_1_8b_quack_rope_baseline.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_1/llama3_1_8b_quack_rope_baseline.yaml)
+- [`customizer_llama_3_1_8b_full_sft_tp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/customizer_llama_3_1_8b_full_sft_tp.yaml)
+- [`llama3_1_8b_columnmapped_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_columnmapped_lora.yaml)
+- [`llama3_1_8b_hellaswag_fp8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml)
+- [`llama3_1_8b_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp.yaml)
+- [`llama3_1_8b_hellaswag_pp_dynamic_seq_len.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp_dynamic_seq_len.yaml)
+- [`llama3_1_8b_instruct_squad_qlora_2node.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_instruct_squad_qlora_2node.yaml)
+- [`llama3_1_8b_squad_peft_rtx_spark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_squad_peft_rtx_spark.yaml)
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`meta-llama/Llama-3.1-8B`](https://huggingface.co/meta-llama/Llama-3.1-8B) | Pretrained checkpoint used by the Quick Start |
+| [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) | Instruction-tuned variant used by the customizer SFT and two-node QLoRA recipes |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-3.1-8B/blob/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b/config.json)

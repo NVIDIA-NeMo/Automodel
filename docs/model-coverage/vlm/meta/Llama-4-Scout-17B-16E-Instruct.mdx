@@ -1,0 +1,61 @@
+---
+title: "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+description: "Fine-tune meta-llama/Llama-4-Scout-17B-16E-Instruct with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/vision-language-models/meta/Llama-4-Scout-17B-16E-Instruct
+---
+
+[Llama 4](https://ai.meta.com/blog/llama-4-multimodal-intelligence/) is Meta's first natively multimodal model family. Llama 4 Scout and Maverick are mixture-of-experts (MoE) models supporting interleaved image and text inputs.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Complete the [recipe setup](#recipe-setup), then run this command from the repository root. This example uses 8 GPUs on one node; validate training and memory use on your hardware.
+
+```bash
+uv run automodel examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | MedPix-VQA; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml) |
+
+## Model Context
+
+Llama-4-Scout-17B-16E-Instruct generates text from image and text inputs. The [upstream model card](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/92f3b1597a195b523d8d9e5700e57e4fbb8f20d3/README.md) reports approximately 109B total parameters, with 17B active per token.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| **Architecture** | `Llama4ForConditionalGeneration` |
+| Parameters | Approximately 109B total; 17B active per token (MoE) |
+| Hugging Face Organization | [meta-llama](https://huggingface.co/meta-llama) |
+| Decoder Layers | 48 |
+| Hidden Size | 5,120 |
+| Attention | 40 attention heads / 8 key-value heads |
+| Context Length | 10,485,760 tokens (checkpoint configuration) |
+| Vocabulary Size | 202,048 |
+| Experts | 16 routed / 1 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Setup
+
+Follow the [installation instructions](/get-started/installation), including the VLM dependencies. Request access to the [Hugging Face checkpoint](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) and wait for approval. Authenticate the training environment with a token from the approved account that can read the checkpoint, for example by setting `HF_TOKEN`.
+
+The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml) loads pretrained weights for LoRA fine-tuning on 1,000 MedPix-VQA training examples and 100 validation examples. It saves checkpoints under `checkpoints/llama_4_scout_17b_16e_instruct`.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Llama-4-Scout-17B-16E-Instruct | [`meta-llama/Llama-4-Scout-17B-16E-Instruct`](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) |
+
+## Related Resources
+
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/92f3b1597a195b523d8d9e5700e57e4fbb8f20d3/config.json)

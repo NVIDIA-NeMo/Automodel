@@ -189,9 +189,7 @@ def _run_biencoder_recipe_case() -> None:
     model = BiEncoderModel(Mistral3BidirectionalModel(_tiny_config()), pooling="avg", l2_normalize=True).to(device)
     reference = copy.deepcopy(model)
     initial_state = {name: value.detach().clone() for name, value in reference.state_dict().items()}
-    mesh = init_device_mesh(
-        "cuda", (1, 2, 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp")
-    )
+    mesh = init_device_mesh("cuda", (1, 2, 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"))
     policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
     fsdp2_strategy_parallelize(
         model,
@@ -207,9 +205,7 @@ def _run_biencoder_recipe_case() -> None:
 
     query_ids = torch.tensor([[1, 2, 3, 4]], device=device)
     passage_ids = torch.tensor(
-        [[10, 10, 10, 10, 1, 2], [1, 3, 4, 5, 0, 0]]
-        if dist.get_rank()
-        else [[1, 2, 3, 4, 0, 0], [1, 3, 4, 5, 0, 0]],
+        [[10, 10, 10, 10, 1, 2], [1, 3, 4, 5, 0, 0]] if dist.get_rank() else [[1, 2, 3, 4, 0, 0], [1, 3, 4, 5, 0, 0]],
         device=device,
     )
     batch = {

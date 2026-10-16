@@ -1,0 +1,64 @@
+---
+title: "mistralai/Ministral-3-8B-Reasoning-2512"
+description: "Use NeMo AutoModel to fine-tune mistralai/Ministral-3-8B-Reasoning-2512 for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/mistralai/Ministral-3-8B-Reasoning-2512
+---
+
+[Ministral-3-8B-Reasoning-2512](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), including the `vlm` and `vlm-media` extras. From the repository root, fine-tune on MedPix-VQA with the example's eight-GPU launch:
+
+```bash
+automodel examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 8-GPU example | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml) |
+
+## Model Context
+
+Ministral-3-8B-Reasoning-2512 is used for image-text-to-text. Its model size is 8.92B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `Mistral3ForConditionalGeneration` |
+| Parameters | 8.92B checkpoint parameters |
+| Decoder Layers | 34 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs in the example launch; GPU model and memory are not specified |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); `tp_size: 1`, `cp_size: 1` |
+| Nodes | 1 for the local Quick Start |
+| Features | Checkpoint saving enabled; `safetensors` format in `vlm_checkpoints/` |
+| Advanced | `torch.bfloat16`; `attn_implementation: eager`; `torch.optim.AdamW` |
+
+### Workflow Notes
+
+The recipe loads pretrained weights and freezes the vision tower while fine-tuning the language model. It uses `mmoukouba/MedPix-VQA`, with `train[:1000]` for training and `validation[:500]` for validation. It runs for one epoch with a global batch size of 8 and a local batch size of 1.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`mistralai/Ministral-3-8B-Reasoning-2512`](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512) | Pretrained checkpoint used by the fine-tuning recipe |
+
+## Related Resources
+
+- [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512/blob/81eaece1948f3875421d9a45bc55487d10e2d894/config.json)

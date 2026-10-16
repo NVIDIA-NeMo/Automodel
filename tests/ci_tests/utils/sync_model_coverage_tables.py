@@ -24,11 +24,6 @@ from pathlib import Path
 import yaml
 
 TABLE_ROW_COUNT = 10
-# Both Muse source paths are linked by published NVIDIA and Meta blog posts.
-# Keep the compatibility copy on disk, but catalog only the canonical card.
-MODEL_CARD_PATH_ALIASES = {
-    "docs/model-coverage/vlm/muse/muse_spark_open.mdx": "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx",
-}
 HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
 HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"
 SUPPORT_LOG_START_MARKER = "{/* BEGIN GENERATED MODEL SUPPORT LOG */}"
@@ -345,7 +340,7 @@ def _load_model_doc_catalog(
     model_coverage_root = docs_root / "model-coverage"
     for directory, model_type in directory_types.items():
         for path in sorted((model_coverage_root / directory).glob("*/*.mdx")):
-            if path.name == "index.mdx" or path.relative_to(docs_root.parent).as_posix() in MODEL_CARD_PATH_ALIASES:
+            if path.name == "index.mdx":
                 continue
             document = path.read_text(encoding="utf-8")
             slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
@@ -354,7 +349,11 @@ def _load_model_doc_catalog(
             docs_page = f"/{slug_match.group(1)}"
             if not DOCS_PAGE_PATTERN.fullmatch(docs_page):
                 raise ValueError(f"Model coverage page has an invalid slug: {path}")
-            architecture_match = re.search(r"^\| \*\*Architecture\*\* \| ([^|]+) \|$", document, flags=re.MULTILINE)
+            architecture_match = re.search(
+                r"^\| (?:\*\*)?(?:Hugging Face )?Architecture(?:\*\*)? \| ([^|]+) \|$",
+                document,
+                flags=re.MULTILINE,
+            )
             architecture_display = architecture_match.group(1).strip() if architecture_match else ""
             page_architectures = (
                 tuple(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", architecture_match.group(1)))
@@ -730,8 +729,13 @@ def _render_architecture_name(architecture: str, aliases: dict[str, str]) -> str
 
 
 def _render_registry_table(
-    entries: list[tuple[str, str, str]], documented_architectures: set[str], aliases: dict[str, str]
+    entries: list[tuple[str, str, str]],
+    documented_architectures: set[str],
+    aliases: dict[str, str],
+    *,
+    diffusion_architectures: set[str] | None = None,
 ) -> str:
+    diffusion_architectures = diffusion_architectures or set()
     native_architectures = {architecture for architecture, _, _ in entries}
     native_rows = [
         f"| {_render_architecture_name(architecture, aliases)} | NeMo native | `{module_path}.{class_name}` |"
@@ -739,7 +743,8 @@ def _render_registry_table(
         if architecture in documented_architectures
     ]
     hf_rows = [
-        f"| {_render_architecture_name(architecture, aliases)} | Hugging Face | `transformers` |"
+        f"| {_render_architecture_name(architecture, aliases)} | Hugging Face | "
+        f"`{'diffusers' if architecture in diffusion_architectures else 'transformers'}` |"
         for architecture in sorted(documented_architectures - native_architectures, key=str.casefold)
     ]
     return "\n".join(
@@ -790,6 +795,12 @@ def _generate_tables(repo_root: Path, *, validate_model_cards: bool = True) -> d
         _parse_registry_entries(registry_source),
         documented_architectures,
         _parse_doc_arch_aliases(aliases_source),
+        diffusion_architectures={
+            architecture
+            for model in documented_models
+            if model.model_type == "Diffusion"
+            for architecture in model.architectures
+        },
     )
     generated_documents = {
         support_log_path: _replace_generated_block(

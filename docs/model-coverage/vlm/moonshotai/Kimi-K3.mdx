@@ -1,0 +1,65 @@
+---
+title: "moonshotai/Kimi-K3"
+description: "Explore moonshotai/Kimi-K3's vision-language architecture and fine-tune its text-only backbone on HellaSwag with NeMo AutoModel."
+slug: model-coverage/vision-language-models/moonshotai/Kimi-K3
+---
+
+[Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) is a Moonshot AI vision-language model with a MoonViT3d vision tower and a Kimi Linear Mixture-of-Experts language backbone.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Use the recipe's 64 nodes with 4 GPUs each. On each node, set `NODE_RANK` to its unique rank (`0` through `63`) and `MASTER_ADDR` to node 0's reachable hostname or IP address. Run from the repository root on every node after completing the [recipe prerequisites](#model-context).
+
+```bash
+uv run --extra fla torchrun --nnodes 64 --nproc-per-node 4 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/kimi/k3_hellaswag.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Text-Only Full Fine-Tuning | HellaSwag; 64 nodes with 4 GPUs each; PP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k3_hellaswag.yaml) |
+
+## Model Context
+
+Kimi-K3 supports image-text-to-text and text generation. The [upstream model card](https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/README.md) reports 2.8 trillion total parameters and 104 billion active parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text and Text Generation |
+| AutoModel Architectures | `KimiK3ForConditionalGeneration`, `KimiK3ForCausalLM` |
+| Hugging Face Organization | [moonshotai](https://huggingface.co/moonshotai) |
+| **Architecture** | `KimiK3ForConditionalGeneration` (checkpoint) |
+| Parameters | 2.8T total; 104B active (upstream report) |
+| Decoder Layers | 93 |
+| Hidden Size | 7,168 |
+| Attention | 96 attention heads / 96 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 163,840 |
+| Experts | 896 routed / 2 shared / 16 selected per token |
+| Configured Dtype | `bfloat16` |
+
+The HellaSwag recipe loads pretrained weights into `KimiK3ForCausalLM` and fine-tunes the text-only backbone. It uses pipeline parallelism across 8 stages (PP8) and expert parallelism across 32 ranks (EP32). The 256-GPU launch matches the recipe's global batch size of 256 and local batch size of 8; changing the topology also requires compatible batch and parallelism settings.
+
+Before launching, make the source checkout and recipe available on every node. Kimi-K3 requires Flash Linear Attention, provided by the `fla` extra selected in the command. The model and tokenizer use `moonshotai/Kimi-K3`, and the dataset is `Rowan/hellaswag`.
+
+The recipe sets `checkpoint.enabled: false`, so it does not save trained checkpoints. Enable checkpoint saving in the YAML if you need to retain the fine-tuned weights.
+
+- `KimiK3ForConditionalGeneration` combines the MoonViT3d vision tower and multimodal projector with the Kimi Linear language backbone.
+- `KimiK3ForCausalLM` exposes the text-only Kimi Linear backbone.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Kimi-K3 | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+- [Gemma 3n Fine-Tuning Example](/recipes-e2e-examples/gemma-3-3n)
+- [Checkpoint Configuration](https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json)

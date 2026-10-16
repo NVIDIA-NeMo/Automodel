@@ -1,0 +1,64 @@
+---
+title: "Qwen/Qwen2.5-Omni-3B"
+description: "Use Qwen/Qwen2.5-Omni-3B with NeMo AutoModel for multimodal fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/omni/qwen/Qwen2.5-Omni-3B
+---
+
+[Qwen2.5-Omni](https://qwenlm.github.io/blog/qwen2.5-omni/) is Alibaba Cloud's omnimodal model supporting text, image, audio, and video inputs in a single unified architecture with a dense language backbone. NeMo AutoModel onboards the **Thinker** stack for audio understanding tasks such as automatic speech recognition (ASR).
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+The example launches eight GPU workers on one node. From the repository root, run:
+
+```bash
+uv run --extra all automodel --nproc-per-node=8 examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Speech Recognition Fine-Tuning | AMI meeting corpus | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml) |
+
+## Model Context
+
+Qwen2.5-Omni-3B accepts text, image, audio, and video inputs. The full checkpoint reports approximately 5.54B parameters in its [pinned metadata](https://huggingface.co/api/models/Qwen/Qwen2.5-Omni-3B/revision/f75b40e3da2003cdd6e1829b1f420ca70797c34e). NeMo AutoModel loads the Thinker stack; Talker and token-to-waveform weights are excluded.
+
+| Property | Value |
+| --- | --- |
+| Task | Omnimodal understanding (text, image, audio, and video) |
+| **Architecture** | `Qwen2_5OmniForConditionalGeneration` |
+| Parameters | 5.54B (full checkpoint) |
+| Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 36 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads and 2 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
+
+The decoder, hidden size, attention, context length, and vocabulary values above describe the Thinker text configuration.
+
+The AMI recipe loads pretrained weights, fine-tunes the audio tower and language model, and freezes the vision tower. It uses Fully Sharded Data Parallelism v2 (FSDP2) and enables checkpoint saving to `result/checkpoints/qwen2_5_omni_asr_ami`.
+
+The Quick Start selects the `all` extra, which includes Transformer Engine for the recipe's `linear: te` backend, `soundfile` for audio decoding, and the `cli` dependencies.
+
+The registry wires the Qwen2.5-Omni Thinker backbone under the following architecture keys:
+
+- `Qwen2_5OmniForConditionalGeneration`
+- `Qwen2_5OmniModel`
+- `Qwen2_5OmniThinkerForConditionalGeneration`
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Qwen2.5-Omni 3B | [`Qwen/Qwen2.5-Omni-3B`](https://huggingface.co/Qwen/Qwen2.5-Omni-3B) |
+
+## Related Resources
+
+- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen2.5-Omni-3B/blob/f75b40e3da2003cdd6e1829b1f420ca70797c34e/config.json)

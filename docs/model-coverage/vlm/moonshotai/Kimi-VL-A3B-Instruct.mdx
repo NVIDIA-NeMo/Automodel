@@ -1,0 +1,55 @@
+---
+title: "moonshotai/Kimi-VL-A3B-Instruct"
+description: "Fine-tune moonshotai/Kimi-VL-A3B-Instruct with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/vision-language-models/moonshotai/Kimi-VL-A3B-Instruct
+---
+
+[Kimi-VL-A3B-Instruct](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct) is a vision-language model from Moonshot AI. It combines a mixture-of-experts (MoE) language backbone with the MoonViT vision encoder for image understanding and multimodal reasoning.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+This example launches eight GPU workers. Review the [recipe setup](#model-context), then run from the repository root:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | CORD-v2; 8 GPUs; expert parallelism size 8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml) |
+
+## Model Context
+
+Kimi-VL-A3B-Instruct has approximately 16 billion total parameters and 3 billion active parameters. The [pinned model card](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/398eede0903cd983a2bfa0cc634e9ac1d843f375/README.md) reports these rounded counts.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| **Architecture** | `KimiVLForConditionalGeneration` |
+| Parameters | ~16B total; ~3B active (MoE) |
+| Hugging Face Organization | [moonshotai](https://huggingface.co/moonshotai) |
+| Decoder Layers | 27 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 16 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 163,840 |
+| Experts | 64 routed / 2 shared / 6 selected per token |
+| Configured Dtype | `bfloat16` |
+
+The recipe loads pretrained weights and fine-tunes on CORD-v2 with the vision tower frozen. It uses fully sharded data parallelism (FSDP2) and expert parallelism across eight GPUs. It selects TransformerEngine and DeepEP. For source installations, add `--extra moe` to the installation guide's `uv sync --locked --all-groups --extra all` command; the `all` extra alone omits DeepEP. Changing the GPU count also requires compatible parallelism and batch settings.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Kimi-VL-A3B-Instruct | [`moonshotai/Kimi-VL-A3B-Instruct`](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct) |
+
+## Related Resources
+
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/398eede0903cd983a2bfa0cc634e9ac1d843f375/config.json)

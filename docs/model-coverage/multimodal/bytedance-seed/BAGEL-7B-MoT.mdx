@@ -1,0 +1,74 @@
+---
+title: "ByteDance-Seed/BAGEL-7B-MoT"
+description: "Fine-tune ByteDance-Seed/BAGEL-7B-MoT with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/multimodal/bytedance-seed/BAGEL-7B-MoT
+---
+
+[BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) is a unified multimodal model from ByteDance Seed. It combines a Qwen2.5 language backbone, a SigLIP-NaViT vision encoder, and a Mixture-of-Transformer-Experts (MoT) architecture for joint understanding and visual-generation training.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Complete the [recipe setup](#recipe-setup), then launch fine-tuning with prepared BAGEL-format data from the repository root. This example uses one node with 8 GPUs.
+
+```bash
+uv run automodel examples/multimodal_finetune/bagel/bagel_sft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Multimodal Pretraining | Prepared image, editing, and vision-language data; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_pretrain/bagel/bagel_pretrain.yaml) |
+| Multimodal Fine-Tuning | Prepared image, editing, and vision-language data; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml) |
+
+## Model Context
+
+BAGEL-7B-MoT supports image and text understanding and image generation. The [upstream model card](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT/blob/5019f57d168e5816e8f3f701b17cc816bb7cf24b/README.md) reports 14B total parameters and 7B active parameters. The decoder dimensions below describe its language backbone.
+
+| Property | Value |
+| --- | --- |
+| Task | Image and text understanding and image generation |
+| Architecture | `BagelForUnifiedMultimodal`, `BagelForConditionalGeneration` |
+| Parameters | 14B total, 7B active (upstream report) |
+| Hugging Face Organization | [ByteDance-Seed](https://huggingface.co/ByteDance-Seed) |
+| Decoder Layers | 28 |
+| Hidden Size | 3,584 |
+| Attention | 28 attention heads and 4 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 152,064 |
+| Checkpoint Dtype | `bfloat16` |
+
+### Recipe Setup
+
+1. Follow the [installation instructions](/get-started/installation) with Transformer Engine (`cuda` extra) and FlashAttention (`fa` extra) available. Both recipes select Transformer Engine for linear and normalization layers, and the vision encoder requires FlashAttention. The standard `all` extras bundle does not include `fa`.
+2. Replace the placeholder paths and sample counts under `dataset.dataset_info` in the selected YAML with prepared BAGEL-format image-generation, image-editing, and vision-language data. Update `dataset.grouped_datasets` to match your data.
+3. For fine-tuning, make the BAGEL checkpoint accessible. The recipe loads pretrained BAGEL weights and resolves `ae.safetensors` from the same local checkpoint directory or Hugging Face repository; `model.vae_path` can override that location.
+4. For pretraining, make the Qwen and SigLIP initializers listed below accessible and replace `model.vae_path: /path/to/ae.safetensors` with the local autoencoder checkpoint path. The pretraining recipe initializes BAGEL from those pretrained backbones.
+
+### Pretrain BAGEL-7B-MoT
+
+After completing [Recipe Setup](#recipe-setup), run from the repository root:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/multimodal_pretrain/bagel/bagel_pretrain.yaml
+```
+
+### Workflow Notes
+
+Both recipes use FSDP2 with `bfloat16` mixed precision and activation checkpointing. They run for 100 steps with `checkpoint.enabled: false`, so they do not save trained weights. To save trained weights, set `checkpoint.enabled: true`. Adjust `step_scheduler.ckpt_every_steps` for periodic saves.
+
+## Available Models
+
+| Checkpoint | Role |
+|---|---|
+| [`ByteDance-Seed/BAGEL-7B-MoT`](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | Pretrained checkpoint for fine-tuning |
+| [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Language initializer for BAGEL pretraining |
+| [HuggingFaceM4/siglip-so400m-14-980-flash-attn2-navit](https://huggingface.co/HuggingFaceM4/siglip-so400m-14-980-flash-attn2-navit) | Vision initializer for BAGEL pretraining |
+
+## Related Resources
+
+- [Pretraining Guide](/recipes-e2e-examples/pretraining)
+
+- [Checkpoint Configuration](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT/blob/5019f57d168e5816e8f3f701b17cc816bb7cf24b/config.json)

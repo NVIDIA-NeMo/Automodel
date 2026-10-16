@@ -1,0 +1,69 @@
+---
+title: "Qwen/Qwen3.5-35B-A3B"
+description: "Fine-tune Qwen/Qwen3.5-35B-A3B on MedPix-VQA with NeMo AutoModel using vision-language recipes with expert parallelism and optional sequence packing."
+slug: model-coverage/vision-language-models/qwen/Qwen3.5-35B-A3B
+---
+
+[Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Qwen3_5MoeForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and [recipe prerequisites](#recipe-prerequisites). From the repository root, launch MedPix-VQA fine-tuning with the recipe's eight-GPU example configuration:
+
+```bash
+automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml) |
+| Vision-Language Fine-Tuning With Packing | MedPix-VQA; PP2; EP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b_neat_packing.yaml) |
+
+## Model Context
+
+Qwen3.5-35B-A3B combines Gated DeltaNet layers, gated attention, and mixture-of-experts layers for image-text-to-text. Its checkpoint contains 35.95B parameters. Both recipes load pretrained weights and fine-tune the language model while keeping the vision encoder frozen.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Qwen3_5MoeForConditionalGeneration` |
+| Parameters | 35.95B checkpoint parameters |
+| Decoder Layers | 40 |
+| Hidden Size | 2,048 |
+| Attention | Gated DeltaNet: 16 query/key heads and 32 value heads; gated attention: 16 query heads and 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration); recipes use a 2,048-token maximum length |
+| Vocabulary Size | 248,320 |
+| Experts | 256 routed experts; 8 selected per token, plus 1 shared expert |
+
+### Recipe Prerequisites
+
+Use a compatible NeMo AutoModel container with DeepEP and HybridEP available, or select the `vlm` and `moe` extras for a source installation. The pinned DeepEP dependency supplies both dispatchers; building it from source requires its CUDA build prerequisites. The base package and `all` bundle omit DeepEP. For the neat-packing recipe's requested FlashAttention 2 implementation, include the `fa` extra. See the [installation instructions](/get-started/installation) for environment setup.
+
+The neat-packing recipe sets `checkpoint.enabled: false`, so it does not save trained weights. Enable checkpoint saving and configure a writable `checkpoint.checkpoint_dir` to retain them. The primary recipe enables checkpoint saving to `/checkpoints/qwen3_5_35b/`; ensure that directory is writable or change it.
+
+### Primary Recipe Configuration
+
+Expert parallelism (EP) distributes experts across ranks; pipeline parallelism (PP) divides the model into stages. The primary recipe uses EP8, while the packed recipe uses PP2 and EP4.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | Eight-GPU example launch |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=8` |
+| Nodes | 1 |
+| Features | Checkpoint saving (`checkpoint.enabled=true`), activation checkpointing (`activation_checkpointing=true`), HybridEP (`dispatcher=hybridep`) |
+| Advanced | `attn=sdpa`, `linear=torch`, `experts=torch_mm`, `dispatcher=hybridep` |
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3.5-35B-A3B`](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | Pretrained checkpoint for both fine-tuning recipes |
+
+## Related Resources
+
+- [Gemma 3n fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+- [Upstream Model Overview](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/59d61f3ce65a6d9863b86d2e96597125219dc754/README.md#model-overview)
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/59d61f3ce65a6d9863b86d2e96597125219dc754/config.json)

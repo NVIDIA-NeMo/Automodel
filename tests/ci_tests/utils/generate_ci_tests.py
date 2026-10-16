@@ -359,6 +359,17 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
             job["variables"]["MODEL_FAMILY"] = model_name
             pipeline[f"{config_name}{suffix}{job_name_suffix}"] = job
 
+    # GitLab rejects a child with no runnable jobs after every recipe is excluded.
+    # Use the same untagged runner as the generation job; never launch Slurm.
+    if len(pipeline) == 1 and yml_configs:
+        pipeline[f"no_enrolled_{test_folder}_tests{job_name_suffix}"] = {
+            "stage": "functional_test",
+            "variables": {"GIT_STRATEGY": "none"},
+            "rules": [{"when": "always"}],
+            "script": ["echo 'No enrolled AutoModel recipes remain in this scope.'"],
+            "timeout": "5 minutes",
+        }
+
     return pipeline
 
 

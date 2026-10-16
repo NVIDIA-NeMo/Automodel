@@ -1,0 +1,72 @@
+---
+title: "Qwen/Qwen3.5-9B"
+description: "Use NeMo AutoModel to fine-tune Qwen/Qwen3.5-9B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/qwen/Qwen3.5-9B
+---
+
+[Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Qwen3_5ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) for a source checkout and review
+the [recipe prerequisites](#workflow-notes). From the repository root, launch this example on one node with eight GPUs:
+
+```bash
+uv run --extra vlm --group dev automodel examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml \
+  --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml) |
+
+## Model Context
+
+Qwen3.5-9B is used for image-text-to-text. Its model size is 9.65B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `Qwen3_5ForConditionalGeneration` |
+| Parameters | 9.65B checkpoint parameters |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | Hybrid: 24 linear-attention layers and 8 full-attention layers; full attention uses 16 query heads and 4 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | Eight GPUs in the launch example; GPU model and memory not specified by the recipe |
+| Strategy | Fully Sharded Data Parallelism v2 (FSDP2); `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=1`, `dp_replicate_size=1` |
+| Nodes | One in the launch example |
+| Features | Checkpoint saving enabled (`checkpoint.enabled=true`) |
+| Advanced | `attn=sdpa`, `linear=torch` |
+
+### Workflow Notes
+
+The Quick Start selects the `vlm` extra and the `dev` dependency group. The recipe's
+`FusedLinearCrossEntropy` loss requires `cut-cross-entropy` from `dev`, which is outside
+the default dependency groups.
+
+The recipe loads pretrained weights, fine-tunes on MedPix-VQA, and saves consolidated
+SafeTensors checkpoints to `/tmp/checkpoints/qwen3_5_9b/`. Choose a persistent checkpoint
+directory to retain the results. If you change the process count, adjust the batch and
+parallelism settings together.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3.5-9B`](https://huggingface.co/Qwen/Qwen3.5-9B) | Pretrained checkpoint used by the recipe |
+
+## Related Resources
+
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-9B/blob/c202236235762e1c871ad0ccb60c8ee5ba337b9a/config.json)

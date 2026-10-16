@@ -1,0 +1,67 @@
+---
+title: "mistralai/Mistral-Small-4-119B-2603"
+description: "Fine-tune mistralai/Mistral-Small-4-119B-2603 on MedPix-VQA with NeMo AutoModel's vision-language recipe and documented distributed launch settings."
+slug: model-coverage/large-language-models/mistralai/Mistral-Small-4-119B-2603
+---
+
+[Mistral-Small-4-119B-2603](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603) accepts image and text inputs and generates text. Use the checked-in NeMo AutoModel vision-language recipe to fine-tune it on MedPix-VQA.
+The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). This example fine-tunes on MedPix-VQA using 4 nodes with 8 GPUs each. Complete the [recipe setup](#recipe-setup), then run from the repository root on every node.
+
+```bash
+uv run torchrun --nnodes 4 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/mistral4/mistral4_medpix.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 4 nodes; 8 GPUs per node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml) |
+
+## Model Context
+
+Mistral-Small-4-119B-2603 is a multimodal mixture-of-experts model with 119.40B checkpoint parameters. The recipe trains on medical images and questions from MedPix-VQA while keeping the vision tower frozen.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-and-text-to-text fine-tuning |
+| **Architecture** | `Mistral3ForConditionalGeneration` |
+| Parameters | 119.40B checkpoint parameters |
+| Decoder Layers | 36 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads and 32 key-value heads |
+| Context Length | 1,048,576 configured positions; 256k-token context documented upstream |
+| Vocabulary Size | 131,072 |
+| Experts | 128 routed experts; 1 shared expert; 4 routed experts selected per token |
+| Configured Dtype | `bfloat16` |
+| Checkpoint Quantization | FP8; the recipe enables `dequantize_base_checkpoint` |
+
+The [upstream model card](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603/blob/a11f36bebf709121056b1dbcc943d1c6afbe494d/README.md) documents a 256k-token context window. The larger checkpoint position limit does not establish a validated training length; this recipe sets the training collator's `max_length` to 2,048.
+
+### Recipe Setup
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation, then configure each node:
+
+1. Use the same repository checkout and environment, with Transformer Engine installed for the recipe's `linear: te` and `rms_norm: te` backends.
+2. Ensure access to `mistralai/Mistral-Small-4-119B-2603` and the `mmoukouba/MedPix-VQA` dataset.
+3. Set `NODE_RANK` to a unique value from `0` through `3`. Set `MASTER_ADDR` on every node to the rank 0 node's reachable hostname or IP address. The command uses port `29500`.
+
+### Workflow Notes
+
+The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml) uses Fully Sharded Data Parallel (FSDP2), pipeline parallelism (`pp_size: 4`), and expert parallelism (`ep_size: 8`). Checkpoint saving is disabled (`checkpoint.enabled: false`); enable it if you need saved checkpoints.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`mistralai/Mistral-Small-4-119B-2603`](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603) | Base checkpoint for MedPix-VQA fine-tuning |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603/blob/a11f36bebf709121056b1dbcc943d1c6afbe494d/config.json)

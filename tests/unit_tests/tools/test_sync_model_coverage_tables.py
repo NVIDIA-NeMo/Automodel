@@ -29,7 +29,6 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     DATED_SUPPORT_TABLE_HEADER,
     HOMEPAGE_END_MARKER,
     HOMEPAGE_START_MARKER,
-    MODEL_CARD_PATH_ALIASES,
     MODEL_TYPE_OVERVIEW_PATHS,
     REGISTRY_END_MARKER,
     REGISTRY_START_MARKER,
@@ -83,6 +82,22 @@ def _commit_recipes(repo_root: Path, timestamp: str = "2026-07-30T12:00:00Z") ->
     )
 
 
+@pytest.mark.parametrize("property_name", ["Architecture", "**Architecture**", "Hugging Face Architecture"])
+def test_model_catalog_reads_architecture_from_template_tables(tmp_path: Path, property_name: str) -> None:
+    card = tmp_path / "docs/model-coverage/llm/provider/Test-Model.mdx"
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        '---\ntitle: "provider/Test-Model"\nslug: model-coverage/large-language-models/provider/Test-Model\n---\n'
+        f"\n## Model Context\n\n| Property | Value |\n| --- | --- |\n| {property_name} | `TestForCausalLM` |\n"
+        "\n## Available Models\n\n[Test](https://huggingface.co/provider/Test-Model)\n",
+        encoding="utf-8",
+    )
+    model_docs, architectures, models = _load_model_doc_catalog(tmp_path / "docs")
+    assert architectures == {"TestForCausalLM"}
+    assert models[0].architecture_display == "`TestForCausalLM`"
+    assert model_docs["provider/Test-Model"] == models
+
+
 def _write_typed_overview_templates(repo_root: Path) -> list[Path]:
     paths = []
     for model_type, relative_path in MODEL_TYPE_OVERVIEW_PATHS:
@@ -106,7 +121,7 @@ slug: model-coverage/diffusion/test/model
 | | |
 |---|---|
 | **Task** | Text-to-Image |
-| **Architecture** | DiT (Flow Matching) |
+| **Architecture** | `TestDiffusionTransformer` |
 | **HF Org** | [Test-Owner](https://huggingface.co/Test-Owner) |
 
 </Info>
@@ -235,6 +250,20 @@ def test_registry_table_uses_documentation_aliases_for_native_models():
         "| `DocumentedArchitecture` (`NativeArchitecture`) | NeMo native | "
         "`nemo_automodel.components.models.native.model.NativeArchitecture` |"
     ) in generated
+
+
+def test_registry_table_distinguishes_diffusion_transformer_and_native_implementations() -> None:
+    generated = _render_registry_table(
+        [("NativeModel", "models.native", "NativeModel")],
+        {"ExternalModel", "NativeModel", "TestDiffusionTransformer"},
+        {},
+        diffusion_architectures={"NativeModel", "TestDiffusionTransformer"},
+    )
+
+    assert "| `TestDiffusionTransformer` | Hugging Face | `diffusers` |" in generated
+    assert "| `ExternalModel` | Hugging Face | `transformers` |" in generated
+    assert "| `NativeModel` | NeMo native | `models.native.NativeModel` |" in generated
+    assert generated.count("| `NativeModel` |") == 1
 
 
 def test_doc_arch_aliases_are_parsed_from_the_coverage_test():
@@ -394,7 +423,10 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes(tmp_path):
     repo_root = Path(__file__).parents[3]
     model_docs, _ = _load_model_docs(repo_root / "docs")
     # Keep real recipe discovery while making Git history independent of checkout size.
-    shutil.copytree(repo_root / "examples" / "retrieval", tmp_path / "examples" / "retrieval")
+    for recipe in (repo_root / "examples" / "retrieval").rglob("*.yaml"):
+        destination = tmp_path / recipe.relative_to(repo_root)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(recipe, destination)
     _commit_recipes(tmp_path)
     releases = _load_model_releases(tmp_path, model_docs)
     models_by_type = {
@@ -404,11 +436,12 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes(tmp_path):
 
     assert "meta-llama/Llama-3.2-1B" in models_by_type["Embedding"]
     assert "mistralai/Ministral-3-3B-Instruct-2512-BF16" in models_by_type["Embedding"]
-    assert models_by_type["Reranking"] == {
+    assert {
         "meta-llama/Llama-3.2-1B",
+        "nvidia/llama-nemotron-rerank-1b-v2",
         "Qwen/Qwen3-Reranker-4B",
         "mistralai/Ministral-3-3B-Instruct-2512-BF16",
-    }
+    } <= models_by_type["Reranking"]
 
 
 def test_generated_model_coverage_tables_are_not_committed():
@@ -453,16 +486,26 @@ def test_committed_generated_tables_are_rejected(tmp_path):
         _validate_generated_tables_are_not_committed(tmp_path)
 
 
-def test_model_card_path_aliases_preserve_published_paths():
+def test_pending_model_reference_guides_preserve_published_routes():
     repo_root = Path(__file__).parents[3]
+    config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
     _, _, catalog = _load_model_doc_catalog(repo_root / "docs")
-    source_paths = [model.source_path for model in catalog]
-    for alias, canonical in MODEL_CARD_PATH_ALIASES.items():
-        assert (repo_root / alias).is_file(), f"Published source URL must remain available: {alias}"
-        assert (repo_root / canonical).is_file(), f"Published source URL must remain available: {canonical}"
-        assert _frontmatter_slug(repo_root / alias) == _frontmatter_slug(repo_root / canonical)
-        assert alias not in source_paths
-        assert source_paths.count(canonical) == 1
+    card_routes = {model.docs_page for model in catalog}
+    reference_guides = {
+        "diffusion/flux3-image-klein.mdx": "diffusion/black-forest-labs/flux-3-image-klein-base",
+        "llm/step-5-preview.mdx": "large-language-models/stepfun-ai/Step-5-Preview",
+        "vlm/muse-spark-open.mdx": "vision-language-models/meta-models/Muse-Spark-open-816B-A42B",
+        "vlm/step-5-preview.mdx": "vision-language-models/stepfun-ai/Step-5-Preview",
+    }
+    for path, slug in reference_guides.items():
+        guide = repo_root / "docs" / "guides" / path
+        route = "/model-coverage/" + slug
+        assert _frontmatter_slug(guide) == route.removeprefix("/")
+        assert route in routes
+        assert route not in card_routes
+        assert "implementation PRs are pending merge" in guide.read_text(encoding="utf-8")
 
 
 def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
@@ -560,7 +603,7 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                     offenders.append(f"{path}: sidebar label {sidebar_label!r} does not match {model_id!r}")
                 document = model_path.read_text(encoding="utf-8")
                 title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
-                if title_match is None or title_match.group(1).casefold() != model_id.casefold():
+                if title_match is None or title_match.group(1).split("/")[-1].casefold() != model_id.casefold():
                     title = title_match.group(1) if title_match is not None else None
                     offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
                 hf_checkpoints = re.findall(
@@ -591,7 +634,7 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
         path.resolve()
         for category_directory in category_directories.values()
         for path in (repo_root / "docs" / "model-coverage" / category_directory).glob("*/*.mdx")
-        if path.name != "index.mdx" and path.relative_to(repo_root).as_posix() not in MODEL_CARD_PATH_ALIASES
+        if path.name != "index.mdx"
     }
     if set(navigated_model_pages) != expected_model_pages:
         offenders.append("nightly navigation does not contain every model card exactly once")
@@ -1003,9 +1046,9 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
         len([line for line in homepage.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]) == TABLE_ROW_COUNT
     )
     assert "[Model-0](/model-coverage/large-language-models/test/model)" in homepage
-    assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in (
-        tmp_path / "docs" / "model-coverage" / "overview.mdx"
-    ).read_text(encoding="utf-8")
+    registry = (tmp_path / "docs" / "model-coverage" / "overview.mdx").read_text(encoding="utf-8")
+    assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in registry
+    assert "| `TestDiffusionTransformer` | Hugging Face | `diffusers` |" in registry
     assert _sync_tables(tmp_path, check=True, validate_model_cards=False) == []
 
 

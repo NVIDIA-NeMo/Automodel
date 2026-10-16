@@ -1,0 +1,64 @@
+---
+title: "Qwen/Qwen3-VL-8B-Instruct"
+description: "Use NeMo AutoModel to fine-tune Qwen/Qwen3-VL-8B-Instruct for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/qwen/Qwen3-VL-8B-Instruct
+---
+
+[Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Qwen3VLForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_instruct_rdr.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | RDR Items | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_8b_instruct_rdr.yaml) |
+| Vision-Language Fine-Tuning | RDR Items; 1 node; context parallelism (`cp_size=2`) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml) |
+
+## Model Context
+
+Qwen3-VL-8B-Instruct is used for image-text-to-text. Its model size is 8.77B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `Qwen3VLForConditionalGeneration` |
+| Parameters | 8.77B checkpoint parameters |
+| Decoder Layers | 36 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+
+### Configuration
+
+The settings below describe the Quick Start recipe. It loads pretrained weights and fine-tunes on `quintend/rdr-items` with the vision tower frozen.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; `tp_size=1`, `cp_size=1` |
+| Nodes | - |
+| Features | Training checkpoint saving (`checkpoint.enabled: true`) |
+| Advanced | - |
+
+The context-parallel recipe also enables vision frame sharding and activation checkpointing. It sets `checkpoint.enabled: false`, so it does not save trained checkpoints.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3-VL-8B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Gemma 3n fine-tuning example](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct/blob/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/config.json)

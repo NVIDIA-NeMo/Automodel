@@ -1,0 +1,72 @@
+---
+title: "Qwen/Qwen3-8B"
+description: "Use NeMo AutoModel to fine-tune Qwen/Qwen3-8B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/qwen/Qwen3-8B
+---
+
+[Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Qwen3ForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and the prerequisites in [Model Context](#model-context). From the repository root in your activated environment, run full fine-tuning on SQuAD. This example uses eight GPUs on one node:
+
+```bash
+automodel examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | SQuAD; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml) |
+| LoRA Fine-Tuning | HellaSwag; 2 pipeline stages | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_hellaswag_pp_peft.yaml) |
+
+## Model Context
+
+Qwen3-8B is used for text generation. Its model size is 8.19B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `Qwen3ForCausalLM` |
+| Parameters | 8.19B checkpoint parameters |
+| Decoder Layers | 36 |
+| Hidden Size | 4,096 |
+| Attention | 32 query heads and 8 key-value heads |
+| Context Length | 40,960 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
+
+The SQuAD Quick Start recipe loads pretrained weights and uses the Hugging Face implementation with FlashAttention-2. For an editable source installation, add `--extra fa` to the installation guide's `uv sync` command; the `all` extra does not include FlashAttention-2.
+
+The HellaSwag LoRA recipe sets `checkpoint.enabled: false`, so it does not save trained adapters.
+
+### Configuration
+
+These settings describe the SQuAD Quick Start recipe. The launch topology is an example, not a hardware minimum.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs in the Quick Start example |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); `tp_size=1`, `cp_size=1` |
+| Nodes | 1 in the Quick Start example |
+| Features | Packed sequences (`packed_sequence_size=1024`) |
+| Advanced | Hugging Face implementation (`force_hf: true`); FlashAttention-2; compilation disabled |
+
+### More Recipes for This Model
+
+- [`qwen3_8b_hellaswag_pp_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_hellaswag_pp_peft.yaml)
+- [`qwen3_8b_squad_rtx_spark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_squad_rtx_spark.yaml)
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-8B/blob/b968826d9c46dd6066d109eabc6255188de91218/config.json)

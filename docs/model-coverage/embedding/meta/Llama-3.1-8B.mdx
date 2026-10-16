@@ -1,0 +1,62 @@
+---
+title: "meta-llama/Llama-3.1-8B"
+description: "Fine-tune meta-llama/Llama-3.1-8B with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/embedding-models/meta/Llama-3.1-8B
+---
+
+[meta-llama/Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) is the checkpoint used by the NeMo AutoModel bi-encoder training recipe below.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) with CUDA-enabled PyTorch and Transformer Engine (`cuda` extra), which provides the recipe's `FusedAdam` optimizer. Complete the [recipe setup](#recipe-setup), then launch from the repository root on eight GPUs. Validate memory use for your hardware.
+
+```bash
+uv run --extra cuda automodel examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Embedding Fine-Tuning | Prepared Nemotron retrieval data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml) |
+
+## Model Context
+
+Llama-3.1-8B is used for text embedding. Its model size is 8.03B (checkpoint tensor count) parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Embedding |
+| **Architecture** | `LlamaForCausalLM` |
+| Parameters | 8.03B (checkpoint tensor count) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads; 8 KV heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Setup
+
+The checked-in configuration uses FSDP2 with tensor and context parallel sizes of one. It selects `meta-llama/Llama-3.1-8B` directly for bi-encoder training. The language-model checkpoint is adapted with average pooling and noncausal attention for embedding training; it is not the pretrained NVIDIA embedding checkpoint. Before launching, ensure your Hugging Face account has access to the checkpoint and set `HF_TOKEN`.
+
+Prepare the `nvidia/embed-nemotron-dataset-v1` dataset with the checked-in helper. Run this command from the repository root to create the local JSON files listed in `dataset.data_dir_list`:
+
+```bash
+uv run python examples/retrieval/bi_encoder/llama_embed_nemotron_8b/data_preparation.py \
+  --download-path ./embed_nemotron_dataset_v1
+```
+
+Checkpoint dimensions and the rounded tensor count come from the revision-pinned sources below. The checkpoint context limit is separate from the training sequence length configured by the recipe.
+
+## Available Models
+
+| Model | HF ID |
+| --- | --- |
+| Llama-3.1-8B | [`meta-llama/Llama-3.1-8B`](https://huggingface.co/meta-llama/Llama-3.1-8B) |
+
+## Related Resources
+
+- [Training Guide](/recipes-e2e-examples/retrieval-finetune)
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-3.1-8B/blob/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b/config.json)
+- [Checkpoint Tensor Metadata](https://huggingface.co/api/models/meta-llama/Llama-3.1-8B/revision/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b)

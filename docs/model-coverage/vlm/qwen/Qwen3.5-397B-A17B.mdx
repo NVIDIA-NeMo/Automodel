@@ -1,0 +1,69 @@
+---
+title: "Qwen/Qwen3.5-397B-A17B"
+description: "Use NeMo AutoModel to fine-tune Qwen/Qwen3.5-397B-A17B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/qwen/Qwen3.5-397B-A17B
+---
+
+[Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Qwen3_5MoeForConditionalGeneration` architecture.
+
+## Quick Start
+
+This example uses 32 nodes with 8 GPUs each. Complete the [recipe prerequisites](#model-context), then run from the repository root on every node. Set `NODE_RANK` uniquely from 0 to 31 and `MASTER_ADDR` to the same reachable rank-0 address.
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+uv run --no-sync torchrun --nnodes 32 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 32 nodes; pipeline parallelism (PP) 8; expert parallelism (EP) 32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml) |
+
+## Model Context
+
+Qwen3.5-397B-A17B is used for image-text-to-text. Its model size is 403.40B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `Qwen3_5MoeForConditionalGeneration` |
+| Parameters | 403.40B checkpoint parameters |
+| Decoder Layers | 60 |
+| Hidden Size | 4,096 |
+| Attention | Gated DeltaNet with full attention every fourth layer; full attention uses 32 query heads and 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
+| Experts | 512 routed experts; 10 routed experts selected per token and 1 shared expert |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs per node in the launch example; GPU model unspecified in the recipe |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=8`, `cp_size=1`, `ep_size=32` |
+| Nodes | 32 |
+| Features | HybridEP (`dispatcher=hybridep`) |
+| Advanced | `attn=sdpa`, `linear=torch`, `experts=torch_mm`, `dispatcher=hybridep` |
+
+### Workflow Notes
+
+Follow the [installation instructions](/get-started/installation) and prepare an environment with the `vlm` and `moe` extras. The `moe` extra supplies the pinned `deep_ep` package, which builds HybridEP; `all` omits this package. For this multi-node recipe, build HybridEP with `HYBRID_EP_MULTINODE=1` and its communication dependencies, as configured in the [repository Dockerfile](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile). The launch command uses `--no-sync` to reuse the prepared environment.
+
+The recipe loads pretrained weights and fine-tunes on MedPix-VQA with the vision tower frozen. It sets `checkpoint.enabled: false`, so it does not save fine-tuned weights.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3.5-397B-A17B`](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/8472618112abcbd45acbcdc58436aff4233c23f7/config.json)

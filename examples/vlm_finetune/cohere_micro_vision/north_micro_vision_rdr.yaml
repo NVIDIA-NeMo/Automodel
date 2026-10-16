@@ -6,12 +6,19 @@
 # and no LR scheduler: warmup and cosine decay are meaningless over 18 steps.
 # For an actual training run use north_micro_vision_shopify_full.yaml.
 #
-#   automodel examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml \
+# Prerequisite: Transformers 5.16.0, as required by the upstream README at
+# checkpoint revision fa548d9aa62c1220bfd21fc6cfc465f1bd2a1a40.
+# The repository pins 5.15.1. The command below overrides that version for
+# this invocation. Run it from the repository root.
+#
+#   uv run --with transformers==5.16.0 automodel \
+#     examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml \
 #     --nproc-per-node 2
 #
-# Requires transformers 5.15.0.dev0 at the validated commit 71c6f699, NOT the
-# transformers==5.8.1 that nemo-automodel==0.5.0 pins: the model's remote code
-# imports symbols absent from 5.8.1 (e.g. transformers.utils.generic.get_max_seqlen).
+# Historical validation: the original recipe notes report Transformers
+# 5.15.0.dev0 at commit 71c6f699 and flag nemo-automodel==0.5.0's 5.8.1 pin
+# as missing remote-code imports such as transformers.utils.generic.get_max_seqlen.
+# These historical notes are not a validation result for Transformers 5.16.0.
 
 recipe: FinetuneRecipeForVLM
 
@@ -35,7 +42,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
-  # sdpa, not flash_attention_2: flash-attn is not installed.
+  # The original validation environment used SDPA without flash-attn installed.
   attn_implementation: sdpa
   trust_remote_code: true
 

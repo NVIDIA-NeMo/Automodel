@@ -25,6 +25,100 @@ exempt_models:
   - starcoder
 
 exempt_configs:
+  # Age-deprecated examples remain available outside GPU CI.
+  customizer_llama_3_1_8b_full_sft_tp:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  customizer_llama_3_2_1b_full_sft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  customizer_llama_3_2_1b_full_sft_chat:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  customizer_llama_3_2_1b_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  customizer_llama_3_2_1b_peft_packing:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_1_8b_columnmapped_lora:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_1_8b_hellaswag_fp8:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_1_8b_hellaswag_pp:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_1_8b_hellaswag_pp_dynamic_seq_len:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_1_8b_instruct_squad_qlora_2node:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_1_8b_squad_peft_rtx_spark:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_1_8b_squad_qlora:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_hellaswag:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_hellaswag_hsdp:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_hellaswag_megatron_fsdp:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_hellaswag_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_packed_cp2:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_squad:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_squad_flashoptim:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_squad_megatron_fsdp:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_squad_neftune:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_squad_qat:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_squad_skypilot:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_squad_skypilot_kubernetes:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_2_1b_squad_skypilot_kubernetes_2nodes:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama_3_2_3b_instruct_squad:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama_3_2_3b_instruct_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  qwen1_5_moe_a2_7b_qlora:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  t5_small_squad:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  # Additional model-card examples require GPU validation or are age-deprecated.
+  aquila_7b_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  deepseek_llm_7b_chat_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  gpt_j_6b_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  gpt_neox_20b_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  bamba_9b_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  jais_13b_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  internlm3_8b_instruct_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  exaone_3_0_7_8b_instruct_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama_3_3_nemotron_super_49b_v1_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  minitron_8b_base_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  orion_14b_base_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  gritlm_7b_vllm_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  stablelm_3b_4e1t_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  chatglm3_6b_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  falcon_7b_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  solar_pro_preview_instruct_squad_peft:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
   falcon3_7b_instruct_hellaswag_fp8:
     reason: "Deprecated for 26.10 (Falcon 3)"
   falcon3_7b_instruct_squad:

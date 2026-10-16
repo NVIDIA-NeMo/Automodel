@@ -18,6 +18,15 @@ exempt_models:
   - mistral
 
 exempt_configs:
+  # Age-deprecated examples remain available outside GPU CI.
+  custom_llama3_1_70b_pretrain_benchmark_8nodes:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_1_8b_peft_benchmark:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_1_8b_quack_rope:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama3_1_8b_quack_rope_baseline:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
   glm_4.5_air_te_deepep:
     reason: "Deprecated for 26.10 (GLM-4.5 MoE)"
   custom_qwen2_5_32b_peft_benchmark:

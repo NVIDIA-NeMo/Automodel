@@ -1,0 +1,67 @@
+---
+title: "nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
+description: "Fine-tune nvidia/Llama-3.1-Nemotron-Nano-8B-v1 on SQuAD using full fine-tuning or low-rank adaptation (LoRA) with NeMo AutoModel."
+slug: model-coverage/large-language-models/nvidia/Llama-3.1-Nemotron-Nano-8B-v1
+---
+
+[Llama-3.1-Nemotron-Nano-8B-v1](https://huggingface.co/nvidia/Llama-3.1-Nemotron-Nano-8B-v1) has NeMo AutoModel recipes for full fine-tuning and low-rank adaptation (LoRA) on the Stanford Question Answering Dataset (SQuAD).
+The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run this command from the repository root
+to launch full fine-tuning on SQuAD. This example uses eight GPUs on one node;
+review the recipe settings in Model Context before adapting the launch.
+
+```bash
+uv run automodel examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad.yaml \
+  --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD; 8-GPU example launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad.yaml) |
+| LoRA Fine-Tuning | SQuAD; 8-GPU example launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad_peft.yaml) |
+
+## Model Context
+
+Llama-3.1-Nemotron-Nano-8B-v1 is used for text generation. Its model size is 8.03B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `LlamaForCausalLM` |
+| Parameters | 8.03B checkpoint parameters |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads and 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+Both recipes use Fully Sharded Data Parallel version 2 (FSDP2). The settings below
+describe the recipes and example launch; hardware minimums are not specified.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs in the example launch; GPU model and memory unspecified |
+| Strategy | FSDP2; `tp_size=1` and `cp_size=1` disable tensor and context parallelism |
+| Nodes | 1 in the Quick Start example |
+| Features | Checkpoint saving (`checkpoint.enabled=true`) |
+| Advanced | Hugging Face model implementation (`force_hf=true`); `torch.compile` disabled |
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`nvidia/Llama-3.1-Nemotron-Nano-8B-v1`](https://huggingface.co/nvidia/Llama-3.1-Nemotron-Nano-8B-v1) | Starting checkpoint for both fine-tuning recipes |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/Llama-3.1-Nemotron-Nano-8B-v1/blob/54641c1611fcff44fa4865626462445e0a153fc7/config.json)

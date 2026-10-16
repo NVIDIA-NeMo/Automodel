@@ -1,0 +1,63 @@
+---
+title: "Qwen/Qwen2.5-3B"
+description: "Use NeMo AutoModel to fine-tune Qwen/Qwen2.5-3B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/qwen/Qwen2.5-3B
+---
+
+[Qwen2.5-3B](https://huggingface.co/Qwen/Qwen2.5-3B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Qwen2ForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and [recipe prerequisites](#model-context), then run full supervised fine-tuning on `llamafactory/glaive_toolcall_en` from the repository root. This example launches eight GPU processes:
+
+```bash
+automodel examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Glaive tool-calling data; eight-GPU example | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml) |
+| LoRA Fine-Tuning | Glaive tool-calling data; one-GPU example | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml) |
+
+## Model Context
+
+Qwen2.5-3B is used for text generation. Its model size is 3.09B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `Qwen2ForCausalLM` |
+| Parameters | 3.09B checkpoint parameters |
+| Decoder Layers | 36 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 2 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
+
+Both fine-tuning recipes use `FusedLinearCrossEntropy` and require `cut-cross-entropy`. For a source installation, follow the [installation guide](/get-started/installation) and run `uv sync --locked --all-groups --extra all` from the repository root. The `--all-groups` option includes the `dev` dependency group that supplies this package.
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | The recipe examples launch on eight GPUs for full fine-tuning and one GPU for LoRA. These counts describe example launches, not hardware minimums. |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); context parallelism disabled (`cp_size: 1`) |
+| Nodes | One node in the documented launch examples |
+| Features | Function-calling supervised fine-tuning (SFT), fused linear cross-entropy |
+| Advanced | `seq_length: 4096`; truncation is disabled by default, so this value does not cap dialogue length. |
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen2.5-3B`](https://huggingface.co/Qwen/Qwen2.5-3B) | Pretrained base model used by both fine-tuning recipes |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen2.5-3B/blob/3aab1f1954e9cc14eb9509a215f9e5ca08227a9b/config.json)

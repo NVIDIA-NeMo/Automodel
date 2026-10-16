@@ -1,0 +1,81 @@
+---
+title: "google/gemma-4-26B-A4B-it"
+description: "Fine-tune google/gemma-4-26B-A4B-it for image-text-to-text tasks with NeMo AutoModel using checked-in recipes and distributed settings."
+slug: model-coverage/vision-language-models/google/gemma-4-26B-A4B-it
+---
+
+[Gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Gemma4ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation) and review the
+[recipe prerequisites](#model-context). From the repository root, launch MedPix-VQA
+fine-tuning on one node with eight GPUs:
+
+```bash
+uv run --extra moe --extra vlm automodel examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml \
+  --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; CP2; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_medpix_ep8cp2_4k.yaml) |
+
+## Model Context
+
+`google/gemma-4-26B-A4B-it` is used for image-text-to-text. Its model size is 25.81B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `Gemma4ForConditionalGeneration` |
+| Parameters | 25.81B checkpoint parameters |
+| Decoder Layers | 30 |
+| Hidden Size | 2,816 |
+| Attention | 16 attention heads; 8 key-value heads in sliding layers and 2 in global layers |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 262,144 |
+| Experts | 128 routed |
+| Configured Dtype | `bfloat16` |
+
+The recipes load pretrained weights. The launch selects the `moe` and `vlm` extras:
+`moe` supplies DeepEP and includes the `cuda` extra for Transformer Engine.
+The standard `all` extra omits DeepEP.
+
+EP8 denotes expert parallelism across eight ranks; CP2 denotes context parallelism
+across two ranks. The CP2 recipe and mock recipe set `checkpoint.enabled: false`,
+so they do not save trained weights. The mock recipe uses synthetic data.
+
+### Configuration
+
+These settings describe the primary recipe used in Quick Start.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 GPUs in the example launch; GPU model unspecified |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size=1`, `cp_size=1`, `ep_size=8` |
+| Nodes | 1 |
+| Features | Checkpoint saving (`enabled=true`), Transformer Engine, DeepEP (`dispatcher=deepep`) |
+| Advanced | `torch.bfloat16`, `attn=te`, `linear=te`, `dispatcher=deepep` |
+
+### More Recipes for This Model
+
+- [`gemma4_26b_a4b_moe_medpix_ep8cp2_4k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_medpix_ep8cp2_4k.yaml)
+- [`gemma4_26b_a4b_moe_mock.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_mock.yaml)
+- [`gemma4_26b_a4b_moe_packing.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_packing.yaml)
+- [`gemma4_26b_a4b_moe_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_peft.yaml)
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`google/gemma-4-26B-A4B-it`](https://huggingface.co/google/gemma-4-26B-A4B-it) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+- [Checkpoint Configuration](https://huggingface.co/google/gemma-4-26B-A4B-it/blob/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/config.json)

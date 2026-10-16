@@ -1,0 +1,58 @@
+---
+title: "BAAI/Aquila-7B"
+description: "Fine-tune BAAI/Aquila-7B with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context, with setup guidance."
+slug: model-coverage/large-language-models/baai/Aquila-7B
+---
+
+[Aquila](https://huggingface.co/BAAI/Aquila-7B) is a Chinese-English bilingual language model from the Beijing Academy of Artificial Intelligence (BAAI).
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/baai/aquila_7b_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/baai/aquila_7b_squad_peft.yaml) |
+
+## Model Context
+
+Aquila-7B is used for text generation. Its model size is 7B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `AquilaForCausalLM` |
+| Parameters | 7B |
+| Hugging Face Organization | [BAAI](https://huggingface.co/BAAI) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads |
+| Context Length | 2,048 tokens (checkpoint configuration) |
+| Vocabulary Size | 100,008 |
+| Checkpoint Dtype | `float16` |
+
+### Recipe Setup
+
+The [aquila_7b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/baai/aquila_7b_squad_peft.yaml) LoRA example loads `BAAI/Aquila-7B` with `dtype: bfloat16` and `trust_remote_code: true`. It uses `rajpurkar/squad` with 512-token sequences and writes checkpoints to `checkpoints/aquila_7b`.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Aquila 7B | [`BAAI/Aquila-7B`](https://huggingface.co/BAAI/Aquila-7B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/BAAI/Aquila-7B/blob/24caff099d1ed30850b0e8e3a40250af73f93346/config.json)

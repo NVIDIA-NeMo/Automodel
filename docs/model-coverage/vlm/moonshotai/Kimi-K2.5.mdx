@@ -1,0 +1,76 @@
+---
+title: "moonshotai/Kimi-K2.5"
+description: "Use NeMo AutoModel to fine-tune moonshotai/Kimi-K2.5 for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/moonshotai/Kimi-K2.5
+---
+
+[Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `KimiK25ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Fine-tune Kimi-K2.5 on MedPix-VQA using the recipe's 32-node setup with 8 GPUs per node. Complete the [prerequisites](#recipe-prerequisites), then run this command from the repository root on every node.
+
+```bash
+uv run --extra vlm --extra moe torchrun --nnodes 32 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/kimi/kimi25vl_medpix.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 32 nodes; PP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/kimi25vl_medpix.yaml) |
+| LoRA Training Benchmark | Synthetic text; random initialization; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/kimi/kimi25vl_lora.yaml) |
+
+## Model Context
+
+Kimi-K2.5 is a mixture-of-experts vision-language model. Its upstream model card reports 1T total parameters and 32B activated parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `KimiK25ForConditionalGeneration` |
+| Parameters | 1T total; 32B activated |
+| Decoder Layers | 61 |
+| Hidden Size | 7,168 |
+| Attention | 64 attention heads; 64 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 163,840 |
+| Experts | 384 routed; 1 shared; 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Prerequisites
+
+Follow the [installation instructions](/get-started/installation) and use the same checkout and environment on every node. Both recipes select Transformer Engine and DeepEP. Include the `vlm` and `moe` extras; `moe` includes the CUDA dependencies and DeepEP, which the standard `all` extra omits.
+
+For the Quick Start, set `NODE_RANK` to a unique value from `0` to `31` on each node. Set `MASTER_ADDR` to the rank-zero node's hostname or IP address, reachable from every node on port `29500`.
+
+### Recipe Behavior
+
+The MedPix-VQA recipe loads pretrained weights and freezes the vision tower. Its collator limits inputs to 1,024 tokens. The low-rank adaptation (LoRA) benchmark initializes weights from the model configuration and uses synthetic text sequences of 4,096 tokens. Both recipes set `checkpoint.enabled: false`, so neither saves trained weights.
+
+### Fine-Tuning Configuration
+
+These settings describe the MedPix-VQA recipe's example topology, not minimum hardware requirements. PP denotes pipeline parallelism; EP denotes expert parallelism.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | GPU model not specified by the recipe |
+| Strategy | FSDP2; `tp_size=1`, `pp_size=8`, `cp_size=1`, `ep_size=32` |
+| Nodes | 32 |
+| Features | Transformer Engine, DeepEP (`dispatcher=deepep`) |
+| Advanced | `bfloat16`, `attn=te`, `linear=torch`, `experts=torch_mm`, `dispatcher=deepep` |
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`moonshotai/Kimi-K2.5`](https://huggingface.co/moonshotai/Kimi-K2.5) | Pretrained weights for fine-tuning; configuration for the benchmark |
+
+## Related Resources
+
+- [Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+- [Upstream Model Card](https://huggingface.co/moonshotai/Kimi-K2.5/blob/4d01dfe0332d63057c186e0b262165819efb6611/README.md)
+- [Checkpoint Configuration](https://huggingface.co/moonshotai/Kimi-K2.5/blob/4d01dfe0332d63057c186e0b262165819efb6611/config.json)

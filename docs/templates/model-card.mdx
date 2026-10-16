@@ -1,0 +1,68 @@
+---
+title: "ORGANIZATION/MODEL-CHECKPOINT-NAME"
+description: "Describe the model and the NeMo AutoModel workflows documented on this page."
+slug: model-coverage/CATEGORY/PROVIDER/MODEL-CHECKPOINT-NAME
+---
+
+Write a short, welcoming paragraph that introduces the upstream model, links its
+exact Hugging Face checkpoint, and explains what readers can do with the recipes.
+
+## Quick Start
+
+Explain what the command does (for example, full supervised fine-tuning or LoRA)
+and name its dataset when applicable. State required hardware and prerequisites.
+From the repository root, launch at least one checked-in recipe for this checkpoint:
+
+```bash
+uv run automodel examples/llm_finetune/MODEL/MODEL_squad.yaml --nproc-per-node 8
+```
+
+Use the recipe's documented Python entry point when it has no `recipe` target.
+For multiple nodes, show the cluster launch command and its required topology.
+Every card must have a recipe; setup prose alone does not satisfy Quick Start.
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD; 8-GPU launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/MODEL/MODEL_squad.yaml) |
+
+Each recipe must load a checkpoint listed in Available Models. Link additional
+recipes for this model, such as LoRA, packed sequences, or pretraining, when they
+exist. Keep the initial command and its corresponding table row consistent.
+Name the operation in Workflow (at most eight words). Put the dataset and key
+requirements in Example Setup (at most 12 words). Use one direct, checked-in
+YAML link labeled "View YAML" in Recipe. Each recipe appears once. Move setup
+guides, extra commands, and detailed settings to Model Context.
+
+## Model Context
+
+Introduce this model's purpose and architecture in a short paragraph before the
+table. Give readers context for the dimensions rather than opening with a table.
+
+| Property | Value |
+| --- | --- |
+| Task | Record the task implemented by the recipe. |
+| Architecture | Record the architecture from the checkpoint or repository. |
+| Parameters | State a numeric parameter count and distinguish total, active, and auxiliary modules when applicable. |
+| Decoder Layers | State the number of decoder layers or transformer blocks. |
+| Hidden Size | State the hidden width. |
+| Attention | State query and key-value head counts, including differences between layer types. |
+| Context Length | State the configured context length and any narrower validated recipe limit. |
+
+{/* Free context: optional prose, tables, code, callouts, and custom H3 or deeper
+headings follow the architecture table. Add data preparation, configuration notes,
+limitations, alternate examples, or measured results here. Omit empty headings.
+For a converted checkpoint or a reproduction initialized from another model,
+add a Recipe Checkpoint row linking the actual recipe checkpoint, list it in
+Available Models, and explain the relationship here. */}
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| Link ORGANIZATION/MODEL-CHECKPOINT-NAME on Hugging Face | Describe its role in the documented workflows. |
+
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)

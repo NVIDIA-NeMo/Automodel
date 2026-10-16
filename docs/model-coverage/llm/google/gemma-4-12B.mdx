@@ -1,0 +1,60 @@
+---
+title: "google/gemma-4-12B"
+description: "Fine-tune google/gemma-4-12B for text generation with NeMo AutoModel using checked-in recipes and documented distributed settings."
+slug: model-coverage/large-language-models/google/gemma-4-12B
+---
+
+[Gemma-4-12B](https://huggingface.co/google/gemma-4-12B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Gemma4UnifiedForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run full fine-tuning on HellaSwag from the repository root. This example launches eight GPU workers:
+
+```bash
+automodel examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 8-GPU launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml) |
+
+## Model Context
+
+gemma-4-12B is used for text generation. Its model size is 11.96B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `Gemma4UnifiedForConditionalGeneration` |
+| Parameters | 11.96B checkpoint parameters |
+| Decoder Layers | 48 |
+| Hidden Size | 3,840 |
+| Attention | 16 attention heads; 8 key-value heads in sliding layers and 1 in global layers |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 262,144 |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | GPU model not specified in the recipe |
+| Strategy | Fully Sharded Data Parallel (FSDP2); `tp_size=1`, `pp_size=1`, `cp_size=1` |
+| Nodes | Not specified in the recipe |
+| Features | Saved training checkpoints (`checkpoint.enabled: true`) |
+| Precision | `torch_dtype: bf16` |
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`google/gemma-4-12B`](https://huggingface.co/google/gemma-4-12B) | Full fine-tuning checkpoint |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/google/gemma-4-12B/blob/023679ed352de9bb66cc873c9009ce3482585c08/config.json)

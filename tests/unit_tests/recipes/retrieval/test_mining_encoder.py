@@ -130,7 +130,9 @@ def test_checkpoint_processor_uses_pinned_revision(monkeypatch):
         "nemo_automodel.recipes.retrieval.mining_encoder.import_module",
         lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=load)),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.retrieval.mining_encoder.NeMoAutoConfig.resolve_revision", lambda _: "pinned-sha")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.retrieval.mining_encoder.NeMoAutoConfig.resolve_revision", lambda _: "pinned-sha"
+    )
     model.source_model_path = "/snapshot"
     CheckpointMiningEncoderConfig().build(model_name_or_path="/snapshot", device=torch.device("cpu"))
     load.assert_called_once_with("org/model", revision="pinned-sha")

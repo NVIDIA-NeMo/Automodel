@@ -1,0 +1,59 @@
+---
+title: "ibm-ai-platform/Bamba-9B"
+description: "Fine-tune ibm-ai-platform/Bamba-9B with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/large-language-models/ibm-ai-platform/Bamba-9B
+---
+
+[Bamba](https://huggingface.co/ibm-ai-platform/Bamba-9B) is a hybrid language model from IBM that combines Mamba-2 state space model (SSM) layers with transformer attention for text generation.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+After installation, run this low-rank adaptation (LoRA) example from the repository root on one node with 8 GPUs. Check the dependencies in [Recipe Setup](#recipe-setup) first. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/ibm_ai_platform/bamba_9b_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/ibm_ai_platform/bamba_9b_squad_peft.yaml) |
+
+## Model Context
+
+Bamba-9B is a base model for text generation with approximately 9.78 billion parameters, according to its [pinned model card](https://huggingface.co/ibm-ai-platform/Bamba-9B/blob/50ec8766310eae056e05e42ba70df45645912e1e/README.md).
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `BambaForCausalLM` |
+| Parameters | Approximately 9.78B |
+| Hugging Face Organization | [ibm-ai-platform](https://huggingface.co/ibm-ai-platform) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads and 8 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+
+### Recipe Setup
+
+The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/ibm_ai_platform/bamba_9b_squad_peft.yaml) uses Fully Sharded Data Parallelism (FSDP2), `bfloat16`, and activation checkpointing. It configures LoRA rank 8 with `alpha: 32`, a global batch size of 8, and 100 training steps on SQuAD sequences of up to 512 tokens.
+
+The checkpoint enables Mamba kernels (`use_mamba_kernels: true`). Use the container or follow the [installation instructions](/get-started/installation) for the `cuda` extra, which includes `mamba-ssm` and `causal-conv1d`.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Bamba 9B | [`ibm-ai-platform/Bamba-9B`](https://huggingface.co/ibm-ai-platform/Bamba-9B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/ibm-ai-platform/Bamba-9B/blob/50ec8766310eae056e05e42ba70df45645912e1e/config.json)

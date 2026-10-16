@@ -1,0 +1,81 @@
+---
+title: "meta-llama/Llama-3.3-70B-Instruct"
+description: "Use NeMo AutoModel to fine-tune meta-llama/Llama-3.3-70B-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/meta/Llama-3.3-70B-Instruct
+---
+
+[Llama-3.3-70B-Instruct](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
+
+## Quick Start
+
+This example uses 4 nodes with 8 GPUs each. Complete the [prerequisites](#prerequisites), then run from the repository root on every node:
+
+```bash
+uv run torchrun --nnodes 4 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | SQuAD; 4 nodes; tensor parallelism 4; pipeline parallelism 2; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml) |
+| LoRA Benchmark | Synthetic data; tensor parallelism 2 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml) |
+
+## Model Context
+
+Llama-3.3-70B-Instruct is used for text generation. Its model size is 70.55B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `LlamaForCausalLM` |
+| Parameters | 70.55B checkpoint parameters |
+| Decoder Layers | 80 |
+| Hidden Size | 8,192 |
+| Attention | 64 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
+
+### Prerequisites
+
+1. Follow the [installation guide](/get-started/installation) on every node. The primary recipe requires Transformer Engine for its `FusedAdam` optimizer.
+2. Obtain access to the [gated checkpoint](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct), then make a token from the approved account available as `HF_TOKEN` on every node.
+3. Set `NODE_RANK` to a unique value from `0` to `3` on each node. Set `MASTER_ADDR` to the rank-0 node's hostname or IP address, reachable from the other nodes on port `29500`.
+
+### Configuration
+
+The primary SQuAD recipe specifies the following example configuration.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 8 H100 or H200 GPUs per node |
+| Strategy | Fully Sharded Data Parallel version 2 (FSDP2); tensor parallelism `tp_size=4`; pipeline parallelism `pp_size=2`; context parallelism `cp_size=1` |
+| Nodes | 4 |
+| Features | Checkpointing (`enabled=true`), activation checkpointing (`activation_checkpointing=true`), packed sequences (`packed_sequence_size=1024`) |
+| Advanced | `bf16` |
+
+### More Recipes for This Model
+
+- [`custom_llama3_3_70b_instruct_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml)
+- [`custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml)
+- [`llama3_3_70b_instruct_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/llama3_3_70b_instruct_peft_benchmark.yaml)
+- [`llama_3_3_70b_instruct_squad_peft_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/llama_3_3_70b_instruct_squad_peft_pp.yaml)
+- [`llama_3_3_70b_instruct_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft.yaml)
+- [`llama_3_3_70b_instruct_squad_peft_qlora_rtx_spark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft_qlora_rtx_spark.yaml)
+- [`llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml)
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`meta-llama/Llama-3.3-70B-Instruct`](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct/blob/6f6073b423013f6a7d4d9f39144961bfbfbc386b/config.json)

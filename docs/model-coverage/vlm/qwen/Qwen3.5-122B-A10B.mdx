@@ -1,0 +1,80 @@
+---
+title: "Qwen/Qwen3.5-122B-A10B"
+description: "Run the NeMo AutoModel long-context fine-tuning smoke test for Qwen/Qwen3.5-122B-A10B with MedPix-VQA and documented distributed settings."
+slug: model-coverage/vision-language-models/qwen/Qwen3.5-122B-A10B
+---
+
+[Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) is a vision-language model (VLM) with a checked-in NeMo AutoModel long-context fine-tuning smoke test for image-text-to-text.
+The Hugging Face configuration declares the `Qwen3_5MoeForConditionalGeneration` architecture.
+
+## Quick Start
+
+Complete the [recipe setup](#recipe-setup). For this example, allocate 16 nodes with 8 GPUs each. From the repository root on every node, run the command with a unique `NODE_RANK` from 0 to 15 and `MASTER_ADDR` set to the same reachable address of node 0.
+
+```bash
+uv run --no-sync torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 10-step smoke test; 16 nodes; CP32; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml) |
+
+## Model Context
+
+Qwen3.5-122B-A10B has 125.09B checkpoint parameters. The recipe loads pretrained weights for a ten-step scaling smoke test on public MedPix-VQA image-text samples.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Qwen3_5MoeForConditionalGeneration` |
+| Parameters | 125.09B checkpoint parameters |
+| Decoder Layers | 48 |
+| Hidden Size | 3,072 |
+| Full Attention | 32 query heads and 2 key-value heads; every fourth decoder layer |
+| Linear Attention | Gated DeltaNet in the remaining decoder layers |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
+| Experts | 256 routed experts; 8 selected per token and 1 shared expert |
+
+The recipe packs sequences of up to 131,072 tokens and trains the vision tower. With `checkpoint.enabled: false`, it saves no trained checkpoint. The image-heavy workload is not a representative throughput benchmark.
+
+### Configuration
+
+The example uses context parallelism (CP) of 32 and expert parallelism (EP) of 8.
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | GPU model not specified by the recipe |
+| Strategy | Fully Sharded Data Parallelism v2 (FSDP2); `tp_size=1`, `pp_size=1`, `cp_size=32`, `ep_size=8` |
+| Nodes | 16 nodes with 8 GPUs each (example topology) |
+| Features | Activation checkpointing (`activation_checkpointing=true`); HybridEP (`dispatcher=hybridep`); vision frame sharding |
+| Advanced | `torch.bfloat16`, `attn=sdpa`, `linear=torch`, `experts=torch_mm`, `dispatcher=hybridep` |
+
+### Recipe Setup
+
+Follow the [installation instructions](/get-started/installation) and prepare the same repository checkout and environment on every node. Select the `moe` and `vlm` extras and the `dev` dependency group: `moe` supplies DeepEP/HybridEP, Flash Linear Attention, and the CUDA dependencies, including Transformer Engine for `FusedAdam`; `dev` supplies `cut-cross-entropy` for `FusedLinearCrossEntropy`.
+
+For a source environment, install these dependencies before launching:
+
+```bash
+uv sync --extra moe --extra vlm --group dev
+```
+
+Building the CUDA extensions requires a matching toolkit and backend libraries. Follow the [repository Dockerfile's HybridEP build setup](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docker/Dockerfile) for the target GPU architecture and communication libraries. The Quick Start uses `--no-sync` to reuse the prepared environment.
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation. Review [qwen3_5_122b_128k_ep8cp32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml) before changing the topology; GPU-count changes require compatible batch and parallelism settings.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3.5-122B-A10B`](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Fine-Tune Gemma 3n](/recipes-e2e-examples/gemma-3-3n)
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-122B-A10B/blob/dc4d348443bc740c68e2d77492492c11606384d5/config.json)

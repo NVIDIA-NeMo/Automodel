@@ -74,3 +74,21 @@ runs:
           echo "  restored $(git ls-tree -r --name-only FETCH_HEAD -- "${subtree}" | wc -l | xargs) files into ${subtree}"
           echo "::endgroup::"
         done <<< "${ARCHIVED_VERSIONS}"
+
+        # Keep historical recipe links reachable after nightly retires the YAMLs.
+        python3 - <<'PY'
+        from pathlib import Path
+        import re
+        import subprocess
+
+        snapshot = "291a8f21681d86f0dbb4f91fb906d5219ea0d07a"
+        pattern = re.compile(r"https://github\.com/NVIDIA-NeMo/Automodel/blob/main/(examples/[^\s)#]+\.ya?ml)")
+        for page in Path("docs/fern/versions").glob("v*/pages/**/*"):
+            if not page.is_file() or page.suffix not in {".md", ".mdx"}:
+                continue
+            def pin(match):
+                recipe = match.group(1)
+                exists = subprocess.run(["git", "cat-file", "-e", f"{snapshot}:{recipe}"], capture_output=True).returncode == 0
+                return match.group(0).replace("/blob/main/", f"/blob/{snapshot}/") if not Path(recipe).is_file() and exists else match.group(0)
+            page.write_text(pattern.sub(pin, page.read_text()))
+        PY
