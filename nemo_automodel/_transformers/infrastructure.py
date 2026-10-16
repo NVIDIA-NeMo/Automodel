@@ -65,7 +65,10 @@ from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPi
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
+from nemo_automodel.components.models.common.utils import (
+    cast_frozen_modules_to_compute_dtype,
+    prepare_frozen_parameters_for_sharding,
+)
 from nemo_automodel.components.moe.quantized_experts import apply_mxfp4_to_moe_experts
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
@@ -659,6 +662,8 @@ def apply_model_infrastructure(
         freeze_config=freeze_config,
         strict=True,
     )
+    if isinstance(strategy_config, FSDP2Config) and peft_config is not None and quantization_config is None:
+        prepare_frozen_parameters_for_sharding(model, strategy_config.mp_policy.param_dtype)
     reapply_trainability = partial(
         _apply_trainability_policy,
         peft_enabled=peft_config is not None,
