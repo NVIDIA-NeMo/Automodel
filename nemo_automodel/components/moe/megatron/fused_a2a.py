@@ -330,6 +330,9 @@ def free_buffer() -> None:
     the whole Slurm allocation and corrupts subsequent forwards. Destroying the buffer first
     frees the runtime and lets a clean ``destroy_process_group`` follow without hanging.
     """
+    from nemo_automodel.shared.nccl_ep import finalize_nccl_ep
+
+    finalize_nccl_ep()
     global _buffer
     if _buffer is not None:
         try:

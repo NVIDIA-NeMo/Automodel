@@ -40,6 +40,7 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.nccl_ep import NcclEpConfig
 
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
@@ -1464,6 +1465,7 @@ class GroupedExpertsDeepEP(nn.Module):
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
+        self.nccl_ep = backend.nccl_ep if backend is not None else NcclEpConfig()
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1531,6 +1533,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
+            nccl_ep=self.nccl_ep,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
@@ -1557,6 +1560,7 @@ class GroupedExpertsDeepEP(nn.Module):
             local_expert_indices=local_expert_indices,
             config=config,
             ep_group=ep_group,
+            hidden_dim=self.config.expert_dim,
         )
         if self.dispatcher_backend == "deepep":
             self._init_deepep_buffer(ep_group)
@@ -1721,7 +1725,9 @@ class GroupedExpertsDeepEP(nn.Module):
                     use_mxfp8=self.use_mxfp8,
                 )
         else:
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
+            # Preserve the dispatch autograd edge even when this rank receives no
+            # tokens: its backward must still participate in EP communication.
+            output1 = torch.matmul(permuted_local_hidden_states, gate_and_up_projs[0])
             output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
 
@@ -1832,6 +1838,7 @@ class GroupedExpertsTE(nn.Module):
         # first-microbatch copy, since forced-balanced routing makes it constant.
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self._static_m_splits: list | None = None
+        self.nccl_ep = backend.nccl_ep if backend is not None else NcclEpConfig()
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -2157,6 +2164,7 @@ class GroupedExpertsTE(nn.Module):
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
+            nccl_ep=self.nccl_ep,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
@@ -2177,6 +2185,7 @@ class GroupedExpertsTE(nn.Module):
             local_expert_indices=local_expert_indices,
             config=token_dispatcher_config,
             ep_group=ep_mesh.get_group(),
+            hidden_dim=self.config.expert_dim,
         )
 
         # Re-create FP8 padding/unpadding with num_local_experts for EP
@@ -2278,7 +2287,9 @@ class GroupedExpertsTE(nn.Module):
                 else:
                     return tensor
 
-            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).T)
+            # Empty dispatched rows retain the collective backward edge and also
+            # work when the local input itself has zero rows.
+            output1 = torch.matmul(permuted_local_hidden_states, to_local(self.gate_up_linear.weight0).T)
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
             all_expert_dependency = output2.new_zeros(())
