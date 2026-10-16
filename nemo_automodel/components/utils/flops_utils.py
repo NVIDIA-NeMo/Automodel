@@ -1991,6 +1991,10 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
 
     # Get config class name
     config_class_name = config.__class__.__name__
+    if config_class_name == "Step5Config":
+        from nemo_automodel.components.models.step5.flops import step5_flops
+
+        return step5_flops
 
     # Map config class names to FLOPs formulas
     class_name_to_formula = {

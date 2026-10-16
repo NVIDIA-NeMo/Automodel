@@ -1669,12 +1669,12 @@ def neat_packed_vlm_collater(
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)
-    for key in ("pixel_values", "pixel_values_videos"):
+    for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = _merge_media_values(tensors)
 
-    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts", "num_patches"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
@@ -1808,12 +1808,12 @@ def packed_sequence_thd_vlm_collater(
         "qkv_format": "thd",
     }
 
-    for key in ("pixel_values", "pixel_values_videos"):
+    for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = _merge_media_values(tensors)
 
-    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts", "num_patches"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
