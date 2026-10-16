@@ -34,6 +34,7 @@ from nemo_automodel.components.models.common.utils import (
     restore_pretrained_generation_config,
     set_is_first_microbatch,
     set_is_optim_step,
+    sum_rows,
 )
 
 
@@ -525,3 +526,10 @@ class TestGenerationConfigHelpers:
         assert generation_config.eos_token_id == [2, 11]
         assert generation_config.do_sample is True
         assert generation_config.temperature == 0.7
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16, torch.int32, torch.bool])
+@pytest.mark.parametrize("rows", [0, 17, 513])
+def test_sum_rows_cpu_preserves_native_sum(dtype, rows):
+    values = torch.ones((2, rows, 7), dtype=dtype)
+    torch.testing.assert_close(sum_rows(values), values.sum(-2), rtol=0, atol=0)

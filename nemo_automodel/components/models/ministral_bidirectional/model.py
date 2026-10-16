@@ -32,8 +32,8 @@ from transformers.models.mistral3.modeling_mistral3 import (
 )
 from transformers.utils import logging
 
+from nemo_automodel.components.models.common.utils import sum_rows
 from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forward_backport
-from nemo_automodel.shared.utils import sum_rows
 
 if TYPE_CHECKING:
     from .reranker_export import Mistral3RerankerMetadataExporter

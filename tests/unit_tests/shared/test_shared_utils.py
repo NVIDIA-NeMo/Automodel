@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from nemo_automodel.shared.utils import dtype_from_str, sum_rows
+from nemo_automodel.shared.utils import dtype_from_str
 
 
 class TestDtypeFromStr:
@@ -63,10 +63,3 @@ class TestDtypeFromStr:
         for invalid_input in invalid_inputs:
             with pytest.raises(KeyError, match=f"Unknown dtype string: {invalid_input}"):
                 dtype_from_str(invalid_input)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16, torch.int32, torch.bool])
-@pytest.mark.parametrize("rows", [0, 17, 513])
-def test_sum_rows_cpu_preserves_native_sum(dtype, rows):
-    values = torch.ones((2, rows, 7), dtype=dtype)
-    torch.testing.assert_close(sum_rows(values), values.sum(-2), rtol=0, atol=0)

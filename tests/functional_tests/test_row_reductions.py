@@ -18,12 +18,12 @@ import pytest
 import torch
 
 from nemo_automodel._transformers.retrieval import pool
+from nemo_automodel.components.models.common.utils import sum_rows
 from nemo_automodel.components.models.kimi_k3.attn_res_triton import HAVE_TRITON
 from nemo_automodel.components.models.kimi_k3.situ import _attn_res_core, _AttnResTritonFunction
 from nemo_automodel.components.models.ministral_bidirectional.model import pool as ministral_pool
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import Gate
-from nemo_automodel.shared.utils import sum_rows
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Exercises CUDA reduction workspace and gradients"

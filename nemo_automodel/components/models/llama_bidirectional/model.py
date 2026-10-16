@@ -34,7 +34,7 @@ from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaModel, LlamaPreTrainedModel
 
-from nemo_automodel.shared.utils import sum_rows
+from nemo_automodel.components.models.common.utils import sum_rows
 
 
 class LlamaBidirectionalConfig(LlamaConfig):

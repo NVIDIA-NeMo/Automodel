@@ -51,8 +51,8 @@ from unittest.mock import MagicMock
 
 import torch
 
+from nemo_automodel.components.models.common.utils import sum_rows
 from nemo_automodel.shared.import_utils import null_decorator
-from nemo_automodel.shared.utils import sum_rows
 
 try:
     import triton

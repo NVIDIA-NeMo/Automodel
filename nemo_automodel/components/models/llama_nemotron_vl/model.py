@@ -26,7 +26,7 @@ from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 from transformers.utils import logging
 
-from nemo_automodel.shared.utils import sum_rows
+from nemo_automodel.components.models.common.utils import sum_rows
 
 logger = logging.get_logger(__name__)
 

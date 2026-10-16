@@ -22,6 +22,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common.utils import sum_rows
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
@@ -37,7 +38,6 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 )
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
-from nemo_automodel.shared.utils import sum_rows
 
 
 class MLP(nn.Module):

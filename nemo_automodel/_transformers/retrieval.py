@@ -51,7 +51,6 @@ from nemo_automodel._transformers.sentence_transformer_export import (
 )
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
-from nemo_automodel.shared.utils import sum_rows
 
 if TYPE_CHECKING:
     from nemo_automodel.components.checkpoint.addons import _ConsolidatedHFMetadataExporter
@@ -378,9 +377,9 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     pool_type = _canonicalize_bi_encoder_pooling(pool_type)
 
     if pool_type == "avg":
-        emb = sum_rows(last_hidden) / attention_mask.sum(dim=1)[..., None]
+        emb = last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
     elif pool_type == "weighted_avg":
-        emb = sum_rows(last_hidden)
+        emb = last_hidden.sum(dim=1)
     elif pool_type == "cls":
         emb = last_hidden[:, 0]
     elif pool_type == "last":
