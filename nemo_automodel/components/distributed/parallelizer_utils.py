@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from collections import defaultdict
 from copy import copy
 from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Sequence, Set, Tuple, Union
 
@@ -326,7 +327,7 @@ def _make_compute_dtype_fn(
          given). Resolved per-param -- a single genuinely lower-precision sibling (e.g.
          Qwen3.5-MoE's bf16 ``shared_expert_gate``) no longer forces the layer's fp32
          master weights into fp32 compute. Intrinsic fp32 is already covered by #1/#2;
-         the ``(storage, compute)`` grouping still keeps each FSDP unit storage-uniform.
+         the grouping still keeps each FSDP unit uniform in trainable storage dtype.
          See NVIDIA-NeMo/Automodel#3327.
 
     Non-floating tensors always keep their storage dtype.
@@ -497,14 +498,32 @@ def fully_shard_by_dtype(
         ignored_params=ignored_params,
     )
 
-    # FSDP2 requires every param group to be uniform in *storage* (original) dtype
-    # -- ``_init_mp_dtypes`` asserts ``{p.orig_dtype}`` is a singleton -- while a group's
-    # ``param_dtype`` controls *compute* dtype. These are independent axes, so we group by
-    # the (storage, compute) pair: this keeps each FSDP unit storage-uniform (satisfying the
-    # assertion even when two different storage dtypes share one compute dtype, e.g. bf16 and
-    # fp32 weights both computing in bf16) while still splitting params that need a different
-    # compute dtype. ``key[1]`` is the compute dtype used as the unit's ``param_dtype``.
-    group_key_of = lambda t: (t.dtype, compute_dtype_of(t))
+    # FSDP requires uniform *trainable* storage dtype per FSDP unit.
+    # Frozen bases may join adapters with different storage but identical compute.
+    # Normalize frozen grouping keys only when that compute group has one trainable
+    # dtype; retain storage isolation for mixed trainable dtypes.
+    trainable_dtypes_by_compute: dict[torch.dtype, set[torch.dtype]] = defaultdict(set)
+    for param in module.parameters():
+        if id(param) not in ignored_param_ids and param.requires_grad:
+            trainable_dtypes_by_compute[compute_dtype_of(param)].add(param.dtype)
+
+    def group_key_of(tensor: torch.Tensor) -> tuple[torch.dtype, torch.dtype]:
+        """Resolve grouping for an arbitrary-shaped parameter or buffer.
+
+        Args:
+            tensor: Parameter or buffer of arbitrary shape; DTensor global shape
+                and mesh placements are not changed.
+
+        Returns:
+            Trainable storage compatibility dtype and compute dtype for grouping.
+        """
+        compute_dtype = compute_dtype_of(tensor)
+        storage_dtype = tensor.dtype
+        if not tensor.requires_grad:
+            trainable_dtypes = trainable_dtypes_by_compute[compute_dtype]
+            if len(trainable_dtypes) == 1:
+                storage_dtype = next(iter(trainable_dtypes))
+        return storage_dtype, compute_dtype
 
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.

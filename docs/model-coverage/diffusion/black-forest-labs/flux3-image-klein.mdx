@@ -31,14 +31,14 @@ The training workflow below covers **FLUX 3 Image Klein Base**, the non-distille
 
 ## Example Recipes
 
-Run the commands below from [the linked recipe revision](https://github.com/NVIDIA-NeMo/Automodel/tree/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c).
+Run the commands below from the AutoModel repository root on the `main` branch.
 
 | Recipe | Description |
 |---|---|
-| [flux3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) | Text-to-image LoRA fine-tuning |
-| [flux3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_t2i_flow.yaml) | Text-to-image full fine-tuning template |
-| [flux3_i2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_i2i_flow.yaml) | Image-editing full fine-tuning template; add the LoRA configuration below for adapter training |
-| [generate_flux3.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/generate/configs/generate_flux3.yaml) | Native image generation with optional trained LoRA weights |
+| [flux3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) | Text-to-image LoRA fine-tuning |
+| [flux3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow.yaml) | Text-to-image full fine-tuning template |
+| [flux3_i2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_i2i_flow.yaml) | Image-editing full fine-tuning template; add the LoRA configuration below for adapter training |
+| [generate_flux3.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_flux3.yaml) | Native image generation with optional trained LoRA weights |
 
 The 100-step validation covers LoRA training. The full fine-tuning templates have not undergone the same end-to-end validation.
 
