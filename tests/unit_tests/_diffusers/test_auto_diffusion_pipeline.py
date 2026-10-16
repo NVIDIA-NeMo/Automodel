@@ -517,6 +517,44 @@ def test_from_pretrained_returns_pipeline(caplog):
     assert mock_to.call_count == 2
 
 
+@pytest.mark.parametrize(
+    "base_dtype, lora_kwargs, expected_dtype",
+    [
+        (torch.bfloat16, {}, torch.float32),
+        (torch.bfloat16, {"lora_dtype": torch.bfloat16}, torch.bfloat16),
+        (torch.bfloat16, {"lora_dtype": None}, torch.bfloat16),
+        (torch.float32, {"lora_dtype": None}, torch.float32),
+    ],
+)
+def test_from_pretrained_lora_storage_policy(base_dtype, lora_kwargs, expected_dtype):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+    from nemo_automodel.components._peft.lora import PeftConfig
+
+    dummy_pipe = DummyPipeline({"transformer": DummyModule()})
+    loader = MagicMock()
+    loader.from_pretrained.return_value = dummy_pipe
+    peft_cfg = PeftConfig(target_modules=["*"], **lora_kwargs)
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", loader),
+    ):
+        pipe = NeMoAutoDiffusionPipeline.from_pretrained(
+            "dummy",
+            device=torch.device("cpu"),
+            torch_dtype=base_dtype,
+            load_for_training=True,
+            model_type="flux",
+            peft_cfg=peft_cfg,
+        )
+
+    assert pipe._peft_config is peft_cfg
+    adapters = [param for name, param in pipe.transformer.named_parameters() if "lora_" in name]
+    base = [param for name, param in pipe.transformer.named_parameters() if "lora_" not in name]
+    assert adapters and base
+    assert all(param.dtype == expected_dtype and param.requires_grad for param in adapters)
+    assert all(param.dtype == base_dtype and not param.requires_grad for param in base)
+
+
 def test_from_pretrained_skips_move_when_flag_false():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
