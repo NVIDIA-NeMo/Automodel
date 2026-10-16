@@ -586,6 +586,43 @@ def _replay_hybridep_dispatch_on_recompute(
     return checkpoint_context_fn
 
 
+def _cache_moe_combine_on_recompute(
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]],
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]]:
+    """Serve each MoE layer's combine output of the checkpoint forward to its backward recompute.
+
+    ``BackendConfig.dispatcher_recompute_cache``: the block's forward keeps a clone of the HybridEP combine
+    output ([tokens, hidden]); the recompute returns it instead of re-running the unpermute, the EP-group
+    barrier and the combine all-to-all (and, with ``moe_tail``, the down projection's GEMM). One cache per
+    checkpointed call, bound for the forward in ``record`` mode and for the recompute in ``replay`` mode.
+    Independent of the dispatch layout replay, so it is installed whether or not the router is recomputed.
+    """
+    from nemo_automodel.components.moe.megatron.fused_a2a import MoERecomputeCache, moe_recompute_cache_scope
+
+    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
+        forward_context, recompute_context = context_fn()
+        cache = MoERecomputeCache()
+
+        @contextmanager
+        def scoped(mode: str, inner: AbstractContextManager):
+            if mode == "replay":
+                cache.rewind()
+            with moe_recompute_cache_scope(cache, mode), inner:
+                yield
+
+        return scoped("record", forward_context), scoped("replay", recompute_context)
+
+    return checkpoint_context_fn
+
+
+def _uses_moe_recompute_cache(model: nn.Module) -> bool:
+    """Return whether any expert module asked for the combine recompute cache."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return False
+    return any(getattr(module, "dispatcher_recompute_cache", "none") != "none" for module in modules())
+
+
 def _uses_hybridep_dispatch(model: nn.Module) -> bool:
     """Return whether any expert module uses the HybridEP dispatcher."""
     modules = getattr(model, "modules", None)
@@ -673,6 +710,7 @@ def apply_ac(
             f"selective={selective}, ignore_router={ignore_router}"
         )
     uses_hybridep_dispatch = checkpoint_decoder and _uses_hybridep_dispatch(model)
+    uses_moe_recompute_cache = checkpoint_decoder and _uses_moe_recompute_cache(model)
     if checkpoint_decoder and not ignore_router and not selective and _uses_hybridep_capacity_mode(model):
         # Without a replay recorder the recompute dispatch runs in capacity mode (``capacity`` rows)
         # while the first forward dispatch was the blocking calibration (``actual`` rows), and
@@ -847,6 +885,11 @@ def apply_ac(
                 )
                 block.register_module(child_name, wrapped_moe)
                 continue
+            if uses_moe_recompute_cache:
+                # Full-block regions only: an MoE-only region ends at the combine, whose output is held by the
+                # consumer outside the region, so its recompute never re-runs the combine and the cache would
+                # only cost the clone.
+                block_context_fn = _cache_moe_combine_on_recompute(block_context_fn)
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
@@ -855,6 +898,8 @@ def apply_ac(
             )
         else:
             block_context_fn = _preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot())
+            if uses_moe_recompute_cache:
+                block_context_fn = _cache_moe_combine_on_recompute(block_context_fn)
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
