@@ -213,7 +213,10 @@ def test_packed_documents_do_not_leak():
     torch.testing.assert_close(packed, separate, rtol=1e-5, atol=1e-6)
     changed = ids.clone()
     changed[:, :8] = 63
-    torch.testing.assert_close(model(changed, position_ids=positions).logits[:, 8:], packed[:, 8:], rtol=0, atol=0)
+    # Changing the first document alters MoE expert token counts, so GEMM shapes and FP32 rounding differ.
+    torch.testing.assert_close(
+        model(changed, position_ids=positions).logits[:, 8:], packed[:, 8:], rtol=1e-5, atol=1e-6
+    )
 
 
 def test_local_auto_config(tmp_path: Path) -> None:
