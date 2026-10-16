@@ -475,6 +475,17 @@ class TestActivationCheckpointingParsing:
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] == "selective"
 
+    def test_moe_mode_allowed_for_ep_only(self):
+        result = parse_distributed_section(
+            {"strategy": "fsdp2", "activation_checkpointing": "moe", "ep_size": 2, "moe": {}}
+        )
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] == "moe"
+        with pytest.raises(ValueError, match="activation_checkpointing='moe'"):
+            parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "moe", "ep_size": 1})
+        with pytest.raises(ValueError, match="activation_checkpointing='moe'"):
+            parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "moe"})
+
     def test_unknown_activation_checkpointing_mode_rejected(self):
         with pytest.raises(ValueError, match="activation_checkpointing"):
             parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "sometimes"})
