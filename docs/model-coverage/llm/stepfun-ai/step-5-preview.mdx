@@ -136,7 +136,7 @@ contains the launch command.
 | Hardware | 16 nodes, 128 NVIDIA H100 80GB GPUs |
 | Model | All 92 decoder layers; random initialization through `from_config` |
 | Parallelism | EP32 / PP4 / CP1 / TP1; DP32 with EP over the data-parallel ranks |
-| Pipeline | 1F1B, one local stage per rank, 24 microbatches; layer partitions [0,24), [24,46), [46,70), [70,92) |
+| Pipeline | 1F1B, one local stage per rank, 24 microbatches; 23 decoder layers per stage |
 | Sequence / global batch | 8,192 tokens / 768 sequences |
 | Data and MoE routing | Mock documents; fake balanced static expert routing |
 | Attention | Learned CSA selection; SWA varlen and CSA forward/backward full-block paths enabled |
