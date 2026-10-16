@@ -1494,7 +1494,28 @@ def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torc
             parameters may be on the meta device. Call before optimizer creation.
         compute_dtype: Reduced compute dtype, or None to retain existing storage.
     """
+    has_frozen_parameters = any(not parameter.requires_grad for parameter in model.parameters())
+    has_trainable_parameters = any(parameter.requires_grad for parameter in model.parameters())
+
+    def preserve_trainable_storage() -> None:
+        """Retain adapter dtypes when a mixed-trainability model is not reduced."""
+        if not (has_frozen_parameters and has_trainable_parameters):
+            return
+        for module in model.modules():
+            trainable_dtypes = {
+                name: parameter.dtype
+                for name, parameter in module.named_parameters(recurse=False)
+                if parameter.requires_grad
+            }
+            if trainable_dtypes:
+                module._preserve_parameter_dtypes = trainable_dtypes
+
     if compute_dtype not in (torch.bfloat16, torch.float16):
+        # A model-wide storage reduction may be unsafe when submodules use
+        # different compute policies. Still retain configured trainable storage
+        # (for example FP32 LoRA adapters) across later model-wide initializer
+        # casts. Frozen parameters remain unrecorded and follow those casts.
+        preserve_trainable_storage()
         return
     fp32_keywords = _get_fp32_module_keywords(model)
     pinned_ids = {
@@ -1517,6 +1538,10 @@ def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torc
             module._preserve_parameter_dtypes = {
                 name: parameter.dtype for name, parameter in module.named_parameters(recurse=False)
             }
+    else:
+        # No frozen parameter needed a storage cast, but adapters can still use
+        # a distinct configured dtype that later whole-model init casts must keep.
+        preserve_trainable_storage()
 
 
 def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.dtype | None) -> None:

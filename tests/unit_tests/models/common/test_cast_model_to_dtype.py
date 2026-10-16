@@ -703,6 +703,35 @@ class TestRestoreFp32Buffers:
 
 
 class TestFrozenStoragePreparation:
+    @pytest.mark.parametrize("compute_dtype", [None, torch.float32, torch.bfloat16])
+    def test_keeps_trainable_storage_when_frozen_reduction_does_not_change_storage(self, compute_dtype):
+        from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+
+        model = SimpleModel()
+        model.linear1.requires_grad_(False)
+        model.linear1.to(torch.bfloat16)
+
+        prepare_frozen_parameters_for_sharding(model, compute_dtype)
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.linear1.weight.dtype == torch.bfloat16
+        assert model.linear2.weight.dtype == torch.float32
+        assert model.linear2.bias.dtype == torch.float32
+
+    def test_keeps_trainable_storage_when_all_frozen_parameters_are_protected(self):
+        from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+
+        model = SimpleModel()
+        model.linear1.requires_grad_(False)
+        model._keep_in_fp32_modules = ["linear1"]
+
+        prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.linear1.weight.dtype == torch.float32
+        assert model.linear2.weight.dtype == torch.float32
+        assert model.linear2.bias.dtype == torch.float32
+
     @pytest.mark.parametrize("base_dtype", [torch.float32, torch.bfloat16])
     def test_preserves_identity_values_and_trainable_storage_through_initialization(self, base_dtype):
         from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
