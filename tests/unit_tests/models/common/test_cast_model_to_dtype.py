@@ -713,9 +713,7 @@ class TestFrozenStoragePreparation:
         before = dict(model.named_parameters())
         values = {name: parameter.detach().clone() for name, parameter in before.items()}
         prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
-        # Both directions occur in model initializers, including yield_fp32_model.
-        cast_model_to_dtype(model, torch.float32)
-        cast_model_to_dtype(model, torch.bfloat16)
+        cast_model_to_dtype(model, None)
         for name, parameter in model.named_parameters():
             expected_dtype = torch.float32 if parameter.requires_grad else torch.bfloat16
             assert parameter is before[name]
@@ -731,7 +729,7 @@ class TestFrozenStoragePreparation:
         model.register_parameter("tied_weight", model.linear1.weight)
         model.register_parameter("norm_alias", model.norm.weight)
         prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
-        cast_model_to_dtype(model, torch.float32)
+        cast_model_to_dtype(model, None)
         assert model.tied_weight is model.linear1.weight
         assert model.linear1.weight.dtype == torch.bfloat16
         assert model.norm.weight.dtype == torch.float32
@@ -745,7 +743,7 @@ class TestFrozenStoragePreparation:
             model.linear1.requires_grad_(False)
         prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
         model.to_empty(device="cpu")
-        cast_model_to_dtype(model, torch.float32)
+        cast_model_to_dtype(model, None)
         assert model.linear1.weight.dtype == torch.bfloat16
         assert model.linear2.weight.dtype == torch.float32
 
@@ -755,7 +753,6 @@ class TestFrozenStoragePreparation:
         model = SimpleModel()
         prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
         assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
-        assert not hasattr(model, "_preserve_parameter_dtypes")
         model.requires_grad_(False)
         for dtype in (None, torch.float32):
             prepare_frozen_parameters_for_sharding(model, dtype)
@@ -770,7 +767,7 @@ class TestFrozenStoragePreparation:
         model = SimpleModel()
         model.linear1.requires_grad_(False)
         prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
-        with yield_fp32_model(model, torch.bfloat16):
+        with yield_fp32_model(model):
             assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
         assert model.linear1.weight.dtype == torch.bfloat16
         assert model.linear2.weight.dtype == torch.float32

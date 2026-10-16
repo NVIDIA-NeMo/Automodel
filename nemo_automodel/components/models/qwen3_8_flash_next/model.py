@@ -733,13 +733,14 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = torch.bfloat16,
     ) -> None:
         """Initialize checkpoint-free model weights.
 
         Args:
             buffer_device: Target device for backend initializers.
             dtype: Final model parameter dtype, excluding intrinsic fp32 GDN state.
+                None preserves each parameter and buffer's storage dtype.
         """
         if buffer_device is None:
             buffer_device = (

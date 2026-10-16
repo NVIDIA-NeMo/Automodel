@@ -477,21 +477,10 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     ) -> None:
         """Initialize grouped-expert parameters (other params init via HF post_init).
 
-        ``dtype`` defaults to the model's **configured** ``torch_dtype`` rather than a
-        hardcoded ``bfloat16``. The meta/FSDP init path
-        (``checkpoint.checkpointing.initialize_model_weights``) calls this with no
-        dtype; a blanket ``self.to(torch.bfloat16)`` would materialize the whole model
-        in bf16 before the checkpoint loads, silently defeating the fp32 master weights
-        that ``model.torch_dtype: float32`` configs request (leaving AdamW on bf16
-        params). Honor the requested dtype instead.
+        ``dtype=None`` preserves each parameter and buffer's current storage dtype,
+        including mixed frozen-base and adapter storage selected before FSDP sharding.
+        Pass a dtype explicitly to cast after initialization.
         """
-        if dtype is None:
-            cfg_dtype = getattr(self.config, "torch_dtype", None)
-            if isinstance(cfg_dtype, str):
-                from nemo_automodel.shared.utils import dtype_from_str
-
-                cfg_dtype = dtype_from_str(cfg_dtype, torch.bfloat16)
-            dtype = cfg_dtype if isinstance(cfg_dtype, torch.dtype) else torch.bfloat16
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         with buffer_device:
             for layer in self.model.layers.values():

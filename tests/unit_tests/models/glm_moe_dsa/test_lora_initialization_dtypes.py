@@ -14,7 +14,6 @@
 
 """GLM-MoE-DSA initialization must preserve the PEFT storage policy."""
 
-import pytest
 import torch
 
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
@@ -22,8 +21,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
 
 
-@pytest.mark.parametrize("init_dtype", [torch.float32, torch.bfloat16])
-def test_glm_moe_dsa_initialization_preserves_frozen_and_adapter_storage(init_dtype):
+def test_glm_moe_dsa_initialization_preserves_frozen_and_adapter_storage():
     from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
     from nemo_automodel.components.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM
@@ -70,7 +68,7 @@ def test_glm_moe_dsa_initialization_preserves_frozen_and_adapter_storage(init_dt
     assert any("experts.lora_" in name for name in adapters)
     assert any("lora_A.weight" in name for name in adapters)
 
-    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=init_dtype)
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=None)
 
     for name, parameter in model.named_parameters():
         assert parameter.dtype == (torch.float32 if parameter.requires_grad else torch.bfloat16), name

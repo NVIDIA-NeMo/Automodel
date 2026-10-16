@@ -991,8 +991,9 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = torch.bfloat16,
     ) -> None:
+        """Initialize weights; ``dtype=None`` preserves existing storage dtypes."""
         buffer_device = buffer_device or _default_init_device()
         init_std = float(getattr(self.config, "initializer_range", 0.02))
         # The backbone (embed/norm/layers, incl. GatedDeltaNet-specific init) owns
@@ -1722,8 +1723,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = torch.bfloat16,
     ) -> None:
+        """Initialize weights; ``dtype=None`` preserves existing storage dtypes."""
         buffer_device = buffer_device or _default_init_device()
         # Initialize the native text backbone (embed/norm/layers incl. the
         # GatedDeltaNet/SSMGate-specific init). The HF vision tower + lm_head were

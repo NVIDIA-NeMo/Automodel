@@ -17,7 +17,7 @@ import logging
 import math
 import os
 import warnings
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -1052,15 +1052,15 @@ def get_rope_config(config) -> tuple[float, dict, float]:
 
 
 def cast_model_to_dtype(
-    model: nn.Module, dtype: torch.dtype = torch.bfloat16, skip_modules: tuple[str, ...] = ()
+    model: nn.Module, dtype: torch.dtype | None = torch.bfloat16, skip_modules: tuple[str, ...] = ()
 ) -> None:
     """Cast model parameters to the target dtype, keeping fp32 modules in full precision.
 
     Respects ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` on
     the model (the same attributes HuggingFace transformers uses).
 
-    Parameters listed in a module's ``_preserve_parameter_dtypes`` keep their
-    storage dtype selected before sharding, including frozen bases and adapters.
+    With ``dtype=None``, leave all parameter and buffer dtypes unchanged.
+    Initializers use this after storage dtypes have been selected before sharding.
 
     Uses ``nn.Module.to()`` which is safe for both plain tensors and DTensors
     (FSDP2 sharded parameters).  When the model is already FSDP2-sharded
@@ -1071,7 +1071,7 @@ def cast_model_to_dtype(
 
     Args:
         model: The model whose parameters should be cast.
-        dtype: Target dtype (e.g. ``torch.bfloat16``).
+        dtype: Target dtype (e.g. ``torch.bfloat16``), or None to preserve existing storage.
         skip_modules: Names of immediate submodules to leave entirely untouched
             (kept at their current dtype). Unlike the ``_keep_in_fp32_modules``
             restore path, these are *detached* during the cast so ``model.to()``
@@ -1082,6 +1082,9 @@ def cast_model_to_dtype(
             holder, sharded separately in fp32), so leaving it fp32 cannot break
             FSDP's uniform-dtype rule.
     """
+    if dtype is None:
+        return
+
     fp32_keywords = _get_fp32_module_keywords(model)
     strict_fp32_keywords = _get_strict_fp32_module_keywords(model)
     has_dtensor_params = _has_dtensor_params(model)
@@ -1109,38 +1112,8 @@ def cast_model_to_dtype(
                     detached.append((parent, child_name, child))
                     parent._modules[child_name] = None
 
-    preserved_dtypes = {
-        id(parameter): storage_dtype
-        for module in model.modules()
-        for name, storage_dtype in getattr(module, "_preserve_parameter_dtypes", {}).items()
-        if (parameter := module._parameters.get(name)) is not None
-    }
-    preserved_dtypes.update(
-        (id(parameter.grad), preserved_dtypes[id(parameter)])
-        for parameter in model.parameters()
-        if id(parameter) in preserved_dtypes and parameter.grad is not None
-    )
-
-    def convert(tensor: torch.Tensor) -> torch.Tensor:
-        """Cast an arbitrary-rank parameter/buffer unless its storage is preserved.
-
-        Args:
-            tensor: Parameter or buffer of arbitrary shape, including a DTensor
-                whose global shape and mesh placements must remain unchanged.
-
-        Returns:
-            Same-shaped tensor on the same device, aliasing the input if its dtype is unchanged.
-        """
-        if not (tensor.is_floating_point() or tensor.is_complex()):
-            return tensor
-        return tensor.to(dtype=preserved_dtypes.get(id(tensor), dtype))
-
     try:
-        if preserved_dtypes:
-            # Keep parameters registered so FSDP's _apply refreshes its shard views.
-            model._apply(convert)
-        else:
-            model.to(dtype)
+        model.to(dtype)
     finally:
         for parent, child_name, child in detached:
             parent._modules[child_name] = child
@@ -1176,12 +1149,12 @@ def cast_model_to_dtype(
 
 
 @contextmanager
-def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None):
+def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None) -> Iterator[nn.Module]:
     """Run a block with the model temporarily in fp32, then cast it to ``restore_dtype``.
 
     On entry the whole model is cast to fp32; on exit it is cast to ``restore_dtype``
-    (which defaults to the model's pre-context floating-point dtype, so by default the
-    original dtype is restored). The exit cast is a no-op when the target is already fp32.
+    when specified. Otherwise, each pre-existing parameter and buffer returns to its
+    own original dtype. Tensors registered inside the context retain their chosen dtype.
 
     The motivating use is from-scratch weight initialization. Sampling a random init directly
     in a reduced-precision dtype (e.g. bf16) distorts the init's variance/mean schedule: bf16's
@@ -1193,20 +1166,20 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
     per-element perturbation that preserves the init statistics. Wrap the body of a model's
     ``initialize_weights`` to keep that round-trip in one place.
 
-    Works whether or not the model is already FSDP2-sharded. A mixed frozen/trainable
-    storage policy is temporarily suspended for initialization and restored on exit.
+    Works whether or not the model is already FSDP2-sharded. The dtype snapshot is
+    local to this context; no storage policy is attached to the model.
     In the AutoModel pipeline ``initialize_weights`` runs after sharding (via
     ``checkpointer.initialize_model_weights``), i.e. on DTensor params, which is supported.
 
-    ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` handling is delegated to
-    ``cast_model_to_dtype``: on an unsharded model those modules' params and buffers are restored
+    When ``restore_dtype`` is explicit, ``_keep_in_fp32_modules`` /
+    ``_keep_in_fp32_modules_strict`` handling is delegated to ``cast_model_to_dtype``: on an unsharded model those modules' params and buffers are restored
     to fp32 on exit; on a sharded model, strict fp32 modules are restored while non-strict modules
     only have their buffers restored.
 
     Args:
         model: The model to run in fp32 within the context.
-        restore_dtype: The dtype to cast the model to on exit. Defaults to the model's current
-            floating-point dtype (captured before the fp32 cast), i.e. the original dtype.
+        restore_dtype: The dtype to cast the model to on exit. None restores each
+            pre-existing parameter and buffer to its own entry dtype, including gradients.
 
     Yields:
         The same ``model``, now in fp32.
@@ -1215,26 +1188,40 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
         >>> with yield_fp32_model(self, dtype):
         ...     self.model.init_weights(buffer_device=buffer_device)
     """
-    if restore_dtype is None:
-        restore_dtype = next((p.dtype for p in model.parameters() if p.is_floating_point()), torch.float32)
-    # Initialization may temporarily need FP32 even when persistent frozen storage
-    # is reduced precision. Restore the storage policy before the exit cast.
-    storage_policies = [
-        (module, module._preserve_parameter_dtypes)
-        for module in model.modules()
-        if hasattr(module, "_preserve_parameter_dtypes")
-    ]
-    for module, _ in storage_policies:
-        del module._preserve_parameter_dtypes
+    original_dtypes = (
+        {
+            name: tensor.dtype
+            for name, tensor in (
+                *model.named_parameters(remove_duplicate=False),
+                *model.named_buffers(remove_duplicate=False),
+            )
+        }
+        if restore_dtype is None
+        else {}
+    )
     try:
         cast_model_to_dtype(model, torch.float32)
-    finally:
-        for module, policy in storage_policies:
-            module._preserve_parameter_dtypes = policy
-    try:
         yield model
     finally:
-        cast_model_to_dtype(model, restore_dtype)
+        if restore_dtype is not None:
+            cast_model_to_dtype(model, restore_dtype)
+        else:
+            # Resolve names again: materialization and FSDP's _apply may replace tensors.
+            dtypes = {
+                id(tensor): original_dtypes[name]
+                for name, tensor in (
+                    *model.named_parameters(remove_duplicate=False),
+                    *model.named_buffers(remove_duplicate=False),
+                )
+                if name in original_dtypes
+            }
+            dtypes.update(
+                (id(parameter.grad), dtypes[id(parameter)])
+                for parameter in model.parameters()
+                if id(parameter) in dtypes and parameter.grad is not None
+            )
+            # _apply refreshes FSDP's shard views while keeping parameters registered.
+            model._apply(lambda tensor: tensor.to(dtype=dtypes.get(id(tensor), tensor.dtype)))
 
 
 def _get_strict_fp32_module_keywords(model: nn.Module) -> list[str]:
@@ -1485,8 +1472,8 @@ def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torc
 
     Trainable parameters retain their configured storage. Model-declared FP32
     precision requirements and checkpoint FP32 compute hints remain authoritative.
-    Record the resulting parameter dtypes so model initialization does not undo
-    this split with a whole-model cast after FSDP has captured the storage layout.
+    Subsequent initialization must use ``dtype=None`` to retain the selected storage
+    layout after FSDP has captured it.
 
     Args:
         model: Unsharded model after its final trainability policy is applied;
@@ -1501,7 +1488,6 @@ def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torc
         for name, parameter in model.named_parameters(remove_duplicate=False)
         if any(keyword in name for keyword in fp32_keywords)
     }
-    preserve_storage = False
     for parameter in model.parameters():
         if parameter.requires_grad or parameter.dtype not in (torch.float32, compute_dtype):
             continue
@@ -1510,12 +1496,6 @@ def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torc
         # Initialization-only storage change: no autograd graph, optimizer, or
         # distributed wrapper owns these plain parameters yet. Preserve identity.
         parameter.data = parameter.data.to(compute_dtype)
-        preserve_storage = True
-    if preserve_storage:
-        for module in model.modules():
-            module._preserve_parameter_dtypes = {
-                name: parameter.dtype for name, parameter in module.named_parameters(recurse=False)
-            }
 
 
 def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.dtype | None) -> None:

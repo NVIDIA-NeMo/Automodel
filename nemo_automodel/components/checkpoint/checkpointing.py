@@ -1499,7 +1499,8 @@ class Checkpointer:
 
         Moves empty parameter shells to the target device, resets HF initialization
         flags, calls the model's weight initialization method, and initializes any
-        PEFT adapters.
+        PEFT adapters. Initialization preserves the existing per-tensor storage dtypes;
+        custom initializers accept ``dtype=None`` for this purpose.
 
         Args:
             model: Model whose weights should be initialized.
@@ -1591,15 +1592,6 @@ class Checkpointer:
                     module._is_hf_initialized = False
 
             if hasattr(model, "initialize_weights"):
-                # Infer the target dtype from existing (floating-point)
-                # parameters so that a model constructed in fp32 (e.g. for fp32
-                # master weights under FSDP2) is not silently cast back to
-                # bf16 inside model.initialize_weights() -> cast_model_to_dtype().
-                param_dtype = None
-                for p in model.parameters():
-                    if p.is_floating_point():
-                        param_dtype = p.dtype
-                        break
                 saved_padding_idx = [(mod, mod.padding_idx) for mod in padded_embeddings]
                 for mod, _ in saved_padding_idx:
                     mod.padding_idx = None
@@ -1617,10 +1609,7 @@ class Checkpointer:
                         model.is_custom_code = original_class.is_custom_code
                     with _DTensorInitCopyMode():
                         try:
-                            if param_dtype is not None:
-                                model.initialize_weights(dtype=param_dtype)
-                            else:
-                                model.initialize_weights()
+                            model.initialize_weights(dtype=None)
                         except TypeError:
                             # Model's initialize_weights() does not accept a dtype kwarg.
                             model.initialize_weights()

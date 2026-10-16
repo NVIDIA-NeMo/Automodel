@@ -89,6 +89,28 @@ def _masks(model, batch_size, seq_len, block_size, device, dtype=torch.float32):
     return {"full_attention": mask_full, "sliding_attention": mask_sliding}
 
 
+@pytest.mark.parametrize("dtype", [None, torch.bfloat16])
+def test_initialization_dtype_preserves_storage_unless_explicit(dtype):
+    from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+    from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+
+    model, _ = _tiny_model()
+    apply_lora_to_linear_modules(model, PeftConfig(target_modules=["*"], lora_dtype=torch.float32))
+    prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+    before = {name: p.dtype for name, p in model.named_parameters()}
+    adapters = {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad}
+    assert any("experts.lora_" in name for name in adapters)
+
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=dtype)
+
+    for name, parameter in model.named_parameters():
+        if dtype is None:
+            assert parameter.dtype == before[name], name
+        if parameter.requires_grad:
+            torch.testing.assert_close(parameter, adapters[name].to(dtype or before[name]), rtol=0, atol=0)
+        assert torch.isfinite(parameter).all(), name
+
+
 def test_construct_and_forward_shape():
     torch.manual_seed(0)
     model, _ = _tiny_model()

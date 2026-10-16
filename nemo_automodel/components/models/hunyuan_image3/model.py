@@ -406,8 +406,9 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
 
     @torch.no_grad()
     def initialize_weights(
-        self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
+        self, buffer_device: torch.device | None = None, dtype: torch.dtype | None = torch.bfloat16
     ) -> None:
+        """Initialize weights; ``dtype=None`` preserves existing storage dtypes."""
         if buffer_device is None:
             buffer_device = (
                 torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
