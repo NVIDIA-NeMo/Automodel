@@ -1172,6 +1172,9 @@ class TestGroupedExpertsDeepEP:
 
     def test_chunked_nonlinear_post_expert_precedes_router_weight(self, moe_config, monkeypatch):
         """Chunking preserves nonlinear postprocessing and routing gradients."""
+        # Expert parameters follow config.dtype (#4388); the hand-written fp32 reference below compares the
+        # chunked path with default tolerances, so build the experts in fp32 like the other reference tests.
+        moe_config.dtype = torch.float32
         moe_config.apply_router_weight_after_down = True
         moe_config.expert_bias = True
         experts = GroupedExpertsDeepEP(moe_config)
