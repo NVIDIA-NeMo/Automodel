@@ -85,6 +85,10 @@ _LAYER_GROUPS: Final[dict[str, LayerGroupPaths]] = {
     "Mistral3FP8VLMForConditionalGeneration": _MISTRAL3_LAYERS,
     "Mistral3ForConditionalGeneration": _MISTRAL3_LAYERS,
     "NemotronHForCausalLM": {"language": ("backbone.layers", "model.layers")},
+    "NemotronH_Omni_Reasoning_V3": {
+        "language": ("language_model.model.layers",),
+        "vision": ("vision_model.encoder.layer",),
+    },
     "GPT2LMHeadModel": {"language": ("transformer.h",)},
     "Qwen2VLForConditionalGeneration": _QWEN2_VL_LAYERS,
     "Qwen2_5_VLForConditionalGeneration": _QWEN2_VL_LAYERS,
