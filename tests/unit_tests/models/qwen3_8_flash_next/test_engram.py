@@ -485,11 +485,13 @@ def _owner_sharded_misroute_worker(rank: int, world_size: int, store_path: str) 
                 The routed ID tensor of shape ``[owned_requests]`` and its
                 send counts, receive counts, and fixed route capacity.
             """
-            received_ids, input_splits, output_splits, capacity = original_exchange_ids(sorted_global_ids, send_counts)
+            received_ids, input_splits, output_splits, capacity, *device_rows = original_exchange_ids(
+                sorted_global_ids, send_counts
+            )
             if rank == 0:
                 received_ids = received_ids.clone()
                 received_ids[0] = table.vocab_end_index
-            return received_ids, input_splits, output_splits, capacity
+            return received_ids, input_splits, output_splits, capacity, *device_rows
 
         # Corrupt rank 0's post-All-to-All payload only.  Rank 1 must still
         # enter the same diagnostic collectives and raise the same error.
@@ -546,6 +548,8 @@ def test_owner_sharded_table_rejects_misrouted_ids_symmetrically(tmp_path: Path)
 
 
 def _owner_sharded_route_metadata_worker(rank: int, world_size: int, store_path: str) -> None:
+    from nemo_automodel.components.models.qwen3_8_flash_next.engram import _segment_rows
+
     try:
         torch.set_num_threads(1)
         dist.init_process_group(
@@ -554,10 +558,12 @@ def _owner_sharded_route_metadata_worker(rank: int, world_size: int, store_path:
             rank=rank,
             world_size=world_size,
         )
+        # The cross-rank metadata preflight below is the strict (host-side) path.
         table = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=12,
             embedding_dim=3,
             initializer_range=0.0,
+            strict_validation=True,
         ).build(process_group=dist.group.WORLD, dtype=torch.float32)
         _parallelize_owner_table(table)
         ids_by_rank = (
@@ -566,6 +572,30 @@ def _owner_sharded_route_metadata_worker(rank: int, world_size: int, store_path:
         )
         global_ids = ids_by_rank[rank]
         owners = torch.div(global_ids, table.num_embeddings_per_rank, rounding_mode="floor")
+        # Non-strict exchange (what DeepSeek-V4.1 runs): one host read of the gathered count
+        # matrix must produce the same split metadata as the strict preflight.
+        fast_table = Qwen3_8_FlashNextEngramTableConfig(
+            num_embeddings=12,
+            embedding_dim=3,
+            initializer_range=0.0,
+            strict_validation=False,
+        ).build(process_group=dist.group.WORLD, dtype=torch.float32)
+        _parallelize_owner_table(fast_table)
+        assert fast_table.strict_validation is False
+        sorted_for_fast = global_ids[torch.argsort(owners, stable=True)]
+        fast_send_counts = torch.bincount(owners, minlength=world_size).to(torch.int64)
+        fast_result = fast_table._exchange_ids(sorted_for_fast, fast_send_counts)
+        strict_result = table._exchange_ids(sorted_for_fast, fast_send_counts)
+        torch.testing.assert_close(fast_result[0], strict_result[0])
+        assert fast_result[1:4] == strict_result[1:4]
+        assert fast_result[1] == tuple(fast_send_counts.tolist())
+        # Both paths also hand back the send-side and receive-side row maps built once
+        # from the device counts, so the payload exchange (forward and backward) issues
+        # no row-map kernels and never re-uploads the host split sizes.
+        for fast_rows, strict_rows, host_sizes in zip(fast_result[4:], strict_result[4:], fast_result[1:3]):
+            assert torch.equal(fast_rows.cpu(), strict_rows.cpu())
+            expected_rows = _segment_rows(host_sizes, fast_result[3], torch.device("cpu"))
+            assert torch.equal(fast_rows.cpu(), expected_rows)
         send_counts = torch.bincount(owners, minlength=world_size).to(torch.int64)
         sorted_ids = global_ids[torch.argsort(owners, stable=True)]
 
@@ -757,3 +787,183 @@ def test_packed_ple_without_boundaries_reads_previous_document() -> None:
     # positions of a later document see the previous one, the rest do not.
     assert not torch.allclose(packed[:, 3:5], second_document[:, :2])
     torch.testing.assert_close(packed[:, 14:15], second_document[:, 11:12], rtol=1e-6, atol=1e-6)
+
+
+def test_engram_table_config_keeps_strict_validation_by_default() -> None:
+    """The shared table keeps the host-side checks unless a model opts out (DeepSeek-V4.1 does through its config);
+    CPU inputs are validated on the host whatever the flag says."""
+    config = Qwen3_8_FlashNextEngramTableConfig(num_embeddings=8, embedding_dim=2, initializer_range=0.0)
+    assert config.strict_validation is True
+    table = config.build(process_group=None, dtype=torch.float32)
+    assert table.strict_validation is True
+    assert table._validate_on_host(torch.zeros(1, dtype=torch.long)) is True
+    fast = Qwen3_8_FlashNextEngramTableConfig(
+        num_embeddings=8, embedding_dim=2, initializer_range=0.0, strict_validation=False
+    ).build(process_group=None, dtype=torch.float32)
+    assert fast.strict_validation is False
+    assert fast._validate_on_host(torch.zeros(1, dtype=torch.long)) is True  # CPU input
+
+
+def test_engram_send_counts_match_bincount() -> None:
+    """The scatter_add_ send counts equal bincount for every owner, including empty ones."""
+    owners = torch.tensor([3, 0, 3, 1, 3], dtype=torch.long)
+    counts = torch.zeros(4, dtype=torch.int64).scatter_add_(0, owners, torch.ones_like(owners, dtype=torch.int64))
+    torch.testing.assert_close(counts, torch.bincount(owners, minlength=4).to(torch.int64))
+
+
+def test_fixed_capacity_all_to_all_packs_with_one_index_copy_and_matches_the_loop_path(monkeypatch) -> None:
+    """The packed / unpacked segments are bitwise those of a per-rank copy loop (ragged counts, empty peers, sentinel
+    padding), for the forward and the swapped backward metadata."""
+    from nemo_automodel.components.models.qwen3_8_flash_next import engram as engram_module
+
+    world_size = 4
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: world_size)
+    sent: dict[str, torch.Tensor] = {}
+
+    def fake_all_to_all(output: torch.Tensor, input_tensor: torch.Tensor, group=None) -> None:
+        # a deterministic "transport": peer r receives from peer (r - 1); the padded layout makes this a roll
+        sent["input"] = input_tensor.clone()
+        output.copy_(input_tensor.view(world_size, -1, *input_tensor.shape[1:]).roll(1, dims=0).view_as(output))
+
+    def loop_reference(rows: torch.Tensor, sizes_in, sizes_out, capacity: int, fill_value: float) -> torch.Tensor:
+        # the per-rank copy loops the index_copy_ / index_select exchange replaced
+        padded_input = rows.new_full((world_size, capacity, *rows.shape[1:]), fill_value)
+        offset = 0
+        for destination_rank, count in enumerate(sizes_in):
+            if count:
+                padded_input[destination_rank, :count].copy_(rows[offset : offset + count])
+            offset += count
+        padded_output = rows.new_full(padded_input.shape, fill_value)
+        fake_all_to_all(padded_output, padded_input.contiguous())
+        compact = rows.new_empty((sum(sizes_out), *rows.shape[1:]))
+        offset = 0
+        for source_rank, count in enumerate(sizes_out):
+            if count:
+                compact[offset : offset + count].copy_(padded_output[source_rank, :count])
+            offset += count
+        return compact
+
+    monkeypatch.setattr(dist, "all_to_all_single", fake_all_to_all)
+    torch.manual_seed(5)
+    in_sizes, out_sizes, capacity = (3, 0, 5, 2), (2, 3, 0, 5), 5
+    values = torch.randn(sum(in_sizes), 3)
+    pg = object()
+    for sizes_in, sizes_out in ((in_sizes, out_sizes), (out_sizes, in_sizes)):  # forward and the swapped backward
+        rows = torch.randn(sum(sizes_in), 3) if sizes_in is not in_sizes else values
+        expected = loop_reference(rows, sizes_in, sizes_out, capacity, -7.0)
+        expected_sent = sent["input"]
+        actual = engram_module._fixed_capacity_all_to_all(rows, sizes_in, sizes_out, capacity, pg, fill_value=-7.0)
+        assert torch.equal(sent["input"], expected_sent), "the padded send buffer (incl. the -7 padding) is identical"
+        assert actual.shape == expected.shape == (sum(sizes_out), 3) and torch.equal(actual, expected)
+    # the row map itself: peer r's k-th row lands at r * capacity + k
+    rows_map = engram_module._segment_rows((3, 0, 5, 2), 5, torch.device("cpu"))
+    assert rows_map.tolist() == [0, 1, 2, 10, 11, 12, 13, 14, 15, 16]
+    assert engram_module._segment_rows((0, 0), 5, torch.device("cpu")).numel() == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_padded_all_to_all_keeps_the_input_dtype_under_autocast(monkeypatch, dtype: torch.dtype) -> None:
+    """A collective has no autocast rule and neither has its autograd wrapper: under BF16 autocast an FP32 (or BF16)
+    padded buffer is exchanged and its gradient routed back in the input dtype, bitwise what the same exchange returns
+    without autocast."""
+    from nemo_automodel.components.models.qwen3_8_flash_next import engram as engram_module
+
+    world_size = 4
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: world_size)
+
+    def fake_all_to_all(output: torch.Tensor, input_tensor: torch.Tensor, group=None) -> None:
+        output.copy_(input_tensor.view(world_size, -1, *input_tensor.shape[1:]).roll(1, dims=0).view_as(output))
+
+    monkeypatch.setattr(dist, "all_to_all_single", fake_all_to_all)
+    torch.manual_seed(7)
+    padded = torch.randn(world_size * 5, 3, dtype=dtype, requires_grad=True)
+    pg = object()
+    out_ref = engram_module._PaddedAllToAll.apply(padded, pg)
+    (grad_ref,) = torch.autograd.grad(out_ref.float().square().sum(), padded)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = engram_module._PaddedAllToAll.apply(padded, pg)
+        (grad,) = torch.autograd.grad(out.float().square().sum(), padded)
+    assert out.dtype == dtype and grad.dtype == dtype
+    assert torch.equal(out, out_ref) and torch.equal(grad, grad_ref)
+
+
+def test_segment_rows_from_counts_and_aligned_capacity() -> None:
+    from nemo_automodel.components.models.qwen3_8_flash_next import engram as engram_module
+
+    counts = torch.tensor([3, 0, 5, 2])
+    assert torch.equal(
+        engram_module._segment_rows_from_counts(counts, 5, 10),
+        engram_module._segment_rows((3, 0, 5, 2), 5, torch.device("cpu")),
+    )
+    assert engram_module._segment_rows_from_counts(torch.tensor([0, 0]), 5, 0).numel() == 0
+    assert engram_module._aligned_capacity(0) == 64
+    assert engram_module._aligned_capacity(100) == 128  # 125 rounded up to the alignment
+    assert engram_module._aligned_capacity(3072) == 3840  # 1.25 x the measured maximum
+
+
+def _owner_sharded_capacity_mode_worker(rank: int, world_size: int, store_path: str) -> None:
+    """Capacity mode (no device-to-host read per lookup) matches the host-read path bit for bit, forward and backward."""
+    try:
+        torch.set_num_threads(1)
+        dist.init_process_group("gloo", init_method=f"file://{store_path}", rank=rank, world_size=world_size)
+        torch.manual_seed(7)
+
+        def build(capacity_mode: bool) -> nn.Module:
+            table = Qwen3_8_FlashNextEngramTableConfig(
+                num_embeddings=16,
+                embedding_dim=3,
+                initializer_range=0.1,
+                strict_validation=False,
+                capacity_mode=capacity_mode,
+            ).build(process_group=dist.group.WORLD, dtype=torch.float32)
+            _parallelize_owner_table(table)
+            return table
+
+        host_table, fast_table = build(False), build(True)
+        with torch.no_grad():
+            fast_table.weight.to_local().copy_(host_table.weight.to_local())
+        assert fast_table._capacity is None and not host_table._use_capacity_mode(torch.zeros(1, dtype=torch.long))
+        for ids in (torch.randint(0, 16, (2, 5)), torch.randint(0, 16, (3, 7)), torch.randint(0, 16, (1, 2))):
+            local_ids = (ids + 3 * rank) % 16  # different request mixes per rank and per lookup
+            expected = host_table(local_ids)
+            actual = fast_table(local_ids)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            upstream = torch.randn_like(expected)
+            expected.backward(upstream)
+            actual.backward(upstream)
+            torch.testing.assert_close(
+                fast_table.weight.grad.to_local(), host_table.weight.grad.to_local(), rtol=1e-6, atol=1e-6
+            )
+            host_table.weight.grad = None
+            fast_table.weight.grad = None
+        assert fast_table._capacity is not None and fast_table._capacity % 64 == 0
+        # Every rank derives the capacity from the same all-gathered matrix: it must agree without a collective.
+        gathered = [torch.zeros(1, dtype=torch.long) for _ in range(world_size)]
+        dist.all_gather(gathered, torch.tensor([fast_table._capacity]))
+        assert all(int(value) == fast_table._capacity for value in gathered)
+        # A jump past the calibrated capacity trips the device-side guard instead of corrupting the exchange.
+        overflow = torch.full((1, fast_table._capacity + 1), 8 * rank, dtype=torch.long)
+        with pytest.raises(RuntimeError):
+            fast_table(overflow)
+        # An exchange that returns without writing leaves the untouched marker: the host-path diagnostics report it.
+        original_all_to_all_single = dist.all_to_all_single
+        setattr(dist, "all_to_all_single", lambda *args, **kwargs: None)
+        try:
+            with pytest.raises(RuntimeError) as exc_info:
+                fast_table(torch.tensor([[1, 9]]))
+        finally:
+            setattr(dist, "all_to_all_single", original_all_to_all_single)
+        message = str(exc_info.value)
+        assert "untouched=" in message and "bad=" in message and "owner_group_rank=0" in message
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_owner_sharded_table_capacity_mode_matches_host_path(tmp_path: Path) -> None:
+    mp.spawn(
+        _owner_sharded_capacity_mode_worker,
+        args=(2, str(tmp_path / "owner-sharded-capacity-pg")),
+        nprocs=2,
+        join=True,
+    )

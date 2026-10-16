@@ -122,6 +122,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         dspark_num_experts_per_tok: int = 3,
         dtype: str = "bfloat16",
         compile_cache_quant: bool = False,
+        engram_strict_validation: bool = False,
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
@@ -216,6 +217,10 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # torch.compile the cache quantize/dequantize core (fp8 / mxfp4 / nvfp4 rounding of the sliding-window and
         # compressed caches); a DeepSeek-V4.1 knob, so it lives here rather than on the shared BackendConfig
         self.compile_cache_quant = compile_cache_quant
+        # Validate every Engram lookup on the host with cross-rank agreement (the original behaviour, about twenty
+        # device-to-host synchronisations and seven small collectives per lookup); False keeps the same invariants as
+        # device-side asserts. See Qwen3_8_FlashNextEngramTableConfig.strict_validation.
+        self.engram_strict_validation = engram_strict_validation
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,
