@@ -43,8 +43,8 @@ def test_nemotron_3_5_bolt_lora_uses_force_hf_without_expert_parallelism() -> No
     assert model["force_hf"] is True
     assert model["trust_remote_code"] is True
     assert model["torch_dtype"] == "torch.bfloat16"
-    assert model["attn_implementation"] == "eager"
-    assert model["revision"] == "a6a1e5030819a130a1ea08aadb1fe42f4cc86777"
+    assert model["attn_implementation"] == "flash_attention_2"
+    assert model["revision"] == "a6a1e5030819a130a1ea08aadb1fe42f4cc86777"  # pragma: allowlist secret
     assert "backend" not in model
     assert "quantization" not in raw_config
 
@@ -85,6 +85,7 @@ def test_nemotron_3_5_bolt_lora_uses_force_hf_without_expert_parallelism() -> No
 
     assert config.step_scheduler.global_batch_size == 1
     assert config.step_scheduler.local_batch_size == 1
+    assert config.step_scheduler.max_steps == 100
     assert config.dataset.path_or_dataset == "naver-clova-ix/cord-v2"
     assert config.dataloader.collate_fn.max_length == 4096
     assert config.validation_dataloader.collate_fn.max_length == 4096

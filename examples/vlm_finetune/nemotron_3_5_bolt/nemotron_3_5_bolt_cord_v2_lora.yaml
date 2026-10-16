@@ -35,7 +35,7 @@ step_scheduler:
   local_batch_size: 1
   ckpt_every_steps: 20
   val_every_steps: 20
-  max_steps: 20
+  max_steps: 100
 
 dist_env:
   backend: nccl
@@ -49,12 +49,12 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16
-  revision: a6a1e5030819a130a1ea08aadb1fe42f4cc86777
+  revision: a6a1e5030819a130a1ea08aadb1fe42f4cc86777  # pragma: allowlist secret
   force_hf: true
   trust_remote_code: true
   torch_dtype: torch.bfloat16
-  # FlashAttention2 rejects this VLM batch mask and the remote HF class does not advertise SDPA.
-  attn_implementation: eager
+  # The pinned remote implementation supports FlashAttention2 on this VLM batch format.
+  attn_implementation: flash_attention_2
   use_liger_kernel: false
   use_sdpa_patching: false
   # This checkpoint revision stores pre-Transformers-5.18 parameter prefixes.
@@ -87,7 +87,7 @@ peft:
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16
-  revision: a6a1e5030819a130a1ea08aadb1fe42f4cc86777
+  revision: a6a1e5030819a130a1ea08aadb1fe42f4cc86777  # pragma: allowlist secret
   trust_remote_code: true
 
 checkpoint:
