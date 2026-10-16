@@ -1189,6 +1189,8 @@ class TestGroupedExpertsDeepEP:
         ]
         result = experts(*args[:4], post_expert_output=torch.tanh)
         ref_hidden, ref_up, ref_down, ref_probs = reference_inputs
+        ref_up = ref_up.to(ref_hidden.dtype)
+        ref_down = ref_down.to(ref_hidden.dtype)
         unweighted = experts.expert_activation(ref_hidden @ ref_up[0], torch.ones(3, 1)) @ ref_down[0]
         expected = torch.tanh(unweighted) * ref_probs[:, None]
         gradient = torch.randn_like(result)
