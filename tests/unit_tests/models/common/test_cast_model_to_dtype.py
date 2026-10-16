@@ -774,3 +774,22 @@ class TestFrozenStoragePreparation:
             assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
         assert model.linear1.weight.dtype == torch.bfloat16
         assert model.linear2.weight.dtype == torch.float32
+
+    def test_fp32_initialization_context_with_activation_checkpoint_wrapper(self):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+        from nemo_automodel.components.models.common.utils import (
+            prepare_frozen_parameters_for_sharding,
+            yield_fp32_model,
+        )
+
+        model = SimpleModel()
+        model.linear1.requires_grad_(False)
+        prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+        model.linear1 = checkpoint_wrapper(model.linear1)
+
+        with yield_fp32_model(model, torch.bfloat16):
+            assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+
+        assert model.linear1.weight.dtype == torch.bfloat16
+        assert model.linear2.weight.dtype == torch.float32

@@ -1052,7 +1052,11 @@ def get_rope_config(config) -> tuple[float, dict, float]:
 
 
 def cast_model_to_dtype(
-    model: nn.Module, dtype: torch.dtype = torch.bfloat16, skip_modules: tuple[str, ...] = ()
+    model: nn.Module,
+    dtype: torch.dtype = torch.bfloat16,
+    skip_modules: tuple[str, ...] = (),
+    *,
+    ignore_preserved_dtypes: bool = False,
 ) -> None:
     """Cast model parameters to the target dtype, keeping fp32 modules in full precision.
 
@@ -1061,6 +1065,8 @@ def cast_model_to_dtype(
 
     Parameters listed in a module's ``_preserve_parameter_dtypes`` keep their
     storage dtype selected before sharding, including frozen bases and adapters.
+    The storage policy is installed by ``prepare_frozen_parameters_for_sharding``
+    and remains active for the model lifetime unless ``ignore_preserved_dtypes`` is set.
 
     Uses ``nn.Module.to()`` which is safe for both plain tensors and DTensors
     (FSDP2 sharded parameters).  When the model is already FSDP2-sharded
@@ -1072,6 +1078,8 @@ def cast_model_to_dtype(
     Args:
         model: The model whose parameters should be cast.
         dtype: Target dtype (e.g. ``torch.bfloat16``).
+        ignore_preserved_dtypes: Temporarily ignore the per-parameter storage policy;
+            used when an initializer needs a uniform FP32 view before restoring storage.
         skip_modules: Names of immediate submodules to leave entirely untouched
             (kept at their current dtype). Unlike the ``_keep_in_fp32_modules``
             restore path, these are *detached* during the cast so ``model.to()``
@@ -1109,12 +1117,16 @@ def cast_model_to_dtype(
                     detached.append((parent, child_name, child))
                     parent._modules[child_name] = None
 
-    preserved_dtypes = {
-        id(parameter): storage_dtype
-        for module in model.modules()
-        for name, storage_dtype in getattr(module, "_preserve_parameter_dtypes", {}).items()
-        if (parameter := module._parameters.get(name)) is not None
-    }
+    preserved_dtypes = (
+        {
+            id(parameter): storage_dtype
+            for module in model.modules()
+            for name, storage_dtype in getattr(module, "_preserve_parameter_dtypes", {}).items()
+            if (parameter := module._parameters.get(name)) is not None
+        }
+        if not ignore_preserved_dtypes
+        else {}
+    )
     preserved_dtypes.update(
         (id(parameter.grad), preserved_dtypes[id(parameter)])
         for parameter in model.parameters()
@@ -1217,20 +1229,9 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
     """
     if restore_dtype is None:
         restore_dtype = next((p.dtype for p in model.parameters() if p.is_floating_point()), torch.float32)
-    # Initialization may temporarily need FP32 even when persistent frozen storage
-    # is reduced precision. Restore the storage policy before the exit cast.
-    storage_policies = [
-        (module, module._preserve_parameter_dtypes)
-        for module in model.modules()
-        if hasattr(module, "_preserve_parameter_dtypes")
-    ]
-    for module, _ in storage_policies:
-        del module._preserve_parameter_dtypes
-    try:
-        cast_model_to_dtype(model, torch.float32)
-    finally:
-        for module, policy in storage_policies:
-            module._preserve_parameter_dtypes = policy
+    # Initialization temporarily needs FP32 even when persistent frozen storage
+    # is reduced precision. Keep the policy metadata intact while bypassing it.
+    cast_model_to_dtype(model, torch.float32, ignore_preserved_dtypes=True)
     try:
         yield model
     finally:

@@ -138,17 +138,19 @@ This keeps the resident model parameters in bf16 instead of fp32, so it can redu
 
 Frozen base parameters do not receive optimizer updates or acquire Adam state. Keeping them in bf16 therefore does not reduce the precision of adapter updates. With `torch.optim.Adam` or `AdamW`, it is the **trainable adapter storage dtype** that determines the precision of adapter updates and EMA buffers.
 
-For unquantized FSDP2 LoRA training, set the adapter dtype explicitly to keep adapter storage and Adam moments in fp32 while allowing frozen base storage and forward/backward compute to remain bf16:
+For multi-rank, unquantized FSDP2 LoRA training, set the adapter dtype explicitly to keep adapter storage and Adam moments in fp32 while allowing frozen base storage and forward/backward compute to remain bf16:
 
 ```yaml
 peft:
   lora_dtype: float32
 ```
 
-The default `peft.lora_dtype: null` inherits the base layer dtype when adapters are created; it does not guarantee fp32 adapters. Setting `peft.lora_dtype: bfloat16` explicitly gives bf16 adapter storage and, with torch Adam/AdamW, bf16 moments. Validate convergence before choosing that setting. Changing `model.dtype` alone does not override an explicit adapter dtype.
+The default `peft.lora_dtype: null` inherits the base layer dtype when adapters are created; it does not guarantee fp32 adapters. Setting `peft.lora_dtype: bfloat16` explicitly gives bf16 adapter storage and, with torch Adam/AdamW, bf16 moments. Validate convergence before choosing that setting. In this multi-rank FSDP2 path, changing `model.dtype` alone does not override an explicit adapter dtype.
+
+On a single-rank FSDP2 setup, parameters remain unsharded and mixed LoRA submodules are cast to the compute dtype, so `peft.lora_dtype: float32` does not guarantee fp32 adapter storage or optimizer moments there.
 
 <Warning>
-The automatic warning about torch Adam/AdamW with trainable bf16 parameters currently skips PEFT runs. Absence of this warning does not mean your adapters or their optimizer state are fp32. Check `peft.lora_dtype` and the actual trainable parameter dtypes; use `peft.lora_dtype: float32` to request fp32 adapter storage with torch Adam/AdamW.
+The automatic warning about torch Adam/AdamW with trainable bf16 parameters currently skips PEFT runs. Absence of this warning does not mean your adapters or their optimizer state are fp32. Check `peft.lora_dtype` and the actual trainable parameter dtypes; use `peft.lora_dtype: float32` to request fp32 adapter storage with torch Adam/AdamW on multi-rank FSDP2 runs.
 </Warning>
 
 ## Example Configs

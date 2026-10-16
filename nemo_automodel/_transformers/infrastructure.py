@@ -87,6 +87,7 @@ from nemo_automodel.components.utils.model_utils import (
     print_trainable_parameters,
 )
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
+from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
@@ -488,6 +489,31 @@ def _get_strategy_config(model_wrapper) -> DistributedStrategyConfig | None:
     return getattr(model_wrapper, "config", None)
 
 
+def _get_frozen_storage_compute_dtype(
+    strategy_config: DistributedStrategyConfig | None, mesh: MeshContext | None
+) -> torch.dtype | None:
+    """Resolve a safe model-wide compute dtype for frozen storage preparation.
+
+    MoE can override the FSDP2 parameter compute dtype for transformer blocks.
+    Since storage preparation currently accepts one dtype for the whole model,
+    skip it when that override differs from the root policy.
+    """
+    compute_dtype = getattr(getattr(strategy_config, "mp_policy", None), "param_dtype", None)
+    moe_config = getattr(mesh, "moe_parallel_config", None)
+    moe_policy = getattr(moe_config, "mp_policy", None)
+    if moe_policy is not None and getattr(moe_policy, "param_dtype", None) != compute_dtype:
+        return None
+    lm_head_precision = getattr(moe_config, "lm_head_precision", None)
+    if isinstance(lm_head_precision, str):
+        lm_head_precision = dtype_from_str(lm_head_precision, default=None)
+    if lm_head_precision == torch.float32:
+        # The head is sharded in FP32 independently of the root/MoE policy.
+        # This helper currently prepares one model-wide storage dtype, so keep
+        # source precision for all frozen params in this configuration.
+        return None
+    return compute_dtype
+
+
 #  apply_model_infrastructure  --  the main post-init orchestration function
 def apply_model_infrastructure(
     model,
@@ -663,7 +689,7 @@ def apply_model_infrastructure(
         strict=True,
     )
     if isinstance(strategy_config, FSDP2Config) and peft_config is not None and quantization_config is None:
-        prepare_frozen_parameters_for_sharding(model, strategy_config.mp_policy.param_dtype)
+        prepare_frozen_parameters_for_sharding(model, _get_frozen_storage_compute_dtype(strategy_config, mesh))
     reapply_trainability = partial(
         _apply_trainability_policy,
         peft_enabled=peft_config is not None,
