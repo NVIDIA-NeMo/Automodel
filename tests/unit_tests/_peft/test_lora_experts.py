@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -63,6 +64,42 @@ def moe_config():
         expert_activation="swiglu",
         dtype=torch.float32,
     )
+
+
+@pytest.mark.parametrize("expert_cls", [GroupedExperts, GroupedExpertsDeepEP])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_expert_construction_honors_storage_dtype(moe_config, expert_cls, dtype):
+    experts = expert_cls(replace(moe_config, dtype=dtype, expert_bias=True))
+    assert all(parameter.dtype == dtype for parameter in experts.parameters())
+
+
+@pytest.mark.parametrize("expert_cls", [GroupedExperts, GroupedExpertsDeepEP])
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("lora_dtype", [None, torch.float32])
+def test_lora_wrapping_preserves_base_storage(moe_config, expert_cls, device, dtype, bias, lora_dtype):
+    # The materialized dtype may differ from config; wrapping must preserve it.
+    config_dtype = torch.float32 if dtype == torch.bfloat16 else torch.bfloat16
+    with torch.device(device):
+        original = expert_cls(replace(moe_config, dtype=config_dtype, expert_bias=bias)).to(dtype)
+    with torch.no_grad():
+        for parameter in original.parameters():
+            parameter.fill_(0.125)
+    base_parameters = dict(original.named_parameters())
+
+    wrapped = patch_moe_module(original, dim=4, lora_dtype=lora_dtype)
+
+    for name, parameter in base_parameters.items():
+        assert wrapped.get_parameter(name) is parameter
+        assert parameter.dtype == dtype and parameter.device.type == device
+        assert not parameter.requires_grad
+        if device != "meta":
+            assert torch.all(parameter == 0.125)
+    adapters = [parameter for name, parameter in wrapped.named_parameters() if name.startswith("lora_")]
+    assert len(adapters) == 4
+    assert all(parameter.dtype == (lora_dtype or dtype) for parameter in adapters)
+    assert all(parameter.device.type == device and parameter.requires_grad for parameter in adapters)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
