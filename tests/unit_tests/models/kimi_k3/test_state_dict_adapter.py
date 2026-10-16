@@ -14,7 +14,9 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
+from torch.distributed._tensor.placement_types import Shard
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import (
@@ -23,6 +25,7 @@ from nemo_automodel.components.models.kimi_k3.state_dict_adapter import (
     _strip_kda_fp32_holder,
     dequantize_mxfp4,
 )
+from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.config import MoEConfig
 
 
@@ -45,6 +48,40 @@ def _tiny_adapter():
     )
     backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
     return KimiK3StateDictAdapter(SimpleNamespace(), moe, backend)
+
+
+class _FakeDTensor:
+    def __init__(self, local_tensor: torch.Tensor, mesh_rank: int, mesh_size: int):
+        """Create a DTensor-like expert weight sharded on dim 0 over a non-EP mesh.
+
+        Args:
+            local_tensor: Rank-local expert tensor of shape [local_experts, ...].
+            mesh_rank: This rank's index in the mesh.
+            mesh_size: Number of ranks in the mesh.
+        """
+        self._local_tensor = local_tensor
+        self.placements = (Shard(0),)
+        self.device_mesh = SimpleNamespace(
+            mesh_dim_names=("dp_shard_cp",),
+            get_local_rank=lambda: mesh_rank,
+            size=lambda: mesh_size,
+        )
+
+    def to_local(self) -> torch.Tensor:
+        return self._local_tensor
+
+
+@pytest.mark.parametrize(("rank", "expected_ids"), [(2, [6, 7, 8]), (3, [9])])
+def test_split_experts_weights_follows_torch_chunk_layout(monkeypatch, rank, expected_ids):
+    """FSDP2 shards 10 experts over 4 ranks as 3, 3, 3, 1 (torch.chunk), not 3, 3, 2, 2."""
+    monkeypatch.setattr(state_dict_utils, "is_dtensor", lambda tensor: isinstance(tensor, _FakeDTensor))
+    adapter = _tiny_adapter()
+    local_tensor = torch.arange(len(expected_ids) * 2, dtype=torch.float32).reshape(len(expected_ids), 2)
+
+    split = adapter._split_experts_weights(_FakeDTensor(local_tensor, rank, 4), n_experts=10)
+
+    assert torch.equal(torch.stack(split), local_tensor)
+    assert adapter._last_expert_ids == expected_ids
 
 
 def _peft_lora_state_dict(rank=8, n_experts=4, dim=64, inter=16):
