@@ -705,8 +705,7 @@ def test_local_checkpoint_override(value, document, expected):
     assert _is_local_checkpoint_override(value, document) is expected
 
 
-def test_model_card_commands_use_checked_in_recipes():
-    repo_root = Path(__file__).parents[3]
+def _model_card_command_violations(repo_root: Path) -> list[str]:
     offenders: list[str] = []
 
     for path in _model_card_paths(repo_root):
@@ -744,10 +743,12 @@ def test_model_card_commands_use_checked_in_recipes():
                 continue
             try:
                 recipe_source = _read_documented_recipe(repo_root, recipe_paths[0], document)
-            except OSError as error:
+                recipe = yaml.safe_load(recipe_source)
+                if not isinstance(recipe, dict):
+                    raise ValueError("Recipe must be a YAML mapping")
+            except (OSError, ValueError, yaml.YAMLError) as error:
                 offenders.append(f"{path.relative_to(repo_root)}: cannot read recipe {recipe_paths[0]}: {error}")
                 continue
-            recipe = yaml.safe_load(recipe_source)
             recipe_model_ids = _iter_pretrained_model_ids(recipe.get("model", {}))
             documented_model_ids_by_case = {model_id.casefold() for model_id in documented_model_ids}
             recipe_model_ids_by_case = {model_id.casefold() for model_id in recipe_model_ids}
@@ -758,6 +759,11 @@ def test_model_card_commands_use_checked_in_recipes():
                     f"{', '.join(sorted(documented_model_ids)) or 'no Hugging Face model IDs'}"
                 )
 
+    return offenders
+
+
+def test_model_card_commands_use_checked_in_recipes():
+    offenders = _model_card_command_violations(Path(__file__).parents[3])
     assert not offenders, "Invalid model-card commands:\n" + "\n".join(f"  - {item}" for item in offenders)
 
 
@@ -1254,7 +1260,7 @@ def test_recipe_pr_requires_main_links_when_its_recipe_arrives(tmp_path, monkeyp
     )
     # The docs PR can publish a validated recipe from another PR.
     assert coverage._validate_recipe_links(tmp_path, document) == permalink
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ValueError, match="recipe is missing"):
         coverage._validate_recipe_links(tmp_path, document + f"[Main]({main_url})")
 
     # The implementation PR contains the recipe, so it must fix every pinned link.
@@ -1274,13 +1280,13 @@ def test_recipe_pr_requires_main_links_when_its_recipe_arrives(tmp_path, monkeyp
     assert coverage._validate_recipe_links(tmp_path, document.replace(permalink, main_url)) == main_url
 
 
-@pytest.mark.parametrize("source,error", [("[", yaml.YAMLError), ("[]", ValueError)])
-def test_linked_recipe_yaml_is_validated(tmp_path, monkeypatch, source, error):
+@pytest.mark.parametrize("source", ["[", "[]"])
+def test_linked_recipe_yaml_is_validated(tmp_path, monkeypatch, source):
     from tests.ci_tests.utils import sync_model_coverage_tables as coverage
 
     document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'c' * 40}/examples/new.yaml)"
     monkeypatch.setattr(coverage, "_read_remote_recipe", lambda url: source)
-    with pytest.raises(error):
+    with pytest.raises(ValueError, match="Invalid recipe links"):
         coverage._validate_recipe_links(tmp_path, document)
 
 
@@ -1295,7 +1301,7 @@ def test_missing_permalink_target_fails(tmp_path, monkeypatch):
         raise HTTPError(url, 404, "Not Found", {}, None)
 
     monkeypatch.setattr(coverage, "_read_remote_recipe", missing)
-    with pytest.raises(HTTPError):
+    with pytest.raises(ValueError, match="404"):
         coverage._validate_recipe_links(tmp_path, document)
 
 
@@ -1328,3 +1334,57 @@ def test_recent_support_uses_permalink_for_documented_card(tmp_path, monkeypatch
 
     without_recipe = coverage._collect_support_entries(tmp_path, old_releases, [model], {})
     assert without_recipe[0].recipe_link == ""
+
+
+def test_recipe_link_errors_include_every_link_card_and_compatibility_copy(tmp_path):
+    from tests.ci_tests.utils import sync_model_coverage_tables as coverage
+
+    models = []
+    source_paths = ["docs/model-coverage/llm/first.mdx", "docs/model-coverage/llm/second.mdx"]
+    alias = next(iter(MODEL_CARD_PATH_ALIASES))
+    expected = []
+    for index, source_path in enumerate([*source_paths, alias]):
+        path = tmp_path / source_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        links = []
+        for suffix in ("a", "b"):
+            recipe_path = f"examples/model_{index}_{suffix}.yaml"
+            recipe = tmp_path / recipe_path
+            recipe.parent.mkdir(parents=True, exist_ok=True)
+            recipe.write_text("model: {}\n")
+            links.append(f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'a' * 40}/{recipe_path})")
+            expected.append(recipe_path)
+        path.write_text("\n".join(links))
+        if source_path in source_paths:
+            models.append(coverage._ModelDoc("LLM", f"/models/{index}", (), "Model", source_path))
+
+    with pytest.raises(ValueError) as caught:
+        coverage._collect_documented_recipe_urls(tmp_path, models)
+
+    message = str(caught.value)
+    for source_path in [*source_paths, alias]:
+        assert source_path in message
+    for recipe_path in expected:
+        assert f"replace its commit permalink with {coverage.REPOSITORY_URL}/{recipe_path}" in message
+
+
+def test_command_validation_collects_link_and_yaml_errors_across_cards(tmp_path):
+    recipe_sources = {"pinned": "model: {}\n", "syntax": "[", "mapping": "[]"}
+    for name, source in recipe_sources.items():
+        recipe = tmp_path / "examples" / f"{name}.yaml"
+        recipe.parent.mkdir(parents=True, exist_ok=True)
+        recipe.write_text(source)
+    for name in [*recipe_sources, "missing"]:
+        card = tmp_path / "docs" / "model-coverage" / "llm" / "test" / f"{name}.mdx"
+        card.parent.mkdir(parents=True, exist_ok=True)
+        revision = "a" * 40 if name == "pinned" else "main"
+        card.write_text(
+            f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/examples/{name}.yaml)\n"
+            f"```bash\nuv run automodel -c examples/{name}.yaml\n```\n"
+        )
+
+    offenders = _model_card_command_violations(tmp_path)
+
+    assert len(offenders) == 4
+    for name in [*recipe_sources, "missing"]:
+        assert any(f"{name}.mdx: cannot read recipe examples/{name}.yaml:" in item for item in offenders)

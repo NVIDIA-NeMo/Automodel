@@ -166,17 +166,44 @@ def _read_documented_recipe(repo_root: Path, recipe_path: str, document: str) ->
 
 
 def _validate_recipe_links(repo_root: Path, document: str) -> str:
-    """Validate every linked recipe and return the first URL for support tables."""
+    """Return the first recipe URL, or report every invalid link in the document."""
     first_url = ""
+    errors: list[str] = []
     for match in RECIPE_LINK_PATTERN.finditer(document):
-        url = _documented_recipe_url(repo_root, match[1], match[0])
+        try:
+            url = _documented_recipe_url(repo_root, match[1], match[0])
+            # Validate data only: never import or execute code from a recipe PR.
+            recipe = yaml.safe_load(_read_documented_recipe(repo_root, match[1], match[0]))
+            if not isinstance(recipe, dict):
+                raise ValueError(f"Recipe must be a YAML mapping: {match[1]}")
+        except (OSError, ValueError, yaml.YAMLError) as error:
+            errors.append(f"{match[1]}: {error}")
+            continue
         if not first_url:
             first_url = url
-        # Validate data only: never import or execute code from a recipe PR.
-        recipe = yaml.safe_load(_read_documented_recipe(repo_root, match[1], match[0]))
-        if not isinstance(recipe, dict):
-            raise ValueError(f"Recipe must be a YAML mapping: {match[1]}")
+    if errors:
+        raise ValueError("Invalid recipe links:\n" + "\n".join(errors))
     return first_url
+
+
+def _collect_documented_recipe_urls(repo_root: Path, documented_models: list[_ModelDoc]) -> dict[str, str]:
+    """Validate all canonical and compatibility cards before reporting recipe-link errors."""
+    recipe_urls: dict[str, str] = {}
+    errors: list[str] = []
+    source_paths = dict.fromkeys(model.source_path for model in documented_models)
+    source_paths.update((alias, None) for alias in MODEL_CARD_PATH_ALIASES if (repo_root / alias).is_file())
+    urls_by_source: dict[str, str] = {}
+    for source_path in source_paths:
+        try:
+            document = (repo_root / source_path).read_text(encoding="utf-8")
+            urls_by_source[source_path] = _validate_recipe_links(repo_root, document)
+        except (OSError, ValueError) as error:
+            errors.append(f"{source_path}: {error}")
+    if errors:
+        raise ValueError("Invalid model-card recipes:\n" + "\n".join(errors))
+    for model in documented_models:
+        recipe_urls[model.docs_page] = urls_by_source[model.source_path]
+    return recipe_urls
 
 
 def _collect_support_entries(
@@ -830,15 +857,7 @@ def _generate_tables(repo_root: Path, *, validate_model_cards: bool = True) -> d
             replace(release, docs_page=model_card_routes[(release.hf_model_id, release.model_type)])
             for release in releases
         ]
-    recipe_urls = {}
-    for model in documented_models:
-        path = repo_root / model.source_path
-        recipe_urls[model.docs_page] = _validate_recipe_links(repo_root, path.read_text(encoding="utf-8"))
-    # Compatibility copies must follow the same link policy as canonical cards.
-    for alias in MODEL_CARD_PATH_ALIASES:
-        path = repo_root / alias
-        if path.is_file():
-            _validate_recipe_links(repo_root, path.read_text(encoding="utf-8"))
+    recipe_urls = _collect_documented_recipe_urls(repo_root, documented_models)
     entries = _collect_support_entries(repo_root, releases, documented_models, recipe_urls)
     generated_support_log = _render_support_log_table(entries)
     generated_homepage = _render_homepage_table(entries)
