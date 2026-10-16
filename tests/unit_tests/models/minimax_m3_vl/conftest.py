@@ -128,12 +128,17 @@ VIDEO_TOKEN_INDEX = 101
 
 @pytest.fixture
 def mtp_model(backend):
-    """Sparse text backbone with one MTP module (DeepSeek-V3 style)."""
+    """Default all-MoE text backbone with one MTP module (DeepSeek-V3 style)."""
     from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
     cfg = MiniMaxM3VLTextConfig(
         torch_dtype="float32",
-        **{**TINY_CFG, "num_mtp_modules": 1, "sparse_attention_config": dict(SPARSE_ATTENTION_CONFIG)},
+        **{
+            **TINY_CFG,
+            "moe_layer_freq": None,
+            "num_mtp_modules": 1,
+            "sparse_attention_config": dict(SPARSE_ATTENTION_CONFIG),
+        },
     )
     m = MiniMaxM3SparseForCausalLM(cfg, backend=backend).eval()
     m.initialize_weights(dtype=torch.float32)

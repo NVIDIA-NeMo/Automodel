@@ -33,9 +33,15 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeGatedDeltaNet,
+    causal_conv1d_fn,
+    causal_conv1d_update,
+    torch_chunk_gated_delta_rule,
+    torch_recurrent_gated_delta_rule,
+)
 
-from nemo_automodel.components.models.qwen3_5.packing import prepare_gated_delta_packed_metadata
+from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
@@ -114,6 +120,26 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     def __init__(self, config, layer_idx: int):
         super().__init__(config, layer_idx)
         self._cp_mesh = None
+        # Transformers 5.15 moved kernel callables from instance attributes to decorated
+        # module-level fallbacks. Prefer the installed kernels, matching the pre-5.15
+        # behavior and the FLA implementation used by the context-parallel path.
+        try:
+            from causal_conv1d import causal_conv1d_fn as fast_causal_conv1d_fn
+            from causal_conv1d import causal_conv1d_update as fast_causal_conv1d_update
+        except ImportError:
+            fast_causal_conv1d_fn = causal_conv1d_fn
+            fast_causal_conv1d_update = causal_conv1d_update
+
+        try:
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+        except ImportError:
+            chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+            fused_recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
+
+        self.causal_conv1d_fn = fast_causal_conv1d_fn
+        self.causal_conv1d_update = fast_causal_conv1d_update
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule
+        self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
         # HF created bare ``A_log``/``dt_bias`` in ``_parameters``; move them into a
         # native fp32 ``SSMGate`` submodule (built directly, not relocated at runtime).
         install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config))
@@ -163,14 +189,12 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             cache_params is not None and cache_params.has_previous_state(self.layer_idx) and seq_len == 1
         )
 
-        # Resolve packing kwargs. Fallback to mask-derivation only when neither
-        # was passed in (bypasses the decoder-layer subclass).
-        if not use_precomputed_states and cu_seqlens is None and indices is None:
-            packed_metadata = prepare_gated_delta_packed_metadata(attention_mask, None)
-            if packed_metadata is not None:
-                cu_seqlens = packed_metadata.cu_seqlens
-                cu_seqlens_cpu = packed_metadata.cu_seqlens_cpu
-                indices = packed_metadata.indices
+        if (
+            not use_precomputed_states
+            and (cu_seqlens is None or indices is None)
+            and is_indexed_packed_mask(attention_mask)
+        ):
+            raise ValueError("Packed Qwen3.5 linear attention requires dataset-provided indices and cu_seqlens.")
 
         if cu_seqlens is not None and cu_seqlens_cpu is None:
             cu_seqlens_cpu = cu_seqlens.detach().cpu()
@@ -187,7 +211,13 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         # (which drops padding entirely) or there is no padding to begin with.
         # Outside packing the original behavior is preserved.
         if not is_packed:
-            hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+            # transformers 5.15 dropped apply_mask_to_padding_states' shape guards, so it
+            # now multiplies by ``attention_mask[:, :, None]`` unconditionally. The helper
+            # documents a 2D padding mask; the 4D packed causal mask (materialized at
+            # cp_size<=1) broadcasts to 5D and raises. Only pass a 2D mask, matching the
+            # pre-5.15 behavior of skipping it for anything else.
+            if attention_mask is None or attention_mask.dim() == 2:
+                hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         if use_precomputed_states:
             conv_state = cache_params.layers[self.layer_idx].conv_states
@@ -222,16 +252,22 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 cache_params.update_conv_state(conv_state, self.layer_idx)
             if self.causal_conv1d_fn is not None:
                 # ``seq_idx`` for causal_conv1d_fn marks per-token segment ids.
-                # Source is the indexed mask, gathered at the same ``indices``
-                # used for unpadding so it lines up with the unpadded layout.
+                # Flattened batches need globally unique ids derived from the
+                # cumulative boundaries; document ids restart in every row.
                 if not is_packed:
                     seq_idx_for_conv = None
                 elif needs_unpad:
-                    seq_idx_for_conv = attention_mask.reshape(-1)[indices].unsqueeze(0).to(torch.int32).contiguous()
+                    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                    seq_idx_for_conv = torch.repeat_interleave(
+                        torch.arange(lengths.numel(), device=lengths.device, dtype=torch.int32),
+                        lengths,
+                        output_size=indices.numel(),
+                    ).unsqueeze(0)
                 else:
                     seq_idx_for_conv = attention_mask.to(torch.int32).contiguous()
+                # HF's fallback calls this input hidden_states; the CUDA kernel uses x.
                 mixed_qkv = self.causal_conv1d_fn(
-                    x=mixed_qkv,
+                    mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
                     bias=self.conv1d.bias,
                     activation=self.activation,

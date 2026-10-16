@@ -297,9 +297,8 @@ _PARITY_CASES = (
 def test_deepseek_gate_matches_hf_reference_router_grouped(bias_mean, bias_std, router_overrides, weight_atol):
     """Proj/Score/Out parity vs the pinned HF reference, grouped routing.
 
-    The reference splits the router across two objects: DeepseekV3TopkRouter does
-    the fp32 projection and returns logits only, while DeepseekV3MoE.route_tokens_to_experts
-    does sigmoid/bias/group-mask/top-k/norm/scale. Automodel's Gate does all of it,
+    The reference's DeepseekV3TopkRouter does the fp32 projection and
+    sigmoid/bias/group-mask/top-k/norm/scale. Automodel's Gate does the same,
     so the comparison drives both.
     """
     # Imported here, not at module scope: modeling_deepseek_v3 pulls in the whole
@@ -333,8 +332,7 @@ def test_deepseek_gate_matches_hf_reference_router_grouped(bias_mean, bias_std, 
     w_am, i_am, _ = gate(x, torch.ones(64, dtype=torch.bool), None)
 
     with torch.no_grad():
-        router_logits = hf_moe.gate(x)
-        i_hf, w_hf = hf_moe.route_tokens_to_experts(router_logits)
+        router_logits, w_hf, i_hf = hf_moe.gate(x)
 
     assert router_logits.dtype is torch.float32  # Proj: reference projects in fp32
     assert w_hf.dtype is torch.float32  # Out: reference never casts back

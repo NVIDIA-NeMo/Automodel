@@ -180,6 +180,9 @@ def _native_to_hf_key(key: str) -> str:
 class Glm5NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Convert GLM split experts and FP8 weights to trainable grouped BF16."""
 
+    # Released checkpoints require allocating FP8 dequantization and grouped-expert rebuilding.
+    _supports_low_memory_dcp_load = False
+
     def __init__(
         self,
         config: Glm5NextConfig,

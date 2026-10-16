@@ -65,6 +65,10 @@ model:
     _target_: nemo_automodel.components.models.deepseek_v32.config.DeepseekV32Config.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
     name_or_path: deepseek-ai/DeepSeek-V3.2
+  # Adapter checkpoints omit router buffers; keep the pretrained correction bias fixed.
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -72,8 +76,8 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: false
-    experts: gmm
-    dispatcher: deepep
+    experts: torch_mm
+    dispatcher: hybridep  # DeepEP times out in multi-node EP32 CI.
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -105,7 +109,7 @@ optimizer:
   weight_decay: 0
 
 ci:
-  time: "00:30:00"
+  time: "00:45:00"
   nodes: 16
   env_vars:
     HF_HUB_OFFLINE: "0"

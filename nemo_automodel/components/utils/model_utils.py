@@ -216,6 +216,10 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         total_params += n
         if p.requires_grad:
             trainable_params += n
+        # Quantized parameters can store packed integer bytes. They still count
+        # above, but a norm of those bytes is neither supported nor meaningful.
+        if not (p.is_floating_point() or p.is_complex()):
+            continue
         try:
             local_sq_norm += p.detach().norm(2) ** 2
         except Exception:
@@ -313,8 +317,9 @@ def print_trainable_parameters(model: nn.Module, name: str = "Model") -> tuple[i
 
 def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns):
     """Freeze a legacy model attribute and modules matching name substrings."""
-    if attribute_name is not None and hasattr(model, attribute_name):
-        getattr(model, attribute_name).requires_grad_(False)
+    module = getattr(model, attribute_name, None) if attribute_name is not None else None
+    if module is not None:
+        module.requires_grad_(False)
 
     for name, module in model.named_modules():
         if any(pattern in name.lower() for pattern in name_patterns):
@@ -769,10 +774,11 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
     batch has already been converted to THD format (with batch_size=1 as a placeholder
     dimension) and that dimension needs to be removed.
 
-    The function performs three key operations:
+    The function performs four key operations:
     1. Removes the batch dimension (dim 0) from input tensors
     2. Filters out padding values from cumulative sequence length tensors
     3. Converts max_seqlen from tensor to scalar if needed
+    4. Resolves the microbatch's TE padding flag from its complete boundary arrays
 
     Args:
         input_ids (torch.Tensor or None): Input token IDs with shape [1, total_tokens]
@@ -841,6 +847,11 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
             attn_kwargs[key] = value[value != seqlens_padding_value].contiguous()
         if key == "max_seqlen" and isinstance(value, torch.Tensor):
             attn_kwargs[key] = value.item()
+
+    # Resolve chunked THD metadata once per model call, after removing sentinels.
+    # A single batch-wide flag cannot describe microbatches with different padding.
+    if attn_kwargs.get("cu_seqlens_padded") is not None and attn_kwargs.get("pad_between_seqs") is None:
+        attn_kwargs["pad_between_seqs"] = not torch.equal(attn_kwargs["cu_seqlens_padded"], attn_kwargs["cu_seqlens"])
 
     return input_ids, position_ids, padding_mask, attn_kwargs
 

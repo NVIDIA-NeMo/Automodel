@@ -98,6 +98,7 @@ def build_cache_manifest(
     shuffle_seed: int,
     mask_reasoning_content: bool,
     chat_template_sha256: str,
+    mask_generation_prompt: bool = False,
 ) -> dict[str, Any]:
     """Assemble the DSpark cache manifest.
 
@@ -129,11 +130,16 @@ def build_cache_manifest(
         "train_split": train_split,
         "shuffle_seed": int(shuffle_seed),
         "mask_reasoning_content": bool(mask_reasoning_content),
+        "mask_generation_prompt": bool(mask_generation_prompt),
         "chat_template_sha256": chat_template_sha256,
     }
 
 
 _IDENTITY_EXEMPT_FIELDS = ("format_version", "complete")
+# Manifest fields added after the first release, with the value a producer that
+# predates them effectively used; ``read_manifest`` fills them in so older
+# caches compare and train as if they recorded it.
+MANIFEST_DEFAULTS: dict[str, Any] = {"mask_reasoning_content": False, "mask_generation_prompt": False}
 
 
 def manifest_mismatch_fields(recorded: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
@@ -183,6 +189,7 @@ def read_manifest(cache_dir: str, allow_incomplete: bool = False) -> dict[str, A
         cache_name=_CACHE_NAME,
         format_version=_FORMAT_VERSION,
         producer_name="precompute_dspark",
+        defaults=MANIFEST_DEFAULTS,
     )
     if not allow_incomplete:
         ensure_manifest_complete(manifest, cache_dir)

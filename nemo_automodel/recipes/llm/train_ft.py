@@ -34,10 +34,18 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-import mlflow
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_MLFLOW, mlflow = safe_import(
+    "mlflow",
+    msg="mlflow is not installed. To enable MLflow experiment tracking, run: uv add nemo-automodel[mlflow]. For the full MLflow stack: uv add nemo-automodel[mlflow-full]",
+)
 import torch
 import torch.nn as nn
-import wandb
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoConfig
@@ -57,12 +65,14 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -71,11 +81,20 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
+from nemo_automodel.components.loss.utils import (
+    _count_label_tokens,
+    _get_lm_head_module,
+    _get_loss_ignore_index,
+    calculate_loss,
+    prepare_lm_weight,
+)
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
@@ -158,20 +177,76 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
+    # Probe the wrapped model's signature, head, and config; training still calls DDP.
+    if isinstance(probe_module, nn.parallel.DistributedDataParallel):
+        probe_module = probe_module.module
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-        return MaskedCrossEntropy()
+        return MaskedCrossEntropy(
+            ignore_index=_get_loss_ignore_index(loss_fn),
+            reduction=getattr(loss_fn, "reduction", "sum"),
+        )
     if (
         pp_enabled
-        and isinstance(loss_fn, FusedLinearCrossEntropy)
+        and isinstance(loss_fn, LinearCrossEntropy)
         and not getattr(probe_module, "_pp_return_hidden_states_supported", False)
     ):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires pipeline stages that can return hidden states")
         logger.warning(
             "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
             "model. Using MaskedCrossEntropy instead."
         )
-        return MaskedCrossEntropy()
+        return MaskedCrossEntropy(
+            ignore_index=_get_loss_ignore_index(loss_fn),
+            reduction=getattr(loss_fn, "reduction", "sum"),
+        )
+    if isinstance(loss_fn, ChunkedCrossEntropy):
+        lm_head = _get_lm_head_module(probe_module)
+        if lm_head is not None or not pp_enabled:
+            loss_fn.validate_lm_head(lm_head, model_config=getattr(probe_module, "config", None))
     return loss_fn
+
+
+def _supports_loss_weights(loss_fn: nn.Module) -> bool:
+    """Return whether ``loss_fn`` accepts the per-token ``loss_weights`` contract."""
+    # Inspect ``forward`` for Modules, but the object itself otherwise: for a plain
+    # function or functools.partial, ``__call__`` is a method-wrapper reporting a
+    # bare ``(*args, **kwargs)``, which hides the real parameters. inspect.signature
+    # already follows ``__call__`` for callable instances.
+    call = loss_fn.forward if isinstance(loss_fn, nn.Module) else loss_fn
+    try:
+        parameters = inspect.signature(call).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    # A ``**kwargs`` catch-all is deliberately NOT accepted: it silently swallows
+    # loss_weights (training an unweighted objective while the domain metrics
+    # claim otherwise) or raises TypeError on the first microbatch, long after
+    # setup could have caught it. Require the parameter by name.
+    return any(parameter.name == "loss_weights" for parameter in parameters)
+
+
+def _get_domain_mixture_blend(dataloader_config: DataloaderConfig) -> tuple[list[str], list[float]]:
+    """Extract the explicit Megatron training blend for domain-mixture construction."""
+    from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
+
+    dataset_config = dataloader_config.dataset_config
+    if not isinstance(dataset_config, MegatronPretrainingConfig):
+        raise ValueError("domain_mixture currently requires a MegatronPretraining dataset")
+    paths = dataset_config.paths
+    if isinstance(paths, dict):
+        paths = paths.get("train")
+    if not isinstance(paths, (list, tuple)):
+        raise ValueError("domain_mixture requires an explicit weighted list in dataset.paths")
+
+    from nemo_automodel.components.datasets.llm.megatron.megatron_utils import get_blend_from_list
+
+    blend_paths, blend_weights = get_blend_from_list(list(paths))
+    if blend_weights is None:
+        raise ValueError("domain_mixture requires explicit sampling weights in dataset.paths")
+    return blend_paths, blend_weights
 
 
 def build_model(
@@ -187,6 +262,8 @@ def build_model(
     cfg_freeze: ConfigNode | dict[str, Any] | FreezeConfig | None = None,
     sdpa_method: list[str] | None = None,
     device_mesh=None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -205,6 +282,7 @@ def build_model(
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
         device_mesh: Pre-created device mesh forwarded when ``distributed_setup`` is not provided.
     """
     with ScopedRNG(seed=seed, ranked=True):
@@ -215,6 +293,7 @@ def build_model(
             # plain mappings or typed FreezeConfig objects.
             "freeze_config": cfg_freeze.to_dict() if isinstance(cfg_freeze, ConfigNode) else cfg_freeze,
             "sdpa_method": sdpa_method,
+            "load_metadata_with_gloo": load_metadata_with_gloo,
         }
         if distributed_setup is not None:
             kwargs["distributed_setup"] = distributed_setup
@@ -298,6 +377,7 @@ def build_model(
                 freeze_config=kwargs.get("freeze_config"),
                 pretrained_model_name_or_path=None,
                 load_base_model=False,
+                load_metadata_with_gloo=load_metadata_with_gloo,
                 cache_dir=hf_constants.HF_HUB_CACHE,
             )
 
@@ -443,6 +523,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # disabled default keeps _forward_backward_step working if setup() is skipped
     # (e.g. unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
+    domain_mixture = None
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -467,6 +548,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     def _should_setup_training_components(self) -> bool:
         """Whether this rank owns the trainable model and its components."""
         return True
+
+    def _configure_packing(self) -> PackingCapabilities:
+        """Configure every local model stage and return its NEAT data requirements."""
+        from nemo_automodel.components.models.common.packing import configure_packing_for_models
+
+        return configure_packing_for_models(self.model_parts)
 
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
@@ -515,6 +602,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=_get_model_name(self.cfg.model)
+            )
+            logging.info("Trackio experiment tracking enabled")
+
         if self.dist_env.is_main and self.cfg.mlflow is not None:
             run_config = self.cfg.to_yaml_dict(use_orig_values=True)
             checkpoint_dir = self.cfg.get("checkpoint.checkpoint_dir", None)
@@ -533,10 +627,56 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build loss_fn (will be set on pipeline_config if PP enabled)
         self.loss_fn = self.cfg.loss_fn.build()
-        if self.magi.hf_dispatch and isinstance(self.loss_fn, FusedLinearCrossEntropy):  # pragma: no cover
+        domain_mixture_config = self.cfg.domain_mixture
+        self.domain_mixture = None
+        if domain_mixture_config is not None:
+            if self.pp_enabled:
+                raise ValueError(
+                    "domain_mixture does not currently support pipeline parallelism because the pipeline "
+                    "target contract does not carry per-token objective weights"
+                )
+            if self.mesh_context.cp_size > 1:
+                raise ValueError(
+                    "domain_mixture does not currently support context parallelism because its "
+                    "distributed gradient contract has not been validated"
+                )
+            # Subclasses inherit this setup() but override _forward_backward_step,
+            # so they would accept the config, flip best_metric_key to the weighted
+            # aggregate and demand per-domain validation sets while training a
+            # completely unweighted objective.
+            if (
+                type(self)._forward_backward_step
+                is not TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step
+            ):
+                raise ValueError(
+                    f"domain_mixture is not supported by {type(self).__name__}: it overrides "
+                    "_forward_backward_step and therefore never applies the per-token objective weights, "
+                    "while the inherited validation loop would still report and checkpoint against them"
+                )
+            if self.cfg.dataloader is None:
+                raise ValueError("domain_mixture requires a dataset/dataloader configuration")
+            # emits_thd is the canonical predicate: a config selecting
+            # packed_sequence_thd_collater directly has packing=None but still
+            # produces packed batches (and drops dataset_id).
+            if self.cfg.dataloader.emits_thd or self.cfg.dataloader.packing is not None:
+                raise ValueError(
+                    "domain_mixture does not support sequence packing because packed batches do not preserve "
+                    "per-token dataset_id provenance"
+                )
+            if not _supports_loss_weights(self.loss_fn):
+                raise ValueError(
+                    f"domain_mixture requires a loss function that accepts loss_weights, got {type(self.loss_fn).__name__}"
+                )
+            reduction = getattr(self.loss_fn, "reduction", None)
+            if reduction != "sum":
+                raise ValueError(
+                    f"domain_mixture requires a loss function with explicit reduction='sum'; got {reduction!r}"
+                )
+            self.domain_mixture = domain_mixture_config.build(blend=_get_domain_mixture_blend(self.cfg.dataloader))
+        if self.magi.hf_dispatch and isinstance(self.loss_fn, LinearCrossEntropy):  # pragma: no cover
             raise ValueError(
                 "The magi HF backend needs full logits and is incompatible with "
-                "FusedLinearCrossEntropy; use a logits-based loss (e.g. MaskedCrossEntropy)."
+                f"{type(self.loss_fn).__name__}; use a logits-based loss (e.g. MaskedCrossEntropy)."
             )
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
@@ -622,6 +762,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_freeze=self.cfg.get("freeze_config", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         self.embedding_row_repair_report = None
         embedding_row_repair = self.cfg.embedding_row_repair
@@ -653,6 +794,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        from nemo_automodel.components.moe.mok_experts import enable_mok_mxfp8_optimizer_step_cache
+
+        enable_mok_mxfp8_optimizer_step_cache(self.model_parts, self.optimizer)
+
         # Loss-function capability check
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
 
@@ -675,6 +820,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     else self.cfg.get("step_scheduler.local_batch_size", 1)
                 ),
                 pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
+                ep_mesh=(
+                    self.moe_mesh["ep"]
+                    if self.moe_mesh is not None and "ep" in (self.moe_mesh.mesh_dim_names or ())
+                    else None
+                ),
+                stages=(self.pp.info.stages if self.pp is not None else None),
             )
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
@@ -696,15 +847,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
         # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
-        attn_implementation = None
+        packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
         if (
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
             and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
         ):
-            from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
-
-            attn_implementation = get_attn_implementation(self.cfg.model, model=self.model_parts[0])
-            configure_packing(attn_implementation=attn_implementation)
+            packing_contract = self._configure_packing()
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config):
@@ -730,7 +878,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         )
                         else self.cfg.get("distributed.cp_size", 1)
                     ),
-                    attn_implementation=attn_implementation,
+                    packing_contract=packing_contract,
                     collate_wrapper=collate_wrapper,
                 )
 
@@ -743,6 +891,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for name, dl_config in self.cfg.validation_dataloaders.items()
         }
+        if self.domain_mixture is not None and self.val_dataloaders:
+            if WEIGHTED_AGGREGATE_NAME in self.val_dataloaders:
+                raise ValueError("validation_dataset_weighted is reserved for the domain_mixture aggregate")
+            missing_validation_domains = [
+                name for name in self.domain_mixture.names if name not in self.val_dataloaders
+            ]
+            if missing_validation_domains:
+                raise ValueError(
+                    "domain_mixture requires one named validation_dataset_<domain> block per domain; "
+                    f"missing {missing_validation_domains}"
+                )
         # Optional tool-call accuracy evaluator for agent SFT runs.
         # Presence of the ``tool_call_eval`` block enables it; absence skips it.
         self.tool_call_evaluator = None
@@ -756,7 +915,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self.distributed_config, self._get_dp_rank(), self._get_dp_group_size()
                 )
         self._warned_tool_call_eval_skipped = False
-        self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
+        self.best_metric_key = self.cfg.get(
+            "checkpoint.best_metric_key",
+            WEIGHTED_AGGREGATE_NAME if self.domain_mixture is not None else "default",
+        )
         # Scheduler — typed configs from RecipeConfig, built with runtime args here.
         self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
@@ -804,12 +966,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.metric_logger_train = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
+        validation_logger_names = list(self.val_dataloaders)
+        if self.domain_mixture is not None and self.val_dataloaders:
+            validation_logger_names.append(WEIGHTED_AGGREGATE_NAME)
         self.metric_logger_valid = {
             name: build_metric_logger(
                 pathlib.Path(self.checkpointer.config.checkpoint_dir)
                 / (f"validation_{name}.jsonl" if name != "default" else "validation.jsonl")
             )
-            for name in self.val_dataloaders.keys()
+            for name in validation_logger_names
         }
 
         # Optionally resume
@@ -890,8 +1055,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        # FusedLinearCrossEntropy consumes hidden states: flag the last stage to emit them
-        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+        # Linear CE consumes hidden states: flag the last stage to emit them
+        if isinstance(self.loss_fn, LinearCrossEntropy):
             last_stage_model._pp_return_hidden_states = True
 
         self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
@@ -979,10 +1144,30 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     # Run validation every val_every_steps
                     val_losses = {}
                     if self.step_scheduler.is_val_step:
+                        total_validation_tokens = 0
                         for val_name, val_dataloader in self.val_dataloaders.items():
                             val_log_data = self._run_validation_epoch(val_dataloader)
                             val_losses[val_name] = val_log_data.metrics["val_loss"]
+                            total_validation_tokens += val_log_data.metrics["num_label_tokens"]
                             self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                        if self.domain_mixture is not None and val_losses:
+                            weighted_loss = self.domain_mixture.weighted_validation_loss(val_losses)
+                            val_losses[WEIGHTED_AGGREGATE_NAME] = weighted_loss
+                            weighted_log_data = MetricsSample(
+                                step=self.step_scheduler.step,
+                                epoch=self.step_scheduler.epoch,
+                                metrics={
+                                    "val_loss": weighted_loss,
+                                    "lr": self.optimizer[0].param_groups[0]["lr"],
+                                    "num_label_tokens": total_validation_tokens,
+                                    "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                                },
+                            )
+                            self.log_val_metrics(
+                                WEIGHTED_AGGREGATE_NAME,
+                                weighted_log_data,
+                                self.metric_logger_valid[WEIGHTED_AGGREGATE_NAME],
+                            )
                         for mp in self.model_parts:
                             mp.train()
 
@@ -1026,6 +1211,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
+        """Run one local batch and accumulate its loss and optional gradients.
+
+        Args:
+            idx: Microbatch index in the accumulation window.
+            batch: Input mapping with token IDs, labels, and physical NEAT
+                document IDs of shape [batch, sequence]. NEAT attention metadata
+                is batch-major; legacy THD inputs are flattened by the sharder.
+                THD MTP requires physical boundaries in cu_seqlens_padded of
+                shape [num_sequences + 1] or [1, num_sequences + 1], or
+                _packed_seq_ids [batch, sequence] supplied by the native model
+                sharder from physical seq_lens_padded [batch, num_sequences].
+            loss_buffer: List receiving the detached scalar loss.
+            num_label_tokens: Global supervised-token count for loss normalization.
+            num_batches: Number of microbatches in the accumulation window.
+            is_train: Whether to backpropagate the combined main and MTP loss.
+        """
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
@@ -1036,6 +1237,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for k, v in batch.items()
         }
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         mtp_cp_enabled = not self.pp_enabled and self._get_cp_group_size() > 1 and model.supports.mtp_enabled
         mtp_cp_inputs = None
         if mtp_cp_enabled:
@@ -1046,7 +1248,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
             mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
                 batch,
-                ignore_index=self.cfg.mtp.ignore_index,
+                ignore_index=ignore_index,
             )
         cp_sharder = ContextParallelSharder(
             model,
@@ -1065,10 +1267,33 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.position_ids
             )
             mtp_per_depth_targets = tuple(
-                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
+                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
+        # Preserve physical NEAT document IDs before model-kwarg filtering. The
+        # loss needs these even when the forward does not accept packing metadata.
+        mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
+        # Preserve packing metadata needed by the loss before model-kwarg filtering.
+        mtp_is_packed = "cu_seqlens" in batch or "cu_seqlens_padded" in batch or batch.get("qkv_format") == "thd"
+        mtp_cu_seqlens = batch.get("cu_seqlens_padded")
         labels = batch.pop("labels")
+        dataset_ids = batch.pop("dataset_id", None)
+        loss_weights = None
+        if is_train and self.domain_mixture is not None:
+            if self.pp_enabled:
+                raise ValueError("domain_mixture does not currently support pipeline parallelism")
+            if self._get_cp_group_size() > 1:
+                raise ValueError("domain_mixture does not currently support context parallelism")
+            if dataset_ids is None:
+                raise ValueError(
+                    "domain_mixture requires each training batch to contain dataset_id; "
+                    "use a blended dataset that emits one ID per sample"
+                )
+            # _run_train_optim_step already bounds-checked every microbatch in this
+            # step, so skip the two blocking device syncs here: they sit before the
+            # forward is enqueued and would cancel the batch's non_blocking prefetch
+            # once per microbatch.
+            loss_weights = self.domain_mixture.loss_weights(dataset_ids, labels, validate_range=False)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
@@ -1090,16 +1315,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
-                # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
+                # Hand physical THD boundaries to the PP loss to mask cross-sequence targets —
                 # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
                 # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
-                # one pack/microbatch per step; the seq_idx tail handles differing per-microbatch boundaries.
-                cu_seqlens = batch_filtered.get("cu_seqlens")
+                # one pack/microbatch per step; batch-major NEAT metadata instead travels with each
+                # microbatch and its model-provided seq_idx tail.
+                cu_seqlens = (
+                    None if "packed_token_indices" in batch_filtered else batch_filtered.get("cu_seqlens_padded")
+                )
                 if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
                     cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
+                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 1:
+                    cu_seqlens = cu_seqlens[cu_seqlens != -1000]
                 pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
-                if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
+                if isinstance(pp_loss_fn, PipelineCausalLMLoss):
                     pp_loss_fn.cu_seqlens = cu_seqlens
+                    pp_loss_fn.is_packed = mtp_is_packed or mtp_seq_idx is not None
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
@@ -1132,28 +1363,35 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             with train_ctx(), sync_ctx, fp8_ctx:
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
+                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                            f"{type(self.loss_fn).__name__} requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
                         )
                 else:
                     out = model(**batch)
 
                 # Gather the LM head once and share it across the main loss and
-                # all MTP depths (FusedLinearCrossEntropy path) to avoid redundant
+                # all MTP depths (linear CE path) to avoid redundant
                 # full_tensor() gathers that accumulate on-device and OOM.
                 loss_distributed_kwargs = {}
                 shared_lm_weight = None
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, LinearCrossEntropy):
                     grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
-                    shared_lm_weight = self.loss_fn.materialize_lm_weight(
-                        _get_lm_head_weight(model),
+                    shared_lm_weight = prepare_lm_weight(
+                        self.loss_fn,
+                        model,
                         grad_reduce_group=grad_reduce_group,
                     )
                     loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
+                    if isinstance(self.loss_fn, ChunkedCrossEntropy):
+                        loss_distributed_kwargs["logits_dtype"] = out.logits.dtype
+                # Only forward the domain-mixture weights when configured, so
+                # loss paths that predate them keep their original signature.
+                if loss_weights is not None:
+                    loss_distributed_kwargs["loss_weights"] = loss_weights
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
@@ -1167,6 +1405,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
+                        # CP targets or NEAT document IDs already define the boundaries.
+                        mtp_cu_seqlens = None
+                    elif mtp_is_packed and mtp_cu_seqlens is None:
+                        raise ValueError(
+                            "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
+                            "including padding; cu_seqlens alone is insufficient."
+                        )
                     mtp_cfg = self.cfg.mtp
                     if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
                         raise NotImplementedError(
@@ -1181,16 +1427,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         mtp_per_depth_h=mtp_per_depth_h,
                         mtp_per_depth_logits=mtp_per_depth_logits,
                         mtp_per_depth_targets=mtp_per_depth_targets,
+                        seq_idx=mtp_seq_idx,
                         labels=labels,
                         model=model,
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
-                        ignore_index=mtp_cfg.ignore_index,
-                        # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
-                        cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
+                        ignore_index=ignore_index,
+                        # MTP shifts index physical token slots, including internal THD padding.
+                        cu_seqlens=mtp_cu_seqlens,
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )
+                # Autograd retains tensors needed by the losses. Release the
+                # output container and auxiliary aliases before backward so
+                # unused full-vocabulary logits do not overlap its allocations.
+                del out, mtp_per_depth_h, mtp_per_depth_logits
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1210,10 +1461,45 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
 
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+
+        domain_label_counts = None
+        if self.domain_mixture is not None:
+            # This runs between two data-parallel collectives, so a rank-local
+            # raise would leave every peer blocked in all_reduce until the NCCL
+            # watchdog fires. Collect the failure instead and all-reduce a flag so
+            # all ranks abort together, on the same step, with a real traceback.
+            # This also validates every microbatch up front, letting the
+            # per-microbatch weighting skip its bounds-check syncs.
+            ignore_index = getattr(self.loss_fn, "ignore_index", -100)
+            domain_label_counts = torch.zeros(len(self.domain_mixture.names), dtype=torch.long)
+            local_error = ""
+            try:
+                for batch in batches:
+                    dataset_ids = batch.get("dataset_id")
+                    if dataset_ids is None:
+                        raise ValueError(
+                            "domain_mixture requires each training batch to contain dataset_id; "
+                            "use a blended dataset that emits one ID per sample"
+                        )
+                    domain_label_counts += self.domain_mixture.label_counts(
+                        dataset_ids, batch["labels"], ignore_index=ignore_index
+                    ).cpu()
+            except (TypeError, ValueError) as exc:
+                local_error = f"{type(exc).__name__}: {exc}"
+                domain_label_counts.zero_()
+            failed = self._dp_allreduce(torch.tensor(1 if local_error else 0, dtype=torch.long)).item()
+            if failed:
+                raise ValueError(
+                    local_error
+                    or "domain_mixture rejected the dataset_id of another data-parallel rank's batch; "
+                    "see that rank's log for the specific error"
+                )
+            domain_label_counts = self._dp_allreduce(domain_label_counts)
 
         num_batches = len(batches)
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
@@ -1240,6 +1526,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if i == 0:
                 prepare_after_first_microbatch()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
@@ -1253,6 +1540,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+            grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
@@ -1329,23 +1617,30 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
 
+        metrics = {
+            "loss": reporting_loss,
+            "grad_norm": grad_norm,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            "tps": tps,
+            # tps is global tokens/sec (num_tokens_in_batch is summed over
+            # the DP group), so per-GPU must divide by the full world size.
+            # Dividing by dp*cp alone inflates it by the pp (and tp) factor.
+            "tps_per_gpu": tps / max(self.dist_env.world_size, 1),
+            "mfu": mfu,
+            "num_tokens_per_step": num_tokens_in_batch,
+            "num_label_tokens": num_label_tokens,
+        }
+        if domain_label_counts is not None:
+            total_domain_labels = max(int(domain_label_counts.sum().item()), 1)
+            for name, count in zip(self.domain_mixture.names, domain_label_counts.tolist()):
+                metrics[f"domain_mixture/{name}_label_tokens"] = count
+                metrics[f"domain_mixture/{name}_label_fraction"] = count / total_domain_labels
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "loss": reporting_loss,
-                "grad_norm": grad_norm,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "tps": tps,
-                # tps is global tokens/sec (num_tokens_in_batch is summed over
-                # the DP group), so per-GPU must divide by the full world size.
-                # Dividing by dp*cp alone inflates it by the pp (and tp) factor.
-                "tps_per_gpu": tps / max(self.dist_env.world_size, 1),
-                "mfu": mfu,
-                "num_tokens_per_step": num_tokens_in_batch,
-                "num_label_tokens": num_label_tokens,
-            },
+            metrics=metrics,
         )
 
     @torch.no_grad()
@@ -1365,7 +1660,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             for batch in val_dataloader:
                 loss_buffer = []
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                num_label_tokens = _count_label_tokens(
+                    batch["labels"], _get_loss_ignore_index(getattr(self, "loss_fn", None))
+                )
                 self._forward_backward_step(
                     0,
                     batch,
@@ -1494,14 +1791,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main or log_data is None:
             return
 
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             if val_name == "default":
                 wandb.log(log_data.metrics, step=log_data.step)
             else:
                 metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
                 wandb.log(metrics, step=log_data.step)
 
-        if mlflow.active_run() is not None:
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            if val_name == "default":
+                trackio_logger.log_metrics(log_data.metrics, step=log_data.step)
+            else:
+                metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
+                trackio_logger.log_metrics(metrics, step=log_data.step)
+
+        if _HAS_MLFLOW and mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
 
         if self.comet_logger is not None:
@@ -1552,24 +1857,29 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB, MLflow, Comet) according to step_scheduler frequency
+        # Log to remote services (WandB, Trackio, MLflow, Comet) according to step_scheduler frequency
+        trackio_logger = getattr(self, "trackio_logger", None)
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
-            if mlflow.active_run() is not None:
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
+            if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
             if self.comet_logger is not None:
                 self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # Log MoE load balance metrics (already collected/reduced on all ranks)
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+            if trackio_logger is not None:
+                self._log_moe_metrics(self.step_scheduler.step, trackio_logger.log_metrics)
             if self.comet_logger is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
                 )
-            if mlflow.active_run() is not None:
+            if _HAS_MLFLOW and mlflow.active_run() is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: mlflow.log_metrics(to_float_metrics(m), step=step)
                 )

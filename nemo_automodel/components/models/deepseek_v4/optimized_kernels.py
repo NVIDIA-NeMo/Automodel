@@ -42,7 +42,7 @@ import torch
 from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.shared.import_utils import safe_import_from
 
-Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "auto"]
+Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "cudnn", "auto"]
 Dsv4IndexerBackend = Literal["torch", "tilelang", "auto"]
 Dsv4SinkhornBackend = Literal["torch", "tilelang", "auto"]
 
@@ -214,8 +214,17 @@ def build_dsv4_sparse_topk_indices(
     n_pooled: int = 0,
     vanilla_key_len: int | None = None,
     q_positions: torch.Tensor | None = None,
+    vision_token_types: torch.Tensor | None = None,
+    max_image_tokens: int = 0,
 ) -> torch.Tensor:
-    """Build Miles-style top-k key indices for DSV4 local-window + compressed KV attention."""
+    """Build Miles-style top-k key indices for DSV4 local-window + compressed KV attention.
+
+    Args:
+        vision_token_types: Optional pseudo-token types with shape ``[batch, sequence]``. Text positions
+            contain ``-1``; image spans contain ``IMAGE_START``, ``IMAGE``, and ``IMAGE_END`` token types.
+            When provided with ``max_image_tokens > 0``, image queries additionally see the full image span.
+        max_image_tokens: Maximum number of tokens in an image span. ``0`` disables visual windowing.
+    """
     vanilla_key_len = seq_len if vanilla_key_len is None else vanilla_key_len
     window = min(vanilla_key_len, window_size)
     if q_positions is None:
@@ -226,9 +235,39 @@ def build_dsv4_sparse_topk_indices(
         q_pos = q_positions.to(device=device, dtype=torch.long)
         if q_pos.shape[0] == 1 and batch_size > 1:
             q_pos = q_pos.expand(batch_size, -1)
-    offsets = torch.arange(window, device=device, dtype=torch.long)
-    k_pos = (q_pos.unsqueeze(-1) - window_size + 1).clamp(min=0) + offsets.view(1, 1, window)
-    topk = torch.where(k_pos > q_pos.unsqueeze(-1), torch.full_like(k_pos, -1), k_pos)
+    if vision_token_types is not None and max_image_tokens > 0:
+        if vision_token_types.dim() == 1:
+            vision_token_types = vision_token_types.unsqueeze(0)
+        vision_token_types = vision_token_types.to(device=device)
+        if vision_token_types.shape != (batch_size, seq_len):
+            raise ValueError(
+                f"vision_token_types must have shape {(batch_size, seq_len)}, got {tuple(vision_token_types.shape)}"
+            )
+
+        # Exact training-time counterpart of the released inference dump's
+        # get_image_visible/get_window_topk_idxs_visible.  Image queries keep
+        # the normal left sliding window and additionally see the complete
+        # [IMAGE_START, IMAGE_END] span in both directions.  Text queries keep
+        # the ordinary causal window.  Visual CP/THD is rejected by the model,
+        # so query and key positions are local contiguous sequence positions.
+        idx = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+        is_start = vision_token_types == 0
+        is_end = vision_token_types == 4
+        valid = (is_start.cumsum(1) > is_end.cumsum(1)) | is_end
+        starts = torch.where(is_start, idx, 0).cummax(1).values
+        left = ((idx - starts) * valid).clamp(max=max_image_tokens - 1)
+        ends = torch.where(is_end, idx, seq_len).flip(1).cummin(1).values.flip(1)
+        right = ((ends - idx) * valid).clamp(max=max_image_tokens)
+
+        width = min(seq_len, window_size + max_image_tokens)
+        left_add = (left - (window_size - 1)).clamp(min=0)
+        window_starts = (idx - (window_size - 1) - left_add).clamp(min=0)
+        topk = window_starts.unsqueeze(-1) + torch.arange(width, device=device, dtype=torch.long)
+        topk = torch.where(topk > (idx + right).unsqueeze(-1), torch.full_like(topk, -1), topk)
+    else:
+        offsets = torch.arange(window, device=device, dtype=torch.long)
+        k_pos = (q_pos.unsqueeze(-1) - window_size + 1).clamp(min=0) + offsets.view(1, 1, window)
+        topk = torch.where(k_pos > q_pos.unsqueeze(-1), torch.full_like(k_pos, -1), k_pos)
 
     if n_pooled > 0:
         if compressed_topk is not None:
@@ -329,8 +368,28 @@ def dsv4_sparse_attention(
     sm_scale: float,
     *,
     backend: Dsv4SparseAttentionBackend,
+    reference_rounding: bool = False,
+    all_rows_nonempty: bool = False,
 ) -> torch.Tensor:
-    """Run DSV4 sparse attention through Miles TileLang kernels or torch fallback."""
+    """Run sparse attention with an optional original-inference rounding mode.
+
+    Args:
+        q: BF16 queries [batch, sequence, heads, head_dim].
+        kv: Shared keys/values [batch, kv_sequence, head_dim].
+        sinks: FP32 denominator biases [heads].
+        topk_idxs: Sparse indices [batch, sequence, slots], with -1 masked.
+        sm_scale: Query/key score multiplier.
+        backend: Sparse execution backend.
+        reference_rounding: Scale logits before max reduction and use the
+            original inference exponent arithmetic. Requires TileLang.
+
+    Returns:
+        Attention output [batch, sequence, heads, head_dim], with q's dtype.
+    """
+    if backend == "cudnn":
+        # cuDNN Frontend DSA kernels (FlashMLA forward when installed): one flat token axis, global K/V coordinates.
+        # The kernels have their own rounding, so ``reference_rounding`` does not apply here.
+        return _dsv4_sparse_attention_cudnn(q, kv, sinks, topk_idxs, sm_scale, all_rows_nonempty=all_rows_nonempty)
     use_tilelang = _should_use_tilelang(
         backend,
         available=_HAS_MILES_SPARSE_ATTN,
@@ -350,19 +409,76 @@ def dsv4_sparse_attention(
             sinks = torch.cat([sinks, sinks.new_zeros(head_pad)], dim=0).contiguous()
 
         # Miles runs this kernel under tensor parallelism, so the kernel sees a
-        # small local head count. AutoModel's DSV4 recipe currently uses TP=1,
-        # which would launch a single H=64, D=512 kernel with excessive shared
-        # memory/register pressure. Chunking heads preserves the same TileLang
-        # fwd/bwd kernels and lets autograd sum the per-chunk KV gradients.
-        max_heads_per_kernel = 16 if q.shape[-1] >= 256 else 64
+        # small local head count. AutoModel's DSV4 recipes use TP=1 (64 heads,
+        # D=512). One backward kernel over all 64 heads, with its thread count
+        # scaled to the head count (see sparse_mqa_bwd_interface), gathers the
+        # top-k KV rows and accumulates the fp32 KV gradient once per layer; the
+        # earlier 16-head chunks repeated both four times and ran the backward
+        # 7-8x slower than the forward. Chunking remains for more than 64 heads.
+        max_heads_per_kernel = 64
         if q.shape[2] > max_heads_per_kernel:
             if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
                 raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
-            output = _miles_sparse_attn_tilelang_head_chunked(q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale)
+            kwargs = {"reference_rounding": True} if reference_rounding else {}
+            output = _miles_sparse_attn_tilelang_head_chunked(
+                q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale, **kwargs
+            )
         else:
-            output = _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale)
+            kwargs = {"reference_rounding": True} if reference_rounding else {}
+            output = _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale, **kwargs)
         return output[:, :, :original_heads, :]
+    if reference_rounding:
+        raise ValueError("Original-inference sparse attention rounding requires the TileLang backend")
     return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
+
+
+def _dsv4_sparse_attention_cudnn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    sinks: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    sm_scale: float,
+    all_rows_nonempty: bool = False,
+) -> torch.Tensor:
+    """Run the shared cuDNN sparse attention on batched DSV4 tensors.
+
+    Args:
+        q: BF16 queries ``[batch, sequence, heads, head_dim]``.
+        kv: BF16 shared keys/values ``[batch, kv_sequence, head_dim]``.
+        sinks: FP32 per-head sink logits ``[heads]``.
+        topk_idxs: Per-batch sparse indices ``[batch, sequence, slots]`` with ``-1`` masked.
+        sm_scale: Softmax scale.
+
+    Returns:
+        BF16 output ``[batch, sequence, heads, head_dim]``.
+    """
+    from nemo_automodel.components.models.common.cudnn_sparse_attention import (
+        cudnn_sparse_attention,
+        is_cudnn_sparse_attention_available,
+    )
+
+    if not is_cudnn_sparse_attention_available():
+        raise RuntimeError(
+            "backend.attn='cudnn' requires nvidia-cudnn-frontend[cutedsl] >= 1.29 (or FlashMLA for the forward)."
+        )
+    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+        raise RuntimeError("dsv4 cuDNN sparse attention requires bfloat16 q and kv.")
+    batch, sequence, heads, head_dim = q.shape
+    kv_sequence = kv.shape[1]
+    offsets = (torch.arange(batch, device=topk_idxs.device, dtype=torch.int64) * kv_sequence).view(batch, 1, 1)
+    flat_idx = torch.where(
+        topk_idxs >= 0, topk_idxs.to(torch.int64) + offsets, torch.full_like(topk_idxs, -1, dtype=torch.int64)
+    )
+    flat_idx = flat_idx.reshape(batch * sequence, 1, -1).to(torch.int32).contiguous()
+    output = cudnn_sparse_attention(
+        q.reshape(batch * sequence, heads, head_dim).contiguous(),
+        kv.reshape(batch * kv_sequence, 1, head_dim).contiguous(),
+        flat_idx,
+        softmax_scale=sm_scale,
+        all_rows_nonempty=all_rows_nonempty,
+        attn_sink=sinks.to(torch.float32).contiguous(),
+    )
+    return output.reshape(batch, sequence, heads, -1)
 
 
 def indexer_scores_torch(

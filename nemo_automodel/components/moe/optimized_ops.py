@@ -18,6 +18,10 @@ Chunked custom-autograd router-weight fp32 multiply: computes the identical
 fp32 math in row chunks and saves only low-precision inputs, removing the
 full-size fp32 intermediates that otherwise pin ~7 GiB blocks per MoE layer
 under activation checkpointing.
+
+With ``BackendConfig.compile_router_weight`` the same Function runs each pass as
+one ``torch.compile``d kernel over the whole tensor instead of the eager chunk
+loop (see ``_compile_router_weight_cores``).
 """
 
 from __future__ import annotations
@@ -30,6 +34,51 @@ _RW_CHUNK_ROWS = 8192
 # Engage the chunked path only for large dispatch tensors, where the memory
 # saving matters; below this the backward recompute is a net compute tax.
 _RW_CHUNK_THRESHOLD = 12288
+
+
+def _rw_fwd_core(x: torch.Tensor, probs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """fp32 router-weight multiply: ``(x * probs)`` in fp32, cast to ``out_dtype``."""
+    return (x.float() * probs.float()).to(out_dtype)
+
+
+def _rw_bwd_x_core(grad_out: torch.Tensor, probs: torch.Tensor, x_dtype: torch.dtype) -> torch.Tensor:
+    """Gradient w.r.t. ``x``: ``(grad_out * probs)`` in fp32, cast to ``x_dtype``."""
+    return (grad_out.float() * probs.float()).to(x_dtype)
+
+
+def _rw_bwd_probs_core(grad_out: torch.Tensor, x: torch.Tensor, probs_dtype: torch.dtype) -> torch.Tensor:
+    """Gradient w.r.t. ``probs``: ``(grad_out * x).sum(-1)`` in fp32, cast to ``probs_dtype``."""
+    return (grad_out.float() * x.float()).sum(dim=-1, keepdim=True).to(probs_dtype)
+
+
+# Module-level dispatch targets. ``_compile_router_weight_cores`` swaps them for
+# ``torch.compile`` wrappers once per process (``BackendConfig.compile_router_weight``);
+# the Function below then runs each pass as one fused kernel over the whole tensor
+# instead of the eager row-chunk loop (cast, multiply, cast, slice-assign per chunk).
+_rw_fwd_dispatch = _rw_fwd_core
+_rw_bwd_x_dispatch = _rw_bwd_x_core
+_rw_bwd_probs_dispatch = _rw_bwd_probs_core
+_RW_CORES_COMPILED = False
+
+
+def _compile_router_weight_cores() -> None:
+    """Wrap the router-weight multiply cores with ``torch.compile``.
+
+    Runs once per process, same lazy pattern as Kimi K3's ``compile_situ``: the
+    compiled functions replace the module-level dispatch targets, so every
+    expert module shares one compiled kernel per pass and repeated model
+    construction does not recompile. Fused kernels keep no fp32 intermediates,
+    so the chunk loop (which only exists to bound eager fp32 transients) is
+    skipped on this path. Numerics are allclose to eager (same fp32 math, one
+    rounding to the output dtype), not guaranteed bitwise-identical.
+    """
+    global _rw_fwd_dispatch, _rw_bwd_x_dispatch, _rw_bwd_probs_dispatch, _RW_CORES_COMPILED
+    if _RW_CORES_COMPILED:
+        return
+    _rw_fwd_dispatch = torch.compile(_rw_fwd_core, dynamic=True)
+    _rw_bwd_x_dispatch = torch.compile(_rw_bwd_x_core, dynamic=True)
+    _rw_bwd_probs_dispatch = torch.compile(_rw_bwd_probs_core, dynamic=True)
+    _RW_CORES_COMPILED = True
 
 
 class _RouterWeightMulFunction(torch.autograd.Function):
@@ -78,6 +127,9 @@ class _RouterWeightMulFunction(torch.autograd.Function):
             ctx.save_for_backward(probs)
         ctx.save_x = save_x
         ctx.x_dtype = x.dtype
+        if _RW_CORES_COMPILED and x.shape[0] > 0:
+            # One fused kernel: cast, multiply, cast to out_dtype -- no fp32 intermediate.
+            return _rw_fwd_dispatch(x, probs, out_dtype)
         out = torch.empty(x.shape, dtype=out_dtype, device=x.device)
         for s in range(0, x.shape[0], _RW_CHUNK_ROWS):
             e = min(s + _RW_CHUNK_ROWS, x.shape[0])
@@ -105,6 +157,12 @@ class _RouterWeightMulFunction(torch.autograd.Function):
             x = None
         grad_x = None
         grad_p = None
+        if _RW_CORES_COMPILED and grad_out.shape[0] > 0:
+            if ctx.needs_input_grad[0]:
+                grad_x = _rw_bwd_x_dispatch(grad_out, probs, ctx.x_dtype)
+            if ctx.needs_input_grad[1] and x is not None:
+                grad_p = _rw_bwd_probs_dispatch(grad_out, x, probs.dtype)
+            return grad_x, grad_p, None, None
         if ctx.needs_input_grad[0]:
             grad_x = torch.empty(grad_out.shape, dtype=ctx.x_dtype, device=grad_out.device)
         if ctx.needs_input_grad[1] and x is not None:

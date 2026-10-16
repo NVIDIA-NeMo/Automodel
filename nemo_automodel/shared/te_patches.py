@@ -17,15 +17,18 @@ Transformer Engine compatibility patches.
 Runtime monkey-patches applied directly to TE classes in memory so they
 take effect immediately in the current process.
 
-Call `apply_te_patches()` early in the process, before TE optimizers are
-instantiated.
+Call `apply_te_patches()` early in the process, before TE optimizers are used.
 """
 
 from __future__ import annotations
 
+import copy
+import itertools
 import logging
+from typing import Any
 
 import torch
+from torch.distributed.tensor import DTensor
 
 _logger = logging.getLogger(__name__)
 
@@ -115,6 +118,170 @@ def _apply_fused_adam_quantized_tensor_patch() -> None:
     _logger.info("Applied FusedAdam QuantizedTensor monkey-patch.")
 
 
+def _apply_fused_adam_empty_shard_patch() -> None:
+    """Keep zero-element FSDP shards out of TE's native multi-tensor kernel.
+
+    TE's multi_tensor_apply metadata writer can overrun its final slot when a
+    zero-element tensor occupies that slot (TE issue #3202).  Filter complete
+    parameter/state columns at the Python/native boundary so state_dict keys,
+    parameter groups, and the update for every nonempty shard stay intact.
+    """
+    from nemo_automodel.shared.import_utils import safe_import, safe_import_te
+
+    have_te, _ = safe_import_te()
+    available, fused_adam = (
+        safe_import("transformer_engine.pytorch.optimizers.fused_adam") if have_te else (False, None)
+    )
+    if not available:
+        _logger.debug("Skipping FusedAdam empty-shard patch: Transformer Engine is unavailable")
+        return
+
+    original = fused_adam.multi_tensor_applier
+    if getattr(original, "_nemo_empty_shard_patch", False) is True:
+        return
+
+    reported_empty_shards = False
+
+    def _apply_without_empty_shards(op, noop_flag_buffer, tensor_lists, *args):
+        """Forward aligned nonempty shard columns to TE's existing applier.
+
+        Args:
+            op: Native multi-tensor optimizer kernel.
+            noop_flag_buffer: Device integer tensor of shape [1], passed unchanged.
+            tensor_lists: Role-major lists [role][parameter]. Each entry is a tensor
+                of arbitrary shape or a DTensor whose local shard has that shape.
+                Roles start with gradients and parameters, followed by optimizer
+                state; corresponding columns describe the same local parameter.
+                Tensor storage is preserved and may be updated in place by op.
+            *args: Native kernel arguments, forwarded unchanged.
+
+        Returns:
+            The original applier's result, or None when every local shard is empty.
+        """
+        nonlocal reported_empty_shards
+        if not tensor_lists or not tensor_lists[0]:
+            return original(op, noop_flag_buffer, tensor_lists, *args)
+
+        width = len(tensor_lists[0])
+        if any(len(tensors) != width for tensors in tensor_lists):
+            raise RuntimeError("FusedAdam multi-tensor lists have different lengths")
+
+        def local_numel(tensor):
+            """Return the element count of a tensor's local shard.
+
+            Args:
+                tensor: Tensor of arbitrary shape, or DTensor with an arbitrary
+                    global shape and possibly empty local shard.
+
+            Returns:
+                Number of local elements, independent of the global DTensor shape.
+            """
+            # TE's original applier unwraps DTensor immediately before the
+            # native call.  Check the same local shard here.
+            return tensor._local_tensor.numel() if hasattr(tensor, "_local_tensor") else tensor.numel()
+
+        nonempty = [index for index, grad in enumerate(tensor_lists[0]) if local_numel(grad)]
+        if len(nonempty) == width:
+            return original(op, noop_flag_buffer, tensor_lists, *args)
+
+        # Each column is one parameter, gradient, and optimizer state tuple.
+        # A zero gradient with a nonempty parameter would indicate an unrelated
+        # error; do not silently omit its update.
+        for index in set(range(width)) - set(nonempty):
+            if local_numel(tensor_lists[1][index]):
+                raise RuntimeError("FusedAdam has an empty gradient for a nonempty parameter shard")
+
+        if not reported_empty_shards:
+            _logger.info("FusedAdam filtered %d empty local shards from native update", width - len(nonempty))
+            reported_empty_shards = True
+        if not nonempty:
+            return None
+        filtered = [[tensors[index] for index in nonempty] for tensors in tensor_lists]
+        return original(op, noop_flag_buffer, filtered, *args)
+
+    _apply_without_empty_shards._nemo_empty_shard_patch = True
+    fused_adam.multi_tensor_applier = _apply_without_empty_shards
+    _logger.info("Applied FusedAdam empty-shard monkey-patch.")
+
+
+def _apply_fused_adam_in_place_load_patch() -> None:
+    """Load FusedAdam state into the optimizer's existing state buffers.
+
+    TE's ``FusedAdam.load_state_dict`` first runs ``torch.optim.Optimizer.load_state_dict``, which casts a copy of
+    every state tensor to the parameter dtype, and then resets each parameter's state and allocates new buffers while
+    the loaded tensors are still referenced. With fp32 master weights (bf16 parameter plus int16 remainder) and fp32
+    moments, a resume then holds about 22 bytes per parameter instead of the 10 bytes of optimizer state, which does
+    not fit large sharded models. The patched method restores the parameter-group hyperparameters, including
+    FusedAdam's per-group ``step``, and copies each loaded state into the existing buffer with ``set_scaled_state``;
+    a buffer is allocated only for a state that does not exist yet.
+    """
+    from nemo_automodel.shared.import_utils import safe_import, safe_import_te
+
+    have_te, _ = safe_import_te()
+    available, fused_adam = (
+        safe_import("transformer_engine.pytorch.optimizers.fused_adam") if have_te else (False, None)
+    )
+    if not available:
+        _logger.debug("Skipping FusedAdam in-place load patch: Transformer Engine is unavailable")
+        return
+    fused_adam_cls = fused_adam.FusedAdam
+    if getattr(fused_adam_cls.load_state_dict, "_nemo_in_place_load_patch", False) is True:
+        return
+
+    def _load_state_dict_in_place(self: Any, state_dict: dict[str, Any]) -> None:
+        """Load an optimizer state dict produced by ``FusedAdam.state_dict``.
+
+        Args:
+            state_dict: Mapping with ``param_groups`` (hyperparameters and parameter ids) and ``state`` (parameter id
+                to state-name mapping). State values are tensors or DTensors with the parameter's shape and
+                placements: ``exp_avg`` / ``exp_avg_sq`` and ``master_param`` in fp32, except ``master_param`` of a
+                bf16 parameter with ``store_param_remainders``, which is the int16 remainder. A value may alias the
+                optimizer's current buffer, as when Distributed Checkpointing loaded it in place.
+        """
+        for pre_hook in self._optimizer_load_state_dict_pre_hooks.values():
+            hook_result = pre_hook(self, state_dict)
+            if hook_result is not None:
+                state_dict = hook_result
+        groups = self.param_groups
+        saved_groups = state_dict["param_groups"]
+        if len(groups) != len(saved_groups):
+            raise ValueError(
+                f"Loaded FusedAdam state has {len(saved_groups)} parameter groups; the optimizer has {len(groups)}."
+            )
+        for index, (group, saved) in enumerate(zip(groups, saved_groups)):
+            if len(group["params"]) != len(saved["params"]):
+                raise ValueError(
+                    f"Loaded FusedAdam parameter group {index} has {len(saved['params'])} parameters; "
+                    f"the optimizer group has {len(group['params'])}."
+                )
+        id_map = dict(
+            zip(
+                itertools.chain.from_iterable(saved["params"] for saved in saved_groups),
+                itertools.chain.from_iterable(group["params"] for group in groups),
+            )
+        )
+        for group, saved in zip(groups, saved_groups):
+            group.update({key: copy.deepcopy(value) for key, value in saved.items() if key != "params"})
+        for key, saved_state in state_dict["state"].items():
+            param = id_map.get(key)
+            if param is None:
+                continue
+            for name, value in saved_state.items():
+                if value is None:
+                    continue
+                local = value._local_tensor if isinstance(value, DTensor) else value
+                keeps_remainder = (
+                    self.store_param_remainders and name == "master_param" and param.dtype == torch.bfloat16
+                )
+                self.set_scaled_state(param, name, local if keeps_remainder else local.float())
+        for post_hook in self._optimizer_load_state_dict_post_hooks.values():
+            post_hook(self)
+
+    _load_state_dict_in_place._nemo_in_place_load_patch = True
+    fused_adam_cls.load_state_dict = _load_state_dict_in_place
+    _logger.info("Applied FusedAdam in-place load_state_dict patch.")
+
+
 def apply_te_patches() -> None:
     """Apply all Transformer Engine runtime patches.
 
@@ -125,5 +292,7 @@ def apply_te_patches() -> None:
         return
 
     _apply_fused_adam_quantized_tensor_patch()
+    _apply_fused_adam_empty_shard_patch()
+    _apply_fused_adam_in_place_load_patch()
 
     _TE_PATCHES_APPLIED = True

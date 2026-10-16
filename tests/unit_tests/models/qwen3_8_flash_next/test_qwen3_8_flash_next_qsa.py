@@ -20,8 +20,10 @@ import torch
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next import layers as qwen3_8_flash_next_layers
 from nemo_automodel.components.models.qwen3_8_flash_next import qsa as qwen3_8_flash_next_qsa
+from nemo_automodel.components.models.qwen3_8_flash_next.backend import Qwen3_8_FlashNextBackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import (
+    _membership_flat_offset,
     _routes_to_membership,
     flex_sparse_gqa_attention,
 )
@@ -361,6 +363,43 @@ def test_flex_membership_gives_empty_rows_a_kernel_safe_dummy_route() -> None:
     assert bool(membership.any(dim=-1).all())
 
 
+def test_flex_membership_offset_is_exact_past_int32_range() -> None:
+    # A 65536-token square membership table holds 2**32 entries, so the last
+    # rows sit beyond INT32_MAX. Python ints are the arbitrary-precision
+    # reference: an int32 evaluation would wrap negative here instead.
+    query_length = kv_length = 65536
+    batch_idx, query_idx, kv_idx = 0, 65535, 65535
+
+    offset = _membership_flat_offset(
+        torch.tensor(batch_idx),
+        torch.tensor(query_idx),
+        torch.tensor(kv_idx),
+        query_length,
+        kv_length,
+    )
+
+    assert offset.dtype == torch.int64
+    assert int(offset) == (batch_idx * query_length + query_idx) * kv_length + kv_idx
+    assert int(offset) > torch.iinfo(torch.int32).max
+
+
+def test_flex_membership_offset_matches_direct_indexing() -> None:
+    membership = torch.rand(2, 5, 7) > 0.5
+    flat = membership.reshape(-1)
+
+    for batch_idx in range(membership.shape[0]):
+        for query_idx in range(membership.shape[1]):
+            for kv_idx in range(membership.shape[2]):
+                offset = _membership_flat_offset(
+                    torch.tensor(batch_idx),
+                    torch.tensor(query_idx),
+                    torch.tensor(kv_idx),
+                    membership.shape[1],
+                    membership.shape[2],
+                )
+                assert bool(flat[offset]) == bool(membership[batch_idx, query_idx, kv_idx])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention requires CUDA")
 def test_flex_qsa_empty_route_rows_have_zero_output_and_gradients() -> None:
     torch.manual_seed(43)
@@ -386,14 +425,21 @@ def test_flex_qsa_empty_route_rows_have_zero_output_and_gradients() -> None:
         assert torch.count_nonzero(tensor.grad) == 0
 
 
-def test_qsa_flex_backend_bypasses_generic_parent_initializer() -> None:
-    backend = _backend()
-    backend.attn = "flex"
+@pytest.mark.parametrize("attn_backend", ["flex", "cute"])
+def test_qsa_sparse_backend_bypasses_generic_parent_initializer(attn_backend: str) -> None:
+    backend = Qwen3_8_FlashNextBackendConfig(
+        attn=attn_backend,
+        linear="torch",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=False,
+    )
 
     attention = Qwen3_8_FlashNextQSAAttention(_config(), layer_idx=0, backend=backend)
 
     assert attention.backend is backend
-    assert attention.backend.attn == "flex"
+    assert attention.backend.attn == attn_backend
     assert attention.attn_module is None
     assert attention.attn_func is None
 

@@ -43,7 +43,7 @@ from nemo_automodel.components.moe.layers import MoEConfig
 class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
     """Convert Qwen3.8-Flash-Next checkpoints without gathering the global PLE table."""
 
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(
         self,

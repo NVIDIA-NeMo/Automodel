@@ -92,7 +92,6 @@ distributed:
     ignore_router_for_ac: true
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
@@ -114,7 +113,6 @@ packed_sequence:
   drop_long_samples: true
   balance_media_tokens: true
   packing_format: neat
-  attn_implementation: sdpa
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

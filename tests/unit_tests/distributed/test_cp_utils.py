@@ -616,6 +616,8 @@ def test_make_cp_batch_for_te_multi_chunk(monkeypatch):
     assert result["qkv_format"] == "thd"
     assert result["input_ids"].shape[0] == 2
     assert result["padding_mask"].shape == result["input_ids"].shape
+    assert torch.equal(result["cu_seqlens_padded"], result["cu_seqlens"])
+    assert result["pad_between_seqs"] is False
 
 
 def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
@@ -641,15 +643,17 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
         "input_ids": torch.tensor([1, 2, 3, 4]),
         "labels": torch.tensor([10, 20, 30, 40]),
         "position_ids": torch.tensor([0, 1, 2, 3]),
-        "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        "cu_seqlens": torch.tensor([0, 3], dtype=torch.int32),
         "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
+        "pad_between_seqs": True,
     }
 
     result, local_indices = _cu._shard_thd_chunk_for_te(batch, cp_mesh, "thd", -1000, 0)
 
     assert "input_ids" in result
     assert "attention_mask" not in result
-    assert "cu_seqlens_padded" not in result
+    assert torch.equal(result["cu_seqlens_padded"], result["cu_seqlens"])
+    assert result["pad_between_seqs"] is False
     # the partition IS the local-token global index map (mock returns arange)
     assert torch.equal(local_indices, torch.arange(4))
 
@@ -808,7 +812,8 @@ def test_sharder_constructor_derives_te_from_model_and_thd_from_batch(monkeypatc
     assert not seen
     ctx, batch = sharder.shard(batch)
     assert ctx is contextlib.nullcontext
-    assert batch == {"thd": True}
+    assert batch["thd"] is True
+    assert torch.equal(batch["_thd_local_indices"], local_indices)
     assert seen["cp_mesh"] is device_mesh["cp"]
     assert (seen["pad"], seen["fmt"], seen["chunks"], seen["sent"]) == (7, "thd", 3, -1000)
 
@@ -1024,7 +1029,8 @@ def test_te_sharder_captures_row_shape(monkeypatch):
     local_indices = torch.tensor([0, 1, 2, 3])  # identity partition (cp fake)
 
     def fake_make_cp_batch_for_te(cp_mesh, batch, *, return_local_indices=False, **kwargs):
-        return ({"thd": True}, local_indices) if return_local_indices else {"thd": True}
+        prepped = {**batch, "thd": True}
+        return (prepped, local_indices) if return_local_indices else prepped
 
     monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
 
@@ -1033,7 +1039,10 @@ def test_te_sharder_captures_row_shape(monkeypatch):
         cp1, None, magi=None, is_thd=True, num_chunks=1, seq_lens_padding_value=-1000, model=None
     )
     sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=1, tp_size=1))
-    sharder.shard({"input_ids": torch.arange(4).view(2, 2)})
+    model_payload = object()
+    _, sharded = sharder.shard({"input_ids": torch.arange(4).view(2, 2), "_model_owned_payload": model_payload})
+    assert sharded["_model_owned_payload"] is model_payload
+    torch.testing.assert_close(sharded["_thd_local_indices"], local_indices)
     assert sharder.shard_layout.input_row_shape == (2, 2)
     assert sharder.shard_layout.padded_seq_len == 4
 

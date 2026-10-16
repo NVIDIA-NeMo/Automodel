@@ -24,6 +24,8 @@ first, then pass the resulting world size here.
 import logging
 from typing import Any, Dict
 
+from torch.distributed.fsdp import MixedPrecisionPolicy
+
 from nemo_automodel.components.distributed.config import (
     DistributedSetup,
     MoEParallelizerConfig,
@@ -146,10 +148,11 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
                 if key in mp_raw and isinstance(mp_raw[key], str):
                     mp_raw[key] = dtype_from_str(mp_raw[key])
             if target is not None and callable(target):
+                if target is MixedPrecisionPolicy:
+                    mp_raw.setdefault("cast_forward_inputs", False)
                 strategy_kwargs["mp_policy"] = target(**mp_raw)
             else:
-                from torch.distributed.fsdp import MixedPrecisionPolicy
-
+                mp_raw.setdefault("cast_forward_inputs", False)
                 strategy_kwargs["mp_policy"] = MixedPrecisionPolicy(**mp_raw)
 
     # Instantiate offload_policy from YAML dict (same ``_target_`` pattern).
@@ -248,6 +251,8 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
         if isinstance(mp_raw, dict) and callable(mp_raw.get("_target_")):
             mp_raw = mp_raw.copy()
             target = mp_raw.pop("_target_")
+            if target is MixedPrecisionPolicy:
+                mp_raw.setdefault("cast_forward_inputs", False)
             for key in ("param_dtype", "reduce_dtype", "output_dtype"):
                 if key in mp_raw and isinstance(mp_raw[key], str):
                     mp_raw[key] = dtype_from_str(mp_raw[key])

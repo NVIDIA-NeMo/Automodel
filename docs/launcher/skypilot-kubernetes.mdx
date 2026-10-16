@@ -167,8 +167,7 @@ torchrun \
   --nproc_per_node=1 \
   --nnodes=$SKYPILOT_NUM_NODES \
   --node_rank=$SKYPILOT_NODE_RANK \
-  --rdzv_backend=c10d \
-  --master_addr=$(echo $SKYPILOT_NODE_IPS | head -n1) \
+  --master_addr="$(echo "$SKYPILOT_NODE_IPS" | head -n1)" \
   --master_port=12375 \
   ~/sky_workdir/nemo_automodel/recipes/llm/train_ft.py \
   -c /tmp/automodel_job_config.yaml

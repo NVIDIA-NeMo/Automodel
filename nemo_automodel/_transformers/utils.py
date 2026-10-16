@@ -20,7 +20,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +216,46 @@ def _patch_special_tokens_pattern():
         PreTrainedTokenizer.__init__._nemo_stp_patched = True  # type: ignore[attr-defined]
 
 
+class _LegacyRopeInitFunctions(dict[str, Callable]):
+    """Supply v4's default on lookup without overriding native v5 initializers.
+
+    Native models merge the registry into their model-owned initializers. A
+    missing-key fallback supports remote code's direct lookup but is not copied
+    by that merge. Unknown types still fail instead of silently using default RoPE.
+    """
+
+    def __missing__(self, key: str) -> Callable:
+        if key != "default":
+            raise KeyError(key)
+        return _default_rope_parameters
+
+
+def _default_rope_parameters(
+    config: PretrainedConfig, device: torch.device | None = None, seq_len: int | None = None
+) -> tuple[torch.Tensor, float]:
+    """Compute the legacy default frequencies for direct registry lookups.
+
+    Args:
+        config: Rotary settings and attention head dimensions.
+        device: Device for the frequency tensor.
+        seq_len: Unused by default RoPE; accepted for the upstream registry API.
+
+    Returns:
+        Float32 inverse frequencies of shape [rotary_dim / 2] and attention scale.
+    """
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters is not None:
+        base = rope_parameters["rope_theta"]
+        partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
+    else:
+        base = config.rope_theta
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+    dim = int(head_dim * partial_rotary_factor)
+    indices = torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float32)
+    return 1.0 / (base ** (indices / dim)), 1.0
+
+
 def apply_cache_compatibility_patches():
     """Apply compatibility patches for transformers cache utilities.
 
@@ -226,6 +266,21 @@ def apply_cache_compatibility_patches():
     _patch_special_tokens_pattern()
 
     import transformers.cache_utils as cache_utils
+    import transformers.utils.import_utils as import_utils
+
+    # Remote v4 checkpoints still import this predicate; v4 defined it as
+    # is_torch_available(), so retain those semantics on v5.
+    if not hasattr(import_utils, "is_torch_fx_available"):
+        import_utils.is_torch_fx_available = import_utils.is_torch_available
+
+    # v5 moved default RoPE initialization into individual model classes.
+    # Remote v4 models still look it up in this registry using their v4 config.
+    import transformers.modeling_rope_utils as rope_utils
+
+    if "default" not in rope_utils.ROPE_INIT_FUNCTIONS and not isinstance(
+        rope_utils.ROPE_INIT_FUNCTIONS, _LegacyRopeInitFunctions
+    ):
+        rope_utils.ROPE_INIT_FUNCTIONS = _LegacyRopeInitFunctions(rope_utils.ROPE_INIT_FUNCTIONS)
 
     # SlidingWindowCache was removed in transformers v5.x
     if not hasattr(cache_utils, "SlidingWindowCache"):

@@ -20,14 +20,64 @@ import pytest
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast, ProcessorMixin
 
 from nemo_automodel import NeMoAutoTokenizer
 from nemo_automodel._transformers import sentence_transformer_export
 from nemo_automodel._transformers.sentence_transformer_export import (
+    SentenceTransformerExportConfig,
     _resolve_sentence_transformer_max_seq_length,
     _save_generated_sentence_transformer_assets,
+    _supports_standard_sentence_transformer_export,
 )
+
+
+def test_composite_export_support_is_selected_by_export_config():
+    text_config = PretrainedConfig()
+    text_config.hidden_size = 8
+    config = PretrainedConfig()
+    config.is_composition = True
+    config.text_config = text_config
+    model = SimpleNamespace(config=config, main_input_name="input_ids")
+
+    assert not _supports_standard_sentence_transformer_export(
+        model,
+        "avg",
+        SentenceTransformerExportConfig(),
+    )
+    assert _supports_standard_sentence_transformer_export(
+        model,
+        "avg",
+        SentenceTransformerExportConfig(input_mode="structured_multimodal"),
+    )
+
+
+def test_multimodal_export_profile_preserves_processor_assets(tmp_path):
+    (tmp_path / "processor_config.json").write_text("{}")
+    (tmp_path / "preprocessor_config.json").write_text("{}")
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+    processor = MagicMock(spec=ProcessorMixin)
+    processor.tokenizer = SimpleNamespace(model_max_length=512, pad_token=None)
+    processor.image_processor = object()
+    processor.chat_template = "{{ messages }}"
+
+    _save_generated_sentence_transformer_assets(
+        model,
+        SentenceTransformerExportConfig(input_mode="structured_multimodal"),
+        original_model_path=None,
+        hf_metadata_dir=str(tmp_path),
+        tokenizer=processor,
+    )
+
+    transformer_config = json.loads((tmp_path / "sentence_bert_config.json").read_text())
+    assert set(transformer_config["modality_config"]) == {"text", "image", "message"}
+    assert transformer_config["module_output_name"] == "token_embeddings"
+    assert (tmp_path / "processor_config.json").is_file()
+    assert (tmp_path / "preprocessor_config.json").is_file()
 
 
 def test_generated_sentence_transformer_assets_regenerate_semantics_and_preserve_source_limit(tmp_path):
@@ -315,7 +365,7 @@ def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypat
     local_root = tmp_path / "local"
     (local_root / "encoder").mkdir(parents=True)
     assert sentence_transformer_export._resolve_cached_source_model_path(
-        str(local_root), SimpleNamespace(), {"subfolder": "encoder"}
+        str(local_root), {"subfolder": "encoder"}
     ) == str(local_root / "encoder")
     assert sentence_transformer_export._resolve_cached_source_repository_path(
         str(local_root), str(local_root / "encoder"), {"subfolder": "encoder"}
@@ -329,8 +379,7 @@ def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypat
 
     result = sentence_transformer_export._resolve_cached_source_model_path(
         "org/model",
-        SimpleNamespace(_commit_hash="exact-commit"),
-        {"cache_dir": "/cache", "revision": "branch", "subfolder": "encoder"},
+        {"cache_dir": "/cache", "revision": "exact-commit", "subfolder": "encoder"},
     )
 
     assert result == str(cached_config.parent)
@@ -351,10 +400,9 @@ def test_cache_hub_source_legal_assets_uses_exact_loaded_revision(monkeypatch):
 
     result = sentence_transformer_export._cache_hub_source_legal_assets(
         "org/model",
-        SimpleNamespace(_commit_hash="exact-commit"),
         {
             "cache_dir": "/cache",
-            "revision": "branch",
+            "revision": "exact-commit",
             "use_auth_token": "token",
             "local_files_only": True,
         },

@@ -29,6 +29,9 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
+
 
 class _ReduceFromTensorParallelRegion(torch.autograd.Function):
     """Sum local TP values in forward and leave replicated gradients local."""
@@ -222,6 +225,8 @@ def _gemma4_tp_plan(model: nn.Module, sequence_parallel: bool = False) -> dict[s
         f"{model_prefix}.embed_tokens": _Gemma4VocabParallelEmbedding(),
         f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+        f"{model_prefix}.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
         f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.o_proj": _Gemma4RowwiseParallel(output_holder),
         f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
@@ -243,57 +248,61 @@ def _gemma4_tp_plan(model: nn.Module, sequence_parallel: bool = False) -> dict[s
     return plan
 
 
-def register_gemma4_parallel_strategy() -> None:
-    """Register Gemma4's model-owned FSDP2 strategy once."""
-    from nemo_automodel.components.distributed.parallelizer import (
-        PARALLELIZATION_STRATEGIES,
-        DefaultParallelizationStrategy,
-        register_parallel_strategy,
-    )
+def _get_attention_head_counts(text_config) -> set[tuple[int, int]]:
+    """Return every per-layer attention-head shape used by a Gemma4 config."""
+    return {
+        (
+            int(layer_config.num_attention_heads),
+            int(layer_config.num_key_value_heads),
+        )
+        for layer_config in text_config.per_layer_config
+    }
 
-    name = "Gemma4ForConditionalGeneration"
-    if name in PARALLELIZATION_STRATEGIES:
-        return
 
-    @register_parallel_strategy(name=name)
-    class Gemma4ParallelizationStrategy(DefaultParallelizationStrategy):
-        """Apply the variant-aware Gemma4 TP plan before standard FSDP2."""
+class Gemma4ModelParallelizer(ModelParallelizer):
+    """Apply the variant-aware Gemma4 TP plan before standard FSDP2."""
 
-        def parallelize(self, model: nn.Module, device_mesh: DeviceMesh, **kwargs: Any) -> nn.Module:
-            """Validate and apply Gemma4 tensor parallelism.
+    def _validate_tp_mesh(self, model: nn.Module, tp_mesh: DeviceMesh) -> None:
+        """Validate every heterogeneous Gemma4 attention-head shape."""
+        tp_size = tp_mesh.size()
+        text_config = model.config.text_config
+        if text_config.enable_moe_block:
+            raise ValueError("Gemma4 MoE does not support tensor parallelism; use expert parallelism instead.")
+        incompatible_head_counts = {
+            head_counts
+            for head_counts in _get_attention_head_counts(text_config)
+            if head_counts[0] % tp_size != 0 or head_counts[1] % tp_size != 0
+        }
+        if incompatible_head_counts:
+            raise ValueError(
+                "Gemma4 TP requires every layer attention head count to be divisible by tp_size; "
+                f"got incompatible_head_counts={sorted(incompatible_head_counts)}, tp_size={tp_size}."
+            )
 
-            Args:
-                model: Gemma4 model to shard.
-                device_mesh: Global mesh containing the tensor-parallel axis.
-                **kwargs: Standard ``DefaultParallelizationStrategy`` options.
+    def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
+        """Keep Gemma4's replay-safe shared attention inside the checkpoint region."""
+        return bool(getattr(model, "kv_sharing_survives_checkpoint_replay", False))
 
-            Returns:
-                The TP/FSDP2-sharded Gemma4 model.
-            """
-            tp_mesh_name = kwargs.get("tp_mesh_name", "tp")
-            tp_mesh = device_mesh[tp_mesh_name]
-            tp_size = tp_mesh.size()
-            text_config = model.config.text_config
+    def _apply(self, model: nn.Module, device_mesh: DeviceMesh, **kwargs: Any) -> nn.Module:
+        """Apply Gemma4 tensor parallelism."""
+        tp_mesh_name = kwargs.get("tp_mesh_name", "tp")
+        tp_mesh = device_mesh[tp_mesh_name]
+        tp_size = tp_mesh.size()
 
-            if tp_size > 1:
-                if text_config.enable_moe_block:
-                    raise ValueError("Gemma4 MoE does not support tensor parallelism; use expert parallelism instead.")
-                num_attention_heads = int(text_config.num_attention_heads)
-                num_key_value_heads = int(text_config.num_key_value_heads)
-                if num_attention_heads % tp_size != 0 or num_key_value_heads % tp_size != 0:
-                    raise ValueError(
-                        "Gemma4 TP requires both attention head counts to be divisible by tp_size; "
-                        f"got num_attention_heads={num_attention_heads}, "
-                        f"num_key_value_heads={num_key_value_heads}, tp_size={tp_size}."
-                    )
-                model._gemma4_tp_enabled = True
-                model._gemma4_tp_size = tp_size
-                model._gemma4_tp_mesh = tp_mesh
+        if tp_size > 1:
+            model._gemma4_tp_enabled = True
+            model._gemma4_tp_size = tp_size
+            model._gemma4_tp_mesh = tp_mesh
 
-                if kwargs.get("tp_shard_plan") is None:
-                    kwargs["tp_shard_plan"] = _gemma4_tp_plan(
-                        model,
-                        sequence_parallel=bool(kwargs.get("sequence_parallel", False)),
-                    )
+            if kwargs.get("tp_shard_plan") is None:
+                kwargs["tp_shard_plan"] = _gemma4_tp_plan(
+                    model,
+                    sequence_parallel=bool(kwargs.get("sequence_parallel", False)),
+                )
 
-            return super().parallelize(model, device_mesh, **kwargs)
+        return super()._apply(model, device_mesh, **kwargs)
+
+
+PARALLELIZER = Gemma4ModelParallelizer()
+
+__all__ = ["PARALLELIZER"]

@@ -13,4 +13,6 @@
 # limitations under the License.
 
 configs:
+  - deepseek_v4/deepseek_v4_flash_mok_mxfp8_fineweb_8k.yaml
   - deepseek_v4/deepseek_v4_flash_pretrain.yaml
+  - glm/glm_5.2_mok_mxfp8_fineweb_8k.yaml

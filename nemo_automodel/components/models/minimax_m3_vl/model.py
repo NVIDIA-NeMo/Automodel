@@ -20,6 +20,7 @@ the sglang reference before the vision tower / VLM wrapper (Stage 3) embeds the
 text model as ``language_model``.
 """
 
+from copy import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,7 +46,8 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
-from nemo_automodel.components.models.minimax_m3_vl.layers import Block, MiniMaxM3RMSNorm
+from nemo_automodel.components.models.minimax_m3_vl.layers import Block, MiniMaxM3MSAAttention, MiniMaxM3RMSNorm
+from nemo_automodel.components.models.minimax_m3_vl.msa import MSAMicrobatch
 from nemo_automodel.components.models.minimax_m3_vl.mtp import MiniMaxM3MTP
 from nemo_automodel.components.models.minimax_m3_vl.state_dict_adapter import (
     MiniMaxM3StateDictAdapter,
@@ -134,9 +136,26 @@ class MiniMaxM3TextModel(nn.Module):
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
+        msa_layers = [b.self_attn for b in self.layers.values() if isinstance(b.self_attn, MiniMaxM3MSAAttention)]
+        # Decided here, on the whole model, so every pipeline stage's deep copy carries the same answer.
+        self.uses_msa = bool(msa_layers)
+        self._msa_forced_blocks = (
+            (msa_layers[0].indexer.init_blocks, msa_layers[0].indexer.local_blocks) if msa_layers else (0, 0)
+        )
+        if self.uses_msa and int(getattr(config, "num_mtp_modules", 0) or 0) > 0:
+            raise NotImplementedError("MiniMax M3 MSA sparse attention supports MTP0 only; set num_mtp_modules=0")
+        if self.uses_msa and len(msa_layers) != len(self.layers) and backend.attn != "te":
+            raise NotImplementedError(
+                "MiniMax M3 backend.sparse_attn='msa' packs its dense attention layers to [tokens, hidden], "
+                "so they isolate documents with cu_seqlens and need a varlen backend: set backend.attn='te' "
+                f"(got backend.attn={backend.attn!r}). backend.attn='sdpa' ignores cu_seqlens entirely "
+                "and backend.attn='flex' rejects grouped-query attention."
+            )
 
         gemma = getattr(config, "use_gemma_norm", False)
-        self.norm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
+        self.norm = MiniMaxM3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
 
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -185,6 +204,7 @@ class MiniMaxM3TextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Map ids/positions/padding[B,S], embeds[B,S,H] and mask[B,S] or [B,1,S,S] to hidden[B,S,H]."""
         # Pipeline stages after the first receive the previous stage's hidden
         # states in the input_ids slot (a float tensor) with embed_tokens=None.
         if inputs_embeds is None and input_ids is not None and torch.is_floating_point(input_ids):
@@ -195,6 +215,28 @@ class MiniMaxM3TextModel(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(0, h.shape[1], device=h.device).unsqueeze(0).expand(h.shape[0], -1)
 
+        msa = None
+        if self.uses_msa:
+            # Every stage builds it (memoized on the batch tensor): with 28 virtual stages over 60 layers,
+            # virtual stage 0 holds only the dense layers 0-2 and still needs it to pack them.
+            msa = MSAMicrobatch.build(
+                h,
+                packed_seq_ids=attn_kwargs.pop("_packed_seq_ids", None),
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                attn_kwargs=attn_kwargs,
+                forced_blocks=self._msa_forced_blocks,
+            )
+            # Plan block selection before the decoder blocks: built lazily inside an activation-checkpointed
+            # block, its one-time ops would be saved by the checkpoint forward and never replayed by the
+            # recompute, shifting every later saved op of that block.
+            msa.prepare_selection()
+            # Canonical ids still own padding for the MoE router. Every attention layer packs, so
+            # document isolation travels as cu_seqlens and no attention mask may survive: a non-None
+            # mask makes the TE backend silently drop cu_seqlens (attention/utils.py:135-143).
+            attention_mask, padding_mask = None, msa.padding_mask
+            attn_kwargs["cu_seqlens"], attn_kwargs["max_seqlen"] = msa.cu_seqlens, msa.max_seqlen
+
         freqs_cis = self.make_freqs_cis(position_ids, **attn_kwargs)
 
         for layer in self.layers.values():
@@ -203,6 +245,8 @@ class MiniMaxM3TextModel(nn.Module):
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                # Dense layers pack too: they isolate documents with cu_seqlens, not a 4-D mask.
+                msa=msa,
                 # Forwarded so CP-aware sparse attention can derive per-document
                 # boundaries (position_ids reset to 0 per packed document) for
                 # block-diagonal masking; ignored/popped by the eager path.
@@ -270,10 +314,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
-
-    # The state-dict adapter loads every tensor from the checkpoint, so skip HF
-    # random init on load (also avoids DTensor-collective hangs under sharding/PP).
-    _skip_init_weights_on_load = True
+    _pp_keep_self_forward: bool = True
 
     @classmethod
     def from_config(
@@ -296,7 +337,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
-        self.backend = backend or BackendConfig()
+        self.backend = copy(backend) if backend is not None else BackendConfig()
         self.model = MiniMaxM3TextModel(config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
@@ -306,6 +347,12 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 self.backend,
                 dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
             )
+
+    @property
+    def consumes_packed_seq_ids(self) -> bool:
+        """Whether the packed loader should hand this model ``_packed_seq_ids`` (the compact document map)
+        for every pack, single-document ones included, instead of a ``[batch, 1, sequence, sequence]`` mask."""
+        return self.model.uses_msa
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -327,7 +374,8 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | MiniMaxM3CausalLMOutput:
+        """Map ids/positions/padding[B,S] and mask[B,S] or [B,1,S,S] to logits[B,S,V] or MTP logits; MSA uses BSHD."""
         if attn_kwargs.get("qkv_format") == "thd":
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
@@ -371,7 +419,9 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 nn.init.trunc_normal_(
                     self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
                 )
-        cast_model_to_dtype(self, dtype)
+        # Preserve the declared FP32 gates. After FSDP wrapping, restoring
+        # DTensor .data after a cast cannot restore its local shard.
+        cast_model_to_dtype(self, dtype, skip_modules=("gate",))
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 
@@ -408,10 +458,6 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # The same attention shards the packed sequence in forward and carries the document
     # boundaries into every layer, so it owns the packed CP path end to end.
     _owns_cp_attention = True
-    # The state-dict adapter fully populates every tensor from the checkpoint
-    # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
-    # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
-    _skip_init_weights_on_load = True
     # CP submesh, installed by the MoE parallelizer's apply_cp when context
     # parallelism is active; None (default) means the forward embeds and shards
     # nothing for CP. See prepare_model_inputs_for_cp / forward.
@@ -455,7 +501,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         text_config = config.text_config
-        self.backend = backend or BackendConfig()
+        self.backend = copy(backend) if backend is not None else BackendConfig()
         self.model = MiniMaxM3TextModel(text_config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
@@ -478,6 +524,12 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 self.backend,
                 dtype=get_dtype(getattr(text_config, "torch_dtype", "bfloat16"), torch.bfloat16),
             )
+
+    @property
+    def consumes_packed_seq_ids(self) -> bool:
+        """Whether the packed loader should hand this model ``_packed_seq_ids`` (the compact document map)
+        for every pack, single-document ones included, instead of a ``[batch, 1, sequence, sequence]`` mask."""
+        return self.model.uses_msa
 
     @property
     def language_model(self):
@@ -817,7 +869,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 nn.init.trunc_normal_(
                     self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
                 )
-        cast_model_to_dtype(self, dtype)
+        # Preserve the declared FP32 gates. After FSDP wrapping, restoring
+        # DTensor .data after a cast cannot restore its local shard.
+        cast_model_to_dtype(self, dtype, skip_modules=("gate",))
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 

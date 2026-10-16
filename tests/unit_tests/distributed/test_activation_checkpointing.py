@@ -242,6 +242,9 @@ def test_fsdp_runtime_ops_are_all_ignored_by_selective_ac(monkeypatch):
         torch.ops.aten.empty.memory_format,
         torch.ops.aten.empty_like.default,
         torch.ops.aten.view.default,
+        # non-zero-dim shard copy-out path: torch.chunk -> aten.split.Tensor, torch.cat(out=)
+        torch.ops.aten.split.Tensor,
+        torch.ops.aten.cat.out,
     }
     assert expected <= sac_ignored
 

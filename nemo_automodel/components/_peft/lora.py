@@ -14,6 +14,8 @@
 
 import logging
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -22,7 +24,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
+from nemo_automodel.components._peft.lora_experts import (
+    GroupedExpertsDeepEPLoRA,
+    GroupedExpertsLoRA,
+)
+from nemo_automodel.components._peft.lora_experts_mxfp4 import (
+    GroupedExpertsDeepEPLoRAMXFP4,
+    GroupedExpertsLoRAMXFP4,
+)
 from nemo_automodel.components._peft.lora_kernel import (
     lora_da_dx_update_wrapper,
     lora_db_update_wrapper,
@@ -57,6 +66,10 @@ class PeftConfig:
     use_memory_efficient_lora: bool = True
     use_triton: bool = False
     moe_rank_scaling: bool = False
+    # Storage mode, not a torch dtype: "unquantized" uses the ordinary floating-point
+    # experts with the model's configured precision (including FP32). "mxfp4"
+    # stores frozen expert bases as fp4-e2m1 + e8m0 scales and requires torch_mm.
+    expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized"
 
     def to_dict(self):
         return self.__dict__.copy()
@@ -77,6 +90,7 @@ class PeftConfig:
             use_memory_efficient_lora=d.get("use_memory_efficient_lora", True),
             use_triton=d.get("use_triton", False),
             moe_rank_scaling=d.get("moe_rank_scaling", False),
+            expert_weight_format=d.get("expert_weight_format", "unquantized"),
         )
 
 
@@ -94,6 +108,11 @@ class LinearLoRA(nn.Linear):
     use those inside LinearLoRA but also for monkey-patching modules, without repeating the
     same code -> therefore those are decorated with @staticmethod.
     """
+
+    # Per-token adapter gate installed by :func:`lora_token_gate`; ``None`` applies LoRA to every token.
+    _lora_token_gate: torch.Tensor | None = None
+    # Module path set by ``patch_linear_module`` when a ``layer_name`` is given; used in error messages.
+    _layer_name: str | None = None
 
     def __init__(
         self,
@@ -314,6 +333,9 @@ class LinearLoRA(nn.Linear):
                 bias = None
             res = tp_linear_forward(x, self.weight, bias, mm_for_2d_compile=False)
 
+        if self._lora_token_gate is not None:
+            return res + self._gated_lora_forward(x)
+
         if not self.use_dora:
             if self.dropout_position == "pre":
                 x = F.dropout(x, p=self.dropout_p, training=self.training)
@@ -376,6 +398,43 @@ class LinearLoRA(nn.Linear):
         dora_extra = (mag_norm_scale - 1) * base_no_bias + mag_norm_scale * lora_result * self.scale
         return res + dora_extra
 
+    def _gated_lora_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the LoRA update with the per-token gate from :func:`lora_token_gate` applied.
+
+        The gate scales the rank-``dim`` hidden activation ``lora_A(x)``, so tokens with gate 0
+        receive no update and contribute no gradient to ``lora_A``/``lora_B``.
+
+        Args:
+            x: Input activations, Tensor of shape [batch, sequence, in_features] whose leading
+                dimensions equal the installed gate's shape, or flattened [batch * sequence,
+                in_features]. DTensor inputs are not supported.
+
+        Returns:
+            Tensor of shape [..., out_features] with the same leading dimensions as ``x``: the
+            gated LoRA update, without the base projection.
+        """
+        if self.use_dora:
+            raise NotImplementedError("lora_token_gate does not support DoRA adapters.")
+        if isinstance(x, DTensor):
+            raise NotImplementedError("lora_token_gate does not support DTensor activations (tensor parallelism).")
+        gate = self._lora_token_gate
+        # Only the exact leading shape or the flattened 2-D form: a permuted layout (e.g. a [batch, sequence]
+        # gate on a sequence-first input) has the same token count but would route the wrong tokens.
+        if gate.shape != x.shape[:-1] and not (x.dim() == 2 and gate.numel() == x.shape[0]):
+            raise ValueError(
+                f"lora_token_gate of shape {tuple(gate.shape)} does not match the LoRA input "
+                f"{self._layer_name or type(self).__name__} of shape {tuple(x.shape)}; expected leading "
+                f"dimensions {tuple(gate.shape)} or a flattened [{gate.numel()}, in_features] input."
+            )
+        if self.dropout_position == "pre":
+            x = F.dropout(x, p=self.dropout_p, training=self.training)
+        hidden = self.lora_A(x)
+        hidden = hidden * (gate.reshape(hidden.shape[:-1]).unsqueeze(-1).to(hidden.dtype) * self.scale)
+        lora_res = self.lora_B(hidden)
+        if self.dropout_position == "post":
+            lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
+        return lora_res
+
 
 class TritonLinearLoRA(LinearLoRA):
     """
@@ -410,6 +469,9 @@ class TritonLinearLoRA(LinearLoRA):
             res = fwd(x)
         else:
             res = F.linear(x, self.weight, self.bias)
+
+        if self._lora_token_gate is not None:
+            return res + self._gated_lora_forward(x)
 
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
@@ -521,12 +583,13 @@ def patch_linear_module(
 
 
 def patch_moe_module(
-    orig_module,
-    dim=8,
-    alpha=32,
-    lora_A_init_method="xavier",
-    lora_dtype=None,
-):
+    orig_module: nn.Module,
+    dim: int = 8,
+    alpha: int = 32,
+    lora_A_init_method: str = "xavier",
+    lora_dtype: torch.dtype | str | None = None,
+    expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized",
+) -> nn.Module:
     """
     Patches a custom MoE module (GroupedExperts or GroupedExpertsDeepEP) with LoRA.
 
@@ -536,30 +599,37 @@ def patch_moe_module(
         alpha (int, optional): LoRA scaling factor. Defaults to 32.
         lora_A_init_method (str, optional): Initialization method for LoRA A matrix. Defaults to "xavier".
         lora_dtype (torch.dtype or str, optional): Data type for LoRA weights. Defaults to None.
+        expert_weight_format (str, optional): Storage mode, not a torch dtype.
+            "unquantized" uses ordinary floating-point experts with the model's configured
+            precision, including FP32. "mxfp4"
+            stores frozen bases as fp4-e2m1 + e8m0 block scales. Meta experts receive
+            packed placeholders for direct checkpoint loading; already materialized
+            weights are quantized in place of the floating-point base. Defaults to "unquantized".
 
     Returns:
-        nn.Module: The LoRA-wrapped MoE module (GroupedExpertsLoRA or GroupedExpertsDeepEPLoRA).
+        nn.Module: The LoRA-wrapped MoE module.
     """
+    if expert_weight_format not in ("unquantized", "mxfp4"):
+        raise ValueError(
+            f"Unsupported expert_weight_format: {expert_weight_format!r}. Expected 'unquantized' or 'mxfp4' "
+            "as the storage mode; floating-point dtype is controlled by the model's precision configuration."
+        )
+    common = dict(lora_dim=dim, alpha=alpha, lora_A_init_method=lora_A_init_method, lora_dtype=lora_dtype)
+    mxfp4 = expert_weight_format == "mxfp4"
     if isinstance(orig_module, GroupedExpertsMoK):
         raise NotImplementedError("LoRA is not supported for Mixture-of-Kittens expert modules.")
     if isinstance(orig_module, GroupedExpertsTE):
         raise NotImplementedError("LoRA is not supported for Transformer Engine (TE) expert modules.")
     elif isinstance(orig_module, GroupedExpertsDeepEP):
-        new_module = GroupedExpertsDeepEPLoRA(
-            orig_module,
-            lora_dim=dim,
-            alpha=alpha,
-            lora_A_init_method=lora_A_init_method,
-            lora_dtype=lora_dtype,
-        )
+        if mxfp4:
+            new_module = GroupedExpertsDeepEPLoRAMXFP4(orig_module, **common)
+        else:
+            new_module = GroupedExpertsDeepEPLoRA(orig_module, **common)
     elif isinstance(orig_module, GroupedExperts):
-        new_module = GroupedExpertsLoRA(
-            orig_module,
-            lora_dim=dim,
-            alpha=alpha,
-            lora_A_init_method=lora_A_init_method,
-            lora_dtype=lora_dtype,
-        )
+        if mxfp4:
+            new_module = GroupedExpertsLoRAMXFP4(orig_module, **common)
+        else:
+            new_module = GroupedExpertsLoRA(orig_module, **common)
     else:
         raise NotImplementedError(f"Unsupported MoE module type: {type(orig_module)}")
 
@@ -646,13 +716,14 @@ def apply_lora_to_linear_modules(
                             moe_dim,
                         )
 
-                # Replace the module in the model
+                # MXFP4 meta experts receive packed checkpoint storage before sharding.
                 new_module = patch_moe_module(
                     module,
                     dim=moe_dim,
                     alpha=peft_config.alpha,
                     lora_A_init_method=peft_config.lora_A_init,
                     lora_dtype=lora_dtype,
+                    expert_weight_format=peft_config.expert_weight_format,
                 )
 
                 # Find parent and replace
@@ -697,6 +768,53 @@ def apply_lora_to_linear_modules(
             logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
 
     return num_modules_matched
+
+
+@contextmanager
+def lora_token_gate(model: nn.Module, gate: torch.Tensor) -> Iterator[None]:
+    """Apply every LoRA linear adapter in ``model`` only to the tokens selected by ``gate``.
+
+    Inside the context, each :class:`LinearLoRA` computes ``base(x) + lora_B(gate * scale * lora_A(x))``;
+    tokens with gate 0 see the frozen base projection and contribute no adapter gradient. The fused
+    memory-efficient LoRA paths are bypassed while a gate is installed. Run the backward pass inside
+    the context too, so activation-checkpoint recomputation sees the same gate.
+
+    Args:
+        model: Module whose LoRA-patched linear layers are gated.
+        gate: Tensor of shape [batch, sequence] matching the leading dimensions of every gated LoRA
+            input (a flattened ``[batch * sequence]`` input is also accepted). Bool or float; float
+            values scale the adapter update per token.
+
+    Yields:
+        None. The gate is removed from every module on exit, including on error. The context is not
+        re-entrant: nesting it leaves the outer gate removed after the inner one exits.
+
+    Raises:
+        ValueError: If ``model`` has no LoRA-patched linear layers.
+        NotImplementedError: If ``model`` contains LoRA-patched MoE expert modules, which do not
+            support per-token gating.
+    """
+    lora_experts = (
+        GroupedExpertsLoRA,
+        GroupedExpertsDeepEPLoRA,
+        GroupedExpertsLoRAMXFP4,
+        GroupedExpertsDeepEPLoRAMXFP4,
+    )
+    modules = []
+    for module in model.modules():
+        if isinstance(module, lora_experts):
+            raise NotImplementedError("lora_token_gate does not support LoRA on MoE expert modules.")
+        if isinstance(module, LinearLoRA):
+            modules.append(module)
+    if not modules:
+        raise ValueError("lora_token_gate found no LoRA-patched linear layers in the model.")
+    for module in modules:
+        module._lora_token_gate = gate
+    try:
+        yield
+    finally:
+        for module in modules:
+            module._lora_token_gate = None
 
 
 class LoRATritonFunction(torch.autograd.Function):

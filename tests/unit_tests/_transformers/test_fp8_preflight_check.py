@@ -22,6 +22,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from transformers import PretrainedConfig
 
 from nemo_automodel._transformers import model_init
 from nemo_automodel._transformers.model_init import (
@@ -394,6 +395,7 @@ class TestCheckFp8DequantizeWillFit:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestForceHfBranchWiring:
     def test_force_hf_invokes_preflight_before_loader(self, monkeypatch):
         """Drive _init_model with force_hf=True and a sentinel-raising preflight.
@@ -413,7 +415,7 @@ class TestForceHfBranchWiring:
         monkeypatch.setattr(
             model_init,
             "get_hf_config",
-            lambda path, attn, **_: SimpleNamespace(architectures=["Dummy"], quantization_config=None),
+            lambda path, attn, **_: PretrainedConfig(architectures=["Dummy"], quantization_config=None),
         )
         monkeypatch.setattr(model_init, "_propagate_torch_dtype_to_subconfigs", lambda *a, **k: None)
         monkeypatch.setattr(model_init, "_streaming_bnb_supported", lambda *a, **k: False)
@@ -452,7 +454,7 @@ class TestForceHfBranchWiring:
         monkeypatch.setattr(
             model_init,
             "get_hf_config",
-            lambda path, attn, **_: SimpleNamespace(
+            lambda path, attn, **_: PretrainedConfig(
                 architectures=["Dummy"], quantization_config={"quant_method": "fp8", "dequantize": True}
             ),
         )

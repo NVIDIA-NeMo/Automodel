@@ -14,7 +14,7 @@
 
 
 # To run this recipe:
-#   automodel examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml --nproc-per-node 8
+#   automodel examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml --nproc-per-node 1
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 #
 # Devstral-Small-2-24B-Instruct-2512 is a per-tensor FP8 checkpoint
@@ -120,3 +120,12 @@ wandb:
 ci:
   recipe_owner: akoumpa
   time: "00:30:00"
+  nproc_per_node: 1
+  cluster_tag: gb10
+  # Exercise FP8 checkpoint loading and LoRA training on unified memory.
+  release:
+    step_scheduler.max_steps: 5
+    step_scheduler.global_batch_size: 1
+    step_scheduler.ckpt_every_steps: 5
+    step_scheduler.val_every_steps: 5
+    validation_dataset.limit_dataset_samples: 4

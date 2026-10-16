@@ -360,12 +360,39 @@ class TestNeatPackedVlmCollater:
         assert result["position_ids"].shape == (2, 4)
         assert result["attention_mask"].shape == (2, 1, 4, 4)
         assert result["attention_mask"].dtype == torch.bool
+        assert "packed_token_indices" not in result
 
         # pixel_values concatenated: 1 + 2 = 3
         assert result["pixel_values"].shape[0] == 3
 
         # n_images_per_sample
         assert result["n_images_per_sample"].tolist() == [1, 2]
+
+    def test_flash_emits_varlen_kwargs_and_no_mask(self):
+        batch = [
+            {
+                "input_ids": torch.tensor([1, 2, 3, 0]),
+                "labels": torch.tensor([10, 20, 30, -100]),
+                "attention_mask": torch.tensor([1, 1, 2, 0]),
+                "position_ids": torch.tensor([0, 1, 0, 0]),
+            },
+            {
+                "input_ids": torch.tensor([4, 5, 6, 7]),
+                "labels": torch.tensor([40, 50, 60, 70]),
+                "attention_mask": torch.tensor([1, 1, 1, 1]),
+                "position_ids": torch.tensor([0, 1, 2, 3]),
+            },
+        ]
+        result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
+
+        # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
+        assert "attention_mask" not in result
+        # row0: doc1(2), doc2(1), pad(1); row1: doc1(4) over the flattened 8 tokens.
+        assert result["cu_seq_lens_q"].tolist() == [0, 2, 3, 4, 8]
+        assert torch.equal(result["cu_seq_lens_q"], result["cu_seq_lens_k"])
+        assert result["max_length_q"] == result["max_length_k"] == 4
+        # Per-document ids preserved for loss / context-parallel consumers.
+        assert result["_packed_seq_ids"].tolist() == [[1, 1, 2, 0], [1, 1, 1, 1]]
 
 
 class TestMRoPESupport:
@@ -584,3 +611,32 @@ def test_compute_mrope_position_ids_passes_sample_mm_token_type_ids_through():
 
     assert pos.shape == (3, 4)
     assert captured["mm"].tolist() == [[0, 1, 1, 0]]
+
+
+class TestVariableResolutionImagePacking:
+    def test_mismatched_image_shapes_are_kept_as_per_image_list(self):
+        samples = [
+            {
+                "input_ids": torch.tensor([1, 2]),
+                "labels": torch.tensor([10, 20]),
+                "pixel_values": torch.randn(2, 3, 8, 8),  # two 8x8 images
+            },
+            {
+                "input_ids": torch.tensor([3]),
+                "labels": torch.tensor([30]),
+                "pixel_values": torch.randn(1, 3, 12, 4),  # one 12x4 image
+            },
+        ]
+        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+
+        assert isinstance(result["pixel_values"], list)
+        assert [tuple(v.shape) for v in result["pixel_values"]] == [(3, 8, 8), (3, 8, 8), (3, 12, 4)]
+
+    def test_matching_image_shapes_still_concatenate(self):
+        samples = [
+            {"input_ids": torch.tensor([1]), "labels": torch.tensor([10]), "pixel_values": torch.randn(2, 3, 8, 8)},
+            {"input_ids": torch.tensor([2]), "labels": torch.tensor([20]), "pixel_values": torch.randn(1, 3, 8, 8)},
+        ]
+        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+        assert isinstance(result["pixel_values"], torch.Tensor)
+        assert tuple(result["pixel_values"].shape) == (3, 3, 8, 8)

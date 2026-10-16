@@ -393,6 +393,7 @@ def _run_args(**over):
         max_new_tokens=8,
         temperature=0.0,
         top_p=1.0,
+        top_k=0,
         num_steps=None,
         timeout_s=1.0,
         max_retries=0,

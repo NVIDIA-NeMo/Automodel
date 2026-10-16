@@ -188,6 +188,7 @@ def _run(args: argparse.Namespace) -> int:
         distributed=False,
         shuffle_seed=args.shuffle_seed,
         mask_reasoning_content=args.mask_reasoning_content,
+        mask_generation_prompt=args.mask_generation_prompt,
     )
     num_samples = len(dataloader.dataset)
 
@@ -208,6 +209,7 @@ def _run(args: argparse.Namespace) -> int:
         shuffle_seed=int(args.shuffle_seed),
         mask_reasoning_content=bool(args.mask_reasoning_content),
         chat_template_sha256=tokenizer_chat_template_sha256(tokenizer),
+        mask_generation_prompt=bool(args.mask_generation_prompt),
     )
     if args.resume:
         _ensure_resume_compatible(args.output_dir, manifest, existing)
@@ -278,6 +280,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--chat-template", default=None, help="Inline Jinja template or path to template/tokenizer config."
     )
     parser.add_argument("--mask-reasoning-content", action="store_true")
+    parser.add_argument(
+        "--mask-generation-prompt",
+        action="store_true",
+        help="Exclude the template-supplied prefix of each assistant turn (role header and any empty reasoning block) from the loss.",
+    )
     parser.add_argument("--target-attn-implementation", default=None)
     parser.add_argument("--target-force-hf", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")

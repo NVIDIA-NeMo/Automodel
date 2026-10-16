@@ -456,7 +456,13 @@ def _build_packed_vlm_sample(
         packed["position_ids"] = torch.tensor(all_position_ids_1d, dtype=torch.long)
 
     if pixel_values_list and all(isinstance(value, torch.Tensor) for value in pixel_values_list):
-        packed["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+        if all(value.shape[1:] == pixel_values_list[0].shape[1:] for value in pixel_values_list):
+            packed["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+        else:
+            # Variable-resolution images (e.g. dynamic-resolution processors): keep
+            # one tensor per image; the THD collater and the model's feature
+            # extractor accept the list form.
+            packed["pixel_values"] = [image for value in pixel_values_list for image in value]
     elif pixel_values_list and all(isinstance(value, (list, tuple)) for value in pixel_values_list):
         packed["pixel_values"] = [item for value in pixel_values_list for item in value]
     elif pixel_values_list:
@@ -654,7 +660,7 @@ class NeatPackConfig:
     collate_max_length: int | None = None
     """Optional maximum padded length used by the packed collator."""
     attn_implementation: str | None = None
-    """Optional packed-mask backend override used only with context parallelism."""
+    """Deprecated packed-mask backend override retained for Python compatibility."""
     packing_format: Literal["neat", "thd"] = "neat"
     """Packed collator format. ``thd`` emits Transformer Engine sequence metadata."""
 

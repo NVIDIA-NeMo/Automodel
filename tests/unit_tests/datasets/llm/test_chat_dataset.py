@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import json
 
 import pytest
@@ -343,13 +344,14 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
         tok,
         seq_length=16,
         start_of_turn_token="<|sot|>",
-        chat_template="OVERRIDE",
+        chat_template="{{ override }}",
         mask_reasoning_content=True,
+        mask_generation_prompt=True,
     )
 
     # init effects
     assert ds.pad_token_id == 3  # from _add_pad_token
-    assert tok.chat_template == "OVERRIDE"
+    assert tok.chat_template == "{{ override }}"
     assert len(ds) == 3
 
     item0 = ds[0]
@@ -366,6 +368,7 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
     assert calls[1]["kwargs"]["tools"] == tools_list
     assert calls[2]["kwargs"]["tools"] is None
     assert calls[0]["kwargs"]["mask_reasoning_content"] is True
+    assert calls[0]["kwargs"]["mask_generation_prompt"] is True
 
     # Bad row: messages not a list → ValueError
     monkeypatch.setattr(tcd, "_load_openai_messages", lambda *a, **k: [{"messages": "oops"}])
@@ -463,12 +466,20 @@ def test_resolve_chat_template_json_file(tmp_path):
     assert _resolve_chat_template(str(f)) == template
 
 
-def test_resolve_chat_template_json_file_without_key(tmp_path):
-    data = {"model_type": "llama", "vocab_size": 32000}
-    f = tmp_path / "config.json"
-    raw = json.dumps(data)
-    f.write_text(raw, encoding="utf-8")
-    assert _resolve_chat_template(str(f)) == raw
+@pytest.mark.parametrize(
+    "content",
+    [
+        json.dumps({"model_type": "llama", "vocab_size": 32000}),
+        json.dumps({"chat_template": [{"name": "default", "template": "{{ messages }}"}]}),
+        "",
+    ],
+    ids=["json-without-key", "json-named-templates", "empty-file"],
+)
+def test_resolve_chat_template_file_without_a_template_raises(tmp_path, content):
+    f = tmp_path / "template.json"
+    f.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match="holds no Jinja template"):
+        _resolve_chat_template(str(f))
 
 
 def test_resolve_chat_template_literal_string():
@@ -476,8 +487,9 @@ def test_resolve_chat_template_literal_string():
     assert _resolve_chat_template(template) == template
 
 
-def test_resolve_chat_template_nonexistent_path():
-    assert _resolve_chat_template("/no/such/file/template.jinja") == "/no/such/file/template.jinja"
+def test_resolve_chat_template_nonexistent_path_raises():
+    with pytest.raises(ValueError, match="neither an existing file nor a Jinja template"):
+        _resolve_chat_template("/no/such/file/template.jinja")
 
 
 def test_tool_calling_chat_dataset_errors(monkeypatch):
@@ -616,6 +628,7 @@ def test_getitem_auto_converts_conversations(monkeypatch):
     ds.mask_reasoning_content = False
     ds.mask_history = False
     ds.unshifted = False
+    ds.mask_generation_prompt = False
 
     out = ds[0]
     assert out == {"input_ids": [1], "labels": [1]}
@@ -631,3 +644,41 @@ def test_getitem_still_rejects_rows_without_messages_or_conversations(monkeypatc
     ds.pad_token_id = 0
     with pytest.raises(ValueError, match="`messages`.*or a `conversations`"):
         _ = ds[0]
+
+
+def test_chat_dataset_config_forwards_mask_generation_prompt(monkeypatch):
+    captured = {}
+
+    class _FakeChatDataset:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(tcd, "ChatDataset", _FakeChatDataset)
+    tcd.ChatDatasetConfig(path_or_dataset_id="ignored", mask_generation_prompt=True).build(tokenizer=object())
+    assert captured["mask_generation_prompt"] is True
+    assert tcd.ChatDatasetConfig(path_or_dataset_id="ignored").mask_generation_prompt is False
+
+
+def test_chat_dataset_config_positional_layout_is_unchanged():
+    # The dataclass is not keyword-only, so the new field must come after every pre-existing
+    # one: a positional construction written against the old layout keeps its meaning.
+    cfg = tcd.ChatDatasetConfig(
+        "ignored",  # path_or_dataset_id
+        "train",  # split
+        None,  # name
+        64,  # seq_length
+        "do_not_pad",  # padding
+        "do_not_truncate",  # truncation
+        None,  # start_of_turn_token
+        None,  # chat_template
+        None,  # shuffle_seed
+        False,  # mask_reasoning_content
+        True,  # mask_history
+        True,  # unshifted
+        True,  # skip_invalid_samples
+    )
+    assert cfg.mask_history is True
+    assert cfg.unshifted is True
+    assert cfg.skip_invalid_samples is True
+    assert cfg.mask_generation_prompt is False
+    assert [f.name for f in dataclasses.fields(tcd.ChatDatasetConfig)][-1] == "mask_generation_prompt"
