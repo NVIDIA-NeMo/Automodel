@@ -79,7 +79,7 @@ dependencies = [
     "ninja",
     "pyyaml",
     "tiktoken",
-    "torch>=2.6.0",
+    "torch>=2.8.0",
     "torchdata",
     # Before upgrading, recheck HF #49373 and nemo_automodel/components/models/pixtral/compat.py.
     # Run tests/ci_tests/scripts/test_pixtral_compat.sh cpu <version> and gpu <version>:
