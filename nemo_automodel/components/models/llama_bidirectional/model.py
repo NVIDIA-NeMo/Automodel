@@ -34,8 +34,6 @@ from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaModel, LlamaPreTrainedModel
 
-from nemo_automodel.components.models.common.utils import sum_rows
-
 
 class LlamaBidirectionalConfig(LlamaConfig):
     """
@@ -102,20 +100,11 @@ class LlamaBidirectionalModel(LlamaModel):
 
 
 def _pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
-    """Pool token hidden states.
-
-    Args:
-        last_hidden_states: Tensor of shape [batch, sequence, hidden].
-        attention_mask: Tensor of shape [batch, sequence], nonzero for valid tokens.
-        pool_type: Pooling mode.
-
-    Returns:
-        Tensor of shape [batch, hidden] containing one pooled representation per sequence.
-    """
+    """Pool hidden states using the specified pooling method."""
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
 
     if pool_type == "avg":
-        emb = sum_rows(last_hidden) / attention_mask.sum(dim=1)[..., None]
+        emb = last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
     elif pool_type == "cls":
         emb = last_hidden[:, 0]
     elif pool_type == "last":

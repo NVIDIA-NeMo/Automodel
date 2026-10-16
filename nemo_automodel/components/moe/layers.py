@@ -22,7 +22,6 @@ from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
-from nemo_automodel.components.models.common.utils import sum_rows
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
@@ -741,7 +740,7 @@ class Gate(nn.Module):
         expert_load = expert_load.float()
 
         context_length = token_mask.sum()
-        expert_scores = sum_rows(original_scores * token_mask.unsqueeze(-1))
+        expert_scores = (original_scores * token_mask.unsqueeze(-1)).sum(dim=0)
 
         if cp_mesh is not None:
             context_length = DTensor.from_local(
