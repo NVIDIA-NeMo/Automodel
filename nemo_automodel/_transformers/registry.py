@@ -264,6 +264,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.muse_glimmer.model", "MuseGlimmerForConditionalGeneration"),
         ),
         (
+            "MuseSparkForConditionalGeneration",
+            ("nemo_automodel.components.models.muse_spark.model", "MuseSpark1xOmniForCausalLM"),
+        ),
+        (
+            "MuseSpark1xOmniForCausalLM",
+            ("nemo_automodel.components.models.muse_spark.model", "MuseSpark1xOmniForCausalLM"),
+        ),
+        (
             "LLaVAOneVision1_5_ForConditionalGeneration",
             (
                 "nemo_automodel.components.models.llava_onevision.model",
@@ -428,6 +436,14 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     ),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
     "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),
+    "muse_spark": (
+        "nemo_automodel.components.models.muse_spark.configuration_muse_spark",
+        "MuseSparkConfig",
+    ),
+    "musespark1x_omni": (
+        "nemo_automodel.components.models.muse_spark.config",
+        "MuseSpark1xOmniConfig",
+    ),
     "qwen3_8_flash_next": ("nemo_automodel.components.models.qwen3_8_flash_next.config", "Qwen3_8_FlashNextConfig"),
     "qwen3_8_flash_next_text": (
         "nemo_automodel.components.models.qwen3_8_flash_next.config",
