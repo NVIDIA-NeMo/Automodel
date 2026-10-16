@@ -1211,7 +1211,13 @@ def relu2_deepep(x, permuted_probs):
 
 
 @torch.compile(fullgraph=True, options={"max_autotune": True})
-def _swiglu_clamped_deepep_compiled(x, permuted_probs, limit: float):
+def _swiglu_clamped_deepep_compiled(
+    x: torch.Tensor,
+    permuted_probs: torch.Tensor,
+    limit: float,
+    *,
+    clamp_after_activation: bool = False,
+) -> torch.Tensor:
     """Clamped SwiGLU (DeepSeek V4 style) for DeepEP.
 
     Gate is clamped at ``max=limit`` and up at ``(-limit, +limit)`` in FP32
@@ -1225,21 +1231,27 @@ def _swiglu_clamped_deepep_compiled(x, permuted_probs, limit: float):
             gate = torch.clamp(gate,                     max=swiglu_limit)
         y = F.silu(gate) * up
 
+    When ``clamp_after_activation=True``, clamp ``silu(gate)`` instead, as
+    required by Step-5. The default preserves DeepSeek V4 arithmetic.
+
     ``x`` has shape ``[..., 2 * inter_dim]`` with gate in the first half
     and up in the second half (same layout as ``weighted_bias_swiglu_impl``).
     """
     gate, up = torch.chunk(x, 2, dim=-1)
-    gate = gate.float().clamp(max=limit)
+    gate = gate.float()
     up = up.float().clamp(min=-limit, max=limit)
-    inter = F.silu(gate) * up
-    return (inter * permuted_probs).to(x.dtype)
+    activated = F.silu(gate).clamp(max=limit) if clamp_after_activation else F.silu(gate.clamp(max=limit))
+    return (activated * up * permuted_probs).to(x.dtype)
 
 
-def swiglu_clamped_deepep(x, permuted_probs, limit: float):
+def swiglu_clamped_deepep(x, permuted_probs, limit: float, *, clamp_after_activation: bool = False):
     """Clamped SwiGLU (DeepSeek V4 style) for DeepEP: Triton kernels on CUDA, the compiled function elsewhere.
 
     See :mod:`nemo_automodel.components.moe.swiglu_triton` for the kernels and the layout guard.
+    The Triton kernels implement DeepSeek V4 order only; Step-5's clamp after SiLU uses the compiled path.
     """
+    if clamp_after_activation:
+        return _swiglu_clamped_deepep_compiled(x, permuted_probs, limit, clamp_after_activation=True)
     if swiglu_triton.uses_triton_kernel(x, permuted_probs):
         return swiglu_triton.swiglu_clamped_triton(x, permuted_probs, limit)
     return _swiglu_clamped_deepep_compiled(x, permuted_probs, limit)
@@ -1250,8 +1262,12 @@ def get_expert_activation_for_deepep(config: MoEConfig):
 
     if config.expert_activation == "swiglu":
         # DeepSeek V4 uses a clamped FP32 variant when swiglu_limit > 0.
-        if getattr(config, "swiglu_limit", 0.0) > 0.0:
-            return partial(swiglu_clamped_deepep, limit=config.swiglu_limit)
+        if config.swiglu_limit > 0.0:
+            return partial(
+                swiglu_clamped_deepep,
+                limit=config.swiglu_limit,
+                clamp_after_activation=config.swiglu_clamp_after_activation,
+            )
         return weighted_bias_swiglu_impl
     elif config.expert_activation == "swigluoai":
         return partial(
