@@ -316,6 +316,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_moe.model", "Qwen3MoeForCausalLM"),
         ),
         (
+            "BeamForCausalLM",
+            ("nemo_automodel.components.models.beam.model", "BeamForCausalLM"),
+        ),
+        (
             "Qwen3NextForCausalLM",
             ("nemo_automodel.components.models.qwen3_next.model", "Qwen3NextForCausalLM"),
         ),
