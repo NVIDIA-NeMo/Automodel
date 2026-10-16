@@ -16,9 +16,11 @@ import getpass
 import logging
 import os
 import socket
-from contextlib import nullcontext
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -57,6 +59,9 @@ from nemo_automodel.components.training.garbage_collection import GarbageCollect
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.recipes._typed_config import RecipeConfig
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -223,12 +228,51 @@ class BaseRecipe:
         for key in keys:
             tracked.discard(key)
 
-    def _autocast_context(self):
-        """Return the recipe-level autocast context configured by the strategy."""
-        autocast_dtype = getattr(getattr(self, "distributed_config", None), "autocast_dtype", None)
-        if autocast_dtype is None:
-            return nullcontext()
-        return torch.autocast(device_type=self.dist_env.device.type, dtype=autocast_dtype)
+    @contextmanager
+    def _autocast_context(self) -> Generator[None, None, None]:
+        """Apply configured forward precision without changing parameter storage.
+
+        PEFT defaults to the FSDP compute dtype, including when one-rank execution
+        skips FSDP. Other strategies require an explicit ``autocast_dtype``.
+        Full-parameter recipes retain their explicit opt-in behavior.
+        """
+        strategy = getattr(self, "distributed_config", None)
+        autocast_dtype = getattr(strategy, "autocast_dtype", None)
+        if autocast_dtype is None and getattr(getattr(self, "cfg", None), "peft", None):
+            autocast_dtype = getattr(getattr(strategy, "mp_policy", None), "param_dtype", None)
+        ctx = (
+            torch.autocast(device_type=self.dist_env.device.type, dtype=autocast_dtype)
+            if autocast_dtype in (torch.bfloat16, torch.float16)
+            else nullcontext()
+        )
+        with ctx:
+            yield
+
+    @contextmanager
+    def _pipeline_autocast_context(self, pipeline: "AutoPipeline | None") -> Generator[None, None, None]:
+        """Scope autocast to pipeline forwards and loss, excluding interleaved backward.
+
+        Restore the original callables even when a schedule step raises. Decorating
+        the model parts also covers schedule-driven forward shape inference.
+        """
+        assert pipeline is not None
+        schedule = pipeline.info.schedule
+        assert schedule is not None
+        with ExitStack() as stack:
+            modules = list(pipeline.parts)
+            if isinstance(schedule._loss_fn, nn.Module):
+                # Keep the loss object visible so recipes can update packed/MTP metadata.
+                modules.append(schedule._loss_fn)
+            elif schedule._loss_fn is not None:
+                stack.callback(setattr, schedule, "_loss_fn", schedule._loss_fn)
+                schedule._loss_fn = self._autocast_context()(schedule._loss_fn)
+            for module in modules:
+                if "forward" in module.__dict__:
+                    stack.callback(setattr, module, "forward", module.forward)
+                else:
+                    stack.callback(delattr, module, "forward")
+                module.forward = self._autocast_context()(module.forward)
+            yield
 
     def save_checkpoint(
         self,

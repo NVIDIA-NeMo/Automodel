@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
@@ -50,6 +51,73 @@ def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) ->
     return F.pad(lora_A, (0, padding)), F.pad(lora_B, (0, 0, 0, padding))
 
 
+def _init_expert_adapter(
+    obj,
+    *,
+    n_experts: int,
+    lora_dim: int,
+    alpha: int,
+    lora_A_init_method: str,
+    lora_dtype: torch.dtype | str | None,
+    init_lora_weights: Callable[[nn.Module, str], None],
+) -> None:
+    """Allocate adapters using the caller's expert count and initializer owner."""
+    obj.lora_dim = lora_dim
+    obj.scale = alpha / lora_dim
+
+    # Freeze base weights
+    obj.gate_and_up_projs.requires_grad = False
+    obj.down_projs.requires_grad = False
+    if obj.expert_bias:
+        obj.gate_up_proj_bias.requires_grad = False
+        obj.down_proj_bias.requires_grad = False
+
+    # Determine dtype
+    if isinstance(lora_dtype, str):
+        lora_dtype = dtype_from_str(lora_dtype)
+    dtype = lora_dtype or obj.gate_and_up_projs.dtype
+    device = obj.gate_and_up_projs.device
+
+    up_proj_dim = obj.config.moe_inter_dim * 2 if obj.is_gated else obj.config.moe_inter_dim
+    expert_dim = obj.config.expert_dim
+
+    # LoRA weights for gate+up (or just up if non-gated) and down projections
+    obj.lora_gate_and_up_A = nn.Parameter(torch.empty(n_experts, expert_dim, lora_dim, dtype=dtype, device=device))
+    obj.lora_gate_and_up_B = nn.Parameter(torch.empty(n_experts, lora_dim, up_proj_dim, dtype=dtype, device=device))
+
+    obj.lora_down_A = nn.Parameter(
+        torch.empty(n_experts, obj.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
+    )
+    obj.lora_down_B = nn.Parameter(torch.empty(n_experts, lora_dim, expert_dim, dtype=dtype, device=device))
+
+    # Initialize LoRA weights
+    init_lora_weights(obj, lora_A_init_method)
+    # Storage is chosen at construction; compute casts must not change it.
+    obj._preserve_parameter_dtypes = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
+
+
+@torch.no_grad
+def _init_expert_lora_weights(self, init_method: str) -> None:
+    """Initialize LoRA weights.
+
+    Exposed as ``init_lora_weights`` on both expert wrappers: the PEFT framework's
+    ``_init_peft_adapters`` calls that hook after materializing from meta to the
+    target device. Keep the hook name and the gate/up-before-down RNG order.
+
+    Args:
+        init_method (str): Initialization method ('xavier' or 'kaiming').
+    """
+    if init_method == "xavier":
+        nn.init.xavier_normal_(self.lora_gate_and_up_A)
+        nn.init.xavier_normal_(self.lora_down_A)
+    else:
+        nn.init.kaiming_uniform_(self.lora_gate_and_up_A, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.lora_down_A, a=math.sqrt(5))
+
+    nn.init.zeros_(self.lora_gate_and_up_B)
+    nn.init.zeros_(self.lora_down_B)
+
+
 class GroupedExpertsLoRA(GroupedExperts):
     """
     GroupedExperts + LoRA.
@@ -65,15 +133,25 @@ class GroupedExpertsLoRA(GroupedExperts):
         lora_down_B (nn.Parameter): LoRA B matrix for down projection.
     """
 
-    def __init__(self, orig_module: GroupedExperts, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
-        super().__init__(orig_module.config)
+    def __init__(
+        self,
+        orig_module: GroupedExperts,
+        lora_dim: int = 8,
+        alpha: int = 32,
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = torch.float32,
+    ) -> None:
+        # Transfer the existing base parameters before sharding/optimizer creation.
+        # A meta shell avoids allocating a second full set of expert weights.
+        with torch.device("meta"):
+            super().__init__(orig_module.config)
 
-        self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
-        self.down_projs.data.copy_(orig_module.down_projs.data)
+        self.gate_and_up_projs = orig_module.gate_and_up_projs
+        self.down_projs = orig_module.down_projs
 
         if self.expert_bias:
-            self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
-            self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
+            self.gate_up_proj_bias = orig_module.gate_up_proj_bias
+            self.down_proj_bias = orig_module.down_proj_bias
 
         # Copy backend setting from original (super().__init__ defaults to False without backend)
         self.use_torch_mm = orig_module.use_torch_mm
@@ -87,65 +165,20 @@ class GroupedExpertsLoRA(GroupedExperts):
         )
 
     @staticmethod
-    def _init_adapter(obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
-        obj.lora_dim = lora_dim
-        obj.scale = alpha / lora_dim
-
-        # Freeze base weights
-        obj.gate_and_up_projs.requires_grad = False
-        obj.down_projs.requires_grad = False
-        if obj.expert_bias:
-            obj.gate_up_proj_bias.requires_grad = False
-            obj.down_proj_bias.requires_grad = False
-
-        # Determine dtype
-        if isinstance(lora_dtype, str):
-            lora_dtype = dtype_from_str(lora_dtype)
-        dtype = lora_dtype or obj.gate_and_up_projs.dtype
-        device = obj.gate_and_up_projs.device
-
-        up_proj_dim = obj.config.moe_inter_dim * 2 if obj.is_gated else obj.config.moe_inter_dim
-        expert_dim = obj.config.expert_dim
-
-        # LoRA weights for gate+up (or just up if non-gated) and down projections
-        obj.lora_gate_and_up_A = nn.Parameter(
-            torch.empty(obj.n_routed_experts, expert_dim, lora_dim, dtype=dtype, device=device)
-        )
-        obj.lora_gate_and_up_B = nn.Parameter(
-            torch.empty(obj.n_routed_experts, lora_dim, up_proj_dim, dtype=dtype, device=device)
+    def _init_adapter(
+        obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype: torch.dtype | str | None = torch.float32
+    ):
+        _init_expert_adapter(
+            obj,
+            n_experts=obj.n_routed_experts,
+            lora_dim=lora_dim,
+            alpha=alpha,
+            lora_A_init_method=lora_A_init_method,
+            lora_dtype=lora_dtype,
+            init_lora_weights=GroupedExpertsLoRA.init_lora_weights,
         )
 
-        obj.lora_down_A = nn.Parameter(
-            torch.empty(obj.n_routed_experts, obj.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
-        )
-        obj.lora_down_B = nn.Parameter(
-            torch.empty(obj.n_routed_experts, lora_dim, expert_dim, dtype=dtype, device=device)
-        )
-
-        # Initialize LoRA weights
-        GroupedExpertsLoRA.init_lora_weights(obj, lora_A_init_method)
-
-    @torch.no_grad
-    def init_lora_weights(self, init_method):
-        """Initialize LoRA weights.
-
-        IMPORTANT: This method is called by the PEFT framework's `_init_peft_adapters`
-        after the model is materialized from meta device to the target device. The method
-        name is critical - it serves as a hook for the framework.
-        Do not rename or remove this method.
-
-        Args:
-            init_method (str): Initialization method ('xavier' or 'kaiming').
-        """
-        if init_method == "xavier":
-            nn.init.xavier_normal_(self.lora_gate_and_up_A)
-            nn.init.xavier_normal_(self.lora_down_A)
-        else:
-            nn.init.kaiming_uniform_(self.lora_gate_and_up_A, a=math.sqrt(5))
-            nn.init.kaiming_uniform_(self.lora_down_A, a=math.sqrt(5))
-
-        nn.init.zeros_(self.lora_gate_and_up_B)
-        nn.init.zeros_(self.lora_down_B)
+    init_lora_weights = _init_expert_lora_weights
 
     def materialize_effective_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the grouped expert weights with the LoRA updates folded in.
@@ -399,15 +432,21 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     """
 
     def __init__(
-        self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
-    ):
-        super().__init__(
-            orig_module.config,
-            dispatcher_backend=orig_module.dispatcher_backend,
-            dispatcher_num_sms=orig_module.dispatcher_num_sms,
-            dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
-            dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
-        )
+        self,
+        orig_module: GroupedExpertsDeepEP,
+        lora_dim: int = 8,
+        alpha: int = 32,
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = torch.float32,
+    ) -> None:
+        with torch.device("meta"):
+            super().__init__(
+                orig_module.config,
+                dispatcher_backend=orig_module.dispatcher_backend,
+                dispatcher_num_sms=orig_module.dispatcher_num_sms,
+                dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
+                dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
+            )
         self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
         self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
@@ -419,12 +458,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
         self.dispatch_rows_never_empty = orig_module.dispatch_rows_never_empty
 
-        self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
-        self.down_projs.data.copy_(orig_module.down_projs.data)
+        self.gate_and_up_projs = orig_module.gate_and_up_projs
+        self.down_projs = orig_module.down_projs
 
         if self.expert_bias:
-            self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
-            self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
+            self.gate_up_proj_bias = orig_module.gate_up_proj_bias
+            self.down_proj_bias = orig_module.down_proj_bias
 
         # Copy DeepEP state from orig_module (set by init_token_dispatcher, not __init__)
         self.n_routed_experts = getattr(orig_module, "n_routed_experts", self.config.n_routed_experts)
@@ -442,62 +481,20 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         )
 
     @staticmethod
-    def _init_adapter(obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
-        obj.lora_dim = lora_dim
-        obj.scale = alpha / lora_dim
-
-        obj.gate_and_up_projs.requires_grad = False
-        obj.down_projs.requires_grad = False
-        if obj.expert_bias:
-            obj.gate_up_proj_bias.requires_grad = False
-            obj.down_proj_bias.requires_grad = False
-
-        if isinstance(lora_dtype, str):
-            lora_dtype = dtype_from_str(lora_dtype)
-        dtype = lora_dtype or obj.gate_and_up_projs.dtype
-        device = obj.gate_and_up_projs.device
-
-        up_proj_dim = obj.config.moe_inter_dim * 2 if obj.is_gated else obj.config.moe_inter_dim
-        expert_dim = obj.config.expert_dim
-
-        # LoRA weights
-        obj.lora_gate_and_up_A = nn.Parameter(
-            torch.empty(obj.config.n_routed_experts, expert_dim, lora_dim, dtype=dtype, device=device)
-        )
-        obj.lora_gate_and_up_B = nn.Parameter(
-            torch.empty(obj.config.n_routed_experts, lora_dim, up_proj_dim, dtype=dtype, device=device)
+    def _init_adapter(
+        obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype: torch.dtype | str | None = torch.float32
+    ):
+        _init_expert_adapter(
+            obj,
+            n_experts=obj.config.n_routed_experts,
+            lora_dim=lora_dim,
+            alpha=alpha,
+            lora_A_init_method=lora_A_init_method,
+            lora_dtype=lora_dtype,
+            init_lora_weights=GroupedExpertsDeepEPLoRA.init_lora_weights,
         )
 
-        obj.lora_down_A = nn.Parameter(
-            torch.empty(obj.config.n_routed_experts, obj.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
-        )
-        obj.lora_down_B = nn.Parameter(
-            torch.empty(obj.config.n_routed_experts, lora_dim, expert_dim, dtype=dtype, device=device)
-        )
-
-        GroupedExpertsDeepEPLoRA.init_lora_weights(obj, lora_A_init_method)
-
-    @torch.no_grad
-    def init_lora_weights(self, init_method):
-        """Initialize LoRA weights.
-
-        IMPORTANT: This method is called by the PEFT framework's `_init_peft_adapters`
-        after the model is materialized from meta device to the target device. The method
-        name is critical - it serves as a hook for the framework.
-        Do not rename or remove this method.
-
-        Args:
-            init_method (str): Initialization method ('xavier' or 'kaiming').
-        """
-        if init_method == "xavier":
-            nn.init.xavier_normal_(self.lora_gate_and_up_A)
-            nn.init.xavier_normal_(self.lora_down_A)
-        else:
-            nn.init.kaiming_uniform_(self.lora_gate_and_up_A, a=math.sqrt(5))
-            nn.init.kaiming_uniform_(self.lora_down_A, a=math.sqrt(5))
-
-        nn.init.zeros_(self.lora_gate_and_up_B)
-        nn.init.zeros_(self.lora_down_B)
+    init_lora_weights = _init_expert_lora_weights
 
     def forward(
         self,

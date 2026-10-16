@@ -521,7 +521,8 @@ class TestTELinearLoRA:
         te_linear = TELinear(in_features=16, out_features=32, bias=False, params_dtype=torch.bfloat16).cuda()
         patched = patch_linear_module(te_linear, dim=4, alpha=8, use_triton=False)
         x = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)
-        out = patched(x)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = patched(x)
         assert out.shape == (2, 32), f"Expected shape (2, 32), got {out.shape}"
         assert torch.isfinite(out).all(), "Output contains non-finite values"
 
@@ -531,9 +532,16 @@ class TestTELinearLoRA:
 
         te_linear = TELinear(in_features=16, out_features=32, bias=False, params_dtype=torch.bfloat16).cuda()
         patched = patch_linear_module(te_linear, dim=4, alpha=8, use_triton=False)
+        nn.init.normal_(patched.lora_B.weight, std=0.02)
         x = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        out = patched(x)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = patched(x)
         out.sum().backward()
+        assert out.dtype == patched.weight.dtype == torch.bfloat16
+        assert x.grad.dtype == torch.bfloat16
+        for adapter in (patched.lora_A, patched.lora_B):
+            assert adapter.weight.dtype == adapter.weight.grad.dtype == torch.float32
+            assert adapter.weight.grad.abs().sum() > 0
         assert patched.lora_A.weight.grad is not None, "lora_A should have gradients"
         assert patched.lora_B.weight.grad is not None, "lora_B should have gradients"
         assert torch.isfinite(patched.lora_A.weight.grad).all(), "lora_A gradients should be finite"

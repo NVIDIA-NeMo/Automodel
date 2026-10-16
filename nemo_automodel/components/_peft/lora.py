@@ -41,6 +41,7 @@ from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
+from nemo_automodel.shared.tp_linear import LoRAProjection as _LoRAProjection
 from nemo_automodel.shared.tp_linear import tp_linear_forward
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -62,7 +63,8 @@ class PeftConfig:
     dropout: float = 0.0
     dropout_position: Literal["pre", "post"] = "post"
     lora_A_init: str = "xavier"
-    lora_dtype: torch.dtype | None = None
+    # Storage precision; compute follows activations/FSDP (BF16 by default).
+    lora_dtype: torch.dtype | str | None = torch.float32
     use_memory_efficient_lora: bool = True
     use_triton: bool = False
     moe_rank_scaling: bool = False
@@ -86,7 +88,7 @@ class PeftConfig:
             dropout=d.get("dropout", 0.0),
             dropout_position=d.get("dropout_position", "post"),
             lora_A_init=d.get("lora_A_init", "xavier"),
-            lora_dtype=d.get("lora_dtype", None),
+            lora_dtype=d.get("lora_dtype", torch.float32),
             use_memory_efficient_lora=d.get("use_memory_efficient_lora", True),
             use_triton=d.get("use_triton", False),
             moe_rank_scaling=d.get("moe_rank_scaling", False),
@@ -116,16 +118,16 @@ class LinearLoRA(nn.Linear):
 
     def __init__(
         self,
-        orig_linear,
-        dim=8,
-        alpha=32,
+        orig_linear: nn.Linear,
+        dim: int = 8,
+        alpha: int = 32,
         use_dora: bool = False,
-        dropout=0.0,
-        dropout_position="post",
-        lora_A_init_method="xavier",
-        lora_dtype=None,
-        use_memory_efficient_lora=True,
-    ):
+        dropout: float = 0.0,
+        dropout_position: Literal["pre", "post"] = "post",
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = torch.float32,
+        use_memory_efficient_lora: bool = True,
+    ) -> None:
         """
         LinearLora constructor.
 
@@ -136,8 +138,8 @@ class LinearLoRA(nn.Linear):
             dropout (float): dropout prob (default: 0.0).
             dropout_position (str): where to apply dropout rel. to lora (choices= ['pre', 'post'], default=post)
             lora_A_init_method (str): init method for lora_A (choices= ['xavier', 'uniform'])
-            lora_dtype (torch.dtype): weight's dtype, by default will use orig_linear's but if they
-            are quantized weights (e.g. 4bit) needs to be specified explicitly.
+            lora_dtype: Adapter storage dtype, default FP32. None inherits the base dtype.
+                Compute follows the activation dtype and mixed-precision policy.
         """
         assert isinstance(orig_linear, nn.Linear)
         super(LinearLoRA, self).__init__(
@@ -188,7 +190,7 @@ class LinearLoRA(nn.Linear):
         dropout=0.0,
         dropout_position="post",
         lora_A_init_method="xavier",
-        lora_dtype=None,
+        lora_dtype: torch.dtype | str | None = torch.float32,
         use_memory_efficient_lora=True,
     ):
         """
@@ -201,8 +203,8 @@ class LinearLoRA(nn.Linear):
             dropout (float): dropout prob (default: 0.0).
             dropout_position (str): where to apply dropout rel. to lora (choices= ['pre', 'post'], default=post)
             lora_A_init_method (str): init method for lora_A (choices= ['xavier', 'uniform'])
-            lora_dtype (torch.dtype): weight's dtype, by default will use orig_linear's but if they
-            are quantized weights (e.g. 4bit) needs to be specified explicitly.
+            lora_dtype: Adapter storage dtype, default FP32. None inherits the base dtype.
+                Compute follows the activation dtype and mixed-precision policy.
         """
         obj.dim = dim
         obj.scale = alpha / dim
@@ -230,8 +232,8 @@ class LinearLoRA(nn.Linear):
                 in_features=dim, out_features=out_features, bias=False, device=device, params_dtype=dtype
             )
         else:
-            obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
-            obj.lora_B = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
+            obj.lora_A = _LoRAProjection(in_features, dim, bias=False, dtype=dtype, device=device)
+            obj.lora_B = _LoRAProjection(dim, out_features, bias=False, dtype=dtype, device=device)
         LinearLoRA.init_lora_weights(obj, lora_A_init_method)
         obj.dropout_p = dropout
         assert dropout_position in ["pre", "post"], ("dropout position can only be pre/post", dropout_position)
@@ -243,12 +245,18 @@ class LinearLoRA(nn.Linear):
                 weight_norm = torch.linalg.norm(obj.weight.data, dim=1).to(dtype=dtype, device=device)
             obj.lora_magnitude = nn.Parameter(weight_norm, requires_grad=True)
 
+        # Model initialization must preserve independently configured base/adapter
+        # storage. Mixed precision owns their compute dtype instead.
+        obj._preserve_parameter_dtypes = ("lora_magnitude",) if obj.use_dora else ()
+        obj.lora_A._preserve_parameter_dtypes = tuple(obj.lora_A._parameters)
+        obj.lora_B._preserve_parameter_dtypes = tuple(obj.lora_B._parameters)
+
     def _dora_weight_norm(self) -> torch.Tensor:
         """
         Compute the detached weight norm used by DoRA.
         """
         # ΔW = B @ A, shapes: [out, dim] @ [dim, in] => [out, in]
-        delta_w = (self.lora_B.weight @ self.lora_A.weight).detach().to(self.weight.dtype)
+        delta_w = (self.lora_B.weight.to(self.weight.dtype) @ self.lora_A.weight.to(self.weight.dtype)).detach()
         weight = self.weight.to(self.weight.dtype)
         weight_norm = torch.linalg.norm(weight + self.scale * delta_w, dim=1).to(weight.dtype)
         return weight_norm.detach()
@@ -279,7 +287,9 @@ class LinearLoRA(nn.Linear):
             raise NotImplementedError(
                 "materialize_effective_weight supports only dense, strided, non-quantized linear weights"
             )
-        return self.weight + self.scale * (self.lora_B.weight @ self.lora_A.weight)
+        return self.weight + self.scale * (
+            self.lora_B.weight.to(self.weight.dtype) @ self.lora_A.weight.to(self.weight.dtype)
+        )
 
     def _should_use_memory_efficient_lora(self, x: torch.Tensor) -> bool:
         """Return whether this LoRA branch can use the custom autograd path."""
@@ -303,6 +313,7 @@ class LinearLoRA(nn.Linear):
 
         Applies LoRA either before or after the dropout, depending on the configuration.
         The result of the original linear transformation is combined with the LoRA output.
+        Mixed input and adapter dtypes require caller-owned ``torch.autocast``.
 
         Args:
             x (Tensor): Input activations of shape ``[B, S, in_features]``
@@ -447,8 +458,7 @@ class TritonLinearLoRA(LinearLoRA):
         dropout (float): dropout prob (default: 0.0).
         dropout_position (str): where to apply dropout rel. to lora (choices= ['pre', 'post'], default=post)
         lora_A_init_method (str): init method for lora_A (choices= ['xavier', 'uniform'])
-        lora_dtype (torch.dtype): weight's dtype, by default will use orig_linear's but if they
-        are quantized weights (e.g. 4bit) needs to be specified explicitly.
+        lora_dtype: Adapter storage dtype, default FP32. None inherits the base dtype.
     """
 
     def forward(self, x):
@@ -490,18 +500,18 @@ class TritonLinearLoRA(LinearLoRA):
 
 
 def patch_linear_module(
-    orig_linear,
-    dim=8,
-    alpha=32,
+    orig_linear: nn.Module,
+    dim: int = 8,
+    alpha: int = 32,
     use_dora: bool = False,
-    dropout=0.0,
-    dropout_position="post",
-    lora_A_init_method="xavier",
-    lora_dtype=None,
-    use_memory_efficient_lora=True,
-    use_triton=True,
-    layer_name=None,
-):
+    dropout: float = 0.0,
+    dropout_position: Literal["pre", "post"] = "post",
+    lora_A_init_method: str = "xavier",
+    lora_dtype: torch.dtype | str | None = torch.float32,
+    use_memory_efficient_lora: bool = True,
+    use_triton: bool = True,
+    layer_name: str | None = None,
+) -> nn.Module:
     """
     Monkey-patches a nn.Linear (orig_linear param) to be a LinearLoRA.
 
@@ -521,9 +531,8 @@ def patch_linear_module(
         dropout_position (str, optional): location to apply dropout wrt lora.
             Defaults to 'post' (choices: 'pre', 'post').
         lora_A_init_method (str, optional): lora_a init method. Defaults to 'xavier'.
-        lora_dtype (_type_, optional): Lora weights' dtype. By default will use orig_linear's dtype
-            but orig_linear might use non-trainable dtype (e.g., 4bit), in which case the user must
-            specify the dtype manually. Defaults to None.
+        lora_dtype: Adapter storage dtype, default FP32. None inherits the base dtype.
+            Compute follows activations and the mixed-precision policy.
         use_memory_efficient_lora (bool, optional): Use the custom autograd implementation for standard LoRA.
             When Triton is enabled this uses Triton kernels; otherwise it uses PyTorch matmuls. Defaults to True.
         use_triton (bool, optional): By default we use the triton kernel LoRA implementation.
@@ -538,9 +547,10 @@ def patch_linear_module(
     if not isinstance(orig_linear, tuple(linear_types)):
         raise NotImplementedError("Expected isinstance(orig_linear, nn.Linear)")
     assert not hasattr(orig_linear, "super_fwd"), orig_linear.super_fwd
+    is_te_linear = HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear)
 
     if use_dora:
-        if HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear):
+        if is_te_linear:
             raise ValueError("DoRA is not supported for transformer_engine.pytorch.Linear layers.")
         if getattr(orig_linear, "quant_state", None) is not None:
             raise ValueError("DoRA is not supported for quantized linear layers (e.g., BitsAndBytes).")
@@ -566,12 +576,9 @@ def patch_linear_module(
         getattr(orig_linear, "quant_state", None) is not None
         and orig_linear.quant_state.__class__ == bitsandbytes.functional.QuantState
     ):
-        if HAS_TE:
-            assert not isinstance(orig_linear, transformer_engine.pytorch.Linear), (
-                "quant_state is not supported with transformer_engine.pytorch.Linear"
-            )
+        assert not is_te_linear, "quant_state is not supported with transformer_engine.pytorch.Linear"
         orig_linear.super_fwd = orig_linear.forward
-    elif HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear):
+    elif is_te_linear:
         # Delegate base computation to TE's forward so TE kernels (including FP8)
         # are used instead of falling back to F.linear().
         orig_linear.super_fwd = orig_linear.forward
@@ -587,7 +594,7 @@ def patch_moe_module(
     dim: int = 8,
     alpha: int = 32,
     lora_A_init_method: str = "xavier",
-    lora_dtype: torch.dtype | str | None = None,
+    lora_dtype: torch.dtype | str | None = torch.float32,
     expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized",
 ) -> nn.Module:
     """
@@ -598,7 +605,7 @@ def patch_moe_module(
         dim (int, optional): LoRA rank (dimension). Defaults to 8.
         alpha (int, optional): LoRA scaling factor. Defaults to 32.
         lora_A_init_method (str, optional): Initialization method for LoRA A matrix. Defaults to "xavier".
-        lora_dtype (torch.dtype or str, optional): Data type for LoRA weights. Defaults to None.
+        lora_dtype (torch.dtype or str, optional): Storage dtype for LoRA weights. Defaults to FP32; None inherits the base dtype.
         expert_weight_format (str, optional): Storage mode, not a torch dtype.
             "unquantized" uses ordinary floating-point experts with the model's configured
             precision, including FP32. "mxfp4"

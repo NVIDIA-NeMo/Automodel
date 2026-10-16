@@ -20,6 +20,41 @@ from collections.abc import Iterable
 from typing import Any
 
 
+def patch_fsdp_mixed_frozen_storage() -> None:
+    """Backport PyTorch 2.8's trainable-only FSDP2 dtype checks to 2.6/2.7.
+
+    All-gather already handles frozen parameters with a different storage dtype.
+    Only parameters with gradients enter reduce-scatter, so its original and
+    reduction dtypes must be derived from trainable parameters. Install lazily
+    before sharding; the process-global patch is version-gated and idempotent.
+    """
+    from nemo_automodel.shared.import_utils import is_torch_min_version
+
+    if is_torch_min_version("2.8.0"):
+        return
+
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    if getattr(FSDPParamGroup._init_mp_dtypes, "_automodel_mixed_frozen_storage", False):
+        return
+
+    def _init_mp_dtypes(self: FSDPParamGroup) -> None:
+        for param in self.fsdp_params:
+            param.init_dtype_attrs(self.mp_policy)
+        trainable_params = [param for param in self.fsdp_params if param.sharded_param.requires_grad]
+        orig_dtypes = {param.orig_dtype for param in trainable_params}
+        reduce_dtypes = {param.reduce_dtype for param in trainable_params}
+        if len(orig_dtypes) > 1:
+            raise AssertionError(f"FSDP expects uniform original parameter dtype but got {orig_dtypes}")
+        if len(reduce_dtypes) > 1:
+            raise AssertionError(f"FSDP expects uniform reduce dtype but got {reduce_dtypes}")
+        self._orig_dtype = next(iter(orig_dtypes)) if trainable_params else None
+        self._reduce_dtype = next(iter(reduce_dtypes)) if trainable_params else None
+
+    _init_mp_dtypes._automodel_mixed_frozen_storage = True
+    FSDPParamGroup._init_mp_dtypes = _init_mp_dtypes
+
+
 def _widest_float_dtype(dtypes: Iterable[Any]) -> Any:
     """Return the float dtype among ``dtypes`` that every other one converts into losslessly.
 

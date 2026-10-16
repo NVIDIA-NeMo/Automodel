@@ -577,7 +577,9 @@ class Gate(nn.Module):
             weight = self.weight.to(dtype=x.dtype)
             bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
 
-        scores = F.linear(x_compute, weight, bias=bias)
+        # Preserve the explicit compute dtype inside recipe autocast.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            scores = F.linear(x_compute, weight, bias=bias)
         if self.use_routing_core:
             weights, indices, original_scores = self.routing_core(scores, self)
         else:

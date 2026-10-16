@@ -282,9 +282,10 @@ class FSDP2Config:
             patterns and the bf16-storage trap.
         offload_policy (Optional[CPUOffloadPolicy]): CPUOffloadPolicy for CPU offloading.
         autocast_dtype (Optional[torch.dtype]): If set, wraps the forward pass in
-            ``torch.autocast(device_type="cuda", dtype=autocast_dtype)``.  Use with
+            ``torch.autocast`` on the recipe device. Use with
             ``output_dtype=float32`` in mp_policy to keep the residual stream in fp32
-            while running matmuls in lower precision.  Set to ``None`` to disable.
+            while running matmuls in lower precision. With ``None``, PEFT recipes use
+            ``mp_policy.param_dtype``; full-parameter recipes leave autocast disabled.
             Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
         activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer

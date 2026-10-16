@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1214,3 +1215,34 @@ def test_moe_rank_scaling_output_equivalence(moe_config, device):
         out_lora = model(x, token_mask, weights, indices)
 
     assert torch.allclose(out_orig, out_lora, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "base_cls, adapter_cls, expected_count",
+    [(GroupedExperts, GroupedExpertsLoRA, 2), (GroupedExpertsDeepEP, GroupedExpertsDeepEPLoRA, 4)],
+)
+@pytest.mark.parametrize("init_method", ["xavier", "kaiming"])
+def test_expert_adapter_count_and_initialization_order(moe_config, base_cls, adapter_cls, expected_count, init_method):
+    original = base_cls(moe_config)
+    original.n_routed_experts = 2  # Deliberately differ from config.n_routed_experts == 4.
+    expected_gate = torch.empty(expected_count, 16, 4)
+    expected_down = torch.empty(expected_count, 32, 4)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(71)
+        for weight in (expected_gate, expected_down):
+            if init_method == "xavier":
+                nn.init.xavier_normal_(weight)
+            else:
+                nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        expected_rng = torch.get_rng_state()
+        torch.manual_seed(71)
+        with patch.object(adapter_cls, "init_lora_weights", wraps=adapter_cls.init_lora_weights) as hook:
+            adapter_cls._init_adapter(original, lora_dim=4, lora_A_init_method=init_method)
+            hook.assert_called_once_with(original, init_method)
+        torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
+    torch.testing.assert_close(original.lora_gate_and_up_A, expected_gate, rtol=0, atol=0)
+    torch.testing.assert_close(original.lora_down_A, expected_down, rtol=0, atol=0)
+    assert original.lora_gate_and_up_B.shape == (expected_count, 4, 64)
+    assert original.lora_down_B.shape == (expected_count, 4, 16)
+    assert torch.count_nonzero(original.lora_gate_and_up_B) == 0
+    assert torch.count_nonzero(original.lora_down_B) == 0

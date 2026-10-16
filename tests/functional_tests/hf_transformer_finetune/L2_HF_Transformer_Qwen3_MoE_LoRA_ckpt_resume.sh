@@ -24,7 +24,7 @@ echo "Checkpoint directory: $CKPT_DIR"
 # 1. Train and save checkpoint
 echo "Starting training..."
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
-    examples/llm_finetune/finetune.py \
+    tests/functional_tests/hf_peft/run_moe_lora_precision.py \
     --config examples/llm_finetune/qwen/qwen3_moe_2layer_proxy_lora.yaml \
     --step_scheduler.max_steps 5 \
     --step_scheduler.ckpt_every_steps 5 \
@@ -34,7 +34,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
 # 2. Resume from checkpoint
 echo "Resuming training..."
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
-    examples/llm_finetune/finetune.py \
+    tests/functional_tests/hf_peft/run_moe_lora_precision.py \
     --config examples/llm_finetune/qwen/qwen3_moe_2layer_proxy_lora.yaml \
     --step_scheduler.max_steps 10 \
     --dataset.split "train[:200]" \

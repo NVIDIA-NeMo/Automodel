@@ -40,8 +40,8 @@ def warn_if_torch_adam_with_bf16_params(
     context: str = "recipe",
     logger: logging.Logger | None = None,
 ) -> None:
-    """Warn about full-parameter bf16 training with vanilla torch Adam optimizers."""
-    if is_peft or not _is_rank_zero() or context in _WARNED_CONTEXTS:
+    """Warn about trainable bf16 parameters with vanilla torch Adam optimizers."""
+    if not _is_rank_zero() or context in _WARNED_CONTEXTS:
         return
 
     if not (_is_torch_adam_optimizer(optimizer) or _is_torch_adam_config(optimizer_cfg)):
@@ -52,11 +52,17 @@ def warn_if_torch_adam_with_bf16_params(
         return
 
     log = logger if logger is not None else logging.getLogger(__name__)
+    recommendation = (
+        "For maximum stability, set peft.lora_dtype: float32."
+        if is_peft
+        else "For maximum stability, set model.torch_dtype=float32 with FSDP mixed precision, or use "
+        "Transformer Engine FusedAdam with master_weights=True."
+    )
     log.warning(
         "Detected torch.optim.Adam/AdamW with trainable bf16 model parameters. Updates and Adam state "
         "will use bf16, which saves memory but may affect training stability, convergence, or final loss. "
-        "For maximum stability, set model.torch_dtype=float32 with FSDP mixed precision, or use Transformer "
-        "Engine FusedAdam with master_weights=True. See docs/guides/mixed-precision-training.mdx."
+        "%s See docs/guides/mixed-precision-training.mdx.",
+        recommendation,
     )
 
     _WARNED_CONTEXTS.add(context)

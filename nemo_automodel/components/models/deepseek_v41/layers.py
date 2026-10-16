@@ -58,7 +58,9 @@ def _hc_project_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Coefficient projection up to the Sinkhorn input: pre, post and the [streams, streams] combination logits."""
     flat = hidden_states.flatten(2).float()
-    mixes = F.linear(flat, fn.float()) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
+    # Preserve the explicit compute dtype inside recipe autocast.
+    with torch.autocast(device_type=flat.device.type, enabled=False):
+        mixes = F.linear(flat, fn.float()) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
     scales = torch.cat((scale[0].expand(streams), scale[1].expand(streams), scale[2].expand(streams * streams)))
     # The released kernel fuses the affine multiply/add before sigmoid and
     # Sinkhorn. Separate operations round its FP32 coefficients differently;

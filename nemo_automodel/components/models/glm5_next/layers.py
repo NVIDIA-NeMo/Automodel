@@ -143,7 +143,9 @@ class Glm5NextHyperConnection(nn.Module):
         """Build Sinkhorn mixing weights and collapse streams for one sublayer."""
         hc = self.hc_mult
         flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
-        pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
+        # Preserve the explicit compute dtype inside recipe autocast.
+        with torch.autocast(device_type=flat.device.type, enabled=False):
+            pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
         pre, post, comb = self._fp32_params(
             pre_w,
             post_w,

@@ -180,7 +180,7 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         # ``addmm_`` is not autocast-eligible — an in-place op cannot change its output dtype — so
         # unlike the ``F.linear`` calls its operands are *not* auto-cast and must already be in the
         # base projection's dtype. They are not when the adapters are held in a different dtype than
-        # the base (``lora_dtype``), which the per-linear path handles via autocast; cast to keep the
+        # the base (``lora_dtype``); cast to keep the
         # fused path identical to it. A no-op when the dtypes already agree.
         e = F.linear(x2, gW)  # gate_out (saved)
         e.addmm_(*_cast(e.dtype, F.linear(x2, gA) * gS, gB.t()))
@@ -362,7 +362,7 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         relu_e = torch.relu(e)
         f = relu_e * relu_e  # down-projection input (recomputed in backward)
         out = F.linear(f, dW)
-        out.addmm_(*_cast(out.dtype, F.linear(f, dA) * dS, dB.t()))
+        out.addmm_(*_cast(out.dtype, F.linear(f, dA.to(f.dtype)) * dS, dB.t()))
         ctx.save_for_backward(x2, e, uA, uB, dA, dB)
         ctx.bases = (uW, dW)
         ctx.scales = (uS, dS)

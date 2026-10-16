@@ -428,7 +428,9 @@ class DeepseekV4HashGate(nn.Module):
         # forward that forgets to set it.
         self._pending_input_ids = None
 
-        scores = F.linear(x.float(), self.weight.float())
+        # Preserve the explicit compute dtype inside recipe autocast.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            scores = F.linear(x.float(), self.weight.float())
         if self.score_func == "sqrtsoftplus":
             scores = F.softplus(scores).sqrt()
         elif self.score_func == "sigmoid":

@@ -88,7 +88,8 @@ def test_recipe_releases_unused_outputs_before_backward(output_kind, dtype, reco
         loss.register_hook(record)
 
     handle = loss_fn.register_forward_hook(record_lifetime)
-    recipe = SimpleNamespace(
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.__dict__.update(
         model_parts=[model],
         loss_fn=loss_fn,
         dist_env=SimpleNamespace(device=torch.device("cpu")),

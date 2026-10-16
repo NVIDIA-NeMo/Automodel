@@ -90,6 +90,7 @@ def _parallelize_fsdp2(
         _patch_is_packed_sequence_for_training,
         fsdp2_sharding_enabled,
     )
+    from nemo_automodel.components.distributed.fsdp_patches import patch_fsdp_mixed_frozen_storage
 
     config = mesh_context.strategy_config
     assert isinstance(config, FSDP2Config)
@@ -101,6 +102,10 @@ def _parallelize_fsdp2(
     if not fsdp2_sharding_enabled(mesh_context.device_mesh):
         return _parallelize_unsharded_fsdp2(model, mesh_context, parallelizer=parallelizer)
 
+    # Dense and diffusion sidecars may call fully_shard directly rather than
+    # fully_shard_by_dtype. They need the same trainable-only dtype checks on
+    # PyTorch 2.6/2.7 for FP32 adapters alongside frozen BF16 base weights.
+    patch_fsdp_mixed_frozen_storage()
     return parallelizer._apply(
         model=model,
         device_mesh=mesh_context.device_mesh,

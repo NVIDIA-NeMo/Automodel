@@ -54,7 +54,7 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
         lora_dim: int = 8,
         alpha: int = 32,
         lora_A_init_method: str = "xavier",
-        lora_dtype: torch.dtype | str | None = None,
+        lora_dtype: torch.dtype | str | None = torch.float32,
     ) -> None:
         """Initialize the parent's adapters, then replace the frozen base storage."""
         with torch.device(orig_module.gate_and_up_projs.device):
@@ -222,7 +222,7 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
         lora_dim: int = 8,
         alpha: int = 32,
         lora_A_init_method: str = "xavier",
-        lora_dtype: torch.dtype | str | None = None,
+        lora_dtype: torch.dtype | str | None = torch.float32,
     ) -> None:
         """Initialize the parent's adapters, then replace the frozen base storage."""
         with torch.device(orig_module.gate_and_up_projs.device):

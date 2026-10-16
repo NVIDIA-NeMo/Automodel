@@ -259,7 +259,9 @@ class Gemma4Gate(nn.Module):
         x_norm = self.norm(x).to(torch.float32)
         x_norm = x_norm * self.scale.to(torch.float32) * self.scalar_root_size
 
-        expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
+        # Preserve the explicit compute dtype inside recipe autocast.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
 
         weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)
@@ -1639,8 +1641,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     ) -> None:
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
-            for p in self.parameters():
-                p.data = p.data.to(dtype)
+            cast_model_to_dtype(self, dtype)
             return
 
         # Guard: HF's super().__init__() calls post_init() -> init_weights() ->

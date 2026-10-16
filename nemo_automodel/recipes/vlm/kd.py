@@ -386,65 +386,66 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             else nullcontext()
         )
         with sync_ctx, train_ctx():
-            # Teacher forward (no grad) — free intermediates immediately.
-            if separate_teacher_logits is None:
-                with (
-                    ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
-                    torch.no_grad(),
-                ):
-                    teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
-                    teacher_out = self.teacher_model(**teacher_batch)
-                    teacher_logits = getattr(teacher_out, "logits", teacher_out).detach().clone()
-                    del teacher_out, teacher_batch
-            else:
-                teacher_logits = separate_teacher_logits
+            with self._autocast_context():
+                # Teacher forward (no grad) — free intermediates immediately.
+                if separate_teacher_logits is None:
+                    with (
+                        ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
+                        torch.no_grad(),
+                    ):
+                        teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
+                        teacher_out = self.teacher_model(**teacher_batch)
+                        teacher_logits = getattr(teacher_out, "logits", teacher_out).detach().clone()
+                        del teacher_out, teacher_batch
+                else:
+                    teacher_logits = separate_teacher_logits
 
-            # Student forward.
-            student_batch = dict(batch)
-            if self.kd_ratio < 1.0 and isinstance(self.loss_fn, LinearCrossEntropy):
-                student_batch["output_hidden_states"] = True
-            student_batch = filter_forward_kwargs(model, student_batch)
-            student_out = model(**student_batch)
-            del student_batch
+                # Student forward.
+                student_batch = dict(batch)
+                if self.kd_ratio < 1.0 and isinstance(self.loss_fn, LinearCrossEntropy):
+                    student_batch["output_hidden_states"] = True
+                student_batch = filter_forward_kwargs(model, student_batch)
+                student_out = model(**student_batch)
+                del student_batch
 
-            student_logits = getattr(student_out, "logits", student_out)
-            if separate_teacher_logits is not None:
-                teacher_logits = self.kd_mesh_bridge.match_student_vocab_shard(student_logits, teacher_logits)
-            hidden_states = get_final_hidden_states(student_out)
-            del student_out
+                student_logits = getattr(student_out, "logits", student_out)
+                if separate_teacher_logits is not None:
+                    teacher_logits = self.kd_mesh_bridge.match_student_vocab_shard(student_logits, teacher_logits)
+                hidden_states = get_final_hidden_states(student_out)
+                del student_out
 
-            # CE loss (skip when kd_ratio >= 1.0).
-            if self.kd_ratio >= 1.0:
-                ce_loss = student_logits.new_tensor(0.0, dtype=student_logits.dtype)
-            else:
-                ce_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=student_logits,
-                    labels=labels,
-                    model=model,
-                    hidden_states=hidden_states,
-                    num_label_tokens=num_label_tokens,
-                    grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
+                # CE loss (skip when kd_ratio >= 1.0).
+                if self.kd_ratio >= 1.0:
+                    ce_loss = student_logits.new_tensor(0.0, dtype=student_logits.dtype)
+                else:
+                    ce_loss = calculate_loss(
+                        self.loss_fn,
+                        logits=student_logits,
+                        labels=labels,
+                        model=model,
+                        hidden_states=hidden_states,
+                        num_label_tokens=num_label_tokens,
+                        grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
+                    )
+                del hidden_states
+
+                kd_labels = _normalize_kd_labels(
+                    labels,
+                    loss_ignore_index=_get_loss_ignore_index(self.loss_fn),
+                    kd_ignore_index=_get_loss_ignore_index(self.kd_loss_fn),
                 )
-            del hidden_states
+                kd_loss = self.kd_loss_fn(
+                    student_logits,
+                    teacher_logits,
+                    kd_labels,
+                    num_batch_labels=num_label_tokens,
+                )
+                del teacher_logits
 
-            kd_labels = _normalize_kd_labels(
-                labels,
-                loss_ignore_index=_get_loss_ignore_index(self.loss_fn),
-                kd_ignore_index=_get_loss_ignore_index(self.kd_loss_fn),
-            )
-            kd_loss = self.kd_loss_fn(
-                student_logits,
-                teacher_logits,
-                kd_labels,
-                num_batch_labels=num_label_tokens,
-            )
-            del teacher_logits
-
-            local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss
-            loss_buffer.append(local_loss.detach().clone())
-            self._ce_loss_buffer.append(ce_loss.detach().clone())
-            self._kd_loss_buffer.append(kd_loss.detach().clone())
+                local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss
+                loss_buffer.append(local_loss.detach().clone())
+                self._ce_loss_buffer.append(ce_loss.detach().clone())
+                self._kd_loss_buffer.append(kd_loss.detach().clone())
             if is_train:
                 (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 

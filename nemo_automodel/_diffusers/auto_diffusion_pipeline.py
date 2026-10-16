@@ -905,8 +905,6 @@ class NeMoAutoDiffusionPipeline:
                     "model_type must be set when peft_cfg is provided. "
                     "Options: 'flux', 'flux2', 'flux3', 'wan', 'hunyuan', 'ltx2'"
                 )
-            import dataclasses
-
             from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 
             pipe._lora_params = {}
@@ -923,21 +921,18 @@ class NeMoAutoDiffusionPipeline:
                             block.attn2.unfuse_projections()
                         logger.info("[LoRA] Wan: unfused attention projection groups")
 
-                    # Ensure LoRA weights are bf16 to match base weights in the
-                    # FSDP2 unit — mixed dtypes cause reduce-scatter to malfunction.
-                    cfg = peft_cfg
-                    if cfg.lora_dtype is None:
-                        cfg = dataclasses.replace(cfg, lora_dtype=torch.bfloat16)
-
+                    # Use the shared LoRA storage policy: FP32 by default, an
+                    # explicit dtype when supplied, or the base dtype for None.
+                    # FSDP's mixed-precision policy controls compute separately.
                     # skip_freeze=True: global base-weight freeze happens after
                     # FSDP2 wrapping (see below). FSDP2 must see all params as
                     # trainable during fully_shard() so gradient reduction is set
                     # up correctly for LoRA params.
-                    apply_lora_to_linear_modules(module, cfg, skip_freeze=True)
+                    apply_lora_to_linear_modules(module, peft_cfg, skip_freeze=True)
 
                     lora_params = [p for n, p in module.named_parameters() if "lora_" in n and p.requires_grad]
                     pipe._lora_params[name] = lora_params
-                    pipe._peft_config = cfg
+                    pipe._peft_config = peft_cfg
                     logger.info(
                         "[LoRA] Stored %d lora_param tensors before FSDP2",
                         len(lora_params),

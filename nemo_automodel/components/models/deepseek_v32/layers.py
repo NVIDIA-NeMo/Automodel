@@ -229,7 +229,9 @@ class DeepseekV32Indexer(nn.Module):
             q = q.transpose(0, 1)
             k = k.transpose(0, 1)
             # scores: [H, T, T]
-            scores = torch.bmm(q.float(), k.float().transpose(-2, -1))
+            # Preserve the explicit compute dtype inside recipe autocast.
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                scores = torch.bmm(q.float(), k.float().transpose(-2, -1))
             # Apply ReLU activation (per training implementation)
             scores = torch.relu(scores)
             # Apply per-head weights: [T, H] -> [H, T, 1]
@@ -242,7 +244,9 @@ class DeepseekV32Indexer(nn.Module):
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             # scores: [B, H, S, S]
-            scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
+            # Preserve the explicit compute dtype inside recipe autocast.
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
             # Apply ReLU activation (per training implementation)
             scores = torch.relu(scores)
             # Apply per-head weights: [B, S, H] -> [B, H, S, 1]

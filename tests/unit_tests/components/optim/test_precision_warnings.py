@@ -15,6 +15,7 @@
 import logging
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from nemo_automodel.components.optim import precision_warnings
@@ -39,14 +40,43 @@ def test_warns_once_for_full_bf16_training_with_torch_adamw(caplog):
 
     assert caplog.text.count(_WARNING_PREFIX) == 1
     assert "docs/guides/mixed-precision-training.mdx" in caplog.text
+    assert "model.torch_dtype=float32" in caplog.text
+    assert "master_weights=True" in caplog.text
 
 
-def test_skips_peft_bf16_training(caplog):
-    param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
-    optimizer = torch.optim.AdamW([param], lr=1.0e-4)
+@pytest.mark.parametrize("optimizer_cls", [torch.optim.Adam, torch.optim.AdamW])
+@pytest.mark.parametrize("use_config", [False, True])
+def test_warns_once_for_peft_bf16_adapters(caplog, optimizer_cls, use_config):
+    base = torch.nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+    adapter = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+    kwargs = (
+        {"optimizer_cfg": SimpleNamespace(_target_=optimizer_cls), "parameters": [base, adapter]}
+        if use_config
+        else {"optimizer": optimizer_cls([base, adapter], lr=1.0e-4)}
+    )
 
     with caplog.at_level(logging.WARNING):
-        warn_if_torch_adam_with_bf16_params(optimizer=optimizer, is_peft=True, context="unit-test")
+        warn_if_torch_adam_with_bf16_params(**kwargs, is_peft=True, context="unit-test")
+        warn_if_torch_adam_with_bf16_params(**kwargs, is_peft=True, context="unit-test")
+
+    assert caplog.text.count(_WARNING_PREFIX) == 1
+    assert "peft.lora_dtype: float32" in caplog.text
+    assert "model.torch_dtype" not in caplog.text
+
+
+@pytest.mark.parametrize("optimizer_cls", [torch.optim.Adam, torch.optim.AdamW])
+@pytest.mark.parametrize("use_config", [False, True])
+def test_skips_peft_frozen_bf16_base_with_fp32_adapters(caplog, optimizer_cls, use_config):
+    base = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16), requires_grad=False)
+    adapter = torch.nn.Parameter(torch.ones(1, dtype=torch.float32))
+    kwargs = (
+        {"optimizer_cfg": SimpleNamespace(_target_=optimizer_cls), "parameters": [base, adapter]}
+        if use_config
+        else {"optimizer": optimizer_cls([base, adapter], lr=1.0e-4)}
+    )
+
+    with caplog.at_level(logging.WARNING):
+        warn_if_torch_adam_with_bf16_params(**kwargs, is_peft=True, context="unit-test")
 
     assert _WARNING_PREFIX not in caplog.text
 

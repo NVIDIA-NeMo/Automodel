@@ -106,14 +106,6 @@ def _configure_sentence_transformer_export(model, collate_fn, *, tokenizer=None)
     configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt, tokenizer=tokenizer)
 
 
-def _get_autocast_ctx(distributed_config):
-    """Return the optional recipe-level autocast context."""
-    autocast_dtype = getattr(distributed_config, "autocast_dtype", None)
-    if autocast_dtype is None or not torch.cuda.is_available():
-        return nullcontext()
-    return torch.autocast(device_type="cuda", dtype=autocast_dtype)
-
-
 def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
     """Return infrastructure kwargs forwarded to model instantiation."""
     kwargs = {
@@ -517,7 +509,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
         query, passage = _unpack_qp(batch)
 
         model = self.model_parts[0]
-        train_ctx = _get_autocast_ctx(self.distributed_config)
         sync_ctx = (
             get_sync_ctx(
                 model,
@@ -528,85 +519,88 @@ class TrainBiEncoderRecipe(BaseRecipe):
             else nullcontext()
         )
 
-        with train_ctx, sync_ctx:
-            if is_train:
-                if query is not None:
-                    query["run_dummy_vision"] = False
-                if passage is not None:
-                    passage["run_dummy_vision"] = True
-            q_reps = model(query)
-            p_reps = model(passage)
-            attr_model = _unwrap_model_for_attrs(model)
+        with sync_ctx:
+            with self._autocast_context():
+                if is_train:
+                    if query is not None:
+                        query["run_dummy_vision"] = False
+                    if passage is not None:
+                        passage["run_dummy_vision"] = True
+                q_reps = model(query)
+                p_reps = model(passage)
+                attr_model = _unwrap_model_for_attrs(model)
 
-            n_passages = self.train_n_passages
-            use_multi_vector_scoring = _uses_multi_vector_scoring(model)
-            if is_train and getattr(attr_model, "do_distributed_inbatch_negative", False):
-                from nemo_automodel.components.models.common.inbatch_neg_utils import (
-                    dist_gather_tensor,
-                    dist_gather_tensor_with_dim1_padding,
-                    mask_gathered_passages_same_doc_as_positive,
-                )
-
-                local_bs = q_reps.shape[0]
-                dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
-                rank = torch.distributed.get_rank() if dist_initialized else 0
-                world_size = torch.distributed.get_world_size() if dist_initialized else 1
-                preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
-                passage_doc_ids = batch.get("passage_doc_ids")
-                if world_size > 1:
-                    ranks_with_ids = torch.tensor(int(passage_doc_ids is not None), device=q_reps.device)
-                    torch.distributed.all_reduce(ranks_with_ids)
-                    if 0 < ranks_with_ids.item() < world_size:
-                        raise ValueError("Every rank must use the same present or absent passage_doc_ids policy")
-
-                if use_multi_vector_scoring:
-                    all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
-                    all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
-                    expected_p = world_size * local_bs * n_passages
-                    assert all_p.shape[0] == expected_p, (
-                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                n_passages = self.train_n_passages
+                use_multi_vector_scoring = _uses_multi_vector_scoring(model)
+                if is_train and getattr(attr_model, "do_distributed_inbatch_negative", False):
+                    from nemo_automodel.components.models.common.inbatch_neg_utils import (
+                        dist_gather_tensor,
+                        dist_gather_tensor_with_dim1_padding,
+                        mask_gathered_passages_same_doc_as_positive,
                     )
-                    scores, labels = distributed_maxsim_scores_and_labels(
-                        q_reps,
-                        all_p,
-                        n_passages,
-                        all_p_mask,
-                        rank,
-                    )
+
+                    local_bs = q_reps.shape[0]
+                    dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
+                    rank = torch.distributed.get_rank() if dist_initialized else 0
+                    world_size = torch.distributed.get_world_size() if dist_initialized else 1
+                    preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
+                    passage_doc_ids = batch.get("passage_doc_ids")
+                    if world_size > 1:
+                        ranks_with_ids = torch.tensor(int(passage_doc_ids is not None), device=q_reps.device)
+                        torch.distributed.all_reduce(ranks_with_ids)
+                        if 0 < ranks_with_ids.item() < world_size:
+                            raise ValueError("Every rank must use the same present or absent passage_doc_ids policy")
+
+                    if use_multi_vector_scoring:
+                        all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
+                        all_p_mask = dist_gather_tensor_with_dim1_padding(
+                            passage["attention_mask"], padding_value=False
+                        )
+                        expected_p = world_size * local_bs * n_passages
+                        assert all_p.shape[0] == expected_p, (
+                            f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                        )
+                        scores, labels = distributed_maxsim_scores_and_labels(
+                            q_reps,
+                            all_p,
+                            n_passages,
+                            all_p_mask,
+                            rank,
+                        )
+                    else:
+                        all_p = dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
+                        expected_p = world_size * local_bs * n_passages
+                        assert all_p.shape[0] == expected_p, (
+                            f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                        )
+                        scores = torch.mm(q_reps, all_p.t())
+                        labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
+                    if attr_model.l2_normalize:
+                        scores = scores / self.temperature
+                    if passage_doc_ids is not None:
+                        all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
+                        mask_gathered_passages_same_doc_as_positive(
+                            scores,
+                            all_doc_ids,
+                            train_n_passages=n_passages,
+                            rank=rank,
+                            local_batch_size=local_bs,
+                        )
                 else:
-                    all_p = dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
-                    expected_p = world_size * local_bs * n_passages
-                    assert all_p.shape[0] == expected_p, (
-                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
-                    )
-                    scores = torch.mm(q_reps, all_p.t())
-                    labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
-                if attr_model.l2_normalize:
-                    scores = scores / self.temperature
-                if passage_doc_ids is not None:
-                    all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
-                    mask_gathered_passages_same_doc_as_positive(
-                        scores,
-                        all_doc_ids,
-                        train_n_passages=n_passages,
-                        rank=rank,
-                        local_batch_size=local_bs,
-                    )
-            else:
-                if use_multi_vector_scoring:
-                    scores, labels = maxsim_scores_and_labels(
-                        q_reps,
-                        p_reps,
-                        n_passages,
-                        passage["attention_mask"],
-                    )
-                else:
-                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
-                if attr_model.l2_normalize:
-                    scores = scores / self.temperature
-            loss = F.cross_entropy(scores, labels)
+                    if use_multi_vector_scoring:
+                        scores, labels = maxsim_scores_and_labels(
+                            q_reps,
+                            p_reps,
+                            n_passages,
+                            passage["attention_mask"],
+                        )
+                    else:
+                        scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+                    if attr_model.l2_normalize:
+                        scores = scores / self.temperature
+                loss = F.cross_entropy(scores, labels)
 
-            loss_buffer.append(loss.clone().detach())
+                loss_buffer.append(loss.clone().detach())
 
             if is_train:
                 # Scale loss by number of gradient accumulation steps to get correct average gradients
@@ -692,7 +686,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             all_scores = []
             all_labels = []
 
-            with torch.no_grad():
+            with torch.no_grad(), self._autocast_context():
                 for batch in val_dataloader:
                     batch = {
                         k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v

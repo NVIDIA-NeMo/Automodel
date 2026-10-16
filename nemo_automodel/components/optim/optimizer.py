@@ -222,8 +222,8 @@ class OptimizerConfig:
         Args:
             model: Model (or model with ``.parts``) to optimize.
             device_mesh: Device mesh used for tensor/data parallelism.
-            is_peft: Whether the model is being trained with PEFT (suppresses the
-                bf16 torch-Adam precision warning).
+            is_peft: Whether the model is being trained with PEFT (selects adapter-specific
+                guidance for the bf16 torch-Adam precision warning).
 
         Returns:
             One optimizer per model part.

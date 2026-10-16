@@ -134,6 +134,36 @@ def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch)
     call.assert_called_once_with(model, context, parallelizer=parallelizer)
 
 
+@pytest.mark.parametrize("sharding_enabled", [False, True])
+def test_fsdp2_installs_storage_compatibility_before_sidecar(monkeypatch, sharding_enabled):
+    """All sidecars, including diffusion overrides, enter the compatibility gate."""
+    from nemo_automodel.components.distributed import fsdp2, fsdp_patches, model_parallelizer
+
+    model = nn.Linear(2, 2)
+    parallelizer = ModelParallelizer()
+    context = SimpleNamespace(
+        cp_size=1,
+        ep_size=1,
+        device_mesh=object(),
+        strategy_config=FSDP2Config(),
+        activation_checkpointing=False,
+        reapply_trainability=None,
+    )
+    installed = Mock()
+    monkeypatch.setattr(fsdp_patches, "patch_fsdp_mixed_frozen_storage", installed)
+    monkeypatch.setattr(fsdp2, "fsdp2_sharding_enabled", lambda mesh: sharding_enabled)
+
+    def shard(**kwargs):
+        installed.assert_called_once_with()
+        return kwargs["model"]
+
+    monkeypatch.setattr(parallelizer, "_apply", shard)
+    monkeypatch.setattr(model_parallelizer, "_parallelize_unsharded_fsdp2", lambda *args, **kwargs: model)
+    assert parallelizer.parallelize(model, context) is model
+    if not sharding_enabled:
+        installed.assert_not_called()
+
+
 def test_moe_executor_uses_generic_sharding_by_default(monkeypatch):
     parallelizer = ModelParallelizer()
     model = nn.Linear(2, 2)

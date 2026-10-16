@@ -1017,7 +1017,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
                 return
 
-            with self._cp_vision_frame_sharding_context(), train_ctx():
+            with (
+                self._cp_vision_frame_sharding_context(),
+                train_ctx(),
+                self._pipeline_autocast_context(self.pp),
+            ):
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -1051,93 +1055,98 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else nullcontext()
             )
             with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
-                batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, LinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            f"{type(self.loss_fn).__name__} requires the model to output hidden states. "
-                            "Set `model.text_config.output_hidden_states=True` in the config."
-                        )
-                else:
-                    out = model(**batch)
+                with self._autocast_context():
+                    batch = filter_forward_kwargs(model, batch)
+                    if isinstance(self.loss_fn, LinearCrossEntropy):
+                        # use num_logits_to_keep to avoid full logits matrix in memory
+                        out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
+                        if "hidden_states" not in out:
+                            raise ValueError(
+                                f"{type(self.loss_fn).__name__} requires the model to output hidden states. "
+                                "Set `model.text_config.output_hidden_states=True` in the config."
+                            )
+                    else:
+                        out = model(**batch)
 
-                grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
-                shared_lm_weight = (
-                    prepare_lm_weight(
-                        self.loss_fn,
-                        model,
-                        grad_reduce_group=grad_reduce_group,
-                    )
-                    if isinstance(self.loss_fn, LinearCrossEntropy)
-                    else None
-                )
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=get_final_hidden_states(out),
-                    lm_weight=shared_lm_weight,
-                    grad_reduce_group=grad_reduce_group,
-                    num_label_tokens=num_label_tokens,
-                )
-                # DSV4-style MTP loss (from main): triggers when the model emits
-                # ``mtp_per_depth_h`` / ``mtp_per_depth_logits``.
-                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
-                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
-                    if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
-                        # CP targets or NEAT document IDs already define the boundaries.
-                        mtp_cu_seqlens = None
-                    elif mtp_is_packed and mtp_cu_seqlens is None:
-                        raise ValueError(
-                            "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
-                            "including padding; cu_seqlens alone is insufficient."
+                    grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
+                    shared_lm_weight = (
+                        prepare_lm_weight(
+                            self.loss_fn,
+                            model,
+                            grad_reduce_group=grad_reduce_group,
                         )
-                    if _cp_active and mtp_per_depth_targets is None:
-                        raise RuntimeError("MTP with context parallelism requires globally prepared per-depth targets")
-                    mtp_cfg = self.cfg.mtp
-                    scaling_factor = (
-                        mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
+                        if isinstance(self.loss_fn, LinearCrossEntropy)
+                        else None
                     )
-                    local_loss = local_loss + calculate_mtp_loss(
+                    local_loss = calculate_loss(
                         self.loss_fn,
-                        mtp_per_depth_h=mtp_per_depth_h,
-                        mtp_per_depth_logits=mtp_per_depth_logits,
-                        mtp_per_depth_targets=mtp_per_depth_targets,
-                        seq_idx=mtp_seq_idx,
+                        logits=getattr(out, "logits", out),
                         labels=labels,
                         model=model,
-                        scaling_factor=scaling_factor,
-                        num_label_tokens=num_label_tokens,
-                        ignore_index=ignore_index,
+                        hidden_states=get_final_hidden_states(out),
                         lm_weight=shared_lm_weight,
-                        logits_dtype=out.logits.dtype,
                         grad_reduce_group=grad_reduce_group,
-                        cu_seqlens=mtp_cu_seqlens,
+                        num_label_tokens=num_label_tokens,
+                    )
+                    # DSV4-style MTP loss (from main): triggers when the model emits
+                    # ``mtp_per_depth_h`` / ``mtp_per_depth_logits``.
+                    mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                    mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                    if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                        if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
+                            # CP targets or NEAT document IDs already define the boundaries.
+                            mtp_cu_seqlens = None
+                        elif mtp_is_packed and mtp_cu_seqlens is None:
+                            raise ValueError(
+                                "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
+                                "including padding; cu_seqlens alone is insufficient."
+                            )
+                        if _cp_active and mtp_per_depth_targets is None:
+                            raise RuntimeError(
+                                "MTP with context parallelism requires globally prepared per-depth targets"
+                            )
+                        mtp_cfg = self.cfg.mtp
+                        scaling_factor = (
+                            mtp_cfg.scaling_factor
+                            if mtp_cfg.scaling_factor is not None
+                            else out.mtp_loss_scaling_factor
+                        )
+                        local_loss = local_loss + calculate_mtp_loss(
+                            self.loss_fn,
+                            mtp_per_depth_h=mtp_per_depth_h,
+                            mtp_per_depth_logits=mtp_per_depth_logits,
+                            mtp_per_depth_targets=mtp_per_depth_targets,
+                            seq_idx=mtp_seq_idx,
+                            labels=labels,
+                            model=model,
+                            scaling_factor=scaling_factor,
+                            num_label_tokens=num_label_tokens,
+                            ignore_index=ignore_index,
+                            lm_weight=shared_lm_weight,
+                            logits_dtype=out.logits.dtype,
+                            grad_reduce_group=grad_reduce_group,
+                            cu_seqlens=mtp_cu_seqlens,
+                        )
+
+                    # Joint base + drafter co-training (Gemma4WithDrafter and
+                    # similar): detect by presence of ``drafter_logits`` on the
+                    # model output and add
+                    # ``drafter_loss_weight * sum_k CE(drafter_logits[k], shifted_labels_k)``
+                    # to the base loss. See ``_shift_labels_left`` for the shift
+                    # convention. Mutually exclusive with the DSV4-style MTP path
+                    # above -- only one of ``drafter_logits`` /
+                    # ``mtp_per_depth_*`` is set per model.
+                    local_loss = self._maybe_add_drafter_loss(
+                        out=out,
+                        base_loss=local_loss,
+                        labels=labels,
+                        model=model,
+                        num_label_tokens=num_label_tokens,
+                        # Log once per remote-logging step on the first microbatch.
+                        log=(idx == 0 and self.step_scheduler.is_remote_logging_step),
                     )
 
-                # Joint base + drafter co-training (Gemma4WithDrafter and
-                # similar): detect by presence of ``drafter_logits`` on the
-                # model output and add
-                # ``drafter_loss_weight * sum_k CE(drafter_logits[k], shifted_labels_k)``
-                # to the base loss. See ``_shift_labels_left`` for the shift
-                # convention. Mutually exclusive with the DSV4-style MTP path
-                # above -- only one of ``drafter_logits`` /
-                # ``mtp_per_depth_*`` is set per model.
-                local_loss = self._maybe_add_drafter_loss(
-                    out=out,
-                    base_loss=local_loss,
-                    labels=labels,
-                    model=model,
-                    num_label_tokens=num_label_tokens,
-                    # Log once per remote-logging step on the first microbatch.
-                    log=(idx == 0 and self.step_scheduler.is_remote_logging_step),
-                )
-
-                loss_buffer.append(local_loss.clone().detach())
+                    loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
@@ -1324,7 +1333,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 )
                 train_ctx, batch = cp_sharder.shard(batch)
                 labels = batch.pop("labels")
-                with self._cp_vision_frame_sharding_context(), train_ctx():
+                with self._cp_vision_frame_sharding_context(), train_ctx(), self._autocast_context():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, LinearCrossEntropy):
                         out = self.model_parts[0](**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
