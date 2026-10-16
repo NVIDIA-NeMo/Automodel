@@ -29,7 +29,6 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     DATED_SUPPORT_TABLE_HEADER,
     HOMEPAGE_END_MARKER,
     HOMEPAGE_START_MARKER,
-    MODEL_CARD_PATH_ALIASES,
     MODEL_TYPE_OVERVIEW_PATHS,
     REGISTRY_END_MARKER,
     REGISTRY_START_MARKER,
@@ -487,16 +486,26 @@ def test_committed_generated_tables_are_rejected(tmp_path):
         _validate_generated_tables_are_not_committed(tmp_path)
 
 
-def test_model_card_path_aliases_preserve_published_paths():
+def test_pending_model_reference_guides_preserve_published_routes():
     repo_root = Path(__file__).parents[3]
+    config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
     _, _, catalog = _load_model_doc_catalog(repo_root / "docs")
-    source_paths = [model.source_path for model in catalog]
-    for alias, canonical in MODEL_CARD_PATH_ALIASES.items():
-        assert (repo_root / alias).is_file(), f"Published source URL must remain available: {alias}"
-        assert (repo_root / canonical).is_file(), f"Published source URL must remain available: {canonical}"
-        assert _frontmatter_slug(repo_root / alias) == _frontmatter_slug(repo_root / canonical)
-        assert alias not in source_paths
-        assert source_paths.count(canonical) == 1
+    card_routes = {model.docs_page for model in catalog}
+    reference_guides = {
+        "diffusion/flux3-image-klein.mdx": "diffusion/black-forest-labs/flux-3-image-klein-base",
+        "llm/step-5-preview.mdx": "large-language-models/stepfun-ai/Step-5-Preview",
+        "vlm/muse-spark-open.mdx": "vision-language-models/meta-models/Muse-Spark-open-816B-A42B",
+        "vlm/step-5-preview.mdx": "vision-language-models/stepfun-ai/Step-5-Preview",
+    }
+    for path, slug in reference_guides.items():
+        guide = repo_root / "docs" / "guides" / path
+        route = "/model-coverage/" + slug
+        assert _frontmatter_slug(guide) == route.removeprefix("/")
+        assert route in routes
+        assert route not in card_routes
+        assert "implementation PRs are pending merge" in guide.read_text(encoding="utf-8")
 
 
 def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
@@ -625,7 +634,7 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
         path.resolve()
         for category_directory in category_directories.values()
         for path in (repo_root / "docs" / "model-coverage" / category_directory).glob("*/*.mdx")
-        if path.name != "index.mdx" and path.relative_to(repo_root).as_posix() not in MODEL_CARD_PATH_ALIASES
+        if path.name != "index.mdx"
     }
     if set(navigated_model_pages) != expected_model_pages:
         offenders.append("nightly navigation does not contain every model card exactly once")
