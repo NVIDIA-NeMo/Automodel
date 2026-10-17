@@ -1166,8 +1166,7 @@ class TestGroupedExpertsDeepEP:
         hidden, probabilities = args[4], args[5]
         hidden.div_(hidden.numel()).requires_grad_()
         probabilities.requires_grad_()
-        # Dispatch keeps the probabilities' gradient only while the routing weights require one (#4348); the mocked
-        # dispatcher hands ``probabilities`` back directly, so declare the requirement on the weights it stands for.
+        # Match the mocked dispatched probabilities with a trainable input router.
         args[2].requires_grad_()
         with torch.no_grad():
             experts.gate_and_up_projs.normal_(std=0.01)
