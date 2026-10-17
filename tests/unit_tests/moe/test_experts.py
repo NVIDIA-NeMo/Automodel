@@ -1160,6 +1160,8 @@ class TestGroupedExpertsDeepEP:
         moe_config.expert_bias = True
         experts = GroupedExpertsDeepEP(moe_config)
         args = self._prepare_forward_path(experts, num_tokens=3)
+        # Dispatch preserves routing gradients only when the input router weights are trainable.
+        args[2].requires_grad_()
         hidden, probabilities = args[4], args[5]
         hidden.div_(hidden.numel()).requires_grad_()
         probabilities.requires_grad_()
