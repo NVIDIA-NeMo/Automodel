@@ -19,7 +19,9 @@ Different chat templates wrap tool calls in different syntax:
   ``<tool_call>{"name": ..., "arguments": ...}</tool_call>``
 * Llama 3.1+: ``<|python_tag|>{"name": ..., "parameters": ...}<|eom_id|>``
 * Mistral: ``[TOOL_CALLS][{...}, {...}]``
-* Harmony / GPT-OSS: ``<|channel|>commentary to=functions.NAME<|message|>{...}``
+* Harmony / GPT-OSS: ``<|channel|>commentary to=functions.NAME<|message|>{...}``,
+  or ``to=functions.NAME<|channel|>commentary<|message|>{...}`` with the recipient
+  in the role section, optionally with ``<|constrain|>json`` before ``<|message|>``
 
 This parser tries each known wrapper, then falls back to a generic JSON
 object scan. It is intentionally permissive: malformed JSON, missing
@@ -57,10 +59,15 @@ class ParsedToolCall:
 
 
 # Harmony / GPT-OSS prefix anchor; the JSON body is then extracted with a
-# balanced-brace scanner so nested ``{...}`` arguments survive.
+# balanced-brace scanner so nested ``{...}`` arguments survive. The recipient
+# may sit in the channel section (``<|channel|>commentary to=functions.NAME``)
+# or in the role section (``to=functions.NAME<|channel|>commentary``), and a
+# ``<|constrain|>json`` token may precede ``<|message|>``. ``(?![\w\-])`` keeps
+# the name from backtracking into the header, which would be quadratic.
 _HARMONY_ANCHOR_RE = re.compile(
-    r"<\|channel\|>\s*commentary\s+to=functions\.(?P<name>[\w\-]+)[^<]*"
-    r"<\|message\|>\s*",
+    r"(?P<chan><\|channel\|>\s*commentary\s+)?to=functions\.(?P<name>[\w\-]+)(?![\w\-])"
+    r"(?(chan)|\s*<\|channel\|>\s*commentary\b)"
+    r"(?:[^<]|<\|constrain\|>)*<\|message\|>\s*",
 )
 # Qwen / Hermes / FunctionGemma / Gemma 3 / GLM-4. The closing ``</tool_call>``
 # is a strong anchor so non-greedy capture is safe here.
