@@ -277,8 +277,8 @@ def test_tokenizer_build_preserves_checkpoint_revision(monkeypatch: pytest.Monke
         return tokenizer
 
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", from_pretrained)
-    config = DeepseekV41Config(name_or_path="local/checkpoint", _commit_hash="pinned-revision")
-    assert config.build_tokenizer() is tokenizer
+    config = DeepseekV41Config(name_or_path="local/checkpoint")
+    assert config.build_tokenizer(revision="pinned-revision") is tokenizer
     assert received == {
         "source": "local/checkpoint",
         "revision": "pinned-revision",

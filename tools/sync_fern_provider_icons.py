@@ -70,6 +70,7 @@ PROVIDER_ORGS = {
     "parasail-ai": "parasail-ai",
     "poolside": "poolside",
     "qwen": "Qwen",
+    "reflection": "reflection",
     "stabilityai": "stabilityai",
     "stepfun-ai": "stepfun-ai",
     "tencent": "tencent",
