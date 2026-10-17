@@ -27,6 +27,10 @@ from nemo_automodel.components.distributed.config import (
     MoEParallelizerConfig,
 )
 from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+from nemo_automodel.components.distributed.parallelizer_utils import (
+    reject_unsupported_mtp_cp,
+    reject_unsupported_mtp_cp_pp,
+)
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.mesh import MeshContext
@@ -59,6 +63,11 @@ def _apply_model_parallelizer(
     mesh_context: MeshContext,
 ) -> nn.Module:
     """Execute shared strategy dispatch for one model-owned parallelizer."""
+    # Diffusers components also use this dispatcher without AutoModel capabilities.
+    if mesh_context.cp_size > 1 and hasattr(model, "supports"):
+        reject_unsupported_mtp_cp_pp(model, pp_size=mesh_context.pp_size)
+        reject_unsupported_mtp_cp(model)
+
     if mesh_context.ep_size > 1:
         return _parallelize_moe(model, mesh_context, parallelizer=parallelizer)
     if isinstance(mesh_context.strategy_config, FSDP2Config):
@@ -169,7 +178,12 @@ def _parallelize_ddp(model: nn.Module, mesh_context: MeshContext) -> nn.Module:
 
     config = mesh_context.strategy_config
     assert isinstance(config, DDPConfig)
-    return parallelize_ddp(model, config, reapply_trainability=mesh_context.reapply_trainability)
+    return parallelize_ddp(
+        model,
+        config,
+        device=mesh_context.ddp_device,
+        reapply_trainability=mesh_context.reapply_trainability,
+    )
 
 
 def _parallelize_megatron_fsdp(model: nn.Module, mesh_context: MeshContext) -> nn.Module:
