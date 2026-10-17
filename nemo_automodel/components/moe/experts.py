@@ -39,7 +39,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
-from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.shared.import_utils import is_te_min_version, safe_import
 
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
@@ -250,6 +250,7 @@ class _AllGatherConcatVarlenFn(Function):
 
 
 if TYPE_CHECKING:
+    from transformer_engine.common.recipe import Recipe
     from transformer_engine.pytorch import GroupedLinear
 
     from nemo_automodel.components.models.common.utils import BackendConfig
@@ -1845,7 +1846,8 @@ class GroupedExpertsTE(nn.Module):
         Args:
             config: MoE configuration containing expert parameters.
             backend: Backend configuration; reads ``benchmark_static_routing``
-                (cache the per-microbatch split list under forced-balanced routing).
+                (cache the per-microbatch split list under forced-balanced routing) and
+                ``te_grouped_tensor`` (prefer TE native grouped-tensor GEMMs).
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
@@ -1860,8 +1862,6 @@ class GroupedExpertsTE(nn.Module):
                 "apply_router_weight_after_down is not supported by GroupedExpertsTE. "
                 "Use BackendConfig(experts='torch_mm') or the DeepEP expert backend."
             )
-
-        from transformer_engine.pytorch import GroupedLinear
 
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
@@ -1886,6 +1886,9 @@ class GroupedExpertsTE(nn.Module):
         # first-microbatch copy, since forced-balanced routing makes it constant.
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self._static_m_splits: list | None = None
+        self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
+        if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
+            raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1906,42 +1909,50 @@ class GroupedExpertsTE(nn.Module):
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
         )
 
-        # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
-        # Non-gated (ReLU²): out_features = moe_inter_dim
-        gate_up_out_features = config.moe_inter_dim * 2 if self.is_gated else config.moe_inter_dim
-
-        # Create TE GroupedLinear layers with full expert count on meta device first
-        self.gate_up_linear = GroupedLinear(
-            num_gemms=config.n_routed_experts,
-            in_features=config.expert_dim,
-            out_features=gate_up_out_features,
-            bias=self.expert_bias,
-            params_dtype=config.dtype,
-            device="meta",
-        )
-        # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
-            num_gemms=config.n_routed_experts,
-            in_features=config.moe_inter_dim,
-            out_features=config.expert_dim,
-            bias=self.expert_bias,
-            params_dtype=config.dtype,
-            device="meta",
-        )
-
+        self._init_grouped_layers(self.num_local_experts)
         self.expert_activation = get_expert_activation_for_deepep(config)
-
-        # FP8 padding/unpadding for GEMM alignment (initialized with full expert count,
-        # re-created in init_token_dispatcher with num_local_experts for EP)
-        from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding
-
-        self.fp8_padding = Fp8Padding(config.n_routed_experts)
-        self.fp8_unpadding = Fp8Unpadding(config.n_routed_experts)
+        self._grouped_tensor_signature: tuple["Recipe | None", torch.dtype] | None = None
 
         self.token_dispatcher = None
         self.ep_mesh = None
         self.moe_mesh = None
         self.ep_rank = 0
+
+    def _init_grouped_layers(self, num_local_experts: int) -> None:
+        """Construct both TE projections and their padding for this EP partition."""
+        from transformer_engine.pytorch import GroupedLinear
+
+        grouped_linear_kwargs = {"use_grouped_tensor": True} if self.use_grouped_tensor else {}
+        gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
+
+        # Create both projections on meta for the current local expert count.
+        self.gate_up_linear = GroupedLinear(
+            num_gemms=num_local_experts,
+            in_features=self.config.expert_dim,
+            out_features=gate_up_out_features,
+            bias=self.expert_bias,
+            params_dtype=self.config.dtype,
+            device="meta",
+            **grouped_linear_kwargs,
+        )
+        # down_linear: [moe_inter_dim] -> [dim]
+        self.down_linear = GroupedLinear(
+            num_gemms=num_local_experts,
+            in_features=self.config.moe_inter_dim,
+            out_features=self.config.expert_dim,
+            bias=self.expert_bias,
+            params_dtype=self.config.dtype,
+            device="meta",
+            **grouped_linear_kwargs,
+        )
+
+        # Recreate padding with the same local expert count after EP repartitioning.
+        from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding
+
+        self.fp8_padding = Fp8Padding(num_local_experts)
+        self.fp8_unpadding = Fp8Unpadding(num_local_experts)
+        self.native_fp8_padding = Fp8Padding(num_local_experts, align_size=128) if self.use_grouped_tensor else None
+        self.native_fp8_unpadding = Fp8Unpadding(num_local_experts, align_size=128) if self.use_grouped_tensor else None
 
     def _get_stacked_weight(self, linear: "GroupedLinear", transpose: bool = False) -> torch.Tensor:
         weights = []
@@ -2168,8 +2179,6 @@ class GroupedExpertsTE(nn.Module):
         Args:
             ep_mesh: Device mesh for expert parallelism.
         """
-        from transformer_engine.pytorch import GroupedLinear
-
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
         _patch_te_modules()
@@ -2184,26 +2193,7 @@ class GroupedExpertsTE(nn.Module):
         )
         self.num_local_experts = self.config.n_routed_experts // self.ep_size
 
-        gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
-
-        self.gate_up_linear = GroupedLinear(
-            num_gemms=self.num_local_experts,
-            in_features=self.config.expert_dim,
-            out_features=gate_up_out_features,
-            bias=self.expert_bias,
-            params_dtype=self.config.dtype,
-            device="meta",
-        )
-
-        # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
-            num_gemms=self.num_local_experts,
-            in_features=self.config.moe_inter_dim,
-            out_features=self.config.expert_dim,
-            bias=self.expert_bias,
-            params_dtype=self.config.dtype,
-            device="meta",
-        )
+        self._init_grouped_layers(self.num_local_experts)
 
         token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
@@ -2233,12 +2223,6 @@ class GroupedExpertsTE(nn.Module):
             ep_group=ep_mesh.get_group(),
         )
 
-        # Re-create FP8 padding/unpadding with num_local_experts for EP
-        from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding
-
-        self.fp8_padding = Fp8Padding(self.num_local_experts)
-        self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
-
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
         """Return dispatcher-owned resources that must be ready before a PP step.
 
@@ -2263,13 +2247,13 @@ class GroupedExpertsTE(nn.Module):
         Forward pass using TE's GroupedLinear with native FP8 support.
 
         Args:
-            x: [num_tokens, model_dim] input tensor
-            token_mask: [num_tokens] boolean mask for valid tokens
-            weights: [num_tokens, num_activated_experts] routing weights
-            indices: [num_tokens, num_activated_experts] expert indices
+            x: CUDA tensor of shape [tokens, hidden], local to this EP rank.
+            token_mask: Boolean tensor of shape [tokens] marking valid tokens.
+            weights: Tensor of shape [tokens, top_k] with routing probabilities.
+            indices: Integer tensor of shape [tokens, top_k] with global expert IDs.
 
         Returns:
-            [num_tokens, model_dim] output tensor
+            Tensor of shape [tokens, hidden], local to this EP rank.
         """
         assert not isinstance(x, DTensor), "Input should not be a DTensor"
         assert self.config.n_routed_experts % self.ep_size == 0, (
@@ -2297,16 +2281,46 @@ class GroupedExpertsTE(nn.Module):
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         fp8_active = FP8GlobalStateManager.is_fp8_enabled()
+        recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8_active else None
+        if self.use_grouped_tensor:
+            from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
+
+            dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
+            signature = (recipe, dtype)
+            if signature != self._grouped_tensor_signature:
+                if not is_module_grouped_tensor_path_supported(recipe, dtype):
+                    raise ValueError(
+                        f"te_grouped_tensor=True does not support {recipe!r} with {dtype} on this device. "
+                        "Set te_grouped_tensor=False to use the legacy TE path."
+                    )
+                self._grouped_tensor_signature = signature
         actual_m_splits = None
-        if fp8_active:
+        unpadding = self.fp8_unpadding
+        if recipe is not None:
             actual_m_splits = m_splits
-            permuted_local_hidden_states, m_splits = self.fp8_padding(permuted_local_hidden_states, m_splits)
-            permuted_probs, _ = self.fp8_padding(permuted_probs, actual_m_splits)
+            padding = self.fp8_padding
+            if self.use_grouped_tensor and (recipe.mxfp8() or recipe.float8_block_scaling()):
+                # Native MXFP8 and FP8 block scaling require 128-row segments;
+                # the legacy MXFP8 padding defaults to 32. Keep separate modules
+                # so external autocast recipe changes do not cache this alignment
+                # into the legacy/current-scaling path.
+                assert self.native_fp8_padding is not None and self.native_fp8_unpadding is not None
+                padding = self.native_fp8_padding
+                unpadding = self.native_fp8_unpadding
+            permuted_local_hidden_states, m_splits = padding(permuted_local_hidden_states, m_splits)
+            permuted_probs, _ = padding(permuted_probs, actual_m_splits)
 
         if sum(m_splits) > 0:
-            output1 = self.gate_up_linear(permuted_local_hidden_states, m_splits)
+            # The native grouped-tensor API consumes device-side int64 split sizes.
+            # Keep the host list for padding, unpadding, and the legacy TE path.
+            grouped_m_splits = (
+                torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
+                if self.use_grouped_tensor
+                else m_splits
+            )
+            output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
             output1 = self.expert_activation(output1, permuted_probs)
-            output2 = self.down_linear(output1, m_splits)
+            output2 = self.down_linear(output1, grouped_m_splits)
             # The down-projection bias must be weighted by the per-token routing probability
             # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
             # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
@@ -2350,7 +2364,7 @@ class GroupedExpertsTE(nn.Module):
             output2 = output2 + all_expert_dependency
 
         if fp8_active and actual_m_splits is not None:
-            output2 = self.fp8_unpadding(output2, actual_m_splits)
+            output2 = unpadding(output2, actual_m_splits)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
