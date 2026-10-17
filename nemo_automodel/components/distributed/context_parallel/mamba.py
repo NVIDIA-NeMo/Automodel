@@ -169,25 +169,40 @@ def _all_to_all_hp2cp(
 
 def _reorder_chunks(
     input_: torch.Tensor,
-    order: list[int],
+    order: list[int] | torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reorder equal-sized chunks of a tensor according to *order*.
 
     Args:
-        input_: ``[B, L, H]`` (BSHD) or ``[T, H]`` (THD).
-        order: Permutation indices (length must equal the number of chunks).
-        cu_seqlens: If provided, reorder per-sequence on dim=0 (THD).
+        input_: Tensor of shape [batch, sequence, hidden] (BSHD), or
+            [tokens, hidden] (packed THD) when ``cu_seqlens`` is provided.
+        order: Permutation of equal-sized chunk indices. For packed THD,
+            also accepts an integer tensor [num_chunks] on the input device
+            to avoid uploading a Python list on each call. BSHD uses a list.
+        cu_seqlens: Integer tensor of shape [sequences + 1] containing the
+            global padded THD boundaries, starting at zero and ending at
+            ``tokens``. Each sequence length must be positive and divisible
+            by ``len(order)``. May reside on CPU or the input device.
+
+    Returns:
+        Tensor with the input shape, dtype, and device, with chunks permuted
+        independently within each sequence. Does not mutate or alias ``input_``.
     """
     num_chunks = len(order)
 
     if cu_seqlens is not None:
-        parts = []
-        for i in range(len(cu_seqlens) - 1):
-            start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
-            chunks = input_[start:end].split((end - start) // num_chunks, dim=0)
-            parts.append(torch.cat([chunks[j] for j in order], dim=0))
-        return torch.cat(parts, dim=0)
+        cu_seqlens = cu_seqlens.to(device=input_.device)
+        positions = torch.arange(input_.shape[0], device=input_.device)
+        sequence_ids = torch.bucketize(positions, cu_seqlens[1:], right=True)
+        starts = cu_seqlens[sequence_ids]
+        chunk_sizes = (cu_seqlens[sequence_ids + 1] - starts) // num_chunks
+        offsets = positions - starts
+        chunk_order = torch.as_tensor(order, device=input_.device)
+        source_positions = starts + chunk_order[offsets // chunk_sizes] * chunk_sizes + offsets % chunk_sizes
+        # This is a permutation: each input row receives exactly one gradient
+        # row. A single gather avoids a full-sized slice gradient per document.
+        return input_.index_select(0, source_positions)
 
     chunks = torch.chunk(input_, chunks=num_chunks, dim=1)
     return torch.cat([chunks[i] for i in order], dim=1)
@@ -213,12 +228,18 @@ def _deinterleave_packed_seqs(
     ``_undo_attention_load_balancing`` reorder that follows).
 
     Args:
-        input_: 2-D tensor ``[T_global, H]``.
-        cu_seqlens: **Local** (pre-all-to-all) cumulative sequence lengths.
-        cp_size: Context-parallel world size.
+        input_: Tensor of shape [global_tokens, local_hidden], containing
+            CP ranks' local token blocks consecutively after all-to-all.
+        cu_seqlens: Integer tensor of shape [sequences + 1], containing
+            positive-length local padded sequence boundaries. Starts at zero
+            and ends at ``global_tokens // cp_size``. May reside on CPU or
+            the input device.
+        cp_size: Context-parallel world size; must divide ``global_tokens``.
 
     Returns:
-        Rearranged 2-D tensor with the same shape.
+        Tensor of shape [global_tokens, local_hidden], in sequence-major order
+        with each sequence's rank blocks consecutive. Preserves dtype/device
+        and does not mutate the input; aliases it for at most one sequence.
     """
     num_seqs = len(cu_seqlens) - 1
     if num_seqs <= 1:
@@ -227,14 +248,14 @@ def _deinterleave_packed_seqs(
     # Each rank contributes a contiguous block of T_local tokens.
     T_local = input_.shape[0] // cp_size
 
-    parts: list[torch.Tensor] = []
-    for s in range(num_seqs):
-        start_s = cu_seqlens[s].item()
-        end_s = cu_seqlens[s + 1].item()
-        for r in range(cp_size):
-            offset = r * T_local
-            parts.append(input_[offset + start_s : offset + end_s])
-    return torch.cat(parts, dim=0)
+    cu_seqlens = cu_seqlens.to(device=input_.device)
+    positions = torch.arange(input_.shape[0], device=input_.device)
+    sequence_ids = torch.bucketize(positions, cu_seqlens[1:] * cp_size, right=True)
+    starts = cu_seqlens[sequence_ids]
+    lengths = cu_seqlens[sequence_ids + 1] - starts
+    offsets = positions - starts * cp_size
+    source_positions = (offsets // lengths) * T_local + starts + offsets % lengths
+    return input_.index_select(0, source_positions)
 
 
 def _reinterleave_packed_seqs(
@@ -246,22 +267,34 @@ def _reinterleave_packed_seqs(
 
     Rearranges from sequence-major back to rank-major order before the
     inverse all-to-all in ``post_conv_ssm``.
+
+    Args:
+        input_: Tensor of shape [global_tokens, local_hidden], containing
+            each packed sequence's CP rank blocks consecutively.
+        cu_seqlens: Integer tensor of shape [sequences + 1], containing
+            positive-length local padded sequence boundaries. Starts at zero
+            and ends at ``global_tokens // cp_size``. May reside on CPU or
+            the input device.
+        cp_size: Context-parallel world size; must divide ``global_tokens``.
+
+    Returns:
+        Tensor of shape [global_tokens, local_hidden], with all of each CP
+        rank's token blocks consecutive. Preserves dtype/device and does not
+        mutate the input; aliases it for at most one sequence.
     """
     num_seqs = len(cu_seqlens) - 1
     if num_seqs <= 1:
         return input_
 
-    # Build per-rank blocks by gathering each rank's portion of every sequence.
-    seq_lens = [(cu_seqlens[s + 1] - cu_seqlens[s]).item() for s in range(num_seqs)]
-    # In the deinterleaved (sequence-major) layout each sequence occupies
-    # seq_len_local * cp_size contiguous tokens.
-    rank_blocks: list[list[torch.Tensor]] = [[] for _ in range(cp_size)]
-    offset = 0
-    for s in range(num_seqs):
-        for r in range(cp_size):
-            rank_blocks[r].append(input_[offset : offset + seq_lens[s]])
-            offset += seq_lens[s]
-    return torch.cat([torch.cat(rb, dim=0) for rb in rank_blocks], dim=0)
+    cu_seqlens = cu_seqlens.to(device=input_.device)
+    T_local = input_.shape[0] // cp_size
+    positions = torch.arange(input_.shape[0], device=input_.device)
+    local_positions = positions % T_local
+    sequence_ids = torch.bucketize(local_positions, cu_seqlens[1:], right=True)
+    starts = cu_seqlens[sequence_ids]
+    lengths = cu_seqlens[sequence_ids + 1] - starts
+    source_positions = starts * cp_size + (positions // T_local) * lengths + local_positions - starts
+    return input_.index_select(0, source_positions)
 
 
 def _undo_attention_load_balancing(
@@ -269,9 +302,25 @@ def _undo_attention_load_balancing(
     cp_size: int,
     cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Reorder from DualChunkSwap to sequential for SSM processing."""
+    """Reorder from DualChunkSwap to sequential for SSM processing.
+
+    Args:
+        input_: Tensor [batch, sequence, hidden], or packed [tokens, hidden].
+        cp_size: Context-parallel world size.
+        cu_seqlens: Optional integer tensor [sequences + 1] of global padded
+            THD boundaries on CPU or the input device. Each document length
+            must be positive and divisible by ``2 * cp_size``.
+
+    Returns:
+        Tensor with the input shape, dtype, and device, in sequential order
+        within each document. Does not mutate or alias the input.
+    """
     num_chunks = 2 * cp_size
-    order = [2 * i for i in range(cp_size)] + [num_chunks - 1 - 2 * i for i in range(cp_size)]
+    if cu_seqlens is not None:
+        chunks = torch.arange(num_chunks, device=input_.device)
+        order = torch.where(chunks < cp_size, 2 * chunks, 2 * (num_chunks - chunks) - 1)
+    else:
+        order = [2 * i for i in range(cp_size)] + [num_chunks - 1 - 2 * i for i in range(cp_size)]
     return _reorder_chunks(input_, order, cu_seqlens)
 
 
@@ -283,11 +332,26 @@ def _redo_attention_load_balancing(
     """Reorder from sequential back to DualChunkSwap for attention.
 
     Inverse of :func:`_undo_attention_load_balancing`.
+
+    Args:
+        input_: Tensor [batch, sequence, hidden], or packed [tokens, hidden].
+        cp_size: Context-parallel world size.
+        cu_seqlens: Optional integer tensor [sequences + 1] of global padded
+            THD boundaries on CPU or the input device. Each document length
+            must be positive and divisible by ``2 * cp_size``.
+
+    Returns:
+        Tensor with the input shape, dtype, and device, in DualChunkSwap order
+        within each document. Does not mutate or alias the input.
     """
     num_chunks = 2 * cp_size
-    order = [None] * num_chunks
-    order[::2] = range(cp_size)
-    order[1::2] = reversed(range(cp_size, num_chunks))
+    if cu_seqlens is not None:
+        chunks = torch.arange(num_chunks, device=input_.device)
+        order = torch.where(chunks % 2 == 0, chunks // 2, num_chunks - 1 - chunks // 2)
+    else:
+        order = [None] * num_chunks
+        order[::2] = range(cp_size)
+        order[1::2] = reversed(range(cp_size, num_chunks))
     return _reorder_chunks(input_, order, cu_seqlens)
 
 

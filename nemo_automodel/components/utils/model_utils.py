@@ -216,6 +216,10 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         total_params += n
         if p.requires_grad:
             trainable_params += n
+        # Quantized parameters can store packed integer bytes. They still count
+        # above, but a norm of those bytes is neither supported nor meaningful.
+        if not (p.is_floating_point() or p.is_complex()):
+            continue
         try:
             local_sq_norm += p.detach().norm(2) ** 2
         except Exception:
@@ -770,10 +774,11 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
     batch has already been converted to THD format (with batch_size=1 as a placeholder
     dimension) and that dimension needs to be removed.
 
-    The function performs three key operations:
+    The function performs four key operations:
     1. Removes the batch dimension (dim 0) from input tensors
     2. Filters out padding values from cumulative sequence length tensors
     3. Converts max_seqlen from tensor to scalar if needed
+    4. Resolves the microbatch's TE padding flag from its complete boundary arrays
 
     Args:
         input_ids (torch.Tensor or None): Input token IDs with shape [1, total_tokens]
@@ -842,6 +847,11 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
             attn_kwargs[key] = value[value != seqlens_padding_value].contiguous()
         if key == "max_seqlen" and isinstance(value, torch.Tensor):
             attn_kwargs[key] = value.item()
+
+    # Resolve chunked THD metadata once per model call, after removing sentinels.
+    # A single batch-wide flag cannot describe microbatches with different padding.
+    if attn_kwargs.get("cu_seqlens_padded") is not None and attn_kwargs.get("pad_between_seqs") is None:
+        attn_kwargs["pad_between_seqs"] = not torch.equal(attn_kwargs["cu_seqlens_padded"], attn_kwargs["cu_seqlens"])
 
     return input_ids, position_ids, padding_mask, attn_kwargs
 
