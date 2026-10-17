@@ -757,7 +757,7 @@ class GroupedExperts(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
-        if backend is not None and getattr(backend, "compile_router_weight", False):
+        if backend is not None and backend.compile_router_weight:
             _compile_router_weight_cores()
 
         # Allocate projection tensor - size depends on whether activation is gated
@@ -1446,7 +1446,7 @@ class GroupedExpertsDeepEP(nn.Module):
         # routes the grouped
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
-        if backend is not None and getattr(backend, "compile_router_weight", False):
+        if backend is not None and backend.compile_router_weight:
             _compile_router_weight_cores()
         # Benchmark-only (BackendConfig.benchmark_static_routing, validated there): routing
         # metadata is identical per microbatch, so host copies of it can be cached.
@@ -1554,8 +1554,8 @@ class GroupedExpertsDeepEP(nn.Module):
         Returns:
             Expert-sorted activations [dispatched_tokens, hidden], counts [local_experts],
             and probabilities [dispatched_tokens, 1]. Nonempty probabilities retain the
-            dispatcher's dtype and autograd connection; empty probabilities use the
-            configured compute dtype.
+            dispatcher's dtype and require gradients only when ``weights`` does;
+            empty probabilities use the configured compute dtype.
         """
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
@@ -1565,6 +1565,11 @@ class GroupedExpertsDeepEP(nn.Module):
             token_indices=indices,
         )
         permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, self.config.dtype)
+        # Multi-output dispatcher autograd functions can attach gradients to probabilities
+        # merely because the hidden states require them. Routing probabilities depend only
+        # on the original weights, so preserve frozen routers through dispatch/permutation.
+        if not weights.requires_grad:
+            permuted_probs = permuted_probs.detach()
         permuted_probs = permuted_probs.unsqueeze(-1)
         return permuted_local_hidden_states, tokens_per_expert, permuted_probs
 
@@ -2200,6 +2205,10 @@ class GroupedExpertsTE(nn.Module):
             token_probs=weights,
             token_indices=indices,
         )
+        # Dispatcher autograd couples its outputs even when routing weights are frozen.
+        # Preserve the router's gradient requirement before the expert activation.
+        if not weights.requires_grad:
+            permuted_probs = permuted_probs.detach()
         permuted_probs = permuted_probs.unsqueeze(-1)
 
         m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)

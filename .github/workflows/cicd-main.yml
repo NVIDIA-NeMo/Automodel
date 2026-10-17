@@ -468,8 +468,8 @@ jobs:
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
-            # GPU shards take ~30 minutes before teardown and coverage finish.
-            timeout: 40
+            # Shard 1 takes ~40 minutes before process exit and coverage finish.
+            timeout: 45
             shard-id: 0
             num-shards: 2
           - test-name: L0_Unit_Tests_GPU_2_of_2
