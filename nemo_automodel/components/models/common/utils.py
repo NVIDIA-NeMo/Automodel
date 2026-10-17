@@ -1399,6 +1399,30 @@ def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
             module._buffers[buffer_name] = buf.to(torch.float32)
 
 
+def lm_head_compute_dtype(lm_head: nn.Module) -> torch.dtype | None:
+    """Return the dtype ``lm_head`` projects in, or ``None`` when it cannot be known.
+
+    A standalone FSDP2 head reports its mixed-precision parameter dtype, because its sharded weight may still
+    expose the master-copy dtype before the forward pre-hook runs; any other head reports the dtype of its
+    materialized ``weight``. ``compute_lm_head_logits`` casts the projection input to it, and a model whose head
+    keeps a different precision from its activations (DeepSeek V4.1's fp32 ``lm_head``) hands the final hidden
+    states out in it, so the recipe's fused loss projects in the head's dtype without a cast of its own.
+
+    Args:
+        lm_head: The language-model head module.
+
+    Returns:
+        The head's compute dtype, or ``None`` when neither an FSDP2 policy nor a ``weight`` tensor is present.
+    """
+    compute_dtype = None
+    if isinstance(lm_head, FSDPModule):
+        compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
+    lm_head_weight = getattr(lm_head, "weight", None)
+    if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
+        compute_dtype = lm_head_weight.dtype
+    return compute_dtype
+
+
 def compute_lm_head_logits(
     lm_head: nn.Module | None,
     hidden_states: torch.Tensor,
@@ -1436,10 +1460,9 @@ def compute_lm_head_logits(
       to fp32 (e.g. via the MoE ``lm_head_precision`` setting). The matmul goes
       through ``lm_head`` (``nn.Linear``, DTensor-aware under FSDP2) rather than
       ``F.linear`` so DTensor redistribution is preserved.
-    - Otherwise, cast the sliced input to the head's effective compute dtype.
-      For a standalone FSDP2 head this comes from its mixed-precision policy,
-      since its sharded weight may still expose the master-copy dtype before the
-      forward pre-hook runs. Other heads use their materialized weight dtype.
+    - Otherwise, cast the sliced input to the head's effective compute dtype
+      (``lm_head_compute_dtype``: the FSDP2 mixed-precision policy of a
+      standalone head, else the materialized weight dtype).
     - ``output_hidden_states``: when set, the (full-sequence, THD-restored)
       ``hidden_states`` are attached to the output so the fused cross-entropy
       path can recompute logits over every position; otherwise the field is
@@ -1477,12 +1500,7 @@ def compute_lm_head_logits(
         if fp32_lm_head:
             logits = lm_head(sliced.float()).to(hidden_states.dtype)
         else:
-            compute_dtype = None
-            if isinstance(lm_head, FSDPModule):
-                compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
-            lm_head_weight = getattr(lm_head, "weight", None)
-            if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
-                compute_dtype = lm_head_weight.dtype
+            compute_dtype = lm_head_compute_dtype(lm_head)
             projection_input = sliced.to(compute_dtype) if compute_dtype is not None else sliced
             logits = lm_head(projection_input)
     if is_thd and logits.dim() == 2:
