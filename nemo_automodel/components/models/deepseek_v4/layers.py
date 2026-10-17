@@ -80,6 +80,7 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     dsv4_sinkhorn_normalize,
     dsv4_sparse_attention,
 )
+from nemo_automodel.components.models.deepseek_v4.sparse_mask import DSV4SparseMask
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -1323,6 +1324,7 @@ class DeepseekV4Attention(nn.Module):
         rotary_compress: nn.Module | None = None,
         start_pos: int = 0,
         position_ids: torch.Tensor | None = None,
+        sparse_mask: DSV4SparseMask | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         cp_group = kwargs.get("_dsv4_cp_group") or getattr(self, "_cp_group", None)
@@ -1379,6 +1381,7 @@ class DeepseekV4Attention(nn.Module):
         vanilla_key_len = full_kv.shape[2]
         n_pooled = 0
         indexer_topk: torch.LongTensor | None = None
+        pooled_seq_ids = pooled_positions = None
 
         if self.compressor is not None:
             assert rotary_compress is not None and position_embeddings_compress is not None, (
@@ -1398,9 +1401,12 @@ class DeepseekV4Attention(nn.Module):
                 # Ratio 4 uses the Indexer/SCA path and is outside this fix.
                 # Direct attention calls without an explicit mask keep the
                 # original behavior since synthetic windows must be maskable.
-                # The normal DeepSeek-V4 model path builds this mask upstream.
+                # The model supplies either a dense mask or compact visibility
+                # metadata; both require the same HCA graph alignment.
                 enable_hca_fsdp_graph_alignment=(
-                    self.training and attention_mask is not None and self.compress_ratio == 128
+                    self.training
+                    and (attention_mask is not None or sparse_mask is not None)
+                    and self.compress_ratio == 128
                 ),
                 position_ids=position_ids,
                 packed_seq_ids=packed_seq_ids,
@@ -1484,6 +1490,16 @@ class DeepseekV4Attention(nn.Module):
                 vision_token_types=vision_token_types,
                 max_image_tokens=int(getattr(self.config, "vision_max_n_token", 0) or 0),
             )
+            if sparse_mask is not None:
+                topk_idxs = sparse_mask.filter_indices(
+                    topk_idxs,
+                    vanilla_key_len=vanilla_key_len,
+                    compress_ratio=self.compress_ratio,
+                    query_positions=query_positions,
+                    query_seq_ids=packed_seq_ids,
+                    pooled_seq_ids=pooled_seq_ids if n_pooled else None,
+                    pooled_positions=pooled_positions if n_pooled else None,
+                )
             attn_output = dsv4_sparse_attention(
                 q.transpose(1, 2).contiguous(),
                 full_kv.squeeze(1).contiguous(),
