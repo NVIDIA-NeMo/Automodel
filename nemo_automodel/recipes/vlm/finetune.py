@@ -99,12 +99,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import (
-    VLM_INPUT_KEYS,
-    _supports_logits_to_keep,
-    filter_forward_kwargs,
-    final_hidden_states_kwargs,
-)
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -1045,7 +1040,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(**{**batch, "logits_to_keep": 1, **final_hidden_states_kwargs(model)})
+                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
                             f"{type(self.loss_fn).__name__} requires the model to output hidden states. "
@@ -1318,9 +1313,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, LinearCrossEntropy):
-                        out = self.model_parts[0](
-                            **{**batch, "logits_to_keep": 1, **final_hidden_states_kwargs(self.model_parts[0])}
-                        )
+                        out = self.model_parts[0](**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     else:
                         out = self.model_parts[0](**batch)
                     local_loss = calculate_loss(

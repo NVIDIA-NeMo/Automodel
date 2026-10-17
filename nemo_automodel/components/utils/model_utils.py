@@ -135,37 +135,6 @@ VLM_INPUT_KEYS: tuple[str, ...] = (
 )
 
 
-def final_hidden_states_kwargs(model: Any) -> dict[str, bool]:
-    """Return the forward kwarg that makes ``model`` attach its final hidden states.
-
-    HF-style models expose every layer through ``output_hidden_states=True`` and the
-    recipe reads the last entry. Models whose ``output_hidden_states`` means something
-    else (DeepSeek V4.1 captures its per-layer hyper-connection residual streams,
-    shape ``[batch, sequence, streams, hidden]``) provide the final normalized
-    ``[batch, sequence, hidden]`` tensor through ``return_hidden_states=True`` instead;
-    this helper picks the kwarg from the forward signature so the fused
-    cross-entropy path works with both contracts.
-
-    Args:
-        model: The model (or wrapper) whose ``forward`` signature is inspected.
-
-    Returns:
-        ``{"return_hidden_states": True}`` when the forward accepts that argument,
-        otherwise ``{"output_hidden_states": True}``.
-    """
-    # Look through DDP / torch.compile wrappers: their forwards take **kwargs.
-    for _ in range(8):
-        inner = getattr(model, "module", None) if type(model).__name__ == "DistributedDataParallel" else None
-        inner = inner if inner is not None else getattr(model, "_orig_mod", None)
-        if inner is None:
-            break
-        model = inner
-    signature = _get_forward_signature(model)
-    if signature is not None and "return_hidden_states" in signature.parameters:
-        return {"return_hidden_states": True}
-    return {"output_hidden_states": True}
-
-
 def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
     """Drop kwargs that ``model.forward`` does not accept.
 

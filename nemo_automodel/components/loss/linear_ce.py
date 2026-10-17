@@ -215,11 +215,6 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
         # Both options only apply to the cce kernel.
         cce_opts = {"filter_eps": None, "accum_e_fp32": True} if self.impl == "cce" else {}
 
-        if hidden_states.dtype != lm_weight.dtype:
-            # An fp32 output head (e.g. the MoE ``lm_head_precision`` policy) keeps its precision:
-            # project in the head's dtype instead of demoting the weight to the activation dtype.
-            hidden_states = hidden_states.to(lm_weight.dtype)
-
         # Compute loss with shift=False to match PyTorch behavior
         loss = linear_cross_entropy(
             hidden_states,
