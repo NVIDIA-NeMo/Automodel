@@ -65,6 +65,7 @@ from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     cast_model_to_dtype,
     compute_lm_head_logits,
+    lm_head_compute_dtype,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
@@ -338,7 +339,7 @@ class DeepseekV41Model(nn.Module):
         image_grid_hws: torch.Tensor | None = None,
         vision_token_types: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        output_hidden_states: bool = False,
+        output_residual_streams: bool = False,
         cp_group: dist.ProcessGroup | None = None,
         packed_seq_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
@@ -353,14 +354,16 @@ class DeepseekV41Model(nn.Module):
             image_grid_hws: Optional patch grids [images, 2].
             vision_token_types: Optional image/text markers [batch, sequence].
             inputs_embeds: Optional projected multimodal embeddings [batch, sequence, hidden].
-            output_hidden_states: Whether to retain streams before each block.
+            output_residual_streams: Whether to retain the residual streams before each block
+                (parity and debugging; not the recipe interface).
             packed_seq_ids: Optional document IDs [batch, local_sequence], zero for padding.
             cp_group: CP group; token axes above are local sequence shards.
                 Engram hashes use global token history, with only local rows looked up.
 
         Returns:
-            Final normalized hidden states [batch, sequence, hidden] and optional
-            per-block streams [batch, sequence, streams, hidden].
+            Final normalized hidden states [batch, sequence, hidden] and, under
+            ``output_residual_streams``, the per-block residual streams
+            [batch, sequence, streams, hidden] captured before each block; else None.
         """
         # Fuse within this FSDP owner's forward so learned image delimiters
         # are unsharded before they are read.
@@ -395,7 +398,7 @@ class DeepseekV41Model(nn.Module):
             position_ids, attention_mask, packed_seq_ids, sequence=input_ids.shape[1], cp_group=cp_group
         )
         state = DeepseekV41AttentionState()
-        captured = [] if output_hidden_states else None
+        captured = [] if output_residual_streams else None
         for layer in self.layers.values():
             if captured is not None:
                 captured.append(hidden_states)
@@ -609,8 +612,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         image_grid_hws: torch.Tensor | None = None,
         vision_token_types: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
-        return_hidden_states: bool = False,
         output_hidden_states: bool = False,
+        output_residual_streams: bool = False,
         cp_group: dist.ProcessGroup | None = None,
         packed_seq_ids: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
@@ -628,8 +631,12 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             image_grid_hws: Optional patch-grid sizes [images, 2].
             vision_token_types: Optional image/text markers [batch, sequence].
             logits_to_keep: Number of final positions, or integer position indices [kept].
-            return_hidden_states: Return final hidden states for the recipe's loss.
-            output_hidden_states: Capture residual streams for numerical comparisons.
+            output_hidden_states: Attach the final normalized hidden states
+                [batch, sequence, hidden], in the head's dtype, as every other model
+                does; the recipes' fused loss projects them with ``lm_head.weight``.
+            output_residual_streams: Attach the per-layer residual streams instead, a
+                tuple of [batch, sequence, streams, hidden] captured before each block,
+                for parity checks and debugging. Exclusive with ``output_hidden_states``.
             seq_lens: Optional real document lengths [batch, documents] for packed text.
             seq_lens_padded: Optional physical document spans [batch, documents].
             qkv_format: Optional "thd" marker from packed_sequence_thd_collater.
@@ -640,7 +647,10 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
 
         Returns:
             CausalLMOutputWithPast containing logits [batch, kept_sequence, vocab],
-            optional scalar loss, and requested hidden tensors. No inference KV cache.
+            optional scalar loss, and ``hidden_states``: the final hidden states
+            [batch, sequence, hidden] under ``output_hidden_states``, the per-block
+            residual streams under ``output_residual_streams``, else None. No
+            inference KV cache.
         """
         if cp_group is None and self.cp_mesh is not None:
             cp_group = self.cp_mesh.get_group()
@@ -679,6 +689,11 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             raise ValueError("Packed text requires seq_lens")
         if qkv_format not in (None, "thd"):
             raise ValueError("DeepSeek V4.1 qkv_format must be omitted or 'thd'")
+        if output_hidden_states and output_residual_streams:
+            raise ValueError(
+                "output_hidden_states returns the final hidden states and output_residual_streams the per-layer "
+                "residual streams; request one of them"
+            )
         hidden, captured = self.model(
             input_ids,
             position_ids=position_ids,
@@ -686,15 +701,22 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             pixel_values=pixel_values,
             image_grid_hws=image_grid_hws,
             vision_token_types=vision_token_types,
-            output_hidden_states=output_hidden_states,
+            output_residual_streams=output_residual_streams,
             cp_group=cp_group,
             packed_seq_ids=packed_seq_ids,
         )
         if layout is not None:
             hidden = layout.restore(hidden)
             captured = None if captured is None else tuple(layout.restore(values) for values in captured)
+        if output_hidden_states:
+            # The fp32 head is this model's own policy (class docstring, ``lm_head_precision``), so the activations
+            # meet it here, where they are produced: the recipes' fused loss reads ``hidden_states`` and projects
+            # with ``lm_head.weight`` itself, and the shared loss must not promote them on the model's behalf.
+            head_dtype = lm_head_compute_dtype(self.lm_head)
+            if head_dtype is not None and hidden.dtype != head_dtype:
+                hidden = hidden.to(head_dtype)
         projected = compute_lm_head_logits(
-            self.lm_head, hidden, logits_to_keep, output_hidden_states=return_hidden_states
+            self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states
         )
         loss = None
         if labels is not None:
@@ -715,7 +737,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         return CausalLMOutputWithPast(
             loss=loss,
             logits=projected.logits,
-            hidden_states=captured if output_hidden_states else projected.hidden_states,
+            hidden_states=captured if output_residual_streams else projected.hidden_states,
         )
 
     @torch.no_grad()

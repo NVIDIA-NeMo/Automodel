@@ -47,6 +47,7 @@ from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCa
 from nemo_automodel.components.moe.layers import FakeBalancedGate
 from nemo_automodel.components.moe.parallelizer import _is_deepseek_v4_model, apply_ac
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 
 # Over the default 5s budget on purpose: this module runs full-model forwards and distributed FSDP checks.
 # Shrink the model fixtures and process startup before lowering this further.
@@ -102,7 +103,7 @@ def test_full_tiny_ced_model_trains_after_meta_initialization() -> None:
     assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight
     inputs = torch.randint(0, 64, (2, 12))
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.002)
-    initial = model(inputs, labels=inputs, output_hidden_states=True)
+    initial = model(inputs, labels=inputs, output_residual_streams=True)
     assert initial.logits.shape == (2, 12, 64)
     assert len(initial.hidden_states) == 6
     initial_loss = initial.loss.item()
@@ -193,10 +194,12 @@ def test_bf16_backbone_returns_unrounded_fp32_logits():
         model.lm_head.weight.copy_(
             torch.linspace(-0.04321, 0.05137, model.lm_head.weight.numel()).view_as(model.lm_head.weight)
         )
-    result = model(torch.tensor([[3, 5, 7, 9]]), return_hidden_states=True)
-    assert result.hidden_states.dtype == torch.bfloat16
+    result = model(torch.tensor([[3, 5, 7, 9]]), output_hidden_states=True)
+    # The final hidden states come out in the head's dtype: bf16 values promoted once, where they are produced.
+    assert result.hidden_states.dtype == torch.float32
+    assert torch.equal(result.hidden_states, result.hidden_states.bfloat16().float())
     assert result.logits.dtype == torch.float32
-    expected = F.linear(result.hidden_states.float(), model.lm_head.weight)
+    expected = F.linear(result.hidden_states, model.lm_head.weight)
     torch.testing.assert_close(result.logits, expected, rtol=0, atol=0)
     assert torch.count_nonzero(result.logits != result.logits.bfloat16().float()) > 0
     result.logits.square().mean().backward()
@@ -211,9 +214,9 @@ def test_labels_match_independent_shifted_logprob_and_head_gradient():
     labels = ids.clone()
     labels[0, 2] = -100
     original = labels.clone()
-    result = model(ids, labels=labels, return_hidden_states=True)
+    result = model(ids, labels=labels, output_hidden_states=True)
     # Compare API variants under the same grad mode and before backward.
-    plain = model(ids, return_hidden_states=True)
+    plain = model(ids, output_hidden_states=True)
     assert plain.loss is None
     torch.testing.assert_close(plain.logits, result.logits, rtol=0, atol=0)
     reference = result.logits.detach().clone().requires_grad_()
@@ -268,12 +271,34 @@ def test_labels_shape_and_inputs_embeds_contract() -> None:
 def test_captured_streams_and_final_hidden_states_have_distinct_contracts() -> None:
     model = _model()
     ids = torch.tensor([[3, 4, 5, 6]])
-    final = model(ids, return_hidden_states=True)
-    captured = model(ids, output_hidden_states=True)
+    final = model(ids, output_hidden_states=True)
+    captured = model(ids, output_residual_streams=True)
     assert final.hidden_states.shape == (1, 4, 16)
     assert len(captured.hidden_states) == 1
     assert captured.hidden_states[0].shape == (1, 4, 4, 16)
     torch.testing.assert_close(final.logits, captured.logits, rtol=0, atol=0)
+    assert model(ids).hidden_states is None
+    with pytest.raises(ValueError, match="request one of them"):
+        model(ids, output_hidden_states=True, output_residual_streams=True)
+    # the model-local kwarg of #3855 is gone: the shared contract is the only way to ask for the final states
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        model(ids, return_hidden_states=True)
+
+
+def test_output_hidden_states_honours_the_recipes_fused_loss_contract() -> None:
+    """The recipes call ``model(**batch, logits_to_keep=1, output_hidden_states=True)`` for a ``LinearCrossEntropy``
+    loss and project ``get_final_hidden_states(out)`` with ``lm_head.weight`` themselves: V4.1 must hand them the
+    final ``[batch, sequence, hidden]`` tensor (not a residual-stream capture) in the head's dtype."""
+    torch.manual_seed(5)
+    model = _model("bfloat16")
+    ids = torch.tensor([[3, 4, 5, 6]])
+    out = model(ids, logits_to_keep=1, output_hidden_states=True)
+    hidden = get_final_hidden_states(out)
+    assert hidden is out.hidden_states and isinstance(hidden, torch.Tensor)
+    assert hidden.shape == (1, 4, model.config.text_config.hidden_size)
+    assert hidden.dtype == model.lm_head.weight.dtype == torch.float32
+    # the kept logits are the head applied to the same cast tensor (same slice shape: bitwise, CPU GEMM blocking aside)
+    torch.testing.assert_close(F.linear(hidden[:, -1:], model.lm_head.weight), out.logits, rtol=0, atol=0)
 
 
 def test_dspark_target_features_are_attention_input_stream_means() -> None:
