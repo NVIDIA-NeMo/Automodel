@@ -93,6 +93,7 @@ from nemo_automodel.components.models.deepseek_v41.processing import (
     IMAGE_START,
     image_inputs_from_batch,
 )
+from nemo_automodel.components.models.deepseek_v41.quantization import compile_cache_quantization
 from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import DeepseekV41StateDictAdapter
 from nemo_automodel.components.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
@@ -248,6 +249,8 @@ class DeepseekV41Model(nn.Module):
             compile_hc_cores()
         if backend.compile_norm and backend.rms_norm != "te":
             compile_norm_core()
+        if config.compile_cache_quant:
+            compile_cache_quantization()
         dtype = dtype_from_str(config.dtype, torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
         active_engram = any(i < config.num_hidden_layers for i in config.engram_layer_ids)

@@ -112,15 +112,37 @@ class MLP(nn.Module):
         if self.swiglu_limit > 0.0:
             # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
             # gate clamp and symmetric up clamp; cast back before down_proj.
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            if x.is_cuda:
+                # One fused kernel instead of two fp32 up-casts, two clamps, silu, mul and a down-cast
+                # (seven launches and two fp32 temporaries per call; the shared-expert branch is issued on
+                # a side stream while the main stream waits for its launches).
+                return self.down_proj(_clamped_swiglu_act(gate, up, self.swiglu_limit))
             dtype = x.dtype
-            gate = self.gate_proj(x).float().clamp(max=self.swiglu_limit)
-            up = self.up_proj(x).float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            gate = gate.float().clamp(max=self.swiglu_limit)
+            up = up.float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
             return self.down_proj((F.silu(gate) * up).to(dtype))
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
         self.apply(init_weights_fn)
+
+
+@torch.compile(fullgraph=True)
+def _clamped_swiglu_act(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
+    """fp32 clamped SwiGLU on separate gate / up projections, cast back to the input dtype.
+
+    Same arithmetic as the eager branch of ``MLP.forward`` (the DeepSeek-V4 reference Expert.forward); inductor
+    fuses it into one kernel per direction. Dynamo's default shape policy: the first token count compiles a static
+    graph, the second recompiles once with a symbolic row count and every later shape reuses it — ``dynamic=False``
+    with ``fullgraph=True`` would instead raise ``FailOnRecompileLimitHit`` after ``recompile_limit`` distinct
+    token counts (variable-length batches). CPU inputs keep the eager chain.
+    """
+    gate_f = gate.float().clamp(max=limit)
+    up_f = up.float().clamp(min=-limit, max=limit)
+    return (F.silu(gate_f) * up_f).to(gate.dtype)
 
 
 class FakeBalancedGate(nn.Module):
@@ -662,23 +684,24 @@ class Gate(nn.Module):
         indices: torch.Tensor,
         token_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Computes the load of each expert based on the selected indices.
+        """Compute expert loads from this rank's local tokens.
+
         Args:
-            indices (torch.Tensor): Indices of the selected experts.
-                Shape is [num_tokens, num_activated_experts].
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
-                Shape is [num_tokens].
+            indices: Integer tensor of shape [tokens, activated_experts] containing
+                selected expert IDs. Repeated IDs count once per token.
+            token_mask: Tensor of shape [tokens] on the same device as ``indices``.
+                Boolean values select valid tokens; numeric values are converted
+                to the indices' dtype before contributing to the load.
 
         Returns:
-            torch.Tensor: Load of each expert (number of tokens routed to each expert).
-                Shape is [num_local_experts].
+            Int64 tensor of shape [n_experts] on the same device as ``indices``,
+            containing each expert's load from the local tokens.
         """
-        # Create a mask for the experts based on the selected indices.
-        expert_mask = indices.new_zeros((indices.shape[0], self.n_experts))
-        contribution = token_mask.to(dtype=expert_mask.dtype).unsqueeze(-1).expand(-1, indices.shape[1])
-        expert_mask.scatter_(dim=1, index=indices, src=contribution)
-        return expert_mask.sum(dim=0)
+        # Keep the token reduction contiguous to avoid column-reduction scratch storage.
+        expert_mask = indices.new_zeros((self.n_experts, indices.shape[0]))
+        contribution = token_mask.to(dtype=expert_mask.dtype).unsqueeze(0).expand(indices.shape[1], -1)
+        expert_mask.scatter_(dim=0, index=indices.T, src=contribution)
+        return expert_mask.sum(dim=1)
 
     def _compute_aux_loss(
         self,

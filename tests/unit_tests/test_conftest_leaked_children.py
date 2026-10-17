@@ -50,6 +50,25 @@ def test_next_test_has_no_stale_workers():
     assert not mp.active_children(), "timeout cleanup left stale multiprocessing children"
 """
 
+_UNREAPED_WORKER = """
+import multiprocessing.process
+import os
+from collections.abc import Iterator
+
+
+@pytest.fixture(scope="session", autouse=True)
+def defer_worker_reaping() -> Iterator[None]:
+    # A bounded join can return before it reaps the worker. Wait for a real
+    # exit without consuming its status to exercise that cleanup race reliably.
+    def join_without_reaping(self: multiprocessing.process.BaseProcess, timeout: float | None = None) -> None:
+        patch.undo()
+        os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOWAIT)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(multiprocessing.process.BaseProcess, "join", join_without_reaping)
+        yield
+"""
+
 _HANGING_POPEN = """
 import subprocess
 import sys
@@ -91,17 +110,20 @@ def test_timeout_does_not_own_existing_child(persistent_child):
 """
 
 
+@pytest.mark.parametrize("defer_reaping", [False, True], ids=["normal-join", "unreaped-worker"])
 @pytest.mark.runtime_budget(
     30,
     hard_timeout=70,
     reason="starts a fresh pytest subprocess that imports torch and spawns a worker",
 )
-def test_pytest_exits_after_timed_out_spawn(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch):
+def test_pytest_exits_after_timed_out_spawn(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, defer_reaping: bool
+) -> None:
     # pytester relocates HOME for inner runs, which hides user-site installs such as torch from a fresh
     # interpreter, so hand the subprocess the outer interpreter's import path.
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(path for path in sys.path if path))
     pytester.makeconftest(_CONFTEST_SOURCE)
-    pytester.makepyfile(test_hang=_HANGING_WORKER)
+    pytester.makepyfile(test_hang=_HANGING_WORKER + (_UNREAPED_WORKER if defer_reaping else ""))
     # Without the cleanup, interpreter shutdown blocks on the sleeping worker and this raises TimeoutExpired.
     result = pytester.runpytest_subprocess("-p", "no:cacheprovider", timeout=40)
     result.assert_outcomes(passed=1, failed=1, errors=1)
