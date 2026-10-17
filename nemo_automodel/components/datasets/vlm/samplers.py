@@ -13,57 +13,17 @@
 # limitations under the License.
 
 import logging
-import math
 import time
 
 import torch
 from torch.utils.data import Sampler
 
+from nemo_automodel.components.datasets.vlm.media_token_estimation import (
+    DEFAULT_TOKENS_PER_MEDIA_ITEM,
+    MediaTokenEstimator,
+)
+
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Lightweight reimplementations of the smart_resize helpers from HF
-# transformers (qwen2_vl / qwen3_vl).  Kept local so this module has no
-# dependency on a specific model package.
-# ---------------------------------------------------------------------------
-
-
-def _smart_resize_image(height, width, factor=28, min_pixels=56 * 56, max_pixels=14 * 14 * 4 * 1280):
-    """Compute the resized (height, width) for an image, matching
-    ``transformers.models.qwen2_vl.image_processing_qwen2_vl.smart_resize``.
-    """
-    h_bar = round(height / factor) * factor
-    w_bar = round(width / factor) * factor
-    if h_bar * w_bar > max_pixels:
-        beta = math.sqrt((height * width) / max_pixels)
-        h_bar = max(factor, math.floor(height / beta / factor) * factor)
-        w_bar = max(factor, math.floor(width / beta / factor) * factor)
-    elif h_bar * w_bar < min_pixels:
-        beta = math.sqrt(min_pixels / (height * width))
-        h_bar = math.ceil(height * beta / factor) * factor
-        w_bar = math.ceil(width * beta / factor) * factor
-    return h_bar, w_bar
-
-
-def _smart_resize_video(
-    num_frames, height, width, temporal_factor=2, factor=32, min_pixels=128 * 128, max_pixels=16 * 16 * 2 * 2 * 2 * 6144
-):
-    """Compute the resized (height, width) for a video, matching
-    ``transformers.models.qwen3_vl.video_processing_qwen3_vl.smart_resize``.
-    """
-    h_bar = round(height / factor) * factor
-    w_bar = round(width / factor) * factor
-    t_bar = math.ceil(num_frames / temporal_factor) * temporal_factor
-    if t_bar * h_bar * w_bar > max_pixels:
-        beta = math.sqrt((num_frames * height * width) / max_pixels)
-        h_bar = max(factor, math.floor(height / beta / factor) * factor)
-        w_bar = max(factor, math.floor(width / beta / factor) * factor)
-    elif t_bar * h_bar * w_bar < min_pixels:
-        beta = math.sqrt(min_pixels / (num_frames * height * width))
-        h_bar = math.ceil(height * beta / factor) * factor
-        w_bar = math.ceil(width * beta / factor) * factor
-    return h_bar, w_bar
 
 
 class LengthGroupedSampler(Sampler):
@@ -83,8 +43,8 @@ class LengthGroupedSampler(Sampler):
         dataset: The dataset to sample from.
         seed: Base random seed (same value on every rank).
         processor: Optional HuggingFace processor (e.g. ``Qwen2VLProcessor``).
-            Used to read ``image_processor`` / ``video_processor`` attributes
-            for accurate media token estimation via ``smart_resize``.
+            Used by :class:`MediaTokenEstimator` for accurate media token
+            estimation.
     """
 
     def __init__(self, dataset, seed=42, processor=None, max_length=None, batch_size=1):
@@ -94,14 +54,8 @@ class LengthGroupedSampler(Sampler):
         self.max_length = max_length
         self.batch_size = max(1, batch_size)
 
-        # Extract processor config for accurate media token estimation
-        self._image_cfg = self._extract_image_config(processor) if processor is not None else None
-        self._video_cfg = self._extract_video_config(processor) if processor is not None else None
-
-        if self._image_cfg is not None:
-            logger.info("LengthGroupedSampler image config: %s", self._image_cfg)
-        if self._video_cfg is not None:
-            logger.info("LengthGroupedSampler video config: %s", self._video_cfg)
+        # Resolves media token counts from the processor (see media_token_estimation)
+        self._media_estimator = MediaTokenEstimator(processor)
 
         # Compute text and media tokens separately for two-level sorting
         self.text_lengths, self.media_lengths = self._compute_or_load_lengths(dataset)
@@ -209,123 +163,6 @@ class LengthGroupedSampler(Sampler):
         return text_lengths, media_lengths
 
     # ------------------------------------------------------------------
-    # Processor config extraction
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_image_config(processor):
-        ip = getattr(processor, "image_processor", None)
-        if ip is None:
-            return None
-        patch_size = getattr(ip, "patch_size", 14)
-        merge_size = getattr(ip, "merge_size", 2)
-        # Qwen2VL/Qwen3VL store min/max_pixels as direct attributes;
-        # fall back to ip.size dict with both Qwen-style and HF-style keys.
-        size = getattr(ip, "size", {}) or {}
-        min_pixels = getattr(ip, "min_pixels", None) or size.get("min_pixels") or size.get("shortest_edge") or 56 * 56
-        max_pixels = (
-            getattr(ip, "max_pixels", None) or size.get("max_pixels") or size.get("longest_edge") or 14 * 14 * 4 * 1280
-        )
-        return {
-            "patch_size": patch_size,
-            "merge_size": merge_size,
-            "factor": patch_size * merge_size,
-            "min_pixels": min_pixels,
-            "max_pixels": max_pixels,
-        }
-
-    @staticmethod
-    def _extract_video_config(processor):
-        vp = getattr(processor, "video_processor", None)
-        if vp is None:
-            return None
-        patch_size = getattr(vp, "patch_size", 16)
-        merge_size = getattr(vp, "merge_size", 2)
-        temporal_patch_size = getattr(vp, "temporal_patch_size", 2)
-        # Qwen2VL/Qwen3VL store min/max_pixels as direct attributes;
-        # fall back to vp.size dict with both Qwen-style and HF-style keys.
-        size = getattr(vp, "size", {}) or {}
-        min_pixels = getattr(vp, "min_pixels", None) or size.get("min_pixels") or size.get("shortest_edge") or 128 * 128
-        max_pixels = (
-            getattr(vp, "max_pixels", None)
-            or size.get("max_pixels")
-            or size.get("longest_edge")
-            or 16 * 16 * 2 * 2 * 2 * 6144
-        )
-        fps = getattr(vp, "fps", 2.0)
-        min_frames = getattr(vp, "min_frames", 4)
-        max_frames = getattr(vp, "max_frames", 768)
-        return {
-            "patch_size": patch_size,
-            "merge_size": merge_size,
-            "temporal_patch_size": temporal_patch_size,
-            "factor": patch_size * merge_size,
-            "min_pixels": min_pixels,
-            "max_pixels": max_pixels,
-            "fps": fps,
-            "min_frames": min_frames,
-            "max_frames": max_frames,
-        }
-
-    # ------------------------------------------------------------------
-    # Media token estimation (accurate, using smart_resize)
-    # ------------------------------------------------------------------
-
-    def _estimate_image_tokens(self, img_meta):
-        """Estimate token count for one image from its ``[height, width]`` metadata."""
-        cfg = self._image_cfg
-        height, width = int(img_meta[0]), int(img_meta[1])
-        resized_h, resized_w = _smart_resize_image(
-            height,
-            width,
-            factor=cfg["factor"],
-            min_pixels=cfg["min_pixels"],
-            max_pixels=cfg["max_pixels"],
-        )
-        merge_length = cfg["merge_size"] ** 2
-        return (resized_h // cfg["patch_size"]) * (resized_w // cfg["patch_size"]) // merge_length
-
-    def _estimate_video_tokens(self, vid_meta):
-        """Estimate token count for one video from its
-        ``[total_frames, height, width, fps, duration]`` metadata.
-        """
-        cfg = self._video_cfg
-        total_frames = int(vid_meta[0])
-        height = int(vid_meta[1])
-        width = int(vid_meta[2])
-        fps = float(vid_meta[3])
-        duration = float(vid_meta[4])
-
-        if total_frames == 0 and fps > 0:
-            total_frames = int(duration * fps)
-
-        # Compute sampled frame count (mirrors HF video processor logic)
-        if fps > 0:
-            nframes = max(1, int(total_frames / fps * cfg["fps"]))
-        else:
-            nframes = max(1, int(duration * cfg["fps"]))
-
-        nframes = min(total_frames, cfg["max_frames"], nframes)
-        nframes = max(cfg["min_frames"], nframes)
-
-        tp = cfg["temporal_patch_size"]
-        if nframes % tp != 0:
-            nframes = ((nframes + tp - 1) // tp) * tp
-
-        resized_h, resized_w = _smart_resize_video(
-            nframes,
-            height,
-            width,
-            temporal_factor=tp,
-            factor=cfg["factor"],
-            min_pixels=cfg["min_pixels"],
-            max_pixels=cfg["max_pixels"],
-        )
-        grid_t = nframes // tp
-        merge_length = cfg["merge_size"] ** 2
-        return grid_t * (resized_h // cfg["patch_size"]) * (resized_w // cfg["patch_size"]) // merge_length
-
-    # ------------------------------------------------------------------
     # Length estimation
     # ------------------------------------------------------------------
 
@@ -363,21 +200,13 @@ class LengthGroupedSampler(Sampler):
                         media_count += 1
 
         mm_meta = example.get("mm_inputs_meta")
-        if mm_meta is not None and (self._image_cfg is not None or self._video_cfg is not None):
-            media_tokens = 0
-            images_meta = mm_meta.get("images_meta")
-            if images_meta and self._image_cfg is not None:
-                for img_meta in images_meta:
-                    if img_meta is not None:
-                        media_tokens += self._estimate_image_tokens(img_meta)
-
-            videos_meta = mm_meta.get("videos_meta")
-            if videos_meta and self._video_cfg is not None:
-                for vid_meta in videos_meta:
-                    if vid_meta is not None:
-                        media_tokens += self._estimate_video_tokens(vid_meta)
+        if mm_meta is not None and self._media_estimator.can_estimate:
+            media_tokens = self._media_estimator.estimate_media_tokens(
+                images_meta=mm_meta.get("images_meta"),
+                videos_meta=mm_meta.get("videos_meta"),
+            )
         else:
-            media_tokens = media_count * 500
+            media_tokens = media_count * DEFAULT_TOKENS_PER_MEDIA_ITEM
 
         return text_tokens, media_tokens
 
