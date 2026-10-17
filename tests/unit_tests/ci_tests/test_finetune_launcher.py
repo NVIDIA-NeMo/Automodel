@@ -26,10 +26,11 @@ from torch.distributed.elastic.rendezvous import RendezvousParameters, c10d_rend
 
 
 @pytest.mark.parametrize("timeout", ["", "37"])
-def test_finetune_and_checkpoint_launches_apply_connection_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: str
+@pytest.mark.parametrize("numa_binding", ["", "node", "socket", "exclusive", "core-complex", "node; exit 0"])
+def test_finetune_and_checkpoint_launches_apply_torchrun_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: str, numa_binding: str
 ) -> None:
-    """Exercise shell command generation and the actual C10d timeout consumer."""
+    """Exercise shell arguments, torchrun CPU binding, and the C10d timeout consumer."""
     # CLI tests replace this module during collection. Import the real parser
     # within the test and restore the prior module/attribute during teardown.
     monkeypatch.delitem(sys.modules, "torch.distributed.run", raising=False)
@@ -67,8 +68,15 @@ def test_finetune_and_checkpoint_launches_apply_connection_timeout(
         "CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION": "true",
         "CHECKPOINT_ROBUSTNESS_PHASES": "train_and_save automodel_reload resume",
         "REQUIRE_FINITE_METRICS": "false",
+        "TORCHRUN_NUMA_BINDING": numa_binding,
     }
-    subprocess.run(["bash", str(launcher)], env=env, capture_output=True, text=True, check=True, timeout=10)
+    result = subprocess.run(["bash", str(launcher)], env=env, capture_output=True, text=True, timeout=10)
+    if numa_binding == "node; exit 0":
+        assert result.returncode == 2
+        assert "Invalid TORCHRUN_NUMA_BINDING" in result.stderr
+        assert not argv_log.exists()
+        return
+    result.check_returncode()
 
     commands = argv_log.read_bytes().split(b"\0\0")
     assert commands.pop() == b""
@@ -78,6 +86,10 @@ def test_finetune_and_checkpoint_launches_apply_connection_timeout(
     for command in commands:
         args = torch_run.get_args_parser().parse_args(command.decode().split("\0"))
         config, _, _ = torch_run.config_from_args(args)
+        if numa_binding:
+            assert config.numa_options.affinity_mode.value == numa_binding
+        else:
+            assert config.numa_options is None
         parameters = RendezvousParameters(
             backend=config.rdzv_backend,
             endpoint=config.rdzv_endpoint,

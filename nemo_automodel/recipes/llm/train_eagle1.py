@@ -30,6 +30,7 @@ from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloade
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule, FeatureNoiseConfig
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_draft_spec
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
@@ -262,6 +263,13 @@ class TrainEagle1Recipe(SpecDecodeRecipeBase):
 
         # Optional Weights & Biases logging (rank 0 only).
         self._init_wandb_run(wandb_name_prefix + str(target_path).rstrip("/").split("/")[-1])
+
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
+            trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
+            trackio_cfg.name = trackio_cfg.name or wandb_name_prefix + str(target_path).rstrip("/").split("/")[-1]
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
+            logger.info("Trackio experiment tracking enabled")
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist EAGLE-recipe-specific scalars. Subclasses extend this."""
@@ -540,6 +548,8 @@ class TrainEagle1Recipe(SpecDecodeRecipeBase):
 
         if getattr(self, "wandb_run", None) is not None:
             self.wandb_run.finish()
+        if getattr(self, "trackio_logger", None) is not None:
+            self.trackio_logger.finish()
 
 
 def main(config_path: str | None = None):

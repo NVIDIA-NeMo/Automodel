@@ -439,7 +439,10 @@ class SpecDecodeRecipeBase(BaseRecipe):
         return True
 
     def _wandb_log(self, data: dict, step: int) -> None:
-        """Log a metrics dict to the rank-0 W&B run when one is active."""
+        """Log a metrics dict to the rank-0 W&B and Trackio runs when active."""
         run = getattr(self, "wandb_run", None)
         if run is not None:
             run.log(data, step=step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(data, step=step)

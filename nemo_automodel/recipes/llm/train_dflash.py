@@ -40,6 +40,7 @@ from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloade
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import DFlashDraftSpec, resolve_dflash_draft_spec
@@ -301,6 +302,15 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
         self._init_wandb_run(type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1])
+
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
+            trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
+            trackio_cfg.name = (
+                trackio_cfg.name or type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1]
+            )
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
+            logger.info("Trackio experiment tracking enabled")
 
     def _build_target_model(self, recipe_cfg, target_path: str, draft_spec: DFlashDraftSpec) -> torch.nn.Module:
         """Load the frozen (optionally tensor-parallel) target model.

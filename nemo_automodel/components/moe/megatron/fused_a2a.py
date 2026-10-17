@@ -160,8 +160,23 @@ class HybridEPDispatchReplayRecorder:
         self._cursor = 0
         self.replay_misses = 0
 
-    def record(self, handle, tokens_per_expert) -> None:
-        self._records.append([handle, tokens_per_expert, None])
+    def record(self, handle, tokens_per_expert, num_permuted_tokens=None) -> None:
+        """Log one checkpoint-forward dispatch.
+
+        When the forward already ran with a host ``int`` extent (capacity mode), that integer is
+        the extent its output was sized to and the one the replay must reuse; recording it also
+        spares ``finalize`` the device-to-host copy for that dispatch (a pre-filled extent is skipped).
+
+        Args:
+            handle: HybridEP dispatch handle the recompute replays from.
+            tokens_per_expert: ``[num_local_experts]`` integer tensor of rows per local expert; when no
+                host extent is recorded, ``finalize`` copies its sum to the host asynchronously and
+                ``resolve`` reads it when the recompute opens.
+            num_permuted_tokens: Host ``int`` extent the forward output was sized to (capacity mode), or
+                a tensor / ``None`` (blocking path, static-routing pin) when ``finalize`` must reduce it.
+        """
+        extent = num_permuted_tokens if isinstance(num_permuted_tokens, int) else None
+        self._records.append([handle, tokens_per_expert, extent])
         self._copies.append(None)
 
     def finalize(self) -> None:
@@ -875,7 +890,7 @@ class HybridEPDispatch(torch.autograd.Function):
         if recorder is not None and _hybridep_dispatch_replay_state.mode == "record":
             # Keep only the reusable layout and its output extent. Recomputed
             # activations and probabilities are still redispatched through it.
-            recorder.record(handle, tokens_per_expert)
+            recorder.record(handle, tokens_per_expert, num_permuted_tokens)
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -998,6 +1013,11 @@ class HybridEPCombine(torch.autograd.Function):
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
             fuse_permute_dispatch=ctx.fuse_permute,
+            # Capacity mode hands a host int: the backward dispatch then needs no stream drain either.
+            # The static-routing pin is a 0-d tensor (``tokens_per_expert.sum()``): the forward treats
+            # any non-None extent as non-blocking, but the backward keeps that pin on the blocking path
+            # as before this change, which only moves the capacity path off the drain.
+            non_blocking=isinstance(ctx.num_permuted_tokens, int),
         )
         return dispatched_hidden, None, None, None, None
 
