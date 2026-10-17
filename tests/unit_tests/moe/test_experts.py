@@ -955,6 +955,8 @@ class TestGroupedExpertsDeepEP:
         hidden_states, probs = args[4], args[5]
         hidden_states.requires_grad_()
         probs.requires_grad_()
+        # Match the mocked dispatched probabilities with a trainable input router.
+        args[2].requires_grad_()
         gemm_rows = []
 
         def dense_mm(value, weights, offs):
@@ -1068,6 +1070,80 @@ class TestGroupedExpertsDeepEP:
             hidden_dim=moe_config.expert_dim,
             dtype=moe_config.dtype,
         )
+
+    @pytest.mark.parametrize("train_router", [False, True])
+    def test_dispatch_preserves_routing_gradient_requirement(self, moe_config, train_router):
+        """A dispatcher's coupled outputs must not unfreeze constant routing weights."""
+
+        class CoupledDispatch(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: object, hidden: torch.Tensor, probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                """Couple dispatch outputs through one autograd node.
+
+                Args:
+                    ctx: Autograd context, unused by this identity dispatch.
+                    hidden: Token activations shaped [tokens, hidden].
+                    probs: Routing probabilities shaped [tokens, 1].
+
+                Returns:
+                    Cloned activations and probabilities shaped [tokens].
+                """
+                return hidden.clone(), probs[:, 0].clone()
+
+            @staticmethod
+            def backward(
+                ctx: object, hidden_grad: torch.Tensor, probs_grad: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                """Restore gradients to the input layouts.
+
+                Args:
+                    ctx: Autograd context, unused by this identity dispatch.
+                    hidden_grad: Activation gradient shaped [tokens, hidden].
+                    probs_grad: Routing gradient shaped [tokens].
+
+                Returns:
+                    Activation gradient and routing gradient shaped [tokens, 1].
+                """
+                return hidden_grad, probs_grad.unsqueeze(-1)
+
+        experts = GroupedExpertsDeepEP(moe_config)
+        experts.token_dispatcher = Mock()
+
+        def dispatch(
+            *,
+            hidden_states: torch.Tensor,
+            num_local_tokens: int,
+            token_probs: torch.Tensor,
+            token_indices: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Simulate dispatch where autograd initially couples both outputs.
+
+            Args:
+                hidden_states: Activations shaped [tokens, hidden].
+                num_local_tokens: Number of tokens assigned to the single expert.
+                token_probs: Routing probabilities shaped [tokens, 1].
+                token_indices: Expert indices shaped [tokens, 1], unused here.
+
+            Returns:
+                Activations [tokens, hidden], counts [1], and probabilities [tokens].
+            """
+            hidden, probs = CoupledDispatch.apply(hidden_states, token_probs)
+            assert probs.requires_grad  # Autograd couples the dispatcher outputs.
+            return hidden, torch.tensor([num_local_tokens]), probs
+
+        experts.token_dispatcher.token_permutation2.side_effect = dispatch
+        hidden = torch.randn(4, 8, requires_grad=True)
+        probs = torch.rand(4, 1, requires_grad=train_router)
+        routed, _, routed_probs = experts._dispatch_tokens(
+            hidden, torch.ones(4, dtype=torch.bool), probs, torch.zeros(4, 1, dtype=torch.long)
+        )
+        assert routed_probs.requires_grad == train_router
+        (routed * routed_probs).sum().backward()
+        torch.testing.assert_close(hidden.grad, probs.detach().expand_as(hidden))
+        if train_router:
+            torch.testing.assert_close(probs.grad, hidden.detach().sum(-1, keepdim=True))
+        else:
+            assert probs.grad is None
 
     def test_grouped_experts_deepep_apply_bias_no_bias(self, moe_config):
         """Test _apply_bias method with no bias."""
