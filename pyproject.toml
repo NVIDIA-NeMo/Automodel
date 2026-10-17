@@ -79,7 +79,7 @@ dependencies = [
     "ninja",
     "pyyaml",
     "tiktoken",
-    "torch>=2.6.0",
+    "torch>=2.8.0",
     "torchdata",
     # Before upgrading, recheck HF #49373 and nemo_automodel/components/models/pixtral/compat.py.
     # Run tests/ci_tests/scripts/test_pixtral_compat.sh cpu <version> and gpu <version>:
@@ -350,7 +350,8 @@ constraint-dependencies = [
 override-dependencies = [
     # leptonai (via nemo-run) caps anyio<=4.9.0; override to keep the security floor
     "anyio>=4.14.2",
-    "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
+    # TE native grouped GEMM with current-scaling FP8 requires cuBLASLt 13.5+ on Hopper.
+    "nvidia-cublas>=13.5; sys_platform == 'linux'",
     # leptonai pins 7.0.0, which caps Starlette below its security-fixed 1.x releases
     "prometheus-fastapi-instrumentator>=8.1.0",
     # databricks-sql-connector caps thrift<0.25; override to retain the security floor.
