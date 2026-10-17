@@ -50,7 +50,6 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-from .backend import Qwen3_8_FlashNextBackendConfig
 from .config import Qwen3_8_FlashNextConfig, Qwen3_8_FlashNextTextConfig
 from .cp import (
     Qwen3_8_FlashNextCPContext,
@@ -74,7 +73,7 @@ class Qwen3_8_FlashNextCausalLMOutput(CausalLMOutputWithPast):
 
 def _qwen3_8_flash_next_backend(backend: BackendConfig | None = None) -> BackendConfig:
     """Return a typed backend with the model's unfused rotary path."""
-    resolved = copy.copy(backend) if backend is not None else Qwen3_8_FlashNextBackendConfig()
+    resolved = copy.copy(backend) if backend is not None else BackendConfig()
     resolved.rope_fusion = False
     return resolved
 
@@ -489,7 +488,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     _owns_cp_attention = True
     # Packed (THD) training and packed CP are owned by the model's
     # route-indexed QSA path for the listed CUDA backends.
-    _packed_cp_attn_backends = ("flex", "cute")
+    _packed_cp_attn_backends = ("flex", "fa4")
 
     @dataclass(frozen=True)
     class ModelCapabilities:
