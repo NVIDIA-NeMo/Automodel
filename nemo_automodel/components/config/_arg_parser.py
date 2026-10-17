@@ -94,30 +94,32 @@ def parse_args_and_load_config(default_cfg_path: str | None = None, argv: list[s
         dotted, val_str = kv.split("=", 1)
         cfg.set_by_dotted(dotted, translate_value(val_str))
 
-    # Resolve the optional `wandb.enable` toggle after overrides, so that
+    # Resolve the optional `wandb.enable` / `trackio.enable` toggles after overrides, so that
     # `wandb.enable=true` passed on the CLI is honored.
-    _resolve_wandb_enable(cfg)
+    _resolve_logger_enable(cfg, "wandb")
+    _resolve_logger_enable(cfg, "trackio")
 
     return cfg
 
 
-def _resolve_wandb_enable(cfg: ConfigNode) -> None:
-    """Apply the optional ``wandb.enable`` toggle in place.
+def _resolve_logger_enable(cfg: ConfigNode, section: str) -> None:
+    """Apply the optional ``<section>.enable`` toggle of a logger section in place.
 
-    A present ``wandb:`` block enables Weights & Biases logging by default
+    A present ``wandb:`` / ``trackio:`` block enables that logger by default
     (backward compatible). Setting ``enable: false`` disables it: the whole
-    ``wandb`` section is dropped so every downstream presence check
+    section is dropped so every downstream presence check
     (``cfg.wandb``, ``cfg.get("wandb")``, ``hasattr(cfg, "wandb")``) consistently
     sees it as absent. The flag itself is always stripped so it is never
-    forwarded to ``wandb.init()`` as an unknown keyword argument.
+    forwarded to ``wandb.init()`` / ``trackio.init()`` as an unknown keyword argument.
 
     Args:
         cfg: The loaded recipe configuration. Mutated in place.
+        section: Logger section name, ``"wandb"`` or ``"trackio"``.
     """
-    node = cfg.get("wandb", None)
+    node = cfg.get(section, None)
     if not isinstance(node, ConfigNode):
         return
     enabled = bool(node.get("enable", True))
     node.__dict__.pop("enable", None)
     if not enabled:
-        cfg.__dict__.pop("wandb", None)
+        cfg.__dict__.pop(section, None)

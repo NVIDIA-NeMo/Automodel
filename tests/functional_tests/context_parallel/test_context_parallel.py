@@ -34,6 +34,7 @@ CP_DENSE_PACKED_TEST_FILENAME = "L2_CP_Dense_Packed_Test.sh"
 TP_DENSE_PACKED_TEST_FILENAME = "L2_TP_Dense_Packed_Test.sh"
 TP_CP_DENSE_PACKED_TEST_FILENAME = "L2_TP_CP_Dense_Packed_Test.sh"
 CP_QWEN3_8_FLASH_NEXT_PACKED_TEST_FILENAME = "L2_CP_Qwen3_8_FlashNext_Packed_Test.sh"
+CP_STEP5_TEST_FILENAME = "L2_CP_Step5_Test.sh"
 TP_CP_DENSE_PACKED_REQUIRED_GPUS = 4
 
 
@@ -63,6 +64,10 @@ class TestContextParallelAttention:
     def test_cp_qwen3_5_moe_linear_attn(self):
         """Test Qwen3.5 MoE linear attention (GatedDeltaNet) with CP=1 vs CP=2."""
         run_test_script(TEST_FOLDER, CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME)
+
+    def test_cp_step5(self):
+        """Test Step5 SWA halo, CP=1 vs CP=2 parity and frozen indexer across layouts."""
+        run_test_script(TEST_FOLDER, CP_STEP5_TEST_FILENAME)
 
     def test_cp_dense_packed(self):
         """Test two-layer packed THD forward and gradient parity for dense Llama, Qwen2, and Qwen3."""

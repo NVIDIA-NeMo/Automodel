@@ -850,6 +850,43 @@ def test_apply_ac_replays_hybridep_layout_for_full_and_selective_ac(monkeypatch,
     replay_wrapper.assert_called_once()
 
 
+@pytest.mark.parametrize("ignore_router", [True, False])
+@pytest.mark.parametrize("selective", [True, False])
+def test_apply_ac_rejects_capacity_mode_only_on_the_path_without_replay(monkeypatch, ignore_router, selective):
+    """Capacity mode needs the dispatch layout replayed on recompute: full AC with ignore_router=False has no
+    recorder, so the recompute dispatch would be sized to the capacity while the calibration dispatch was not."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+    expert.dispatcher_capacity_factor = 1.5
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    if selective:
+        activation_checkpointing_stub = sys.modules["nemo_automodel.components.distributed.activation_checkpointing"]
+        activation_checkpointing_stub.make_selective_checkpoint_context_fn = lambda: (
+            lambda: (nullcontext(), nullcontext())
+        )
+        activation_checkpointing_stub.SELECTIVE_AC_WRAPPER_FLAG = "_nemo_selective_ac"
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    run = lambda: P.apply_ac(  # noqa: E731
+        HybridEPModel([DummyBlock()]),
+        ignore_router=ignore_router,
+        hidden_size=7168,
+        num_experts=384,
+        selective=selective,
+    )
+    if not ignore_router and not selective:
+        with pytest.raises(ValueError, match="dispatcher_capacity_factor needs the routing pinned"):
+            run()
+    else:
+        run()
+
+
 def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_available(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
 
@@ -1611,7 +1648,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     apply_ep_mock.assert_called_once()
     # AC enabled
     apply_ac_mock.assert_called_once_with(
-        model, ignore_router=True, selective=False, activation_checkpointing_scope="all"
+        model, ignore_router=True, selective=False, activation_checkpointing_scope="all", moe_only=False
     )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
