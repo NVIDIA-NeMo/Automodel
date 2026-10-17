@@ -60,13 +60,8 @@ dist_env:
   # JIT-compiles its own HybridEP (nvcc, per-process cache) and TileLang kernels, and pipeline
   # parallelism serializes that across the 8 stages. 30 min hits the NCCL watchdog on the
   # first P2P recv; 120 leaves headroom. Set NEMO_HYBRIDEP_JIT_CACHE=<shared dir> to reuse the
-  # HybridEP kernels across runs, and see `prewarm` below.
+  # HybridEP kernels across runs.
   timeout_minutes: 120
-
-# Compile every pipeline stage concurrently with one synthetic forward+backward before the
-# training loop instead of stage-by-stage inside step 0 (see docs/guides/configuration.mdx).
-prewarm:
-  pipeline_stage_compile: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config

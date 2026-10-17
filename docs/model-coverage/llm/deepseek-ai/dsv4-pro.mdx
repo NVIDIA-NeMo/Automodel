@@ -30,9 +30,8 @@ for the full multi-node environment setup.
 
 - **First step is long.** On 64 H100 nodes a cold start spends 38-40 minutes before step 0:
   each rank JIT-compiles its HybridEP and TileLang kernels, and pipeline parallelism runs those
-  compiles stage after stage. The recipes therefore set `dist_env.timeout_minutes: 120` and
-  enable `prewarm.pipeline_stage_compile`, which compiles all stages concurrently before the
-  loop. Point `NEMO_HYBRIDEP_JIT_CACHE` at a shared directory to reuse the HybridEP kernels
+  compiles stage after stage. The recipes therefore set `dist_env.timeout_minutes: 120`.
+  Point `NEMO_HYBRIDEP_JIT_CACHE` at a shared directory to reuse the HybridEP kernels
   across runs.
 - **Resolve the Hub once, not 512 times.** With hundreds of ranks resolving
   `deepseek-ai/DeepSeek-V4-Pro` and the dataset online at start-up, the anonymous Hugging Face
