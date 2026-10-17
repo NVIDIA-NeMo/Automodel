@@ -72,7 +72,13 @@ from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppre
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.dspark_target import (
+    dspark_packed_forward as deepseek_v4_dspark_packed_forward,
+)
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41DSparkTargetConfig
+from nemo_automodel.components.models.deepseek_v41.dspark_target import (
+    dspark_packed_forward as deepseek_v41_dspark_packed_forward,
+)
 from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
 from nemo_automodel.components.optim.optimizer import build_optimizer
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
@@ -166,6 +172,18 @@ def _packing_kwargs(batch: dict) -> dict:
         "seq_lens": batch["seq_lens"],
         "doc_remaining": batch["doc_remaining"],
     }
+
+
+def _validate_draft_packing(draft_model: torch.nn.Module) -> None:
+    """Reject sequence packing for a draft whose forward ignores the packing metadata.
+
+    Such a draft would silently let anchors cross document boundaries.
+    """
+    if not getattr(draft_model, "supports_sequence_packing", False):
+        raise NotImplementedError(
+            f"Sequence packing (packed_sequence_size>0) is not supported by the "
+            f"{type(draft_model).__name__} DSpark draft."
+        )
 
 
 def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
@@ -670,7 +688,11 @@ class TrainDSparkRecipe(BaseRecipe):
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         load_metadata_with_gloo = read_load_metadata_with_gloo(self.cfg.get("checkpoint", None))
 
+        # V4 and V4.1 isolate packed documents through their own packing metadata
+        # instead of the generic block-causal mask.
+        target_packed_forward = None
         if is_deepseek_v4_target:
+            target_packed_forward = deepseek_v4_dspark_packed_forward
             if self.cached_target_path is None:
                 # Full V4-Flash target loaded with the same expert-parallel / FSDP and
                 # FP8-dequant path as the V4 finetune recipe, so the 256 experts shard
@@ -696,6 +718,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["DeepseekV4ForCausalLM"])
         elif is_deepseek_v41_target:
+            target_packed_forward = deepseek_v41_dspark_packed_forward
             if self.cached_target_path is None:
                 target_options = DeepseekV41DSparkTargetConfig(
                     target_path=target_path,
@@ -898,7 +921,12 @@ class TrainDSparkRecipe(BaseRecipe):
         # -1 (the embedding output) and enforces strictly-increasing ids.
         self.target_layer_ids = target_layer_ids
         self.target_wrapper = (
-            HFDSparkTargetModel(self.target_model, target_layer_ids=target_layer_ids, cp_mesh=self.cp_mesh)
+            HFDSparkTargetModel(
+                self.target_model,
+                target_layer_ids=target_layer_ids,
+                cp_mesh=self.cp_mesh,
+                packed_forward=target_packed_forward,
+            )
             if self.target_model is not None
             else None
         )
@@ -1113,13 +1141,8 @@ class TrainDSparkRecipe(BaseRecipe):
             draft_model = draft_cls(draft_config_obj)
         self.draft_model = draft_model.to(device=self.device)
         cast_model_to_dtype(self.draft_model, self.compute_dtype)
-        if self.packed_sequence_size > 0 and type(self.draft_model).__name__ != "Qwen3DSparkModel":
-            # Only the Qwen3 draft forward threads the packing metadata so far; the
-            # other DSpark drafts would silently let anchors cross document boundaries.
-            raise NotImplementedError(
-                f"Sequence packing (packed_sequence_size>0) is only supported by the Qwen3 DSpark draft, "
-                f"not {type(self.draft_model).__name__}."
-            )
+        if self.packed_sequence_size > 0:
+            _validate_draft_packing(self.draft_model)
 
         # training only the backbone, fc, Markov head, and confidence head.
         if embed_src is None or head_src is None:
