@@ -609,6 +609,8 @@ navigation:
             slug: nvidia
             path: ../../model-coverage/vlm/nvidia/index.mdx
             contents:
+              - page: "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16"
+                path: ../../model-coverage/vlm/nvidia/nvidia-nemotron-3-5-bolt-74b-a9b-bf16.mdx
               - page: "NVIDIA-Nemotron-Parse-v1.1"
                 path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
           - section: "OpenGVLab"
