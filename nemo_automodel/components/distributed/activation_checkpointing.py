@@ -612,13 +612,14 @@ def apply_submodule_checkpointing(
     wrapped_counts: dict[str, int] = {
         "mlp": 0,
         "attention": 0,
+        "mixer": 0,
         "pre_norm": 0,
         "post_norm": 0,
         "mot": 0,
     }
     for layer in layers:
-        wrapped_counts["mlp"] += _wrap_first_existing_attr(layer, ("mlp", "feed_forward", "ffn"), context_fn=context_fn)
-        wrapped_counts["attention"] += _wrap_first_existing_attr(
+        mlp_wrapped = _wrap_first_existing_attr(layer, ("mlp", "feed_forward", "ffn"), context_fn=context_fn)
+        attention_wrapped = _wrap_first_existing_attr(
             layer,
             # "linear_attn" covers hybrid linear-attention blocks (e.g. Qwen3-Next /
             # Qwen3.5 Gated DeltaNet layers), which name their mixer "linear_attn"
@@ -627,6 +628,18 @@ def apply_submodule_checkpointing(
             # "linear_attn" (never both), so first-match wrapping stays unambiguous.
             ("self_attn", "attention", "attn", "linear_attn"),
             skip=has_kv_sharing,
+            context_fn=context_fn,
+        )
+        wrapped_counts["mlp"] += mlp_wrapped
+        wrapped_counts["attention"] += attention_wrapped
+        wrapped_counts["mixer"] += _wrap_first_existing_attr(
+            layer,
+            # Remote hybrid architectures such as Nemotron-H expose exactly one
+            # Mamba, attention, dense-MLP, or MoE computation module as ``mixer``.
+            # Treat it as a fallback so models with conventional attention/MLP
+            # children do not acquire nested checkpoint wrappers.
+            ("mixer",),
+            skip=has_kv_sharing or bool(mlp_wrapped or attention_wrapped),
             context_fn=context_fn,
         )
         wrapped_counts["pre_norm"] += _wrap_first_existing_attr(

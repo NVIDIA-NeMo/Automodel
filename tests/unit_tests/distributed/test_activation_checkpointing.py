@@ -268,6 +268,27 @@ def test_submodule_checkpointing_with_snapshot_context_reruns_recompute_under_fo
     assert block.attn._checkpoint_wrapped_module.qkv.weight.grad is not None
 
 
+def test_submodule_checkpointing_wraps_generic_hybrid_mixer():
+    """Remote hybrid blocks expose Mamba, attention, MLP, or MoE as ``mixer``."""
+
+    class HybridBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = nn.LayerNorm(_D)
+            self.mixer = nn.Linear(_D, _D)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x + self.mixer(self.norm(x))
+
+    block = HybridBlock()
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False, context_fn=None)
+
+    assert isinstance(block.mixer, CheckpointWrapper)
+    x = torch.randn(2, _D, requires_grad=True)
+    block(x).sum().backward()
+    assert x.grad is not None
+
+
 def test_submodule_checkpointing_recompute_restores_forward_sdpa_callable(monkeypatch):
     """Recompute must preserve a forward-local suspension of CP's SDPA monkeypatch."""
     original_sdpa = F.scaled_dot_product_attention
