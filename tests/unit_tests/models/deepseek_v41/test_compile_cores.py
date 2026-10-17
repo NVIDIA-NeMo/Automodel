@@ -21,6 +21,7 @@ import torch
 import torch._dynamo
 from torch._dynamo.utils import counters as dynamo_counters
 
+import nemo_automodel.components.models.deepseek_v41.engram as v41_engram
 import nemo_automodel.components.models.deepseek_v41.layers as v41_layers
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
@@ -70,6 +71,24 @@ def test_model_hooks_compile_the_cores_once(restore_cores) -> None:
     with torch.device("meta"):
         DeepseekV41ForCausalLM(config, backend=_compile_backend())
     assert tuple(getattr(v41_layers, name) for name in _CORE_NAMES) == compiled  # second model: no recompile
+
+
+def test_model_hook_compiles_the_engram_gate_once(monkeypatch) -> None:
+    monkeypatch.setattr(v41_engram, "_engram_gate", v41_engram._engram_gate_core)
+    monkeypatch.setattr(v41_engram, "_ENGRAM_GATE_COMPILED", False)
+    assert DeepseekV41TextConfig().compile_engram is False
+    with torch.device("meta"):
+        DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
+    assert v41_engram._engram_gate is v41_engram._engram_gate_core  # default: eager
+    config = _tiny_config()
+    config.text_config.compile_engram = True
+    with torch.device("meta"):
+        DeepseekV41ForCausalLM(config, backend=_backend())
+    assert v41_engram._ENGRAM_GATE_COMPILED and v41_engram._engram_gate is not v41_engram._engram_gate_core
+    compiled = v41_engram._engram_gate
+    with torch.device("meta"):
+        DeepseekV41ForCausalLM(config, backend=_backend())
+    assert v41_engram._engram_gate is compiled  # second model: no recompile
 
 
 def _hc_case(dtype: torch.dtype):
