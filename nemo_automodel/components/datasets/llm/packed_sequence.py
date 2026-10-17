@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 
 import torch
 from datasets import Dataset, DatasetDict
@@ -106,12 +107,23 @@ def _pad_pack(
     packed_sequence_size: int,
     cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
     cp_size: int = 1,
+    pad_to_multiple_of: int = 1,
 ) -> PACK_TYPE:
-    """
-    Pads a pack to ``packed_sequence_size``.
+    """Pad an aligned pack to its fixed token budget.
 
-    seq_lens contains original lengths.
-    seq_lens_padded applies CP padding (if cp_size > 1) and pack-level padding.
+    Args:
+        pack: Token tensors input_ids, labels and position_ids [tokens], plus
+            real document lengths seq_lens [documents].
+        padding_idx: Input padding token.
+        packed_sequence_size: Physical token budget, including alignment padding.
+        cross_entropy_ignore_idx: Label value excluded from loss.
+        cp_size: CP geometry used by generic THD packing.
+        pad_to_multiple_of: Additional per-document alignment independent of CP.
+
+    Returns:
+        Tensor mapping with token fields [packed_sequence_size], real seq_lens
+        and physical seq_lens_padded [documents]. Trailing padding belongs to the
+        final span; real document lengths are unchanged.
     """
     # Pad tokens
     num_padding_tokens = packed_sequence_size - len(pack["input_ids"])
@@ -132,8 +144,8 @@ def _pad_pack(
     original_seq_lens = pack["seq_lens"].clone()
 
     # seq_lens_padded: apply CP padding to each sequence, then add pack padding to last
-    if cp_size > 1:
-        cp_divisibility_factor = 2 * cp_size
+    cp_divisibility_factor = math.lcm(2 * cp_size if cp_size > 1 else 1, pad_to_multiple_of)
+    if cp_divisibility_factor > 1:
         # Apply CP padding to each sequence length
         cp_padded_lens = []
         for seq_len in pack["seq_lens"]:
@@ -195,9 +207,20 @@ def _tensorize_and_pad_pack(
     packed_sequence_size: int,
     cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
     cp_size: int = 1,
-) -> None:
-    """
-    converts to tensors, pads a pack and returns it.
+    pad_to_multiple_of: int = 1,
+) -> PACK_TYPE:
+    """Tensorize and pad one pack using the layout documented by _pad_pack.
+
+    Args:
+        pack: Lists of token fields [tokens] and document lengths [documents].
+        padding_idx: Input padding token.
+        packed_sequence_size: Fixed physical token budget.
+        cross_entropy_ignore_idx: Padding label.
+        cp_size: Generic THD context-parallel size.
+        pad_to_multiple_of: Additional document alignment.
+
+    Returns:
+        Tensor mapping with token fields [packed_sequence_size] and lengths [documents].
     """
     pack = _convert_to_tensors(pack)
     pack = _pad_pack(
@@ -206,6 +229,7 @@ def _tensorize_and_pad_pack(
         packed_sequence_size=packed_sequence_size,
         cross_entropy_ignore_idx=cross_entropy_ignore_idx,
         cp_size=cp_size,
+        pad_to_multiple_of=pad_to_multiple_of,
     )
     return pack
 
@@ -227,13 +251,22 @@ def _split_and_add_pack(
     padding_idx: int,
     cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
     cp_size: int = 1,
+    pad_to_multiple_of: int = 1,
 ) -> PACK_TYPE:
-    """
-    Splits the current pack at the boundary, processes it, adds it to ``packs``.
+    """Finalize complete documents and carry the last document into the next pack.
 
-    ...and returns the start of the next pack.
+    Args:
+        current_pack: Lists of tokens [tokens] and real lengths [documents].
+        packs: Output list receiving one tensorized, padded pack.
+        previous_sample_boundary: Physical token offset before the last document.
+        packed_sequence_size: Fixed physical token budget, including alignment.
+        padding_idx: Input padding token.
+        cross_entropy_ignore_idx: Padding label.
+        cp_size: Generic THD context-parallel size.
+        pad_to_multiple_of: Additional document alignment.
 
-    TODO(@akoumparouli): refactor.
+    Returns:
+        List-valued token fields and lengths for the remaining document, preserving order.
     """
     pack = {
         "input_ids": current_pack["input_ids"][:previous_sample_boundary],
@@ -250,6 +283,7 @@ def _split_and_add_pack(
             packed_sequence_size=packed_sequence_size,
             cross_entropy_ignore_idx=cross_entropy_ignore_idx,
             cp_size=cp_size,
+            pad_to_multiple_of=pad_to_multiple_of,
         )
     )
 
@@ -266,18 +300,20 @@ def _split_and_add_pack(
 
 
 def pack_dataset(
-    dataset,
-    split,
-    packed_sequence_size,
-    max_packs=None,
-    padding_idx=0,
-    drop_long_samples=True,
-    cp_size=1,
-):
+    dataset: torch.utils.data.Dataset | Dataset | DatasetDict | list[dict[str, list[int]]],
+    split: str | None,
+    packed_sequence_size: int,
+    max_packs: int | None = None,
+    padding_idx: int = 0,
+    drop_long_samples: bool = True,
+    cp_size: int = 1,
+    *,
+    pad_to_multiple_of: int = 1,
+) -> Dataset:
     """
     Pack the dataset to defined length.
 
-    In particulat, it will iterate through the dataset. Use a buffer to hold samples until
+    In particular, it will iterate through the dataset. Use a buffer to hold samples until
     packed_sequence_size, then append the buffer to packs as a single "packed" sample.
     Continue until max_packs or end of dataset.
 
@@ -289,6 +325,14 @@ def pack_dataset(
         drop_long_samples (bool): If True, drop samples that are longer than packed_sequence_size.
         cp_size (int): Context parallel size. When > 1, each sequence will be padded to be
             divisible by 2*cp_size for context parallel processing. Default: 1 (no CP).
+        pad_to_multiple_of (int): Align each document's physical span to this many tokens,
+            including this padding in the pack budget. Real lengths and shifted labels are preserved.
+            Default: 1. This alignment is independent of context-parallel size.
+
+    Returns:
+        Arrow dataset of fixed-length input_ids, already-shifted labels and position_ids
+        [packed_sequence_size], plus real seq_lens and physical seq_lens_padded [documents]
+        per row. Position IDs restart for each document; padded labels equal -100.
     """
     packs: list[PACK_TYPE] = []
     if isinstance(dataset, DatasetDict):
@@ -308,7 +352,9 @@ def pack_dataset(
     logged_drop_long_samples = False
 
     # Calculate CP divisibility factor
-    cp_divisibility_factor = 2 * cp_size if cp_size > 1 else 1
+    if pad_to_multiple_of < 1 or packed_sequence_size % pad_to_multiple_of:
+        raise ValueError("packed_sequence_size must be divisible by positive pad_to_multiple_of")
+    cp_divisibility_factor = math.lcm(2 * cp_size if cp_size > 1 else 1, pad_to_multiple_of)
 
     for sample in dataset:
         input_ids, labels = sample["input_ids"], sample["labels"]
@@ -331,7 +377,7 @@ def pack_dataset(
             )
 
         # Apply CP padding if needed
-        if cp_size > 1:
+        if cp_divisibility_factor > 1:
             # Pad sequence to be divisible by 2*cp_size
             cp_padded_len = ((seq_len + cp_divisibility_factor - 1) // cp_divisibility_factor) * cp_divisibility_factor
             cp_padding_amount = cp_padded_len - seq_len
@@ -361,6 +407,7 @@ def pack_dataset(
                 padding_idx=padding_idx,
                 cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
                 cp_size=cp_size,
+                pad_to_multiple_of=pad_to_multiple_of,
             )
 
         # Keep track of previous sample boundary
@@ -379,6 +426,7 @@ def pack_dataset(
                 packed_sequence_size=packed_sequence_size,
                 cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
                 cp_size=cp_size,
+                pad_to_multiple_of=pad_to_multiple_of,
             )
         )
 

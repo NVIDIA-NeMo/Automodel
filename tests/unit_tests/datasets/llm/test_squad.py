@@ -270,3 +270,39 @@ def test_fp8_flag_is_noop():
     # still returns a dataset
     assert isinstance(ds, LazyMappedDataset)
     assert len(ds) == 2
+
+
+def test_chat_template_path_handles_unanswerable_example(monkeypatch):
+    """
+    SQuAD v2-style rows can have no gold answer (``answers["text"] == []``).
+    The plain prompt/completion path already maps that to an empty answer; the
+    chat-template path must do the same instead of raising ``IndexError``.
+    """
+    unanswerable = Dataset.from_dict(
+        {
+            "id": ["0", "1"],
+            "title": ["t0", "t1"],
+            "context": ["Earth is round.", "Sky is blue."],
+            "question": ["Who owns Earth?", "What color is the sky?"],
+            "answers": [
+                {"text": [], "answer_start": []},
+                {"text": ["blue"], "answer_start": [7]},
+            ],
+        }
+    )
+    monkeypatch.setattr(mqd, "load_dataset", lambda name, split=None, **kw: unanswerable)
+
+    # Reference: the plain (no chat template) path accepts the row.
+    plain_row = make_squad_dataset(DummyTokenizer())[0]
+    assert len(plain_row["input_ids"]) == len(plain_row["labels"])
+
+    tok = DummyTokenizer(with_chat_template=True)
+    ds = make_squad_dataset(tok)
+    row = ds[0]
+
+    assert len(row["input_ids"]) == len(row["labels"]) == len(row["attention_mask"])
+    # The (empty) assistant turn is still supervised: its closing EOS is a label.
+    supervised = [label for label in row["labels"] if label != -100]
+    assert supervised == [tok.eos_token_id]
+    # The answerable row in the same dataset is unaffected.
+    assert any(label != -100 for label in ds[1]["labels"])

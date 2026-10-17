@@ -13,12 +13,16 @@
 # limitations under the License.
 
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from transformers import LlamaConfig, PretrainedConfig
 
+from nemo_automodel.components.training.timers import Timers
+from nemo_automodel.components.utils.flops_utils import llama2_flops
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
 
@@ -116,6 +120,7 @@ def mock_recipe(mock_config, monkeypatch):
     """Create a mock benchmarking recipe instance."""
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", MagicMock())
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", MagicMock())
+    monkeypatch.setattr(torch.cuda, "set_device", MagicMock())
     with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
         recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
         recipe.cfg = mock_config
@@ -149,6 +154,7 @@ def mock_recipe(mock_config, monkeypatch):
         recipe._bench_json_output_path = None
         recipe._wandb_enabled = False
         recipe.wandb_run = None
+        recipe.trackio_logger = None
         recipe.partial_cuda_graph_manager = None
         recipe._partial_cuda_graph_capture_pending = False
         recipe.step_scheduler = SimpleNamespace(step=0, gc_every_steps=None)
@@ -173,6 +179,20 @@ class TestBenchmarkingRecipeInitialization:
             assert recipe._bench_nsys_end == -1  # from benchmark.nsys_end
             assert recipe._bench_nsys_ranks == []  # from benchmark.nsys_ranks
             assert recipe._bench_seq_len == 2048  # from dataset.seq_len
+
+    @pytest.mark.parametrize("scope", ["model", "text"])
+    def test_init_accepts_flops_scope(self, mock_config: ConfigNamespace, scope: str) -> None:
+        mock_config.benchmark.flops_scope = scope
+        with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
+            recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
+        assert recipe._bench_flops_scope == scope
+
+    def test_init_rejects_invalid_flops_scope(self, mock_config: ConfigNamespace) -> None:
+        mock_config.benchmark.flops_scope = "vision"
+        with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__") as parent:
+            with pytest.raises(ValueError, match="benchmark.flops_scope must be"):
+                BenchmarkingRecipeForNextTokenPrediction(mock_config)
+        parent.assert_not_called()
 
     def test_init_infers_max_steps_from_step_scheduler(self, mock_config):
         """Test that max_steps is inferred from step_scheduler."""
@@ -305,6 +325,80 @@ class TestBenchmarkingRecipeInitialization:
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
 class TestBenchmarkingRecipeSetup:
     """Test setup method of BenchmarkingRecipeForNextTokenPrediction."""
+
+    @pytest.mark.parametrize(
+        "initialized,cuda_available,local_rank,current_device",
+        [(False, True, 3, 0), (True, True, 1, 3), (False, False, 3, 0)],
+    )
+    def test_setup_selects_device_before_timer(
+        self,
+        mock_recipe: BenchmarkingRecipeForNextTokenPrediction,
+        monkeypatch: pytest.MonkeyPatch,
+        initialized: bool,
+        cuda_available: bool,
+        local_rank: int,
+        current_device: int,
+    ) -> None:
+        events: list[tuple[str, int]] = []
+        mock_recipe.timers = Timers(log_level=2, log_option="minmax")
+        monkeypatch.setenv("LOCAL_RANK", str(local_rank))
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: initialized)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+
+        def select_device(device: int) -> None:
+            nonlocal current_device
+            current_device = device
+            events.append(("set_device", device))
+
+        def synchronize() -> None:
+            events.append(("synchronize", current_device))
+
+        def parent_setup() -> None:
+            events.append(("parent_setup", current_device))
+            raise RuntimeError("stop before constructing the model")
+
+        monkeypatch.setattr(torch.cuda, "set_device", select_device)
+        monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+        with patch(
+            "nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.setup",
+            side_effect=parent_setup,
+        ):
+            with pytest.raises(RuntimeError, match="stop before constructing the model"):
+                mock_recipe.setup()
+
+        expected_device = local_rank if cuda_available and not initialized else current_device
+        binding = [("set_device", local_rank)] if cuda_available and not initialized else []
+        assert events == binding + [
+            ("synchronize", expected_device),
+            ("parent_setup", expected_device),
+            ("synchronize", expected_device),
+        ]
+
+    @pytest.mark.parametrize("scope", ["model", "text"])
+    def test_setup_requires_explicit_text_scope_for_composite(
+        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, scope: str
+    ) -> None:
+        text = LlamaConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=256,
+        )
+        mock_recipe.model_parts[0].config = PretrainedConfig(text_config=text)
+        mock_recipe._bench_flops_scope = scope
+        with (
+            patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.setup"),
+            patch.object(mock_recipe, "_mtp_tflops", return_value=0.0),
+        ):
+            if scope == "model":
+                with pytest.raises(ValueError, match="No FLOPs formula.*flops_scope='model'"):
+                    mock_recipe.setup()
+            else:
+                mock_recipe.setup()
+                expected = llama2_flops(text, gbs=256, seq_len=2048) / 1e12
+                assert mock_recipe.tflops == pytest.approx(expected)
 
     @patch("nemo_automodel.recipes.llm.benchmark.get_flops_formula_for_hf_config")
     def test_setup_clears_val_dataloader(self, mock_get_flops, mock_recipe):
@@ -469,6 +563,7 @@ class TestBenchmarkingRecipeRunBenchmark:
         """Test that optimizer step is called once per iteration."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
         graph_manager = MagicMock()
+        sync_tp_replicas = MagicMock()
         mock_recipe.partial_cuda_graph_manager = graph_manager
         mock_recipe._partial_cuda_graph_capture_pending = True
 
@@ -504,11 +599,19 @@ class TestBenchmarkingRecipeRunBenchmark:
             )
         )
 
-        with patch("torch.distributed.barrier"):
+        with (
+            patch("torch.distributed.barrier"),
+            patch(
+                "nemo_automodel.recipes.llm.benchmark.synchronize_tp_replica_gradients",
+                sync_tp_replicas,
+            ),
+        ):
             mock_recipe.run_benchmark()
 
             # Should be called 30 times (once per iteration)
             assert mock_recipe.optimizer[0].step.call_count == 30
+            assert sync_tp_replicas.call_count == 30
+            sync_tp_replicas.assert_called_with(mock_recipe.model_parts, mock_recipe.device_mesh)
             graph_manager.capture.assert_called_once_with()
             assert mock_recipe._partial_cuda_graph_capture_pending is False
 
@@ -686,6 +789,15 @@ class TestBenchmarkingRecipeWandBIntegration:
                 barrier=False,
             )
 
+    def test_log_iteration_mfu_uses_global_flops_once(
+        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mock_recipe.timers._get_global_min_max_time.return_value = {"iteration": (0.5, 1.5)}
+        with caplog.at_level("INFO", logger="nemo_automodel.recipes.llm.benchmark"):
+            mock_recipe._log_iteration_metrics("iteration", ga_steps=4, peak_tflops=989, rank=0, iteration=10)
+        expected_mfu = mock_recipe.tflops / (mock_recipe.dist_env.world_size * 1.5 * 989) * 100
+        assert f"MFU: {expected_mfu:.6f}%" in caplog.text
+
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
 class TestBenchmarkingRecipeJSONOutput:
@@ -709,10 +821,14 @@ class TestBenchmarkingRecipeJSONOutput:
 
             assert recipe._bench_json_output_path is None
 
-    def test_log_benchmark_summary_creates_json_file(self, mock_recipe, tmp_path):
+    @pytest.mark.parametrize("scope", ["model", "text"])
+    def test_log_benchmark_summary_creates_json_file(
+        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, tmp_path: Path, scope: str
+    ) -> None:
         """Test that benchmark summary is written to JSON file."""
         json_file = tmp_path / "benchmark_summary.json"
         mock_recipe._bench_json_output_path = str(json_file)
+        mock_recipe._bench_flops_scope = scope
 
         # Mock timers
         mock_timer = MagicMock()
@@ -735,16 +851,19 @@ class TestBenchmarkingRecipeJSONOutput:
         with open(json_file) as f:
             summary_data = json.load(f)
 
+        assert summary_data["flops_scope"] == scope
         assert summary_data["total_steps"] == 30
         assert summary_data["warmup_steps"] == 10
         assert summary_data["training_steps"] == 20
         assert summary_data["peak_tflops"] == 989
         assert summary_data["world_size"] == 8
+        assert summary_data["tflops_total"] == mock_recipe.tflops
+        assert summary_data["tflops_per_gpu"] == mock_recipe.tflops / 8
         assert summary_data["global_batch_size"] == 256
         assert summary_data["local_batch_size"] == 4
         assert summary_data["seq_len"] == 2048
-        assert "avg_iter_time_seconds" in summary_data
-        assert "avg_mfu_percent" in summary_data
+        assert summary_data["avg_iter_time_seconds"] == pytest.approx(10.0 / 20)
+        assert summary_data["avg_mfu_percent"] == pytest.approx(mock_recipe.tflops / (8 * (10.0 / 20) * 989) * 100)
 
     def test_log_benchmark_summary_skips_json_when_none(self, mock_recipe, tmp_path):
         """Test that JSON output is skipped when path is None."""
@@ -770,10 +889,18 @@ class TestBenchmarkingRecipeJSONOutput:
 class TestBenchmarkingRecipeSummaryData:
     """Test benchmark summary data structure and WandB logging."""
 
+    @pytest.mark.parametrize("scope", ["model", "text"])
     @patch("wandb.log")
     @patch("wandb.Table")
-    def test_summary_wandb_table_structure(self, mock_table_class, mock_wandb_log, mock_recipe):
-        """Test that wandb table is created with correct structure."""
+    def test_summary_wandb_table_structure(
+        self,
+        mock_table_class: MagicMock,
+        mock_wandb_log: MagicMock,
+        mock_recipe: BenchmarkingRecipeForNextTokenPrediction,
+        scope: str,
+    ) -> None:
+        """Test that wandb table identifies the selected FLOPs scope."""
+        mock_recipe._bench_flops_scope = scope
         mock_recipe.wandb_run = MagicMock()
         mock_table_instance = MagicMock()
         mock_table_class.return_value = mock_table_instance
@@ -802,15 +929,26 @@ class TestBenchmarkingRecipeSummaryData:
         assert "Total Steps" in metric_names
         assert "Warmup Steps" in metric_names
         assert "Training Steps" in metric_names
-        assert "Avg MFU (%)" in metric_names
+        expected_mfu_label = "Avg MFU (%)" if scope == "model" else "Avg text-backbone MFU (%)"
+        assert expected_mfu_label in metric_names
         assert "TFLOPs/GPU/s" in metric_names
         assert "World Size" in metric_names
         assert "Global Batch Size" in metric_names
         assert "Sequence Length" in metric_names
+        metrics = dict(data)
+        avg_iter_time = 100.0 / 20
+        per_gpu_tflops_per_second = mock_recipe.tflops / (mock_recipe.dist_env.world_size * avg_iter_time)
+        assert metrics["Avg Iteration Time (s)"] == pytest.approx(avg_iter_time)
+        assert metrics[expected_mfu_label] == pytest.approx(per_gpu_tflops_per_second / 989 * 100)
+        assert metrics["TFLOPs/GPU/s"] == pytest.approx(per_gpu_tflops_per_second)
 
+    @pytest.mark.parametrize("scope", ["model", "text"])
     @patch("wandb.log")
-    def test_summary_wandb_scalar_metrics(self, mock_wandb_log, mock_recipe):
-        """Test that scalar metrics are logged to wandb."""
+    def test_summary_wandb_scalar_metrics(
+        self, mock_wandb_log: MagicMock, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, scope: str
+    ) -> None:
+        """Test that scalar metrics retain their FLOPs scope in W&B."""
+        mock_recipe._bench_flops_scope = scope
         mock_recipe.wandb_run = MagicMock()
 
         # Mock timers
@@ -838,10 +976,15 @@ class TestBenchmarkingRecipeSummaryData:
 
         assert scalar_call is not None
         scalar_metrics = scalar_call[0][0]
-        assert "summary/avg_iter_time_seconds" in scalar_metrics
-        assert "summary/avg_mfu_percent" in scalar_metrics
+        avg_iter_time = 100.0 / 20
+        assert scalar_metrics["summary/avg_iter_time_seconds"] == pytest.approx(avg_iter_time)
+        assert scalar_metrics["summary/avg_mfu_percent"] == pytest.approx(
+            mock_recipe.tflops / (mock_recipe.dist_env.world_size * avg_iter_time * 989) * 100
+        )
+        assert scalar_metrics["summary/flops_scope"] == scope
         assert "summary/training_time_seconds" in scalar_metrics
-        assert "summary/tflops_per_gpu" in scalar_metrics
+        assert scalar_metrics["summary/tflops_total"] == mock_recipe.tflops
+        assert scalar_metrics["summary/tflops_per_gpu"] == mock_recipe.tflops / mock_recipe.dist_env.world_size
 
     @patch("wandb.finish")
     def test_wandb_finish_called(self, mock_wandb_finish, mock_recipe):

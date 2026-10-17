@@ -18,12 +18,19 @@ import argparse
 import ast
 import re
 import subprocess
-from dataclasses import dataclass
+import urllib.request
+from dataclasses import dataclass, replace
+from functools import cache
 from pathlib import Path
 
 import yaml
 
 TABLE_ROW_COUNT = 10
+# Both Muse source paths are linked by published NVIDIA and Meta blog posts.
+# Keep the compatibility copy on disk, but catalog only the canonical card.
+MODEL_CARD_PATH_ALIASES = {
+    "docs/model-coverage/vlm/muse/muse_spark_open.mdx": "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx",
+}
 HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
 HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"
 SUPPORT_LOG_START_MARKER = "{/* BEGIN GENERATED MODEL SUPPORT LOG */}"
@@ -31,9 +38,13 @@ SUPPORT_LOG_END_MARKER = "{/* END GENERATED MODEL SUPPORT LOG */}"
 REGISTRY_START_MARKER = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
 REGISTRY_END_MARKER = "{/* END GENERATED MODEL ARCHITECTURES */}"
 HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
+DOCS_PAGE_PATTERN = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._/-]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
+RECIPE_LINK_PATTERN = re.compile(
+    r"https://github\.com/NVIDIA-NeMo/Automodel/blob/(?:main|[0-9a-f]{40})/"
+    r"(examples/[A-Za-z0-9_./-]+\.yaml)"
+)
 DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model | Recipe |"
 DATED_MODEL_TABLE_HEADER = "| Date | Model | Architectures | Recipe |"
 MODEL_TYPE_OVERVIEW_PATHS = (
@@ -46,6 +57,17 @@ MODEL_TYPE_OVERVIEW_PATHS = (
     ("Embedding", "embedding/index.mdx"),
     ("Reranking", "reranker/index.mdx"),
 )
+MODEL_TYPE_ROUTE_CATEGORIES = {
+    "LLM": "large-language-models",
+    "Encoder-Decoder": "large-language-models",
+    "VLM": "vision-language-models",
+    "Multimodal": "multimodal",
+    "Omni": "omni",
+    "dLLM": "dllm",
+    "Diffusion": "diffusion",
+    "Embedding": "embedding-models",
+    "Reranking": "reranking-models",
+}
 GENERATED_MARKER_PAIRS = (
     (HOMEPAGE_START_MARKER, HOMEPAGE_END_MARKER),
     (SUPPORT_LOG_START_MARKER, SUPPORT_LOG_END_MARKER),
@@ -99,6 +121,130 @@ class _ModelDoc:
     title: str = ""
     source_path: str = ""
     architecture_display: str = ""
+
+
+@dataclass(frozen=True)
+class _SupportEntry:
+    date: str
+    model_type: str
+    model_link: str
+    architecture: str
+    recipe_link: str
+
+
+def _documented_recipe_url(repo_root: Path, recipe_path: str, document: str) -> str:
+    if ".." in Path(recipe_path).parts or Path(recipe_path).is_absolute():
+        raise ValueError(f"Recipe path must stay inside the checkout: {recipe_path}")
+    permalink = re.search(
+        rf"https://github\.com/NVIDIA-NeMo/Automodel/blob/([0-9a-f]{{40}})/{re.escape(recipe_path)}(?=$|[)#?\s])",
+        document,
+    )
+    main_url = f"{REPOSITORY_URL}/{recipe_path}"
+    if (repo_root / recipe_path).is_file():
+        if permalink:
+            raise ValueError(f"{recipe_path} exists in this checkout; replace its commit permalink with {main_url}")
+        return main_url
+    if permalink:
+        return f"https://github.com/NVIDIA-NeMo/Automodel/blob/{permalink[1]}/{recipe_path}"
+    raise FileNotFoundError(f"{recipe_path}: recipe is missing from this checkout; use a matching commit permalink")
+
+
+@cache
+def _read_remote_recipe(url: str) -> str:
+    raw_url = (
+        url.split("?", 1)[0].replace("https://github.com/", "https://raw.githubusercontent.com/").replace("/blob/", "/")
+    )
+    with urllib.request.urlopen(raw_url, timeout=10) as response:
+        return response.read().decode("utf-8")
+
+
+def _read_documented_recipe(repo_root: Path, recipe_path: str, document: str) -> str:
+    url = _documented_recipe_url(repo_root, recipe_path, document)
+    if url == f"{REPOSITORY_URL}/{recipe_path}":
+        return (repo_root / recipe_path).read_text(encoding="utf-8")
+    return _read_remote_recipe(url)
+
+
+def _validate_recipe_links(repo_root: Path, document: str) -> str:
+    """Return the first recipe URL, or report every invalid link in the document."""
+    first_url = ""
+    errors: list[str] = []
+    for match in RECIPE_LINK_PATTERN.finditer(document):
+        try:
+            url = _documented_recipe_url(repo_root, match[1], match[0])
+            # Validate data only: never import or execute code from a recipe PR.
+            recipe = yaml.safe_load(_read_documented_recipe(repo_root, match[1], match[0]))
+            if not isinstance(recipe, dict):
+                raise ValueError(f"Recipe must be a YAML mapping: {match[1]}")
+        except (OSError, ValueError, yaml.YAMLError) as error:
+            errors.append(f"{match[1]}: {error}")
+            continue
+        if not first_url:
+            first_url = url
+    if errors:
+        raise ValueError("Invalid recipe links:\n" + "\n".join(errors))
+    return first_url
+
+
+def _collect_documented_recipe_urls(repo_root: Path, documented_models: list[_ModelDoc]) -> dict[str, str]:
+    """Validate all canonical and compatibility cards before reporting recipe-link errors."""
+    recipe_urls: dict[str, str] = {}
+    errors: list[str] = []
+    source_paths = dict.fromkeys(model.source_path for model in documented_models)
+    source_paths.update((alias, None) for alias in MODEL_CARD_PATH_ALIASES if (repo_root / alias).is_file())
+    urls_by_source: dict[str, str] = {}
+    for source_path in source_paths:
+        try:
+            document = (repo_root / source_path).read_text(encoding="utf-8")
+            urls_by_source[source_path] = _validate_recipe_links(repo_root, document)
+        except (OSError, ValueError) as error:
+            errors.append(f"{source_path}: {error}")
+    if errors:
+        raise ValueError("Invalid model-card recipes:\n" + "\n".join(errors))
+    for model in documented_models:
+        recipe_urls[model.docs_page] = urls_by_source[model.source_path]
+    return recipe_urls
+
+
+def _collect_support_entries(
+    repo_root: Path, releases: list[_ModelRelease], documented_models: list[_ModelDoc], recipe_urls: dict[str, str]
+) -> list[_SupportEntry]:
+    docs_by_page = {model.docs_page: model for model in documented_models}
+    entries = []
+    represented_pages = set()
+    for release in releases:
+        model = docs_by_page.get(release.docs_page)
+        date = release.release_date
+        if model is not None:
+            represented_pages.add((model.docs_page, release.model_type))
+        entries.append(
+            _SupportEntry(
+                date,
+                release.model_type,
+                _render_model_link(release),
+                model.architecture_display if model else "",
+                _render_recipe_link(release),
+            )
+        )
+    for model in documented_models:
+        if (model.docs_page, model.model_type) in represented_pages:
+            continue
+        date = _load_file_addition_date(repo_root, model.source_path)
+        if date is None:
+            continue
+        recipe_url = recipe_urls.get(model.docs_page, "")
+        entries.append(
+            _SupportEntry(
+                date,
+                model.model_type,
+                f"[{model.title}]({model.docs_page})",
+                model.architecture_display,
+                f"[recipe]({recipe_url})" if recipe_url else "",
+            )
+        )
+    entries.sort(key=lambda entry: (entry.model_type.casefold(), entry.model_link.casefold()))
+    entries.sort(key=lambda entry: entry.date, reverse=True)
+    return entries
 
 
 def _replace_generated_block(document: str, start_marker: str, end_marker: str, generated_block: str) -> str:
@@ -176,6 +322,7 @@ def _run_git(repo_root: Path, arguments: list[str]) -> str:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
     except (OSError, subprocess.CalledProcessError) as error:
         raise ValueError(f"Could not inspect Git history: {error}") from error
@@ -214,7 +361,7 @@ def _load_recipe_addition_dates(repo_root: Path) -> dict[str, str]:
             commit, commit_date = line.removeprefix("@@COMMIT@@").split(" ", 1)
         elif line.endswith(".yaml") and commit_date is not None:
             additions.setdefault(line, (commit_date, commit))
-    current_recipes = {str(path.relative_to(repo_root)) for path in (repo_root / "examples").rglob("*.yaml")}
+    current_recipes = {path.relative_to(repo_root).as_posix() for path in (repo_root / "examples").rglob("*.yaml")}
     missing_recipes = current_recipes - additions.keys()
     if missing_recipes:
         raise ValueError(
@@ -328,6 +475,8 @@ def _load_model_doc_catalog(
     model_coverage_root = docs_root / "model-coverage"
     for directory, model_type in directory_types.items():
         for path in sorted((model_coverage_root / directory).glob("*/*.mdx")):
+            if path.name == "index.mdx" or path.relative_to(docs_root.parent).as_posix() in MODEL_CARD_PATH_ALIASES:
+                continue
             document = path.read_text(encoding="utf-8")
             slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
             if slug_match is None:
@@ -398,11 +547,17 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
                 documented_type = next(iter(documented_types))
                 if documented_type in {"Omni", "Multimodal"}:
                     model_type = documented_type
+            typed_docs = [model_doc for model_doc in matching_docs if model_doc.model_type == model_type]
+            hf_model_name = hf_model_id.rsplit("/", 1)[1]
             docs_page = next(
-                (model_doc.docs_page for model_doc in matching_docs if model_doc.model_type == model_type),
-                f"https://huggingface.co/{hf_model_id}",
+                (
+                    model_doc.docs_page
+                    for model_doc in typed_docs
+                    if model_doc.docs_page.rsplit("/", 1)[-1] == hf_model_name
+                ),
+                typed_docs[0].docs_page if typed_docs else f"https://huggingface.co/{hf_model_id}",
             )
-            recipe_string = str(recipe)
+            recipe_string = recipe.as_posix()
             release_date = introduction_dates.get((recipe_string, hf_model_id))
             if release_date is None:
                 raise ValueError(f"Could not find when {hf_model_id} was introduced in {recipe_string}")
@@ -420,6 +575,128 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
     return releases
 
 
+def _strip_automodel_route_prefix(route: str) -> str:
+    for prefix in ("/nemo/automodel/nightly", "/nemo/automodel"):
+        if route.casefold().startswith(prefix.casefold()):
+            return route[len(prefix) :]
+    return route
+
+
+def _resolve_redirect(source: str, redirects: dict[str, str]) -> str:
+    route = f"/nemo/automodel{source}"
+    visited = set()
+    route_key = route.casefold()
+    while route_key in redirects:
+        if route_key in visited:
+            raise ValueError(f"Model-card redirect cycle starts at {source}")
+        visited.add(route_key)
+        route = redirects[route_key]
+        route_key = route.casefold()
+    return _strip_automodel_route_prefix(route)
+
+
+def _resolve_model_card_routes(
+    repo_root: Path,
+    releases: list[_ModelRelease],
+    model_docs: dict[str, list[_ModelDoc]],
+    documented_models: list[_ModelDoc],
+) -> dict[tuple[str, str], str]:
+    """Resolve every recipe model ID and model type to exactly one model card."""
+    docs_config_path = repo_root / "docs" / "fern" / "docs.yml"
+    try:
+        docs_config = yaml.safe_load(docs_config_path.read_text(encoding="utf-8"))
+        redirect_entries = docs_config["redirects"]
+        redirects: dict[str, str] = {}
+        redirect_sources: dict[str, str] = {}
+        for redirect in redirect_entries:
+            source = redirect["source"]
+            destination = redirect["destination"]
+            source_key = source.casefold()
+            previous_source = redirect_sources.get(source_key)
+            if previous_source is not None:
+                raise ValueError(
+                    f"Fern redirects contain case-insensitive duplicate sources: {previous_source} and {source}"
+                )
+            redirect_sources[source_key] = source
+            redirects[source_key] = destination
+    except (OSError, KeyError, TypeError, yaml.YAMLError) as error:
+        raise ValueError(f"Could not load Fern redirects from {docs_config_path}: {error}") from error
+
+    card_routes_by_key: dict[str, str] = {}
+    for model in documented_models:
+        route_key = model.docs_page.casefold()
+        previous_route = card_routes_by_key.get(route_key)
+        if previous_route is not None and previous_route != model.docs_page:
+            raise ValueError(f"Model-card routes collide case-insensitively: {previous_route} and {model.docs_page}")
+        card_routes_by_key[route_key] = model.docs_page
+
+    canonical_sources = {
+        f"{prefix}{route}".casefold()
+        for route in card_routes_by_key.values()
+        for prefix in ("/nemo/automodel", "/nemo/automodel/nightly")
+    }
+    colliding_sources = sorted(redirect_sources[source] for source in canonical_sources & redirects.keys())
+    if colliding_sources:
+        raise ValueError(
+            "Fern redirect sources collide case-insensitively with canonical model-card routes: "
+            + ", ".join(colliding_sources)
+        )
+
+    provider_routes_by_owner: dict[str, set[str]] = {}
+    for hf_model_id, docs in model_docs.items():
+        owner = hf_model_id.split("/", 1)[0].casefold()
+        for model_doc in docs:
+            provider_routes_by_owner.setdefault(owner, set()).add(model_doc.docs_page.rsplit("/", 1)[0])
+
+    resolved: dict[tuple[str, str], str] = {}
+    missing: list[tuple[str, str]] = []
+    ambiguous: list[tuple[str, str, list[str]]] = []
+    for release in releases:
+        owner, model_name = release.hf_model_id.split("/", 1)
+        model_name = model_name.replace("_", "-")
+        provider_routes = provider_routes_by_owner.get(owner.casefold(), set())
+        category = MODEL_TYPE_ROUTE_CATEGORIES[release.model_type]
+        preferred_routes = {route for route in provider_routes if route.startswith(f"/model-coverage/{category}/")}
+
+        def card_destinations(routes: set[str]) -> set[str]:
+            return {
+                card_routes_by_key[destination.casefold()]
+                for provider_route in routes
+                if (destination := _resolve_redirect(f"{provider_route}/{model_name}", redirects)).casefold()
+                in card_routes_by_key
+            }
+
+        destinations = card_destinations(preferred_routes)
+        if not destinations:
+            # Some checkpoints are reused by a workflow classified differently
+            # from the card, for example an Omni checkpoint in an LLM recipe.
+            destinations = card_destinations(provider_routes)
+
+        key = (release.hf_model_id, release.model_type)
+        if not destinations:
+            missing.append(key)
+        elif len(destinations) > 1:
+            ambiguous.append((*key, sorted(destinations)))
+        else:
+            resolved[key] = next(iter(destinations))
+
+    if missing or ambiguous:
+        details = []
+        if missing:
+            details.extend(f"  - missing: {model_type}: {hf_model_id}" for hf_model_id, model_type in missing)
+        if ambiguous:
+            details.extend(
+                f"  - ambiguous: {model_type}: {hf_model_id} -> {', '.join(destinations)}"
+                for hf_model_id, model_type, destinations in ambiguous
+            )
+        raise ValueError(
+            "Every recipe model ID must resolve to exactly one model card.\n"
+            + "\n".join(details)
+            + "\nAdd an exact model-card route or one Fern redirect to the intended card."
+        )
+    return resolved
+
+
 def _render_recipe_link(release: _ModelRelease) -> str:
     return f"[recipe]({REPOSITORY_URL}/{release.recipe})"
 
@@ -430,79 +707,22 @@ def _render_model_link(release: _ModelRelease) -> str:
     return f"[{model_name}]({release.docs_page})"
 
 
-def _render_release_table(releases: list[_ModelRelease], *, include_type: bool = True) -> str:
-    if include_type:
-        header = [DATED_SUPPORT_TABLE_HEADER, "|:-----|:-----|:-----|:-----|"]
-        table_rows = [
-            f"| {release.release_date} | {release.model_type} | {_render_model_link(release)} | "
-            f"{_render_recipe_link(release)} |"
-            for release in releases
-        ]
-    else:
-        header = [DATED_MODEL_TABLE_HEADER, "|:-----|:-----|:-----|:-----|"]
-        table_rows = [
-            f"| {release.release_date} | {_render_model_link(release)} | | {_render_recipe_link(release)} |"
-            for release in releases
-        ]
-
-    return "\n".join([*header, *table_rows])
-
-
-def _render_typed_support_table(
-    repo_root: Path,
-    releases: list[_ModelRelease],
-    documented_models: list[_ModelDoc],
-) -> str:
-    docs_by_page = {model.docs_page: model for model in documented_models}
-    rows = []
-    represented_pages = set()
-    for release in releases:
-        model_doc = docs_by_page.get(release.docs_page)
-        if model_doc is not None:
-            represented_pages.add(model_doc.docs_page)
-        architectures = model_doc.architecture_display if model_doc is not None else ""
-        rows.append((release.release_date, _render_model_link(release), architectures, _render_recipe_link(release)))
-
-    for model_doc in documented_models:
-        if model_doc.docs_page in represented_pages:
-            continue
-        addition_date = _load_file_addition_date(repo_root, model_doc.source_path)
-        if addition_date is None:
-            continue
-        rows.append(
-            (
-                addition_date,
-                f"[{model_doc.title}]({model_doc.docs_page}) (documentation)",
-                model_doc.architecture_display,
-                "",
-            )
-        )
-
-    rows.sort(key=lambda row: (row[0], row[1].casefold()), reverse=True)
-    table = "\n".join(
-        [
-            DATED_MODEL_TABLE_HEADER,
-            "|:-----|:-----|:-----|:-----|",
-            *(f"| {date} | {model} | {architectures} | {recipe} |" for date, model, architectures, recipe in rows),
-        ]
-    )
-    return "\n\n".join(
-        [
-            SUPPORT_LOG_START_MARKER,
-            '<div className="compact-model-tables">',
-            COMPACT_TABLE_STYLE,
-            table,
-            "</div>",
-            SUPPORT_LOG_END_MARKER,
-        ]
-    )
+def _render_release_table(entries: list[_SupportEntry], *, include_type: bool = True) -> str:
+    header = DATED_SUPPORT_TABLE_HEADER if include_type else DATED_MODEL_TABLE_HEADER
+    rows = [header, "|:-----|:-----|:-----|:-----|"]
+    for entry in entries:
+        if include_type:
+            rows.append(f"| {entry.date} | {entry.model_type} | {entry.model_link} | {entry.recipe_link} |")
+        else:
+            rows.append(f"| {entry.date} | {entry.model_link} | {entry.architecture} | {entry.recipe_link} |")
+    return "\n".join(rows)
 
 
 def _belongs_to_overview(model_type: str, overview_type: str) -> bool:
     return model_type == overview_type or (overview_type == "LLM" and model_type == "Encoder-Decoder")
 
 
-def _render_compact_release_table(releases: list[_ModelRelease], *, include_type: bool = True) -> str:
+def _render_compact_release_table(releases: list[_SupportEntry], *, include_type: bool = True) -> str:
     return "\n\n".join(
         [
             '<div className="compact-model-tables">',
@@ -513,7 +733,7 @@ def _render_compact_release_table(releases: list[_ModelRelease], *, include_type
     )
 
 
-def _render_support_log_table(releases: list[_ModelRelease], *, include_type: bool = True) -> str:
+def _render_support_log_table(releases: list[_SupportEntry], *, include_type: bool = True) -> str:
     return "\n\n".join(
         [
             SUPPORT_LOG_START_MARKER,
@@ -523,7 +743,7 @@ def _render_support_log_table(releases: list[_ModelRelease], *, include_type: bo
     )
 
 
-def _render_homepage_table(releases: list[_ModelRelease]) -> str:
+def _render_homepage_table(releases: list[_SupportEntry]) -> str:
     if len(releases) < TABLE_ROW_COUNT:
         raise ValueError(f"Git history produced only {len(releases)} model releases")
     return "\n\n".join(
@@ -607,7 +827,7 @@ def _render_registry_table(
     )
 
 
-def _generate_tables(repo_root: Path) -> dict[Path, str]:
+def _generate_tables(repo_root: Path, *, validate_model_cards: bool = True) -> dict[Path, str]:
     _validate_dated_support_tables_are_generated(repo_root)
     docs_root = repo_root / "docs"
     support_log_path = repo_root / "docs" / "model-coverage" / "latest-models.mdx"
@@ -631,8 +851,16 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
 
     model_docs, documented_architectures, documented_models = _load_model_doc_catalog(docs_root)
     releases = _load_model_releases(repo_root, model_docs)
-    generated_support_log = _render_support_log_table(releases)
-    generated_homepage = _render_homepage_table(releases)
+    if validate_model_cards:
+        model_card_routes = _resolve_model_card_routes(repo_root, releases, model_docs, documented_models)
+        releases = [
+            replace(release, docs_page=model_card_routes[(release.hf_model_id, release.model_type)])
+            for release in releases
+        ]
+    recipe_urls = _collect_documented_recipe_urls(repo_root, documented_models)
+    entries = _collect_support_entries(repo_root, releases, documented_models, recipe_urls)
+    generated_support_log = _render_support_log_table(entries)
+    generated_homepage = _render_homepage_table(entries)
     generated_registry = _render_registry_table(
         _parse_registry_entries(registry_source),
         documented_architectures,
@@ -647,10 +875,9 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
                 typed_overviews[model_type],
                 SUPPORT_LOG_START_MARKER,
                 SUPPORT_LOG_END_MARKER,
-                _render_typed_support_table(
-                    repo_root,
-                    [release for release in releases if _belongs_to_overview(release.model_type, model_type)],
-                    [model for model in documented_models if _belongs_to_overview(model.model_type, model_type)],
+                _render_support_log_table(
+                    [entry for entry in entries if _belongs_to_overview(entry.model_type, model_type)],
+                    include_type=False,
                 ),
             )
             for model_type, _ in MODEL_TYPE_OVERVIEW_PATHS
@@ -665,8 +892,8 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
     return generated_documents
 
 
-def _sync_tables(repo_root: Path, *, check: bool) -> list[Path]:
-    generated_documents = _generate_tables(repo_root)
+def _sync_tables(repo_root: Path, *, check: bool, validate_model_cards: bool = True) -> list[Path]:
+    generated_documents = _generate_tables(repo_root, validate_model_cards=validate_model_cards)
     changed_paths = [
         path for path, generated in generated_documents.items() if path.read_text(encoding="utf-8") != generated
     ]

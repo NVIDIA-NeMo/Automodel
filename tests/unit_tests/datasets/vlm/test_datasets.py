@@ -2092,3 +2092,147 @@ def test_shopify_product_catalogue_dataset_config_build(monkeypatch):
 
     assert captured == {"path_or_dataset": "Shopify/product-catalogue", "split": "test"}
     assert len(dataset) == 2
+
+
+class _LengthByTextProcessor:
+    """Processor whose token count depends on the rendered text: ``LONG`` -> 10 tokens
+    (over the test max_length), anything else -> 4 tokens whose ids encode the sample."""
+
+    def apply_chat_template(self, conversations, tokenize=False):
+        return [conversations[0][0]["content"][0]["text"]]
+
+    def __call__(self, **kwargs):
+        import torch
+
+        text = kwargs["text"][0]
+        if text == "LONG":
+            ids = list(range(100, 110))
+        else:
+            ids = [int(text)] * 4
+        return {
+            "input_ids": torch.tensor([ids]),
+            "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+        }
+
+
+class TestPreTokenizedDatasetWrapperReplacementDeterminism:
+    """Over-long (or otherwise unusable) samples are replaced by a substitute chosen
+    from a per-sample RNG, never from the process-global ``random`` state.
+
+    Regression test: with the global RNG, ranks whose ``random`` stream had
+    advanced differently (e.g. the per-node dataset-building rank) substituted a
+    different document, so context-parallel ranks of one CP group saw different
+    packs / ``cu_seqlens`` for the same microbatch and TE's ring-attention gradient
+    accumulation produced inf/nan (or silently wrong) dk/dv.
+    """
+
+    def _stub_pipeline(self, monkeypatch):
+        import torch
+
+        import nemo_automodel.components.datasets.vlm.collate_fns as collate_fns
+        import nemo_automodel.components.datasets.vlm.fake_image as fake_image
+
+        monkeypatch.setattr(ds, "_preload_media", lambda example, processor, **kw: example)
+        monkeypatch.setattr(ds, "_build_video_metadata", lambda conversation: None)
+        monkeypatch.setattr(fake_image, "_conversation_has_media", lambda conversation: False)
+        monkeypatch.setattr(collate_fns, "_extract_media_from_conversations", lambda conversations: ([], []))
+        monkeypatch.setattr(
+            collate_fns,
+            "build_labels_from_template",
+            lambda input_ids, conversations, processor: torch.zeros_like(input_ids),
+        )
+
+    def _make_dataset(self, n=64):
+        def conv(text):
+            return {
+                "conversation": [
+                    {"role": "user", "content": [{"type": "text", "text": text}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                ]
+            }
+
+        return [conv("LONG")] + [conv(str(i)) for i in range(1, n)]
+
+    def test_substitute_is_independent_of_global_random_state(self, monkeypatch):
+        import random
+
+        self._stub_pipeline(monkeypatch)
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            self._make_dataset(), _LengthByTextProcessor(), max_length=4, truncate=False, inject_fake_images=False
+        )
+
+        random.seed(1)
+        first = wrapper[0]["input_ids"].tolist()
+        random.seed(2)
+        second = wrapper[0]["input_ids"].tolist()
+        random.seed(3)
+        third = wrapper[0]["input_ids"].tolist()
+
+        assert first != list(range(100, 110)), "the over-long sample must have been replaced"
+        assert first == second == third, "the substitute must not depend on the process-global RNG state"
+
+    def test_different_samples_get_different_substitute_streams(self):
+        draws = {ds._replacement_rng(idx).randint(0, 10**9) for idx in range(32)}
+        assert len(draws) > 1
+
+
+class _FakeSqlDataset:
+    """Minimal stand-in for an Arrow ``Dataset`` with ``map`` / ``column_names``."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.column_names = list(rows[0].keys()) if rows else []
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def map(self, fn, remove_columns=None):
+        return [fn(r) for r in self.rows]
+
+
+def test_spider_schema_to_ddl_renders_tables_keys_and_underscored_names():
+    row = {
+        "db_id": "perpetrator",
+        "Schema (values (type))": "perpetrator : Perpetrator_ID (number) , People_ID (number) | people : People_ID (number) , Home Town (text)",
+        "Primary Keys": "perpetrator : Perpetrator_ID | people : People_ID",
+        "Foreign Keys": "perpetrator : People_ID equals people : People_ID",
+    }
+    ddl = ds.spider_schema_to_ddl(row)
+    assert ddl.splitlines() == [
+        "CREATE TABLE perpetrator (Perpetrator_ID NUMBER, People_ID NUMBER, PRIMARY KEY (Perpetrator_ID), "
+        "FOREIGN KEY (People_ID) REFERENCES people(People_ID))",
+        "CREATE TABLE people (People_ID NUMBER, Home_Town TEXT, PRIMARY KEY (People_ID))",
+    ]
+
+
+def test_make_spider_dataset_joins_schema_and_collapses_query_whitespace(monkeypatch):
+    spider_rows = [
+        {"db_id": "perpetrator", "question": "How many perpetrators?", "query": "SELECT  count(*)  FROM perpetrator"}
+    ]
+    schema_rows = [
+        {
+            "db_id": "perpetrator",
+            "Schema (values (type))": "perpetrator : Perpetrator_ID (number)",
+            "Primary Keys": "perpetrator : Perpetrator_ID",
+            "Foreign Keys": "",
+        }
+    ]
+    calls = []
+
+    def fake_load_dataset(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _FakeSqlDataset(schema_rows if "schema" in str(args) + str(kwargs) else spider_rows)
+
+    monkeypatch.setattr(ds, "load_dataset", fake_load_dataset)
+
+    result = ds.make_spider_dataset(split="validation[:1]")
+
+    assert calls[0] == (("xlangai/spider",), {"split": "validation[:1]"})
+    assert calls[1] == (("richardr1126/spider-schema",), {"split": "train"})
+    user_turn, assistant_turn = result[0]["conversation"]
+    assert (
+        "CREATE TABLE perpetrator (Perpetrator_ID NUMBER, PRIMARY KEY (Perpetrator_ID))"
+        in user_turn["content"][0]["text"]
+    )
+    assert "How many perpetrators?" in user_turn["content"][0]["text"]
+    assert assistant_turn["content"][0]["text"] == "SELECT count(*) FROM perpetrator"

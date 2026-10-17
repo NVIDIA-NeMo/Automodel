@@ -63,8 +63,10 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  # Feed final hidden states directly to the compiled projection and cross entropy.
+  output_hidden_states: true
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: openai/gpt-oss-20b
   trust_remote_code: true
   backend:
@@ -73,7 +75,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
@@ -82,8 +84,12 @@ checkpoint:
   enabled: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-  fp32_upcast: false
+  # Keep the hidden-state loss API introduced for the full-logits OOM in #3907.
+  # torch_compile recovers throughput but materializes BF16 logits before FP32 CE.
+  # NeMo-CI job 484242802 (cdd4f1d44, 8x H100 80GB) reports rank-0 peak allocated
+  # memory of 58.77 GiB, about 20 GiB below device capacity (not total CUDA usage).
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset

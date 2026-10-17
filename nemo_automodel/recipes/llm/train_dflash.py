@@ -51,7 +51,9 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
@@ -61,11 +63,13 @@ from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_activation_checkpointing,
     apply_draft_compile,
     apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
     raise_if_peft_configured,
+    read_load_metadata_with_gloo,
     should_sync_grads,
 )
 
@@ -261,6 +265,7 @@ class TrainDFlashRecipe(BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
             packed_sequence_size=packed_sequence_size,
             dp_mesh=self.dp_mesh,
         )
@@ -277,6 +282,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                 packed_sequence_size=packed_sequence_size,
                 dp_mesh=self.dp_mesh,
             )
@@ -321,10 +327,13 @@ class TrainDFlashRecipe(BaseRecipe):
                 attention_backend=attention_backend,
             )
         self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
-        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede AC and the DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
         # Optional torch.compile of the draft, in place; after the fp8 swap.
         apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
+        apply_draft_activation_checkpointing(
+            self.draft_model, self.cfg.get("distributed.activation_checkpointing", False)
+        )
 
         trainer_module = self._build_trainer_module(attention_backend, recipe_cfg).to(self.device)
         if self.dist_env.world_size > 1:
@@ -342,6 +351,10 @@ class TrainDFlashRecipe(BaseRecipe):
                 process_group=self._draft_ddp_process_group(),
             )
         self.trainer_module = trainer_module
+        # DDP broadcasts only inside the DP subgroup. The draft is replicated
+        # across TP, so align those independently initialized copies before the
+        # optimizer captures them and TP replica gradients are averaged.
+        broadcast_tp_replicas([self.trainer_module], self.device_mesh)
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
@@ -398,6 +411,15 @@ class TrainDFlashRecipe(BaseRecipe):
                 default_name=type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1],
             )
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
+            trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
+            trackio_cfg.name = (
+                trackio_cfg.name or type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1]
+            )
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
+            logger.info("Trackio experiment tracking enabled")
+
     def _build_target_model(self, recipe_cfg, target_path: str, draft_spec: DFlashDraftSpec) -> torch.nn.Module:
         """Load the frozen (optionally tensor-parallel) target model.
 
@@ -418,6 +440,7 @@ class TrainDFlashRecipe(BaseRecipe):
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            load_metadata_with_gloo=read_load_metadata_with_gloo(self.cfg.get("checkpoint", None)),
         )
         if target_attn_implementation is not None:
             target_kwargs["attn_implementation"] = target_attn_implementation
@@ -604,6 +627,13 @@ class TrainDFlashRecipe(BaseRecipe):
             "block_size": self.block_size,
             "mask_token_id": self.mask_token_id,
             "target_layer_ids": target_layer_ids,
+            # Output/input transforms the target applies around the shared head and
+            # embedding. Identity for every Qwen3-family target; the published
+            # Muse Glimmer drafter ships a multiplier and a logit softcap, and both
+            # training and decoding must apply whatever is stamped here.
+            "output_multiplier": float(recipe_cfg.get("output_multiplier", 1.0)),
+            "final_logit_softcapping": recipe_cfg.get("final_logit_softcapping", None),
+            "input_embedding_scale": float(recipe_cfg.get("input_embedding_scale", 1.0)),
         }
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
@@ -667,10 +697,13 @@ class TrainDFlashRecipe(BaseRecipe):
         return {}
 
     def _wandb_log(self, data: dict[str, float], step: int) -> None:
-        """Log scalar metrics to the rank-zero W&B run when configured."""
+        """Log scalar metrics to the rank-zero W&B and Trackio runs when configured."""
         run = getattr(self, "wandb_run", None)
         if run is not None:
             run.log(data, step=step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(data, step=step)
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
@@ -1086,6 +1119,10 @@ class TrainDFlashRecipe(BaseRecipe):
                     pending_micro_batches += 1
 
                     if pending_micro_batches == self.grad_accumulation_steps:
+                        synchronize_tp_replica_gradients(
+                            [self.trainer_module],
+                            getattr(self, "device_mesh", None),
+                        )
                         torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
@@ -1143,6 +1180,10 @@ class TrainDFlashRecipe(BaseRecipe):
                 # Flush the trailing partial accumulation window (see EAGLE recipes
                 # for the rescale rationale).
                 if pending_micro_batches > 0:
+                    synchronize_tp_replica_gradients(
+                        [self.trainer_module],
+                        getattr(self, "device_mesh", None),
+                    )
                     scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                     for p in self.trainer_module.parameters():
                         if p.grad is not None:

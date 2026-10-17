@@ -67,7 +67,7 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.
 docker run --gpus all -it --rm \
   --shm-size=8g \
   -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.06.00
+  nvcr.io/nvidia/nemo-automodel:26.10.00
 ```
 
 **2.** Navigate to the AutoModel directory (where the recipes are):

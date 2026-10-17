@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
 from copy import copy
-from typing import Callable, Dict, Iterator, List, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -25,14 +26,24 @@ from torch.distributed.fsdp import (
     fully_shard,
 )
 
-from nemo_automodel.shared.torch_patches import (
+from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
-from nemo_automodel.shared.torch_patches import (
+from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_unused_param_reduction as _patch_fsdp_unused_param_reduction,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
+
+__all__ = [
+    "fully_shard_by_dtype",
+    "reject_unsupported_mtp_cp",
+    "reject_unsupported_mtp_cp_pp",
+]
 
 
 def reject_unsupported_mtp_cp(model: nn.Module) -> None:
@@ -41,15 +52,20 @@ def reject_unsupported_mtp_cp(model: nn.Module) -> None:
         raise RuntimeError(f"{type(model).__name__} does not support MTP with context parallelism")
 
 
-def reject_unsupported_mtp_cp_pp(model: nn.Module) -> None:
-    """Reject MTP+CP on every trimmed pipeline stage before CP collectives."""
+def reject_unsupported_mtp_cp_pp(model: nn.Module, *, pp_size: int | None = None) -> None:
+    """Reject unsupported MTP+CP+PP before parallelizing the model.
+
+    Call only when context parallelism is active.
+
+    Args:
+        model: Model whose MTP capabilities are checked.
+        pp_size: Pipeline mesh size, when available. The legacy stage hook
+            also detects trimmed stages when the supplied mesh omits PP.
+    """
+    if not model.supports.mtp_enabled or model.supports.supports_mtp_cp_pp:
+        return
     is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
-    if (
-        model.supports.mtp_enabled
-        and not model.supports.supports_mtp_cp_pp
-        and callable(is_pp_stage_fn)
-        and is_pp_stage_fn()
-    ):
+    if (pp_size is not None and pp_size > 1) or (callable(is_pp_stage_fn) and is_pp_stage_fn()):
         raise NotImplementedError(
             "MTP with context and pipeline parallelism is not supported; use PP size 1 or CP size 1"
         )
@@ -189,7 +205,8 @@ def _fully_shard(
     offload_policy: OffloadPolicy | None,
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
-    fully_shard_fn: Callable[..., None] | None = None,
+    *,
+    shard_module: Callable[..., None],
 ) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
@@ -200,7 +217,7 @@ def _fully_shard(
                 offload_policy,
                 reshard_after_forward,
                 ignored_params,
-                fully_shard_fn,
+                shard_module=shard_module,
             )
     else:
         _call_fully_shard(
@@ -210,7 +227,7 @@ def _fully_shard(
             offload_policy,
             reshard_after_forward,
             ignored_params,
-            fully_shard_fn,
+            shard_module=shard_module,
         )
 
 
@@ -221,11 +238,9 @@ def _call_fully_shard(
     offload_policy: OffloadPolicy | None,
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
-    fully_shard_fn: Callable[..., None] | None = None,
+    *,
+    shard_module: Callable[..., None],
 ) -> None:
-    if fully_shard_fn is None:
-        fully_shard_fn = fully_shard
-
     kwargs = {
         "mesh": mesh,
         "mp_policy": mp_policy,
@@ -240,7 +255,7 @@ def _call_fully_shard(
         if module_ignored_params:
             kwargs["ignored_params"] = module_ignored_params
 
-    fully_shard_fn(module, **kwargs)
+    shard_module(module, **kwargs)
 
 
 def _mp_policy_with_param_dtype(
@@ -253,7 +268,6 @@ def _mp_policy_with_param_dtype(
     object.__setattr__(mp_policy_copy, "param_dtype", param_dtype)
     if param_dtype == torch.float32:
         object.__setattr__(mp_policy_copy, "reduce_dtype", torch.float32)
-        object.__setattr__(mp_policy_copy, "output_dtype", torch.float32)
         # FP32 compute modules own any required input cast. Casting at the nested
         # FSDP boundary changes the module-visible input dtype and can make an
         # activation-checkpoint recompute disagree with the original forward.
@@ -309,7 +323,7 @@ def _make_compute_dtype_fn(
          given). Resolved per-param -- a single genuinely lower-precision sibling (e.g.
          Qwen3.5-MoE's bf16 ``shared_expert_gate``) no longer forces the layer's fp32
          master weights into fp32 compute. Intrinsic fp32 is already covered by #1/#2;
-         the ``(storage, compute)`` grouping still keeps each FSDP unit storage-uniform.
+         the grouping still keeps each FSDP unit uniform in trainable storage dtype.
          See NVIDIA-NeMo/Automodel#3327.
 
     Non-floating tensors always keep their storage dtype.
@@ -321,6 +335,7 @@ def _make_compute_dtype_fn(
     pinned_ids: Set[int] = set()
     if fp32_compute_module_names:
         for name, tensor in (*module.named_parameters(), *module.named_buffers()):
+            name = canonical_parameter_fqn(name)
             if id(tensor) not in ignored_param_ids and any(token in name for token in fp32_compute_module_names):
                 pinned_ids.add(id(tensor))
 
@@ -349,7 +364,7 @@ def fully_shard_by_dtype(
     fp32_compute_module_names: Tuple[str, ...] = (),
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
-    fully_shard_fn: Callable[..., None] | None = None,
+    model_parallelizer: "ModelParallelizer | None" = None,
 ) -> None:
     """Fully shard a module so every parameter computes in its required dtype.
 
@@ -385,9 +400,10 @@ def fully_shard_by_dtype(
         ignored_params: Parameters already owned by another FSDP or parallelism
             unit. They are excluded from dtype grouping and forwarded to the
             enclosing FSDP unit.
-        fully_shard_fn: Optional model-specific replacement for ``fully_shard``.
-            Every FSDP unit created by this function uses this callback.
+        model_parallelizer: Optional model sidecar that owns the
+            FSDP primitive.
     """
+    shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
     ignored_params = set(ignored_params or ())
     ignored_param_ids = {id(param) for param in ignored_params}
     compute_dtype_of = _make_compute_dtype_fn(
@@ -397,14 +413,32 @@ def fully_shard_by_dtype(
         ignored_params=ignored_params,
     )
 
-    # FSDP2 requires every param group to be uniform in *storage* (original) dtype
-    # -- ``_init_mp_dtypes`` asserts ``{p.orig_dtype}`` is a singleton -- while a group's
-    # ``param_dtype`` controls *compute* dtype. These are independent axes, so we group by
-    # the (storage, compute) pair: this keeps each FSDP unit storage-uniform (satisfying the
-    # assertion even when two different storage dtypes share one compute dtype, e.g. bf16 and
-    # fp32 weights both computing in bf16) while still splitting params that need a different
-    # compute dtype. ``key[1]`` is the compute dtype used as the unit's ``param_dtype``.
-    group_key_of = lambda t: (t.dtype, compute_dtype_of(t))
+    # FSDP requires uniform *trainable* storage dtype per FSDP unit.
+    # Frozen bases may join adapters with different storage but identical compute.
+    # Normalize frozen grouping keys only when that compute group has one trainable
+    # dtype; retain storage isolation for mixed trainable dtypes.
+    trainable_dtypes_by_compute: dict[torch.dtype, set[torch.dtype]] = defaultdict(set)
+    for param in module.parameters():
+        if id(param) not in ignored_param_ids and param.requires_grad:
+            trainable_dtypes_by_compute[compute_dtype_of(param)].add(param.dtype)
+
+    def group_key_of(tensor: torch.Tensor) -> tuple[torch.dtype, torch.dtype]:
+        """Resolve grouping for an arbitrary-shaped parameter or buffer.
+
+        Args:
+            tensor: Parameter or buffer of arbitrary shape; DTensor global shape
+                and mesh placements are not changed.
+
+        Returns:
+            Trainable storage compatibility dtype and compute dtype for grouping.
+        """
+        compute_dtype = compute_dtype_of(tensor)
+        storage_dtype = tensor.dtype
+        if not tensor.requires_grad:
+            trainable_dtypes = trainable_dtypes_by_compute[compute_dtype]
+            if len(trainable_dtypes) == 1:
+                storage_dtype = next(iter(trainable_dtypes))
+        return storage_dtype, compute_dtype
 
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.
@@ -422,7 +456,7 @@ def fully_shard_by_dtype(
                 offload_policy,
                 reshard_after_forward,
                 ignored_params,
-                fully_shard_fn,
+                shard_module=shard_module,
             )
         return
     elif len(grouped_params) == 1:
@@ -434,7 +468,7 @@ def fully_shard_by_dtype(
             offload_policy,
             reshard_after_forward,
             ignored_params,
-            fully_shard_fn,
+            shard_module=shard_module,
         )
     else:
         least_items_key = min(grouped_params.items(), key=lambda x: len(x[1]))[0]
@@ -477,19 +511,22 @@ def fully_shard_by_dtype(
             }
             if ignored_params:
                 subtree_kwargs["ignored_params"] = ignored_params
-            if fully_shard_fn is not None:
-                subtree_kwargs["fully_shard_fn"] = fully_shard_fn
-            _fully_shard(_get_module_from_path(module, path), **subtree_kwargs)
+            _fully_shard(
+                _get_module_from_path(module, path),
+                shard_module=shard_module,
+                **subtree_kwargs,
+            )
         if len(grouped_params) == 2:
             parent_key = next(key for key in grouped_params if key != least_items_key)
+            parent_policy = _mp_policy_with_param_dtype(mp_policy, parent_key[1])
             _call_fully_shard(
                 module,
                 mesh,
-                _mp_policy_with_param_dtype(mp_policy, parent_key[1]),
+                parent_policy,
                 offload_policy,
                 reshard_after_forward,
                 ignored_params,
-                fully_shard_fn,
+                shard_module=shard_module,
             )
         elif ignored_params:
             # Preserve the caller's FSDP ownership boundary after every managed
@@ -501,5 +538,5 @@ def fully_shard_by_dtype(
                 offload_policy,
                 reshard_after_forward,
                 ignored_params,
-                fully_shard_fn,
+                shard_module=shard_module,
             )

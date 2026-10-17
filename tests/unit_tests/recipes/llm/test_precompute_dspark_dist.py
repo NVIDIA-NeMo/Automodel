@@ -30,11 +30,19 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import Qwen3Config
 
+import nemo_automodel.recipes.llm._dspark_target_build as tdb
 import nemo_automodel.recipes.llm.precompute_dspark_dist as pdd
 from nemo_automodel.components.datasets.llm.dspark_cache import (
     CachedDSparkDataset,
     read_manifest,
     read_target_weight_modules,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V4_MODEL_TYPE,
+    DEEPSEEK_V41_MODEL_TYPE,
+    GLM_5_2_MODEL_TYPE,
+    KIMI_K3_MODEL_TYPES,
+    MINIMAX_M3_MODEL_TYPES,
 )
 
 _VOCAB = 16
@@ -116,6 +124,7 @@ _IDENTITY_KWARGS = dict(
     shuffle_seed=42,
     mask_reasoning_content=False,
     chat_template_sha256="0" * 64,
+    mask_generation_prompt=False,
 )
 
 
@@ -146,6 +155,7 @@ def test_build_manifest_schema():
     assert manifest["train_split"] == "train"
     assert manifest["shuffle_seed"] == 42
     assert manifest["mask_reasoning_content"] is False
+    assert manifest["mask_generation_prompt"] is False
     assert manifest["chat_template_sha256"] == "0" * 64
 
 
@@ -179,6 +189,7 @@ def test_ensure_output_dir_compatible_rejects_different_input_identity(tmp_path)
         ("train_split", "train[:50]"),
         ("shuffle_seed", 7),
         ("mask_reasoning_content", True),
+        ("mask_generation_prompt", True),
         ("chat_template_sha256", "f" * 64),
     ]:
         with pytest.raises(ValueError, match=field):
@@ -219,19 +230,19 @@ def test_tokenizer_chat_template_sha256():
 
 
 # ---------------------------------------------------------------------------
-# _build_target dispatch
+# build_dspark_target dispatch
 # ---------------------------------------------------------------------------
 
 
 def test_build_target_rejects_minimax():
     with pytest.raises(ValueError, match="multimodal"):
-        pdd._build_target(
+        tdb.build_dspark_target(
             cfg=_Cfg(),
             recipe_cfg=_recipe_cfg(),
             world_size=8,
             device=torch.device("cpu"),
             compute_dtype=torch.float32,
-            model_type=list(pdd._MINIMAX_M3_MODEL_TYPES)[0],
+            model_type=list(MINIMAX_M3_MODEL_TYPES)[0],
             target_path="mm",
             trust_remote_code=False,
         )
@@ -239,7 +250,11 @@ def test_build_target_rejects_minimax():
 
 @pytest.mark.parametrize(
     "model_type,builder_attr",
-    [(pdd._DEEPSEEK_V4_MODEL_TYPE, "build_deepseek_v4_target"), (pdd._GLM_5_2_MODEL_TYPE, "build_glm_5_2_target")],
+    [
+        (DEEPSEEK_V4_MODEL_TYPE, "build_deepseek_v4_target"),
+        (GLM_5_2_MODEL_TYPE, "build_glm_5_2_target"),
+        (KIMI_K3_MODEL_TYPES[0], "build_kimi_k3_target"),
+    ],
 )
 def test_build_target_dispatches_sharded_builders(monkeypatch, model_type, builder_attr):
     captured = {}
@@ -248,8 +263,8 @@ def test_build_target_dispatches_sharded_builders(monkeypatch, model_type, build
         captured.update(kwargs)
         return "target-config", "target-model", "distributed-setup"
 
-    monkeypatch.setattr(pdd, builder_attr, _fake_builder)
-    config, model = pdd._build_target(
+    monkeypatch.setattr(tdb, builder_attr, _fake_builder)
+    config, model = tdb.build_dspark_target(
         cfg=_Cfg({"x": 1}),
         recipe_cfg=_recipe_cfg(),
         world_size=16,
@@ -265,6 +280,58 @@ def test_build_target_dispatches_sharded_builders(monkeypatch, model_type, build
     assert captured["trust_remote_code"] is True
 
 
+@pytest.mark.parametrize("custom_backends", [False, True])
+def test_build_target_dispatches_model_owned_v41_config(monkeypatch, custom_backends):
+    captured = {}
+    setup = object()
+    model = SimpleNamespace(config=SimpleNamespace(text_config="target-text-config"))
+
+    def _fake_setup(cfg, world_size):
+        captured["world_size"] = world_size
+        return setup
+
+    def _fake_build(self, **kwargs):
+        captured["options"] = self
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr(tdb, "create_distributed_setup_from_config", _fake_setup)
+    monkeypatch.setattr(tdb.DeepseekV41DSparkTargetConfig, "build", _fake_build)
+    overrides = (
+        dict(
+            target_attn_backend="eager",
+            target_dispatcher="torch",
+            target_experts="torch",
+            target_enable_fsdp_optimizations=False,
+        )
+        if custom_backends
+        else {}
+    )
+    config, actual = tdb.build_dspark_target(
+        cfg=_Cfg(),
+        recipe_cfg=_recipe_cfg(**overrides),
+        world_size=64,
+        device=torch.device("cuda"),
+        compute_dtype=torch.bfloat16,
+        model_type=DEEPSEEK_V41_MODEL_TYPE,
+        target_path="deepseek-v41",
+        trust_remote_code=True,
+    )
+    assert config == "target-text-config"
+    assert actual is model
+    assert captured["world_size"] == 64
+    assert captured["distributed_setup"] is setup
+    assert captured["device"] == torch.device("cuda")
+    assert captured["compute_dtype"] == torch.bfloat16
+    options = captured["options"]
+    assert options.target_path == "deepseek-v41"
+    assert options.trust_remote_code is True
+    assert options.attn_backend == ("eager" if custom_backends else "tilelang")
+    assert options.dispatcher == ("torch" if custom_backends else "hybridep")
+    assert options.experts == ("torch" if custom_backends else "torch_mm")
+    assert options.enable_fsdp_optimizations is not custom_backends
+
+
 def test_build_target_generic_replicated_path(monkeypatch):
     fake_model = SimpleNamespace(config=_config_stub(), to=lambda _d: fake_model)
     captured = {}
@@ -274,8 +341,8 @@ def test_build_target_generic_replicated_path(monkeypatch):
         captured.update(kwargs)
         return fake_model
 
-    monkeypatch.setattr(pdd.NeMoAutoModelForCausalLM, "from_pretrained", _fake_from_pretrained)
-    config, model = pdd._build_target(
+    monkeypatch.setattr(tdb.NeMoAutoModelForCausalLM, "from_pretrained", _fake_from_pretrained)
+    config, model = tdb.build_dspark_target(
         cfg=_Cfg(),
         recipe_cfg=_recipe_cfg(target_attn_implementation="eager"),
         world_size=4,
@@ -395,22 +462,26 @@ def test_run_writes_cache_single_process(monkeypatch, tmp_path):
         lambda **_kw: SimpleNamespace(device=torch.device("cpu"), world_size=1, rank=0, is_main=True),
     )
     monkeypatch.setattr(pdd, "_read_target_model_type", lambda *_a, **_k: "qwen3")
-    monkeypatch.setattr(pdd.NeMoAutoModelForCausalLM, "from_pretrained", lambda *_a, **_k: fake_model)
+    monkeypatch.setattr(tdb.NeMoAutoModelForCausalLM, "from_pretrained", lambda *_a, **_k: fake_model)
     monkeypatch.setattr(
         pdd.NeMoAutoTokenizer,
         "from_pretrained",
         lambda *_a, **_k: SimpleNamespace(chat_template="{{ messages }}", apply_chat_template=lambda *a, **k: None),
     )
     monkeypatch.setattr(pdd, "HFDSparkTargetModel", _FakeWrapper)
+    loader_kwargs = {}
     monkeypatch.setattr(
         pdd,
         "build_eagle3_dataloader",
-        lambda **_kw: DataLoader(
-            _TokenDataset(3),
-            batch_size=2,
-            shuffle=False,
-            collate_fn=lambda fs: {k: torch.stack([f[k] for f in fs], 0) for k in fs[0]},
-            drop_last=False,
+        lambda **_kw: (
+            loader_kwargs.update(_kw)
+            or DataLoader(
+                _TokenDataset(3),
+                batch_size=2,
+                shuffle=False,
+                collate_fn=lambda fs: {k: torch.stack([f[k] for f in fs], 0) for k in fs[0]},
+                drop_last=False,
+            )
         ),
     )
 
@@ -418,13 +489,16 @@ def test_run_writes_cache_single_process(monkeypatch, tmp_path):
     cfg = _Cfg(
         {
             "dist_env": {"backend": "gloo"},
-            "recipe_args": _recipe_cfg(cache_output_dir=cache_dir),
+            "recipe_args": _recipe_cfg(cache_output_dir=cache_dir, mask_generation_prompt=True),
         }
     )
     assert pdd.run(cfg) == 0
 
     manifest = read_manifest(cache_dir)
     assert manifest["num_samples"] == 3
+    # The loss-mask option reaches both the dataloader and the recorded input identity.
+    assert loader_kwargs["mask_generation_prompt"] is True
+    assert manifest["mask_generation_prompt"] is True
     assert manifest["target_layer_ids"] == _LAYERS
     dataset = CachedDSparkDataset(cache_dir)
     assert len(dataset) == 3
@@ -453,3 +527,25 @@ def test_main_parses_config_and_runs(monkeypatch):
     monkeypatch.setattr(pdd, "run", _fake_run)
     assert pdd.main("some.yaml") == 0
     assert seen["cfg"] is sentinel_cfg
+
+
+def test_manifest_without_mask_generation_prompt_matches_default(tmp_path):
+    """Caches written before the field existed compare as ``mask_generation_prompt=False``."""
+    from nemo_automodel.components.datasets.llm.dspark_cache import (
+        manifest_mismatch_fields,
+        read_manifest,
+        write_manifest,
+    )
+
+    current = pdd.build_cache_manifest(**_manifest_kwargs())
+    legacy = {k: v for k, v in current.items() if k != "mask_generation_prompt"}
+    write_manifest(str(tmp_path), legacy)
+
+    # The reader fills the field in, so the legacy cache compares (and trains) as False.
+    recorded = read_manifest(str(tmp_path), allow_incomplete=True)
+    assert recorded["mask_generation_prompt"] is False
+    assert manifest_mismatch_fields(recorded, current) == []
+    assert manifest_mismatch_fields(
+        recorded, pdd.build_cache_manifest(**_manifest_kwargs(mask_generation_prompt=True))
+    ) == ["mask_generation_prompt"]
+    pdd._ensure_output_dir_compatible(str(tmp_path), current)  # no raise

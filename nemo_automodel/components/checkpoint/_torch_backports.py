@@ -58,7 +58,12 @@ def apply_patches() -> None:
 def apply_async_checkpoint_patch() -> None:
     """
     Apply stabilization patch for torch.distributed.checkpoint async process executor.
-    This serializes creation of the global background process across concurrent async_save calls.
+
+    This serializes creation of the global background process across concurrent
+    async_save calls and makes its first initialization synchronous. PyTorch
+    otherwise checks for the process on the caller thread but assigns it later on
+    a worker thread, allowing consecutive distributed saves to disagree across
+    ranks about whether process-group initialization is required.
     """
     try:
         ape_mod = importlib.import_module("torch.distributed.checkpoint._async_process_executor")
@@ -85,6 +90,30 @@ def apply_async_checkpoint_patch() -> None:
             except Exception:
                 # Defensive: if staticmethod replacement fails, leave as-is
                 logger.debug("Failed to assign locked _execute_save_impl", exc_info=True)
+
+        ProcessGroupInitInfo = getattr(ape_mod, "_ProcessGroupInitInfo", None)
+        AsyncCheckpointProcess = getattr(ape_mod, "_AsyncCheckpointProcess", None)
+        if (
+            Exec is not None
+            and ProcessGroupInitInfo is not None
+            and AsyncCheckpointProcess is not None
+            and not hasattr(Exec, "_nemo_orig_execute_save")
+        ):
+            Exec._nemo_orig_execute_save = Exec.execute_save
+
+            def _nemo_initialize_checkpoint_process(self, *args, **kwargs):
+                with ape_mod._NEMO_CREATE_LOCK:
+                    if ape_mod._CHECKPOINT_PROCESS is None:
+                        pg_init_info = ProcessGroupInitInfo(kwargs.get("process_group"))
+                        ape_mod._CHECKPOINT_PROCESS = AsyncCheckpointProcess(pg_init_info=pg_init_info)
+                return Exec._nemo_orig_execute_save(self, *args, **kwargs)
+
+            try:
+                Exec.execute_save = _nemo_initialize_checkpoint_process
+                logger.debug("Applied synchronous initialization patch to DCP process executor")
+            except Exception:
+                # Defensive: if method replacement fails, leave as-is
+                logger.debug("Failed to assign patched execute_save", exc_info=True)
 
         ape_mod._NEMO_PATCHED_CREATE_LOCK = True
     except ModuleNotFoundError:

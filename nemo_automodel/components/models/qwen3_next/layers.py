@@ -18,7 +18,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
-from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
+from transformers.models.qwen3_next.modeling_qwen3_next import (
+    Qwen3NextGatedDeltaNet,
+    torch_chunk_gated_delta_rule,
+    torch_recurrent_gated_delta_rule,
+)
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
@@ -30,6 +34,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -99,6 +104,35 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
     def __init__(self, config: Qwen3NextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
         _install_ssm_gate(self)
+        self._bind_kernels()
+
+    def _bind_kernels(self) -> None:
+        """Restore the kernel callables HF dropped as instance attributes in 5.15.
+
+        transformers <=5.12 set ``causal_conv1d_fn`` / ``causal_conv1d_update`` /
+        ``chunk_gated_delta_rule`` / ``recurrent_gated_delta_rule`` on the module and
+        left ``causal_conv1d_fn`` as ``None`` when the kernel package was absent.
+        5.15 moved them to decorated module-level fallbacks, so ``forward`` below --
+        which calls them with the kernel package's own signature (``x=``,
+        ``seq_idx=``) -- raised AttributeError. Rebind the installed kernels, and
+        keep ``None`` when causal_conv1d is missing so the pure-torch conv branch in
+        ``forward`` is taken rather than a signature-incompatible fallback.
+        """
+        has_conv1d, causal_conv1d_fn = safe_import_from("causal_conv1d", "causal_conv1d_fn")
+        _, causal_conv1d_update = safe_import_from("causal_conv1d", "causal_conv1d_update")
+        _, chunk_gated_delta_rule = safe_import_from(
+            "fla.ops.gated_delta_rule", "chunk_gated_delta_rule", alt=torch_chunk_gated_delta_rule
+        )
+        _, fused_recurrent_gated_delta_rule = safe_import_from(
+            "fla.ops.gated_delta_rule", "fused_recurrent_gated_delta_rule", alt=torch_recurrent_gated_delta_rule
+        )
+
+        # safe_import_from returns an UnavailableMeta placeholder rather than None
+        # when causal_conv1d is missing, so key the pure-torch branch off the flag.
+        self.causal_conv1d_fn = causal_conv1d_fn if has_conv1d else None
+        self.causal_conv1d_update = causal_conv1d_update if has_conv1d else None
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule
+        self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
 
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
         """Compute the decay gate ``g`` in fp32, via the holder when it exists."""
@@ -117,7 +151,10 @@ class Qwen3NextFp32GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # through ``self._compute_gate(a)`` so A_log/dt_bias stay fp32 under FSDP.
         from transformers.models.qwen3_next.modeling_qwen3_next import apply_mask_to_padding_states
 
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        # transformers 5.15 dropped this helper's shape guards; it documents a 2D padding
+        # mask and a 4D packed causal mask would broadcast to 5D and raise.
+        if attention_mask is None or attention_mask.dim() == 2:
+            hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         batch_size, seq_len, _ = hidden_states.shape
 

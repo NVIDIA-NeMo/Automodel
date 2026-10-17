@@ -363,7 +363,7 @@ class GlmMoeDsaStateDictAdapter(Glm4MoeStateDictAdapter):
     that should not be quantized (k_norm, weights_proj).
     """
 
-    _supports_write_through_checkpoint_load = False
+    _supports_low_memory_dcp_load = False
 
     _indexer_non_quantized_keys = [
         "indexer.k_norm.weight",

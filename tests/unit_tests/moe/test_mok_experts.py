@@ -69,6 +69,24 @@ def test_mok_functional_import_is_lazy_and_cached(monkeypatch: pytest.MonkeyPatc
     assert imports == ["mok.functional"]
 
 
+def test_mok_ops_import_is_lazy_and_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    ops = object()
+    imports: list[str] = []
+
+    def fake_safe_import(path: str, **kwargs: object) -> tuple[bool, object]:
+        del kwargs
+        imports.append(path)
+        return True, ops
+
+    monkeypatch.setattr(mok_experts, "_mok_ops", None)
+    monkeypatch.setattr(mok_experts, "safe_import", fake_safe_import)
+
+    assert mok_experts._mok_ops is None
+    assert mok_experts._load_mok_ops() is ops
+    assert mok_experts._load_mok_ops() is ops
+    assert imports == ["mok.ops"]
+
+
 def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
@@ -82,6 +100,7 @@ def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> N
         lambda *args, **kwargs: (True, FakeFunctional),
     )
     config = MoKBackendConfig(
+        precision="mxfp8",
         fwd_num_comm_sms=24,
         bwd_num_comm_sms=20,
         minibatch_size=2048,
@@ -100,6 +119,11 @@ def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> N
         "schedule_capacity_multiplier": 0.75,
         "all_gather_top_experts_chunk_bytes": 1024,
     }
+
+
+def test_mok_backend_config_rejects_unknown_precision() -> None:
+    with pytest.raises(ValueError, match="mok.precision must be 'bf16' or 'mxfp8'; got 'fp8'"):
+        MoKBackendConfig(precision="fp8")
 
 
 def test_mok_accepts_dsv4_clamped_swiglu() -> None:
@@ -154,7 +178,7 @@ def test_mok_passes_swiglu_limit_to_functional_forward_and_backward(
     routed_up = torch.empty(1, 256, 256, dtype=torch.bfloat16)
     routed_down = torch.empty(1, 256, 256, dtype=torch.bfloat16)
 
-    _, schedule, forward_context = runtime.forward(
+    _, schedule, forward_context, mxfp8_weights = runtime.forward(
         x,
         router_weights,
         top_experts,
@@ -177,9 +201,199 @@ def test_mok_passes_swiglu_limit_to_functional_forward_and_backward(
         routed_gate,
         routed_up,
         routed_down,
+        mxfp8_weights,
     )
 
     assert calls == {"forward_limit": functional_limit, "backward_limit": functional_limit}
+
+
+@pytest.mark.parametrize("retain_until_optimizer_step", [False, True])
+def test_mok_mxfp8_quantizes_only_routed_weights_with_required_layouts(
+    monkeypatch: pytest.MonkeyPatch,
+    retain_until_optimizer_step: bool,
+) -> None:
+    functional_calls: dict[str, tuple[object, ...]] = {}
+    quantization_calls: list[tuple[torch.Tensor, bool, bool]] = []
+    quantization_results: list[tuple[torch.Tensor | None, ...]] = []
+
+    class FakeFunctional:
+        @staticmethod
+        def get_workspace(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return object()
+
+        @staticmethod
+        def build_schedule(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return object()
+
+        @staticmethod
+        def forward(*args: object) -> tuple[torch.Tensor, object]:
+            functional_calls["forward"] = args
+            return args[3], object()
+
+        @staticmethod
+        def backward(*args: object) -> tuple[object, ...]:
+            functional_calls["backward"] = args
+            return ()
+
+    class FakeOps:
+        @staticmethod
+        def mxfp8_quantize(
+            weight: torch.Tensor,
+            return_normal: bool,
+            return_transposed: bool,
+        ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+            quantization_calls.append((weight, return_normal, return_transposed))
+            call_id = len(quantization_calls)
+            normal = weight.clone() if return_normal else None
+            normal_scale = torch.tensor([call_id], dtype=torch.uint8) if return_normal else None
+            transposed = weight.transpose(-1, -2).contiguous() if return_transposed else None
+            transposed_scale = torch.tensor([call_id + 10], dtype=torch.uint8) if return_transposed else None
+            result = (normal, normal_scale, transposed, transposed_scale)
+            quantization_results.append(result)
+            return result
+
+    monkeypatch.setattr(mok_experts, "_mok_functional", FakeFunctional)
+    monkeypatch.setattr(mok_experts, "_mok_ops", FakeOps)
+    runtime = mok_experts._MoKRuntime(MoKBackendConfig(precision="mxfp8"), swiglu_limit=0.0)
+    runtime._retain_mxfp8_cache_until_optimizer_step = retain_until_optimizer_step
+    runtime.config = object()
+    runtime.ep_group = object()
+    x = torch.empty(4, 256, dtype=torch.bfloat16)
+    router_weights = torch.empty(4, 2, dtype=torch.float32)
+    top_experts = torch.empty(4, 2, dtype=torch.int64)
+    shared_gate = torch.empty(256, 256, dtype=torch.bfloat16)
+    shared_up = torch.empty(256, 256, dtype=torch.bfloat16)
+    shared_down = torch.empty(256, 256, dtype=torch.bfloat16)
+    routed_gate = torch.empty(1, 256, 256, dtype=torch.bfloat16)
+    routed_up = torch.empty(1, 256, 256, dtype=torch.bfloat16)
+    routed_down = torch.empty(1, 256, 256, dtype=torch.bfloat16)
+
+    _, schedule, forward_context, mxfp8_weights = runtime.forward(
+        x,
+        router_weights,
+        top_experts,
+        shared_gate,
+        shared_up,
+        shared_down,
+        routed_gate,
+        routed_up,
+        routed_down,
+    )
+    _, _, _, recompute_mxfp8_weights = runtime.forward(
+        x,
+        router_weights,
+        top_experts,
+        shared_gate,
+        shared_up,
+        shared_down,
+        routed_gate,
+        routed_up,
+        routed_down,
+    )
+    runtime.backward(
+        schedule,
+        forward_context,
+        x,
+        x,
+        router_weights,
+        shared_gate,
+        shared_up,
+        shared_down,
+        routed_gate,
+        routed_up,
+        routed_down,
+        recompute_mxfp8_weights,
+    )
+
+    expected_layouts = (
+        (True, True),
+        (True, True),
+        (True, True),
+    )
+    for (actual_weight, *actual_layout), expected_weight, expected_layout in zip(
+        quantization_calls,
+        (routed_gate, routed_up, routed_down),
+        expected_layouts,
+        strict=True,
+    ):
+        assert actual_weight is expected_weight
+        assert tuple(actual_layout) == expected_layout
+    forward_args = functional_calls["forward"]
+    assert all(
+        actual is expected
+        for actual, expected in zip(forward_args[5:8], (shared_gate, shared_up, shared_down), strict=True)
+    )
+    for actual, quantized in zip(mxfp8_weights, quantization_results, strict=True):
+        assert all(actual_item is expected_item for actual_item, expected_item in zip(actual, quantized, strict=True))
+    for actual, expected in zip(forward_args[8:11], mxfp8_weights, strict=True):
+        assert all(
+            actual_item is expected_item for actual_item, expected_item in zip(actual, expected[:2], strict=True)
+        )
+    assert len(mxfp8_weights) == 3
+    assert len(recompute_mxfp8_weights) == 3
+    assert all(actual is expected for actual, expected in zip(recompute_mxfp8_weights, mxfp8_weights, strict=True))
+    backward_args = functional_calls["backward"]
+    assert all(
+        actual is expected
+        for actual, expected in zip(backward_args[7:10], (shared_gate, shared_up, shared_down), strict=True)
+    )
+    for actual, expected in (
+        (backward_args[10], quantization_results[0]),
+        (backward_args[11], quantization_results[1]),
+        (backward_args[12], quantization_results[2][2:]),
+    ):
+        assert all(actual_item is expected_item for actual_item, expected_item in zip(actual, expected, strict=True))
+    if retain_until_optimizer_step:
+        assert runtime._mxfp8_weights is mxfp8_weights
+        runtime._invalidate_mxfp8_cache()
+    assert runtime._mxfp8_weights is None
+
+
+def test_mok_mxfp8_optimizer_post_hook_refreshes_cached_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    quantization_calls: list[torch.Tensor] = []
+
+    def fake_quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        quantization_calls.append(weight)
+        return weight, weight, weight, weight
+
+    monkeypatch.setattr(mok_experts, "_mxfp8_weight_both", fake_quantize)
+    experts = GroupedExpertsMoK(
+        _valid_moe_config(),
+        BackendConfig(dispatcher="mok", mok={"precision": "mxfp8"}),
+    )
+    optimizer = torch.optim.AdamW(experts.parameters(), lr=1.0e-3, foreach=False)
+    mok_experts.enable_mok_mxfp8_optimizer_step_cache([experts], [optimizer])
+    routed_weights = (
+        experts.routed_gate_weights,
+        experts.routed_up_weights,
+        experts.routed_down_weights,
+    )
+
+    first = experts.runtime._get_mxfp8_weights(*routed_weights)
+    assert experts.runtime._get_mxfp8_weights(*routed_weights) is first
+    assert len(quantization_calls) == 3
+    generation = experts.runtime._mxfp8_cache_generation
+
+    sum(parameter.float().sum() for parameter in experts.parameters()).backward()
+    optimizer.step()
+
+    assert experts.runtime._mxfp8_cache_generation == generation + 1
+    assert experts.runtime._mxfp8_weights is None
+    refreshed = experts.runtime._get_mxfp8_weights(*routed_weights)
+    assert refreshed is not first
+    assert len(quantization_calls) == 6
+
+
+def test_mok_mxfp8_cache_requires_one_optimizer_per_model_part() -> None:
+    experts = GroupedExpertsMoK(
+        _valid_moe_config(),
+        BackendConfig(dispatcher="mok", mok={"precision": "mxfp8"}),
+    )
+
+    with pytest.raises(ValueError, match="one optimizer per model part"):
+        mok_experts.enable_mok_mxfp8_optimizer_step_cache([experts], [])
 
 
 @pytest.mark.parametrize(
@@ -203,7 +417,8 @@ def test_mok_rejects_unsupported_moe_contract(overrides: dict[str, object], mess
 
 def test_mok_state_dict_preserves_combined_expert_layout() -> None:
     config = _valid_moe_config()
-    source = GroupedExpertsMoK(config, BackendConfig(dispatcher="mok"))
+    backend = BackendConfig(dispatcher="mok", mok={"precision": "mxfp8"})
+    source = GroupedExpertsMoK(config, backend)
     with torch.no_grad():
         source.routed_gate_weights.copy_(
             torch.arange(source.routed_gate_weights.numel(), dtype=torch.float32)
@@ -226,7 +441,7 @@ def test_mok_state_dict_preserves_combined_expert_layout() -> None:
     torch.testing.assert_close(state["gate_and_up_projs"][..., 256:], source.routed_up_weights.transpose(-1, -2))
     torch.testing.assert_close(state["down_projs"], source.routed_down_weights.transpose(-1, -2))
 
-    restored = GroupedExpertsMoK(config, BackendConfig(dispatcher="mok"))
+    restored = GroupedExpertsMoK(config, backend)
     restored.load_state_dict(state)
     torch.testing.assert_close(restored.routed_gate_weights, source.routed_gate_weights)
     torch.testing.assert_close(restored.routed_up_weights, source.routed_up_weights)
@@ -289,9 +504,7 @@ def test_mok_rejects_lora_patching() -> None:
 
 
 @pytest.mark.parametrize("world_size", [1, 2, 3, 5, 6])
-def test_mok_requires_world_size_divisible_by_four(
-    monkeypatch: pytest.MonkeyPatch, world_size: int
-) -> None:
+def test_mok_requires_world_size_divisible_by_four(monkeypatch: pytest.MonkeyPatch, world_size: int) -> None:
     monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: world_size)
 
     with pytest.raises(ValueError, match=rf"world size to be divisible by 4; got {world_size}"):
@@ -502,9 +715,9 @@ def test_mok_manual_backward_maps_gradients_to_autograd_inputs() -> None:
         hidden: torch.Tensor
 
     class FakeRuntime:
-        def forward(self, x: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, object, object]:
+        def forward(self, x: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, object, object, None]:
             del args
-            return x.clone(), FakeSchedule(torch.zeros(1, dtype=torch.int32)), FakeForwardContext(x.clone())
+            return x.clone(), FakeSchedule(torch.zeros(1, dtype=torch.int32)), FakeForwardContext(x.clone()), None
 
         def backward(
             self,
@@ -519,8 +732,10 @@ def test_mok_manual_backward_maps_gradients_to_autograd_inputs() -> None:
             routed_gate_weights: torch.Tensor,
             routed_up_weights: torch.Tensor,
             routed_down_weights: torch.Tensor,
+            mxfp8_forward_weights: None,
         ) -> tuple[torch.Tensor, ...]:
             del schedule, forward_context, grad_output
+            assert mxfp8_forward_weights is None
             return (
                 torch.full_like(x, 1),
                 torch.full_like(router_weights, 2),
@@ -564,6 +779,85 @@ def test_mok_manual_backward_maps_gradients_to_autograd_inputs() -> None:
         torch.testing.assert_close(actual, torch.full_like(actual, expected))
 
 
+def test_mok_mxfp8_autograd_restores_saved_weight_layouts() -> None:
+    @dataclass(frozen=True)
+    class FakeSchedule:
+        peer_rank: torch.Tensor
+
+    @dataclass(frozen=True)
+    class FakeForwardContext:
+        hidden: torch.Tensor
+
+    routed_layouts = tuple(
+        tuple(torch.full((1,), projection * 4 + layout) for layout in range(4)) for projection in range(3)
+    )
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.backward_layouts: tuple[tuple[torch.Tensor, ...], ...] | None = None
+
+        def forward(
+            self, x: torch.Tensor, *args: torch.Tensor
+        ) -> tuple[torch.Tensor, object, object, tuple[tuple[torch.Tensor, ...], ...]]:
+            del args
+            return (
+                x.clone(),
+                FakeSchedule(torch.zeros(1, dtype=torch.int32)),
+                FakeForwardContext(x.clone()),
+                routed_layouts,
+            )
+
+        def backward(
+            self,
+            schedule: object,
+            forward_context: object,
+            grad_output: torch.Tensor,
+            x: torch.Tensor,
+            router_weights: torch.Tensor,
+            shared_gate_weights: torch.Tensor,
+            shared_up_weights: torch.Tensor,
+            shared_down_weights: torch.Tensor,
+            routed_gate_weights: torch.Tensor,
+            routed_up_weights: torch.Tensor,
+            routed_down_weights: torch.Tensor,
+            mxfp8_weights: tuple[tuple[torch.Tensor, ...], ...],
+        ) -> tuple[torch.Tensor, ...]:
+            del schedule, forward_context, grad_output
+            self.backward_layouts = mxfp8_weights
+            return (
+                torch.ones_like(x),
+                torch.ones_like(router_weights),
+                torch.ones_like(routed_gate_weights),
+                torch.ones_like(routed_up_weights),
+                torch.ones_like(routed_down_weights),
+                torch.ones_like(shared_gate_weights),
+                torch.ones_like(shared_up_weights),
+                torch.ones_like(shared_down_weights),
+            )
+
+    runtime = FakeRuntime()
+    tensors = [torch.randn(2, 2, requires_grad=True) for _ in range(8)]
+    output = mok_experts._MoKAutogradFunction.apply(
+        runtime,
+        tensors[0],
+        tensors[1],
+        torch.zeros(2, 2, dtype=torch.int64),
+        tensors[2],
+        tensors[3],
+        tensors[4],
+        tensors[5],
+        tensors[6],
+        tensors[7],
+    )
+    output.sum().backward()
+
+    assert runtime.backward_layouts is not None
+    for actual_projection, expected_projection in zip(runtime.backward_layouts, routed_layouts, strict=True):
+        for actual, expected in zip(actual_projection, expected_projection, strict=True):
+            torch.testing.assert_close(actual, expected)
+    assert all(tensor.grad is not None for tensor in tensors)
+
+
 def test_mok_context_uses_checkpoint_saved_tensor_hooks() -> None:
     @dataclass(frozen=True)
     class FakeSchedule:
@@ -581,7 +875,7 @@ def test_mok_context_uses_checkpoint_saved_tensor_hooks() -> None:
             self.first_context_refs: list[weakref.ReferenceType[torch.Tensor]] = []
             self.backward_state: tuple[object, object] | None = None
 
-        def forward(self, x: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, object, object]:
+        def forward(self, x: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, object, object, None]:
             del args
             self.forward_calls += 1
             schedule = FakeSchedule(
@@ -597,7 +891,7 @@ def test_mok_context_uses_checkpoint_saved_tensor_hooks() -> None:
                     weakref.ref(forward_context.x_routed),
                     *(weakref.ref(item) for item in forward_context.hidden_routed),
                 ]
-            return x.clone(), schedule, forward_context
+            return x.clone(), schedule, forward_context, None
 
         def backward(
             self,
@@ -607,6 +901,8 @@ def test_mok_context_uses_checkpoint_saved_tensor_hooks() -> None:
             *inputs: torch.Tensor,
         ) -> tuple[torch.Tensor, ...]:
             self.backward_state = (schedule, forward_context)
+            assert inputs[-1] is None
+            inputs = inputs[:-1]
             return tuple(torch.ones_like(tensor) for tensor in (inputs[0], inputs[1], *inputs[5:], *inputs[2:5]))
 
     runtime = FakeRuntime()

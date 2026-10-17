@@ -44,12 +44,19 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
+
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
+from nemo_automodel.components.loggers.loggers import TrackioConfig  # noqa: E402
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages  # noqa: E402
 from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend  # noqa: E402
 from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa: E402
     build_bagel_from_hf_backbones,
@@ -58,6 +65,7 @@ from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa:
 )
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG  # noqa: E402
 from nemo_automodel.components.training.step_scheduler import StepScheduler  # noqa: E402
+from nemo_automodel.components.training.utils import clip_grad_norm  # noqa: E402
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
 from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
@@ -414,6 +422,16 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             suppress_wandb_log_messages()
             run = self._build_wandb()
             logging.info("Running run at %s", run.url)
+
+        # -- trackio ------------------------------------------------------
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
+            trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
+            model_name = str(_resolve_bagel_artifact_path(self.cfg) or "bagel")
+            self.trackio_logger = trackio_cfg.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=model_name
+            )
+            logging.info("Trackio experiment tracking enabled")
 
         self._log_experiment_details()
         self._log_library_versions()
@@ -809,20 +827,16 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 num_batches=num_batches,
             )
 
-        # Grad clip + step.
-        # FSDP2 sharded parameters expose ``clip_grad_norm_`` via the manager,
-        # but the simplest cross-wrapper approach is torch.nn.utils.clip_grad_norm_
-        # on trainable params. FSDP2 DTensor params play nice with it in newer
-        # torch versions; for older ones we fall back to the raw compute.
-        if max_grad_norm is not None and max_grad_norm > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad],
-                max_norm=max_grad_norm,
-                norm_type=2.0,
-                foreach=True,
-            )
-        else:
-            grad_norm = torch.tensor(0.0, device=device)
+        # Synchronize unsharded TP replicas once at the optimizer boundary,
+        # then compute a sharding-aware norm and clip when configured.
+        clip_threshold = max_grad_norm if max_grad_norm is not None and max_grad_norm > 0 else None
+        synchronize_tp_replica_gradients([self.model], self.device_mesh)
+        grad_norm = clip_grad_norm(
+            clip_threshold,
+            [self.model],
+            device_mesh=self.device_mesh,
+            foreach=True,
+        )
 
         # LR warmup (stateless; called before each optimizer.step).
         self._apply_warmup(self.step_scheduler.step)
@@ -981,19 +995,11 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     # ------------------------------------------------------------------
     def _build_wandb(self):
         assert self.cfg.get("wandb", None) is not None
-        from wandb import Settings
-
-        kwargs = self.cfg.wandb.to_dict()
-        if kwargs.get("name", "") == "":
-            # default name: model basename.
-            mp = _resolve_bagel_artifact_path(self.cfg) or "bagel"
-            kwargs["name"] = "_".join(str(mp).split("/")[-2:])
-        run = wandb.init(
-            **kwargs,
-            config=self.cfg.to_dict(),
-            settings=Settings(silent=True),
+        # default name: model basename.
+        mp = _resolve_bagel_artifact_path(self.cfg) or "bagel"
+        return init_wandb_run(
+            self.cfg.wandb.to_dict(), self.cfg.to_dict(), default_name="_".join(str(mp).split("/")[-2:])
         )
-        return run
 
     def log_train_metrics(self, log_data) -> None:
         if not self.dist_env.is_main:
@@ -1001,8 +1007,11 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         if not self.step_scheduler.is_remote_logging_step:
             self.metric_logger_train.log(log_data)
             return
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
         self.metric_logger_train.log(log_data)
         logging.info(
             "step {} | epoch {} | ce {:.4f} | mse {:.4f} | grad_norm {:.4f} | "

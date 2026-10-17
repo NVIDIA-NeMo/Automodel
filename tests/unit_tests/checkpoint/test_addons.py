@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -24,10 +25,12 @@ from torch.nn.parallel import DistributedDataParallel
 from nemo_automodel.components.checkpoint.addons import (
     ConsolidatedHFAddon,
     _extract_target_modules,
+    _get_automodel_peft_metadata,
     _group_barrier,
     _is_group_rank_0,
     _maybe_save_custom_model_code,
     _maybe_strip_quantization_config,
+    load_automodel_peft_config_dict,
 )
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
@@ -105,7 +108,10 @@ def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
 
 
 @pytest.mark.parametrize("use_ddp", [False, True])
-def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, use_ddp):
+@pytest.mark.parametrize("v4_compatible", [False, True])
+def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(
+    tmp_path: Path, use_ddp: bool, v4_compatible: bool
+) -> None:
     metadata_dir = tmp_path / "metadata"
     metadata_dir.mkdir()
     exporter = SimpleNamespace(validate=MagicMock(), save=MagicMock())
@@ -123,7 +129,7 @@ def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, us
         fqn_to_file_index_mapping={"w": 1},
         fqn_to_dtype_mapping=None,
         original_model_path="/source",
-        v4_compatible=True,
+        v4_compatible=v4_compatible,
     )
 
     exporter.validate.assert_called_once_with(tokenizer=tokenizer, original_model_path="/source")
@@ -131,6 +137,7 @@ def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, us
         hf_metadata_dir=str(metadata_dir),
         tokenizer=tokenizer,
         original_model_path="/source",
+        v4_compatible=v4_compatible,
     )
 
 
@@ -413,7 +420,7 @@ class TestExtractTargetModules:
         """
 
         class _RenamingAdapter(_StubStateDictAdapter):
-            def map_peft_target_module_to_hf(self, name):
+            def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
                 return name.replace(".mlp.experts.", ".block_sparse_moe.experts.")
 
         model = _make_model_with_named_modules(
@@ -501,3 +508,66 @@ class TestMaybeStripQuantizationConfig:
         """No error when model has no config attribute."""
         model = nn.Linear(4, 4)
         _maybe_strip_quantization_config(model)
+
+
+class TestParamWrapperLayoutStamp:
+    """The PEFT save stamps the fused expert LoRA layout into
+    automodel_peft_config.json (peft flipped ParamWrapper in 0.19.1,
+    huggingface/peft#3165) so loads resolve it from metadata, not shapes."""
+
+    def test_v5_adapter_gets_the_modern_stamp_by_default(self):
+        from nemo_automodel.components.checkpoint.addons import _get_paramwrapper_layout_stamp
+
+        adapter = SimpleNamespace(_v5_peft_target_parameters=("mlp.experts.gate_up_proj",))
+        assert _get_paramwrapper_layout_stamp(adapter, False, False) == "peft-0.19.1"
+        assert _get_paramwrapper_layout_stamp(adapter, False, True) == "peft-0.18"
+
+    def test_non_v5_or_v4_saves_get_no_stamp(self):
+        from nemo_automodel.components.checkpoint.addons import _get_paramwrapper_layout_stamp
+
+        v5_adapter = SimpleNamespace(_v5_peft_target_parameters=("mlp.experts.gate_up_proj",))
+        plain_adapter = SimpleNamespace(_v5_peft_target_parameters=())
+        assert _get_paramwrapper_layout_stamp(plain_adapter, False, False) is None
+        assert _get_paramwrapper_layout_stamp(None, False, False) is None
+        assert _get_paramwrapper_layout_stamp(v5_adapter, True, False) is None
+
+
+class TestParamWrapperLayoutHintPlumbing:
+    def test_metadata_reader_round_trips(self, tmp_path):
+        import json as json_module
+
+        from nemo_automodel.components.checkpoint.checkpointing import _read_paramwrapper_layout_metadata
+
+        assert _read_paramwrapper_layout_metadata(tmp_path) is None
+        (tmp_path / "automodel_peft_config.json").write_text(json_module.dumps({"paramwrapper_layout": "peft-0.18"}))
+        assert _read_paramwrapper_layout_metadata(tmp_path) == "peft-0.18"
+
+    def test_hint_is_set_during_from_hf_and_cleared_after(self):
+        from nemo_automodel.components.checkpoint.checkpointing import _maybe_adapt_state_dict_from_hf
+
+        seen = {}
+
+        class _Adapter:
+            def from_hf(self, state_dict, device_mesh=None, **kwargs):
+                seen["hint"] = self._paramwrapper_layout_hint
+                return state_dict
+
+        model = nn.Module()
+        model.state_dict_adapter = _Adapter()
+        _maybe_adapt_state_dict_from_hf(model, {}, paramwrapper_layout_hint="peft-0.18")
+
+        assert seen["hint"] == "peft-0.18"
+        assert model.state_dict_adapter._paramwrapper_layout_hint is None
+
+
+def test_load_automodel_peft_config_dict_round_trips_the_saved_metadata(tmp_path):
+    import json
+
+    from nemo_automodel.components._peft.lora import PeftConfig
+
+    peft = PeftConfig(target_modules=["*.qkv_proj"], dim=16, alpha=8, lora_dtype=torch.bfloat16)
+    (tmp_path / "automodel_peft_config.json").write_text(json.dumps(_get_automodel_peft_metadata(peft)))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 8}))
+    loaded = PeftConfig.from_dict(load_automodel_peft_config_dict(str(tmp_path)))
+    assert loaded.target_modules == ["*.qkv_proj"] and (loaded.dim, loaded.alpha) == (16, 8)
+    assert loaded.lora_dtype == "torch.bfloat16"

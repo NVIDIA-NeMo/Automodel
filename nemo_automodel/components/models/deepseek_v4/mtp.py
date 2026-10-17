@@ -87,6 +87,21 @@ class DeepseekV4MTPBlock(nn.Module):
             mtp_attn_cfg.compress_ratios = ratios
         self.self_attn = DeepseekV4Attention(mtp_attn_cfg, layer_idx=layer_idx, backend=backend)
         self.mlp = MoE(moe_config, backend)
+        if int(getattr(config, "vision_n_layers", 0) or 0) > 0 and not backend.fake_balanced_gate:
+            # Imported lazily because model.py imports this module lazily for the
+            # same circular-dependency reason. Released vision checkpoints carry
+            # ``bias_vl`` for every MTP gate even though MTP is inference-only in
+            # the current visual path.
+            from nemo_automodel.components.models.deepseek_v4.model import (  # noqa: PLC0415
+                DeepseekV4VisionGate,
+            )
+
+            self.mlp.gate = DeepseekV4VisionGate(
+                config,
+                moe_config,
+                gate_precision=backend.gate_precision,
+                hash_routing=False,
+            )
         self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
         self.post_attention_layernorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
 
@@ -165,6 +180,9 @@ class DeepseekV4MTPBlock(nn.Module):
 
         pre, post, comb = self.ffn_hc(hidden_states)
         collapsed = (pre.unsqueeze(-1) * hidden_states).sum(dim=2).to(hidden_states.dtype)
+        set_routing_context = getattr(self.mlp.gate, "set_routing_context", None)
+        if set_routing_context is not None:
+            set_routing_context(input_ids, None)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
         hidden_states = post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(
             comb.transpose(-1, -2).to(dtype), hidden_states
@@ -187,6 +205,9 @@ class DeepseekV4MTPBlock(nn.Module):
             nn.init.trunc_normal_(self.h_proj.weight, mean=0.0, std=init_std)
         self.self_attn.init_weights(target_device, init_std=init_std)
         self.mlp.init_weights(target_device, init_std=init_std)
+        init_dsv4_weights = getattr(self.mlp.gate, "init_dsv4_weights", None)
+        if init_dsv4_weights is not None:
+            init_dsv4_weights()
         self.attn_hc.init_weights(init_std)
         self.ffn_hc.init_weights(init_std)
         self.hc_head.init_weights(init_std)

@@ -47,6 +47,7 @@ def _build_models():
         "transformers.models.inkling",
         reason="Reference parity requires a development Transformers build with Inkling",
     )
+    from transformers.models.inkling import modeling_inkling
     from transformers.models.inkling.configuration_inkling import InklingConfig as HFInklingConfig
     from transformers.models.inkling.modeling_inkling import (
         InklingForConditionalGeneration as HFInklingForConditionalGeneration,
@@ -54,6 +55,23 @@ def _build_models():
 
     cfg, nemo = _build_native_model()
     hf_config = HFInklingConfig.from_dict(cfg.to_dict())
+
+    # Transformers prefers the installed causal-conv1d extension even for CPU inputs.
+    # Keep these CPU reference tests on the original PyTorch implementations.
+    def torch_causal_conv1d_fn(hidden_states, weight, bias=None, activation=None, **kwargs):
+        _, hidden_size, seq_len = hidden_states.shape
+        out = F.conv1d(
+            hidden_states.to(weight.dtype),
+            weight=weight.unsqueeze(1),
+            bias=bias,
+            padding=weight.shape[-1] - 1,
+            groups=hidden_size,
+        )[:, :, :seq_len]
+        if activation is not None:
+            out = getattr(F, activation)(out)
+        return out.to(hidden_states.dtype)
+
+    modeling_inkling.causal_conv1d_fn = torch_causal_conv1d_fn
     hf = HFInklingForConditionalGeneration(hf_config).to(dtype=torch.float32).eval()
     return cfg, hf, nemo
 

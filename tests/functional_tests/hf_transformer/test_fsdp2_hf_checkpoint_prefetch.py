@@ -31,7 +31,7 @@ from torch.distributed.tensor import DTensor
 from torch.utils.checkpoint import checkpoint
 from transformers.modeling_layers import GradientCheckpointingLayer
 
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _WORLD_SIZE = 2
@@ -165,7 +165,7 @@ def _worker(rank: int, port: int) -> None:
 
         FSDPParamGroup.unshard = counted_unshard
 
-        model = DefaultParallelizationStrategy().parallelize(
+        model = ModelParallelizer()._apply(
             model=model,
             device_mesh=mesh,
             mp_policy=MixedPrecisionPolicy(

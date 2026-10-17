@@ -33,6 +33,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
+from torch.distributed.device_mesh import init_device_mesh
 from torch.nn.parallel import DistributedDataParallel
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoConfig, PretrainedConfig
@@ -54,26 +55,26 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
     build_cached_dspark_dataloader,
     read_manifest,
     read_target_weight_modules,
+    tokenizer_chat_template_sha256,
 )
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
+from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
-from nemo_automodel.components.distributed.activation_checkpointing import (
-    apply_selective_checkpointing_to_layers,
-    apply_submodule_checkpointing,
-    is_selective_activation_checkpointing,
-)
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41DSparkTargetConfig
 from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
 from nemo_automodel.components.optim.optimizer import build_optimizer
-from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
 from nemo_automodel.components.speculative.dspark.config import (
     build_deepseek_v4_draft_config,
     build_gemma4_draft_config,
@@ -83,12 +84,16 @@ from nemo_automodel.components.speculative.dspark.config import (
 )
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics, DSparkTrainerModule
 from nemo_automodel.components.speculative.dspark.registry import (
-    build_target_layer_ids,
+    ModelOwnedDSparkProvider,
     resolve_dspark_draft_spec,
 )
+from nemo_automodel.components.speculative.dspark.remote import DSparkTargetInfo, RemoteDSparkTargetModel
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
 from nemo_automodel.components.speculative.dspark.target_utils import (
     DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V41_MODEL_TYPE as _DEEPSEEK_V41_MODEL_TYPE,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
     GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
@@ -109,6 +114,7 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
     read_target_model_type as _read_target_model_type,
 )
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, parse_distributed_section
 from nemo_automodel.recipes.base_recipe import (
@@ -122,16 +128,19 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     distributed_section_dict,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
+    resolve_dspark_target_layer_ids,
     resolve_reduced_target_layers,
     unsupported_parallel_axes,
     validate_dspark_parallelism_axes,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_activation_checkpointing,
     apply_draft_compile,
     apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
     raise_if_peft_configured,
+    read_load_metadata_with_gloo,
 )
 
 logger = logging.getLogger(__name__)
@@ -177,6 +186,33 @@ def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_
             "Sequence packing with a FlashAttention target requires micro_batch_size=1 "
             f"(got {micro_batch_size}); set micro_batch_size=1 or load the target with "
             "attn_implementation='sdpa'."
+        )
+
+
+def _validate_remote_target_options(
+    *, cached_target_path: str | None, is_multimodal: bool, packed_sequence_size: int, cp_size: int
+) -> None:
+    """Reject the recipe options the remote target backend does not support.
+
+    The remote server receives only ``input_ids`` / ``attention_mask`` / ``loss_mask``
+    and runs one unsharded forward per request, so it cannot serve image inputs,
+    the block-causal packing metadata, or a context-parallel target. A precomputed
+    cache already replaces the target, so it cannot be combined with a remote one.
+    """
+    if cached_target_path is not None:
+        raise ValueError(
+            "recipe_args.target_model_backend='remote' and recipe_args.cached_target_path are mutually "
+            "exclusive: the cache already replaces the target. Unset one of them."
+        )
+    if is_multimodal:
+        raise NotImplementedError("recipe_args.target_model_backend='remote' does not support multimodal targets.")
+    if packed_sequence_size > 0:
+        raise NotImplementedError(
+            "recipe_args.target_model_backend='remote' does not support sequence packing; set packed_sequence_size=0."
+        )
+    if cp_size > 1:
+        raise NotImplementedError(
+            "recipe_args.target_model_backend='remote' does not support context parallelism; set cp_size=1."
         )
 
 
@@ -285,24 +321,6 @@ def _resolve_warmup_steps(warmup_ratio: float, total_optim_steps: int, min_warmu
     return max(min_warmup_steps, int(warmup_ratio * total_optim_steps))
 
 
-def _apply_draft_activation_checkpointing(draft_model: torch.nn.Module, mode: bool | str) -> None:
-    """Apply the recipe's AC mode to the trainable DSpark draft before FSDP."""
-    if not mode or (isinstance(mode, str) and mode.lower() == "false"):
-        return
-    layers = list(getattr(draft_model, "layers", ()))
-    if not layers:
-        logger.warning("Draft activation checkpointing requested, but the draft exposes no layers.")
-        return
-    if is_selective_activation_checkpointing(mode):
-        apply_selective_checkpointing_to_layers(draft_model, layers, has_kv_sharing=False)
-        logger.info("Enabled selective activation checkpointing on %d draft layers", len(layers))
-    else:
-        # DSpark's native layers are not HF GradientCheckpointingLayer subclasses.
-        # Checkpoint their attention/MLP/norm submodules before FSDP indexes params.
-        apply_submodule_checkpointing(layers, has_kv_sharing=False)
-        logger.info("Enabled full activation checkpointing on %d draft layers", len(layers))
-
-
 def _validate_cached_dspark_manifest(
     cache_dir: str,
     manifest: dict,
@@ -313,8 +331,13 @@ def _validate_cached_dspark_manifest(
     target_model_type: str,
     seq_length: int,
     compute_dtype: torch.dtype,
+    chat_template_sha256: str | None,
 ) -> None:
-    """Validate that a DSpark offline cache matches the configured target/draft run."""
+    """Validate that a DSpark offline cache matches the configured target/draft run.
+
+    ``chat_template_sha256`` is the hash of the template the run configured, or ``None`` when it
+    configured none and so has no framing to compare against the cache's.
+    """
     if str(manifest["target_model"]) != str(target_model):
         logger.warning(
             "DSpark cache at %s was built for target_model=%r, but this run configured target_model=%r. "
@@ -323,6 +346,17 @@ def _validate_cached_dspark_manifest(
             cache_dir,
             manifest["target_model"],
             target_model,
+        )
+    # A cache written before the manifest recorded the template has nothing to compare (None).
+    recorded_template_sha256 = manifest.get("chat_template_sha256")
+    if chat_template_sha256 is not None and recorded_template_sha256 not in (None, chat_template_sha256):
+        logger.warning(
+            "DSpark cache at %s was tokenized with a chat template (sha256 %s) that differs from this run's "
+            "(sha256 %s). Cached samples keep the framing they were built with; rebuild the cache with "
+            "precompute_dspark to train on the current template.",
+            cache_dir,
+            recorded_template_sha256,
+            chat_template_sha256,
         )
     if str(manifest["target_model_type"]) != str(target_model_type):
         raise ValueError(
@@ -587,6 +621,7 @@ class TrainDSparkRecipe(BaseRecipe):
         trust_remote_code = bool(recipe_cfg.get("trust_remote_code", False))
         target_model_type = _read_target_model_type(target_path, trust_remote_code)
         is_deepseek_v4_target = target_model_type == _DEEPSEEK_V4_MODEL_TYPE
+        is_deepseek_v41_target = target_model_type == _DEEPSEEK_V41_MODEL_TYPE
         is_glm_5_2_target = target_model_type == _GLM_5_2_MODEL_TYPE
         is_gemma4_target = target_model_type in _GEMMA4_MODEL_TYPES
         is_minimax_m3_target = target_model_type in _MINIMAX_M3_MODEL_TYPES
@@ -606,6 +641,24 @@ class TrainDSparkRecipe(BaseRecipe):
                 "Sequence packing (packed_sequence_size>0) is only supported on the online text-only "
                 "DSpark path; the VLM and cached-target paths do not carry the packing metadata."
             )
+        cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
+        # Where the frozen target runs: in this process ("colocated") or on separate
+        # serve_dspark_target servers ("remote") that send the captured features back.
+        target_model_backend = str(recipe_cfg.get("target_model_backend", "colocated"))
+        if target_model_backend not in ("colocated", "remote"):
+            raise ValueError(
+                f"Unknown recipe_args.target_model_backend={target_model_backend!r}; expected 'colocated' or 'remote'."
+            )
+        use_remote_target = target_model_backend == "remote"
+        if use_remote_target:
+            _validate_remote_target_options(
+                cached_target_path=self.cached_target_path,
+                is_multimodal=is_multimodal,
+                packed_sequence_size=self.packed_sequence_size,
+                cp_size=cp_size,
+            )
+        # Neither a precomputed cache nor a remote server needs the target weights here.
+        load_target = self.cached_target_path is None and not use_remote_target
 
         validate_dspark_parallelism_axes(self.cfg)
 
@@ -615,10 +668,10 @@ class TrainDSparkRecipe(BaseRecipe):
         # Restricted to the dense Qwen3-style target -- the DeepSeek V4 / GLM-5.2 /
         # Gemma4 / MiniMax M3 / Kimi K3 targets already run under their own
         # expert-parallel / FSDP mesh, which CP is not composed with here.
-        cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         if cp_size > 1:
             if (
                 is_deepseek_v4_target
+                or is_deepseek_v41_target
                 or is_glm_5_2_target
                 or is_gemma4_target
                 or is_minimax_m3_target
@@ -626,7 +679,7 @@ class TrainDSparkRecipe(BaseRecipe):
             ):
                 raise NotImplementedError(
                     "Context parallelism (cp_size>1) is only supported for the dense Qwen3-style DSpark "
-                    "target; the DeepSeek V4 / GLM-5.2 / Gemma4 / MiniMax M3 / Kimi K3 targets already "
+                    "target; the DeepSeek V4/V4.1, GLM-5.2, Gemma4, MiniMax M3, and Kimi K3 targets already "
                     "run under their own expert-parallel / FSDP mesh. Set cp_size=1 for those."
                 )
             # The CP hook intercepts the target's F.scaled_dot_product_attention call, so
@@ -659,9 +712,10 @@ class TrainDSparkRecipe(BaseRecipe):
         if self.cached_target_path is None or chat_template is not None:
             _apply_target_chat_template(self.tokenizer, chat_template)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        load_metadata_with_gloo = read_load_metadata_with_gloo(self.cfg.get("checkpoint", None))
 
         if is_deepseek_v4_target:
-            if self.cached_target_path is None:
+            if load_target:
                 # Full V4-Flash target loaded with the same expert-parallel / FSDP and
                 # FP8-dequant path as the V4 finetune recipe, so the 256 experts shard
                 # across ranks instead of replicating per rank.
@@ -685,6 +739,36 @@ class TrainDSparkRecipe(BaseRecipe):
                     target_config.num_hidden_layers = n_reduced
                 self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["DeepseekV4ForCausalLM"])
+        elif is_deepseek_v41_target:
+            if load_target:
+                target_options = DeepseekV41DSparkTargetConfig(
+                    target_path=target_path,
+                    trust_remote_code=trust_remote_code,
+                    target_num_hidden_layers=recipe_cfg.get("target_num_hidden_layers", None),
+                )
+                target_options.attn_backend = str(recipe_cfg.get("target_attn_backend", target_options.attn_backend))
+                target_options.dispatcher = str(recipe_cfg.get("target_dispatcher", target_options.dispatcher))
+                target_options.experts = str(recipe_cfg.get("target_experts", target_options.experts))
+                target_options.enable_fsdp_optimizations = bool(
+                    recipe_cfg.get("target_enable_fsdp_optimizations", target_options.enable_fsdp_optimizations)
+                )
+                self.distributed_setup = create_distributed_setup_from_config(
+                    self.cfg, world_size=self.dist_env.world_size
+                )
+                self.target_model = target_options.build(
+                    device=self.device,
+                    compute_dtype=self.compute_dtype,
+                    distributed_setup=self.distributed_setup,
+                )
+                target_config = self.target_model.config
+            else:
+                target_config = DeepseekV41Config.from_pretrained(
+                    target_path,
+                    name_or_path=target_path,
+                    vision_config={"num_hidden_layers": 0},
+                )
+                self.target_model = None
+            architectures = list(getattr(target_config, "architectures", None) or ["DeepseekV41ForCausalLM"])
         elif is_minimax_m3_target:
             # MiniMax M3 VL is a ~400B-parameter MoE VLM: load it frozen through the
             # same expert-parallel / FSDP distributed path the VLM finetune recipe
@@ -711,7 +795,7 @@ class TrainDSparkRecipe(BaseRecipe):
             architectures = list(
                 getattr(target_config, "architectures", None) or ["MiniMaxM3SparseForConditionalGeneration"]
             )
-            if self.cached_target_path is None:
+            if load_target:
                 self.distributed_setup = create_distributed_setup_from_config(
                     self.cfg,
                     world_size=self.dist_env.world_size,
@@ -728,7 +812,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     linear="torch",
                     rms_norm="torch_fp32",
                     rope_fusion=False,
-                    experts=str(recipe_cfg.get("target_experts", "gmm")),
+                    experts=str(recipe_cfg.get("target_experts", "torch_mm")),
                     dispatcher="hybridep",
                     enable_hf_state_dict_adapter=True,
                     enable_fsdp_optimizations=True,
@@ -738,6 +822,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     trust_remote_code=trust_remote_code,
                     torch_dtype=self.compute_dtype,
                     distributed_setup=self.distributed_setup,
+                    load_metadata_with_gloo=load_metadata_with_gloo,
                     backend=backend,
                     # The released bf16 checkpoint ships no real MTP weights despite the
                     # config declaring some, and DSpark trains its own separate draft
@@ -749,7 +834,7 @@ class TrainDSparkRecipe(BaseRecipe):
             else:
                 self.target_model = None
         elif is_glm_5_2_target:
-            if self.cached_target_path is None:
+            if load_target:
                 # GLM-5.2 (GlmMoeDsaForCausalLM) is a ~355B-parameter MLA + DSA MoE LM: load
                 # it frozen through the same expert-parallel / FSDP distributed path the GLM
                 # finetune recipe uses, sharding the 256 routed experts across ranks instead
@@ -776,7 +861,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["GlmMoeDsaForCausalLM"])
         elif is_kimi_k3_target:
-            if self.cached_target_path is None:
+            if load_target:
                 target_config, self.target_model, self.distributed_setup = build_kimi_k3_target(
                     cfg=self.cfg,
                     world_size=self.dist_env.world_size,
@@ -802,7 +887,7 @@ class TrainDSparkRecipe(BaseRecipe):
             architectures = getattr(target_config, "architectures", []) or []
             is_gemma4_target = getattr(target_config, "model_type", "") in _GEMMA4_MODEL_TYPES
 
-            if self.cached_target_path is None:
+            if load_target:
                 target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
                 target_kwargs = {}
                 if target_attn_implementation is not None:
@@ -825,6 +910,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     torch_dtype=self.compute_dtype,
                     force_hf=bool(recipe_cfg.get("target_force_hf", False)),
                     distributed_setup=self.distributed_setup,
+                    load_metadata_with_gloo=load_metadata_with_gloo,
                     **target_kwargs,
                 )
                 if self.distributed_setup is None:
@@ -839,23 +925,39 @@ class TrainDSparkRecipe(BaseRecipe):
         # width) so the two never disagree.
         # Gemma4 and MiniMax M3 VL nest their text fields (layer count, vocab)
         # under text_config.
-        target_text_config = target_config.text_config if (is_gemma4_target or is_minimax_m3_target) else target_config
+        target_text_config = (
+            target_config.text_config
+            if (is_deepseek_v41_target or is_gemma4_target or is_minimax_m3_target)
+            else target_config
+        )
         num_target_layers = int(target_text_config.num_hidden_layers)
         draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
-        target_layer_ids = list(
-            recipe_cfg.get("target_layer_ids", None)
-            or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
-        )
-        target_layer_ids = validate_target_layer_ids(target_layer_ids, num_target_layers)
+        target_layer_ids = resolve_dspark_target_layer_ids(recipe_cfg, num_target_layers)
         # HFDSparkTargetModel validates target_layer_ids against the actual (possibly
         # reduced) layer count via common.validate_target_layer_ids, which also accepts
         # -1 (the embedding output) and enforces strictly-increasing ids.
         self.target_layer_ids = target_layer_ids
-        self.target_wrapper = (
-            HFDSparkTargetModel(self.target_model, target_layer_ids=target_layer_ids, cp_mesh=self.cp_mesh)
-            if self.target_model is not None
-            else None
-        )
+        if use_remote_target:
+            remote_urls = list(recipe_cfg.get("remote_urls", None) or [])
+            self.target_wrapper = RemoteDSparkTargetModel(
+                remote_urls,
+                device=self.device,
+                timeout=int(recipe_cfg.get("remote_timeout", 120)),
+                max_retries=int(recipe_cfg.get("remote_max_retries", 3)),
+                # A server pairs NCCL with one client, so ranks sharing servers use the wire plane.
+                enable_nccl=self.dist_env.world_size == 1,
+            )
+            self.target_wrapper.check_target_info(
+                DSparkTargetInfo.from_text_config(target_text_config, target_layer_ids)
+            )
+            if self.dist_env.is_main:
+                logger.info("DSpark REMOTE target: %d server(s) at %s.", len(remote_urls), remote_urls)
+        elif self.target_model is not None:
+            self.target_wrapper = HFDSparkTargetModel(
+                self.target_model, target_layer_ids=target_layer_ids, cp_mesh=self.cp_mesh
+            )
+        else:
+            self.target_wrapper = None
 
         self.block_size = int(recipe_cfg.get("block_size", 7))
         self.num_anchors = int(recipe_cfg.get("num_anchors", 512))
@@ -910,6 +1012,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     distributed=self.dist_env.world_size > 1,
                     shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                     mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                    mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                     packed_sequence_size=self.packed_sequence_size,
                     dp_mesh=self.dp_mesh,
                 )
@@ -926,6 +1029,7 @@ class TrainDSparkRecipe(BaseRecipe):
                         distributed=self.dist_env.world_size > 1,
                         shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                         mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                        mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                         packed_sequence_size=self.packed_sequence_size,
                     )
         else:
@@ -939,6 +1043,19 @@ class TrainDSparkRecipe(BaseRecipe):
                 target_model_type=target_model_type,
                 seq_length=recipe_cfg.seq_length,
                 compute_dtype=self.compute_dtype,
+                # Without a configured template the tokenizer keeps the checkpoint's, which this run never renders.
+                chat_template_sha256=None if chat_template is None else tokenizer_chat_template_sha256(self.tokenizer),
+            )
+            # The cached loss masks are used as stored, so the options that shaped them must match.
+            ensure_supervision_options_match(
+                manifest,
+                {
+                    "mask_reasoning_content": recipe_cfg.get("mask_reasoning_content", False),
+                    "mask_generation_prompt": recipe_cfg.get("mask_generation_prompt", False),
+                },
+                cache_name="DSpark",
+                cache_dir=self.cached_target_path,
+                producer_name="precompute_dspark (or precompute_dspark_dist)",
             )
             embed_src, head_src = read_target_weight_modules(self.cached_target_path)
             self.train_dataloader = build_cached_dspark_dataloader(
@@ -967,14 +1084,31 @@ class TrainDSparkRecipe(BaseRecipe):
         # additive mask (the DFlash SDPA path), so they are exempt from the requirement.
         attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
         if (
-            not (is_deepseek_v4_target or is_glm_5_2_target or is_kimi_k3_target)
+            not (is_deepseek_v4_target or is_deepseek_v41_target or is_glm_5_2_target or is_kimi_k3_target)
             and attention_backend != "flex_attention"
         ):
             raise ValueError(f"DSpark training requires attention_backend='flex_attention', got {attention_backend!r}.")
         confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", 1.0))
         markov_rank = int(recipe_cfg.get("markov_rank", 256))
 
-        if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target or is_kimi_k3_target:
+        draft_model = None
+        if isinstance(target_config, ModelOwnedDSparkProvider):
+            margs = _DraftArgs(
+                num_draft_layers=draft_num_hidden_layers,
+                target_layer_ids=target_layer_ids,
+                block_size=self.block_size,
+                num_anchors=self.num_anchors,
+                mask_token_id=self.mask_token_id,
+                markov_rank=markov_rank,
+                markov_head_type=str(recipe_cfg.get("markov_head_type", "vanilla")),
+                confidence_head_alpha=confidence_head_alpha,
+                confidence_head_with_markov=bool(recipe_cfg.get("confidence_head_with_markov", True)),
+                confidence_head_stop_gradient=bool(recipe_cfg.get("confidence_head_stop_gradient", False)),
+            )
+            draft_model = target_config.build_dspark_draft(margs)
+        elif (
+            is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target or is_kimi_k3_target
+        ):
             # Gemma4, DeepSeek V4, GLM-5.2, MiniMax M3, and Kimi K3 drafts share one typed
             # draft-config builder that takes the same DSpark model-args bundle.
             margs = _DraftArgs(
@@ -1030,8 +1164,11 @@ class TrainDSparkRecipe(BaseRecipe):
             draft_config_obj = Qwen3Config.from_dict(draft_config)
             draft_config_obj._attn_implementation = attention_backend
 
-        draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
-        self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        if draft_model is None:
+            draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
+            draft_model = draft_cls(draft_config_obj)
+        self.draft_model = draft_model.to(device=self.device)
+        cast_model_to_dtype(self.draft_model, self.compute_dtype)
         if self.packed_sequence_size > 0 and type(self.draft_model).__name__ != "Qwen3DSparkModel":
             # Only the Qwen3 draft forward threads the packing metadata so far; the
             # other DSpark drafts would silently let anchors cross document boundaries.
@@ -1065,7 +1202,7 @@ class TrainDSparkRecipe(BaseRecipe):
         activation_checkpointing = dist_cfg.get("activation_checkpointing", False) if dist_cfg is not None else False
         # The target consumes this setting through its distributed setup, while
         # the separately constructed trainable draft must be wrapped explicitly.
-        _apply_draft_activation_checkpointing(self.draft_model, activation_checkpointing)
+        apply_draft_activation_checkpointing(self.draft_model, activation_checkpointing)
 
         trainer_module = DSparkTrainerModule(
             self.draft_model,
@@ -1083,15 +1220,26 @@ class TrainDSparkRecipe(BaseRecipe):
             if strategy == "fsdp2":
                 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
-                mp_policy = MixedPrecisionPolicy(param_dtype=self.compute_dtype, reduce_dtype=torch.float32)
-                # Shard over "dp" (not the world) under CP so the draft stays replicated
-                # across cp ranks; without a mesh (cp_size=1) this is the world default.
-                shard_kwargs = {"mp_policy": mp_policy}
-                if self.dp_mesh is not None:
-                    shard_kwargs["mesh"] = self.dp_mesh
+                mp_policy = MixedPrecisionPolicy(
+                    param_dtype=self.compute_dtype, reduce_dtype=torch.float32, cast_forward_inputs=False
+                )
+                # CP keeps the draft replicated across CP ranks. Otherwise use a
+                # named WORLD mesh so checkpoint adapters can resolve FSDP shards.
+                draft_mesh = self.dp_mesh
+                if draft_mesh is None:
+                    draft_mesh = init_device_mesh(self.device.type, (self.dist_env.world_size,), mesh_dim_names=("dp",))
+                fp32_compute_module_names = tuple(
+                    getattr(trainer_module.draft_model, "_keep_in_fp32_modules_strict", ())
+                )
                 for layer in trainer_module.draft_model.layers:
-                    fully_shard(layer, **shard_kwargs)
-                fully_shard(trainer_module, **shard_kwargs)
+                    fully_shard_by_dtype(
+                        layer,
+                        mesh=draft_mesh,
+                        mp_policy=mp_policy,
+                        offload_policy=None,
+                        fp32_compute_module_names=fp32_compute_module_names,
+                    )
+                fully_shard(trainer_module, mesh=draft_mesh, mp_policy=mp_policy)
             elif strategy == "ddp":
                 trainer_module = DistributedDataParallel(
                     trainer_module,
@@ -1170,6 +1318,13 @@ class TrainDSparkRecipe(BaseRecipe):
             cfg_dict=self.cfg.to_dict(),
             default_name="dspark_" + str(target_path).rstrip("/").split("/")[-1],
         )
+
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
+            trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
+            trackio_cfg.name = trackio_cfg.name or "dspark_" + str(target_path).rstrip("/").split("/")[-1]
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
+            logger.info("Trackio experiment tracking enabled")
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
@@ -1536,12 +1691,33 @@ class TrainDSparkRecipe(BaseRecipe):
         return eval_metrics
 
     def _wandb_log(self, data: dict, step: int) -> None:
-        """Log rank-zero metrics when a W&B run is active."""
+        """Log rank-zero metrics when a W&B or Trackio run is active."""
         run = getattr(self, "wandb_run", None)
         if run is not None:
             run.log(data, step=step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(data, step=step)
+
+    def _close_remote_target(self) -> None:
+        """Disconnect from the remote target servers, which then shut down.
+
+        Only the main rank disconnects: a server shuts down on the first disconnect
+        it receives, and every rank's last target request precedes a collective the
+        main rank also joins, so by now no rank still needs the servers.
+        """
+        if self.dist_env.is_main and isinstance(getattr(self, "target_wrapper", None), RemoteDSparkTargetModel):
+            self.target_wrapper.close()
 
     def _finish_wandb(self) -> None:
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            try:
+                trackio_logger.finish()
+            except Exception:
+                logger.warning("Failed to finish Trackio run cleanly.", exc_info=True)
+            finally:
+                self.trackio_logger = None
         run = getattr(self, "wandb_run", None)
         if run is None:
             return
@@ -1562,6 +1738,7 @@ class TrainDSparkRecipe(BaseRecipe):
             if getattr(self, "metric_logger", None) is not None:
                 self.metric_logger.close()
             self._finish_wandb()
+            self._close_remote_target()
             return
 
         pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
@@ -1594,7 +1771,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     pending_micro_batches += 1
 
                     if pending_micro_batches == self.grad_accumulation_steps:
-                        torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                        scale_grads_and_clip_grad_norm(self.max_grad_norm, [self.trainer_module])
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
                         self.lr_scheduler.step()
@@ -1658,7 +1835,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     for p in self.trainer_module.parameters():
                         if p.grad is not None:
                             p.grad.mul_(scale)
-                    torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                    scale_grads_and_clip_grad_norm(self.max_grad_norm, [self.trainer_module])
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
@@ -1710,6 +1887,7 @@ class TrainDSparkRecipe(BaseRecipe):
             if getattr(self, "metric_logger", None) is not None:
                 self.metric_logger.close()
             self._finish_wandb()
+            self._close_remote_target()
 
 
 def main(config_path: str | None = None):
