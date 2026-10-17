@@ -383,6 +383,10 @@ def _import_parallelizer_with_stubs(monkeypatch):
 
     _install_torch_and_layers_stubs(monkeypatch)
 
+    # parallelizer imports the real fsdp_patches; load it before the package below is replaced by a stub whose
+    # __path__ is empty, so this file also passes when it runs first (or alone) in a pytest process.
+    importlib.import_module("nemo_automodel.components.distributed.fsdp_patches")
+
     # Stub the distributed package, config normalization, pipelining module, and hf_utils.
     distributed_stub = types.ModuleType("nemo_automodel.components.distributed")
     distributed_stub.__path__ = []
@@ -450,6 +454,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         shard_module(module, **kwargs)
 
     parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
+    parallelizer_utils_stub.fully_shard_across_blocks = lambda blocks, module_names, **kwargs: set()
     parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
 
@@ -1138,6 +1143,78 @@ def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_
         ignored_params=set(block.mlp.experts.parameters()),
         model_parallelizer=None,
     )
+
+
+class _HolderBlock(DummyBlock):
+    """A block with one fp32 holder parameter beside its MoE experts."""
+
+    def __init__(self):
+        super().__init__(mlp=DummyMoE())
+        self.sinks = DummyParam()
+
+    def parameters(self):
+        yield self.sinks
+        yield from self.mlp.experts.parameters()
+
+
+def test_apply_fsdp_routes_declared_cross_block_holders_to_one_shared_unit(monkeypatch):
+    """Holders named in ``_fsdp_shard_across_blocks`` go to ``fully_shard_across_blocks`` once, before the
+    per-block units, and the parameters it owns stay out of the block's dtype unit."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    shared_sharder_mock = MagicMock()
+    monkeypatch.setattr(P.parallelizer_utils, "fully_shard_by_dtype", shared_sharder_mock)
+    block = _HolderBlock()
+    cross_block_mock = MagicMock(return_value={block.sinks})
+    monkeypatch.setattr(P.parallelizer_utils, "fully_shard_across_blocks", cross_block_mock)
+    model = DummyModel([block])
+    model._fsdp_shard_across_blocks = ["attn.sinks_param"]
+    fsdp_mesh = object()
+    mp_policy = MagicMock()
+    offload_policy = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=True,
+    )
+
+    cross_block_mock.assert_called_once_with(
+        [block],
+        ("attn.sinks_param",),
+        mesh=fsdp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        shard_module=fully_shard_mock,
+    )
+    ignored = shared_sharder_mock.call_args.kwargs["ignored_params"]
+    assert block.sinks in ignored
+    assert set(block.mlp.experts.parameters()) <= ignored
+
+
+def test_apply_fsdp_without_cross_block_declaration_leaves_the_shared_unit_alone(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    cross_block_mock = MagicMock(return_value=set())
+    monkeypatch.setattr(P.parallelizer_utils, "fully_shard_across_blocks", cross_block_mock)
+
+    P.apply_fsdp(
+        model=DummyModel([DummyBlock(mlp=DummyMoE())]),
+        fsdp_mesh=object(),
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        mp_policy=MagicMock(),
+        offload_policy=object(),
+    )
+
+    cross_block_mock.assert_not_called()
 
 
 def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):

@@ -445,6 +445,10 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         "norm1.weight",
         "norm2.weight",
     ]
+    # fp32 holders whose forward ignores its input: one FSDP unit across all blocks (see
+    # parallelizer_utils.fully_shard_across_blocks) — per-block units could only be reduce-scattered one by one
+    # in FSDP2's root post-backward callback after the whole backward.
+    _fsdp_shard_across_blocks = ["attn.sinks_param"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
