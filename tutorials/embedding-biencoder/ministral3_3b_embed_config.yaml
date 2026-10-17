@@ -24,6 +24,7 @@ step_scheduler:
   ckpt_every_steps: 50
   val_every_steps: 25
   max_steps: 100
+  num_epochs: null
 
 dist_env:
   backend: nccl
@@ -41,7 +42,7 @@ model:
   torch_dtype: bfloat16
   attn_implementation: flash_attention_2
   extract_submodel: language_model
-  do_distributed_inbatch_negative: false
+  do_distributed_inbatch_negative: true
 
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
