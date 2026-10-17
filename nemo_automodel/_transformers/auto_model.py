@@ -104,6 +104,7 @@ from nemo_automodel._transformers.model_init import (
     resolve_sdpa_method,
 )
 from nemo_automodel.components.models.common.tie_word_embeddings import reject_tie_word_embeddings_flip
+from nemo_automodel.components.utils.parameter_config import ParameterConfig, apply_parameter_config
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
     from transformers.cache_utils import StaticCache
@@ -405,6 +406,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config,
         compile_config,
         load_base_model,
+        parameter_config: ParameterConfig | None = None,
+        preserve_parameter_dtypes: bool = False,
         _retry_depth=0,
         **kwargs,
     ):
@@ -422,6 +425,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         kwargs = dict(kwargs)  # Defensive copy so retries get clean state
         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
+        if parameter_config is not None and (freeze_config is not None or peft_config is not None):
+            raise ValueError("parameter_config cannot be combined with freeze_config or PEFT")
         load_metadata_with_gloo = kwargs.pop("load_metadata_with_gloo", False)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
         if isinstance(pretrained_model_name_or_path_or_config, str):
@@ -460,6 +465,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 fp8_config=fp8_config,
                 compile_config=compile_config,
                 load_base_model=load_base_model,
+                parameter_config=parameter_config,
+                preserve_parameter_dtypes=preserve_parameter_dtypes,
                 _retry_depth=_retry_depth + 1,
                 **retry_kwargs,
             )
@@ -643,6 +650,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         attach_capabilities_and_validate(model, mesh)
 
+        if parameter_config is not None:
+            if weights_already_loaded:
+                raise ValueError("parameter_config requires construction before pretrained weights are loaded")
+            apply_parameter_config(model, parameter_config)
+
         model = apply_model_infrastructure(
             model=model,
             pretrained_model_name_or_path=pretrained_path,
@@ -662,6 +674,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             cache_dir=cache_dir,
             freeze_config=freeze_config,
             weights_already_loaded=weights_already_loaded,
+            preserve_parameter_dtypes=preserve_parameter_dtypes or parameter_config is not None,
             inject_te_attention=inject_te_attention,
             load_metadata_with_gloo=load_metadata_with_gloo,
         )
@@ -686,6 +699,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
+        parameter_config: ParameterConfig | None = None,
+        preserve_parameter_dtypes: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -739,6 +754,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 If provided, FP8 quantization will be applied. Default: None.
             compile_config (CompileConfig | None, optional): Configuration for torch.compile.
                 If provided, the model will be compiled. Default: None.
+            parameter_config: Exact trainable parameter names and storage dtypes,
+                applied before loading and sharding. Cannot be combined with PEFT
+                or freeze_config. Requires checkpoint-free model construction.
+            preserve_parameter_dtypes: Preserve constructor storage dtypes during
+                materialization; requires a model initializer supporting dtype=None.
+                Also enabled by parameter_config. Defaults to False.
             **kwargs: Additional keyword arguments. Notable ones include:
                 - dtype (str | torch.dtype): Model storage dtype. Takes precedence
                   over ``torch_dtype`` when not ``None``; accepts ``auto``.
@@ -824,6 +845,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config=fp8_config,
             compile_config=compile_config,
             load_base_model=True,
+            parameter_config=parameter_config,
+            preserve_parameter_dtypes=preserve_parameter_dtypes,
             **kwargs,
         )
 
@@ -845,6 +868,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
+        parameter_config: ParameterConfig | None = None,
+        preserve_parameter_dtypes: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -945,6 +970,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config=fp8_config,
             compile_config=compile_config,
             load_base_model=kwargs.pop("load_base_model", False),
+            parameter_config=parameter_config,
+            preserve_parameter_dtypes=preserve_parameter_dtypes,
             **kwargs,
         )
 

@@ -773,7 +773,8 @@ class TestApplyModelInfrastructurePostShardInit:
                     pretrained_model_name_or_path="",
                 )
 
-    def test_peft_init_method_forwarded_to_initialize_model_weights(self):
+    @pytest.mark.parametrize("preserve_dtypes", [False, True])
+    def test_peft_init_method_forwarded_to_initialize_model_weights(self, preserve_dtypes):
         """peft_config.lora_A_init should be forwarded as peft_init_method."""
         from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
@@ -798,11 +799,12 @@ class TestApplyModelInfrastructurePostShardInit:
                 device=torch.device("cpu"),
                 load_base_model=False,
                 peft_config=peft_config,
+                preserve_parameter_dtypes=preserve_dtypes,
                 pretrained_model_name_or_path="",
             )
 
             mock_ckpt.initialize_model_weights.assert_called_once_with(
-                model, torch.device("cpu"), peft_init_method="xavier"
+                model, torch.device("cpu"), peft_init_method="xavier", preserve_parameter_dtypes=preserve_dtypes
             )
 
     def test_applies_rotary_fix_automatically_when_needed(self):
@@ -872,7 +874,7 @@ class TestApplyModelInfrastructurePostShardInit:
 
 
 def _run_apply_model_infrastructure_load_before_shard(
-    *, peft_config=None, is_meta_device=True, weights_already_loaded=False
+    *, peft_config=None, is_meta_device=True, weights_already_loaded=False, preserve_parameter_dtypes=False
 ):
     """Helper that invokes apply_model_infrastructure with load_before_shard=True."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
@@ -899,6 +901,7 @@ def _run_apply_model_infrastructure_load_before_shard(
             pretrained_model_name_or_path="test/model",
             cache_dir="/tmp/cache",
             weights_already_loaded=weights_already_loaded,
+            preserve_parameter_dtypes=preserve_parameter_dtypes,
         )
 
         return result, mock_ckpt, model
@@ -907,17 +910,24 @@ def _run_apply_model_infrastructure_load_before_shard(
 class TestLoadBeforeShardPath:
     """Tests for the load_before_shard code path in apply_model_infrastructure."""
 
-    def test_load_before_shard_calls_initialize_then_load(self):
+    @pytest.mark.parametrize("preserve_dtypes", [False, True])
+    def test_load_before_shard_calls_initialize_then_load(self, preserve_dtypes):
         """load_before_shard should call initialize_model_weights before load_base_model."""
-        _, mock_ckpt, model = _run_apply_model_infrastructure_load_before_shard()
+        _, mock_ckpt, model = _run_apply_model_infrastructure_load_before_shard(
+            preserve_parameter_dtypes=preserve_dtypes
+        )
 
-        mock_ckpt.initialize_model_weights.assert_called_once_with(model, torch.device("cpu"), peft_init_method=None)
+        mock_ckpt.initialize_model_weights.assert_called_once_with(
+            model, torch.device("cpu"), peft_init_method=None, preserve_parameter_dtypes=preserve_dtypes
+        )
         mock_ckpt.load_base_model.assert_called_once_with(
             model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=True
         )
 
         init_idx = mock_ckpt.method_calls.index(
-            call.initialize_model_weights(model, torch.device("cpu"), peft_init_method=None)
+            call.initialize_model_weights(
+                model, torch.device("cpu"), peft_init_method=None, preserve_parameter_dtypes=preserve_dtypes
+            )
         )
         load_idx = mock_ckpt.method_calls.index(
             call.load_base_model(model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=True)

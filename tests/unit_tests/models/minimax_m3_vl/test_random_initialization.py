@@ -204,9 +204,15 @@ def test_checkpoint_overwrites_random_initialization(tmp_path: Path) -> None:
     initialize = Checkpointer.initialize_model_weights
     load = Checkpointer.load_base_model
 
-    def record_initialize(model: M3Model, device: torch.device, peft_init_method: str | None = None) -> None:
+    def record_initialize(
+        model: M3Model,
+        device: torch.device,
+        peft_init_method: str | None = None,
+        *,
+        preserve_parameter_dtypes: bool = False,
+    ) -> None:
         events.append("initialize")
-        initialize(model, device, peft_init_method)
+        initialize(model, device, peft_init_method, preserve_parameter_dtypes=preserve_parameter_dtypes)
         _assert_text_initialized(model)
         initialized_embeddings.append(model.model.embed_tokens.weight.detach().clone())
 

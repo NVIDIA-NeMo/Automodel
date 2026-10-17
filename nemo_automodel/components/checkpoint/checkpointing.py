@@ -1492,7 +1492,11 @@ class Checkpointer:
 
     @staticmethod
     def initialize_model_weights(
-        model: torch.nn.Module, device: torch.device, peft_init_method: str | None = None
+        model: torch.nn.Module,
+        device: torch.device,
+        peft_init_method: str | None = None,
+        *,
+        preserve_parameter_dtypes: bool = False,
     ) -> None:
         """
         Materialize meta-device parameters and initialize model weights.
@@ -1505,12 +1509,15 @@ class Checkpointer:
             model: Model whose weights should be initialized.
             device: Target device for materialized parameters.
             peft_init_method: Initialization method for PEFT adapters (e.g. "xavier").
+            preserve_parameter_dtypes: Keep the existing per-parameter storage
+                dtypes; requires initialize_weights(dtype=None). Defaults to False.
         """
         # Only materialize parameters that are actually on the meta device.
         # When the caller sets is_meta_device=True but the model was already
         # constructed on a real device (e.g. ContextManagers was patched to
         # a no-op), calling to_empty_parameters_only would replace valid
         # weights with uninitialized CUDA memory.
+        original_dtypes = {name: p.dtype for name, p in model.named_parameters()} if preserve_parameter_dtypes else {}
         has_meta_params = any(p.device.type == "meta" for p in model.parameters())
         if has_meta_params:
             to_empty_parameters_only(model, device=device)
@@ -1616,14 +1623,17 @@ class Checkpointer:
                         original_class = next(cls for cls in type(model).__mro__ if not issubclass(cls, FSDPModule))
                         model.is_custom_code = original_class.is_custom_code
                     with _DTensorInitCopyMode():
-                        try:
-                            if param_dtype is not None:
-                                model.initialize_weights(dtype=param_dtype)
-                            else:
+                        if preserve_parameter_dtypes:
+                            model.initialize_weights(dtype=None)
+                        else:
+                            try:
+                                if param_dtype is not None:
+                                    model.initialize_weights(dtype=param_dtype)
+                                else:
+                                    model.initialize_weights()
+                            except TypeError:
+                                # Model's initialize_weights() does not accept a dtype kwarg.
                                 model.initialize_weights()
-                        except TypeError:
-                            # Model's initialize_weights() does not accept a dtype kwarg.
-                            model.initialize_weights()
                 finally:
                     if bind_original_hf_class:
                         del model.is_custom_code
@@ -1645,6 +1655,11 @@ class Checkpointer:
 
         if peft_init_method is not None:
             _init_peft_adapters(model, peft_init_method)
+
+        if preserve_parameter_dtypes:
+            changed = [name for name, p in model.named_parameters() if p.dtype != original_dtypes[name]]
+            if changed:
+                raise RuntimeError(f"Model initialization changed parameter storage dtypes: {changed}")
 
     def load_base_model(
         self,

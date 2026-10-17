@@ -23,6 +23,52 @@ Precision settings have distinct effects:
 
 When `model.dtype: bfloat16` is used with `torch.optim.AdamW`, the AdamW EMA buffers (`exp_avg` and `exp_avg_sq`) are also stored in bf16. This is fragile for long full-parameter training runs: bf16 has only a 7-bit mantissa, so small EMA updates can be rounded away even though the values themselves are still in range. Symptoms range from silent degradation (slower convergence, that is, higher final loss at the same step count, with no visible instability) to overt failure: unstable `grad_norm`, loss bumps, loss spikes, or divergence.
 
+## Exact update surfaces before checkpoint loading
+
+For a partial-model update such as SpeechLM reinforcement learning, use
+`ParameterConfig` to select exact parameter names and their storage dtype before
+loading weights or applying distributed wrapping. Module-level `freeze_config`
+remains the choice when only trainability needs to change.
+
+```python
+import torch
+from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel.components.utils.parameter_config import ParameterConfig
+
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    "/path/to/nemotron-checkpoint",
+    dtype=torch.bfloat16,
+    parameter_config=ParameterConfig(
+        trainable_names=("model.layers.0.norm.weight",),
+        trainable_dtype=torch.float32,
+    ),
+)
+```
+
+Use names from the unwrapped model's `named_parameters()`. All other parameters
+are frozen and retain their constructor storage dtype unless `frozen_dtype` is
+explicitly set. Tied parameters retain their shared identity and use the first
+name returned by `named_parameters()`. Unknown, duplicate, or empty selections
+raise an error. Construct the optimizer after the loader returns.
+
+This option requires a checkpoint-free construction path with an initializer
+supporting `dtype=None`, as implemented by native Nemotron V3. It cannot be
+combined with PEFT or `freeze_config`, or used after an HF constructor has
+already loaded weights. It preserves the selected storage precision through
+materialization, so an FP32 checkpoint is not rounded to BF16 before loading.
+It does not change FSDP compute precision.
+
+For native checkpoint conversion without changing trainability, use
+`preserve_parameter_dtypes=True` instead. Both modes verify that initialization
+preserves parameter dtypes. The default loader behavior is unchanged.
+
+Nemotron V3 also accepts `compute_mtp=False` during an off-pipeline-parallel
+forward call. This skips auxiliary MTP computation while retaining all MTP
+parameters for checkpoint loading and saving. Response-only RL callers can
+combine it with `compute_logits=False, output_hidden_states=True` to consume
+the final hidden states without materializing full-vocabulary logits. The
+existing empty-vocabulary logits tensor remains the return contract.
+
 ## Recommended fp32 Master Weight and Optimizer-State Patterns
 
 Use one of these patterns for long full-parameter training (pre-training or extended fine-tuning):
