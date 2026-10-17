@@ -629,6 +629,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         self.metric_logger_valid.log(log_data)
 
@@ -663,6 +666,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         self.metric_logger_train.log(log_data)
 

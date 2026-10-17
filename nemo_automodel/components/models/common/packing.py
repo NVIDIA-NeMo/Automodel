@@ -112,6 +112,13 @@ def get_packing_capabilities(
     if attn_implementation == "fa4":
         uses_native_fa4 = isinstance(model, NativeFA4Consumer) and model._uses_native_fa4
         if not uses_native_fa4:
+            if model_mask_type is not None:
+                # Model-owned FA4 attention consumes its declared compact mask,
+                # without the shared varlen implementation's metadata hook.
+                return PackingCapabilities(
+                    packed_mask_type=model_mask_type,
+                    requires_packed_sequence_metadata=requires_metadata,
+                )
             raise ValueError("Native FA4 packing requires a model declaring native FA4 support.")
         return PackingCapabilities(
             packed_mask_type="document_ids",

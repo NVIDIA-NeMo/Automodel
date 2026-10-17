@@ -43,7 +43,7 @@ Usage:
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Dict, Iterable
 
 import torch
@@ -59,6 +59,10 @@ from nemo_automodel.components.distributed.model_parallelizer import (
 )
 from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
+
+if TYPE_CHECKING:
+    from diffusers import ModularPipeline
+
 
 # diffusers is an optional dependency
 try:
@@ -134,6 +138,70 @@ def _import_diffusers_class(class_name: str):
             f"Class '{class_name}' not found in diffusers. Check pipeline_spec.transformer_cls in your YAML config."
         )
     return getattr(diffusers, class_name)
+
+
+def _load_modular_transformer(
+    model_dir: str,
+    torch_dtype: torch.dtype,
+    config_overrides: "dict[str, ConfigFieldValue] | None" = None,
+    **kwargs,
+) -> "NeMoAutoDiffusionPipeline":
+    """Load only the denoiser transformer from a modular diffusers checkpoint.
+
+    Modular pipelines (``modular_model_index.json``) have no classic pipeline
+    class, so ``DiffusionPipeline.from_pretrained`` cannot auto-detect them.
+    Training only needs the transformer, so this resolves the transformer class
+    from the modular index and loads just the ``transformer/`` subfolder into a
+    minimal ``NeMoAutoDiffusionPipeline`` wrapper.
+
+    Args:
+        model_dir: Local snapshot directory containing ``modular_model_index.json``
+            and a ``transformer/`` subfolder.
+        torch_dtype: Parameter dtype passed to the transformer's ``from_pretrained``.
+        config_overrides: Optional config kwargs forwarded to the transformer's
+            ``from_pretrained`` to override saved config values (e.g. Flux3's
+            ``gen_type``/``cond_type`` mode selection for partial loading).
+        **kwargs: Additional arguments forwarded to the transformer's
+            ``from_pretrained`` (e.g. ``low_cpu_mem_usage``).
+
+    Returns:
+        NeMoAutoDiffusionPipeline wrapping the loaded transformer.
+
+    Raises:
+        ValueError: If the modular index has no ``transformer`` entry or the
+            entry does not name a diffusers class.
+    """
+    import json
+
+    index_path = os.path.join(model_dir, "modular_model_index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+
+    entry = index.get("transformer")
+    if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+        raise ValueError(
+            f"Modular checkpoint index {index_path} has no valid 'transformer' entry; "
+            "cannot determine the transformer class to load for training."
+        )
+    library, class_name = entry[0], entry[1]
+    if library != "diffusers":
+        raise ValueError(
+            f"Modular checkpoint transformer entry points at library {library!r}; only diffusers "
+            "transformer classes are supported for training."
+        )
+
+    transformer_cls = _import_diffusers_class(class_name)
+    logger.info("[INFO] Loading modular checkpoint transformer %s from %s", class_name, model_dir)
+    if config_overrides:
+        logger.info("[INFO] Transformer config overrides: %s", config_overrides)
+    transformer = transformer_cls.from_pretrained(
+        model_dir,
+        subfolder="transformer",
+        torch_dtype=torch_dtype,
+        **(config_overrides or {}),
+        **kwargs,
+    )
+    return NeMoAutoDiffusionPipeline(transformer=transformer)
 
 
 def _choose_device(device: torch.device | None) -> torch.device:
@@ -451,8 +519,13 @@ def _apply_parallelization(
     pipe,
     mesh_context: MeshContext | None,
     components_to_load: Iterable[str] | None = None,
+    *,
+    device: torch.device | None = None,
 ):
     """Apply FSDP2/DDP parallelization to pipeline components.
+
+    Explicit single-rank DDP placement is carried in a copy of MeshContext.
+    Multi-rank placement remains owned by the distributed strategy.
 
     Each parallelized component is stamped with ``_pre_shard_hf_state_dict_keys``:
     its state-dict keys captured just before sharding (after LoRA injection, QKV
@@ -469,6 +542,14 @@ def _apply_parallelization(
 
     if not torch.distributed.is_initialized():
         raise RuntimeError("Distributed environment must be initialized for parallelization")
+    # Preserve explicit placement, including CPU, over the single-rank Gloo
+    # CUDA default. Copy the context to keep the caller's settings unchanged.
+    if (
+        device is not None
+        and isinstance(mesh_context.strategy_config, DDPConfig)
+        and torch.distributed.get_world_size() == 1
+    ):
+        mesh_context = replace(mesh_context, ddp_device=device)
     for comp_name, comp_module in _iter_pipeline_modules(pipe):
         if components_to_load is not None and comp_name not in components_to_load:
             continue
@@ -626,8 +707,9 @@ class NeMoAutoDiffusionPipeline:
         attention_backend: str | None = None,
         backend: "BackendConfig | None" = None,
         config_overrides: dict[str, ConfigFieldValue] | None = None,
+        transformer_config_overrides: dict[str, ConfigFieldValue] | None = None,
         **kwargs,
-    ) -> "DiffusionPipeline | NeMoAutoDiffusionPipeline":
+    ) -> "DiffusionPipeline | ModularPipeline | NeMoAutoDiffusionPipeline":
         """
         Load pipeline from pretrained weights using DiffusionPipeline auto-detection.
 
@@ -639,6 +721,10 @@ class NeMoAutoDiffusionPipeline:
         it is returned; the diffusers-only options below are then rejected.
 
         No pipeline_spec is needed - the pipeline type is determined automatically.
+
+        Modular checkpoints (repos with a modular_model_index.json and no
+        model_index.json, e.g. FLUX.3) load only the transformer for training.
+        Inference loads the complete modular pipeline, preserving FP32 VAE precision.
 
         Args:
             pretrained_model_name_or_path: HuggingFace model ID or local path
@@ -655,7 +741,7 @@ class NeMoAutoDiffusionPipeline:
             peft_cfg: PeftConfig instance or None. When provided, LoRA is injected
                 before _apply_parallelization() (FSDP2 wrapping). Base weights
                 are frozen after FSDP2; LoRA params are collected pre-FSDP2 and stored on pipe.
-            model_type: "flux" | "flux2" | "wan" | "hunyuan" | "ltx2". Required when peft_cfg is provided.
+            model_type: "flux" | "flux2" | "flux3" | "wan" | "hunyuan" | "ltx2". Required when peft_cfg is provided.
             active_transformer: For two-transformer pipelines (e.g. Wan2.2 with
                 ``transformer`` + ``transformer_2``), selects which one becomes
                 ``pipe.transformer`` for training. Accepts ``"transformer"`` (default,
@@ -671,7 +757,13 @@ class NeMoAutoDiffusionPipeline:
             backend: ``BackendConfig`` of a custom-model transformer.
             config_overrides: Fields set on the custom-model transformer's config before it is built; every key
                 must be a field of that config.
+            transformer_config_overrides: Config kwargs forwarded to the transformer's
+                ``from_pretrained`` to override saved config values (e.g. Flux3's
+                ``gen_type``/``cond_type`` mode selection for partial loading). Only
+                supported for modular checkpoints; classic model_index.json pipelines
+                cannot override per-component configs at load time.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
+                (or, for modular checkpoints, to the transformer's from_pretrained)
 
         Returns:
             The loaded diffusers pipeline with requested components replaced by their parallelized modules, or a
@@ -715,13 +807,46 @@ class NeMoAutoDiffusionPipeline:
                 "Install with: pip install nemo_automodel[diffusion]"
             )
 
-        # Use DiffusionPipeline.from_pretrained for auto-detection
-        pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
-            model_dir,
-            *model_args,
-            torch_dtype=torch_dtype,
-            **kwargs,
+        is_modular_checkpoint = not os.path.isfile(os.path.join(model_dir, "model_index.json")) and os.path.isfile(
+            os.path.join(model_dir, "modular_model_index.json")
         )
+        if transformer_config_overrides and not is_modular_checkpoint:
+            raise ValueError(
+                "transformer_config_overrides is only supported for modular checkpoints "
+                "(modular_model_index.json); classic model_index.json pipelines cannot "
+                "override per-component configs at load time."
+            )
+
+        load_modular_components = (
+            is_modular_checkpoint
+            and not load_for_training
+            and not components_to_load
+            and peft_cfg is None
+            and not transformer_config_overrides
+        )
+        if load_modular_components:
+            from diffusers import ModularPipeline
+
+            pipe = ModularPipeline.from_pretrained(model_dir, **kwargs)
+            # The FLUX.3 image VAE was trained in FP32. Keep that precision
+            # while loading the denoiser and text encoder in the requested dtype.
+            pipe.load_components(dtype={"default": torch_dtype, "vae": torch.float32})
+        elif is_modular_checkpoint:
+            # Training needs only the denoiser, without text/VAE residency.
+            pipe = _load_modular_transformer(
+                model_dir,
+                torch_dtype=torch_dtype,
+                config_overrides=transformer_config_overrides,
+                **kwargs,
+            )
+        else:
+            # Use DiffusionPipeline.from_pretrained for auto-detection
+            pipe = DiffusionPipeline.from_pretrained(
+                model_dir,
+                *model_args,
+                torch_dtype=torch_dtype,
+                **kwargs,
+            )
 
         logger.info("[INFO] Loaded pipeline type: %s", type(pipe).__name__)
 
@@ -740,7 +865,10 @@ class NeMoAutoDiffusionPipeline:
             for name, module in _iter_pipeline_modules(pipe):
                 if not components_to_load or name in components_to_load:
                     logger.info("[INFO] Moving module: %s to device/dtype", name)
-                    _move_module_to_device(module, dev, torch_dtype)
+                    if load_modular_components:
+                        module.to(device=dev)
+                    else:
+                        _move_module_to_device(module, dev, torch_dtype)
 
         if compact_fused_qkv_projections and not fuse_qkv_projections:
             raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
@@ -775,7 +903,7 @@ class NeMoAutoDiffusionPipeline:
             if model_type is None:
                 raise ValueError(
                     "model_type must be set when peft_cfg is provided. "
-                    "Options: 'flux', 'flux2', 'wan', 'hunyuan', 'ltx2'"
+                    "Options: 'flux', 'flux2', 'flux3', 'wan', 'hunyuan', 'ltx2'"
                 )
             import dataclasses
 
@@ -834,7 +962,7 @@ class NeMoAutoDiffusionPipeline:
         # sets up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
         # DDP LoRA: base weights are frozen before wrapping so DDP only reduces LoRA gradients.
         parallel_components = components_to_load if components_to_parallelize is None else components_to_parallelize
-        _apply_parallelization(pipe, mesh_context, parallel_components)
+        _apply_parallelization(pipe, mesh_context, parallel_components, device=device)
 
         # Freeze base weights after FSDP2 wrapping — mirrors the LLM pattern in
         # nemo_automodel/_transformers/infrastructure.py lines 513-518.
@@ -1061,6 +1189,6 @@ class NeMoAutoDiffusionPipeline:
                 _ensure_params_trainable(module, module_name=name)
 
         # Apply parallelization (FSDP2 or DDP)
-        _apply_parallelization(pipe, mesh_context, components_to_load)
+        _apply_parallelization(pipe, mesh_context, components_to_load, device=device)
 
         return pipe
