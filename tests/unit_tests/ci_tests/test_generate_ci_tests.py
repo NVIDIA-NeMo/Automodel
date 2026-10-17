@@ -228,17 +228,18 @@ def test_migrated_moe_recipes_preserve_activation_checkpointing(config_path):
 
 
 @pytest.mark.parametrize(
-    ("config_path", "activation_checkpointing"),
+    ("config_path", "activation_checkpointing", "loss_impl"),
     [
-        ("examples/llm_benchmark/gpt_oss/gptoss_20b_te_deepep.yaml", None),
-        ("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep_gb200.yaml", True),
+        ("examples/llm_benchmark/gpt_oss/gptoss_20b_te_deepep.yaml", None, "torch_compile"),
+        ("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep_gb200.yaml", True, "cce"),
     ],
 )
-def test_gpt_oss_oom_benchmark_configs_use_fused_loss(config_path, activation_checkpointing):
+def test_gpt_oss_oom_benchmark_configs_use_fused_loss(config_path, activation_checkpointing, loss_impl):
     recipe = YAML(typ="safe").load(Path(config_path))
 
     assert recipe["model"]["output_hidden_states"] is True
     assert recipe["loss_fn"]["_target_"] == ("nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy")
+    assert recipe["loss_fn"].get("impl", "cce") == loss_impl
     if activation_checkpointing is not None:
         assert recipe["distributed"]["activation_checkpointing"] is activation_checkpointing
 
