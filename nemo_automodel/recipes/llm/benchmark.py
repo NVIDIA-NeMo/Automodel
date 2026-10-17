@@ -20,6 +20,7 @@ import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDataset
+from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.moe.megatron.token_dispatcher import hybrid_ep_token_capacity
 from nemo_automodel.components.training.timers import Timers
@@ -164,6 +165,10 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         This method calls the parent's setup() but adapts it for benchmarking purposes.
         It skips validation dataloader, checkpointing, and other training-specific features.
         """
+        # The setup timer synchronizes CUDA before distributed initialization.
+        # Select this worker's GPU first to avoid retaining a context on GPU 0.
+        if not torch.distributed.is_initialized() and torch.cuda.is_available():
+            torch.cuda.set_device(get_local_rank_preinit())
         with self.timers("setup", log_level=1):
             # Call parent setup
             super().setup()
