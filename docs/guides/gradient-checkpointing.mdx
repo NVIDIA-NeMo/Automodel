@@ -168,6 +168,19 @@ LC-CE and gradient checkpointing target **different memory hot-spots** (output l
 ## Performance Considerations
 1. **Extra compute**: Each checkpointed segment is recomputed once during the backward pass. In practice, the wall-clock overhead is ≈5-10% for transformer models.
 2. **Throughput vs. Batch Size**: The goal is usually to _increase batch size_ or _sequence length_ while keeping throughput constant.
+3. **MoE recompute cache (HybridEP dispatcher)**: with block checkpointing, the backward re-executes every MoE layer's forward, including the HybridEP combine (unpermute, expert-parallel barrier, all-to-all) and the expert down projection whose output only feeds that combine. `model.backend.dispatcher_recompute_cache` keeps each layer's combine output from the checkpoint forward (one `[tokens, hidden]` activation per MoE layer per in-flight microbatch) and serves it in the recompute:
+
+```yaml
+model:
+  backend:
+    dispatcher: hybridep
+    experts: torch_mm
+    dispatcher_recompute_cache: moe_tail   # none (default) | combine | moe_tail
+distributed:
+  activation_checkpointing: true
+```
+
+   `combine` skips the recomputed unpermute, barrier and combine all-to-all; `moe_tail` additionally builds the down projection's autograd node without running its GEMM (torch grouped-GEMM experts without expert bias, router weight applied inside the activation). Gradients are unchanged. On DeepSeek-V4.1-Flash at 16 GB200 nodes (EP64, 4k sequences, local batch 2) the step time dropped by 1.4 % (`combine`) and 3.9 % (`moe_tail`) for +3.2 GiB of peak allocated memory (40 MoE layers × 80 MiB).
 
 ## Verify It Works
 Run a checked-in recipe config with activation checkpointing enabled and inspect the peak memory:
