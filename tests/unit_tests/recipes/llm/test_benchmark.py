@@ -1120,3 +1120,33 @@ class TestBenchmarkingRecipeLossCalculation:
         # Verify loss reduction includes context parallelism
         loss_reduction_calls = [call for call in dp_allreduce_calls if call["include_cp"]]
         assert len(loss_reduction_calls) >= 1
+
+
+@pytest.mark.parametrize("pp_enabled,expected", [(False, 8192), (True, 2048)])
+def test_mock_dataset_infers_hybridep_capacity(mock_recipe, monkeypatch, pp_enabled, expected):
+    from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDataset
+
+    mock_recipe.dataloader.dataset = MockIterableDataset(seq_len=2048, batch_size=4)
+    mock_recipe.pp_enabled = pp_enabled
+    mock_recipe.pp = SimpleNamespace(pp_microbatch_size=1)
+    context = MagicMock()
+    monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.hybrid_ep_token_capacity", context)
+    mock_recipe._run_benchmark = MagicMock()
+    mock_recipe.run_benchmark()
+    context.assert_called_once_with(expected)
+    context.return_value.__enter__.assert_called_once()
+    context.return_value.__exit__.assert_called_once()
+    mock_recipe._run_benchmark.assert_called_once()
+
+
+@pytest.mark.parametrize("axis", ["tp_size", "cp_size"])
+def test_sharded_token_layout_retains_negotiation(mock_recipe, monkeypatch, axis):
+    from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDataset
+
+    mock_recipe.dataloader.dataset = MockIterableDataset(seq_len=2048, batch_size=4)
+    mock_recipe.cfg.distributed = SimpleNamespace(**{axis: 2})
+    context = MagicMock()
+    monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.hybrid_ep_token_capacity", context)
+    mock_recipe._run_benchmark = MagicMock()
+    mock_recipe.run_benchmark()
+    context.assert_called_once_with(None)

@@ -782,6 +782,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_sms_preprocessing_api: int | None = None,
         num_blocks_permute: int | None = None,
         num_blocks_unpermute: int | None = None,
+        num_of_tokens_per_rank: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, object]:
         """Dispatch hidden states using compact indices or a dense routing map.
 
@@ -805,6 +806,8 @@ class HybridEPDispatch(torch.autograd.Function):
             num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
             num_blocks_permute: Optional dispatch permutation block count.
             num_blocks_unpermute: Optional combine unpermutation block count.
+            num_of_tokens_per_rank: Group-uniform slot extent, at least every rank's real input rows.
+                Upstream aligns and pads routing metadata; activations retain their real shape.
 
         Returns:
             Dispatched hidden states with shape [dispatched_tokens, hidden], grouped by local
@@ -816,6 +819,7 @@ class HybridEPDispatch(torch.autograd.Function):
         if first_call:
             t_first = time.perf_counter()
             seq_len, hidden_dim = x.shape[-2:]
+            seq_len = max(16, num_of_tokens_per_rank or seq_len)
             fp8_dispatch = False
             init_hybrid_ep_buffer(
                 group,
@@ -874,6 +878,7 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
+            num_of_tokens_per_rank=num_of_tokens_per_rank,
             fuse_permute_dispatch=fuse_permute,
         )
 
@@ -939,6 +944,7 @@ class HybridEPDispatch(torch.autograd.Function):
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -1041,6 +1047,7 @@ if HAVE_HYBRIDEP:
         num_sms_preprocessing_api: int | None = None,
         num_blocks_permute: int | None = None,
         num_blocks_unpermute: int | None = None,
+        num_of_tokens_per_rank: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, object]:
         """Dispatch tokens through HybridEP while retaining dense probability layout.
 
@@ -1060,6 +1067,8 @@ if HAVE_HYBRIDEP:
             num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
             num_blocks_permute: Optional dispatch permutation block count.
             num_blocks_unpermute: Optional combine unpermutation block count.
+            num_of_tokens_per_rank: Group-uniform slot extent, at least every rank's real input rows.
+                Upstream aligns and pads routing metadata; activations retain their real shape.
 
         Returns:
             Dispatched hidden states with shape [dispatched_tokens, hidden], grouped by local
@@ -1083,6 +1092,7 @@ if HAVE_HYBRIDEP:
             num_sms_preprocessing_api,
             num_blocks_permute,
             num_blocks_unpermute,
+            num_of_tokens_per_rank,
         )
 
     def hybrid_ep_combine(

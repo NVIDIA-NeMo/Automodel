@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-GPU HybridEP routing, fusion, padding, and checkpoint replay parity."""
+"""Two-GPU HybridEP dynamic batches, capacity-scope collectives, and numerical parity."""
 
 import pytest
 
@@ -25,4 +25,5 @@ HYBRIDEP_PARITY = "L2_MoE_HybridEP_UnequalTokens_Parity.sh"
 class TestHybridEPUnequalTokensParity:
     @pytest.mark.timeout(600)
     def test_routing_fusion_and_checkpoint_parity(self) -> None:
+        """Check dynamic routing/fusion batches and scoped all-reduce removal with checkpointing."""
         run_test_script(TEST_FOLDER, HYBRIDEP_PARITY)

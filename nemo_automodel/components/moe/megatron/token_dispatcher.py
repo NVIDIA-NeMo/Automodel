@@ -17,7 +17,10 @@ import logging
 import math
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from threading import RLock
 from typing import List, Literal, Tuple
 
 import torch
@@ -411,6 +414,42 @@ def _assert_no_hybridep_overflow(handle, capacity: int) -> None:
     )
 
 
+# CUDA checkpoint recomputation runs on an autograd thread, so this scoped
+# capacity must be process-wide. Serialize scope owners; dispatch only reads it.
+_hybridep_token_capacity: int | None = None
+_hybridep_capacity_lock = RLock()
+
+
+@contextmanager
+def hybrid_ep_token_capacity(num_tokens: int | None) -> Iterator[None]:
+    """Scope a proven group-uniform dispatch capacity across forward and backward.
+
+    Scopes are process-wide and serialized between owner threads. This keeps the
+    capacity visible to CUDA autograd workers during checkpoint recomputation.
+    The owner must retain the scope until all associated backward work completes.
+
+    Args:
+        num_tokens: Common upper bound on local dispatch rows on every EP rank,
+            established by the caller's input pipeline. None retains per-dispatch
+            negotiation. The bound must remain valid during recomputation and
+            all overlapping pipeline microbatches. Exceeding it raises instead
+            of conditionally entering a collective on only some ranks.
+
+    Yields:
+        None. The previous capacity is restored on exit, including on errors.
+    """
+    if num_tokens is not None and num_tokens < 0:
+        raise ValueError("HybridEP token capacity must be nonnegative")
+    global _hybridep_token_capacity
+    with _hybridep_capacity_lock:
+        previous_capacity = _hybridep_token_capacity
+        _hybridep_token_capacity = num_tokens
+        try:
+            yield
+        finally:
+            _hybridep_token_capacity = previous_capacity
+
+
 class _HybridEPManager(_DispatchManager):
     """
     A manager class to handle fused all-to-all communication processes for MoE models using
@@ -481,9 +520,6 @@ class _HybridEPManager(_DispatchManager):
         # Handle used for combine operation
         self.handle = None
         self.pad_multiple = None
-        # Set by dispatch() when this rank padded its tokens up to the EP-group
-        # maximum; combine() slices the padding back off.
-        self.num_unpadded_tokens: int | None = None
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
@@ -572,44 +608,26 @@ class _HybridEPManager(_DispatchManager):
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
 
-        # HybridEP's fused all-to-all exchanges fixed-extent buffers, so every rank
-        # in the EP group must dispatch the same number of tokens, and the kernel's
-        # metadata allgather additionally requires that count to be 16-byte aligned
-        # (4 tokens). Unequal or unaligned counts (variable-length or packed dynamic
-        # batches) abort or deadlock the collective. Pad this rank's tokens up to
-        # the aligned group-wide maximum: padded rows route to no expert (all-False
-        # routing map), and combine() slices them back off.
-        self.num_unpadded_tokens = None
-        if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
-            num_tokens = hidden_states.shape[0]
-            pin = self.benchmark_static_routing and _STATIC_ROUTING_PAD_PIN
-            if self.equal_token_counts:
-                # Every rank holds the same row count by construction (fixed-shape batches): the
-                # group-wide maximum is the local count, so only align it. No collective, no host sync.
-                target_tokens = _align_up(num_tokens, _HYBRIDEP_TOKEN_ALIGNMENT)
-            elif pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
-                target_tokens = self._static_target_tokens
-            else:
+        # DeepEP #744 retains real activation/probability rows and pads only
+        # routing metadata to a group-uniform slot extent. Upstream aligns it.
+        num_tokens = hidden_states.shape[0]
+        target_tokens = _hybridep_token_capacity
+        pin = self.benchmark_static_routing and _STATIC_ROUTING_PAD_PIN
+        if target_tokens is not None:
+            if num_tokens > target_tokens:
+                raise ValueError(f"HybridEP dispatch has {num_tokens} rows, exceeding proven capacity {target_tokens}")
+        elif self.equal_token_counts:
+            target_tokens = num_tokens
+        elif pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
+            target_tokens = self._static_target_tokens
+        else:
+            target_tokens = num_tokens
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
                 group_max = torch.tensor(num_tokens, device=hidden_states.device)
                 torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
-                target_tokens = _align_up(int(group_max), _HYBRIDEP_TOKEN_ALIGNMENT)
-                if pin:
-                    self._static_target_tokens = target_tokens
-                    if torch.distributed.get_rank() == 0:
-                        logging.getLogger(__name__).info(
-                            "benchmark_static_routing: HybridEP pad size pinned at %d tokens "
-                            "(per-dispatch EP-group max all-reduce + host sync skipped from now on)",
-                            target_tokens,
-                        )
-            pad_tokens = target_tokens - num_tokens
-            if pad_tokens > 0:
-                self.num_unpadded_tokens = num_tokens
-                hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_tokens))
-                if self.routing_map is not None:
-                    self.routing_map = nn.functional.pad(self.routing_map, (0, 0, 0, pad_tokens))
-                if self.token_indices is not None:
-                    self.token_indices = nn.functional.pad(self.token_indices, (0, 0, 0, pad_tokens), value=-1)
-                self.token_probs = nn.functional.pad(self.token_probs, (0, 0, 0, pad_tokens))
+                target_tokens = int(group_max)
+            if pin:
+                self._static_target_tokens = target_tokens
 
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
             x=hidden_states,
@@ -623,6 +641,7 @@ class _HybridEPManager(_DispatchManager):
             num_sms_combine_api=self.moe_hybridep_num_sms,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
+            num_of_tokens_per_rank=target_tokens,
             fuse_permute=self.moe_hybridep_permute_fusion,
             num_sms_preprocessing_api=self.moe_hybridep_num_sms_preprocessing,
             num_blocks_permute=self.moe_hybridep_num_blocks_permute,
@@ -692,9 +711,6 @@ class _HybridEPManager(_DispatchManager):
         )
         self.handle = None
         self.num_permuted_tokens = None
-        if self.num_unpadded_tokens is not None:
-            hidden_states = hidden_states[: self.num_unpadded_tokens]
-            self.num_unpadded_tokens = None
         return hidden_states
 
     def get_dispatched_metadata(self) -> torch.Tensor:
@@ -746,7 +762,6 @@ class _HybridEPManager(_DispatchManager):
             "routing_map",
             "handle",
             "pad_multiple",
-            "num_unpadded_tokens",
             "tokens_per_expert",
             "dispatched_probs",
             "num_permuted_tokens",
