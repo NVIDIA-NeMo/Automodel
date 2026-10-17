@@ -141,9 +141,16 @@ class _DeepepManager(_DispatchManager):
         self.router_dtype = router_dtype
         self.moe_router_expert_pad_multiple = moe_router_expert_pad_multiple
 
-        # Metadata
+        # Per-dispatch state. dispatch()/get_permuted_hidden_states_by_experts() fill it and
+        # combine() releases it again; see _release_dispatch_state().
         self.token_indices: torch.Tensor | None = None
         self.token_probs: torch.Tensor | None = None
+        self.tokens_per_expert: torch.Tensor | None = None
+        self.dispatched_indices: torch.Tensor | None = None
+        self.dispatched_probs: torch.Tensor | None = None
+        self.dispatched_routing_map: torch.Tensor | None = None
+        self.reversed_mapping_for_combine: torch.Tensor | None = None
+        self.hidden_shape_before_permute: torch.Size | None = None
         # Handle used for combine operation
         self.handle = None
 
@@ -204,6 +211,10 @@ class _DeepepManager(_DispatchManager):
         self.tokens_per_expert = num_tokens_per_expert
         self.dispatched_indices = dispatched_indices
         self.dispatched_probs = dispatched_probs
+        # The kernel consumed the routing inputs; drop them so the manager stops referencing
+        # the router's autograd graph as early as possible (see _release_dispatch_state()).
+        self.token_probs = None
+        self.token_indices = None
 
         return hidden_states
 
@@ -265,9 +276,30 @@ class _DeepepManager(_DispatchManager):
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        # Release the handle after combine operation
-        self.handle = None
+        self._release_dispatch_state()
         return hidden_states
+
+    def _release_dispatch_state(self) -> None:
+        """Drop every tensor that belongs to the dispatch that was just combined.
+
+        ``token_probs`` and ``dispatched_probs`` carry a ``grad_fn``. Under non-reentrant
+        activation checkpointing the last dispatch of a step is a backward recompute, and a
+        live reference into that recompute graph keeps the layer's recomputed activations
+        alive after ``backward()``; the allocator then cannot return those segments. Nothing
+        reads this state after ``combine()``: the next ``setup_metadata()``/``dispatch()``
+        rebuilds it. ``dispatch()`` and ``get_permuted_hidden_states_by_experts()`` already
+        drop the autograd-connected tensors they consume, because an early-stopped recompute
+        never reaches ``combine()``.
+        """
+        self.handle = None
+        self.token_indices = None
+        self.token_probs = None
+        self.tokens_per_expert = None
+        self.dispatched_indices = None
+        self.dispatched_probs = None
+        self.dispatched_routing_map = None
+        self.reversed_mapping_for_combine = None
+        self.hidden_shape_before_permute = None
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
@@ -309,6 +341,9 @@ class _DeepepManager(_DispatchManager):
         )
         if self.router_dtype == "fp64":
             permuted_probs = permuted_probs.to(torch.float64)
+        # permute() consumed the dispatched routing tensors; only the unpermute inputs stay.
+        self.dispatched_indices = None
+        self.dispatched_probs = None
         return hidden_states, permuted_probs
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -474,10 +509,13 @@ class _HybridEPManager(_DispatchManager):
         # that computes it runs once. NEMO_STATIC_ROUTING_PAD_PIN=0 keeps the per-dispatch path (A/B).
         self._static_target_tokens: int | None = None
 
-        # Metadata
+        # Per-dispatch state. setup_metadata()/dispatch() fill it and combine() releases it
+        # again; see _release_dispatch_state().
         self.token_probs: torch.Tensor | None = None
         self.token_indices: torch.Tensor | None = None
         self.routing_map: torch.Tensor | None = None
+        self.tokens_per_expert: torch.Tensor | None = None
+        self.dispatched_probs: torch.Tensor | None = None
         # Handle used for combine operation
         self.handle = None
         self.pad_multiple = None
@@ -630,6 +668,11 @@ class _HybridEPManager(_DispatchManager):
         )
 
         self.tokens_per_expert = tokens_per_expert
+        # The kernel consumed the routing inputs; drop them so the manager stops referencing
+        # the router's autograd graph as early as possible (see _release_dispatch_state()).
+        self.token_probs = None
+        self.token_indices = None
+        self.routing_map = None
         if capacity_mode:
             # num_permuted_tokens already holds the capacity for a non-blocking dispatch; only the
             # one blocking calibration dispatch and the overflow check happen after the call.
@@ -690,18 +733,40 @@ class _HybridEPManager(_DispatchManager):
             pad_multiple=self.pad_multiple,
             fuse_permute=self.moe_hybridep_permute_fusion,
         )
-        self.handle = None
-        self.num_permuted_tokens = None
         if self.num_unpadded_tokens is not None:
             hidden_states = hidden_states[: self.num_unpadded_tokens]
-            self.num_unpadded_tokens = None
+        self._release_dispatch_state()
         return hidden_states
+
+    def _release_dispatch_state(self) -> None:
+        """Drop every tensor that belongs to the dispatch that was just combined.
+
+        ``token_probs`` and ``dispatched_probs`` carry a ``grad_fn``. Under non-reentrant
+        activation checkpointing the last dispatch of a step is a backward recompute, and a
+        live reference into that recompute graph keeps the layer's recomputed activations
+        alive after ``backward()``; the allocator then cannot return those segments. Nothing
+        reads this state after ``combine()``: the next ``setup_metadata()``/``dispatch()``
+        rebuilds it. ``dispatch()`` and ``get_permuted_hidden_states_by_experts()`` already
+        drop the autograd-connected tensors they consume, because an early-stopped recompute
+        never reaches ``combine()``. Calibrated capacity and the static-routing pins persist
+        on purpose.
+        """
+        self.handle = None
+        self.num_permuted_tokens = None
+        self.num_unpadded_tokens = None
+        self.token_probs = None
+        self.token_indices = None
+        self.routing_map = None
+        self.tokens_per_expert = None
+        self.dispatched_probs = None
 
     def get_dispatched_metadata(self) -> torch.Tensor:
         return None, self.dispatched_probs
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states, self.dispatched_probs
+        # Hand the probabilities to the experts and stop holding them here.
+        dispatched_probs, self.dispatched_probs = self.dispatched_probs, None
+        return hidden_states, dispatched_probs
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states
