@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 import torch.nn as nn
 
@@ -31,6 +31,7 @@ class _DionFamilyConfig(Protocol):
     scalar_opt: str
     scalar_betas: tuple[float, float]
     scalar_eps: float
+    supports_batched_matrices: ClassVar[bool]
 
 
 _import_error: Exception | None = None
@@ -47,7 +48,7 @@ def is_dion_optimizer(optimizer_factory: Any) -> bool:
     """Return whether an optimizer factory targets a Dion-family optimizer."""
     name = getattr(optimizer_factory, "__name__", "")
     module = getattr(optimizer_factory, "__module__", "")
-    return module.startswith("dion") or name in {"Dion", "Dion2", "Muon", "NorMuon"}
+    return module.startswith("dion") or name in {"Dion", "Dion2", "Muon", "NorMuon", "Muown"}
 
 
 def _separate_param_groups(
@@ -60,6 +61,9 @@ def _separate_param_groups(
     scalar_lr: float | None = None,
     embed_lr: float | None = None,
     lm_head_lr: float | None = None,
+    *,
+    supports_batched_matrices: bool = False,
+    use_matrix_layout: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Separate model parameters into groups for Dion/Muon optimizers.
@@ -74,8 +78,25 @@ def _separate_param_groups(
         scalar_lr: Learning rate for scalar (vector/bias) params. Defaults to base_lr.
         embed_lr: Learning rate for embedding params. Defaults to scalar_lr or base_lr.
         lm_head_lr: Learning rate for lm_head. Defaults to base_lr / sqrt(d_in).
+        supports_batched_matrices: Route 3D+ weights to the matrix optimizer when
+            it supports batches of matrices, including grouped MoE experts.
+        use_matrix_layout: Split transposed storage into its own matrix group for
+            optimizers whose update depends on the output-neuron axis.
     """
     matrix_params = []
+    transposed_matrix_params = []
+    modules = dict(model.named_modules())
+    if use_matrix_layout:
+        # A stale declaration (e.g. a renamed projection) would silently treat [..., input, output] storage as
+        # [..., output, input], so every declared name must be one of the module's own parameters.
+        for module_name, module in modules.items():
+            declared = getattr(module, "_nemo_transposed_matrix_parameters", ())
+            missing = [parameter_name for parameter_name in declared if parameter_name not in module._parameters]
+            if missing:
+                raise ValueError(
+                    f"{type(module).__name__} at {module_name or '<root>'!r} lists {missing} in "
+                    "_nemo_transposed_matrix_parameters, but has no parameters with those names."
+                )
     vector_params = []
     embed_params = []
     lm_head_params = []
@@ -84,12 +105,8 @@ def _separate_param_groups(
         if not param.requires_grad:
             continue
 
-        module = None
-        try:
-            module_name = name.rsplit(".", 1)[0]
-            module = dict(model.named_modules()).get(module_name, None)
-        except Exception:
-            module = None
+        module_name, _, parameter_name = name.rpartition(".")
+        module = modules.get(module_name)
 
         if isinstance(module, nn.Embedding):
             embed_params.append(param)
@@ -99,8 +116,15 @@ def _separate_param_groups(
             lm_head_params.append(param)
             continue
 
-        if param.ndim == 2:
-            matrix_params.append(param)
+        is_matrix = param.ndim == 2 or (supports_batched_matrices and param.ndim > 2)
+        # Batched-matrix optimizers keep 2D biases on the scalar optimizer; others keep main's ndim == 2 rule.
+        is_bias = parameter_name == "bias" or parameter_name.endswith("_bias")
+        if is_matrix and not (supports_batched_matrices and is_bias):
+            transposed_names = getattr(module, "_nemo_transposed_matrix_parameters", ())
+            if use_matrix_layout and parameter_name in transposed_names:
+                transposed_matrix_params.append(param)
+            else:
+                matrix_params.append(param)
         else:
             vector_params.append(param)
 
@@ -125,6 +149,9 @@ def _separate_param_groups(
         ),
         dict(params=embed_params, algorithm=scalar_opt, lr=effective_embed_lr, weight_decay=0.0, **scalar_kwargs),
     ]
+
+    if transposed_matrix_params:
+        param_groups.append(dict(params=transposed_matrix_params, matrix_transposed=True))
 
     if lm_head_params:
         # Use explicit lm_head_lr or scale by sqrt(d_in) as recommended in Dion docs
@@ -220,6 +247,8 @@ def build_dion_optimizer(
         scalar_lr=getattr(config, "scalar_lr", None),
         embed_lr=getattr(config, "embed_lr", None),
         lm_head_lr=getattr(config, "lm_head_lr", None),
+        supports_batched_matrices=config.supports_batched_matrices,
+        use_matrix_layout=getattr(config, "use_matrix_layout", False),
     )
 
     dion_mesh = _get_dion_mesh(device_mesh)

@@ -68,6 +68,8 @@ class MXFP4ExpertStorageMixin:
     """
 
     _MXFP4_BASE_NAMES: tuple[str, ...] = ("gate_and_up_projs", "down_projs")
+    # The packed replacements are frozen and stored [experts, out, in]; no transposed float projections remain.
+    _nemo_transposed_matrix_parameters: tuple[str, ...] = ()
 
     def _validate_mxfp4_config(self) -> None:
         """Reject execution modes that the packed expert computation does not implement."""

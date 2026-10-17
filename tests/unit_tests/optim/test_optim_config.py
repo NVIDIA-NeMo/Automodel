@@ -355,6 +355,19 @@ class TestDionFamilyConfigs:
         assert type(opt).__name__ == "Muon"
         assert len(opt.param_groups) >= 2  # matrix group + scalar/embed group(s)
 
+    def test_muon_keeps_grouped_experts_on_the_scalar_optimizer(self):
+        # dion.Muon reads the last two dims as [out, in] for its spectral-norm LR scale, but grouped experts store
+        # [expert, in, out]; until Muon honors that layout, 3D expert weights stay on the scalar optimizer.
+        pytest.importorskip("dion")
+        from nemo_automodel.components.optim.optimizer import MuonConfig
+
+        model = torch.nn.Module()
+        model.experts = torch.nn.Parameter(torch.randn(4, 8, 16))
+        opt = MuonConfig(lr=1e-3).build(model)[0]
+
+        (group,) = [g for g in opt.param_groups if any(p is model.experts for p in g["params"])]
+        assert group["algorithm"] == "adamw"
+
     @pytest.mark.parametrize("cls_name", ["Muon", "NorMuon", "Dion2", "Dion"])
     def test_all_dion_configs_build(self, cls_name):
         pytest.importorskip("dion")
@@ -366,8 +379,12 @@ class TestDionFamilyConfigs:
             "Dion2": opt_mod.Dion2Config,
             "Dion": opt_mod.DionConfig,
         }[cls_name]
-        opt = cfg_cls(lr=5e-4).build(_dion_test_model())[0]
+        model = _dion_test_model()
+        opt = cfg_cls(lr=5e-4, scalar_lr=1e-4, adamw_param_patterns=[r"^1\.weight$"]).build(model)[0]
         assert type(opt).__name__ == cls_name
+        (group,) = [g for g in opt.param_groups if any(p is model[1].weight for p in g["params"])]
+        assert group["algorithm"] == "adamw"
+        assert group["lr"] == pytest.approx(1e-4)
 
 
 # ---------------------------------------------------------------------------
