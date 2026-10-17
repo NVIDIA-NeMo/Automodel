@@ -485,7 +485,7 @@ class BackendConfig:
             unpermute, the EP-group barrier and the combine all-to-all. ``"moe_tail"`` additionally
             builds the down projection's autograd node in the recompute without running its GEMM
             (its output only fed the skipped combine; torch_mm experts without expert bias and with
-            the router weight applied inside the activation). Costs one [tokens, hidden] activation
+            the router weight applied inside the activation) (a post-expert callback that reads the output keeps the GEMM). Costs one [tokens, hidden] activation
             per MoE layer per in-flight microbatch; gradients are unchanged.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.

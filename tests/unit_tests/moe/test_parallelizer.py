@@ -473,6 +473,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
     activation_checkpointing_stub.ensure_fsdp_ops_sac_ignored = lambda: None
     activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
+    activation_checkpointing_stub.ensure_moe_recompute_cache_ops_sac_ignored = lambda: None
     activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: (
         context_fn() if context_fn is not None else (nullcontext(), nullcontext())
     )

@@ -2610,6 +2610,29 @@ class TestGroupedExpertsTE:
             assert experts.num_local_experts == te_moe_config.n_routed_experts // 2
             assert experts.token_dispatcher is not None
 
+    def test_grouped_experts_te_forwards_the_combine_cache_to_the_dispatcher(self, te_moe_config):
+        """BackendConfig accepts TE + HybridEP + "combine": the setting must reach the dispatcher config, or the
+        requested cache silently reverts to "none" on this construction path (review of #4395)."""
+        from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+        backend = BackendConfig(experts="te", dispatcher="hybridep", dispatcher_recompute_cache="combine")
+        experts = GroupedExpertsTE(te_moe_config, backend=backend, dispatcher_backend="hybridep")
+        assert experts.dispatcher_recompute_cache == "combine"
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 2
+        mock_mesh.get_local_rank.return_value = 0
+        mock_mesh.get_group.return_value = Mock()
+        mock_mesh.mesh_dim_names = ("ep",)
+        with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher") as mock_dispatcher:
+            mock_dispatcher.return_value = Mock()
+            experts.init_token_dispatcher(mock_mesh)
+            call_kwargs = mock_dispatcher.call_args
+            config_arg = call_kwargs.kwargs.get("config") or call_kwargs[1].get("config")
+            if config_arg is None:
+                config_arg = call_kwargs[0][2]  # positional arg
+            assert config_arg.moe_flex_dispatcher_backend == "hybridep"
+            assert config_arg.moe_hybridep_recompute_cache == "combine"
+
     def test_grouped_experts_te_init_token_dispatcher_updates_linear_layers(self, te_moe_config):
         """Test init_token_dispatcher recreates linear layers with correct num_gemms."""
         from nemo_automodel.components.moe.experts import GroupedExpertsTE
@@ -3790,3 +3813,36 @@ class TestDispatcherRecomputeCacheKnob:
         # the combine cache alone is fine with it
         combine_only = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache="combine")
         GroupedExpertsDeepEP(replace(moe_config, apply_router_weight_after_down=True), backend=combine_only)
+
+    def test_moe_tail_keeps_the_down_projection_for_a_post_expert_callback(self, moe_config, monkeypatch):
+        """A post-expert callback reads the down projection's output: in a cached recompute the deferred (skipped)
+        GEMM would hand it an uninitialised tensor and its backward would save garbage (review of #4395)."""
+        import nemo_automodel.components.moe.experts as experts_module
+
+        backend = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache="moe_tail")
+        experts = GroupedExpertsDeepEP(moe_config, backend=backend)
+        args = TestGroupedExpertsDeepEP._prepare_forward_path(experts, num_tokens=3)
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(std=0.01)
+            experts.down_projs.normal_(std=0.01)
+
+        def grouped_mm(value, weights, offs):
+            """Multiply [tokens, input] grouped by expert with weights [experts, input, output] -> [tokens, output]."""
+            starts = [0, *offs.tolist()]
+            return torch.cat([value[starts[i] : starts[i + 1]] @ weights[i] for i in range(weights.shape[0])])
+
+        monkeypatch.setattr(experts_module, "select_grouped_mm", lambda use_mxfp8: grouped_mm)
+        monkeypatch.setattr(experts_module, "hybridep_combine_output_cached", lambda: True)  # a cached recompute
+        deferred = []
+        real_apply = experts_module._DownProjGroupedMM.apply
+        monkeypatch.setattr(
+            experts_module._DownProjGroupedMM, "apply", staticmethod(lambda *a: (deferred.append(1), real_apply(*a))[1])
+        )
+        with_callback = experts(*args[:4], post_expert_output=torch.tanh)
+        assert deferred == []  # the GEMM ran: the callback saw real values
+        experts.dispatcher_recompute_cache = "none"
+        reference = experts(*args[:4], post_expert_output=torch.tanh)
+        torch.testing.assert_close(with_callback, reference, rtol=0, atol=0)
+        experts.dispatcher_recompute_cache = "moe_tail"
+        experts(*args[:4])
+        assert deferred == [1]  # with no reader of the output the GEMM is skipped as before

@@ -1779,7 +1779,10 @@ class GroupedExpertsDeepEP(nn.Module):
                     activation_probs,
                     self.expert_activation,
                     use_mxfp8=self.use_mxfp8,
-                    defer_down_proj=self.dispatcher_recompute_cache == "moe_tail",
+                    # moe_tail skips the down projection's GEMM in a recompute whose combine is cached — sound
+                    # only while nothing reads that output. A post-expert callback does, and would save an
+                    # uninitialised tensor for its own backward, so it keeps the GEMM (review of #4395).
+                    defer_down_proj=self.dispatcher_recompute_cache == "moe_tail" and post_expert_output is None,
                 )
         else:
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
@@ -1813,7 +1816,10 @@ class _DownProjGroupedMM(torch.autograd.Function):
     ``offs``), so the gradients match the plain path bit for bit, and the saved tensors are the same three as
     the native node, which keeps the checkpoint's saved-tensor stream identical in forward and recompute.
     ``torch._grouped_mm`` has no autocast rule, and neither has this node: dtypes are used as given and a mix is
-    rejected by the op, under autocast or not.
+    rejected by the op, under autocast or not. The recompute-only allocation is kept out of selective
+    checkpointing's op-stream accounting (``apply_ac`` registers ``aten.new_empty.default`` in
+    ``SAC_IGNORED_OPS`` when the cache is in use); the caller keeps the GEMM when a post-expert callback reads
+    the output.
     """
 
     @staticmethod
@@ -1948,6 +1954,13 @@ class GroupedExpertsTE(nn.Module):
         )
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
+        )
+
+        # BackendConfig.dispatcher_recompute_cache: the HybridEP combine output of a checkpoint forward is served
+        # in the recompute ("combine"); "moe_tail" is refused by BackendConfig for this backend (no deferred GEMM
+        # here). The dispatcher config below carries it, so the requested mode survives this constructor.
+        self.dispatcher_recompute_cache = (
+            str(getattr(backend, "dispatcher_recompute_cache", "none")) if backend is not None else "none"
         )
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
@@ -2264,6 +2277,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
             moe_benchmark_static_routing=self.static_routing,
         )
 

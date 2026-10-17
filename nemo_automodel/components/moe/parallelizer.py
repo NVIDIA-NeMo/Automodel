@@ -833,12 +833,17 @@ def apply_ac(
 
     from nemo_automodel.components.distributed.activation_checkpointing import (
         ensure_fsdp_ops_sac_ignored,
+        ensure_moe_recompute_cache_ops_sac_ignored,
         ensure_profiler_ops_sac_ignored,
         transformer_engine_attention_backend_snapshot_context_fn,
     )
 
     ensure_profiler_ops_sac_ignored()
     ensure_fsdp_ops_sac_ignored()
+    if uses_moe_recompute_cache:
+        # moe_tail allocates the skipped down projection's output in the recompute only; the router-saving
+        # context below indexes every recompute op against the forward's stream (review of #4395).
+        ensure_moe_recompute_cache_ops_sac_ignored()
 
     def _with_attention_backend_snapshot(context_fn=None):
         return functools.partial(transformer_engine_attention_backend_snapshot_context_fn, context_fn)
