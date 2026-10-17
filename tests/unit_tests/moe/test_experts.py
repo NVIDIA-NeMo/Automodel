@@ -1162,6 +1162,10 @@ class TestGroupedExpertsDeepEP:
         args = self._prepare_forward_path(experts, num_tokens=3)
         hidden, probabilities = args[4], args[5]
         hidden.div_(hidden.numel()).requires_grad_()
+        # The mocked dispatcher returns ``probabilities`` independently of ``weights``;
+        # production derives them from ``weights``, whose gradient requirement gates the
+        # routing-gradient path, so keep the fixture consistent with that contract.
+        args[2].requires_grad_()
         probabilities.requires_grad_()
         with torch.no_grad():
             experts.gate_and_up_projs.normal_(std=0.01)
