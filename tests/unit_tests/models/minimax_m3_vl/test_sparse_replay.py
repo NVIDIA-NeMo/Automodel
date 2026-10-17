@@ -130,7 +130,7 @@ def _cpu_attention(
         q: Queries [batch, sequence, query_heads, head_dim].
         k: Keys [batch, sequence, kv_heads, head_dim].
         v: Values [batch, sequence, kv_heads, head_dim].
-        block_sel: Boolean selected blocks [batch, index_heads, sequence, blocks].
+        block_sel: Uint8 packed blocks [batch, index_heads, sequence, ceil(blocks/8)].
         q_positions: Query token slots [sequence].
         keep_mask: Optional caller keep mask [batch, heads, sequence, sequence].
         rescue_pad_queries: Local path must pass False.
@@ -141,7 +141,8 @@ def _cpu_attention(
     assert not rescue_pad_queries
     length = k.shape[1]
     keys = torch.arange(length, device=q.device)
-    mask = block_sel[..., keys // self.indexer.block_size]
+    blocks = keys // self.indexer.block_size
+    mask = ((block_sel[..., blocks // 8].int() >> (blocks % 8)) & 1).bool()
     mask = mask.repeat_interleave(self.num_heads // self.indexer.num_index_heads, dim=1)
     mask = mask & (keys[None, :] <= q_positions[:, None])
     if keep_mask is not None:
