@@ -226,6 +226,23 @@ def _disable_fsdp_for_moe_module(module: torch.nn.Module) -> None:
         )
 
 
+def _enable_fsdp_for_moe_module(module: torch.nn.Module) -> None:
+    """Configure every FSDP unit of a MoE module to reduce its gradients in the next backward.
+
+    Counterpart of :func:`_disable_fsdp_for_moe_module`; used when the pipeline stage was
+    patched with ``reduce_grad_per_microbatch=True`` (``distributed.defer_fsdp_grad_sync: false``)
+    so that each micro-batch reduce-scatters its gradients instead of accumulating an unsharded
+    ``reduce_dtype`` gradient across micro-batches.
+    """
+    for fsdp_module in _iter_fsdp_modules(module):
+        _configure_fsdp_module(
+            fsdp_module,
+            is_last_backward=True,
+            reshard_after_backward=True,
+            requires_gradient_sync=True,
+        )
+
+
 def _run_post_backward_for_moe_module(module: torch.nn.Module) -> None:
     fsdp_modules = list(_iter_fsdp_modules(module))
 
@@ -336,10 +353,23 @@ def patched_backward_maybe_with_nosync(
             run_post_backward(self.submod)
     # If submod is a MoEFSDPSyncMixin, use the MoE-specific FSDP functions
     elif isinstance(self.submod, MoEFSDPSyncMixin):
-        _disable_fsdp_for_moe_module(self.submod)
-        result = perform_backward(backward_type)()
-        if last_backward and get_is_optim_step():
-            _run_post_backward_for_moe_module(self.submod)
+        if getattr(self, "_reduce_grad_per_microbatch", False):
+            # Same contract as the FSDPModule branch above: honour
+            # ``distributed.defer_fsdp_grad_sync: false`` by letting every micro-batch
+            # reduce-scatter its gradients. Without this the MoE branch always deferred,
+            # and the dense parameters of the stage kept an unsharded ``reduce_dtype``
+            # gradient accumulator alive across all micro-batches regardless of the knob.
+            _enable_fsdp_for_moe_module(self.submod)
+            result = perform_backward(backward_type)()
+            if last_backward:
+                # Manually run post-backward, as for the FSDPModule branch, so the final
+                # reduction is synced back to the default stream.
+                _run_post_backward_for_moe_module(self.submod)
+        else:
+            _disable_fsdp_for_moe_module(self.submod)
+            result = perform_backward(backward_type)()
+            if last_backward and get_is_optim_step():
+                _run_post_backward_for_moe_module(self.submod)
     else:
         # Non-DP submodule, regular backward
         result = perform_backward(backward_type)()
