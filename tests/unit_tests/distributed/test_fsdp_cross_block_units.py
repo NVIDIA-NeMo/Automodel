@@ -77,6 +77,33 @@ def test_one_unit_for_all_blocks_with_an_fp32_policy():
     assert owned == {block.attn.sinks_param.weight for block in blocks}
 
 
+def test_an_output_dtype_policy_does_not_cast_the_sink_unit():
+    """An explicit bf16 ``output_dtype`` on the blocks' policy must not reach the fp32 holders: the unit is internal to
+    the block's forward, so its outputs keep their natural dtype (otherwise FSDP rounds every sink to bf16 before
+    attention reads it)."""
+    blocks = [_Block() for _ in range(2)]
+    calls = []
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16, cast_forward_inputs=False
+    )
+
+    fully_shard_across_blocks(
+        blocks,
+        ["attn.sinks_param"],
+        mesh="mesh",
+        mp_policy=policy,
+        offload_policy=None,
+        shard_module=lambda module, **kwargs: calls.append(kwargs),
+    )
+
+    (kwargs,) = calls
+    assert kwargs["mp_policy"].output_dtype is None
+    assert kwargs["mp_policy"].param_dtype == torch.float32
+    assert kwargs["mp_policy"].reduce_dtype == torch.float32
+    assert kwargs["mp_policy"].cast_forward_inputs is False
+    assert policy.output_dtype == torch.bfloat16  # the caller's policy is untouched
+
+
 def _swap_parameters(modules, **kwargs):
     """Stand-in for FSDP2: ``fully_shard`` installs new (sharded DTensor) parameter objects on the modules."""
     for module in modules:

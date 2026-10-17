@@ -389,7 +389,8 @@ def fully_shard_across_blocks(
         module_names: Dotted module names relative to a block (``"attn.sinks_param"``); each name
             becomes one cross-block unit. Sourced from the model's ``_fsdp_shard_across_blocks``.
         mesh: FSDP mesh of the blocks.
-        mp_policy: The blocks' mixed-precision policy; the unit computes and reduces in fp32.
+        mp_policy: The blocks' mixed-precision policy; the unit computes and reduces in fp32 and returns its
+            natural fp32 outputs (the policy's ``output_dtype`` is cleared, as for every internal unit).
         offload_policy: Parameter/gradient offload policy.
         shard_module: FSDP primitive (``fully_shard`` or a model parallelizer's override).
 
@@ -403,7 +404,10 @@ def fully_shard_across_blocks(
     owned: set[nn.Parameter] = set()
     if not module_names:
         return owned
-    fp32_policy = _mp_policy_with_param_dtype(mp_policy, torch.float32)
+    # An internal unit like the per-dtype ones: fp32 parameters and reductions, no input cast, and no external
+    # output dtype — with an explicit ``output_dtype`` (bf16) FSDP would otherwise round every holder's fp32 sink
+    # before attention reads it.
+    fp32_policy = get_internal_fsdp_mp_policy(_mp_policy_with_param_dtype(mp_policy, torch.float32))
     for module_name in module_names:
         suffix = "." + module_name
         modules = [
