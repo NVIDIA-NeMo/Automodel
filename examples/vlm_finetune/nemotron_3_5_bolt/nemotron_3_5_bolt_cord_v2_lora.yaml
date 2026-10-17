@@ -53,10 +53,15 @@ model:
   force_hf: true
   trust_remote_code: true
   torch_dtype: torch.bfloat16
-  # The pinned remote implementation supports FlashAttention2 on this VLM batch format.
-  attn_implementation: flash_attention_2
+  # The pinned remote FA2 path converts an all-valid mask to an unsupported 4D
+  # additive mask, and the remote model does not advertise SDPA support.
+  attn_implementation: eager
   use_liger_kernel: false
   use_sdpa_patching: false
+  # The remote router restores this buffer to FP32 in forward, but an earlier
+  # BF16 cast would already have rounded its checkpoint values.
+  keep_in_fp32_modules:
+    - e_score_correction_bias
   # This checkpoint revision stores pre-Transformers-5.18 parameter prefixes.
   key_mapping:
     '^language_model\.backbone\.': language_model.model.
