@@ -60,10 +60,22 @@ def test_channels_are_independent() -> None:
         assert second.current() is None
 
 
-def test_checkpoint_context_fn_records_then_replays_per_call() -> None:
-    channel: RecomputeReplay[int] = RecomputeReplay("test")
+class _HookedRecorder(RecomputeReplayRecorder[int]):
+    """Recorder that logs the channel hooks into the enclosing event list."""
+
     events: list[str] = []
-    finalized: list[int] = []
+
+    def on_record_exit(self) -> None:
+        self.events.append(f"record exit {len(self)}")
+
+    def on_replay_enter(self) -> None:
+        self.events.append("replay enter")
+
+
+def test_checkpoint_context_fn_records_then_replays_per_call() -> None:
+    channel: RecomputeReplay[int] = RecomputeReplay("test", recorder_factory=_HookedRecorder)
+    events: list[str] = []
+    _HookedRecorder.events = events
 
     @contextmanager
     def tracked(name: str):
@@ -74,7 +86,7 @@ def test_checkpoint_context_fn_records_then_replays_per_call() -> None:
     def context_fn():
         return tracked("forward"), tracked("recompute")
 
-    wrapped = channel.checkpoint_context_fn(context_fn, on_record_exit=lambda rec: finalized.append(len(rec)))
+    wrapped = channel.checkpoint_context_fn(context_fn)
 
     def decide(value: int) -> int:
         binding = channel.current()
@@ -90,13 +102,22 @@ def test_checkpoint_context_fn_records_then_replays_per_call() -> None:
     forward_ctx, recompute_ctx = wrapped()
     with forward_ctx:
         assert [decide(1), decide(2)] == [1, 2]
-    assert finalized == [2]
+    # The record-exit hook runs after the forward context has exited.
+    assert events == ["enter forward", "exit forward", "record exit 2"]
     with recompute_ctx:
         # Replay returns the forward decisions regardless of the recomputed value.
         assert [decide(10), decide(20)] == [1, 2]
         # A third call outruns the log and falls back to the fresh decision.
         assert decide(30) == 30
-    assert events == ["enter forward", "exit forward", "enter recompute", "exit recompute"]
+    # The replay-enter hook runs before the recompute context opens.
+    assert events == [
+        "enter forward",
+        "exit forward",
+        "record exit 2",
+        "replay enter",
+        "enter recompute",
+        "exit recompute",
+    ]
     assert channel.current() is None
 
     # A second checkpoint call gets its own recorder.

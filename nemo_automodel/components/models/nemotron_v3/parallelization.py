@@ -29,11 +29,7 @@ from torch.distributed.tensor.placement_types import Shard
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
-from nemo_automodel.components.distributed.parallelizer_utils import (
-    fully_shard_by_dtype,
-    reject_unsupported_mtp_cp,
-    reject_unsupported_mtp_cp_pp,
-)
+from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +90,6 @@ class NemotronHModelParallelizer(ModelParallelizer):
             cp_layers = list(layers)
             mtp_layers = getattr(getattr(model, "mtp", None), "layers", None)
             mtp_cp_enabled = model.supports.mtp_enabled
-            reject_unsupported_mtp_cp_pp(model)
-            reject_unsupported_mtp_cp(model)
             if mtp_cp_enabled and mtp_layers is None:
                 raise RuntimeError("MTP is enabled but model.mtp.layers is unavailable for context parallelism")
             if mtp_cp_enabled:

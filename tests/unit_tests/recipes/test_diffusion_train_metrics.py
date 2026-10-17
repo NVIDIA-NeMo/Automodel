@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import logging
+import os
 import sys
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -22,7 +24,12 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderBuild
+from nemo_automodel.components.datasets.diffusion.sampler import SequentialBucketSampler
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
+from nemo_automodel.components.flow_matching.adapters.simple import SimpleAdapter
+from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline
+from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion import train as diffusion_train
 from nemo_automodel.recipes.diffusion.train import (
@@ -734,6 +741,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     monkeypatch.setattr(diffusion_train.wandb, "run", None, raising=False)
 
     recipe.dist_env = SimpleNamespace(is_main=True)
+    recipe.trackio_logger = None
     recipe.global_batch_size = 5
     recipe.local_batch_size = 2
     recipe.num_nodes = 1
@@ -863,6 +871,93 @@ def _make_validation_recipe(losses, num_batches=2, dp_rank=0):
     return recipe
 
 
+class _TinyValidationModel(nn.Module):
+    """Trainable identity projection accepting the production SimpleAdapter inputs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Linear(2, 2)
+        nn.init.eye_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+        self.batch_sizes: list[int] = []
+        self.training_modes: list[bool] = []
+        self.grad_enabled: list[bool] = []
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        attention_kwargs: dict[str, float] | None = None,
+        return_dict: bool = False,
+    ) -> tuple[torch.Tensor]:
+        """Project the final latent axis while recording validation execution mode.
+
+        Args:
+            hidden_states: Tensor of shape [batch, channels, height, width] or
+                [batch, channels, frames, height, width], with width equal to 2.
+            timestep: Tensor of shape [batch]; accepted but unused by this tiny model.
+            encoder_hidden_states: Tensor of shape [batch, sequence, hidden];
+                accepted but unused by this tiny model.
+            attention_kwargs: Adapter attention options, unused by this tiny model.
+            return_dict: Adapter output option; the test uses tuple outputs.
+
+        Returns:
+            One-element tuple containing a prediction tensor with the same shape as
+            ``hidden_states`` and independent storage.
+        """
+        self.batch_sizes.append(hidden_states.shape[0])
+        self.training_modes.append(self.training)
+        self.grad_enabled.append(torch.is_grad_enabled())
+        return (self.projection(hidden_states),)
+
+
+def _make_tiny_validation_recipe(
+    *, latent_key: str = "video_latents", num_samples: int = 4, dp_rank: int = 0, dp_world_size: int = 1
+) -> TrainDiffusionRecipe:
+    """Build a CPU recipe with real bucket batching and an analytically known initial loss."""
+    latent_shape = (1, 2, 2) if latent_key == "image_latents" else (1, 1, 2, 2)
+    samples = [
+        {latent_key: torch.full(latent_shape, float(value)), "text_embeddings": torch.zeros(1, 2)}
+        for value in range(1, num_samples + 1)
+    ]
+    sampler = SequentialBucketSampler(
+        SimpleNamespace(
+            sorted_bucket_keys=[0],
+            bucket_groups={0: {"indices": list(range(num_samples)), "resolution": (2, 2)}},
+            calculator=None,
+        ),
+        base_batch_size=3,
+        drop_last=False,
+        shuffle_buckets=False,
+        shuffle_within_bucket=False,
+        num_replicas=dp_world_size,
+        rank=dp_rank,
+    )
+    recipe = object.__new__(TrainDiffusionRecipe)
+    model = _TinyValidationModel()
+    recipe.model = nn.parallel.DistributedDataParallel(model) if dp_world_size > 1 else model
+    recipe.device = torch.device("cpu")
+    recipe.device_mesh = None
+    recipe.compute_dtype = torch.float32
+    recipe._autocast_dtype = None
+    recipe.seed = 1234
+    recipe.val_dataloader = torch.utils.data.DataLoader(
+        samples, batch_sampler=sampler, generator=torch.Generator().manual_seed(0)
+    )
+    recipe.flow_matching_pipeline = FlowMatchingPipeline(
+        model_adapter=SimpleAdapter(),
+        device=recipe.device,
+        timestep_sampling="uniform",
+        flow_shift=1.0,
+        sigma_min=1.0,
+        sigma_max=1.0,
+    )
+    # At sigma=1, the initial identity model predicts noise. The target is noise -
+    # clean_latents, so each sample's weighted MSE is exactly 2 * clean_latents**2.
+    return recipe
+
+
 class _StopSetupAfterDataloaders(Exception):
     """Ends ``setup()`` right after the dataloader section; the rest needs a real model."""
 
@@ -883,7 +978,10 @@ def _patch_setup_dataloaders(monkeypatch, *, validation_batches=1, with_validati
     if with_validation:
         validation_config = SimpleNamespace(
             build=MagicMock(
-                return_value=SimpleNamespace(dataloader=[object()] * validation_batches, sampler="val-sampler")
+                return_value=DiffusionDataloaderBuild(
+                    dataloader=torch.utils.data.DataLoader(range(validation_batches)),
+                    sampler=torch.utils.data.SequentialSampler(range(validation_batches)),
+                )
             )
         )
 
@@ -924,7 +1022,7 @@ def test_setup_shards_the_validation_dataloader_like_the_training_one(monkeypatc
 
     # dist is not initialized in the harness, so the data-parallel group is rank 0 of 1.
     validation_config.build.assert_called_once_with(dp_rank=0, dp_world_size=1, batch_size=1)
-    assert recipe.val_sampler == "val-sampler"
+    assert recipe.val_sampler is validation_config.build.return_value.sampler
     assert len(recipe.val_dataloader) == 1
 
 
@@ -934,6 +1032,39 @@ def test_setup_rejects_an_empty_validation_dataloader(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Validation dataloader is empty"):
         recipe.setup()
+
+
+@pytest.mark.parametrize("bucket_sizes,drop_last", [([], False), ([8], True), ([12, 12], True)])
+def test_setup_empty_validation_error_reports_bucket_batching(monkeypatch, bucket_sizes, drop_last):
+    config = _patch_setup_dataloaders(monkeypatch)
+    groups = {}
+    offset = 0
+    for key, size in enumerate(bucket_sizes):
+        groups[key] = {"indices": list(range(offset, offset + size)), "resolution": (256, 256)}
+        offset += size
+    sampler = SequentialBucketSampler(
+        SimpleNamespace(sorted_bucket_keys=list(groups), bucket_groups=groups, calculator=None),
+        base_batch_size=16,
+        drop_last=drop_last,
+        num_replicas=1,
+        rank=0,
+    )
+    loader = torch.utils.data.DataLoader(range(offset), batch_sampler=sampler)
+    config.build.return_value = DiffusionDataloaderBuild(dataloader=loader, sampler=sampler, drop_last=drop_last)
+    cfg = _setup_cfg(val_every_steps=5)
+    cfg.set_by_dotted("step_scheduler.local_batch_size", 16)
+    recipe = TrainDiffusionRecipe(cfg)
+
+    with pytest.raises(RuntimeError) as exc:
+        recipe.setup()
+
+    message = str(exc.value)
+    assert f"dataset_size={offset}" in message
+    assert "local_batch_size=16" in message
+    assert "dp_size=1" in message
+    assert f"drop_last={drop_last}" in message
+    assert "data.validation_dataloader.drop_last: false" in message
+    assert "resolution bucket" in message
 
 
 @pytest.mark.parametrize(
@@ -965,6 +1096,70 @@ def test_run_validation_epoch_averages_batch_losses_in_eval_mode(monkeypatch):
     assert recipe.flow_matching_pipeline.grad_enabled == [False, False]
     assert recipe.flow_matching_pipeline.model_was_training == [False, False]
     assert recipe.model.training is True
+
+
+@pytest.mark.parametrize("latent_key", ["video_latents", "image_latents", "latents"])
+def test_run_validation_epoch_weights_partial_batches_by_sample_count(monkeypatch, latent_key):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(2.0), torch.tensor(8.0)])
+    recipe.val_dataloader = [{latent_key: torch.zeros(3, 1)}, {latent_key: torch.zeros(1, 1)}]
+
+    assert recipe._run_validation_epoch(global_step=0) == pytest.approx(3.5)
+
+
+@pytest.mark.parametrize("latent_key", ["video_latents", "image_latents"])
+@pytest.mark.parametrize("num_samples,expected_sizes,expected_loss", [(2, [2], 5.0), (4, [3, 1], 15.0)])
+def test_run_validation_epoch_with_tiny_model_keeps_and_weights_tails(
+    latent_key: str, num_samples: int, expected_sizes: list[int], expected_loss: float
+) -> None:
+    recipe = _make_tiny_validation_recipe(latent_key=latent_key, num_samples=num_samples)
+
+    assert recipe._run_validation_epoch(global_step=0) == pytest.approx(expected_loss, rel=1e-6)
+    assert recipe.model.batch_sizes == expected_sizes
+    assert recipe.model.training_modes == [False] * len(expected_sizes)
+    assert recipe.model.grad_enabled == [False] * len(expected_sizes)
+    assert recipe.model.training is True
+    assert all(parameter.grad is None for parameter in recipe.model.parameters())
+    # Repeating validation must traverse all batches again.
+    assert recipe._run_validation_epoch(global_step=1) == pytest.approx(expected_loss, rel=1e-6)
+    assert recipe.model.batch_sizes == expected_sizes * 2
+
+
+def test_tiny_model_training_update_is_unchanged_by_validation() -> None:
+    recipes = [_make_tiny_validation_recipe(), _make_tiny_validation_recipe()]
+    for with_validation, recipe in zip((False, True), recipes):
+        optimizer = torch.optim.SGD(recipe.model.parameters(), lr=0.001, momentum=0.9)
+        batch = next(iter(recipe.val_dataloader))
+        with ScopedRNG(seed=9876, ranked=False):
+            for global_step in range(2):
+                optimizer.zero_grad(set_to_none=True)
+                _, loss, _, _ = recipe.flow_matching_pipeline.step(
+                    model=recipe.model,
+                    batch=batch,
+                    device=recipe.device,
+                    dtype=recipe.compute_dtype,
+                    global_step=global_step,
+                    collect_metrics=False,
+                )
+                assert torch.isfinite(loss)
+                loss.backward()
+                optimizer.step()
+                if with_validation and global_step == 0:
+                    parameters_before = [parameter.detach().clone() for parameter in recipe.model.parameters()]
+                    grads_before = [parameter.grad.clone() for parameter in recipe.model.parameters()]
+                    assert torch.isfinite(torch.tensor(recipe._run_validation_epoch(global_step)))
+                    for parameter, before, grad in zip(recipe.model.parameters(), parameters_before, grads_before):
+                        torch.testing.assert_close(parameter, before, rtol=0, atol=0)
+                        torch.testing.assert_close(parameter.grad, grad, rtol=0, atol=0)
+
+        assert not torch.equal(recipe.model.projection.weight, torch.eye(2))
+        assert all(torch.isfinite(parameter.grad).all() for parameter in recipe.model.parameters())
+
+    assert recipes[1].model.training_modes == [True, False, False, True]
+    assert recipes[1].model.grad_enabled == [True, False, False, True]
+    for reference, actual in zip(recipes[0].model.parameters(), recipes[1].model.parameters()):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        torch.testing.assert_close(actual.grad, reference.grad, rtol=0, atol=0)
 
 
 def test_run_validation_epoch_runs_under_the_training_autocast(monkeypatch):
@@ -1012,7 +1207,7 @@ def test_run_validation_epoch_raises_when_the_loader_yields_no_batches(monkeypat
     monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
     recipe = _make_validation_recipe([torch.tensor(1.0)], num_batches=0)
 
-    with pytest.raises(RuntimeError, match="Validation produced no batches"):
+    with pytest.raises(RuntimeError, match="Validation produced no samples"):
         recipe._run_validation_epoch(global_step=0)
 
 
@@ -1047,7 +1242,7 @@ def test_run_validation_epoch_reduces_sum_and_count_over_dp_group(monkeypatch):
     val_loss = recipe._run_validation_epoch(global_step=0)
 
     assert all_reduce_calls == [(diffusion_train.dist.ReduceOp.SUM, "dp-group", [6.0, 2.0])]
-    # 12.0 summed loss over 4 summed batches: the mean is invariant to the rank count.
+    # 12.0 summed loss over 4 summed samples: the mean is invariant to the rank count.
     assert val_loss == pytest.approx(3.0)
 
 
@@ -1069,6 +1264,7 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
 
     recipe = object.__new__(TrainDiffusionRecipe)
     recipe.dist_env = SimpleNamespace(is_main=True)
+    recipe.trackio_logger = None
     recipe.global_batch_size = 2
     recipe.local_batch_size = 2
     recipe.num_nodes = 1
@@ -1114,3 +1310,52 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     else:
         recipe._run_validation_epoch.assert_not_called()
         assert all(call_args.args[0].keys() != {"val_loss"} for call_args in wandb_log.call_args_list)
+
+
+def _distributed_validation_worker(rank: int, rendezvous: str) -> None:
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    torch.distributed.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        recipe = _make_tiny_validation_recipe(num_samples=8, dp_rank=rank, dp_world_size=2)
+        # The real sampler assigns [1, 3, 5, 7] to rank 0 and [2, 4, 6, 8] to rank 1.
+        # Mean weighted MSE over all eight samples: 2 * mean([1, 4, 9, 16, 25, 36, 49, 64]).
+        assert recipe._run_validation_epoch(global_step=0) == pytest.approx(51.0, rel=1e-6)
+        assert recipe.model.module.batch_sizes == [3, 1]
+        assert recipe.model.training is True
+        # A real DDP backward must still synchronize after the no-grad validation forwards.
+        optimizer = torch.optim.SGD(recipe.model.parameters(), lr=0.001)
+        _, loss, _, _ = recipe.flow_matching_pipeline.step(
+            model=recipe.model,
+            batch=next(iter(recipe.val_dataloader)),
+            device=recipe.device,
+            dtype=recipe.compute_dtype,
+            global_step=1,
+            collect_metrics=False,
+        )
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert all(torch.isfinite(parameter.grad).all() for parameter in recipe.model.parameters())
+        optimizer.step()
+        assert not torch.equal(recipe.model.module.projection.weight, torch.eye(2))
+        assert recipe.model.module.training_modes == [False, False, True]
+        assert recipe.model.module.grad_enabled == [False, False, True]
+
+        padded_recipe = _make_tiny_validation_recipe(num_samples=5, dp_rank=rank, dp_world_size=2)
+        # Padding repeats sample value 1: ranks score [1, 3, 5] and [2, 4, 1].
+        # 2 * (1 + 9 + 25 + 4 + 16 + 1) / 6 = 56 / 3, rather than 22 for unique samples.
+        assert padded_recipe._run_validation_epoch(global_step=0) == pytest.approx(56.0 / 3.0, rel=1e-6)
+        assert padded_recipe.model.module.batch_sizes == [3]
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(
+    30, hard_timeout=60, reason="Spawn two interpreters and run a real Gloo validation reduction"
+)
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="requires Gloo")
+def test_run_validation_epoch_weights_samples_across_real_dp_ranks(tmp_path):
+    torch.multiprocessing.spawn(
+        _distributed_validation_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=2, join=True
+    )
