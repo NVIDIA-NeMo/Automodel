@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
@@ -34,6 +36,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
     QWEN3_8_FLASH_NEXT_NGRAM_HEAD_VOCAB_SIZES,
     Qwen3_8_FlashNextEngramTableConfig,
     Qwen3_8_FlashNextNGramEmbedding,
+    Qwen3_8_FlashNextOwnerShardedEmbedding,
     Qwen3_8_FlashNextPLELayer,
 )
 
@@ -793,9 +796,9 @@ def test_engram_table_config_keeps_strict_validation_by_default() -> None:
     """The shared table keeps the host-side checks unless a model opts out (DeepSeek-V4.1 does through its config);
     CPU inputs are validated on the host whatever the flag says."""
     config = Qwen3_8_FlashNextEngramTableConfig(num_embeddings=8, embedding_dim=2, initializer_range=0.0)
-    assert config.strict_validation is True
+    assert config.strict_validation is True and config.capacity_mode is False
     table = config.build(process_group=None, dtype=torch.float32)
-    assert table.strict_validation is True
+    assert table.strict_validation is True and table.capacity_mode is False and not table._use_capacity_mode()
     assert table._validate_on_host(torch.zeros(1, dtype=torch.long)) is True
     fast = Qwen3_8_FlashNextEngramTableConfig(
         num_embeddings=8, embedding_dim=2, initializer_range=0.0, strict_validation=False
@@ -922,7 +925,7 @@ def _owner_sharded_capacity_mode_worker(rank: int, world_size: int, store_path: 
         host_table, fast_table = build(False), build(True)
         with torch.no_grad():
             fast_table.weight.to_local().copy_(host_table.weight.to_local())
-        assert fast_table._capacity is None and not host_table._use_capacity_mode(torch.zeros(1, dtype=torch.long))
+        assert fast_table._capacity is None and not host_table._use_capacity_mode() and fast_table._use_capacity_mode()
         for ids in (torch.randint(0, 16, (2, 5)), torch.randint(0, 16, (3, 7)), torch.randint(0, 16, (1, 2))):
             local_ids = (ids + 3 * rank) % 16  # different request mixes per rank and per lookup
             expected = host_table(local_ids)
@@ -941,7 +944,22 @@ def _owner_sharded_capacity_mode_worker(rank: int, world_size: int, store_path: 
         gathered = [torch.zeros(1, dtype=torch.long) for _ in range(world_size)]
         dist.all_gather(gathered, torch.tensor([fast_table._capacity]))
         assert all(int(value) == fast_table._capacity for value in gathered)
-        # A jump past the calibrated capacity trips the device-side guard instead of corrupting the exchange.
+        # The capacity is calibrated by the first lookup and never moves: a no-grad lookup larger than anything so far
+        # (still inside the capacity) changes nothing, and a checkpointed lookup recomputes with the very same padded
+        # layout whatever ran in between (review of #4394: the lagged refresh grew it during the recompute).
+        calibrated = fast_table._capacity
+        bigger = torch.arange(2 * calibrated - 8) % 16  # alternates owners: per-peer count = calibrated - 4
+        with torch.no_grad():
+            torch.testing.assert_close(fast_table(bigger), host_table(bigger), rtol=0, atol=0)
+        assert fast_table._capacity == calibrated
+        checkpointed = torch.utils.checkpoint.checkpoint(fast_table, bigger, use_reentrant=False)
+        checkpointed.sum().backward()
+        assert fast_table._capacity == calibrated and fast_table.weight.grad is not None
+        fast_table.weight.grad = None
+        # The exact-count path (the default) follows any growth; capacity mode is the bounded-workload opt-in and
+        # refuses a per-peer count beyond its calibration instead of corrupting the exchange.
+        grown = torch.arange(40 * calibrated) % 16
+        torch.testing.assert_close(host_table(grown)[:16], host_table(torch.arange(16)), rtol=0, atol=0)
         overflow = torch.full((1, fast_table._capacity + 1), 8 * rank, dtype=torch.long)
         with pytest.raises(RuntimeError):
             fast_table(overflow)
@@ -964,6 +982,66 @@ def test_owner_sharded_table_capacity_mode_matches_host_path(tmp_path: Path) -> 
     mp.spawn(
         _owner_sharded_capacity_mode_worker,
         args=(2, str(tmp_path / "owner-sharded-capacity-pg")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _owner_sharded_empty_requester_worker(rank: int, world_size: int, store_path: str) -> None:
+    """An empty requester takes the same validation path, hence the same collectives, as its peers (review of #4394).
+
+    The device path cannot run on CPU, so the host/device decision is forced to the device path on every rank; with
+    the request-count-gated split that path and the host path met in different collectives (rank 1's validity
+    all-reduce against rank 0's count all-gather) and the lookup hung or failed.
+    """
+    try:
+        torch.set_num_threads(1)
+        dist.init_process_group(
+            "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world_size, timeout=timedelta(seconds=120)
+        )
+        original = Qwen3_8_FlashNextOwnerShardedEmbedding._validate_on_host
+        Qwen3_8_FlashNextOwnerShardedEmbedding._validate_on_host = lambda self, tensor: False
+        try:
+            full_weight = torch.arange(48, dtype=torch.float32).view(16, 3) / 10
+            for capacity_mode in (False, True):
+                table = Qwen3_8_FlashNextEngramTableConfig(
+                    num_embeddings=16,
+                    embedding_dim=3,
+                    initializer_range=0.0,
+                    strict_validation=False,
+                    capacity_mode=capacity_mode,
+                ).build(process_group=dist.group.WORLD, dtype=torch.float32)
+                _parallelize_owner_table(table)
+                table.weight.to_local().detach().copy_(full_weight[table.vocab_start_index : table.vocab_end_index])
+                ids = torch.tensor([0, 7, 8, 9, 9, 14, 14, 15]) if rank == 0 else torch.tensor([], dtype=torch.long)
+                actual = table(ids)
+                torch.testing.assert_close(actual, F.embedding(ids, full_weight), rtol=0, atol=0)
+                upstream = torch.arange(ids.numel() * 3, dtype=torch.float32).view(-1, 3) / 7
+                actual.backward(upstream)
+                expected_weight = full_weight.clone().requires_grad_(True)
+                F.embedding(ids, expected_weight).backward(upstream)
+                dist.all_reduce(expected_weight.grad, group=dist.group.WORLD)
+                torch.testing.assert_close(
+                    table.weight.grad.to_local(),
+                    expected_weight.grad[table.vocab_start_index : table.vocab_end_index],
+                    rtol=0,
+                    atol=0,
+                )
+            # the dtype rule still fails on the device path, on every rank alike, before any collective
+            with pytest.raises(ValueError, match="integer dtype"):
+                table(torch.zeros(2, dtype=torch.float32))
+        finally:
+            Qwen3_8_FlashNextOwnerShardedEmbedding._validate_on_host = original
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(30, reason="spawns two Gloo workers")
+def test_owner_sharded_table_keeps_empty_requesters_on_the_peers_validation_path(tmp_path: Path) -> None:
+    mp.spawn(
+        _owner_sharded_empty_requester_worker,
+        args=(2, str(tmp_path / "owner-sharded-empty-pg")),
         nprocs=2,
         join=True,
     )

@@ -309,6 +309,7 @@ class DeepseekV41Engram(nn.Module):
             num_embeddings=padded_rows,
             embedding_dim=config.engram_head_dim,
             strict_validation=bool(getattr(config, "engram_strict_validation", False)),
+            capacity_mode=bool(getattr(config, "engram_capacity_mode", False)),
             initializer_range=config.initializer_range,
         ).build(process_group=process_group, dtype=dtype)
         self.wkv = initialize_linear_module(
@@ -336,6 +337,20 @@ class DeepseekV41Engram(nn.Module):
         nn.init.ones_(self.k_weight)
         self.embed.mark_sharding_contract()
 
+    def _validates_on_device(self, hash_ids: torch.Tensor) -> bool:
+        """Whether hash IDs are checked with device-side asserts (CUDA, strict validation off).
+
+        The choice depends on the device and the table's flag only, never on this rank's request count: an empty
+        requester must take the same path, and the same collectives, as its peers.
+
+        Args:
+            hash_ids: Integer tensor of shape [batch, sequence, hash_heads]; only its device matters here.
+
+        Returns:
+            True for the device-side path, False for the host-side, cross-rank-symmetric checks.
+        """
+        return hash_ids.is_cuda and not self.embed.strict_validation
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -362,13 +377,16 @@ class DeepseekV41Engram(nn.Module):
         if hash_ids.shape != (*hidden_states.shape[:2], self.hash_heads):
             raise ValueError("Engram hash_ids must have shape [batch, sequence, hash_heads] matching hidden_states")
         valid = hash_ids.dtype in (torch.int32, torch.int64)
-        if valid and hash_ids.numel() and hash_ids.is_cuda and not self.embed.strict_validation:
+        if self._validates_on_device(hash_ids):
             # Device-side assert on CUDA (no host read, no validity collective); the
             # table's own lookup asserts the physical range the same way.
-            torch._assert_async(
-                ((hash_ids >= 0) & (hash_ids < self.num_embeddings)).all(),
-                f"Engram hash_ids must be logical row IDs in [0, {self.num_embeddings})",
-            )
+            if not valid:
+                raise ValueError(f"Engram hash_ids must be an int32/int64 tensor, got {hash_ids.dtype}")
+            if hash_ids.numel():
+                torch._assert_async(
+                    ((hash_ids >= 0) & (hash_ids < self.num_embeddings)).all(),
+                    f"Engram hash_ids must be logical row IDs in [0, {self.num_embeddings})",
+                )
         else:
             if valid and hash_ids.numel():
                 valid = bool(((hash_ids >= 0) & (hash_ids < self.num_embeddings)).all())

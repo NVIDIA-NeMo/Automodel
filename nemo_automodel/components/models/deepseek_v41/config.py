@@ -123,6 +123,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         dtype: str = "bfloat16",
         compile_cache_quant: bool = False,
         engram_strict_validation: bool = False,
+        engram_capacity_mode: bool = False,
         compile_engram: bool = False,
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
@@ -222,6 +223,10 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # device-to-host synchronisations and seven small collectives per lookup); False keeps the same invariants as
         # device-side asserts. See Qwen3_8_FlashNextEngramTableConfig.strict_validation.
         self.engram_strict_validation = engram_strict_validation
+        # Engram capacity mode (Qwen3_8_FlashNextEngramTableConfig.capacity_mode): the owner exchange is sized once by
+        # the first lookup and never read back again. An opt-in for bounded workloads only (fixed-shape benchmark
+        # batches); fine-tuning with variable sequence lengths or local-batch padding keeps the exact-count path.
+        self.engram_capacity_mode = engram_capacity_mode
         # torch.compile the Engram gate core (fp32 casts, the stream / key RMS reductions, the signed-square-root sigmoid
         # gate and the gated residual add) once per process (engram.compile_engram_gate): allclose to eager, not
         # bitwise. A DeepSeek-V4.1 knob like compile_cache_quant, so it lives here rather than on the shared BackendConfig.

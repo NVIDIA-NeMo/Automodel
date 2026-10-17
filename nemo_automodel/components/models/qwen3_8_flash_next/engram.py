@@ -79,9 +79,8 @@ QWEN3_8_FLASH_NEXT_NGRAM_HEAD_OFFSETS = (
 QWEN3_8_FLASH_NEXT_NGRAM_PADDED_ROWS = 320001536
 
 
-_CAPACITY_MARGIN = 1.25  # capacity mode: padded rows per peer = ceil(max count x margin), aligned
+_CAPACITY_MARGIN = 1.25  # capacity mode: padded rows per peer = ceil(calibrated max count x margin), aligned
 _CAPACITY_ALIGN = 64
-_CAPACITY_REFRESH_LAG = 2  # lookups between recording a count maximum and folding it into the capacity (never blocks)
 _UNTOUCHED = (
     -2
 )  # receive-buffer fill: distinct from the -1 padding senders write, so an a2a that returns without writing is caught
@@ -321,21 +320,29 @@ class Qwen3_8_FlashNextEngramTableConfig:
             costs about twenty device-to-host synchronisations and seven small
             collectives, which stall the issuing thread on every Engram layer,
             forward and recompute. ``False`` keeps the same invariants as
-            device-side asserts (``torch._assert_async``) on CUDA inputs, reads
-            the route metadata back once per lookup and enables capacity mode;
+            device-side asserts (``torch._assert_async``) on CUDA inputs and
+            reads the route metadata (the count matrix) back once per lookup;
             a violated invariant then surfaces as a CUDA device-side assertion
             instead of a symmetric Python exception. DeepSeek-V4.1 opts out
             through ``text_config.engram_strict_validation`` (default False).
-            CPU inputs are always validated on the host.
+            CPU inputs are always validated on the host. The validation path is
+            chosen per table (device and this flag), never per request count, so
+            an empty requester takes the same collectives as its peers.
+        capacity_mode: Opt-in for bounded workloads. The padded exchange is
+            sized once, by the first lookup (its per-peer count maximum x 1.25,
+            aligned), read back to the host that one time and fixed from then
+            on, so no later lookup synchronises; a lookup whose per-peer count
+            exceeds that calibration aborts with a device-side assertion. Keep
+            it off (the default, the exact-count path) for ordinary inputs —
+            growing sequence lengths, local-batch padding, distribution shifts —
+            which it would reject; fixed-shape benchmark batches qualify.
     """
 
     num_embeddings: int
     embedding_dim: int
     initializer_range: float = 0.02
     strict_validation: bool = True
-    # None: capacity mode for CUDA lookups (no device-to-host read per lookup), the host-read path on CPU and under
-    # strict_validation; True / False force it either way (tests, measurement).
-    capacity_mode: bool | None = None
+    capacity_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.num_embeddings <= 0:
@@ -428,12 +435,11 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         self.global_row_end = self.vocab_end_index
         self.local_row_start = 0
         self.local_row_end = self.num_embeddings_per_rank
-        # Capacity mode (P13): the padded exchange is sized once from the first lookup and refreshed from
-        # non-blocking reads of later count maxima; every rank sees the same count matrix, so every rank
-        # derives the same capacity without a collective on the host value.
-        self._capacity_mode_requested = getattr(config, "capacity_mode", None)
+        # Capacity mode (opt-in, bounded workloads): the padded exchange is sized once from the first lookup and
+        # fixed afterwards; every rank sees the same count matrix, so every rank derives the same capacity without
+        # a collective on the host value, and a checkpointed forward and its recomputation agree by construction.
+        self.capacity_mode = bool(config.capacity_mode)
         self._capacity: int | None = None
-        self._capacity_reads: list[tuple[torch.Tensor, object]] = []
         self.weight = nn.Parameter(
             torch.empty(
                 self.num_embeddings_per_rank,
@@ -557,41 +563,26 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         local_weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
         nn.init.normal_(local_weight, mean=0.0, std=self.initializer_range)
 
-    def _use_capacity_mode(self, tensor: torch.Tensor) -> bool:
-        """Whether this lookup runs without a device-to-host read (capacity mode)."""
-        if self.process_group is None or self.strict_validation:
-            return False
-        if self._capacity_mode_requested is not None:
-            return bool(self._capacity_mode_requested)
-        return tensor.is_cuda
+    def _use_capacity_mode(self) -> bool:
+        """Whether lookups run without a device-to-host read (capacity mode): a per-table opt-in, never automatic."""
+        return self.process_group is not None and not self.strict_validation and self.capacity_mode
 
     def _capacity_for(self, count_matrix: torch.Tensor) -> int:
-        """Padded rows per peer for this lookup: calibrated once, refreshed from reads recorded lookups ago.
+        """Padded rows per peer: calibrated by the first lookup, fixed from then on.
 
-        The first lookup reads the matrix maximum synchronously (one calibration, like HybridEP's capacity mode).
-        Every lookup then records its maximum into pinned host memory with a non-blocking copy and an event; the
-        read recorded ``_CAPACITY_REFRESH_LAG`` lookups ago is folded into the capacity, so a drifting distribution
-        raises the capacity without a stall. A device-side assert guards the lag: a jump beyond the margin aborts
-        the step instead of corrupting the exchange.
+        The first lookup reads the matrix maximum synchronously (one calibration per table, like HybridEP's
+        capacity mode). Every later lookup only asserts on the device that its own maximum fits. Nothing about the
+        padded layout depends on what ran in between, so a checkpointed forward and its recomputation size the
+        exchange identically; a per-peer count beyond the calibration aborts the step instead of corrupting the
+        exchange — that is the bounded-workload contract of ``capacity_mode``.
         """
         max_dev = count_matrix.max()
         if self._capacity is None:
             self._capacity = _aligned_capacity(int(max_dev.item()))
-        elif len(self._capacity_reads) >= _CAPACITY_REFRESH_LAG:
-            host_value, event = self._capacity_reads.pop(0)
-            if event is not None:
-                event.synchronize()
-            self._capacity = max(self._capacity, _aligned_capacity(int(host_value.item())))
-        if max_dev.is_cuda:
-            host_value = torch.empty((), dtype=torch.int64, pin_memory=True)
-            host_value.copy_(max_dev, non_blocking=True)
-            event = torch.cuda.Event()
-            event.record()
-        else:
-            host_value, event = max_dev.clone(), None
-        self._capacity_reads.append((host_value, event))
         torch._assert_async(
-            max_dev <= self._capacity, "Engram capacity mode: a lookup exceeded the calibrated padded capacity"
+            max_dev <= self._capacity,
+            "Engram capacity mode: a lookup exceeded the calibrated padded capacity (capacity_mode is an opt-in for "
+            "bounded workloads; the exact-count path follows any request size)",
         )
         return self._capacity
 
@@ -677,12 +668,17 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             torch.int64,
             torch.uint8,
         }
-        if is_integer and global_ids.numel() > 0 and not self._validate_on_host(global_ids):
-            # Device-side assert: no device-to-host read and no validity collective.
-            torch._assert_async(
-                (global_ids.min() >= 0) & (global_ids.max() < self.num_embeddings),
-                f"Engram row IDs must lie in [0, {self.num_embeddings})",
-            )
+        if not self._validate_on_host(global_ids):
+            # Device path: no device-to-host read and no validity collective. Chosen by device and
+            # strict_validation alone, so an empty requester never joins a collective its peers skip; the
+            # dtype is a program invariant and fails the same way on every rank.
+            if not is_integer:
+                raise ValueError(f"Engram row IDs must use an integer dtype, got {global_ids.dtype}")
+            if global_ids.numel() > 0:
+                torch._assert_async(
+                    (global_ids.min() >= 0) & (global_ids.max() < self.num_embeddings),
+                    f"Engram row IDs must lie in [0, {self.num_embeddings})",
+                )
             return
         in_range = is_integer
         if is_integer and global_ids.numel() > 0:
@@ -988,7 +984,7 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         unsort_indices = torch.empty_like(sort_indices)
         unsort_indices[sort_indices] = torch.arange(sort_indices.numel(), device=sort_indices.device)
         self._validate_sorted_send_ids(sorted_global_ids, send_counts)
-        if self._use_capacity_mode(sorted_global_ids):
+        if self._use_capacity_mode():
             return self._lookup_capacity_mode(sorted_global_ids, send_counts, unsort_indices, original_shape)
 
         received_ids, input_split_sizes, output_split_sizes, capacity, send_rows, receive_rows = self._exchange_ids(

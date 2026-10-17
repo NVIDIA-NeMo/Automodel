@@ -295,3 +295,7 @@ def test_engram_strict_validation_defaults_off_for_v41():
     assert DeepseekV41TextConfig().engram_strict_validation is False
     assert DeepseekV41TextConfig(engram_strict_validation=True).engram_strict_validation is True
     assert Qwen3_8_FlashNextEngramTableConfig(num_embeddings=8, embedding_dim=2).strict_validation is True
+    # capacity mode (the exchange sized once, never read back) is an explicit opt-in on both configs
+    assert DeepseekV41TextConfig().engram_capacity_mode is False
+    assert DeepseekV41TextConfig(engram_capacity_mode=True).engram_capacity_mode is True
+    assert Qwen3_8_FlashNextEngramTableConfig(num_embeddings=8, embedding_dim=2).capacity_mode is False
