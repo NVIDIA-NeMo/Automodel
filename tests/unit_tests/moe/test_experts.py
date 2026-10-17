@@ -1154,6 +1154,7 @@ class TestGroupedExpertsDeepEP:
 
     def test_chunked_nonlinear_post_expert_precedes_router_weight(self, moe_config, monkeypatch):
         """Chunking preserves nonlinear postprocessing and routing gradients."""
+        moe_config.dtype = torch.float32
         moe_config.apply_router_weight_after_down = True
         moe_config.expert_bias = True
         experts = GroupedExpertsDeepEP(moe_config)
@@ -1161,6 +1162,7 @@ class TestGroupedExpertsDeepEP:
         hidden, probabilities = args[4], args[5]
         hidden.div_(hidden.numel()).requires_grad_()
         probabilities.requires_grad_()
+        args[2].requires_grad_()
         with torch.no_grad():
             experts.gate_and_up_projs.normal_(std=0.01)
             experts.down_projs.normal_(std=0.01)
