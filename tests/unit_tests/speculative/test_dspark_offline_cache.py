@@ -253,7 +253,7 @@ def test_parser_accepts_required_args():
     assert args.dtype == "bf16"
 
 
-@pytest.mark.parametrize("model_type", ["deepseek_v4", "glm_moe_dsa", "minimax_m3_vl"])
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41", "glm_moe_dsa", "kimi_k3", "minimax_m3_vl"])
 def test_precompute_rejects_targets_that_need_specialized_online_loading(monkeypatch, tmp_path, model_type):
     import nemo_automodel.components.speculative.precompute_dspark as precompute_dspark
 

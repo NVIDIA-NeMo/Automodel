@@ -68,6 +68,9 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
     DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V41_MODEL_TYPE as _DEEPSEEK_V41_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
     GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
@@ -87,7 +90,10 @@ logger = logging.getLogger(__name__)
 
 _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES = (
     _DEEPSEEK_V4_MODEL_TYPE,
+    _DEEPSEEK_V41_MODEL_TYPE,
     _GLM_5_2_MODEL_TYPE,
+    # Not "kimi_linear": published Kimi-Linear-48B checkpoints use that model_type too.
+    "kimi_k3",
     *_MINIMAX_M3_MODEL_TYPES,
 )
 
@@ -148,9 +154,9 @@ def _run(args: argparse.Namespace) -> int:
     if model_type in _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES:
         raise ValueError(
             "precompute_dspark supports HF-loadable single-process targets only. "
-            f"model_type={model_type!r}: DeepSeek V4 / GLM-5.2 targets use the distributed offline precompute "
-            "(python -m nemo_automodel.recipes.llm.precompute_dspark_dist); MiniMax M3 is multimodal and the "
-            "DSpark cache schema is text-only, so it needs the online training path."
+            f"model_type={model_type!r}: DeepSeek V4/V4.1, GLM-5.2, and Kimi K3 targets use the distributed "
+            "offline precompute (python -m nemo_automodel.recipes.llm.precompute_dspark_dist); MiniMax M3 is "
+            "multimodal and the DSpark cache schema is text-only, so it needs the online training path."
         )
 
     target_config = AutoConfig.from_pretrained(args.target_model, trust_remote_code=args.trust_remote_code)
