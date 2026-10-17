@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as torch_checkpoint
@@ -247,6 +246,70 @@ class _AllGatherConcatVarlenFn(Function):
         dist.all_reduce(grad_full, op=dist.ReduceOp.SUM, group=ctx.group)
         grad_local = grad_full.narrow(0, start, local_len).contiguous()
         return grad_local, None, None, None
+
+
+class _ReduceScatterVarlenFn(Function):
+    """Reduce-scatter with variable local lengths and autograd-safe backward.
+
+    The inverse of ``_AllGatherConcatVarlenFn``: every rank holds rows for all ranks' tokens, concatenated in
+    rank order, and each rank keeps the group-wide sum of its own rows. Each rank's rows are padded to the
+    longest rank's length, so all ranks pass equal-size buffers to the collective. Backward all-gathers the
+    local gradient with the same padding. Compared with all-reduce followed by a local narrow, both directions
+    move half the bytes.
+    """
+
+    @staticmethod
+    def forward(ctx, gathered: torch.Tensor, group: dist.ProcessGroup, gathered_lens: list[int]) -> torch.Tensor:
+        """Sum every rank's rows over the group and return this rank's rows.
+
+        Args:
+            gathered: Tensor of shape [gathered_tokens, ...], with arbitrary trailing dimensions. It concatenates
+                the rows of every rank in rank order without padding, so gathered_tokens equals sum(gathered_lens).
+            group: Process group to reduce over.
+            gathered_lens: Row count of each rank in the group, in rank order.
+
+        Returns:
+            New tensor of shape [gathered_lens[rank], ...] with gathered's dtype, holding the sum over the group
+            of this rank's rows.
+        """
+        max_len = max(gathered_lens)
+        trailing = tuple(gathered.shape[1:])
+        if all(length == max_len for length in gathered_lens):
+            padded = gathered.contiguous()
+        else:
+            padded = gathered.new_zeros((len(gathered_lens), max_len) + trailing)
+            for rows, source in zip(padded, gathered.split(gathered_lens)):
+                rows[: source.size(0)].copy_(source)
+            padded = padded.view((-1,) + trailing)
+        local = gathered.new_empty((max_len,) + trailing)
+        dist.reduce_scatter_tensor(local, padded, op=dist.ReduceOp.SUM, group=group)
+
+        ctx.group = group
+        ctx.gathered_lens = gathered_lens
+        return local[: gathered_lens[dist.get_rank(group)]]
+
+    @staticmethod
+    def backward(ctx, grad_local: torch.Tensor):
+        """All-gather the local gradient back into the rank-ordered row layout.
+
+        Args:
+            grad_local: Tensor of shape [local_tokens, ...], the gradient of this rank's summed rows.
+
+        Returns:
+            Gradient of shape [gathered_tokens, ...] in the unpadded rank-ordered layout of the forward input,
+            followed by None for the non-tensor arguments.
+        """
+        gathered_lens = ctx.gathered_lens
+        max_len = max(gathered_lens)
+        trailing = tuple(grad_local.shape[1:])
+        if grad_local.size(0) < max_len:
+            grad_local = torch.cat([grad_local, grad_local.new_zeros((max_len - grad_local.size(0),) + trailing)])
+        grad_padded = grad_local.new_empty((len(gathered_lens) * max_len,) + trailing)
+        dist.all_gather_into_tensor(grad_padded, grad_local.contiguous(), group=ctx.group)
+        if any(length != max_len for length in gathered_lens):
+            per_rank = grad_padded.view((len(gathered_lens), max_len) + trailing)
+            grad_padded = torch.cat([rows[:length] for rows, length in zip(per_rank, gathered_lens)])
+        return grad_padded, None, None
 
 
 if TYPE_CHECKING:
@@ -855,6 +918,32 @@ class GroupedExperts(nn.Module):
 
         return x, weights, indices, token_mask, gathered_lens
 
+    @staticmethod
+    def _combine_ep_outputs(
+        y: torch.Tensor,
+        x: torch.Tensor,
+        *,
+        ep_group: dist.ProcessGroup,
+        gathered_lens: list[int],
+    ) -> torch.Tensor:
+        """Sum the local experts' outputs over the expert-parallel group and keep this rank's tokens.
+
+        Args:
+            y: Tensor of shape [gathered_tokens, hidden], or [gathered_tokens, topk, hidden] when routing weights
+                apply after the down projection, with this rank's local-expert contributions for every gathered
+                token in rank order. The gradient anchor below updates it in place.
+            x: Tensor of shape [gathered_tokens, hidden], the gathered activations from ``_gather_ep_inputs``.
+            ep_group: Expert-parallel process group.
+            gathered_lens: Per-rank token counts from ``_gather_ep_inputs``.
+
+        Returns:
+            Tensor of shape [local_tokens, ...] with y's trailing axes and dtype, holding the combined outputs
+            of this rank's tokens.
+        """
+        # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
+        y.add_(x.sum(dtype=torch.float32) * 0.0)
+        return _ReduceScatterVarlenFn.apply(y, ep_group, gathered_lens)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -934,7 +1023,6 @@ class GroupedExperts(nn.Module):
         # EP variable-length all-gather
         if ep_size > 1:
             ep_group = ep_mesh.get_group()
-            local_num_tokens = x.size(0)
 
             x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
                 x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
@@ -975,13 +1063,7 @@ class GroupedExperts(nn.Module):
             )
 
         if ep_size > 1:
-            # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
-            y.add_(x.sum(dtype=torch.float32) * 0.0)
-
-            # Reduce and narrow to the original per-rank token boundaries.
-            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
-            start = sum(gathered_lens[:ep_rank])
-            y = y.narrow(0, start, local_num_tokens).contiguous()
+            y = self._combine_ep_outputs(y, x, ep_group=ep_group, gathered_lens=gathered_lens)
 
         if self.config.apply_router_weight_after_down:
             y = y.sum(dim=1)
