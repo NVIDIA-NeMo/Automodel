@@ -54,6 +54,9 @@ class TestParallelismParity:
     def test_pp_grad_accum_parity(self):
         run_test_script(TEST_FOLDER, PP_GRAD_ACCUM_PARITY_FILENAME)
 
+    def test_pp_dtype_parity(self):
+        run_test_script(TEST_FOLDER, "L2_Parallelism_PP_Dtype_Parity.sh")
+
     def test_deepseek_v4_pp2_parity(self):
         run_test_script(TEST_FOLDER, DEEPSEEK_V4_PP2_PARITY_FILENAME)
 

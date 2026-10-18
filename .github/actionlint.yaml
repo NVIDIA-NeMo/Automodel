@@ -1,0 +1,8 @@
+self-hosted-runner:
+  labels:
+    - nemo-ci-aws-gpu-x2
+    - nemo-ci-aws-gpu-x4
+    - nemo-ci-aws-gpu-x8
+    - nemo-ci-gcp-gpu-x2
+    - nemo-ci-gcp-gpu-x2-imex
+    - nemo-ci-gcp-gpu-x4
