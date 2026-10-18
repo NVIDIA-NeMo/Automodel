@@ -40,6 +40,7 @@ import torch.nn as nn
 from .adapters import (
     FlowMatchingContext,
     Flux2Adapter,
+    Flux3Adapter,
     FluxAdapter,
     HunyuanAdapter,
     LTX2Adapter,
@@ -631,7 +632,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
     Factory function to create a model adapter by name.
 
     Args:
-        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "qwen_image",
+        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "flux3", "qwen_image",
             "qwen_image_21", "qwen_image_edit", "ltx2", "hunyuan_image3")
         **kwargs: Additional arguments passed to the adapter constructor
 
@@ -653,6 +654,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
         "simple": SimpleAdapter,
         "flux": FluxAdapter,
         "flux2": Flux2Adapter,
+        "flux3": Flux3Adapter,
         "qwen_image": QwenImageAdapter,
         "qwen_image_21": QwenImage21Adapter,
         "qwen_image_edit": QwenImageEditAdapter,

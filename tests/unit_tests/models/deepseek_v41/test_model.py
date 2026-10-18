@@ -32,7 +32,7 @@ from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from nemo_automodel._transformers.capabilities import _is_deepseek_v4
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_across_blocks, fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
@@ -427,6 +427,17 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
         policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=None, cast_forward_inputs=False
         )
+        # The attention sinks share one FSDP unit across the blocks (the production parallelizer does the same
+        # through _fsdp_shard_across_blocks); the per-block dtype units must then leave those parameters alone.
+        cross_block = fully_shard_across_blocks(
+            list(model.model.layers.values()),
+            model._fsdp_shard_across_blocks,
+            mesh=mesh,
+            mp_policy=policy,
+            offload_policy=None,
+        )
+        assert len(cross_block) == len(model.model.layers)
+        assert all(isinstance(parameter, DTensor) for parameter in cross_block)
         for module in model.model.layers.values():
             fully_shard_by_dtype(
                 module,
@@ -435,6 +446,7 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
                 offload_policy=None,
                 fp32_compute_module_names=tuple(strict_names),
                 reshard_after_forward=True,
+                ignored_params=cross_block & set(module.parameters()),
             )
         fully_shard(model.model.embed_tokens, mesh=mesh, mp_policy=policy, reshard_after_forward=True)
         fully_shard(
@@ -482,3 +494,35 @@ def test_fsdp_initialization_preserves_local_storage_dtype_and_checkpoint_values
     tmp_path: Path, storage_dtype: torch.dtype
 ) -> None:
     mp.spawn(_fsdp_initialization_worker, args=(str(tmp_path / "rendezvous"), storage_dtype), nprocs=2, join=True)
+
+
+def test_model_validates_attention_inputs_once_before_the_layers() -> None:
+    """The model runs the host-synchronising position / mask checks once per forward and the layers skip them."""
+    model = _model()
+    input_ids = torch.randint(0, 17, (1, 4))
+    with pytest.raises(ValueError, match="zero-based"):
+        model(input_ids, position_ids=torch.tensor([[0, 1, 0, 1]]))
+    with pytest.raises(ValueError, match="right padding"):
+        model(input_ids, position_ids=torch.arange(4)[None], attention_mask=torch.tensor([[0, 1, 1, 1]]))
+    logits = model(input_ids, position_ids=torch.arange(4)[None]).logits
+    assert logits.shape == (1, 4, 17)
+
+
+def test_attention_sinks_are_declared_for_one_cross_block_fsdp_unit():
+    from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Parameter
+
+    model = _model()
+    assert model._fsdp_shard_across_blocks == ["attn.sinks_param"]
+    layers = dict(model.model.layers.items())  # ModuleDict keyed by the layer index
+    assert layers
+    # every block carries the holder under the declared name, and nothing else does
+    named = {name for name, _ in model.named_modules() if name.endswith("attn.sinks_param")}
+    assert named == {f"model.layers.{key}.attn.sinks_param" for key in layers}
+    holders = [layer.attn.sinks_param for layer in layers.values()]
+    assert all(isinstance(holder, DeepseekV4FP32Parameter) for holder in holders)
+    assert all(param.dtype == torch.float32 for holder in holders for param in holder.parameters())
+    # the holder's forward ignores its input: FSDP2 hooks post-backward on the inputs, so it would never fire
+    reference = torch.zeros(2, requires_grad=True)
+    out = holders[0](reference)
+    torch.testing.assert_close(out, holders[0].weight, rtol=0, atol=0)
+    assert torch.autograd.grad(out.sum(), reference, allow_unused=True)[0] is None
