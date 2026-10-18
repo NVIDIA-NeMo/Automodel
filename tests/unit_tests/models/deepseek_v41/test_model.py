@@ -283,10 +283,11 @@ def test_captured_streams_and_final_hidden_states_have_distinct_contracts() -> N
         model(ids, return_hidden_states=True)
 
 
-def test_output_hidden_states_honours_the_recipes_fused_loss_contract() -> None:
+def test_output_hidden_states_honours_the_recipes_fused_loss_contract(monkeypatch) -> None:
     """The recipes call ``model(**batch, logits_to_keep=1, output_hidden_states=True)`` for a ``LinearCrossEntropy``
     loss and project ``get_final_hidden_states(out)`` with ``lm_head.weight`` themselves: V4.1 must hand them the
-    final ``[batch, sequence, hidden]`` tensor (not a residual-stream capture) in the backbone's dtype."""
+    final ``[batch, sequence, hidden]`` tensor (not a residual-stream capture) in the backbone's dtype, and the
+    fused loss projects the bf16 states in the fp32 head's dtype."""
     torch.manual_seed(5)
     model = _model("bfloat16")
     ids = torch.tensor([[3, 4, 5, 6]])
@@ -298,6 +299,29 @@ def test_output_hidden_states_honours_the_recipes_fused_loss_contract() -> None:
     assert model.lm_head.weight.dtype == torch.float32
     # the kept logits are the fp32 head applied to the same positions
     torch.testing.assert_close(F.linear(hidden[:, -1:].float(), model.lm_head.weight), out.logits, rtol=0, atol=0)
+
+    # The recipes' fused loss: cut-cross-entropy's torch_compile projection is ``e @ c.T`` with no dtype
+    # alignment, so the loss promotes the bf16 states to the fp32 weight it was handed.
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    def stand_in(e, c, targets=None, *, ignore_index=-100, reduction="sum", **_):
+        assert e.dtype == c.dtype == torch.float32
+        return F.cross_entropy(
+            (e @ c.T).view(-1, c.shape[0]), targets.view(-1), ignore_index=ignore_index, reduction=reduction
+        )
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", stand_in, raising=False)
+    labels = ids.roll(-1, dims=1)
+    loss = linear_ce_mod.FusedLinearCrossEntropy(impl="torch_compile")(hidden, labels, model.lm_head.weight)
+    expected = F.cross_entropy(
+        F.linear(hidden.float(), model.lm_head.weight).view(-1, model.config.text_config.vocab_size),
+        labels.view(-1),
+        reduction="sum",
+    )
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert model.lm_head.weight.grad is not None and model.lm_head.weight.grad.dtype == torch.float32
 
 
 def test_dspark_target_features_are_attention_input_stream_means() -> None:

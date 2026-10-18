@@ -216,6 +216,14 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
                         "An fp32 lm_head is not supported by the cce kernel; use MaskedCrossEntropy or "
                         "ChunkedCrossEntropy instead."
                     )
+        if hidden_states.dtype != lm_weight.dtype:
+            # Project in the dtype of the weight the loss actually consumes, as the model's own lm_head
+            # (``compute_lm_head_logits``) and ChunkedCrossEntropy do: the backbone hands its activations
+            # out unchanged, so a bf16 backbone with an fp32 head (DeepSeek V4.1, ``lm_head_precision:
+            # float32``) is promoted once here, and an FSDP head whose master weight is gathered after
+            # resharding meets hidden states of the same dtype. The projection ``e @ c.T`` inside
+            # cut-cross-entropy does not align dtypes itself.
+            hidden_states = hidden_states.to(lm_weight.dtype)
 
         # First compute loss with sum reduction to handle normalization ourselves
         softcap = None if self.logit_softcapping == 0 else self.logit_softcapping
