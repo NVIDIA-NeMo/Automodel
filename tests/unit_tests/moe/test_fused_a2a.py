@@ -526,7 +526,7 @@ def test_moe_recompute_cache_round_trip():
     assert torch.equal(cache.take(), torch.zeros(2))
     assert not cache.has_next()
     assert cache.take() is None
-    assert cache.misses == 1
+    assert cache.replay_misses == 1
     cache.rewind()
     assert cache.has_next()  # cursor rewound; entries already handed out are None
     assert cache.take() is None
@@ -594,18 +594,18 @@ def test_moe_recompute_phase_and_combine_cache_flag():
     cache = fused_a2a.MoERecomputeCache()
     assert fused_a2a.moe_recompute_phase() is None
     assert fused_a2a.hybridep_combine_output_cached() is False
-    with fused_a2a.moe_recompute_cache_scope(cache, "record"):
+    with fused_a2a.moe_combine_replay.scope(cache, "record"):
         assert fused_a2a.moe_recompute_phase() == "record"
         assert fused_a2a.hybridep_combine_output_cached() is False
         cache.record(torch.ones(1))
-    with fused_a2a.moe_recompute_cache_scope(cache, "replay"):
+    with fused_a2a.moe_combine_replay.scope(cache, "replay"):
         assert fused_a2a.moe_recompute_phase() == "replay"
         assert fused_a2a.hybridep_combine_output_cached() is True
         cache.take()
         assert fused_a2a.hybridep_combine_output_cached() is False
     assert fused_a2a.moe_recompute_phase() is None
-    with pytest.raises(ValueError, match="Unsupported MoE recompute cache mode"):
-        with fused_a2a.moe_recompute_cache_scope(cache, "forward"):
+    with pytest.raises(ValueError, match="Unsupported MoE combine replay mode"):
+        with fused_a2a.moe_combine_replay.scope(cache, "forward"):
             pass
 
 
@@ -614,7 +614,7 @@ def test_hybridep_combine_without_cache_flag_ignores_the_bound_cache():
     fused_a2a._hybrid_ep_buffer = buffer
     cache = fused_a2a.MoERecomputeCache()
     x = torch.randn(3, 2)
-    with fused_a2a.moe_recompute_cache_scope(cache, "record"):
+    with fused_a2a.moe_combine_replay.scope(cache, "record"):
         buffer.input_shape = (3, 2)
         fused_a2a.HybridEPCombine.apply(x, "handle", None, None, False, False)
     assert not cache.has_next()

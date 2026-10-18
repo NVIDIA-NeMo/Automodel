@@ -496,6 +496,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     fused_a2a_stub = types.ModuleType("nemo_automodel.components.moe.megatron.fused_a2a")
     fused_a2a_stub.deepep_dispatch_replay = RecomputeReplay("DeepEP dispatch (stub)")
     fused_a2a_stub.hybridep_dispatch_replay = RecomputeReplay("HybridEP dispatch (stub)")
+    fused_a2a_stub.moe_combine_replay = RecomputeReplay("MoE combine (stub)")
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.moe.megatron.fused_a2a",

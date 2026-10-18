@@ -552,22 +552,9 @@ def _cache_moe_combine_on_recompute(
     checkpointed call, bound for the forward in ``record`` mode and for the recompute in ``replay`` mode.
     Independent of the dispatch layout replay, so it is installed whether or not the router is recomputed.
     """
-    from nemo_automodel.components.moe.megatron.fused_a2a import MoERecomputeCache, moe_recompute_cache_scope
+    from nemo_automodel.components.moe.megatron.fused_a2a import moe_combine_replay
 
-    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
-        forward_context, recompute_context = context_fn()
-        cache = MoERecomputeCache()
-
-        @contextmanager
-        def scoped(mode: str, inner: AbstractContextManager):
-            if mode == "replay":
-                cache.rewind()
-            with moe_recompute_cache_scope(cache, mode), inner:
-                yield
-
-        return scoped("record", forward_context), scoped("replay", recompute_context)
-
-    return checkpoint_context_fn
+    return moe_combine_replay.checkpoint_context_fn(context_fn)
 
 
 def _uses_moe_recompute_cache(model: nn.Module) -> bool:

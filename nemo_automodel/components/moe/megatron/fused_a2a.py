@@ -22,9 +22,7 @@ import logging
 import os
 import shutil
 import tempfile
-import threading
 import time
-from contextlib import contextmanager
 
 from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
 
@@ -180,70 +178,40 @@ class HybridEPDispatchReplayRecorder(RecomputeReplayRecorder[list]):
         self.resolve()
 
 
-class MoERecomputeCache:
+class MoERecomputeCache(RecomputeReplayRecorder[torch.Tensor]):
     """Combine outputs of one checkpointed block forward, served to its recompute in call order.
 
-    ``BackendConfig.dispatcher_recompute_cache``: ``moe/parallelizer._cache_moe_combine_on_recompute`` creates one
-    per checkpointed call and binds it through :func:`moe_recompute_cache_scope` -- ``record`` around the
-    checkpoint forward, ``replay`` around the backward recompute. Independent of the dispatch layout replay, so
-    it also works when the router is recomputed (``ignore_router_for_ac=False``).
+    ``BackendConfig.dispatcher_recompute_cache``: ``moe/parallelizer._cache_moe_combine_on_recompute`` binds one
+    per checkpointed call through :data:`moe_combine_replay` -- ``record`` around the checkpoint forward, ``replay``
+    around the backward recompute. Independent of the dispatch layout replay, so it also works when the router is
+    recomputed (``ignore_router_for_ac=False``).
     """
-
-    def __init__(self) -> None:
-        self._outputs: list[torch.Tensor | None] = []
-        self._cursor = 0
-        self.misses = 0
 
     def record(self, combined_hidden: torch.Tensor) -> None:
         """Keep one combine output of the checkpoint forward (a detached clone)."""
-        self._outputs.append(combined_hidden.detach().clone())
+        super().record(combined_hidden.detach().clone())
 
     def has_next(self) -> bool:
         """Whether the recompute's next combine has a cached forward output."""
-        return self._cursor < len(self._outputs)
+        return self._cursor < len(self._records)
 
     def take(self) -> torch.Tensor | None:
         """Return the next cached output (released from the cache), or ``None`` when the recompute diverged."""
-        if not self.has_next():
-            self.misses += 1
-            return None
-        cached = self._outputs[self._cursor]
-        self._outputs[self._cursor] = None  # the recompute graph owns it from here
-        self._cursor += 1
+        index = self._cursor
+        cached = super().take()
+        if cached is not None:
+            self._records[index] = None  # the recompute graph owns it from here
         return cached
 
-    def rewind(self) -> None:
-        self._cursor = 0
 
-
-class _MoERecomputeCacheState(threading.local):
-    def __init__(self) -> None:
-        self.cache: MoERecomputeCache | None = None
-        self.mode: str | None = None
-
-
-_moe_recompute_cache_state = _MoERecomputeCacheState()
-
-
-@contextmanager
-def moe_recompute_cache_scope(cache: MoERecomputeCache | None, mode: str):
-    """Bind the combine cache of a checkpointed block for its forward (``record``) or recompute (``replay``)."""
-    if mode not in ("record", "replay"):
-        raise ValueError(f"Unsupported MoE recompute cache mode: {mode}")
-    state = _moe_recompute_cache_state
-    previous = (state.cache, state.mode)
-    state.cache = cache
-    state.mode = mode if cache is not None else None
-    try:
-        yield
-    finally:
-        state.cache, state.mode = previous
+# Checkpoint-recompute replay of HybridEP combine outputs; see MoERecomputeCache.
+moe_combine_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("MoE combine", recorder_factory=MoERecomputeCache)
 
 
 def moe_recompute_phase() -> str | None:
     """``"record"`` inside a checkpoint forward with a bound cache, ``"replay"`` inside its recompute, else ``None``."""
-    state = _moe_recompute_cache_state
-    return state.mode if state.cache is not None else None
+    replay = moe_combine_replay.current()
+    return replay[1] if replay is not None else None
 
 
 def hybridep_combine_output_cached() -> bool:
@@ -253,8 +221,8 @@ def hybridep_combine_output_cached() -> bool:
     (``BackendConfig.dispatcher_recompute_cache``); the down projection feeding that combine may then skip
     its GEMM (``moe/experts._DownProjGroupedMM``).
     """
-    state = _moe_recompute_cache_state
-    return state.cache is not None and state.mode == "replay" and state.cache.has_next()
+    replay = moe_combine_replay.current()
+    return replay is not None and replay[1] == "replay" and replay[0].has_next()
 
 
 # Checkpoint-recompute replay of HybridEP dispatch layouts; see HybridEPDispatchReplayRecorder.
@@ -999,9 +967,9 @@ class HybridEPCombine(torch.autograd.Function):
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
         ctx.fuse_permute = fuse_permute
-        cache = _moe_recompute_cache_state.cache if cache_output else None
-        if cache is not None and _moe_recompute_cache_state.mode == "replay":
-            cached = cache.take()
+        replay = moe_combine_replay.current() if cache_output else None
+        if replay is not None and replay[1] == "replay":
+            cached = replay[0].take()
             if cached is not None:
                 return cached
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
@@ -1010,8 +978,8 @@ class HybridEPCombine(torch.autograd.Function):
             pad_multiple=pad_multiple,
             fuse_unpermute_combine=fuse_permute,
         )
-        if cache is not None and _moe_recompute_cache_state.mode == "record":
-            cache.record(combined_hidden)
+        if replay is not None and replay[1] == "record":
+            replay[0].record(combined_hidden)
         return combined_hidden
 
     @staticmethod
