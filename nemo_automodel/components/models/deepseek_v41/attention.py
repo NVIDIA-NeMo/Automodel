@@ -38,7 +38,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 from torch.utils._python_dispatch import _disable_current_modes
 
-from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.common.rope_triton import apply_rope_triton
 from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Parameter, DeepseekV4GroupedLinear
@@ -52,6 +51,7 @@ from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
 from nemo_automodel.components.models.deepseek_v41.indexer import indexer_scores
 from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41RMSNorm
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str
 
 
