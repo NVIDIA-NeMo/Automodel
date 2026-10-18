@@ -41,6 +41,7 @@ model:
   attn_implementation: flash_attention_2
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
     linear: te
     rms_norm: te
     rope_fusion: false
@@ -72,6 +73,8 @@ dataset:
   split: train
 
 packed_sequence:
+  # The native text backend uses TE; preserve document boundaries with THD metadata.
+  packing_format: thd
   pretokenize: true
   max_length: 8192
   pack_size: 8192

@@ -121,6 +121,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         dspark_n_routed_experts: int = 128,
         dspark_num_experts_per_tok: int = 3,
         dtype: str = "bfloat16",
+        compile_cache_quant: bool = False,
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
@@ -183,6 +184,9 @@ class DeepseekV41TextConfig(PretrainedConfig):
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
+        # "torch": eager fp32 mHC math (released reference); "compile": the projection, collapse and expand
+        # cores wrapped once per process with torch.compile (layers.compile_hc_cores) — allclose, not bitwise,
+        # static shapes. Persisted by save_pretrained like every config field.
         self.engram_layer_ids = [1, 14] if engram_layer_ids is None else list(engram_layer_ids)
         self.engram_num_embeddings = (
             ([384006168, 384016682] if self.engram_layer_ids else [])
@@ -209,6 +213,9 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # Serialized Transformers configs can contain rope_parameters in
         # addition to rope_scaling. Its YaRN validator reads the model's
         # dimensions during base initialization, so establish them first.
+        # torch.compile the cache quantize/dequantize core (fp8 / mxfp4 / nvfp4 rounding of the sliding-window and
+        # compressed caches); a DeepSeek-V4.1 knob, so it lives here rather than on the shared BackendConfig
+        self.compile_cache_quant = compile_cache_quant
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,
@@ -431,8 +438,11 @@ class DeepseekV41Config(PretrainedConfig):
             **kwargs,
         )
 
-    def build_tokenizer(self) -> PreTrainedTokenizerFast:
+    def build_tokenizer(self, *, revision: str | None = None) -> PreTrainedTokenizerFast:
         """Load the checkpoint's fast tokenizer for deterministic Engram hashing.
+
+        Args:
+            revision: Resolved Hub revision shared with the config and weight loads.
 
         Returns:
             The original fast tokenizer from this configuration's checkpoint
@@ -447,7 +457,7 @@ class DeepseekV41Config(PretrainedConfig):
             raise ValueError("Engram tokenizer construction requires a checkpoint source or an explicit tokenizer")
         tokenizer = AutoTokenizer.from_pretrained(
             self._name_or_path,
-            revision=self._commit_hash,
+            revision=revision,
             trust_remote_code=False,
             use_fast=True,
         )
@@ -584,6 +594,7 @@ class DeepseekV41DSparkTargetConfig:
         """
         # The transformers bridge also imports model configs during registration.
         from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+        from nemo_automodel._transformers.auto_config import NeMoAutoConfig
         from nemo_automodel.components.models.common import BackendConfig
 
         if device.type != "cuda":
@@ -596,13 +607,16 @@ class DeepseekV41DSparkTargetConfig:
                 "DeepSeek V4.1 DSpark does not support target_num_hidden_layers: "
                 "the released target feature contract requires layers 37, 38, and 39"
             )
+        revision = NeMoAutoConfig.resolve_revision(self.target_path)
         target_config = DeepseekV41Config.from_pretrained(
             self.target_path,
+            revision=revision,
             name_or_path=self.target_path,
             vision_config={"num_hidden_layers": 0},
         )
         return NeMoAutoModelForCausalLM.from_config(
             config=target_config,
+            revision=revision,
             backend=BackendConfig(
                 attn=self.attn_backend,
                 linear="torch",
