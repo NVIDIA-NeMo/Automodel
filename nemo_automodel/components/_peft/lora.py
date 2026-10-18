@@ -14,6 +14,8 @@
 
 import logging
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -106,6 +108,11 @@ class LinearLoRA(nn.Linear):
     use those inside LinearLoRA but also for monkey-patching modules, without repeating the
     same code -> therefore those are decorated with @staticmethod.
     """
+
+    # Per-token adapter gate installed by :func:`lora_token_gate`; ``None`` applies LoRA to every token.
+    _lora_token_gate: torch.Tensor | None = None
+    # Module path set by ``patch_linear_module`` when a ``layer_name`` is given; used in error messages.
+    _layer_name: str | None = None
 
     def __init__(
         self,
@@ -326,6 +333,9 @@ class LinearLoRA(nn.Linear):
                 bias = None
             res = tp_linear_forward(x, self.weight, bias, mm_for_2d_compile=False)
 
+        if self._lora_token_gate is not None:
+            return res + self._gated_lora_forward(x)
+
         if not self.use_dora:
             if self.dropout_position == "pre":
                 x = F.dropout(x, p=self.dropout_p, training=self.training)
@@ -388,6 +398,43 @@ class LinearLoRA(nn.Linear):
         dora_extra = (mag_norm_scale - 1) * base_no_bias + mag_norm_scale * lora_result * self.scale
         return res + dora_extra
 
+    def _gated_lora_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the LoRA update with the per-token gate from :func:`lora_token_gate` applied.
+
+        The gate scales the rank-``dim`` hidden activation ``lora_A(x)``, so tokens with gate 0
+        receive no update and contribute no gradient to ``lora_A``/``lora_B``.
+
+        Args:
+            x: Input activations, Tensor of shape [batch, sequence, in_features] whose leading
+                dimensions equal the installed gate's shape, or flattened [batch * sequence,
+                in_features]. DTensor inputs are not supported.
+
+        Returns:
+            Tensor of shape [..., out_features] with the same leading dimensions as ``x``: the
+            gated LoRA update, without the base projection.
+        """
+        if self.use_dora:
+            raise NotImplementedError("lora_token_gate does not support DoRA adapters.")
+        if isinstance(x, DTensor):
+            raise NotImplementedError("lora_token_gate does not support DTensor activations (tensor parallelism).")
+        gate = self._lora_token_gate
+        # Only the exact leading shape or the flattened 2-D form: a permuted layout (e.g. a [batch, sequence]
+        # gate on a sequence-first input) has the same token count but would route the wrong tokens.
+        if gate.shape != x.shape[:-1] and not (x.dim() == 2 and gate.numel() == x.shape[0]):
+            raise ValueError(
+                f"lora_token_gate of shape {tuple(gate.shape)} does not match the LoRA input "
+                f"{self._layer_name or type(self).__name__} of shape {tuple(x.shape)}; expected leading "
+                f"dimensions {tuple(gate.shape)} or a flattened [{gate.numel()}, in_features] input."
+            )
+        if self.dropout_position == "pre":
+            x = F.dropout(x, p=self.dropout_p, training=self.training)
+        hidden = self.lora_A(x)
+        hidden = hidden * (gate.reshape(hidden.shape[:-1]).unsqueeze(-1).to(hidden.dtype) * self.scale)
+        lora_res = self.lora_B(hidden)
+        if self.dropout_position == "post":
+            lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
+        return lora_res
+
 
 class TritonLinearLoRA(LinearLoRA):
     """
@@ -422,6 +469,9 @@ class TritonLinearLoRA(LinearLoRA):
             res = fwd(x)
         else:
             res = F.linear(x, self.weight, self.bias)
+
+        if self._lora_token_gate is not None:
+            return res + self._gated_lora_forward(x)
 
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
@@ -718,6 +768,53 @@ def apply_lora_to_linear_modules(
             logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
 
     return num_modules_matched
+
+
+@contextmanager
+def lora_token_gate(model: nn.Module, gate: torch.Tensor) -> Iterator[None]:
+    """Apply every LoRA linear adapter in ``model`` only to the tokens selected by ``gate``.
+
+    Inside the context, each :class:`LinearLoRA` computes ``base(x) + lora_B(gate * scale * lora_A(x))``;
+    tokens with gate 0 see the frozen base projection and contribute no adapter gradient. The fused
+    memory-efficient LoRA paths are bypassed while a gate is installed. Run the backward pass inside
+    the context too, so activation-checkpoint recomputation sees the same gate.
+
+    Args:
+        model: Module whose LoRA-patched linear layers are gated.
+        gate: Tensor of shape [batch, sequence] matching the leading dimensions of every gated LoRA
+            input (a flattened ``[batch * sequence]`` input is also accepted). Bool or float; float
+            values scale the adapter update per token.
+
+    Yields:
+        None. The gate is removed from every module on exit, including on error. The context is not
+        re-entrant: nesting it leaves the outer gate removed after the inner one exits.
+
+    Raises:
+        ValueError: If ``model`` has no LoRA-patched linear layers.
+        NotImplementedError: If ``model`` contains LoRA-patched MoE expert modules, which do not
+            support per-token gating.
+    """
+    lora_experts = (
+        GroupedExpertsLoRA,
+        GroupedExpertsDeepEPLoRA,
+        GroupedExpertsLoRAMXFP4,
+        GroupedExpertsDeepEPLoRAMXFP4,
+    )
+    modules = []
+    for module in model.modules():
+        if isinstance(module, lora_experts):
+            raise NotImplementedError("lora_token_gate does not support LoRA on MoE expert modules.")
+        if isinstance(module, LinearLoRA):
+            modules.append(module)
+    if not modules:
+        raise ValueError("lora_token_gate found no LoRA-patched linear layers in the model.")
+    for module in modules:
+        module._lora_token_gate = gate
+    try:
+        yield
+    finally:
+        for module in modules:
+            module._lora_token_gate = None
 
 
 class LoRATritonFunction(torch.autograd.Function):

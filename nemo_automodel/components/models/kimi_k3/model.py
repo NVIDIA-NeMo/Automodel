@@ -72,6 +72,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate, MoE
+from nemo_automodel.components.moe.router_replay import replay_selection
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
@@ -1122,23 +1123,11 @@ class KimiK3Gate(Gate):
             scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
         indices = scores_for_choice.topk(self.topk, dim=-1, sorted=False)[1]
+        indices = replay_selection(self.router_replay, indices)
         weights = scores.gather(1, indices)
         if self.topk > 1 and self.norm_topk_prob:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return weights * self.route_scale, indices, None
-
-
-_SHARED_EXPERT_STREAMS: dict[int, torch.cuda.Stream] = {}
-
-
-def _shared_expert_stream(device: torch.device) -> torch.cuda.Stream:
-    """Return the per-device side stream used for shared-expert overlap (created lazily, one per process)."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    stream = _SHARED_EXPERT_STREAMS.get(index)
-    if stream is None:
-        stream = torch.cuda.Stream(device=index)
-        _SHARED_EXPERT_STREAMS[index] = stream
-    return stream
 
 
 class KimiK3MoE(MoE):
@@ -1230,23 +1219,15 @@ class KimiK3MoE(MoE):
         weights, indices, _ = self.gate(identity, token_mask, gate_cp_mesh)
         routed_input = self.routed_expert_down_proj(identity)
         # Shared-expert overlap (BackendConfig.shared_expert_overlap): the shared experts only
-        # depend on ``identity``, so launch them on a side stream before the routed path and
-        # join after it. Under expert parallelism the routed path spends most of its time in
-        # dispatch / combine communication on the current stream, which leaves SMs free for the
-        # shared-expert GEMMs (same idea as Megatron-Core's ``moe_shared_expert_overlap``).
-        # Autograd replays each backward op on the stream its forward op used; measured on an
+        # depend on ``identity``, so launch them on the side stream before the routed path and
+        # join after it; the stream helpers are the shared ``MoE`` class's. Measured on an
         # 8-node EP32 K3 mini the win comes from the forward and recompute passes (launching the
         # shared experts after the routed path to reorder the backward was slower: the routed path
         # host-syncs on tokens_per_expert, which serializes the shared experts behind it).
         shared_output = None
         shared_stream = None
         if self.shared_experts is not None and self.backend.shared_expert_overlap and identity.is_cuda:
-            shared_stream = _shared_expert_stream(identity.device)
-            shared_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(shared_stream):
-                shared_output = self.shared_experts(identity)
-            # ``identity`` was allocated on the current stream; keep its block alive for the side stream.
-            identity.record_stream(shared_stream)
+            shared_output, shared_stream = self._shared_experts_on_side_stream(identity)
         if not self.training and not self._has_distributed_experts():
             routed = self._forward_reference_order(routed_input, indices, weights)
         else:
@@ -1255,9 +1236,7 @@ class KimiK3MoE(MoE):
             routed = self.routed_expert_norm(routed)
         output = self.routed_expert_up_proj(routed)
         if shared_output is not None:
-            current = torch.cuda.current_stream()
-            current.wait_stream(shared_stream)
-            shared_output.record_stream(current)
+            self._join_shared_experts(shared_output, shared_stream)
             output = output + shared_output
         elif self.shared_experts is not None:
             output = output + self.shared_experts(identity)

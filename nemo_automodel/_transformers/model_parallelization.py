@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
+import importlib
 from typing import Final
+
+from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
 
 LayerGroupPaths = dict[str, tuple[str, ...]]
 
@@ -100,10 +103,27 @@ _LAYER_GROUPS: Final[dict[str, LayerGroupPaths]] = {
 
 
 def configure_parallelization_metadata(model_class: type) -> type:
-    """Attach adapter-owned layer paths without importing concrete model modules."""
+    """Attach layer paths and explicitly compatible model-owned HF policies.
+
+    Args:
+        model_class: AutoModel's wrapper class for the selected implementation.
+            Existing model-owned parallelizers take precedence.
+
+    Returns:
+        The same class with its parallelization metadata attached. Native model
+        implementations are not imported to resolve an HF compatibility policy.
+    """
     layer_groups = _LAYER_GROUPS.get(model_class.__name__)
     if layer_groups is not None:
         model_class.parallel_layer_groups = layer_groups
+    if getattr(model_class, "parallelizer", None) is None:
+        registration = MODEL_ARCH_MAPPING.get(model_class.__name__)
+        # Only registrations that explicitly declare HF compatibility may load
+        # a native sidecar. Importing other model packages can pull in kernels
+        # that force_hf callers deliberately avoid.
+        if registration is not None and len(registration) > 2 and "hf_parallelizer" in registration[2]:
+            sidecar_module = f"{registration[0].rsplit('.', 1)[0]}.parallelization"
+            model_class.parallelizer = importlib.import_module(sidecar_module).PARALLELIZER
     return model_class
 
 

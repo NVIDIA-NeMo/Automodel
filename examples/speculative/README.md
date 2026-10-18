@@ -247,6 +247,29 @@ Offline cache is produced by `precompute_eagle3.py`
 then consumed through `cached_target_path`. DSpark also supports a text-only offline cache through `precompute_dspark.py`
 for HF-loadable single-process text targets.
 
+DSpark supports the co-located and remote backends too. Its remote server,
+`serve_dspark_target`, reads the same YAML as the training run, so both sides
+load the same target and capture layers; at setup the trainer still checks the
+served layer count, hidden size, vocab size, and `target_layer_ids` against its
+config. The server captures the features with the same code as the co-located
+path, so training is numerically unchanged. See
+`dspark/qwen3_0.6b_dspark_remote.yaml`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m nemo_automodel.recipes.llm.serve_dspark_target -c examples/speculative/dspark/qwen3_0.6b_dspark_remote.yaml
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/qwen3_0.6b_dspark_remote.yaml
+```
+
+The server listens on `target_server.host` / `target_server.port` (default
+`0.0.0.0:8001`) and runs the target in a single process. The DSpark remote
+backend does not prefetch (`target_prefetch_depth` is EAGLE-3 only) and does not
+support sequence packing, multimodal targets, context parallelism, or
+`cached_target_path`. Serving targets that need an expert-parallel mesh across
+several GPUs (DeepSeek V4/V4.1, GLM-5.2, Kimi K3) is tracked in issue #4325.
+
 The loss-mask options live under `recipe_args` in the speculative recipes (not under a
 `dataset:` block): `mask_reasoning_content` drops rendered reasoning traces from the loss, and
 `mask_generation_prompt` drops the prefix of each assistant turn that the chat template's
@@ -628,7 +651,7 @@ checkpoint cadence: `ckpt_every_steps`, `save_checkpoint_every_epoch`.
 | `draft_attn_implementation` | EAGLE-3 | `eager` (default) or `flash_attention_2`. |
 | `fc_norm`, `norm_output` | EAGLE-3.1 | Both default false; either alone is a valid intermediate config. |
 | `draft_weights_path` | EAGLE-3 | Warm-start the draft from a consolidated safetensors export (file or directory); required for meaningful LoRA adaptation. |
-| `target_model_backend`, `remote_urls`, `target_prefetch_depth`, `remote_timeout`, `remote_max_retries` | EAGLE-3 remote | See [Target Backends](#target-backends). |
+| `target_model_backend`, `remote_urls`, `remote_timeout`, `remote_max_retries` | EAGLE-3 / DSpark remote | See [Target Backends](#target-backends). `target_prefetch_depth` is EAGLE-3 only. |
 | `cached_target_path` | EAGLE-3 / DSpark offline | Path to a cache produced by `precompute_eagle3.py`, `precompute_dspark.py`, or (large sharded targets) `precompute_dspark_dist.py`. |
 | `parallel_drafting`, `num_depths`, `num_draft_layers`, `down_sample_ratio`, `down_sample_ratio_min`, `mask_token_id`, `sequence_partitions` | P-EAGLE | `mask_token_id` is required (no default). `sequence_partitions > 1` splits each sequence by dependency lineage to bound long-context memory. |
 | `block_size`, `num_anchors`, `loss_decay_gamma`, `mask_token_id`, `target_layer_ids`, `attention_backend` | DFlash (LLM recipe) | Block drafting knobs. |
@@ -669,7 +692,8 @@ nemo_automodel/components/speculative/
   dflash/       core, dflash2_core, domino_core, jetspec_core, draft_qwen3,
                 draft_qwen3_dflash2, registry, target
   dspark/       core, draft_qwen3, draft_deepseek_v4, draft_glm_5_2,
-                draft_gemma4, draft_minimax_m3, markov_head, registry, target
+                draft_gemma4, draft_minimax_m3, markov_head, registry, target,
+                remote                      # remote target server logic + client
   regenerate.py            # dataset regeneration with the target model
   regen_loop.py            # on-policy regeneration during training (regen block)
   decode_eval.py           # periodic real accept-length eval (decode_eval block)
@@ -685,4 +709,5 @@ nemo_automodel/components/speculative/
 nemo_automodel/recipes/llm/
   train_eagle1.py  train_eagle2.py  train_eagle3.py  peagle_recipe.py
   train_dflash.py  train_domino.py  train_jetspec.py  train_dspark.py
+  serve_dspark_target.py                    # remote DSpark target server
 ```
