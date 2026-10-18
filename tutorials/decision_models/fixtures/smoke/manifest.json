@@ -1,0 +1,14 @@
+{
+  "kind": "deterministic-fictional-smoke-data",
+  "seed": 7,
+  "counts": {
+    "train": 16,
+    "validation": 8,
+    "test": 8
+  },
+  "sha256": {
+    "train": "8e2f85cc923b204ca690af0b5d0c42040f45b2fda4317f19f540fca90ef04ff6",
+    "validation": "e88f7e3b70394664eaa2b67207f547122af08f9ed18da055067f4adfe971658b",
+    "test": "58d5e038e91670e093724f8dbd3fab39ac6888b67e22593726e54b0e0eab2160"
+  }
+}
