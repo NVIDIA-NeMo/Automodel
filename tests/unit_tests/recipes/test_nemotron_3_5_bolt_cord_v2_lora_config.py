@@ -44,7 +44,6 @@ def test_nemotron_3_5_bolt_lora_uses_force_hf_without_expert_parallelism() -> No
     assert model["trust_remote_code"] is True
     assert model["torch_dtype"] == "torch.bfloat16"
     assert model["attn_implementation"] == "eager"
-    assert model["keep_in_fp32_modules"] == ["e_score_correction_bias"]
     assert model["revision"] == "a6a1e5030819a130a1ea08aadb1fe42f4cc86777"  # pragma: allowlist secret
     assert "backend" not in model
     assert "quantization" not in raw_config

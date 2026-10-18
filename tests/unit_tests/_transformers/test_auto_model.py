@@ -1737,67 +1737,6 @@ class TestBuildModelRetryDepth:
         assert result is sentinel_model
         assert order == ["runtime_patches", "infrastructure"]
 
-    def test_build_model_preserves_configured_fp32_router_bias_and_routing(self):
-        """Recipe FP32 patterns take effect before the native infrastructure cast."""
-
-        class Router(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.weight = torch.nn.Parameter(torch.eye(2), requires_grad=False)
-                self.register_buffer(
-                    "e_score_correction_bias",
-                    torch.tensor([1.001, 1.0], dtype=torch.float32),
-                )
-
-            def selected_expert(self) -> torch.Tensor:
-                scores = torch.tensor([[0.0, 0.0005]], dtype=torch.float32)
-                return torch.topk(scores + self.e_score_correction_bias, k=1, dim=-1).indices
-
-        class RemoteModel(torch.nn.Module):
-            _keep_in_fp32_modules: list[str] = ["rotary_emb"]
-
-            def __init__(self) -> None:
-                super().__init__()
-                self.router = Router()
-
-        from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
-
-        # Negative control: BF16 rounding changes the selected expert.
-        rounded_model = RemoteModel()
-        original_route = rounded_model.router.selected_expert()
-        cast_frozen_modules_to_compute_dtype(rounded_model, torch.bfloat16)
-        assert not torch.equal(rounded_model.router.selected_expert(), original_route)
-
-        build_kwargs, mock_config = self._make_build_kwargs()
-        build_kwargs["keep_in_fp32_modules"] = ["e_score_correction_bias"]
-        model = RemoteModel()
-        checkpoint_bias = model.router.e_score_correction_bias.clone()
-        checkpoint_route = model.router.selected_expert()
-
-        def fake_apply_infrastructure(*, model, **kwargs):
-            assert model._keep_in_fp32_modules == ["rotary_emb", "e_score_correction_bias"]
-            cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
-            torch.testing.assert_close(model.router.e_score_correction_bias, checkpoint_bias, rtol=0, atol=0)
-            assert model.router.e_score_correction_bias.dtype == torch.float32
-            assert torch.equal(model.router.selected_expert(), checkpoint_route)
-            return model
-
-        with (
-            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
-            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(False, model)),
-            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
-            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
-            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
-            patch(
-                "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
-                side_effect=fake_apply_infrastructure,
-            ),
-            patch("torch.cuda.current_device", return_value=0),
-        ):
-            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
-
-        assert result is model
-
     def test_custom_model_gets_sdpa_patch_when_method_resolved(self):
         """Custom models need resolved SDPA method constraints too, e.g. to exclude cuDNN under AC."""
         build_kwargs, mock_config = self._make_build_kwargs()

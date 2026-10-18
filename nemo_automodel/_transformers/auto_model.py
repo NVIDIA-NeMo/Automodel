@@ -126,26 +126,6 @@ _DISTRIBUTED_SETUP_ONLY_KWARGS = {
 }
 
 
-def _extend_keep_in_fp32_modules(model: PreTrainedModel, module_patterns: list[str] | None) -> None:
-    """Extend a Hugging Face model's FP32-preservation contract.
-
-    Trust-remote-code checkpoints can contain numerically sensitive FP32 tensors
-    without declaring them through Transformers' ``_keep_in_fp32_modules``
-    attribute. Apply recipe-provided patterns before PEFT, sharding, and the
-    frozen-module compute-dtype cast so those tensors retain their checkpoint
-    values instead of undergoing a lossy FP32-to-BF16-to-FP32 round trip.
-
-    Args:
-        model: Materialized Hugging Face model.
-        module_patterns: Qualified-name substrings to preserve in FP32.
-    """
-    if not module_patterns:
-        return
-
-    existing_patterns = model._keep_in_fp32_modules or ()
-    model._keep_in_fp32_modules = list(dict.fromkeys([*existing_patterns, *module_patterns]))
-
-
 def _reject_separate_distributed_kwargs(kwargs: dict) -> None:
     provided = sorted(_DISTRIBUTED_SETUP_ONLY_KWARGS & set(kwargs))
     if provided:
@@ -425,7 +405,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         fp8_config,
         compile_config,
         load_base_model,
-        keep_in_fp32_modules: list[str] | None = None,
         _retry_depth=0,
         **kwargs,
     ):
@@ -481,7 +460,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 fp8_config=fp8_config,
                 compile_config=compile_config,
                 load_base_model=load_base_model,
-                keep_in_fp32_modules=keep_in_fp32_modules,
                 _retry_depth=_retry_depth + 1,
                 **retry_kwargs,
             )
@@ -610,7 +588,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 return _retry(attn_implementation=attn_implementation)
             raise
 
-        _extend_keep_in_fp32_modules(model, keep_in_fp32_modules)
         model = apply_model_runtime_patches(model, mesh)
 
         # Kernel patching
@@ -709,7 +686,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        keep_in_fp32_modules: list[str] | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -763,9 +739,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 If provided, FP8 quantization will be applied. Default: None.
             compile_config (CompileConfig | None, optional): Configuration for torch.compile.
                 If provided, the model will be compiled. Default: None.
-            keep_in_fp32_modules (list[str] | None, optional): Qualified-name
-                substrings for parameters or buffers that must retain their FP32
-                checkpoint values through model setup. Default: None.
             **kwargs: Additional keyword arguments. Notable ones include:
                 - dtype (str | torch.dtype): Model storage dtype. Takes precedence
                   over ``torch_dtype`` when not ``None``; accepts ``auto``.
@@ -851,7 +824,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config=fp8_config,
             compile_config=compile_config,
             load_base_model=True,
-            keep_in_fp32_modules=keep_in_fp32_modules,
             **kwargs,
         )
 
@@ -873,7 +845,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        keep_in_fp32_modules: list[str] | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """
@@ -974,7 +945,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config=fp8_config,
             compile_config=compile_config,
             load_base_model=kwargs.pop("load_base_model", False),
-            keep_in_fp32_modules=keep_in_fp32_modules,
             **kwargs,
         )
 

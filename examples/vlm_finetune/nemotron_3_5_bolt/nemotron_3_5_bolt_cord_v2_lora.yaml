@@ -58,10 +58,6 @@ model:
   attn_implementation: eager
   use_liger_kernel: false
   use_sdpa_patching: false
-  # The remote router restores this buffer to FP32 in forward, but an earlier
-  # BF16 cast would already have rounded its checkpoint values.
-  keep_in_fp32_modules:
-    - e_score_correction_bias
   # This checkpoint revision stores pre-Transformers-5.18 parameter prefixes.
   key_mapping:
     '^language_model\.backbone\.': language_model.model.
