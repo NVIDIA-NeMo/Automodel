@@ -410,24 +410,6 @@ class TestComputeLmHeadLogits:
         assert out.hidden_states.shape == (1, 7, self.HIDDEN)
         torch.testing.assert_close(out.hidden_states, hidden.unsqueeze(0))
 
-    def test_output_hidden_states_follow_the_heads_compute_dtype(self):
-        """An fp32 head (e.g. ``lm_head_precision: float32``) hands out fp32 hidden states for the fused loss."""
-        lm_head = self._lm_head()  # nn.Linear with an fp32 weight
-        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.bfloat16)
-        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=1, output_hidden_states=True)
-        assert out.hidden_states.dtype == torch.float32
-        assert torch.equal(out.hidden_states, hidden.float())  # promoted once, no rounding
-        # the fused loss projects the attached states with lm_head.weight: that equals the head's own logits
-        torch.testing.assert_close(lm_head(out.hidden_states[:, -1:]), out.logits, rtol=0, atol=0)
-
-    def test_output_hidden_states_fp32_lm_head_flag_hands_out_fp32(self):
-        """The ``fp32_lm_head`` flag casts logits back to bf16 but the attached hidden states stay fp32."""
-        lm_head = self._lm_head()
-        hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
-        out = compute_lm_head_logits(lm_head, hidden, is_thd=True, fp32_lm_head=True, output_hidden_states=True)
-        assert out.logits.dtype == torch.bfloat16
-        assert out.hidden_states.dtype == torch.float32 and out.hidden_states.shape == (1, 7, self.HIDDEN)
-
 
 class TestGenerationConfigHelpers:
     def test_from_model_config_takes_stop_tokens_from_a_pretrained_config(self):

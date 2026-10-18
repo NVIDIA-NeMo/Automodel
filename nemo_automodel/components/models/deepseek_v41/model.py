@@ -634,8 +634,9 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             vision_token_types: Optional image/text markers [batch, sequence].
             logits_to_keep: Number of final positions, or integer position indices [kept].
             output_hidden_states: Attach the final normalized hidden states
-                [batch, sequence, hidden], in the head's dtype, as every other model
-                does; the recipes' fused loss projects them with ``lm_head.weight``.
+                [batch, sequence, hidden], in the backbone's activation dtype, as
+                every other model does; the recipes' linear losses project them
+                with ``lm_head.weight``.
             output_residual_streams: Attach the per-layer residual streams instead, a
                 tuple of [batch, sequence, streams, hidden] captured before each block,
                 for parity checks and debugging. Exclusive with ``output_hidden_states``.

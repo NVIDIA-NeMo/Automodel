@@ -1443,11 +1443,7 @@ def compute_lm_head_logits(
     - ``output_hidden_states``: when set, the (full-sequence, THD-restored)
       ``hidden_states`` are attached to the output so the fused cross-entropy
       path can recompute logits over every position; otherwise the field is
-      ``None``. They are handed out in the same compute dtype the head projects
-      in (fp32 under ``fp32_lm_head`` or an fp32 head, e.g. the MoE
-      ``lm_head_precision`` setting), so a fused loss that projects them with
-      ``lm_head.weight`` itself sees the head's precision without casting on the
-      model's behalf. For a head in the activation dtype this is a no-op.
+      ``None``.
 
     Args:
         lm_head: The language-model head module, or ``None`` on a pipeline stage
@@ -1467,7 +1463,6 @@ def compute_lm_head_logits(
         ``hidden_states`` are the final hidden states when ``output_hidden_states``
         is set, else ``None``.
     """
-    compute_dtype = None
     if lm_head is None:
         logits = hidden_states
     else:
@@ -1480,9 +1475,9 @@ def compute_lm_head_logits(
             else:
                 sliced = hidden_states[:, slice_indices, :]
         if fp32_lm_head:
-            compute_dtype = torch.float32
             logits = lm_head(sliced.float()).to(hidden_states.dtype)
         else:
+            compute_dtype = None
             if isinstance(lm_head, FSDPModule):
                 compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
             lm_head_weight = getattr(lm_head, "weight", None)
@@ -1496,8 +1491,6 @@ def compute_lm_head_logits(
     hidden_out = None
     if output_hidden_states:
         hidden_out = hidden_states.unsqueeze(0) if is_thd and hidden_states.dim() == 2 else hidden_states
-        if compute_dtype is not None and hidden_out.dtype != compute_dtype:
-            hidden_out = hidden_out.to(compute_dtype)
 
     return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
 

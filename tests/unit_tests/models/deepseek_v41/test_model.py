@@ -195,11 +195,9 @@ def test_bf16_backbone_returns_unrounded_fp32_logits():
             torch.linspace(-0.04321, 0.05137, model.lm_head.weight.numel()).view_as(model.lm_head.weight)
         )
     result = model(torch.tensor([[3, 5, 7, 9]]), output_hidden_states=True)
-    # The final hidden states come out in the head's dtype: bf16 values promoted once, where they are produced.
-    assert result.hidden_states.dtype == torch.float32
-    assert torch.equal(result.hidden_states, result.hidden_states.bfloat16().float())
+    assert result.hidden_states.dtype == torch.bfloat16
     assert result.logits.dtype == torch.float32
-    expected = F.linear(result.hidden_states, model.lm_head.weight)
+    expected = F.linear(result.hidden_states.float(), model.lm_head.weight)
     torch.testing.assert_close(result.logits, expected, rtol=0, atol=0)
     assert torch.count_nonzero(result.logits != result.logits.bfloat16().float()) > 0
     result.logits.square().mean().backward()
@@ -288,7 +286,7 @@ def test_captured_streams_and_final_hidden_states_have_distinct_contracts() -> N
 def test_output_hidden_states_honours_the_recipes_fused_loss_contract() -> None:
     """The recipes call ``model(**batch, logits_to_keep=1, output_hidden_states=True)`` for a ``LinearCrossEntropy``
     loss and project ``get_final_hidden_states(out)`` with ``lm_head.weight`` themselves: V4.1 must hand them the
-    final ``[batch, sequence, hidden]`` tensor (not a residual-stream capture) in the head's dtype."""
+    final ``[batch, sequence, hidden]`` tensor (not a residual-stream capture) in the backbone's dtype."""
     torch.manual_seed(5)
     model = _model("bfloat16")
     ids = torch.tensor([[3, 4, 5, 6]])
@@ -296,9 +294,10 @@ def test_output_hidden_states_honours_the_recipes_fused_loss_contract() -> None:
     hidden = get_final_hidden_states(out)
     assert hidden is out.hidden_states and isinstance(hidden, torch.Tensor)
     assert hidden.shape == (1, 4, model.config.text_config.hidden_size)
-    assert hidden.dtype == model.lm_head.weight.dtype == torch.float32
-    # the kept logits are the head applied to the same cast tensor (same slice shape: bitwise, CPU GEMM blocking aside)
-    torch.testing.assert_close(F.linear(hidden[:, -1:], model.lm_head.weight), out.logits, rtol=0, atol=0)
+    assert hidden.dtype == torch.bfloat16
+    assert model.lm_head.weight.dtype == torch.float32
+    # the kept logits are the fp32 head applied to the same positions
+    torch.testing.assert_close(F.linear(hidden[:, -1:].float(), model.lm_head.weight), out.logits, rtol=0, atol=0)
 
 
 def test_dspark_target_features_are_attention_input_stream_means() -> None:
