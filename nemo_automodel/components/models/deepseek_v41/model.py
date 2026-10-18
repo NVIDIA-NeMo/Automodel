@@ -76,7 +76,11 @@ from nemo_automodel.components.models.deepseek_v41.attention import (
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
-from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram, DeepseekV41NgramHash
+from nemo_automodel.components.models.deepseek_v41.engram import (
+    DeepseekV41Engram,
+    DeepseekV41NgramHash,
+    compile_engram_gate,
+)
 from nemo_automodel.components.models.deepseek_v41.fsdp import PARALLELIZER
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41HyperConnection,
@@ -250,6 +254,8 @@ class DeepseekV41Model(nn.Module):
             compile_norm_core()
         if config.compile_cache_quant:
             compile_cache_quantization()
+        if config.compile_engram:
+            compile_engram_gate()
         dtype = dtype_from_str(config.dtype, torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
         active_engram = any(i < config.num_hidden_layers for i in config.engram_layer_ids)
