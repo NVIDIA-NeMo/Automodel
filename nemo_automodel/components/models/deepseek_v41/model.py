@@ -65,7 +65,6 @@ from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     cast_model_to_dtype,
     compute_lm_head_logits,
-    lm_head_compute_dtype,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
@@ -711,13 +710,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         if layout is not None:
             hidden = layout.restore(hidden)
             captured = None if captured is None else tuple(layout.restore(values) for values in captured)
-        if output_hidden_states:
-            # The fp32 head is this model's own policy (class docstring, ``lm_head_precision``), so the activations
-            # meet it here, where they are produced: the recipes' fused loss reads ``hidden_states`` and projects
-            # with ``lm_head.weight`` itself, and the shared loss must not promote them on the model's behalf.
-            head_dtype = lm_head_compute_dtype(self.lm_head)
-            if head_dtype is not None and hidden.dtype != head_dtype:
-                hidden = hidden.to(head_dtype)
         projected = compute_lm_head_logits(
             self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states
         )
