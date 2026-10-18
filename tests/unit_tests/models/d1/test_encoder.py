@@ -1,0 +1,78 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Bidirectional context and media-prefix isolation in the Omni encoder."""
+
+import torch
+
+from nemo_automodel.components.models.d1.encoder import D1OmniEncoder
+
+
+def tiny_config():
+    return dict(
+        vocab_size=32,
+        hidden_size=64,
+        intermediate_size=96,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        layer_types=["conv", "full_attention"],
+        norm_eps=1e-5,
+        conv_L_cache=3,
+        conv_bias=False,
+        block_ffn_dim_multiplier=1.0,
+        block_multiple_of=16,
+        rope_theta=1e6,
+    )
+
+
+def test_text_is_bidirectional_but_media_cannot_read_text():
+    torch.manual_seed(7)
+    encoder = D1OmniEncoder(tiny_config()).eval()
+    values = torch.randn(1, 6, 64)
+    changed = values.clone()
+    changed[:, 4:] += torch.randn(1, 2, 64) * 2
+    valid = torch.ones(1, 6, dtype=torch.bool)
+    media_length = torch.tensor([2])
+    before = encoder(values, valid, media_length)
+    after = encoder(changed, valid, media_length)
+    torch.testing.assert_close(before[:, :2], after[:, :2], rtol=0, atol=0)
+    assert not torch.allclose(before[:, 2], after[:, 2])
+    text_values = values.detach().requires_grad_()
+    text_output = encoder(text_values, valid, torch.tensor([0]))
+    text_output[:, 0, :8].sum().backward()
+    assert torch.isfinite(text_values.grad).all()
+    assert text_values.grad[:, -1].abs().sum() > 0
+
+
+def test_padding_cannot_change_real_encoder_states():
+    encoder = D1OmniEncoder(tiny_config()).eval()
+    values = torch.randn(1, 4, 64)
+    valid = torch.ones(1, 4, dtype=torch.bool)
+    prefix = torch.tensor([1])
+    original = encoder(values, valid, prefix)
+    padded = torch.cat([values, torch.randn(1, 3, 64) * 100], dim=1)
+    padded_valid = torch.cat([valid, torch.zeros(1, 3, dtype=torch.bool)], dim=1)
+    actual = encoder(padded, padded_valid, prefix)[:, :4]
+    torch.testing.assert_close(original, actual, atol=2e-6, rtol=2e-5)
+
+
+def test_dtype_moves_preserve_exact_float32_rotary_frequencies():
+    encoder = D1OmniEncoder(tiny_config())
+    expected = encoder.rotary_emb.inv_freq.clone()
+    encoder.to(torch.bfloat16)
+    assert encoder.rotary_emb.inv_freq.dtype == torch.float32
+    torch.testing.assert_close(encoder.rotary_emb.inv_freq, expected, atol=0, rtol=0)
+    encoder.to(torch.float32)
+    torch.testing.assert_close(encoder.rotary_emb.inv_freq, expected, atol=0, rtol=0)

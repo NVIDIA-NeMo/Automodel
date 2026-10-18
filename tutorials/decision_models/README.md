@@ -1,6 +1,6 @@
 # Typed decision-model post-training
 
-These notebooks use framework-owned CLM/CLEF APIs with a newly authored fictional fixture. They cover released baselines, head adaptation, supervised training, optional policy continuation, validation selection, checkpoint persistence and heldout reporting. No training results, model weights or executed outputs are bundled. The small fixture checks mechanics; it is not a security benchmark.
+These notebooks use framework-owned CLM/CLEF/D1 APIs with a newly authored fictional fixture. They cover released baselines, head adaptation, supervised training, optional policy continuation, validation selection, checkpoint persistence and heldout reporting. No training results, model weights or executed outputs are bundled. The small fixture checks mechanics; it is not a security benchmark.
 
 | Notebook | Workflow |
 | --- | --- |
@@ -8,6 +8,7 @@ These notebooks use framework-owned CLM/CLEF APIs with a newly authored fictiona
 | [01 CLM supervised and utility](01_clm_supervised_and_utility.ipynb) | Frozen encoder, released head baseline, supervised heads, optional exact expected utility or sampled GRPO |
 | [02 CLEF heads or LoRA](02_clef_heads_or_lora.ipynb) | Frozen schema head or backbone LoRA plus schema head; optional utility continuation and local merged export |
 | [03 CLM contrastive heads](03_clm_contrastive_heads.ipynb) | Bidirectional InfoNCE on cached frozen features, with repeated-positive false-negative masking |
+| [04 D1 readouts](04_d1_readouts.ipynb) | Frozen D1-3B answer-token rows or D1 Omni marker head; baseline, SFT and optional utility continuation |
 | [05 Optional Data Designer](05_optional_data_designer.ipynb) | Public-provider writer/judge paraphrases, source-case split assignment, identifier filtering and frozen new manifests |
 | [06 Experimental calibration continuation](06_experimental_calibration_continuation.ipynb) | Gaussian logit proposals, correctness/confidence reward, group baseline and CE anchor; validation Brier selection |
 
@@ -43,6 +44,10 @@ Native reports retain decision accuracy, exact record match, NLL, Brier, calibra
 
 Notebook 05 needs `uv pip install data-designer==0.9.4 pandas pyarrow` in the chosen environment and your own `NVIDIA_API_KEY` only when generation is enabled. Inspect its two-record preview before `REVIEWED_PREVIEW=True`. Labels and utility tables remain policy-derived; writer/judge output changes only observation prose. Source cases keep their original split and appear at most once. Automated checks do not prove factual accuracy or absence of personal data; inspect generated text before sharing it. Generated data defines a new experiment and must not replace an existing split silently.
 
-The tutorial code and newly authored fixture follow this repository's [Apache 2.0 license](../../LICENSE). Downloaded models and third-party packages retain their own licenses; none of their weights or source trees is redistributed here. This source preparation has CPU checks only; no new GPU training, API generation or model export is claimed.
+## Experimental D1 readouts
 
-The native commands use `automodel examples/decision/clm_soc_triage.yaml`, `clef_soc_triage_heads.yaml` and `clef_soc_triage_lora.yaml`. Recipe definitions remain in `nemo_automodel/recipes/decision/`; model-owned heads remain in their CLM/CLEF packages. See the [example flags and configuration notes](../../examples/decision/README.md).
+[04 D1 readouts](04_d1_readouts.ipynb) covers D1-3B additive answer-token rows and the D1 Omni marker head through native framework models. It keeps the backbone frozen, selects readouts on validation, and reports baseline/SFT/optional utility stages on the same heldout split. Use a prepared single-GPU environment; this source preparation did not run D1 GPU training, publisher comparisons or media paths. The fictional observations are text-only and establish no image/audio adaptation result or numerical-parity claim. The implementation follows the repository's Apache 2.0 license; downloaded publisher weights and remote components retain their [publisher license](https://www.liquid.ai/lfm-license).
+
+The tutorial code and newly authored fixture follow this repository's [Apache 2.0 license](../../LICENSE). Downloaded models, publisher runtime components and third-party packages retain their own licenses. Model weights are not bundled in these tutorials. This source preparation has CPU checks only; no new GPU training, API generation or model export is claimed.
+
+The native commands use `automodel examples/decision/clm_soc_triage.yaml`, `clef_soc_triage_heads.yaml` and `clef_soc_triage_lora.yaml`. The D1 command is `uv run python examples/decision/d1_posttrain.py`. Recipe definitions remain in `nemo_automodel/recipes/decision/`; model-owned heads remain in their CLM/CLEF packages. See the [example flags and configuration notes](../../examples/decision/README.md).

@@ -5,6 +5,7 @@
 | `clm_soc_triage.yaml` | `TrainCLMHeadsRecipe` | CLM-v0.1-8B: frozen Qwen3-8B encoder (embedded once, cached), projection-head eval / SFT / RL |
 | `clef_soc_triage_heads.yaml` | `TrainClefDecisionRecipe` | CLEF frozen backbone + joint schema head, using the same eval / SFT / reward loop |
 | `clef_soc_triage_lora.yaml` | `TrainClefDecisionRecipe` | Clef 27B: LoRA + joint schema head with FSDP2, eval / SFT / RL, stage chaining with `init_from` |
+| `d1_posttrain.py` | `D1PostTraining` | Experimental frozen-backbone D1-3B answer-token rows or Omni marker-head adaptation, with a publisher-baseline gate |
 | `export_clef_release.py` | — | Merge a Clef stage (LoRA + head) into a directory with the `Cloudflare/clef` release layout |
 
 From the repository root, prepare fresh fictional data first (128 train, 32 validation and 32 test records):
@@ -37,6 +38,14 @@ pooling, normalization, precision and library settings, so changing those settin
 CLM/CLEF example configurations pin the public model versions whose prompt and checkpoint contracts they use.
 The CLEF frozen-backbone configuration installs no adapters and optimizes only the external joint head.
 Stages save weights for staged initialization; they are not full optimizer/scheduler resume checkpoints.
+
+D1 examples are experimental. Tiny configuration tests exercise causal/readout/gradient contracts; released-size
+GPU acceptance remains required for D1-3B. A prior released-size D1-3B baseline comparison exceeded the declared probability
+tolerance, and no successful fresh full-size rerun has been collected for this contribution. The contributed NeMo
+implementation follows this repository's Apache 2.0 license. Downloaded publisher code and model artifacts retain
+their own license terms:
+[model](https://huggingface.co/LiquidAI/d1-3B) and [Omni](https://huggingface.co/LiquidAI/d1-omni-600M).
+No publisher weights are included in these examples.
 
 CLEF uses complete optimizer windows and drops an incomplete final window. Its global batch size must be positive,
 divisible by `local_batch_size * DP world size`, and small enough to fit at least one training window. For the
