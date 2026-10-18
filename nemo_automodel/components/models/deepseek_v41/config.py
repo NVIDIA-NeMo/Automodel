@@ -122,6 +122,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         dspark_num_experts_per_tok: int = 3,
         dtype: str = "bfloat16",
         compile_cache_quant: bool = False,
+        reuse_sparse_selection_on_recompute: bool = True,
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
@@ -216,6 +217,10 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # torch.compile the cache quantize/dequantize core (fp8 / mxfp4 / nvfp4 rounding of the sliding-window and
         # compressed caches); a DeepSeek-V4.1 knob, so it lives here rather than on the shared BackendConfig
         self.compile_cache_quant = compile_cache_quant
+        # Under activation checkpointing, serve the frozen CSA2 indexer's selection and the sparse-index plan of
+        # the checkpoint forward to the recompute instead of recomputing them (attention.csa2_selection_replay);
+        # a DeepSeek-V4.1 knob like compile_cache_quant. Numerics are unchanged; False recomputes them.
+        self.reuse_sparse_selection_on_recompute = bool(reuse_sparse_selection_on_recompute)
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,
