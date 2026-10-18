@@ -65,7 +65,10 @@ from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPi
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
+from nemo_automodel.components.models.common.utils import (
+    cast_frozen_modules_to_compute_dtype,
+    prepare_frozen_parameters_for_sharding,
+)
 from nemo_automodel.components.moe.quantized_experts import apply_mxfp4_to_moe_experts
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
@@ -84,6 +87,7 @@ from nemo_automodel.components.utils.model_utils import (
     print_trainable_parameters,
 )
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
+from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
@@ -485,6 +489,31 @@ def _get_strategy_config(model_wrapper) -> DistributedStrategyConfig | None:
     return getattr(model_wrapper, "config", None)
 
 
+def _get_frozen_storage_compute_dtype(
+    strategy_config: DistributedStrategyConfig | None, mesh: MeshContext | None
+) -> torch.dtype | None:
+    """Resolve a safe model-wide compute dtype for frozen storage preparation.
+
+    MoE can override the FSDP2 parameter compute dtype for transformer blocks.
+    Since storage preparation currently accepts one dtype for the whole model,
+    skip it when that override differs from the root policy.
+    """
+    compute_dtype = getattr(getattr(strategy_config, "mp_policy", None), "param_dtype", None)
+    moe_config = getattr(mesh, "moe_parallel_config", None)
+    moe_policy = getattr(moe_config, "mp_policy", None)
+    if moe_policy is not None and getattr(moe_policy, "param_dtype", None) != compute_dtype:
+        return None
+    lm_head_precision = getattr(moe_config, "lm_head_precision", None)
+    if isinstance(lm_head_precision, str):
+        lm_head_precision = dtype_from_str(lm_head_precision, default=None)
+    if lm_head_precision == torch.float32:
+        # The head is sharded in FP32 independently of the root/MoE policy.
+        # This helper currently prepares one model-wide storage dtype, so keep
+        # source precision for all frozen params in this configuration.
+        return None
+    return compute_dtype
+
+
 #  apply_model_infrastructure  --  the main post-init orchestration function
 def apply_model_infrastructure(
     model,
@@ -506,6 +535,7 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
+    load_metadata_with_gloo: bool = False,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -544,6 +574,7 @@ def apply_model_infrastructure(
         inject_te_attention: When True, inject TransformerEngine DotProductAttention
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
+        load_metadata_with_gloo: Use a CPU group for base-weight load planning. Default: False.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -563,6 +594,7 @@ def apply_model_infrastructure(
         model_repo_id=pretrained_model_name_or_path,
         save_consolidated=False,
         is_peft=peft_config is not None,
+        load_metadata_with_gloo=load_metadata_with_gloo,
     )
     checkpointer = Checkpointer(
         ckpt_config,
@@ -611,24 +643,29 @@ def apply_model_infrastructure(
 
     checkpoint_already_loaded = False
     if load_before_shard:
-        if weights_already_loaded:
-            # HF's from_pretrained already populated the weights during model init.
-            # Still call load_base_model with load_base_model=False to
-            # handle weight tying
-            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
-        else:
-            # Only meta-device models need their parameter shells materialized first.
-            if is_meta_device:
-                lora_a_init = getattr(peft_config, "lora_A_init", None)
-                checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
-            checkpointer.load_base_model(
-                model,
-                device,
-                cache_dir,
-                pretrained_model_name_or_path,
-                load_base_model=load_base_model,
-            )
-        checkpoint_already_loaded = True
+        try:
+            if weights_already_loaded:
+                # HF's from_pretrained already populated the weights during model init.
+                # Still call load_base_model with load_base_model=False to
+                # handle weight tying
+                checkpointer.load_base_model(
+                    model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False
+                )
+            else:
+                # Only meta-device models need their parameter shells materialized first.
+                if is_meta_device:
+                    lora_a_init = getattr(peft_config, "lora_A_init", None)
+                    checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+                checkpointer.load_base_model(
+                    model,
+                    device,
+                    cache_dir,
+                    pretrained_model_name_or_path,
+                    load_base_model=load_base_model,
+                )
+            checkpoint_already_loaded = True
+        finally:
+            checkpointer.close()
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     state_dict_adapter = getattr(model, "state_dict_adapter", None)
@@ -651,6 +688,8 @@ def apply_model_infrastructure(
         freeze_config=freeze_config,
         strict=True,
     )
+    if isinstance(strategy_config, FSDP2Config) and peft_config is not None and quantization_config is None:
+        prepare_frozen_parameters_for_sharding(model, _get_frozen_storage_compute_dtype(strategy_config, mesh))
     reapply_trainability = partial(
         _apply_trainability_policy,
         peft_enabled=peft_config is not None,
@@ -738,15 +777,18 @@ def apply_model_infrastructure(
     # decision so that changes to the meta-device policy cannot silently skip loading.
     should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and not weights_already_loaded
     if should_load_checkpoint:
-        model_parts = model.parts if hasattr(model, "parts") else [model]
-        for mp in model_parts:
-            checkpointer.load_base_model(
-                mp,
-                device,
-                cache_dir,
-                pretrained_model_name_or_path,
-                load_base_model=load_base_model,
-            )
+        try:
+            model_parts = model.parts if hasattr(model, "parts") else [model]
+            for mp in model_parts:
+                checkpointer.load_base_model(
+                    mp,
+                    device,
+                    cache_dir,
+                    pretrained_model_name_or_path,
+                    load_base_model=load_base_model,
+                )
+        finally:
+            checkpointer.close()
 
     _verify_safe_moe_tp_weights_loaded(
         model,

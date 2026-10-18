@@ -1639,8 +1639,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     ) -> None:
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
-            for p in self.parameters():
-                p.data = p.data.to(dtype)
+            cast_model_to_dtype(self, dtype)
             return
 
         # Guard: HF's super().__init__() calls post_init() -> init_weights() ->

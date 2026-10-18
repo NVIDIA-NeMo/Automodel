@@ -124,6 +124,11 @@ def _is_selective_ac(activation_checkpointing: object) -> bool:
     )
 
 
+def _is_moe_only_ac(activation_checkpointing: object) -> bool:
+    """Return True when the AC mode requests checkpointing of the MoE sub-blocks only."""
+    return isinstance(activation_checkpointing, str) and activation_checkpointing.lower() == "moe"
+
+
 def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     config = getattr(model, "config", None)
     if getattr(config, "model_type", None) == "deepseek_v4":
@@ -142,8 +147,15 @@ def _get_cp_stream() -> torch.cuda.Stream:
 
 
 def _get_moe_module(block: nn.Module) -> MoE | None:
+    """Return the block's MoE sub-block, looking through a checkpoint wrapper around it.
+
+    With ``activation_checkpointing='moe'`` the MoE sub-block itself is the checkpoint unit, so the
+    FSDP wrapping that separates expert parameters from the block must still find it.
+    """
     for name in ("moe", "mlp"):
         module = getattr(block, name, None)
+        # A checkpoint wrapper forwards attribute access but not isinstance; look inside.
+        module = getattr(module, "_checkpoint_wrapped_module", module)
         if isinstance(module, MoE):
             return module
 
@@ -553,13 +565,20 @@ def _replay_hybridep_dispatch_on_recompute(
         def scoped(mode: str, inner: AbstractContextManager):
             if mode == "replay":
                 recorder.rewind()
+                # Read the dispatch extents here, before the recompute op context
+                # opens: the copies started at the end of the checkpoint forward
+                # have normally completed by now, so this is at most a wait on an
+                # event that has already fired (once per microbatch, never once per
+                # layer), and no aten op enters the recompute trace.
+                recorder.resolve()
             with hybridep_dispatch_replay_scope(recorder, mode):
                 with inner:
                     yield
                 if mode == "record":
-                    # Cache the dispatch extents only after the selective-op
-                    # context exits. Recompute can then reuse them without an
-                    # extra aten.sum that would diverge from the forward trace.
+                    # Start the extent copies only after the selective-op context
+                    # exits (no extra aten.sum in the forward trace) and without a
+                    # host synchronization — reading them per block stalled the
+                    # launch queue once per layer per microbatch.
                     recorder.finalize()
 
         return scoped("record", forward_context), scoped("replay", recompute_context)
@@ -579,6 +598,28 @@ def _uses_hybridep_dispatch(model: nn.Module) -> bool:
     )
 
 
+def _moe_child(block: nn.Module) -> tuple[str, MoE] | None:
+    """Return the attribute name and module of the block's MoE sub-block, if any."""
+    for name in ("moe", "mlp"):
+        module = getattr(block, name, None)
+        if isinstance(module, MoE):
+            return name, module
+    return None
+
+
+def _uses_hybridep_capacity_mode(model: nn.Module) -> bool:
+    """Return whether any HybridEP expert module runs capacity mode (``dispatcher_capacity_factor``)."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return False
+    return any(
+        isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsTE))
+        and getattr(module, "dispatcher_backend", None) == "hybridep"
+        and getattr(module, "dispatcher_capacity_factor", None) is not None
+        for module in modules()
+    )
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
@@ -586,6 +627,7 @@ def apply_ac(
     num_experts: int | None = None,
     selective: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
+    moe_only: bool = False,
 ):
     """Apply activation checkpointing to the model.
 
@@ -601,6 +643,9 @@ def apply_ac(
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy saves ``topk``, and HybridEP reuses the
             checkpoint-forward dispatch layout while redispatching recomputed activations.
+        moe_only: If True, checkpoint only each decoder block's MoE sub-block (``moe``/``mlp``)
+            and save every other activation of the block. Requires ``ignore_router=True`` and
+            ``selective=False``; blocks without an MoE sub-block are left uncheckpointed.
         activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
             and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
             the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
@@ -621,7 +666,23 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
+    if moe_only and (selective or not ignore_router):
+        raise ValueError(
+            "activation_checkpointing='moe' requires ignore_router_for_ac=true and cannot be "
+            "combined with selective checkpointing; got "
+            f"selective={selective}, ignore_router={ignore_router}"
+        )
     uses_hybridep_dispatch = checkpoint_decoder and _uses_hybridep_dispatch(model)
+    if checkpoint_decoder and not ignore_router and not selective and _uses_hybridep_capacity_mode(model):
+        # Without a replay recorder the recompute dispatch runs in capacity mode (``capacity`` rows)
+        # while the first forward dispatch was the blocking calibration (``actual`` rows), and
+        # non-reentrant checkpointing fails on the shape mismatch on every run.
+        raise ValueError(
+            "dispatcher_capacity_factor needs the routing pinned across the activation-checkpoint recompute: "
+            "set distributed.moe.ignore_router_for_ac=true (the default) or use selective activation "
+            "checkpointing; with ignore_router_for_ac=false and full checkpointing the recompute dispatch "
+            "is sized to the capacity while the forward calibration dispatch was not"
+        )
     repeated_mtp_moe_block_ids = _repeated_mtp_moe_block_ids(model) if checkpoint_decoder else set()
     if repeated_mtp_moe_block_ids:
         logger.info(
@@ -766,6 +827,26 @@ def apply_ac(
             block_context_fn = _replay_deepep_dispatch_on_recompute(block_context_fn)
             if uses_hybridep_dispatch:
                 block_context_fn = _replay_hybridep_dispatch_on_recompute(block_context_fn)
+            if moe_only:
+                # Checkpoint the MoE sub-block alone: attention / linear-attention /
+                # residual mixing keep their activations, only the experts (and the
+                # dispatch around them) are recomputed. The block itself is not
+                # wrapped, so model-owned block hooks (e.g. route replay) are not needed.
+                moe_child = _moe_child(block)
+                if moe_child is None:
+                    logger.info(
+                        "Skipping MoE-only activation checkpointing for block %s without an MoE sub-block", layer_id
+                    )
+                    continue
+                child_name, moe_module = moe_child
+                wrapped_moe = ptd_checkpoint_wrapper(
+                    moe_module,
+                    preserve_rng_state=True,
+                    determinism_check=_register_moe_checkpoint_determinism_check(),
+                    context_fn=block_context_fn,
+                )
+                block.register_module(child_name, wrapped_moe)
+                continue
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
@@ -869,6 +950,21 @@ def apply_fsdp(
             len(externally_sharded_params),
         )
 
+    # fp32 parameter holders whose forward ignores its input (DeepSeek-V4 attention sinks) share one FSDP
+    # unit across all blocks instead of one per block: FSDP2 can only run their post-backward in the root
+    # callback after the whole backward, serially — see fully_shard_across_blocks.
+    cross_block_names = tuple(getattr(model, "_fsdp_shard_across_blocks", None) or ())
+    cross_block_params: set[nn.Parameter] = set()
+    if cross_block_names:
+        cross_block_params = parallelizer_utils.fully_shard_across_blocks(
+            list(_iter_moe_blocks(model, _model)),
+            cross_block_names,
+            mesh=fsdp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            shard_module=shard_module,
+        )
+
     multimodal_modules: list[tuple[str, nn.Module, set[nn.Parameter], bool]] = []
     for module_name, module in iter_multimodal_modules(model):
         module_params = set(module_parameters(module))
@@ -959,6 +1055,8 @@ def apply_fsdp(
             ignored_params.update(moe_module.experts.parameters())
         if externally_sharded_params:
             ignored_params.update(externally_sharded_params.intersection(block.parameters()))
+        if cross_block_params:
+            ignored_params.update(cross_block_params.intersection(block.parameters()))
 
         # Reuse the dense dtype-aware path for model-owned fp32 contracts while
         # leaving EP-owned experts out of the block's dtype and FSDP ownership.
@@ -1236,8 +1334,6 @@ def parallelize_model(
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
-        parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
-        parallelizer_utils.reject_unsupported_mtp_cp(model)
         apply_cp(model, world_mesh[cp_axis_name])
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
@@ -1256,6 +1352,7 @@ def parallelize_model(
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
             activation_checkpointing_scope=activation_checkpointing_scope,
+            moe_only=_is_moe_only_ac(activation_checkpointing),
         )
 
     if reapply_trainability is not None:

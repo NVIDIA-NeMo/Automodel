@@ -273,6 +273,42 @@ class TestPreprocessArgsAndKwargsForAttn:
         self.k = torch.randn(self.batch_size, self.num_heads, self.seq_len, self.head_dim)
         self.v = torch.randn(self.batch_size, self.num_heads, self.seq_len, self.head_dim)
 
+    @pytest.mark.parametrize("shape", [(4,), (1, 4, 4), (1, 1, 4, 4)])
+    @pytest.mark.parametrize("dtype", [torch.bool, torch.float32])
+    def test_te_rejects_non_padding_mask_layouts(self, shape, dtype):
+        q = torch.randn(1, 4, 2, 8)
+        mask = torch.ones(shape, dtype=dtype)
+
+        with pytest.raises(ValueError, match="2D.*padding mask.*THD"):
+            preprocess_args_and_kwargs_for_attn(q, q, q, mask, attn_impl="te")
+
+    @pytest.mark.parametrize("dtype", [torch.bool, torch.int64, torch.float32])
+    def test_te_preserves_binary_padding_mask_semantics(self, dtype):
+        q = torch.randn(1, 4, 2, 8)
+        mask = torch.tensor([[1, 1, 0, 0]], dtype=dtype)
+
+        q_out, k_out, v_out, kwargs = preprocess_args_and_kwargs_for_attn(q, q, q, mask, attn_impl="te")
+
+        assert q_out is q and k_out is q and v_out is q
+        assert kwargs["attn_mask_type"] == "padding_causal"
+        torch.testing.assert_close(kwargs["attention_mask"], torch.tensor([[[[False, False, True, True]]]]))
+        torch.testing.assert_close(mask, torch.tensor([[1, 1, 0, 0]], dtype=dtype))
+
+    def test_te_preserves_thd_document_boundaries(self):
+        q = torch.randn(5, 2, 8)
+        boundaries = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+        q_out, k_out, v_out, kwargs = preprocess_args_and_kwargs_for_attn(
+            q, q, q, None, attn_impl="te", cu_seqlens=boundaries, max_seqlen=3
+        )
+
+        assert q_out is q and k_out is q and v_out is q
+        assert kwargs["qkv_format"] == "thd"
+        assert "attention_mask" not in kwargs
+        torch.testing.assert_close(kwargs["cu_seqlens_q"], boundaries)
+        torch.testing.assert_close(kwargs["cu_seqlens_kv"], boundaries)
+        assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_kv"] == 3
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_te_with_attention_mask(self):
         """Test TE preprocessing with attention mask."""

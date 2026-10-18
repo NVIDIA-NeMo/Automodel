@@ -1,7 +1,6 @@
 ---
 name: testing
-description: Testing reference for NeMo AutoModel — unit and functional test layout, tier semantics (L0/L1/L2), running tests locally, adding or disabling tests, and pytest conventions.
-when_to_use: Adding, running, or disabling tests; debugging a test failure; choosing the right test tier; understanding L0 vs L1 vs L2; handling flaky tests; 'add a test', 'which tier', 'functional test layout'.
+description: Testing reference for NeMo AutoModel — unit and functional test layout, tier semantics (L0/L1/L2), running tests locally, adding or disabling tests, and pytest conventions. Use when adding, running, or disabling tests; debugging a test failure; choosing the right test tier; understanding L0 vs L1 vs L2; handling flaky tests; 'add a test', 'which tier', 'functional test layout'.
 ---
 
 # Testing

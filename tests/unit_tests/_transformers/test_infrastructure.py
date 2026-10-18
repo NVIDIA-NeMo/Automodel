@@ -110,6 +110,26 @@ class TestShouldLoadBeforeShard:
         assert _should_load_before_shard(**{**self._DEFAULTS, "ep_size": 1}) is True
 
 
+@pytest.mark.parametrize("lm_head_precision", [torch.float32, "float32"])
+def test_frozen_storage_preparation_skips_conflicting_moe_compute_policy(lm_head_precision):
+    from nemo_automodel._transformers.infrastructure import _get_frozen_storage_compute_dtype
+
+    strategy_config = SimpleNamespace(mp_policy=SimpleNamespace(param_dtype=torch.bfloat16))
+    assert (
+        _get_frozen_storage_compute_dtype(strategy_config, SimpleNamespace(moe_parallel_config=None)) == torch.bfloat16
+    )
+
+    mesh = SimpleNamespace(moe_parallel_config=SimpleNamespace(mp_policy=SimpleNamespace(param_dtype=torch.float32)))
+    assert _get_frozen_storage_compute_dtype(strategy_config, mesh) is None
+
+    mesh = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(
+            mp_policy=SimpleNamespace(param_dtype=torch.bfloat16), lm_head_precision=lm_head_precision
+        )
+    )
+    assert _get_frozen_storage_compute_dtype(strategy_config, mesh) is None
+
+
 def test_moe_infrastructure_routes_fsdp2_through_model_parallelizer_contract():
     """EP and FSDP2 share the model-owned parallelization contract."""
     from nemo_automodel._transformers.infrastructure import instantiate_infrastructure, parallelize_for_pp
@@ -517,7 +537,8 @@ def test_apply_model_infrastructure_handles_unwrapped_single_rank_ddp_model():
 class TestApplyModelInfrastructurePostShardInit:
     """Tests for initialize_model_weights being called in apply_model_infrastructure."""
 
-    def test_load_only_checkpointer_disables_consolidated_export(self):
+    @pytest.mark.parametrize("load_metadata_with_gloo", [False, True])
+    def test_load_only_checkpointer_disables_consolidated_export(self, load_metadata_with_gloo: bool) -> None:
         """Infrastructure checkpointer loads base weights only and should not warn about consolidated saves."""
         from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
@@ -539,11 +560,39 @@ class TestApplyModelInfrastructurePostShardInit:
                 is_meta_device=True,
                 device=torch.device("cpu"),
                 load_base_model=True,
+                load_metadata_with_gloo=load_metadata_with_gloo,
                 pretrained_model_name_or_path="test/model",
             )
 
         checkpoint_config = MockCheckpointer.call_args.args[0]
         assert checkpoint_config.save_consolidated.value == "false"
+        assert checkpoint_config.load_metadata_with_gloo is load_metadata_with_gloo
+        mock_ckpt.close.assert_called_once()
+
+    @pytest.mark.parametrize("load_before_shard", [False, True])
+    def test_failed_base_load_closes_owned_checkpointer(self, load_before_shard: bool) -> None:
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=load_before_shard),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as constructor,
+        ):
+            checkpointer = constructor.return_value
+            checkpointer.config.dequantize_base_checkpoint = False
+            checkpointer.load_base_model.side_effect = RuntimeError("failed checkpoint read")
+            with pytest.raises(RuntimeError, match="failed checkpoint read"):
+                apply_model_infrastructure(
+                    model=_DummyModel(),
+                    is_meta_device=True,
+                    device=torch.device("cpu"),
+                    load_base_model=True,
+                    load_metadata_with_gloo=True,
+                    pretrained_model_name_or_path="test/model",
+                )
+            checkpointer.close.assert_called_once()
 
     def test_from_config_meta_calls_initialize_model_weights(self):
         """from_config path (load_base_model=False) on meta device should call initialize_model_weights."""

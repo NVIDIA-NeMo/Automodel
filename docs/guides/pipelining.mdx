@@ -156,10 +156,22 @@ distributed:
     pp_recv_buffer_pool_slack: 2     # extra buffer sets beyond the in-flight depth
 ```
 
-The option applies only to schedules with a bounded in-flight depth (currently
-`1f1b`); other schedules keep the stock allocation with a warning. If the installed
-torch exposes neither of the two known `PipelineStage` layouts, the pool is not
-installed and stock behavior is kept (logged at install time).
+Native `interleaved1f1b` also supports `pp_recv_buffer_pool: true`. Its pool is
+installed after schedule construction and uses the actual receive/compute order
+to assign slots separately for each local stage and direction. Received
+activations are copied into independent leaves before forward, and received
+gradients are copied before backward, so slot reuse cannot overwrite values
+retained by activation-checkpoint recomputation or asynchronous sends. These
+copies remain live for their consumers; peak memory savings therefore depend on
+the schedule and model rather than the ordinary 1F1B ring formula above.
+
+Other schedules and custom CSV schedules keep the stock allocation with a
+warning. Ordinary 1F1B supports both known `PipelineStage` layouts and keeps
+stock behavior if neither is available. Interleaved pooling requires the
+native lowered communication schedule, full backward actions, and the
+`_setup_forward_recv_info` / `_setup_backward_recv_info` stage API. Older stage
+APIs keep stock buffers with a warning; unsupported lifetimes are rejected
+before pooling is installed.
 
 ### Model Patching Flags
 
