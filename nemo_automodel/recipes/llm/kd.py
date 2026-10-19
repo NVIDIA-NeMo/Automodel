@@ -1191,9 +1191,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if getattr(self, "tool_call_evaluator", None) is not None:
             prefix = self.tool_call_evaluator.metric_prefix
             count_key = f"{prefix}/_count"
-            if isinstance(self.distributed_config, FSDP2Config) and not getattr(
-                self.tool_call_evaluator, "run_on_fsdp2", False
-            ):
+            run_on_fsdp2 = getattr(self.tool_call_evaluator, "run_on_fsdp2", False)
+            if isinstance(self.distributed_config, FSDP2Config) and not run_on_fsdp2:
                 if not self._warned_tool_call_eval_skipped:
                     logging.warning(
                         "Skipping tool_call_evaluator during FSDP2 training. "
@@ -1202,6 +1201,30 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     )
                     self._warned_tool_call_eval_skipped = True
                 metrics[f"{prefix}/_disabled_fsdp2"] = 1.0
+            elif (
+                getattr(self, "separate_meshes", False)
+                and isinstance(self.distributed_config, FSDP2Config)
+                and run_on_fsdp2
+            ):
+                # With separate student/teacher meshes, only the student ranks enter
+                # generation here -- the teacher rank is off in
+                # KDMeshBridge.broadcast_command on a different process group. HF
+                # `generate()` on an FSDP2-wrapped student auto-detects FSDP and
+                # defaults `synced_gpus=True`, which all-reduces its unfinished-
+                # sequence flag over the *world* group every decode step. Since the
+                # teacher never participates in that all-reduce, the student ranks
+                # hang waiting for it. Skip in-loop generation for this combination
+                # rather than risk that hang; run the evaluator offline instead.
+                if not self._warned_tool_call_eval_separate_meshes_skipped:
+                    logging.warning(
+                        "Skipping tool_call_evaluator: tool_call_eval.run_on_fsdp2=true "
+                        "with separate_meshes=true can hang, because HF generate()'s "
+                        "FSDP synced_gpus all-reduce only includes student ranks while "
+                        "the teacher rank waits in KDMeshBridge.broadcast_command. "
+                        "Run the evaluator offline from a checkpoint instead."
+                    )
+                    self._warned_tool_call_eval_separate_meshes_skipped = True
+                metrics[f"{prefix}/_disabled_separate_meshes"] = 1.0
             else:
                 sharded = self.tool_call_evaluator.sample_shard is not None
                 try:

@@ -914,6 +914,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self.distributed_config, self._get_dp_rank(), self._get_dp_group_size()
                 )
         self._warned_tool_call_eval_skipped = False
+        self._warned_tool_call_eval_separate_meshes_skipped = False
         self.best_metric_key = self.cfg.get(
             "checkpoint.best_metric_key",
             WEIGHTED_AGGREGATE_NAME if self.domain_mixture is not None else "default",
@@ -1146,15 +1147,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         total_validation_tokens = 0
                         for val_name, val_dataloader in self.val_dataloaders.items():
                             val_log_data = self._run_validation_epoch(val_dataloader)
-                            # Route through best_metric_key so checkpoint promotion can track a
-                            # custom evaluator metric (e.g. tool_call_eval's tool_call/args_exact_match)
-                            # instead of always using raw val_loss. Falls back to val_loss when
-                            # best_metric_key isn't a key in this dataset's metrics, which also
-                            # safely covers the domain_mixture WEIGHTED_AGGREGATE_NAME default
-                            # without special-casing it here.
-                            val_losses[val_name] = val_log_data.metrics.get(
-                                self.best_metric_key, val_log_data.metrics["val_loss"]
-                            )
+                            if len(self.val_dataloaders) == 1:
+                                # Single dataset: best_metric_key has no dataset to select
+                                # among (BaseRecipe.save_checkpoint always promotes the lone
+                                # entry), so here it instead names a custom evaluator metric
+                                # inside this dataset's own metrics (e.g. tool_call_eval's
+                                # tool_call/args_exact_match). Falls back to val_loss when
+                                # best_metric_key isn't a key in this dataset's metrics.
+                                val_losses[val_name] = val_log_data.metrics.get(
+                                    self.best_metric_key, val_log_data.metrics["val_loss"]
+                                )
+                            else:
+                                # Multiple datasets (e.g. domain_mixture): best_metric_key
+                                # instead selects which *dataset* save_checkpoint promotes.
+                                # Keep every dataset's reported value as its own val_loss here
+                                # so that dataset-name selection isn't clobbered by a metric
+                                # key that coincidentally also appears inside every dataset's
+                                # metrics dict (e.g. "lr").
+                                val_losses[val_name] = val_log_data.metrics["val_loss"]
                             total_validation_tokens += val_log_data.metrics["num_label_tokens"]
                             self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                         if self.domain_mixture is not None and val_losses:

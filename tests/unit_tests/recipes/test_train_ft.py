@@ -1538,6 +1538,69 @@ def test_run_train_validation_loop_falls_back_to_val_loss_when_key_absent():
     assert saved_val_losses == {"default": pytest.approx(0.9)}
 
 
+def test_run_train_validation_loop_keeps_dataset_selection_distinct_from_inner_metric():
+    """With more than one validation dataset, best_metric_key selects which
+    *dataset* save_checkpoint promotes (see BaseRecipe.save_checkpoint); it must
+    not also be used to substitute an inner metrics-dict value for every
+    dataset. Every validation result also carries an "lr" entry, so
+    best_metric_key="lr" (naming a dataset) previously got silently
+    reinterpreted as "pick the lr metric", clobbering val_loss for datasets
+    whose metrics happen to contain that key too.
+    """
+
+    class _OneValidationStep:
+        step = 1
+        epoch = 0
+        epochs = [0]
+        is_val_step = True
+        is_ckpt_step = True
+        sigterm_flag = False
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            yield ["dummy-batch"]
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.model_parts = [MagicMock()]
+    trainer.step_scheduler = _OneValidationStep()
+    trainer.max_grad_norm = 1.0
+    trainer.partial_cuda_graph_manager = None
+    trainer._partial_cuda_graph_capture_pending = False
+    trainer._enable_qat_if_delayed = MagicMock()
+    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    trainer.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.01}])]
+    trainer._collect_moe_load_balance = MagicMock()
+    trainer._maybe_collect_garbage = MagicMock()
+    trainer.log_train_metrics = MagicMock()
+    trainer.log_val_metrics = MagicMock()
+    trainer.save_checkpoint = MagicMock()
+    trainer.domain_mixture = None
+    trainer.val_dataloaders = {"lr": object(), "other": object()}
+    # Every validation result also contains "lr" (the learning rate), identical
+    # across datasets. "val_loss" improves 0.8 -> 0.2 for the "lr" dataset while
+    # the constant lr value (0.01) must NOT be substituted in its place.
+    trainer._run_validation_epoch = MagicMock(
+        side_effect=[
+            SimpleNamespace(metrics={"val_loss": 0.2, "lr": 0.01, "num_label_tokens": 10}),
+            SimpleNamespace(metrics={"val_loss": 0.5, "lr": 0.01, "num_label_tokens": 10}),
+        ]
+    )
+    trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
+    trainer.metric_logger_valid = {
+        "lr": SimpleNamespace(close=MagicMock()),
+        "other": SimpleNamespace(close=MagicMock()),
+    }
+    trainer.checkpointer = SimpleNamespace(finalize=MagicMock())
+    trainer.best_metric_key = "lr"
+
+    trainer.run_train_validation_loop()
+
+    saved_val_losses = trainer.save_checkpoint.call_args.args[3]
+    assert saved_val_losses == {"lr": pytest.approx(0.2), "other": pytest.approx(0.5)}
+
+
 def test_compute_trust_remote_code_prefers_cfg_flag():
     cfg_model = ConfigNode({"trust_remote_code": False, "pretrained_model_name_or_path": "ignored"})
 

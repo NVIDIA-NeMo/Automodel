@@ -286,6 +286,8 @@ def _make_kd_eval_recipe(distributed_config, evaluator):
     recipe.tool_call_evaluator = evaluator
     recipe.tokenizer = object()
     recipe._warned_tool_call_eval_skipped = False
+    recipe._warned_tool_call_eval_separate_meshes_skipped = False
+    recipe.separate_meshes = False
     recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
     return recipe
 
@@ -366,3 +368,20 @@ class TestKDRunValidationToolCallEval:
         # An evaluate() that raised contributes an empty result -> zeros, count 0.
         assert out.metrics["tool_call/_count"] == 0.0
         assert out.metrics["tool_call/has_call"] == 0.0
+
+    def test_separate_meshes_skips_in_loop_eval(self, monkeypatch):
+        """With separate_meshes=true, only student ranks would enter generation
+        while the teacher rank waits in KDMeshBridge.broadcast_command on a
+        different group. HF `generate()`'s synced_gpus all-reduce targets the
+        world group, so the student ranks hang. Skip in-loop generation for
+        this combination instead of risking that hang.
+        """
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        ev = _FakeToolCallEvaluator(run_on_fsdp2=True)
+        recipe = _make_kd_eval_recipe(FSDP2Config(), ev)
+        recipe.separate_meshes = True
+        out = self._run(recipe, monkeypatch)
+        assert out.metrics["tool_call/_disabled_separate_meshes"] == 1.0
+        assert ev.eval_calls == 0  # generation never ran
+        assert recipe._warned_tool_call_eval_separate_meshes_skipped is True
