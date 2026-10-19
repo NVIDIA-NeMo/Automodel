@@ -25,6 +25,7 @@ step_scheduler:
   val_every_steps: 25
   max_steps: 100
   num_epochs: null
+  save_checkpoint_every_epoch: false
 
 dist_env:
   backend: nccl
@@ -75,9 +76,12 @@ dataloader:
   num_workers: 0
 
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   lr: 2.0e-6
   weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
 
 lr_scheduler:
   lr_warmup_steps: 10
@@ -87,7 +91,8 @@ checkpoint:
   enabled: true
   checkpoint_dir: ./output/ministral3_3b_embed_tutorial/checkpoints
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
+  max_recent_checkpoints: 2
 
 distributed:
   strategy: fsdp2
