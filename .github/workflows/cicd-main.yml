@@ -18,12 +18,13 @@ on:
   push:
     branches:
       - main
+      - "r0.[0-9]+.0"
       - "pull-request/[0-9]+"
       - "deploy-release/*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/r0.') }}
 
 permissions:
   id-token: write
@@ -339,12 +340,19 @@ jobs:
         id: setup-buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
+      - name: Select cache scope
+        id: cache-scope
+        env:
+          PR_BASE_REF: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
+        run: bash .github/scripts/select-ci-cache-scope.sh
+
       - name: Compute cache keys
         id: cache_keys
         shell: bash
+        env:
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
         run: |
-          PR_NUMBER="${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}"
-          BRANCH_SANITIZED=$(echo "${{ github.ref_name }}" | tr '/' '-' | tr -cd '[:alnum:]._-')
+          BRANCH_SANITIZED=$(echo "${GITHUB_REF_NAME}" | tr '/' '-' | tr -cd '[:alnum:]._-')
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             KEY="main"
           elif [[ -n "$PR_NUMBER" ]]; then
@@ -372,6 +380,7 @@ jobs:
           PLATFORM: ${{ steps.platform.outputs.platforms }}
           REGISTRY: ${{ matrix.registry }}
           CACHE_KEY: ${{ steps.cache_keys.outputs.key }}
+          RELEASE_BRANCH: ${{ steps.cache-scope.outputs.release_branch }}
         run: bash .github/scripts/prepare-container-dependencies.sh
 
       # DeepEP and other source builds can produce different result digests for
@@ -384,18 +393,27 @@ jobs:
         env:
           BASELINE_CACHE: ${{ matrix.registry }}/automodel:main-buildcache
           RUN_CACHE: ${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}-buildcache
+          RELEASE_BRANCH: ${{ steps.cache-scope.outputs.release_branch }}
+          REGISTRY: ${{ matrix.registry }}
         run: |
-          DONOR_CACHE="$RUN_CACHE"
-          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
-            DONOR_CACHE="$BASELINE_CACHE"
+          DONOR_CACHE="$BASELINE_CACHE"
+          CANDIDATES=("$RUN_CACHE")
+          if [[ -n "$RELEASE_BRANCH" ]]; then
+            CANDIDATES+=("${REGISTRY}/automodel:${RELEASE_BRANCH}-buildcache")
           fi
+          for candidate in "${CANDIDATES[@]}"; do
+            if docker buildx imagetools inspect "$candidate" >/dev/null 2>&1; then
+              DONOR_CACHE="$candidate"
+              break
+            fi
+          done
           echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
 
-      # Keep multi-GB cache ownership on main. Copied PR branches can restore
+      # Main and release branches own UV caches. Copied PR branches can restore
       # main's cache without consuming repository storage with scoped copies.
       - name: Restore and save uv build cache
         id: uv-build-cache-main
-        if: steps.dependencies.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        if: steps.dependencies.outputs.cache-hit != 'true' && steps.cache-scope.outputs.cache_writer == 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .buildkit-cache/uv
@@ -404,7 +422,7 @@ jobs:
 
       - name: Restore uv build cache
         id: uv-build-cache-branch
-        if: steps.dependencies.outputs.cache-hit != 'true' && github.ref != 'refs/heads/main'
+        if: steps.dependencies.outputs.cache-hit != 'true' && steps.cache-scope.outputs.cache_writer != 'true'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .buildkit-cache/uv
@@ -422,9 +440,9 @@ jobs:
             {
               ".buildkit-cache/uv": "/opt/uv_cache"
             }
-          # Branch runs are restore-only, so extracting their updated mount
+          # PR runs are restore-only, so extracting their updated mount
           # after the build would create an archive that no step persists.
-          skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.uv-build-cache-main.outputs.cache-hit == 'true' }}
+          skip-extraction: ${{ steps.cache-scope.outputs.cache_writer != 'true' || steps.uv-build-cache-main.outputs.cache-hit == 'true' }}
 
       - name: Generate GitHub App token
         id: app-token
