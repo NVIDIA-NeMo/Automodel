@@ -59,6 +59,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
   model_type: bi_encoder
   data_dir_list:
+    # 8 toy conceptual pairs synthetically generated with Google Gemini 2.5 Pro for format demonstration
     - tutorials/embedding-biencoder/sample_retrieval_data.jsonl
   data_type: train
   n_passages: 2
