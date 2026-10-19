@@ -91,6 +91,17 @@ See the [Installation Guide](/get-started/installation).
 
 The reranker's scoring projection and `model.temperature` scaling run in FP32, including under BF16 autocast. The recipe also computes cross entropy in FP32. Keep the top-level `temperature: 1.0` when using a non-unit model temperature; setup rejects two active temperature sources.
 
+The consolidated reranker export uses stock Sentence Transformers modules and includes no custom model or processor Python files. Load it without remote-code trust:
+
+```python
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder("<CHECKPOINT_DIR>/LATEST/model/consolidated", trust_remote_code=False)
+scores = reranker.predict([("query", "document")])
+```
+
+The exported scores use the trained head without the training temperature. Stock Transformers `AutoModel` and `AutoProcessor` also load the export with `trust_remote_code=False`. `AutoModel` returns backbone hidden states; the trained scoring projection is saved in `2_Dense/model.safetensors`. Stock Transformers does not provide `AutoModelForSequenceClassification` for this Mistral3 VLM architecture. Use `CrossEncoder` for ready-to-use reranker scores.
+
 To freeze model towers, use the top-level `freeze_config` section. For example, setting `freeze_vision_tower: true` and `freeze_language_model: true` within that section leaves the projector and, for reranking, the scoring head trainable.
 
 ## Related Resources

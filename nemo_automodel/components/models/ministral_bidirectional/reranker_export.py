@@ -137,7 +137,7 @@ class Mistral3RerankerMetadataExporter:
         self.dense_weight = weight.to(device="cpu", dtype=torch.float32, copy=True).contiguous()
 
     def save_model_assets(self, directory: str | Path) -> None:
-        """Write stock configs and the small standalone Transformers scoring adapter."""
+        """Write stock metadata without bundling a custom Transformers scoring adapter."""
         if self.model.config.pooling != "avg":
             raise ValueError("Portable Mistral3 reranker export requires mean pooling (pooling=avg).")
         directory = Path(directory)
@@ -145,7 +145,9 @@ class Mistral3RerankerMetadataExporter:
         config = self.model.model.get_hf_export_config()
         config.architectures = ["Mistral3ForSequenceClassification"]
         config.text_config.architectures = ["Ministral3ForSequenceClassification"]
-        config.auto_map = {"AutoModelForSequenceClassification": "model.Mistral3ForSequenceClassification"}
+        # Sentence Transformers scores with its stock Transformer/Pooling/Dense
+        # modules. Transformers AutoModel loads the stock backbone; declaring a
+        # custom classification adapter here would require trust_remote_code.
         # Do not carry training or generation temperatures into the inference export.
         for subconfig in (config, config.text_config, config.vision_config):
             for name in ("temperature", "score_temperature"):
@@ -153,7 +155,10 @@ class Mistral3RerankerMetadataExporter:
                     delattr(subconfig, name)
         config.is_causal = config.text_config.is_causal
         config.save_pretrained(directory)
-        shutil.copyfile(Path(__file__).with_name("reranker_model.py"), directory / "model.py")
+        # An export may overwrite a checkpoint produced by the old custom-code
+        # exporter. Remove only the two Python assets owned by that exporter.
+        for filename in ("model.py", "processor.py"):
+            (directory / filename).unlink(missing_ok=True)
 
     def save(
         self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None, v4_compatible: bool

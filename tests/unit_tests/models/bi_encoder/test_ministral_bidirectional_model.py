@@ -2077,11 +2077,11 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
 
 
 @pytest.mark.runtime_budget(
-    75,
-    reason="two real export/reload paths plus isolated Transformers and ST inference took 56.8s under CI coverage",
+    30,
+    reason="two real export/reload paths plus isolated stock Transformers inference",
 )
 def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Trained heads export through both save paths into stock ST modules and portable Transformers."""
+    """Both save paths preserve trained scores without bundling or executing custom Python."""
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     # Share interpreter/import startup, but build and verify each export independently.
     export_dirs = [tmp_path / "direct", tmp_path / "consolidated"]
@@ -2140,6 +2140,10 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
                 metadata={"format": "pt"},
             )
         else:
+            # Re-exporting an older checkpoint must remove its obsolete custom code.
+            export_dir.mkdir()
+            for filename in ("model.py", "processor.py"):
+                (export_dir / filename).write_text('raise RuntimeError("obsolete export code was executed")\n')
             encoder.save_pretrained(str(export_dir), tokenizer=processor)
         metadata = json.loads((export_dir / "config_sentence_transformers.json").read_text())
         assert metadata["model_type"] == "CrossEncoder"
@@ -2153,8 +2157,7 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
         serialized_tokenizer = json.loads((export_dir / "tokenizer.json").read_text())
         assert serialized_tokenizer["truncation"] is None
         assert serialized_tokenizer["padding"] is None
-        assert (export_dir / "model.py").is_file()
-        assert not (export_dir / "processor.py").exists()
+        assert not list(export_dir.rglob("*.py"))
         from safetensors.torch import load_file
 
         dense_weight = load_file(export_dir / "2_Dense/model.safetensors")["linear.weight"]
@@ -2166,9 +2169,8 @@ def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, mon
             assert "temperature" not in subconfig
             assert "score_temperature" not in subconfig
         assert encoder.effective_score_temperature == 0.02
-        assert saved_config["auto_map"] == {
-            "AutoModelForSequenceClassification": "model.Mistral3ForSequenceClassification"
-        }
+        for subconfig in (saved_config, saved_config["text_config"], saved_config["vision_config"]):
+            assert "auto_map" not in subconfig
         restored = CrossEncoderModel.build(str(export_dir), attn_implementation="eager").eval()
         assert restored.effective_score_temperature == 1.0
         torch.testing.assert_close(restored(**model_inputs).logits, expected, rtol=1e-5, atol=1e-7)
@@ -2182,11 +2184,12 @@ import torch
 # Tiny CPU forwards are faster without thread-pool scheduling overhead.
 torch.set_num_threads(1)
 from PIL import Image
-from transformers import AutoModelForSequenceClassification, AutoProcessor
+from safetensors.torch import load_file
+from transformers import AutoModel, AutoProcessor
 directories = sys.argv[1:]
 for directory in directories:
     expected = torch.load(directory + ".pt", weights_only=True)
-    model = AutoModelForSequenceClassification.from_pretrained(directory, trust_remote_code=True, attn_implementation="eager").eval()
+    model = AutoModel.from_pretrained(directory, trust_remote_code=False, attn_implementation="eager").eval()
     processor = AutoProcessor.from_pretrained(directory, trust_remote_code=False)
     long_messages = [{"role": "query", "content": "What?"}, {"role": "document", "content": "literal " * 45}]
     long_inputs = processor.apply_chat_template(long_messages, tokenize=True, return_dict=True, return_tensors="pt")
@@ -2204,17 +2207,23 @@ for directory in directories:
     assert set(inputs) == set(expected["inputs"])
     for key, value in inputs.items():
         torch.testing.assert_close(value, expected["inputs"][key], rtol=0, atol=0)
-    assert model.state_dict().keys() == expected["state"].keys()
+    backbone_state = {key.removeprefix("model."): value for key, value in expected["state"].items() if key.startswith("model.")}
+    assert model.state_dict().keys() == backbone_state.keys()
     for key, value in model.state_dict().items():
-        torch.testing.assert_close(value, expected["state"][key], rtol=0, atol=0)
+        torch.testing.assert_close(value, backbone_state[key], rtol=0, atol=0)
     with torch.no_grad():
-        torch.testing.assert_close(model(**inputs).logits, expected["logits"], rtol=1e-6, atol=1e-6)
+        hidden = model(**inputs).last_hidden_state
+        pooled = hidden.masked_fill(~inputs["attention_mask"][..., None].bool(), 0).sum(1) / inputs["attention_mask"].sum(1)[:, None]
+        head = load_file(directory + "/2_Dense/model.safetensors")["linear.weight"]
+        torch.testing.assert_close(head, expected["state"]["score.weight"], rtol=0, atol=0)
+        scores = torch.nn.functional.linear(pooled.float(), head.float())
+        torch.testing.assert_close(scores, expected["logits"], rtol=1e-6, atol=1e-6)
         tuple_output = model(**inputs, return_dict=False)
         assert isinstance(tuple_output, tuple)
-        torch.testing.assert_close(tuple_output[0], expected["logits"], rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(tuple_output[0], hidden, rtol=1e-6, atol=1e-6)
         model.config.return_dict = False
         assert isinstance(model(**inputs), tuple)
-        assert hasattr(model(**inputs, return_dict=True), "logits")
+        assert hasattr(model(**inputs, return_dict=True), "last_hidden_state")
 assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") for name in sys.modules)
 """
     result = subprocess.run(
@@ -2227,7 +2236,7 @@ assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") fo
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
-    # The child proves that exported model/processor code works without AutoModel.
+    # The child proves that stock Transformers can reproduce scores without NeMo AutoModel.
     # Check ST interoperability here to avoid importing its training dependencies
     # again in the child; retain token and score parity for both export paths.
     from sentence_transformers import CrossEncoder
