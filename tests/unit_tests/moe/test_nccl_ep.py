@@ -359,7 +359,7 @@ def test_empty_experts_keep_dispatch_backward_edge(tokens, lora, packed, expert_
     out = experts(
         torch.ones(tokens, config.dim),
         torch.zeros(tokens, dtype=torch.bool),
-        torch.ones(tokens, 2),
+        torch.ones(tokens, 2, requires_grad=True),
         torch.zeros(tokens, 2, dtype=torch.int64),
     )
     out.sum().backward()

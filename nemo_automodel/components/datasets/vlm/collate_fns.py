@@ -1129,14 +1129,24 @@ def nemotron_parse_collate_fn(
     return batch
 
 
-def _ensure_rgb(conversations):
-    """Convert any PIL images in conversations to RGB to handle RGBA/grayscale inputs."""
+def _ensure_rgb(conversations, preserve_alpha: bool = False):
+    """Convert any PIL images in conversations to RGB to handle RGBA/grayscale inputs.
+
+    Args:
+        conversations: Conversation samples whose image items are normalized in place.
+        preserve_alpha: When True, RGBA images are passed through unchanged so the
+            image processor can apply its own alpha handling (e.g. flattening onto
+            white). PIL's plain ``convert("RGB")`` discards the alpha channel,
+            exposing the raw RGB values of fully transparent pixels.
+    """
     for conv in conversations:
         for turn in conv:
             content = turn.get("content")
             if isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict) and isinstance(item.get("image"), PILImage.Image):
+                        if preserve_alpha and item["image"].mode == "RGBA":
+                            continue
                         item["image"] = item["image"].convert("RGB")
     return conversations
 
@@ -1262,6 +1272,7 @@ def default_collate_fn(
     processor,
     max_length: int | None = None,
     drop_overlong: bool = False,
+    preserve_alpha: bool = False,
     _post_tokenize_hook=None,
 ) -> dict[str, Any]:
     """Default collate function for multimodal VLM datasets.
@@ -1271,6 +1282,12 @@ def default_collate_fn(
         processor: Multimodal processor used to apply the chat template.
         max_length: Optional maximum token sequence length.
         drop_overlong: Whether to remove samples estimated to exceed ``max_length``.
+        preserve_alpha: When True, RGBA images keep their alpha channel until
+            the image processor runs, letting processors with alpha-aware
+            handling (e.g. flattening onto white) see the original
+            transparency. Defaults to False (alpha is dropped while converting
+            to RGB), matching the behavior of stock HuggingFace image
+            processors.
         _post_tokenize_hook: Optional callable ``(batch, processor) -> batch``
             invoked right after ``apply_chat_template`` and before
             ``build_labels``.  Used by model-specific collate wrappers
@@ -1284,7 +1301,7 @@ def default_collate_fn(
         whose tensor elements preserve their processor-defined shapes; image lists
         commonly contain tensors of shape [channels, height, width].
     """
-    conversations = _ensure_rgb([example["conversation"] for example in examples])
+    conversations = _ensure_rgb([example["conversation"] for example in examples], preserve_alpha=preserve_alpha)
 
     # Optionally drop overlong samples before processing
     if max_length is not None and drop_overlong:
@@ -1669,12 +1686,12 @@ def neat_packed_vlm_collater(
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)
-    for key in ("pixel_values", "pixel_values_videos"):
+    for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = _merge_media_values(tensors)
 
-    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts", "num_patches"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
@@ -1808,12 +1825,12 @@ def packed_sequence_thd_vlm_collater(
         "qkv_format": "thd",
     }
 
-    for key in ("pixel_values", "pixel_values_videos"):
+    for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = _merge_media_values(tensors)
 
-    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts", "num_patches"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)

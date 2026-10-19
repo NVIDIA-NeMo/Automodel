@@ -40,14 +40,14 @@ embedding matrix. Excluding that matrix gives approximately 26.6B.
 
 ## Recipes
 
-Run the commands below from [the linked recipe revision](https://github.com/NVIDIA-NeMo/Automodel/tree/94a6317c7bd28c5397ed34d7155fc6d43264ed3b).
+Run the commands below from the AutoModel repository root on the `main` branch.
 
 | Recipe | Hardware and parallelism | Data |
 | --- | --- | --- |
-| [Full SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/94a6317c7bd28c5397ed34d7155fc6d43264ed3b/examples/llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml) | 11 nodes x 4 GB200; EP44; global batch 44 | Tulu3, 4,096 tokens |
-| [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/94a6317c7bd28c5397ed34d7155fc6d43264ed3b/examples/llm_finetune/stepfun/step_5_preview_tulu3_lora.yaml) | 2 nodes x 4 GB200; EP8; global batch 8; rank 32 | Tulu3, 4,096 tokens |
-| [Long-context SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/94a6317c7bd28c5397ed34d7155fc6d43264ed3b/examples/llm_finetune/stepfun/step_5_preview_tulu3_packed128k_cp32.yaml) | 16 nodes x 8 H100; PP4 / CP32 / EP32, interleaved 1F1B; global batch 8 | Tulu3 packed to 131,072 tokens |
-| [Benchmark](https://github.com/NVIDIA-NeMo/Automodel/blob/94a6317c7bd28c5397ed34d7155fc6d43264ed3b/examples/llm_benchmark/step/step_5_preview_full92_mock_h100.yaml) | 16 nodes x 8 H100; PP4 / EP32; global batch 768 | Mock, 8,192 tokens |
+| [Full SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml) | 11 nodes x 4 GB200; EP44; global batch 44 | Tulu3, 4,096 tokens |
+| [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_lora.yaml) | 2 nodes x 4 GB200; EP8; global batch 8; rank 32 | Tulu3, 4,096 tokens |
+| [Long-context SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_packed128k_cp32.yaml) | 16 nodes x 8 H100; PP4 / CP32 / EP32, interleaved 1F1B; global batch 8 | Tulu3 packed to 131,072 tokens |
+| [Benchmark](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/step/step_5_preview_full92_mock_h100.yaml) | 16 nodes x 8 H100; PP4 / EP32; global batch 768 | Mock, 8,192 tokens |
 
 The recipes load the model and tokenizer from
 [`stepfun-ai/Step-5-Preview-BF16`](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
@@ -127,7 +127,7 @@ passing local, unshifted labels directly to the CP model. See
 ## Full-Depth H100 Benchmark
 
 The
-[benchmark recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/94a6317c7bd28c5397ed34d7155fc6d43264ed3b/examples/llm_benchmark/step/step_5_preview_full92_mock_h100.yaml)
+[benchmark recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/step/step_5_preview_full92_mock_h100.yaml)
 uses the native `nemo_automodel.recipes.llm.benchmark` entry point; its header
 contains the launch command.
 
@@ -136,7 +136,7 @@ contains the launch command.
 | Hardware | 16 nodes, 128 NVIDIA H100 80GB GPUs |
 | Model | All 92 decoder layers; random initialization through `from_config` |
 | Parallelism | EP32 / PP4 / CP1 / TP1; DP32 with EP over the data-parallel ranks |
-| Pipeline | 1F1B, one local stage per rank, 24 microbatches; layer partitions [0,24), [24,46), [46,70), [70,92) |
+| Pipeline | 1F1B, one local stage per rank, 24 microbatches; 23 decoder layers per stage |
 | Sequence / global batch | 8,192 tokens / 768 sequences |
 | Data and MoE routing | Mock documents; fake balanced static expert routing |
 | Attention | Learned CSA selection; SWA varlen and CSA forward/backward full-block paths enabled |

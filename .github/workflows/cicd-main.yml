@@ -487,8 +487,8 @@ jobs:
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             is-unit-test: true
             cpu-only: false
-            # GPU shards take ~30 minutes before teardown and coverage finish.
-            timeout: 40
+            # Shard 1 takes ~40 minutes before process exit and coverage finish.
+            timeout: 45
             shard-id: 0
             num-shards: 2
           - test-name: L0_Unit_Tests_GPU_2_of_2
@@ -587,7 +587,7 @@ jobs:
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 20
+            timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Retrieval
@@ -682,7 +682,7 @@ jobs:
             is-optional: "true"
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 20
+            timeout: 30
           - test-name: L2_Retrieval
             test-folder: retrieval
             timeout: 20

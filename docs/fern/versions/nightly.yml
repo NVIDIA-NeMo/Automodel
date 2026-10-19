@@ -404,6 +404,13 @@ navigation:
                 path: ../../model-coverage/llm/qwen/qwen3-8-flash-next.mdx
               - page: "QwQ-32B"
                 path: ../../model-coverage/llm/qwen/qwq-32b.mdx
+          - section: "Reflection AI"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRnABAABXRUJQVlA4TGMBAAAvE8AEAB/jppEkScrxlj+8A3Hn/dcdNNxGkqRIteL5b9e5QRrj/3Q5biRJkXLZf8/Wj9W+4LC7cv6DJk6LUAg66leFmmr34bCJ53LZKt/nbdMe82l+f//6I2797qhJFM2/adi0+QpD9A9CqhRpEHyvDwQBHKXaolCC8TreNo3YxPyLtCpGZBAhBhGDGEgjQkDiACgRgwwgEQIiCoBECIOIRAyARASVAEKhFBEDIMW4us1pEzgOAMBsrk1t27aN2LXt/ZeIXh0gov8K27ZtsnfSnkFR5F8iIZukBDi55GGSnOL0FJfzhm92TwT8OiKfLy7lbd0fC6bn97DV7GwvJcT1vd3bM1ItqoEG2A8iwNds7jlhhyk3MOoN2tIZESGTf4+ZYdKlEkBXvsAkSfI9z+D8iFYKEICAbS8JI5uaLx5IzG4hi8nRWssad0yjcyLh9270Xih8DLn6yf4KJRUQk//pfyIJAA=="/></svg>'
+            slug: reflection
+            path: ../../model-coverage/llm/reflection/index.mdx
+            contents:
+              - page: "Beam-1.0-501B-A23B"
+                path: ../../model-coverage/llm/reflection/beam-1-0-501b-a23b.mdx
           - section: "Stability AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRrwBAABXRUJQVlA4TLABAAAvE8AEEK/CNrJtJQd3iDwkJKIAqqUSmqAOd3m04biRJEXKmmVyYW1Z/3978D4PmKGnGEaSFKUB//zMP4tfF6e2bRvb/uzv+9XVbKP++X+7/0FQ7WQkJScbAQjowAAFgAAEIKC8f0IqUZ8cu4ufByp51cMa/21spwxl26xf0Xt6yx9+QLn53vYxfvmIelus+uGgh7PWtPCMmYKrfHT18jL7+R26jIrp5UHJZIv9SwkYqjaJxBQxXZi/oXcnWUVV1lu0Kx+1BONH9/3xkX3J6ePOGioPJVJ/XEqU7fhZ5HLSoi9nF9nxWlYF1nf7+kU1pKl9KM2pFc4EZ4I9Qzxh3K+3YhBDeUP3e39AdgBzqkNVM3U+dO1h20BBtewiINa2bbrK84tt2y/mtxknq/9eYhQQ0f8J4AauZm5DPGbCCUWSiXhqIQiHTIgEvD7PnENE0kF/OBoLzThwQqZeywEHMTGqzUalkEWU5H0C5Ivlr9JSBGmXQKsNxt3nPRsLuyc89sajYffjAbvZibKlC53+z9/v+2Cq2zQH6hYCT28vr8+A1aVypMiR+v/3twGsFdMBVws="/></svg>'
             slug: stabilityai
