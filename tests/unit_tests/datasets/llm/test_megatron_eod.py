@@ -286,15 +286,22 @@ class TestGetItemDocumentBoundaryOutput:
         ds.masks_and_position_ids_are_cached = False
         return ds
 
-    def test_position_ids_returned_when_reset_enabled(self):
-        sample = self._dataset(reset_position_ids=True)[0]
+    @pytest.mark.parametrize("create_attention_mask", [False, True])
+    def test_position_ids_returned_when_reset_enabled(self, create_attention_mask):
+        sample = self._dataset(reset_position_ids=True, create_attention_mask=create_attention_mask)[0]
         assert "position_ids" in sample
         # tokens are [5, EOD, 7, 8, EOD]: positions restart after each EOD.
         assert sample["position_ids"].tolist() == [0, 1, 0, 1, 2]
+        assert sample["attention_mask"].tolist() == [1, 1, 1, 1, 1]
+        padded = self._dataset(
+            text=[5, EOD, 7, 0, 0, 0], reset_position_ids=True, create_attention_mask=create_attention_mask
+        )[0]
+        assert padded["attention_mask"].tolist() == [1, 1, 1, 0, 0]
 
     def test_position_ids_absent_when_reset_disabled(self):
         sample = self._dataset()[0]
         assert "position_ids" not in sample
+        assert "attention_mask" not in sample
 
     def test_eod_mask_loss_encodes_ignore_index_in_labels(self):
         sample = self._dataset(eod_mask_loss=True)[0]
@@ -370,9 +377,12 @@ class TestGetItemDocumentBoundaryOutput:
             attn_pdrop=0,
             resid_pdrop=0,
             embd_pdrop=0,
+            tie_word_embeddings=False,
         )
         config._attn_implementation = attention_implementation
-        model = GPT2LMHeadModel(config).eval()
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(123)
+            model = GPT2LMHeadModel(config).eval()
         inputs = {key: batch[key] for key in ("input_ids", "position_ids", "attention_mask")}
         with torch.no_grad():
             output = model(**inputs).logits
@@ -382,6 +392,22 @@ class TestGetItemDocumentBoundaryOutput:
             isolated = model(input_ids=torch.tensor([[7, 8, EOD]])).logits
         torch.testing.assert_close(output[:, 2:], changed[:, 2:], rtol=0, atol=0)
         torch.testing.assert_close(output[0, 2:], isolated[0], rtol=1e-5, atol=1e-6)
+
+        # The output head is untied so this row can receive gradients only through
+        # the input token's participation in attention, not as an output class.
+        embedding = model.get_input_embeddings().weight
+        assert embedding.data_ptr() != model.get_output_embeddings().weight.data_ptr()
+        inputs["input_ids"] = batch["input_ids"]
+        for reset_attention in (False, True):
+            model.zero_grad(set_to_none=True)
+            inputs["attention_mask"] = batch["attention_mask"] if reset_attention else None
+            logits = model(**inputs).logits[:, 2:]
+            loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 100), batch["labels"][:, 2:].reshape(-1))
+            loss.backward()
+            assert torch.count_nonzero(embedding.grad[7:9]).item() > 0
+            # Token 5 occurs exclusively in document one. The causal control
+            # must detect cross-document flow; resetting attention must stop it.
+            assert (torch.count_nonzero(embedding.grad[5]).item() == 0) is reset_attention
 
     def test_labels_untouched_when_eod_mask_loss_disabled(self):
         sample = self._dataset()[0]

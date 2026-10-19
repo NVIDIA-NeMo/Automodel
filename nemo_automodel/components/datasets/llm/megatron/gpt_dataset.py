@@ -268,6 +268,37 @@ class GPTDataset(torch.utils.data.Dataset):
         config (GPTDatasetConfig): The config
     """
 
+    def __getstate__(self) -> dict[str, object]:
+        """Serialize cached numeric indices by path instead of copying mmap buffers.
+
+        Returns:
+            Instance state with read-only document_index [documents], sample_index
+            [samples + 1, 2] and shuffle_index [samples] replaced by their .npy
+            paths. Optional cached_attention_mask [1, sequence, sequence] and
+            cached_loss_mask/cached_position_ids [sequence] retain normal tensor
+            serialization. Parent-process arrays and readers remain open.
+        """
+        state = self.__dict__.copy()
+        for name in ("document_index", "sample_index", "shuffle_index"):
+            value = state[name]
+            if isinstance(value, numpy.memmap) and value.mode == "r":
+                state[name] = value.filename
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        """Reopen process-local read-only indices after worker deserialization.
+
+        Args:
+            state: Instance state from __getstate__, including optional cached
+                attention mask [1, sequence, sequence] and loss mask/positions
+                [sequence]. Numeric index paths are reopened as read-only maps.
+        """
+        for name in ("document_index", "sample_index", "shuffle_index"):
+            value = state[name]
+            if isinstance(value, (str, os.PathLike)):
+                state[name] = numpy.load(value, allow_pickle=False, mmap_mode="r")
+        self.__dict__.update(state)
+
     def __init__(
         self,
         indexed_dataset: IndexedDataset,
@@ -426,8 +457,10 @@ class GPTDataset(torch.utils.data.Dataset):
             Mapping with integer input_ids and labels of shape [sequence] and
             floating loss_mask of shape [sequence]. EOD-masked labels contain
             -100. When requested, position_ids has shape [sequence] and
-            attention_mask has shape [1, sequence, sequence]. Reset attention
-            masks are additive float32 masks: zero permits attention and
+            attention_mask has shape [1, sequence, sequence]. Position-only
+            resets instead return a binary mask [sequence], with one for valid
+            tokens, to keep attention segmentation independent of rotary positions.
+            Reset attention masks are additive float32 masks: zero permits attention and
             negative infinity blocks it. Without reset_attention_mask, the
             legacy boolean mask uses True to block attention.
         """
@@ -491,7 +524,14 @@ class GPTDataset(torch.utils.data.Dataset):
             "labels": labels,
             "loss_mask": loss_mask,
         }
-        if self.config.create_attention_mask:
+        if self.config.reset_position_ids and not self.config.reset_attention_mask:
+            # HF otherwise infers packed-document boundaries from discontinuous
+            # rotary positions. A binary mask requests ordinary physical causal
+            # attention without allocating a quadratic mask in the dataset.
+            # Flash attention additionally needs a supported varlen contract;
+            # the recipe validates that backend/loader combination before use.
+            sample["attention_mask"] = (~tokens_pad_mask).long()
+        elif self.config.create_attention_mask:
             if self.config.reset_attention_mask:
                 # The helper uses Megatron's True=blocked convention. HF eager
                 # attention and SDPA accept an additive mask without differing

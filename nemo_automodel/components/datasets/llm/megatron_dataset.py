@@ -50,7 +50,10 @@ class MegatronPretrainingConfig:
     seq_length: int = 2048
     """Sequence length."""
     create_attention_mask: bool = False
-    """Whether to generate attention masks (not supported with fused/flash attention)."""
+    """Whether to generate dense attention masks (not supported with fused/flash attention).
+
+    Position-only resets supply a binary validity mask independently of this flag.
+    """
     reset_position_ids: bool = field(default=False, kw_only=True)
     """Whether to reset position IDs at document boundaries (EOD tokens)."""
     reset_attention_mask: bool = field(default=False, kw_only=True)
@@ -199,7 +202,8 @@ class MegatronPretraining:
             tokenizer (Optional[PreTrainedTokenizerBase]): An instance of a PreTrainedTokenizerBase object.
             micro_batch_size (int): Batch size per GPU.
             global_batch_size (int): Global batch size.
-            create_attention_mask (bool): Option to enable the attention masks generation.
+            create_attention_mask (bool): Option to generate dense attention masks.
+                Position-only resets still supply a binary validity mask.
                 Not supported with fused and flash attention.
             reset_position_ids (bool): Option to reset position IDs at document boundaries
                 (EOD tokens).

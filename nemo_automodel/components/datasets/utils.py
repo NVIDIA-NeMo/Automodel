@@ -352,10 +352,11 @@ def packed_sequence_thd_collater(batch):
     - Padding and stacking seq_lens and seq_lens_padded with sentinel value -1000
     - Including 'qkv_format': 'thd' in the output to indicate THD format
 
-    When batch items lack packed-sequence metadata (seq_lens, seq_lens_padded, position_ids),
-    such as samples from ChatDataset, this collater synthesizes the missing fields so that each
-    sample is treated as a single-sequence "pack". Variable-length sequences are padded to the
-    longest length in the batch. This enables using THD format with TE context parallelism
+    When batch items lack seq_lens, this collater synthesizes length metadata so each sample
+    is treated as a single-sequence "pack". Supplied position_ids are preserved; otherwise they
+    default to consecutive indices. Variable-length sequences are padded to the longest length
+    in the batch, with padding positions using their physical token indices. Input records and
+    their tensors are not modified. This enables using THD format with TE context parallelism
     without requiring the dataset to perform actual sequence packing.
 
     Args:
@@ -369,8 +370,9 @@ def packed_sequence_thd_collater(batch):
             - 'seq_lens_padded': List[int] - Sequence lengths including identifier/padding tokens
 
             For non-packed data (e.g. ChatDataset), each dictionary needs only:
-            - 'input_ids': List[int] - Token IDs (variable length across batch)
-            - 'labels': List[int] - Labels (same length as input_ids)
+            - 'input_ids': List[int] or 1D tensor [sequence] - Token IDs (variable length across batch)
+            - 'labels': List[int] or 1D tensor [sequence] - Labels (same length as input_ids)
+            - 'position_ids': List[int] or 1D tensor [sequence] - Optional positions matching input_ids
             - 'attention_mask': List[int] - (optional) 1 for real tokens, 0 for padding
 
             Example batch with 2 packed examples, both with 6 total tokens:
@@ -403,6 +405,7 @@ def packed_sequence_thd_collater(batch):
         Note: seq_lens and seq_lens_padded are padded with -1000 to handle variable number of
         packed sequences per example. These sentinel values should be filtered out before use.
     """
+    batch = [dict(item) for item in batch]
     # Extract and remove padding token metadata if present
     pad_token_ids = None
     if len(batch) > 0 and "___PAD_TOKEN_IDS___" in batch[0]:
@@ -433,7 +436,18 @@ def packed_sequence_thd_collater(batch):
             # seq_lens_padded must cover the full padded length so that
             # cu_seqlens_padded[-1] == total_tokens in the downstream THD pipeline.
             item["seq_lens_padded"] = [max_len]
-            item["position_ids"] = list(range(max_len))
+            position_ids = list(range(max_len))
+            if "position_ids" in item:
+                if item["position_ids"] is None:
+                    raise ValueError("position_ids must be a 1D sequence matching input_ids, got None")
+                supplied_positions = torch.as_tensor(item["position_ids"])
+                if supplied_positions.ndim != 1 or supplied_positions.numel() != cur_len:
+                    raise ValueError(
+                        f"position_ids must have shape ({cur_len},) matching input_ids, "
+                        f"got {tuple(supplied_positions.shape)}"
+                    )
+                position_ids[:cur_len] = supplied_positions.tolist()
+            item["position_ids"] = position_ids
 
             if pad_amount > 0:
                 item["input_ids"] = list(item["input_ids"]) + [input_ids_pad] * pad_amount
