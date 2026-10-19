@@ -180,6 +180,105 @@ def test_preview_rejects_unsafe_navigation(tmp_path: Path, proposed: str) -> Non
     assert not (tmp_path / "injected").exists()
 
 
+@pytest.mark.parametrize("invalid_slug", [False, True])
+def test_preview_navigation_uses_pr_cards_instead_of_retained_fallbacks(tmp_path: Path, invalid_slug: bool) -> None:
+    """Renames and deletions affect navigation even while old pages remain staged."""
+    categories = {
+        "llm": "large-language-models",
+        "vlm": "vision-language-models",
+        "multimodal": "multimodal",
+        "omni": "omni",
+        "dllm": "dllm",
+        "diffusion": "diffusion",
+        "embedding": "embedding-models",
+        "reranker": "reranking-models",
+    }
+    provider = {
+        "section": "Trusted Provider",
+        "slug": "provider",
+        "icon": "trusted-icon",
+        "path": "../../model-coverage/llm/provider/index.mdx",
+        "contents": [
+            {"page": "Model-V1", "path": "../../model-coverage/llm/provider/old-name.mdx"},
+            {"page": "Deleted", "path": "../../model-coverage/llm/provider/deleted.mdx"},
+        ],
+    }
+    navigation = [
+        {"page": "Guide", "path": "../../guides/guide.mdx"},
+        {
+            "section": "Model Coverage",
+            "contents": [
+                {"section": directory, "slug": slug, "contents": [provider] if directory == "llm" else []}
+                for directory, slug in categories.items()
+            ],
+        },
+    ]
+    route = "/nemo/automodel/nightly/model-coverage/large-language-models/provider/Model-V1"
+    unrelated_redirect = {"source": "/old-guide", "destination": "/guide"}
+    config = {"title": "Trusted Site", "redirects": [{"source": route, "destination": "/retired"}, unrelated_redirect]}
+    trusted = {
+        "fern/versions/nightly.yml": yaml.safe_dump({"navigation": navigation}),
+        "fern/docs.yml": yaml.safe_dump(config),
+        "guides/guide.mdx": "Trusted guide",
+        "model-coverage/llm/provider/index.mdx": "Trusted provider index",
+        # The old filename intentionally disagrees with its canonical slug.
+        "model-coverage/llm/provider/old-name.mdx": "---\nslug: model-coverage/large-language-models/provider/Model-V1\n---\nOld card",
+        "model-coverage/llm/provider/deleted.mdx": "---\nslug: model-coverage/large-language-models/provider/deleted\n---\nDeleted card",
+    }
+    slug = "wrong-route" if invalid_slug else route.removeprefix("/nemo/automodel/nightly/")
+    proposed = {
+        "fern/versions/nightly.yml": "PR navigation must not be used",
+        "fern/docs.yml": "PR configuration must not be used",
+        "model-coverage/llm/provider/index.mdx": "Updated provider index",
+        "model-coverage/llm/provider/Model-V1.mdx": f"---\nslug: {slug}\n---\nRenamed card",
+    }
+    for source, files in (("trusted-source", trusted), ("pr-source", proposed)):
+        for name, content in files.items():
+            path = tmp_path / source / "docs" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+
+    workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
+    steps = {step["name"]: step for step in workflow["jobs"]["preview"]["steps"]}
+    env = {**os.environ, "RUNNER_TEMP": str(tmp_path / "runner")}
+    subprocess.run(
+        ["bash", "-e", "-c", steps["Prepare preview docs"]["run"]],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-c", steps["Resolve model card paths in trusted navigation"]["run"]],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if invalid_slug:
+        assert result.returncode != 0
+        assert "Model card filename must match its public checkpoint URL" in result.stderr
+        assert "Model-V1.mdx" in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+
+    preview = tmp_path / "runner/fern-preview/docs"
+    assert (preview / "model-coverage/llm/provider/old-name.mdx").is_file()
+    assert (preview / "model-coverage/llm/provider/deleted.mdx").is_file()
+    actual = yaml.safe_load((preview / "fern/versions/nightly.yml").read_text())["navigation"]
+    assert actual[0] == navigation[0]
+    actual_provider = actual[1]["contents"][0]["contents"][0]
+    assert actual_provider == {
+        **provider,
+        "contents": [{"page": "Model-V1", "path": "../../model-coverage/llm/provider/Model-V1.mdx"}],
+    }
+    assert yaml.safe_load((preview / "fern/docs.yml").read_text()) == {
+        **config,
+        "redirects": [unrelated_redirect],
+    }
+
+
 @pytest.mark.parametrize("job", ["linting", "import_linting", "type_checking"])
 def test_code_lint_jobs_use_docs_only_preflight(job: str) -> None:
     """All code lint jobs honor the same docs-only decision as training CI."""
