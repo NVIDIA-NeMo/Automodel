@@ -1145,6 +1145,7 @@ def test_sharded_token_layout_retains_negotiation(mock_recipe, monkeypatch, axis
     from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDataset
 
     mock_recipe.dataloader.dataset = MockIterableDataset(seq_len=2048, batch_size=4)
+    mock_recipe.dataloader.batch_size = None
     mock_recipe.cfg.distributed = SimpleNamespace(**{axis: 2})
     context = MagicMock()
     monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.hybrid_ep_token_capacity", context)
