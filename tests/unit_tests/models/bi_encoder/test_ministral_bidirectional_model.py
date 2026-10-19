@@ -2077,8 +2077,8 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
 
 
 @pytest.mark.runtime_budget(
-    30,
-    reason="two real export/reload paths plus isolated stock Transformers inference",
+    75,
+    reason="two real export/reload paths plus isolated Transformers and ST inference took 56.8s under CI coverage",
 )
 def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Both save paths preserve trained scores without bundling or executing custom Python."""
