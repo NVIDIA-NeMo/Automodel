@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Full-parameter Qwen3.8-2.4T-A95B text SFT run validated on 256 GPUs:
+# Full-parameter Qwen3.8-2.4T-A95B text SFT configuration for 256 GPUs:
 #   64 nodes x 4 GPUs, EP32 x PP8, DP32, 100 steps, lr=1e-5.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -44,7 +44,10 @@ model:
   use_sdpa_patching: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
+    # Avoid masked BF16/HD256 cuDNN SDPA backward NaNs on GB200.
+    # FA4 uses varlen attention for padding; CP remains disabled in this recipe.
+    # https://github.com/pytorch/pytorch/issues/200406
+    attn: fa4
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
