@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from typing import Any, Callable, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
 from nemo_automodel.shared.import_utils import safe_import
@@ -61,6 +63,21 @@ def initialize_attn_module_and_func(
         default_enable_gqa = cast(bool, kwargs.get("enable_gqa", num_gqa_groups is not None))
 
         def attn_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **call_kwargs: Any) -> torch.Tensor:
+            """Apply SDPA to head-major tensors without mutating the inputs.
+
+            Args:
+                q: Tensor of shape [..., query_heads, query_sequence, head_dim].
+                k: Tensor of shape [..., kv_heads, key_sequence, head_dim].
+                v: Tensor of shape [..., kv_heads, key_sequence, value_dim].
+                    Leading batch dimensions are arbitrary; Q/K/V share dtype
+                    and device. With GQA, query_heads is divisible by kv_heads.
+                **call_kwargs: SDPA overrides. ``attn_mask`` is a boolean keep
+                    mask or additive floating-point mask broadcastable to
+                    [..., query_heads, query_sequence, key_sequence].
+
+            Returns:
+                Tensor of shape [..., query_heads, query_sequence, value_dim].
+            """
             unexpected_call_kwargs = call_kwargs.keys() - supported_sdpa_kwargs
             if unexpected_call_kwargs:
                 raise TypeError(f"Unsupported SDPA attention kwargs: {sorted(unexpected_call_kwargs)}")
@@ -75,16 +92,41 @@ def initialize_attn_module_and_func(
                 k = k.repeat_interleave(groups, dim=-3)
                 v = v.repeat_interleave(groups, dim=-3)
                 enable_gqa = False
-            return F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
-                scale=scale,
-                enable_gqa=enable_gqa,
-            )
+            kernel_context = nullcontext()
+            if (
+                q.is_cuda
+                and q.dtype == torch.bfloat16
+                and q.shape[-1] == 256
+                and attn_mask is not None
+                and torch.is_grad_enabled()
+                and (q.requires_grad or k.requires_grad or v.requires_grad)
+            ):
+                # cuDNN SDPA (reproduced with 9.25 on GB200) can return NaN dQ
+                # for masked BF16/head-dim-256 attention despite finite inputs,
+                # outputs and upstream gradients. Keep the mask and SDPA math
+                # unchanged; exclude only that backend for this backward path.
+                # Respect caller-disabled backends and restore flags on exit.
+                backends = [
+                    backend
+                    for backend, enabled in (
+                        (SDPBackend.FLASH_ATTENTION, torch.backends.cuda.flash_sdp_enabled()),
+                        (SDPBackend.EFFICIENT_ATTENTION, torch.backends.cuda.mem_efficient_sdp_enabled()),
+                        (SDPBackend.MATH, torch.backends.cuda.math_sdp_enabled()),
+                    )
+                    if enabled
+                ]
+                kernel_context = sdpa_kernel(backends)
+            with kernel_context:
+                return F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                    is_causal=is_causal,
+                    scale=scale,
+                    enable_gqa=enable_gqa,
+                )
 
         return None, attn_func
     elif attn_impl == "fa4":
