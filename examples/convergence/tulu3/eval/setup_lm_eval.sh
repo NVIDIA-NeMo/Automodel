@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Setup lm-evaluation-harness for running eval benchmarks.
-# Idempotent: skips clone/install if already present.
+# Idempotent: reuses an existing clone and virtual environment.
 #
 # Usage:
 #   bash setup_lm_eval.sh [INSTALL_DIR]
@@ -51,25 +51,28 @@ else
 fi
 
 # ── Virtual-env & dependencies ───────────────────────────────────────────────
-if [ -f "$VENV_DIR/bin/activate" ]; then
-  echo "Virtual environment already exists at $VENV_DIR, skipping install."
-else
+if [ ! -f "$VENV_DIR/bin/activate" ]; then
   echo "Creating virtual environment and installing dependencies ..."
-  unset UV_PROJECT_ENVIRONMENT 2>/dev/null || true
-
-  cd "$INSTALL_DIR"
   uv venv "$VENV_DIR"
-  source "$VENV_DIR/bin/activate"
-  uv pip install langdetect immutabledict wonderwords nltk
-  # Floor the eval stack: gemma4's head_dim makes vLLM auto-select the FA4 cute kernel
-  # (vllm_flash_attn.cute). On older cutlass-dsl (the 4.5.x that vllm 0.25.x resolves
-  # transitively) that kernel fails to compile -> GPUModuleOp / cudaErrorIllegalAddress.
-  # vllm 0.28.0 + cutlass-dsl 4.6.0 compiles it cleanly (verified: gemma4 IFEval
-  # prompt_level_strict_acc=0.5360).
-  # vLLM 0.28.0 reads the per-layer head dimensions and KV-head counts written by
-  # the transformers 5.15.1 training stack; older vLLM releases expect the removed
-  # global fields and fail while constructing Gemma4 full-attention layers.
-  uv pip install -e ".[vllm]" "vllm==0.28.0" "transformers==5.15.1" "nvidia-cutlass-dsl>=4.6.0"
-
-  echo "Setup complete. Activate with:  source $VENV_DIR/bin/activate"
+else
+  echo "Reusing virtual environment at $VENV_DIR."
 fi
+unset UV_PROJECT_ENVIRONMENT 2>/dev/null || true
+cd "$INSTALL_DIR"
+source "$VENV_DIR/bin/activate"
+
+# Install on every invocation so a reused environment cannot retain stale pins.
+uv pip install langdetect immutabledict wonderwords nltk
+# Floor the eval stack: gemma4's head_dim makes vLLM auto-select the FA4 cute kernel
+# (vllm_flash_attn.cute). On older cutlass-dsl (the 4.5.x that vllm 0.25.x resolves
+# transitively) that kernel fails to compile -> GPUModuleOp / cudaErrorIllegalAddress.
+# vllm 0.28.0 + cutlass-dsl 4.6.0 compiles it cleanly (verified: gemma4 IFEval
+# prompt_level_strict_acc=0.5360).
+# vLLM 0.28.0 reads the per-layer head dimensions and KV-head counts written by
+# the transformers 5.18.0 training stack; older vLLM releases expect the removed
+# global fields and fail while constructing Gemma4 full-attention layers. Keep the
+# transformers pin aligned with the training environment so axial vision RoPE is
+# available when vLLM initializes the exported Gemma4 checkpoint.
+uv pip install -e ".[vllm]" "vllm==0.28.0" "transformers==5.18.0" "nvidia-cutlass-dsl>=4.6.0"
+
+echo "Setup complete. Activate with:  source $VENV_DIR/bin/activate"
