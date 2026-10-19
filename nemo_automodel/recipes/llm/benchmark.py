@@ -327,10 +327,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
     def run_benchmark(self) -> None:
         """Run with an inferred capacity when the input pipeline proves a bound."""
         capacity = None
-        # The mock text dataset emits fixed-length batches. Restrict this proof
-        # to unsharded token layouts; other layouts retain safe negotiation.
+        # The mock text dataset emits fixed-length batches. Loader batching and
+        # custom collators can change that shape, so retain negotiation for them
+        # and for sharded token layouts.
         if (
             isinstance(self.dataloader.dataset, MockIterableDataset)
+            and self.dataloader.batch_size is None
+            and self.cfg.get("dataloader.collate_fn") is None
             and self.cfg.get("distributed.tp_size", 1) == 1
             and self.cfg.get("distributed.cp_size", 1) == 1
         ):

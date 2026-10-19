@@ -748,6 +748,9 @@ class _HybridEPManager(_DispatchManager):
         capacity is calibrated from the first *real* batch, whose routing skew a
         balanced synthetic batch cannot stand in for, so the factor and any
         calibrated capacity are restored untouched.
+
+        The real-input token bound is also suspended: synthetic preparation can
+        use more rows after the runtime's minimum-capacity and chunk rounding.
         """
         if num_tokens <= 0:
             raise ValueError(f"num_tokens must be positive, got {num_tokens}")
@@ -774,7 +777,7 @@ class _HybridEPManager(_DispatchManager):
         try:
             # Validation loops commonly run under inference_mode.  HybridEP's
             # backward kernel variants still need a real autograd graph here.
-            with torch.inference_mode(False), torch.enable_grad():
+            with hybrid_ep_token_capacity(None), torch.inference_mode(False), torch.enable_grad():
                 token_ids = torch.arange(num_tokens, device=device).unsqueeze(1)
                 topk_offsets = torch.arange(self.router_topk, device=device).unsqueeze(0)
                 expert_indices = (token_ids * self.router_topk + topk_offsets) % self.num_experts

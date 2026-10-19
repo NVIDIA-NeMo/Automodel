@@ -209,6 +209,75 @@ class TestHybridEPRuntimeInitialization:
         assert initialize_calls[0]["num_tokens"] == 1024
         assert fused_a2a._hybrid_ep_initialized_capacity == 1024
 
+    @pytest.mark.parametrize("num_tokens,warmup_tokens", [(128, 512), (1000, 1024)])
+    @pytest.mark.parametrize("compact", [False, True])
+    @pytest.mark.parametrize("fail_warmup", [False, True])
+    def test_cold_runtime_preparation_suspends_real_batch_bound(
+        self, hybrid_ep_manager, monkeypatch, num_tokens, warmup_tokens, compact, fail_warmup
+    ):
+        """Synthetic warmup can exceed the real bound, which is restored even after failure."""
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        monkeypatch.setattr(hybrid_ep_manager, "moe_hybridep_compact_routing", compact)
+        initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 4, torch.float32)
+        dispatch_rows = []
+        dispatched_hidden = []
+
+        def dispatch(x, routing_map, probs, *, topk_idx, **kwargs):
+            """Route synthetic rows through identity experts.
+
+            Args:
+                x: Tensor of shape [tokens, hidden].
+                routing_map: Optional Boolean tensor of shape [tokens, experts].
+                probs: Tensor of shape [tokens, experts].
+                topk_idx: Optional tensor of shape [tokens, top_k].
+                **kwargs: Scalar dispatch settings.
+
+            Returns:
+                Hidden tensor of shape [dispatched_tokens, hidden], probability tensor of shape
+                [dispatched_tokens], no scaling metadata, counts of shape [experts], and a handle.
+            """
+            dispatch_rows.append(x.shape[0])
+            if fail_warmup:
+                raise RuntimeError("synthetic kernel failure")
+            if routing_map is None:
+                routing_map = torch.zeros_like(probs, dtype=torch.bool).scatter_(1, topk_idx, True)
+            rows = routing_map.nonzero(as_tuple=False)[:, 0]
+            hidden = x[rows]
+            hidden.retain_grad()
+            dispatched_hidden.append(hidden)
+            return hidden, probs[routing_map], None, routing_map.sum(0), None
+
+        def combine(x, **kwargs):
+            """Combine identity expert contributions.
+
+            Args:
+                x: Tensor of shape [dispatched_tokens, hidden], with top-k rows per input token.
+                **kwargs: Unused scalar combine settings and an empty handle.
+
+            Returns:
+                Tensor of shape [tokens, hidden], summed over the top-k expert axis.
+            """
+            return x.reshape(warmup_tokens, hybrid_ep_manager.router_topk, 4).sum(1)
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", dispatch)
+        monkeypatch.setattr(td, "hybrid_ep_combine", combine)
+        with td.hybrid_ep_token_capacity(num_tokens):
+            if fail_warmup:
+                with pytest.raises(RuntimeError, match="synthetic kernel failure"):
+                    initializer.prepare(num_tokens=num_tokens, device=torch.device("cpu"))
+            else:
+                initializer.prepare(num_tokens=num_tokens, device=torch.device("cpu"))
+                torch.testing.assert_close(
+                    dispatched_hidden[0].grad,
+                    torch.full((warmup_tokens * hybrid_ep_manager.router_topk, 4), 1 / hybrid_ep_manager.router_topk),
+                )
+            # Exercise dispatch after warmup to prove that the real-input guard was restored.
+            hybrid_ep_manager.token_probs = torch.zeros(num_tokens + 1, 8)
+            with pytest.raises(ValueError, match=f"exceeding proven capacity {num_tokens}"):
+                hybrid_ep_manager.dispatch(torch.zeros(num_tokens + 1, 4))
+        assert dispatch_rows == [warmup_tokens]
+
     def test_runtime_state_is_process_global_and_reinitializes_only_on_growth(self, hybrid_ep_manager, monkeypatch):
         with patch(
             "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
