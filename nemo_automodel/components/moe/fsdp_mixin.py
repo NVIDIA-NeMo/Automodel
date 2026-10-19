@@ -167,7 +167,8 @@ class MoEFSDPSyncMixin:
       it manually triggers post-backward hooks and resharding. With
       ``defer_fsdp_grad_sync: false`` every micro-batch reduce-scatters its own gradients
       (after its full or weight backward); the input backward of a split schedule never
-      reduces or reshards, and resharding is deferred to the last backward.
+      reduces or reshards, and resharding/finalization is deferred to the last backward so
+      that pending split weight backwards still find the unsharded parameters.
     """
 
     def prepare_for_grad_accumulation(self, pp_enabled: bool = False) -> None:
@@ -230,30 +231,13 @@ def _disable_fsdp_for_moe_module(module: torch.nn.Module) -> None:
         )
 
 
-def _enable_fsdp_for_moe_module(module: torch.nn.Module) -> None:
-    """Configure every FSDP unit of a MoE module to reduce its gradients in the next backward.
-
-    Counterpart of :func:`_disable_fsdp_for_moe_module`; used when the pipeline stage was
-    patched with ``reduce_grad_per_microbatch=True`` (``distributed.defer_fsdp_grad_sync: false``)
-    so that each micro-batch reduce-scatters its gradients instead of accumulating an unsharded
-    ``reduce_dtype`` gradient across micro-batches.
-    """
-    for fsdp_module in _iter_fsdp_modules(module):
-        _configure_fsdp_module(
-            fsdp_module,
-            is_last_backward=True,
-            reshard_after_backward=True,
-            requires_gradient_sync=True,
-        )
-
-
 def _reduce_fsdp_for_moe_module(module: torch.nn.Module, *, last_backward: bool) -> None:
-    """Reduce this micro-batch's gradients; reshard and finalize only on the last backward.
+    """Let FSDP's hooks reduce-scatter this micro-batch's gradients; reshard and finalize only on the last backward.
 
-    Used for the weight backward of a split (input/weight) schedule under
-    ``distributed.defer_fsdp_grad_sync: false``. The weight backwards still queued for the
-    other micro-batches refer to the same unsharded parameter objects, so the parameters
-    must stay unsharded until the last one has run.
+    Used for a full backward under ``distributed.defer_fsdp_grad_sync: false``. A split
+    weight backward for an earlier micro-batch may still be pending (mixed schedules such
+    as ``F0 I0 F1 B1 W0``) and looks the parameters up by their unsharded objects, so the
+    parameters must stay unsharded until the actual last backward.
     """
     for fsdp_module in _iter_fsdp_modules(module):
         _configure_fsdp_module(
@@ -394,21 +378,25 @@ def patched_backward_maybe_with_nosync(
                 _disable_fsdp_for_moe_module(self.submod)
                 result = perform_backward(backward_type)()
             elif backward_type == "weight":
-                # This micro-batch's gradients are complete after the weight backward, so
-                # reduce-scatter them now. Resharding has to wait for the last backward:
-                # the weight backwards still queued for the other micro-batches look the
-                # parameters up by the same unsharded objects. FSDP's own post-backward
-                # hooks hang off the forward graph and do not fire for a weight-only
-                # backward, so run them manually.
-                _reduce_fsdp_for_moe_module(self.submod, last_backward=last_backward)
+                # Keep FSDP out of the whole weight helper: ``stage_backward_weight`` runs
+                # one ``autograd.grad`` per parameter group, and an activation-checkpoint
+                # recompute inside a later group must still see the unsharded parameters,
+                # so nothing may reduce or reshard until the helper returns. Then
+                # reduce-scatter this micro-batch's gradients manually (FSDP's own hooks
+                # hang off the forward graph and do not fire for a weight-only backward);
+                # resharding waits for the last backward because the weight backwards
+                # still queued for the other micro-batches look the parameters up by the
+                # same unsharded objects.
+                _disable_fsdp_for_moe_module(self.submod)
                 result = perform_backward(backward_type)()
                 _run_post_backward_for_moe_module(self.submod, last_backward=last_backward)
             else:
-                # ``full``: same contract as the FSDPModule branch above; reduce-scatter
-                # and reshard through FSDP's hooks, and on the last backward run the
+                # ``full``: reduce-scatter through FSDP's hooks. Resharding and finalizing
+                # wait for the last backward, since a split weight backward of an earlier
+                # micro-batch may still be pending; on the last backward run the
                 # post-backward manually so the reduction is synced back to the default
-                # stream.
-                _enable_fsdp_for_moe_module(self.submod)
+                # stream, as in the FSDPModule branch above.
+                _reduce_fsdp_for_moe_module(self.submod, last_backward=last_backward)
                 result = perform_backward(backward_type)()
                 if last_backward:
                     _run_post_backward_for_moe_module(self.submod)

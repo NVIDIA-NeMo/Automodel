@@ -892,13 +892,14 @@ class TestPatchedBackwardMaybeWithNosync:
 
                 result = patched_backward_maybe_with_nosync(mock_stage, "full", bwd_kwargs, last_backward=False)
 
-                # Gradient sync stays enabled for this micro-batch ...
+                # Gradient sync is on for this micro-batch, but the parameters stay unsharded and the
+                # step is not finalized: a split weight backward of an earlier micro-batch may still be
+                # pending (mixed schedules), and the manual post-backward only runs on the last one.
                 assert model._requires_gradient_sync is True
-                assert model._is_last_backward is True
-                assert model._reshard_after_backward is True
+                assert model._is_last_backward is False
+                assert model._reshard_after_backward is False
                 assert moe_model.lm_head._requires_gradient_sync is True
                 assert block.mlp.experts._requires_gradient_sync is True
-                # ... and the manual post-backward is only run on the last micro-batch.
                 mock_run_post.assert_not_called()
                 grads, param_groups = result
                 assert grads == ((), None)
@@ -1028,8 +1029,9 @@ class TestPatchedBackwardMaybeWithNosync:
     def test_moe_fsdp_mixin_reduce_grad_per_microbatch_weight_reduces_without_reshard(
         self, mock_isinstance, mock_get_optim
     ):
-        """A non-last weight backward reduces this micro-batch's gradients but keeps the
-        parameters unsharded for the weight backwards still queued; the last one reshards."""
+        """FSDP stays disabled while ``stage_backward_weight`` runs (it is several autograd calls, and a
+        checkpoint recompute in a later group still needs the unsharded parameters); afterwards this
+        micro-batch's gradients are reduced manually, resharding only on the last backward."""
 
         def isinstance_side_effect(obj, cls):
             if cls == MoEFSDPSyncMixin:
@@ -1054,15 +1056,14 @@ class TestPatchedBackwardMaybeWithNosync:
 
                 patched_backward_maybe_with_nosync(mock_stage, "weight", {"param_groups": []}, last_backward=False)
 
-                assert model._requires_gradient_sync is True
+                # Flags as seen by the (mocked) weight helper: fully disabled.
+                assert model._requires_gradient_sync is False
                 assert model._reshard_after_backward is False
                 assert model._is_last_backward is False
                 mock_run_post.assert_called_once_with(moe_model, last_backward=False)
 
                 patched_backward_maybe_with_nosync(mock_stage, "weight", {"param_groups": []}, last_backward=True)
 
-                assert model._reshard_after_backward is True
-                assert model._is_last_backward is True
                 mock_run_post.assert_called_with(moe_model, last_backward=True)
 
     def test_backward_type_input(self):
