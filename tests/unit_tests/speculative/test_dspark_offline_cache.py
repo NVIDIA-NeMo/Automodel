@@ -291,6 +291,19 @@ def test_resume_compatibility_rejects_manifest_mismatch(tmp_path):
         _ensure_resume_compatible(cache_dir, manifest, existing_shards={0})
 
 
+def test_resume_compatibility_rejects_kwargs_that_only_python_equality_merges(tmp_path):
+    cache_dir = str(tmp_path / "cache")
+    _write_tiny_cache(cache_dir, num_samples=2, shard_size=2, seq_len=4)
+    recorded = {**read_manifest(cache_dir), "chat_template_kwargs": {"enable_thinking": False}}
+    write_manifest(cache_dir, recorded)
+
+    with pytest.raises(ValueError, match="chat_template_kwargs"):
+        _ensure_resume_compatible(
+            cache_dir, {**recorded, "chat_template_kwargs": {"enable_thinking": 0}}, existing_shards={0}
+        )
+    _ensure_resume_compatible(cache_dir, recorded, existing_shards={0})  # same types -> ok
+
+
 def test_precompute_resume_mismatch_does_not_overwrite_target_weights(monkeypatch, tmp_path):
     import nemo_automodel.components.speculative.precompute_dspark as precompute_dspark
 

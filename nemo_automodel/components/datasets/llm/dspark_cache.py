@@ -24,6 +24,7 @@ precompute job write those tensors once and lets training stream them later via
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -148,16 +149,28 @@ MANIFEST_DEFAULTS: dict[str, Any] = {
 }
 
 
+def manifest_value_identity(value: Any) -> str:
+    """Return ``value`` in the canonical JSON form the manifest persists it in.
+
+    Python equality treats ``False == 0`` and ``1 == 1.0`` as equal, recursively, but a
+    chat template renders them differently (``tojson`` gives ``false`` vs ``0``), so
+    manifest values are compared through this type-preserving form instead of ``==``.
+    """
+    return json.dumps(value, sort_keys=True)
+
+
 def manifest_mismatch_fields(recorded: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
     """Return the manifest keys whose values differ, ignoring bookkeeping fields.
 
-    ``format_version`` and the ``complete`` marker describe the on-disk state,
-    not the run configuration, so they never count as a mismatch.
+    Values are compared in their persisted JSON form (``manifest_value_identity``), so
+    ``False`` and ``0`` differ. ``format_version`` and the ``complete`` marker describe
+    the on-disk state, not the run configuration, so they never count as a mismatch.
     """
     return sorted(
         k
         for k in recorded.keys() | manifest.keys()
-        if k not in _IDENTITY_EXEMPT_FIELDS and recorded.get(k) != manifest.get(k)
+        if k not in _IDENTITY_EXEMPT_FIELDS
+        and manifest_value_identity(recorded.get(k)) != manifest_value_identity(manifest.get(k))
     )
 
 
@@ -293,6 +306,7 @@ __all__ = [
     "existing_shard_indices",
     "manifest_mismatch_fields",
     "manifest_path",
+    "manifest_value_identity",
     "read_manifest",
     "read_target_weight_modules",
     "shard_path",

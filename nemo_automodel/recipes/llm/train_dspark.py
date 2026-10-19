@@ -54,6 +54,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.dspark_cache import (
     DTYPE_MAP,
     build_cached_dspark_dataloader,
+    manifest_value_identity,
     read_manifest,
     read_target_weight_modules,
     tokenizer_chat_template_sha256,
@@ -367,7 +368,7 @@ def _validate_cached_dspark_manifest(
     # read_manifest fills in {} for caches written before the manifest recorded the kwargs.
     recorded_template_kwargs = manifest.get("chat_template_kwargs", {})
     run_template_kwargs = {} if chat_template_kwargs is None else chat_template_kwargs
-    if recorded_template_kwargs != run_template_kwargs:
+    if manifest_value_identity(recorded_template_kwargs) != manifest_value_identity(run_template_kwargs):
         raise ValueError(
             f"DSpark cache at {cache_dir} was tokenized with chat_template_kwargs={recorded_template_kwargs!r}, "
             f"but this run sets {run_template_kwargs!r}. The cached samples keep the framing they were built "

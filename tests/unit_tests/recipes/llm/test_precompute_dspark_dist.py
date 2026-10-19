@@ -200,6 +200,36 @@ def test_ensure_output_dir_compatible_rejects_different_input_identity(tmp_path)
             )
 
 
+@pytest.mark.parametrize(
+    ("recorded", "current"),
+    [
+        ({"mode": False}, {"mode": 0}),
+        ({"mode": True}, {"mode": 1}),
+        ({"mode": 1}, {"mode": 1.0}),
+        ({"opts": {"mode": False}}, {"opts": {"mode": 0}}),
+        ({"opts": [True]}, {"opts": [1]}),
+    ],
+)
+def test_ensure_output_dir_compatible_rejects_kwargs_that_only_python_equality_merges(tmp_path, recorded, current):
+    """``False == 0`` and ``1 == 1.0`` in Python, but a template renders them differently."""
+    from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest
+
+    write_manifest(str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(chat_template_kwargs=recorded)))
+    with pytest.raises(ValueError, match="chat_template_kwargs"):
+        pdd._ensure_output_dir_compatible(
+            str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(chat_template_kwargs=current))
+        )
+
+
+def test_ensure_output_dir_compatible_ignores_kwargs_key_order(tmp_path):
+    from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest
+
+    write_manifest(str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(chat_template_kwargs={"a": 1, "b": 2})))
+    pdd._ensure_output_dir_compatible(
+        str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(chat_template_kwargs={"b": 2, "a": 1}))
+    )  # no raise
+
+
 def test_read_manifest_does_not_share_a_mutable_default(tmp_path):
     from nemo_automodel.components.datasets.llm.dspark_cache import read_manifest, write_manifest
 

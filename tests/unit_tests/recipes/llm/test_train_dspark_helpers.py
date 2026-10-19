@@ -842,6 +842,9 @@ def test_cached_dspark_manifest_accepts_matching_chat_template_kwargs(overrides,
         ({"chat_template_kwargs": {"thinking_mode": "chat"}}, {"thinking_mode": "thinking"}),
         ({}, {"thinking_mode": "thinking"}),
         ({}, "thinking"),
+        # Equal under Python ==, but a template renders them differently (tojson: false vs 0).
+        ({"chat_template_kwargs": {"mode": False}}, {"mode": 0}),
+        ({"chat_template_kwargs": {"opts": {"mode": 1}}}, {"opts": {"mode": 1.0}}),
     ],
 )
 def test_cached_dspark_manifest_rejects_chat_template_kwargs_mismatch(overrides, configured):
