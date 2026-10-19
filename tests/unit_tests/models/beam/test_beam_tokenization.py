@@ -23,8 +23,8 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel._transformers.tokenization.tool_call_arguments import DictToolArgumentsTokenizer
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
-from nemo_automodel.components.models.beam.tokenization import BeamTokenizer
 
 # Mirrors the guard in Beam's chat template: arguments are rendered per parameter and must be a mapping.
 _TEMPLATE = (
@@ -77,7 +77,7 @@ def _conversation(arguments):
 
 
 def test_string_arguments_render_like_dict_arguments(beam_dir):
-    tok = BeamTokenizer.from_pretrained(beam_dir)
+    tok = DictToolArgumentsTokenizer.from_pretrained(beam_dir)
     as_dict = tok.apply_chat_template(_conversation({"path": "/w", "n": 2}), tokenize=False)
     as_str = tok.apply_chat_template(_conversation('{"path": "/w", "n": 2}'), tokenize=False)
     assert as_str == as_dict
@@ -89,13 +89,13 @@ def test_string_arguments_render_like_dict_arguments(beam_dir):
 
 @pytest.mark.parametrize("arguments", ["[1, 2]", "not json", '"text"'])
 def test_non_object_arguments_still_reach_the_template(beam_dir, arguments):
-    tok = BeamTokenizer.from_pretrained(beam_dir)
+    tok = DictToolArgumentsTokenizer.from_pretrained(beam_dir)
     with pytest.raises(Exception, match="function.arguments must be a dict"):
         tok.apply_chat_template(_conversation(arguments), tokenize=False)
 
 
 def test_input_conversation_is_not_mutated(beam_dir):
-    tok = BeamTokenizer.from_pretrained(beam_dir)
+    tok = DictToolArgumentsTokenizer.from_pretrained(beam_dir)
     conversation = _conversation('{"path": "/w"}')
     before = copy.deepcopy(conversation)
     tok.apply_chat_template(conversation, tokenize=False)
@@ -103,7 +103,7 @@ def test_input_conversation_is_not_mutated(beam_dir):
 
 
 def test_batched_conversations(beam_dir):
-    tok = BeamTokenizer.from_pretrained(beam_dir)
+    tok = DictToolArgumentsTokenizer.from_pretrained(beam_dir)
     rendered = tok.apply_chat_template([_conversation('{"a": 1}'), _conversation({"a": 1})], tokenize=False)
     assert rendered[0] == rendered[1]
 
@@ -118,7 +118,7 @@ def test_registry_wraps_beam_only(tmp_path, beam_dir):
 
 
 def test_copies_keep_the_wrapper_and_save_is_unchanged(tmp_path, beam_dir):
-    tok = BeamTokenizer.from_pretrained(beam_dir)
+    tok = DictToolArgumentsTokenizer.from_pretrained(beam_dir)
     for copied in (pickle.loads(pickle.dumps(tok)), copy.deepcopy(tok)):  # noqa: S301
         assert "<p path>/w</p>" in copied.apply_chat_template(_conversation('{"path": "/w"}'), tokenize=False)
 
@@ -134,7 +134,9 @@ def test_chat_dataset_accepts_string_and_dict_arguments(tmp_path, beam_dir):
     rows = [{"messages": _conversation('{"path": "/w"}')}, {"messages": _conversation({"path": "/w"})}]
     data = tmp_path / "train.jsonl"
     data.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    ds = ChatDataset(str(data), tokenizer=BeamTokenizer.from_pretrained(beam_dir), seq_length=None, padding=False)
+    ds = ChatDataset(
+        str(data), tokenizer=DictToolArgumentsTokenizer.from_pretrained(beam_dir), seq_length=None, padding=False
+    )
     first, second = ds[0], ds[1]
     assert first["input_ids"] == second["input_ids"]
     assert first["labels"] == second["labels"]

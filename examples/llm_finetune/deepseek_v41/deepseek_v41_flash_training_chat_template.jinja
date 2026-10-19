@@ -1,7 +1,7 @@
 {#- Training chat template for DeepSeek-V4.1-Flash (deepseek-ai/DeepSeek-V4.1-Flash,
     chat_template.jinja at revision 2cba9e42aa026125f3ed06c6d98c1db82f7ca027, itself ported from
     encoding/encoding.py in the model repo). For the same thinking_mode it renders byte-identically
-    to the released template, with two differences:
+    to the released template, with three differences:
 
     1. A generation block marks each assistant turn's supervised span: the reasoning text and
        </think> (thinking mode, on turns that keep their reasoning), the answer, any DSML tool
@@ -14,6 +14,8 @@
        would train every reply without reasoning as an empty reasoning block, so chat is the
        safer default. To train on thinking-mode data, where assistant turns carry
        reasoning_content, pass thinking_mode: thinking through chat_template_kwargs.
+    3. It rejects tool calls whose function.arguments is not an object, which the released body renders as one
+       DSML parameter named "arguments". NeMoAutoTokenizer hands this model type JSON-string arguments as objects.
 
     Extra kwargs, as in the released template, set through chat_template_kwargs: thinking_mode
     ("thinking" | "chat"; enable_thinking=true/false is accepted as an alias), drop_thinking
@@ -35,6 +37,11 @@
         {%- endfor -%}
     {%- endif -%}
 {%- endif -%}
+{%- for msg in messages if msg.role == "assistant" and msg.get("tool_calls") -%}
+    {%- for tc in msg.tool_calls if tc.function.arguments is not mapping -%}
+        {{- raise_exception("Tool call arguments must be an object, or they render as one DSML parameter named \"arguments\"; load the tokenizer with NeMoAutoTokenizer (default tokenizer_backend), which parses JSON-string arguments for DeepSeek-V4.1") -}}
+    {%- endfor -%}
+{%- endfor -%}
 {#- Released template body. -#}
 {%- set IMG = "<｜deepseek_image｜>" -%}
 {%- set DSML = "｜DSML｜" -%}

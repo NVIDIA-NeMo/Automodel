@@ -157,6 +157,12 @@ For data with tool calls or reasoning, use
 from the same directory, the released `chat_template.jinja` with loss spans.
 It renders those three roles identically, and for thinking-mode data the
 dataset takes `chat_template_kwargs: {thinking_mode: thinking}`.
+Tool-call arguments render as one DSML parameter each, so the template
+rejects arguments that are not an object. `ChatDataset` stores arguments as
+JSON strings; load the dataset tokenizer with
+`nemo_automodel.NeMoAutoTokenizer.from_pretrained` (the example configs use
+`transformers.AutoTokenizer.from_pretrained`), which parses them back into
+objects for this model type. The DSpark recipes already load it that way.
 
 Three points apply to every H100 variant:
 

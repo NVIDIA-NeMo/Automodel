@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Beam tokenizer: render JSON-string tool-call arguments as the dicts Beam's chat template requires.
+"""Hand JSON-string tool-call arguments to a chat template as dicts.
 
-Beam's chat template renders every tool-call argument as its own ``<rfl:parameter>`` block, so it needs
-``function.arguments`` as a mapping and raises on strings. Automodel's chat datasets store arguments as JSON
-strings (the OpenAI wire format, and the only form Arrow-backed datasets keep intact). ``BeamTokenizer`` loads
-the regular tokenizer and wraps that instance's ``apply_chat_template`` to parse such strings back into dicts
-first, which is also what the serving stacks pass to the same template. Other models are unaffected: the
-wrapper is registered for ``model_type == "beam"`` only, and the tokenizer class (and hence ``save_pretrained``
-output) is unchanged.
+Some chat templates render every tool-call argument as its own field, so they need ``function.arguments`` as a
+mapping. Automodel's chat datasets store arguments as JSON strings (the OpenAI wire format, and the only form
+Arrow-backed datasets keep intact). ``wrap_tokenizer`` makes a tokenizer instance's ``apply_chat_template`` parse
+such strings back into dicts first, which is also what the serving stacks pass to those templates.
+``DictToolArgumentsTokenizer`` is registered in ``TokenizerRegistry`` for the model types whose templates need it
+(Beam, DeepSeek-V4.1); other models are unaffected, and the tokenizer class (and hence ``save_pretrained`` output)
+is unchanged.
 """
 
 import functools
@@ -54,7 +54,17 @@ def _message_with_dict_arguments(message: Any) -> Any:
 
 
 def tool_call_arguments_as_dicts(conversation: Any) -> Any:
-    """Parse JSON-string tool-call arguments into dicts for one conversation or a batch of conversations."""
+    """Parse JSON-string tool-call arguments into dicts for one conversation or a batch of conversations.
+
+    Args:
+        conversation: A list of chat messages, a list of such lists, or anything else ``apply_chat_template``
+            accepts.
+
+    Returns:
+        The same structure with every tool call whose ``function.arguments`` is a JSON-object string replaced by
+        a copy holding the parsed dict. Other arguments, messages and inputs are returned unchanged, and the input
+        is never mutated.
+    """
     if not isinstance(conversation, (list, tuple)):
         return conversation
     if conversation and isinstance(conversation[0], (list, tuple)):
@@ -73,19 +83,35 @@ def wrap_tokenizer(tokenizer: PreTrainedTokenizerBase) -> PreTrainedTokenizerBas
     The wrapper is an instance attribute, so the tokenizer class (and its ``save_pretrained`` output and
     pickling) stays the one the default loader picked. A ``functools.partial`` over a module-level function,
     not a closure, keeps the tokenizer picklable and deep-copyable.
+
+    Args:
+        tokenizer: The tokenizer to wrap in place.
+
+    Returns:
+        The same tokenizer, whose ``apply_chat_template`` now passes conversations through
+        :func:`tool_call_arguments_as_dicts` first.
     """
     tokenizer.apply_chat_template = functools.partial(_apply_chat_template_with_dict_arguments, tokenizer)
     return tokenizer
 
 
-class BeamTokenizer:
-    """Tokenizer factory registered for ``model_type == "beam"`` in ``TokenizerRegistry``."""
+class DictToolArgumentsTokenizer:
+    """Tokenizer factory for models whose chat template needs tool-call arguments as dicts."""
 
     @classmethod
     def from_pretrained(
         cls, pretrained_model_name_or_path: str | os.PathLike[str], *args: object, **kwargs: object
     ) -> PreTrainedTokenizerBase:
-        """Load the tokenizer exactly as the default path does, then wrap ``apply_chat_template``."""
+        """Load the tokenizer exactly as the default path does, then wrap ``apply_chat_template``.
+
+        Args:
+            pretrained_model_name_or_path: Hub id or local directory of the tokenizer.
+            *args: Forwarded to the default loader.
+            **kwargs: Forwarded to the default loader.
+
+        Returns:
+            The default Automodel tokenizer with :func:`wrap_tokenizer` applied.
+        """
         from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
             NeMoAutoTokenizerWithBosEosEnforced,
         )
