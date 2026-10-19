@@ -71,6 +71,16 @@ class RecomputeReplayRecorder(Generic[T]):
         """Restart replay from the first record."""
         self._cursor = 0
 
+    def on_record_exit(self) -> None:
+        """Hook run once the checkpoint-forward context has exited.
+
+        Work that must stay out of the checkpointed op trace -- a device-to-host read of
+        a recorded extent, say -- belongs here. No-op by default.
+        """
+
+    def on_replay_enter(self) -> None:
+        """Hook run after :meth:`rewind`, before the recompute context opens. No-op by default."""
+
     @property
     def records(self) -> tuple[T, ...]:
         """The recorded decisions in forward order."""
@@ -98,10 +108,18 @@ class RecomputeReplay(Generic[T]):
 
     Args:
         name: Channel name used in error messages.
+        recorder_factory: Builds the per-checkpoint-call recorder; a
+            :class:`RecomputeReplayRecorder` subclass overrides the hooks when the
+            recorded decisions need post-processing outside the checkpointed trace.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        recorder_factory: Callable[[], RecomputeReplayRecorder[T]] = RecomputeReplayRecorder,
+    ) -> None:
         self.name = name
+        self._recorder_factory = recorder_factory
         self._binding = _Binding()
 
     @contextmanager
@@ -131,19 +149,16 @@ class RecomputeReplay(Generic[T]):
             return None
         return recorder, mode
 
-    def checkpoint_context_fn(
-        self,
-        context_fn: CheckpointContextFn | None,
-        *,
-        on_record_exit: Callable[[RecomputeReplayRecorder[T]], None] | None = None,
-    ) -> CheckpointContextFn:
+    def checkpoint_context_fn(self, context_fn: CheckpointContextFn | None) -> CheckpointContextFn:
         """Wrap a checkpoint ``context_fn`` so this channel records in forward and replays in recompute.
+
+        The recorder's :meth:`RecomputeReplayRecorder.on_record_exit` runs after the forward
+        context exits and :meth:`RecomputeReplayRecorder.on_replay_enter` before the recompute
+        context opens, so neither enters the checkpointed op trace.
 
         Args:
             context_fn: Existing ``torch.utils.checkpoint`` context factory returning the
                 ``(forward, recompute)`` context managers, or ``None`` for no other contexts.
-            on_record_exit: Optional hook run on the recorder after the forward context
-                exits, for work that must stay out of the checkpointed op trace.
 
         Returns:
             A context factory that binds a fresh recorder per checkpoint call.
@@ -153,17 +168,18 @@ class RecomputeReplay(Generic[T]):
             forward_context, recompute_context = (
                 context_fn() if context_fn is not None else (nullcontext(), nullcontext())
             )
-            recorder: RecomputeReplayRecorder[T] = RecomputeReplayRecorder()
+            recorder = self._recorder_factory()
 
             @contextmanager
             def scoped(mode: str, inner: AbstractContextManager) -> Iterator[None]:
                 if mode == "replay":
                     recorder.rewind()
+                    recorder.on_replay_enter()
                 with self.scope(recorder, mode):
                     with inner:
                         yield
-                    if mode == "record" and on_record_exit is not None:
-                        on_record_exit(recorder)
+                    if mode == "record":
+                        recorder.on_record_exit()
 
             return scoped("record", forward_context), scoped("replay", recompute_context)
 
