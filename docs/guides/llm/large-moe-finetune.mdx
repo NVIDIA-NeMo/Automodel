@@ -96,6 +96,23 @@ distributed:
     layers_per_stage: 2
 ```
 
+## Choose a Token Dispatcher
+
+Set `model.backend.dispatcher` to select token communication separately from
+the expert-parallel group size, `distributed.ep_size`.
+
+| `dispatcher` | Backend |
+|---|---|
+| `torch` | PyTorch DTensor collectives for EP, or local experts without EP. |
+| `deepep` | DeepEP token dispatch and combine. |
+| `hybridep` | HybridEP dispatch and combine, with optional fused token permutation. |
+| `uccl_ep` | UCCL-EP dispatch and combine using libibverbs RDMA. |
+| `mok` | Mixture-of-Kittens fused communication and expert computation; Blackwell only. |
+| `nccl_ep` (pending) | Experimental Transformer Engine NCCL-EP; requires [PR #4384](https://github.com/NVIDIA-NeMo/Automodel/pull/4384), which is not yet merged. |
+
+For dependencies, hardware and model constraints, expert compute choices, and
+configuration defaults, see [MoE Backends and Dispatchers](/development/moe-backends).
+
 ## Configure HybridEP Routing
 
 Several large-scale MoE recipes select HybridEP in the model backend:
@@ -107,8 +124,6 @@ model:
     dispatcher: hybridep
 ```
 
-For the full dispatcher list, expert compute choices, dependencies, and tuning
-settings, see [MoE Backends and Dispatchers](/development/moe-backends).
 The [HybridEP reference](/development/moe-backends#configure-hybridep-routing)
 explains dense and compact routing, fused permutation, capacity mode, and
 unequal token counts.
