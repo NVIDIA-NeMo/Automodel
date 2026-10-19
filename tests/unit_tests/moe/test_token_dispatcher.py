@@ -411,7 +411,22 @@ def test_hybridep_slots_preserve_routing_and_gradients(hybrid_ep_manager, monkey
     )
 
     def dispatch(x, routing_map, probs, *, topk_idx, **kwargs):
-        """Apply weighted identity experts to real [tokens, hidden] rows."""
+        """Apply weighted identity experts to real input rows.
+
+        Args:
+            x: Tensor of shape [tokens, hidden], containing this EP rank's real input rows.
+            routing_map: Optional Boolean tensor of shape [tokens, experts], with one column
+                per global expert; absent for compact routing.
+            probs: Tensor of shape [tokens, experts], containing dense float32 routing probabilities.
+            topk_idx: Optional tensor of shape [tokens, top_k], containing global expert indices
+                for compact routing; absent for dense routing.
+            **kwargs: Scalar communication settings, including the group-uniform slot extent.
+
+        Returns:
+            Weighted hidden tensor of shape [tokens, hidden], the input probability tensor of
+            shape [tokens, experts] returned by reference, no scaling metadata, placeholder expert
+            counts of shape [experts], and an opaque combine handle.
+        """
         assert kwargs["num_of_tokens_per_rank"] == group_max
         assert x.shape[0] == probs.shape[0] == num_tokens
         if compact:

@@ -702,6 +702,18 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
+        """Combine expert rows into the original per-rank token order.
+
+        Args:
+            hidden_states: Tensor of shape [dispatched_tokens, hidden], grouped by local expert
+                on this EP rank. Capacity padding rows are ignored according to the dispatch handle.
+            async_finish: Ignored because HybridEP does not expose asynchronous completion here.
+            allocate_on_comm_stream: Ignored because HybridEP owns its communication stream.
+
+        Returns:
+            Tensor of shape [tokens, hidden], containing this EP rank's real input rows in their
+            original order, without routing-metadata padding.
+        """
         hidden_states = hybrid_ep_combine(
             x=hidden_states,
             handle=self.handle,
