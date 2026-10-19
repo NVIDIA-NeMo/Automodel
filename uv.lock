@@ -100,7 +100,7 @@ constraints = [
 ]
 overrides = [
     { name = "anyio", specifier = ">=4.14.2" },
-    { name = "nvidia-cublas", marker = "sys_platform == 'linux'", specifier = "==13.4.1.1" },
+    { name = "nvidia-cublas", marker = "sys_platform == 'linux'", specifier = ">=13.5" },
     { name = "prometheus-fastapi-instrumentator", specifier = ">=8.1.0" },
     { name = "thrift", specifier = ">=0.25.0" },
     { name = "urllib3", specifier = ">=2.8.0" },
@@ -2096,11 +2096,9 @@ name = "flashoptim"
 version = "0.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
-    { name = "packaging" },
-    { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
-    { name = "torch", version = "2.10.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
+    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform == 'linux'" },
+    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform == 'linux'" },
+    { name = "packaging", marker = "sys_platform == 'linux'" },
     { name = "torch", version = "2.10.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
     { name = "triton", version = "3.6.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
 ]
@@ -4383,7 +4381,7 @@ name = "nemo-automodel"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
-    { name = "flashoptim" },
+    { name = "flashoptim", marker = "sys_platform == 'linux'" },
     { name = "megatron-fsdp" },
     { name = "mistral-common", extra = ["audio", "hf-hub", "sentencepiece"] },
     { name = "ninja" },
@@ -4648,7 +4646,7 @@ requires-dist = [
     { name = "ffpa-attn", marker = "extra == 'ffpa'", specifier = ">=0.2.4" },
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
     { name = "flash-linear-attention", marker = "extra == 'fla'", specifier = ">=0.4.2" },
-    { name = "flashoptim", specifier = ">=0.1.3" },
+    { name = "flashoptim", marker = "sys_platform == 'linux'", specifier = ">=0.1.3" },
     { name = "fmha-sm100", marker = "sys_platform == 'linux' and extra == 'msa'", git = "https://github.com/MiniMax-AI/MSA.git?rev=80434d7f67877c6570ca19cac444b84bc9855dac" },
     { name = "ftfy", marker = "extra == 'diffusion'" },
     { name = "gigatoken", marker = "extra == 'gigatoken'" },
@@ -4707,9 +4705,9 @@ requires-dist = [
     { name = "tile-kernels", marker = "extra == 'cuda'", specifier = "==1.0.0" },
     { name = "tilelang", marker = "extra == 'cuda'", specifier = ">=0.1.11" },
     { name = "timm", marker = "extra == 'vlm'", specifier = "<=1.0.22" },
-    { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.6.0", index = "https://pypi.org/simple" },
-    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = ">=2.8.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.8.0", index = "https://pypi.org/simple" },
+    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.8.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchao", specifier = ">=0.16.0" },
     { name = "torchdata" },
     { name = "torchvision", marker = "sys_platform == 'darwin' and extra == 'diffusion'", index = "https://pypi.org/simple" },
@@ -5165,14 +5163,14 @@ wheels = [
 
 [[package]]
 name = "nvidia-cublas"
-version = "13.4.1.1"
+version = "13.8.1.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2e/d0/4e327087b6026a15d83b31ee1268fa16292e3bb71fb402bbe017bf6649ac/nvidia_cublas-13.4.1.1-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:6351d2d921527479d6d5002e620fe1971d3e10c730b544c02a36d65301efb00d", size = 513048233, upload-time = "2026-04-28T21:25:23.612Z" },
-    { url = "https://files.pythonhosted.org/packages/f8/79/0cefdaa1d9e45018a227bac64a79b92d2733cde28a8fd09c65362de08622/nvidia_cublas-13.4.1.1-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:28c983c8c03aa9a2d7b36cddcef2bfeeea85e13241d77df7622665502159f347", size = 404870806, upload-time = "2026-04-28T21:25:06.483Z" },
+    { url = "https://files.pythonhosted.org/packages/35/ea/54b9b5f0e0317cc1587353324e6821e16212693c3fde021d88919eaeee2f/nvidia_cublas-13.8.1.7-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:803b9974cd7164a481d0b11c25826498d383d0ef0c372573bc6577a344ddf74e", size = 552728945, upload-time = "2026-09-28T19:53:21.046Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/1b/adc70acf3fde509b1f0ca29d1c0e8d9b00aaecd871f8cf877257c8b68d9c/nvidia_cublas-13.8.1.7-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:c11a27fd4379510e5b1f84b367a2514d1e52fe5cc13442117a0e0a1addee3cf2", size = 439315821, upload-time = "2026-09-28T19:52:22.63Z" },
 ]
 
 [[package]]

@@ -72,6 +72,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate, MoE
+from nemo_automodel.components.moe.router_replay import replay_selection
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
@@ -1122,6 +1123,7 @@ class KimiK3Gate(Gate):
             scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
         indices = scores_for_choice.topk(self.topk, dim=-1, sorted=False)[1]
+        indices = replay_selection(self.router_replay, indices)
         weights = scores.gather(1, indices)
         if self.topk > 1 and self.norm_topk_prob:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)

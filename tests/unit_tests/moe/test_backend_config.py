@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from typing import Literal
 
 import pytest
 import torch
@@ -506,6 +507,31 @@ class TestBackendConfigPartialCudaGraphs:
                 dispatcher="deepep",
                 cuda_graph=CudaGraphConfig(modules=["moe_router", "moe_preprocess"]),
             )
+
+
+@pytest.mark.parametrize("experts,dispatcher", [("torch", "torch"), ("torch_mm", "deepep")])
+def test_native_te_grouped_tensor_rejects_other_expert_backends(
+    experts: Literal["torch", "torch_mm"], dispatcher: Literal["torch", "deepep"]
+) -> None:
+    with pytest.raises(ValueError, match="te_grouped_tensor=True requires experts='te'"):
+        BackendConfig(experts=experts, dispatcher=dispatcher, te_grouped_tensor=True)
+
+
+@pytest.mark.parametrize("dispatcher", ["torch", "mok"])
+def test_native_te_grouped_tensor_rejects_unsupported_dispatchers(dispatcher: Literal["torch", "mok"]) -> None:
+    with pytest.raises(ValueError, match="te_grouped_tensor=True requires dispatcher=") as exc_info:
+        BackendConfig(experts="te", dispatcher=dispatcher, te_grouped_tensor=True)
+
+    assert f"got dispatcher='{dispatcher}'" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("dispatcher", ["deepep", "hybridep", "uccl_ep"])
+def test_native_te_grouped_tensor_is_opt_in(dispatcher: Literal["deepep", "hybridep", "uccl_ep"]) -> None:
+    assert not BackendConfig(experts="te", dispatcher=dispatcher).te_grouped_tensor
+    config = BackendConfig(experts="te", dispatcher=dispatcher, te_grouped_tensor=True)
+    assert config.te_grouped_tensor
+    assert config.experts == "te"
+    assert config.dispatcher == dispatcher
 
 
 class TestBackendConfigHybridEPSyncFree:
