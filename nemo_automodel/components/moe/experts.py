@@ -212,6 +212,35 @@ if _BIAS_GRAD_TRITON_AVAILABLE:
 # ── EP variable-length collective helpers ──
 
 
+def _all_gather_varlen(
+    local_tensor: torch.Tensor, group: dist.ProcessGroup, gathered_lens: list[int], max_len: int
+) -> torch.Tensor:
+    """All-gather variable-length shards along dim 0 into one buffer, in rank order.
+
+    Gathering into a single buffer lets NCCL write the result in place. A list all-gather
+    stages through a flat buffer, copies it out per rank, and then needs a concatenation.
+
+    Args:
+        local_tensor: Tensor of shape [local_tokens, ...], with matching trailing axes across ranks.
+        group: Process group to gather over.
+        gathered_lens: Token count of every rank in the group, in rank order.
+        max_len: Largest entry of gathered_lens; every rank pads its shard to this length.
+
+    Returns:
+        Tensor of shape [sum(gathered_lens), ...] without padding. When all ranks hold
+        max_len tokens this is the gather buffer itself; otherwise one copy drops the padding.
+    """
+    local_len = local_tensor.size(0)
+    if local_len < max_len:
+        pad = local_tensor.new_zeros((max_len - local_len,) + tuple(local_tensor.shape[1:]))
+        local_tensor = torch.cat([local_tensor, pad], dim=0)
+    gathered = local_tensor.new_empty((len(gathered_lens) * max_len,) + tuple(local_tensor.shape[1:]))
+    dist.all_gather_into_tensor(gathered, local_tensor.contiguous(), group=group)
+    if all(n == max_len for n in gathered_lens):
+        return gathered
+    return torch.cat([gathered.narrow(0, rank * max_len, n) for rank, n in enumerate(gathered_lens)], dim=0)
+
+
 class _AllGatherConcatVarlenFn(Function):
     """All-gather with variable local lengths and autograd-safe backward.
 
@@ -221,23 +250,10 @@ class _AllGatherConcatVarlenFn(Function):
 
     @staticmethod
     def forward(ctx, local_tensor: torch.Tensor, group: dist.ProcessGroup, gathered_lens: list[int], max_len: int):
-        local_len = local_tensor.size(0)
-        if local_len < max_len:
-            pad_shape = (max_len - local_len,) + tuple(local_tensor.shape[1:])
-            pad = torch.zeros(pad_shape, dtype=local_tensor.dtype, device=local_tensor.device)
-            local_padded = torch.cat([local_tensor, pad], dim=0)
-        else:
-            local_padded = local_tensor
-
-        world_size = len(gathered_lens)
-        gathered = [torch.empty_like(local_padded) for _ in range(world_size)]
-        dist.all_gather(gathered, local_padded, group=group)
-        gathered = [g[:n] for g, n in zip(gathered, gathered_lens)]
-
         ctx.group = group
         ctx.gathered_lens = gathered_lens
         ctx.rank = dist.get_rank(group)
-        return torch.cat(gathered, dim=0)
+        return _all_gather_varlen(local_tensor, group, gathered_lens, max_len)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -813,11 +829,12 @@ class GroupedExperts(nn.Module):
         """
         local_num_tokens = x.size(0)
 
-        # Exchange per-rank token counts
-        local_len_t = torch.tensor([local_num_tokens], device=x.device, dtype=torch.int64)
-        gathered_len_t = [torch.zeros_like(local_len_t) for _ in range(ep_size)]
-        dist.all_gather(gathered_len_t, local_len_t, group=ep_group)
-        gathered_lens = [int(t.item()) for t in gathered_len_t]
+        # Exchange per-rank token counts with one gather and one device-to-host read (new_full fills on
+        # the device, so building the local count does not synchronize either).
+        local_len_t = x.new_full((1,), local_num_tokens, dtype=torch.int64)
+        gathered_len_t = x.new_empty((ep_size,), dtype=torch.int64)
+        dist.all_gather_into_tensor(gathered_len_t, local_len_t, group=ep_group)
+        gathered_lens = gathered_len_t.tolist()
         max_len = max(gathered_lens)
 
         def _all_gather_dim0_var(local_tensor: torch.Tensor, *, differentiable: bool) -> torch.Tensor:
@@ -832,16 +849,7 @@ class GroupedExperts(nn.Module):
             """
             if differentiable:
                 return _AllGatherConcatVarlenFn.apply(local_tensor, ep_group, gathered_lens, max_len)
-            if max_len > local_tensor.size(0):
-                pad_shape = (max_len - local_tensor.size(0),) + tuple(local_tensor.shape[1:])
-                pad = torch.zeros(pad_shape, dtype=local_tensor.dtype, device=local_tensor.device)
-                local_padded = torch.cat([local_tensor, pad], dim=0)
-            else:
-                local_padded = local_tensor
-            gathered = [torch.empty_like(local_padded) for _ in range(ep_size)]
-            dist.all_gather(gathered, local_padded, group=ep_group)
-            gathered = [g[:n] for g, n in zip(gathered, gathered_lens)]
-            return torch.cat(gathered, dim=0)
+            return _all_gather_varlen(local_tensor, ep_group, gathered_lens, max_len)
 
         x = _all_gather_dim0_var(x, differentiable=True)
         # Routing probabilities participate in the main-loss gradient.
