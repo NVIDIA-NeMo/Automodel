@@ -38,7 +38,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.gemma4_moe.cp_attention import (
-    attach_gemma4_cp_ring_attention,
+    apply_gemma4_cp_attention_backend_policy,
     gemma4_vision_group_ids,
 )
 from nemo_automodel.components.models.gemma4_moe.cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
@@ -75,9 +75,7 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.state_dict_adapter = Gemma4UnifiedStateDictAdapter()
-        for module in self.modules():
-            if isinstance(module, Gemma4UnifiedTextAttention):
-                attach_gemma4_cp_ring_attention(module)
+        apply_gemma4_cp_attention_backend_policy(self, Gemma4UnifiedTextAttention)
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
         """Tie the output head to Gemma4 Unified's text input embedding."""

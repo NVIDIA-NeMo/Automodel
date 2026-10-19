@@ -98,7 +98,7 @@ from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
+from .cp_attention import apply_gemma4_cp_attention_backend_policy, gemma4_vision_group_ids
 from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
 from .parallelization import PARALLELIZER
 from .sdpa_fp32 import enable_gemma4_sdpa_fp32
@@ -1037,22 +1037,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
     def _apply_cp_attention_backend_policy(self) -> None:
         """Apply the model-owned CP attention backend policy to the final module tree."""
-        text_config = getattr(self.config, "text_config", self.config)
-        full_backend = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower()
-        sliding_backend = str(getattr(text_config, "cp_sliding_attn_backend", "flex")).lower()
-
-        if full_backend not in {"flex", "ffpa"}:
-            raise ValueError(f"Unsupported cp_full_attn_backend: {full_backend!r}")
-        if sliding_backend not in {"flex", "fa"}:
-            raise ValueError(f"Unsupported cp_sliding_attn_backend: {sliding_backend!r}")
-
-        for module in self.modules():
-            if isinstance(module, Gemma4Attention):
-                attach_gemma4_cp_ring_attention(
-                    module,
-                    use_ffpa=full_backend == "ffpa",
-                    sliding_backend=sliding_backend,
-                )
+        apply_gemma4_cp_attention_backend_policy(self, Gemma4Attention)
 
     def __init__(
         self,

@@ -1363,3 +1363,29 @@ def attach_gemma4_cp_ring_attention(
     }
     attention_module.run_cp_manual_attention = MethodType(_gemma4_cp_manual_attention, attention_module)
     attention_module.setup_cp_attention = MethodType(_install_gemma4_cp_ring_sdpa, attention_module)
+
+
+def apply_gemma4_cp_attention_backend_policy(model: torch.nn.Module, attention_cls: type) -> None:
+    """Attach the ring to every ``attention_cls`` module of ``model`` with the configured CP kernels.
+
+    The text config selects the kernels: ``cp_full_attn_backend`` (``flex`` | ``ffpa``) for full-attention
+    layers and ``cp_sliding_attn_backend`` (``flex`` | ``fa``) for sliding-window layers; both default to
+    ``flex``.
+
+    Args:
+        model: The Gemma4-family model whose self-attention modules get the ring.
+        attention_cls: The self-attention module class to attach to.
+
+    Raises:
+        ValueError: For an unsupported backend name.
+    """
+    text_config = getattr(model.config, "text_config", model.config)
+    full_backend = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower()
+    sliding_backend = str(getattr(text_config, "cp_sliding_attn_backend", "flex")).lower()
+    if full_backend not in {"flex", "ffpa"}:
+        raise ValueError(f"Unsupported cp_full_attn_backend: {full_backend!r}")
+    if sliding_backend not in {"flex", "fa"}:
+        raise ValueError(f"Unsupported cp_sliding_attn_backend: {sliding_backend!r}")
+    for module in model.modules():
+        if isinstance(module, attention_cls):
+            attach_gemma4_cp_ring_attention(module, use_ffpa=full_backend == "ffpa", sliding_backend=sliding_backend)
