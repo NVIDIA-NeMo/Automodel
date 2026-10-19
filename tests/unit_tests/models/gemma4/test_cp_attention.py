@@ -171,6 +171,17 @@ def test_zero_if_none_returns_zeros_when_none():
 # ---------------------------------------------------------------------------
 # attach_gemma4_cp_ring_attention
 # ---------------------------------------------------------------------------
+def test_flex_compile_settings_scope_recompile_room_and_duck_shape():
+    from torch.fx.experimental import _config as fx_config
+
+    limit, duck = torch._dynamo.config.recompile_limit, fx_config.use_duck_shape
+    with cpa._flex_compile_settings():
+        assert torch._dynamo.config.recompile_limit >= cpa._FLEX_RECOMPILE_LIMIT
+        assert fx_config.use_duck_shape is False
+    assert torch._dynamo.config.recompile_limit == limit
+    assert fx_config.use_duck_shape == duck
+
+
 def test_attach_sets_metadata_keys_and_method():
     module = torch.nn.Linear(2, 2)
     cpa.attach_gemma4_cp_ring_attention(module)

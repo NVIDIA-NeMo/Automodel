@@ -36,7 +36,7 @@ from nemo_automodel.components.models.gemma4_unified.model import Gemma4UnifiedF
 IMAGE_TOKEN_ID = 100
 
 
-def _model(attn_implementation="sdpa"):
+def _model(attn_implementation="sdpa", **text_overrides):
     text = Gemma4UnifiedTextConfig(
         vocab_size=128,
         hidden_size=64,
@@ -54,6 +54,7 @@ def _model(attn_implementation="sdpa"):
         num_kv_shared_layers=0,
         hidden_size_per_layer_input=0,
         pad_token_id=0,
+        **text_overrides,
     )
     vision = Gemma4UnifiedVisionConfig(
         mm_embed_dim=32, output_proj_dims=32, patch_size=2, pooling_kernel_size=2, model_patch_size=4, mm_posemb_size=16
@@ -85,6 +86,17 @@ def test_capabilities_and_ring_attached_at_construction():
     assert not any(getattr(m, "_cp_uses_attention_hook", False) for m in attention)
     supports = ModelSupports(model)
     assert supports.supports_cp and supports.supports_cp_with_sequence_packing
+
+
+def test_cp_attention_backends_follow_the_text_config():
+    attention = [
+        m
+        for m in _model(cp_sliding_attn_backend="fa", cp_full_attn_backend="ffpa").modules()
+        if isinstance(m, Gemma4UnifiedTextAttention)
+    ]
+    assert all(m._gemma4_cp_sliding_backend == "fa" and m._gemma4_cp_use_ffpa for m in attention)
+    with pytest.raises(ValueError, match="cp_sliding_attn_backend"):
+        _model(cp_sliding_attn_backend="sdpa")
 
 
 @pytest.mark.parametrize("with_image", [False, True])
