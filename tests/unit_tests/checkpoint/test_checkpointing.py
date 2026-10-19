@@ -147,6 +147,21 @@ def test_load_on_global_ranks_falls_back_to_legacy_rng_state(tmp_path, caplog):
     assert (random.random(), np.random.rand(), torch.rand(1).item()) == expected
 
 
+def test_load_optimizer_skips_gracefully_when_optim_dir_missing(tmp_path, caplog):
+    """A checkpoint written with save_optimizer=False has no optim/ dir; loading it must
+    warn and leave the optimizer untouched instead of crashing on a missing DCP path."""
+    checkpointer = CheckpointingConfig(checkpoint_dir=tmp_path, save_consolidated=False).build(0, 0, 0)
+    model = torch.nn.Linear(2, 2, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    optimizer_state_before = optimizer.state_dict()
+
+    with caplog.at_level(logging.WARNING):
+        checkpointer.load_optimizer(optimizer, model, str(tmp_path))
+
+    assert "checkpoint.save_optimizer was False" in caplog.text
+    assert optimizer.state_dict() == optimizer_state_before
+
+
 class TestConsolidationProcessGroup:
     """Tests for the process group that isolates inline consolidation from NCCL."""
 
