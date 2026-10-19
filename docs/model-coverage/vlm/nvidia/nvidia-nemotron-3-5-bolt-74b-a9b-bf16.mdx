@@ -32,7 +32,7 @@ CUDA_VISIBLE_DEVICES=0 automodel \
 | Hardware | 1 NVIDIA GB300 GPU |
 | Strategy | FSDP2; `dp_size=1`, `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=1` |
 | Sequence length | 4,096 tokens |
-| Features | BF16 LoRA, activation checkpointing, reshard after forward, frozen vision encoder and projector |
+| Features | BF16 LoRA, reshard after forward, frozen vision encoder and projector |
 | Advanced | Hugging Face remote implementation, eager attention |
 
 ## Model Reference

@@ -44,7 +44,8 @@ def test_nemotron_3_5_bolt_lora_uses_force_hf_without_expert_parallelism() -> No
     assert model["trust_remote_code"] is True
     assert model["torch_dtype"] == "torch.bfloat16"
     assert model["attn_implementation"] == "eager"
-    assert model["revision"] == "a6a1e5030819a130a1ea08aadb1fe42f4cc86777"  # pragma: allowlist secret
+    assert "revision" not in model
+    assert "revision" not in raw_config["processor"]
     assert "backend" not in model
     assert "quantization" not in raw_config
 
@@ -80,8 +81,12 @@ def test_nemotron_3_5_bolt_lora_uses_force_hf_without_expert_parallelism() -> No
     assert distributed.cp_size == 1
     assert distributed.pp_size == 1
     assert distributed.ep_size == 1
-    assert distributed.activation_checkpointing is True
+    assert distributed.activation_checkpointing is False
     assert distributed.reshard_after_forward is True
+
+    optimizer = raw_config["optimizer"]
+    assert optimizer["exp_avg_dtype"] == "torch.float32"
+    assert optimizer["exp_avg_sq_dtype"] == "torch.float32"
 
     assert config.step_scheduler.global_batch_size == 1
     assert config.step_scheduler.local_batch_size == 1
@@ -92,3 +97,5 @@ def test_nemotron_3_5_bolt_lora_uses_force_hf_without_expert_parallelism() -> No
     assert config.ci.cluster_tag == "gb300"
     assert config.ci.nodes == 1
     assert config.ci.nproc_per_node == 1
+    assert config.ci.time == "00:30:00"
+    assert "env_vars" not in raw_config["ci"]

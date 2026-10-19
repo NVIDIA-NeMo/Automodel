@@ -24,7 +24,7 @@
 # out_proj.weight directly instead of calling the wrapped module's forward.
 #
 # Run on exactly one GB300 GPU:
-#   CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 automodel \
+#   CUDA_VISIBLE_DEVICES=0 automodel \
 #     examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_cord_v2_lora.yaml \
 #     --nproc-per-node 1
 
@@ -49,16 +49,15 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16
-  revision: a6a1e5030819a130a1ea08aadb1fe42f4cc86777  # pragma: allowlist secret
   force_hf: true
   trust_remote_code: true
   torch_dtype: torch.bfloat16
-  # The pinned remote FA2 path converts an all-valid mask to an unsupported 4D
+  # The remote FA2 path converts an all-valid mask to an unsupported 4D
   # additive mask, and the remote model does not advertise SDPA support.
   attn_implementation: eager
   use_liger_kernel: false
   use_sdpa_patching: false
-  # This checkpoint revision stores pre-Transformers-5.18 parameter prefixes.
+  # The checkpoint stores pre-Transformers-5.18 parameter prefixes.
   key_mapping:
     '^language_model\.backbone\.': language_model.model.
     '^mlp1\.0\.': vision_projector.mlp1.norm.
@@ -88,7 +87,6 @@ peft:
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16
-  revision: a6a1e5030819a130a1ea08aadb1fe42f4cc86777  # pragma: allowlist secret
   trust_remote_code: true
 
 checkpoint:
@@ -105,7 +103,7 @@ distributed:
   pp_size: 1
   ep_size: 1
   sequence_parallel: false
-  activation_checkpointing: true
+  activation_checkpointing: false
   reshard_after_forward: true
 
 freeze_config:
@@ -148,8 +146,8 @@ optimizer:
   betas: [0.9, 0.95]
   master_weights: true
   store_param_remainders: true
-  exp_avg_dtype: torch.bfloat16
-  exp_avg_sq_dtype: torch.bfloat16
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
 
 wandb:
   enable: false
@@ -161,8 +159,5 @@ ci:
   cluster_tag: gb300
   nodes: 1
   nproc_per_node: 1
-  time: "02:00:00"
+  time: "00:30:00"
   max_steps: 2
-  env_vars:
-    OMP_NUM_THREADS: 8
-    MKL_NUM_THREADS: 8
