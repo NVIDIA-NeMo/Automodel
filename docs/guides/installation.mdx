@@ -132,6 +132,14 @@ Install directly in WSL2 Ubuntu environment (follow Debian instructions).
 
 ## Prerequisites
 
+For MoE training, check the
+[dispatcher requirements](/development/moe-backends)
+before choosing extras or a container. DeepEP/HybridEP use the `moe` extra;
+UCCL-EP requires a separate native installation; MoK uses the optional `mok`
+extra on supported hardware. The proposed NCCL-EP backend requires an enabled
+Transformer Engine build and is tracked in
+[PR #4384](https://github.com/NVIDIA-NeMo/Automodel/pull/4384).
+
 ### System Requirements
 - **Python**: 3.10 or higher
 - **GPU runtime**: The current source lock selects PyTorch `cu130` wheels on Linux, while the current container build uses a CUDA 13.2 development image. These are separate installation artifacts, not a blanket CUDA 11.8+ requirement

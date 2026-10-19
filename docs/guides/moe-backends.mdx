@@ -1,0 +1,298 @@
+---
+title: "MoE Backends and Dispatchers"
+description: "Reference for NeMo AutoModel MoE dispatchers, expert compute backends, configuration defaults, dependencies, and support limits."
+---
+
+NeMo AutoModel configures MoE token communication and expert computation through
+`model.backend`. This reference lists the available dispatchers, their
+requirements, and their configuration fields. For complete fine-tuning recipes
+and launch commands, see [Fine-Tune Large MoE LLMs](/recipes-e2e-examples/large-moe-fine-tuning).
+
+## Choose a Token Dispatcher
+
+Set `model.backend.dispatcher` to choose how tokens reach their assigned experts
+and how expert outputs return to the original token order. Set
+`model.backend.experts` separately to choose the expert matrix-multiplication
+implementation. Selecting a dispatcher does not set the expert-parallel group
+size: configure `distributed.ep_size` as well.
+
+The following table lists every current dispatcher and the proposed NCCL-EP
+addition. Current options are defined by
+[`BackendConfig`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/common/utils.py).
+
+| `dispatcher` | Implementation | Requirements and scope |
+|---|---|---|
+| `torch` | PyTorch DTensor all-gather/reduce-scatter for EP; local experts without EP. | No extra EP communication package. Use `experts: torch` or `experts: torch_mm`. |
+| `deepep` | DeepEP dispatch/combine with local token permutation. | Requires the `deep_ep` native extension and its NVSHMEM dependencies. [DeepEP and UCCL-EP](#configure-deepep-and-uccl-ep) includes example recipes. |
+| `hybridep` | HybridEP dispatch/combine, with optional fused permutation. | Requires the HybridEP APIs from AutoModel's pinned DeepEP revision. See [HybridEP routing](#configure-hybridep-routing). |
+| `uccl_ep` | UCCL-EP dispatch/combine through AutoModel's flex dispatcher. | Requires a separate UCCL-EP installation or a container built with it. Uses libibverbs RC QPs for RDMA in environments such as Azure where GPU-to-NIC PCIe P2P is unavailable. |
+| `mok` | Mixture-of-Kittens fused communication and expert SwiGLU computation. | Blackwell only, with a built MoK extension and a compatible model. See [MoK requirements](#configure-mixture-of-kittens). |
+| `nccl_ep` (pending) | Transformer Engine NCCL-EP dispatch/combine. | Experimental BF16, Hopper/SM90+, and an NCCL-EP-enabled TE build. Requires [PR #4384](https://github.com/NVIDIA-NeMo/Automodel/pull/4384); see [NCCL-EP](#nccl-ep-pending). |
+
+<Note>
+If `dispatcher` is omitted, AutoModel selects `deepep` when CUDA and the
+`deep_ep` package are available, otherwise `uccl_ep` when CUDA and UCCL-EP are
+available, otherwise `torch`. HybridEP and MoK require explicit selection.
+Set the dispatcher explicitly to keep the choice consistent across environments.
+</Note>
+
+For expert parallelism, use `distributed.strategy: fsdp2` and an `ep_size`
+greater than 1 that divides the number of routed experts and fits the distributed
+topology. For a `tp_size: 1` topology, `ep_size` must divide
+`dp_size * cp_size`. `megatron_fsdp` does not support EP, PP, or
+`sequence_parallel`. See
+[Distributed Setup](/development/distributed-setup) for the topology API.
+
+For example, this fragment selects DeepEP and eight-way EP for a compatible MoE
+model on eight GPUs:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: deepep
+
+distributed:
+  strategy: fsdp2
+  ep_size: 8
+```
+
+With world size 1, `deepep`, `hybridep`, and `uccl_ep` warn and fall back to
+local grouped experts. A single-GPU run therefore does not exercise their EP
+transport.
+
+### Expert Compute Backends
+
+The `model.backend.experts` field accepts the following values:
+
+| `experts` | Implementation | Scope |
+|---|---|---|
+| `torch` | Per-expert PyTorch loop. | Use with `dispatcher: torch`. |
+| `torch_mm` | PyTorch grouped matrix multiplication. | Use with `torch`, `deepep`, `hybridep`, or `uccl_ep`. |
+| `te` | Transformer Engine `GroupedLinear`. | Requires a flex dispatcher: `deepep`, `hybridep`, or `uccl_ep`. |
+| `gmm` | Deprecated compatibility alias for `torch_mm`. | Use `torch_mm` in new configurations. |
+| `torch_mm_mxfp8` | torchao MXFP8 grouped GEMM for training. | Requires GB200/SM100+ and torchao for the MXFP8 path; falls back to PyTorch grouped matrix multiplication otherwise. |
+
+If `experts` is omitted, the default is `torch_mm` when CUDA is available and
+`torch` otherwise. `torch_mm_mxfp8` is separate from MoK's `mok.precision`
+setting. Expert precision does not imply that tokens are communicated in the
+same precision.
+
+The `te_grouped_tensor: true` option requires `experts: te` and one of
+`deepep`, `hybridep`, or `uccl_ep`. Device and precision support follows
+Transformer Engine's `GroupedLinear` contract. Pairing `experts: te` with
+`dispatcher: torch` falls back to `experts: torch_mm`.
+
+### Shared Dispatcher Settings
+
+Place these settings under `model.backend`. They apply to `deepep`, `hybridep`,
+and `uccl_ep`; MoK uses its own nested settings.
+
+| Setting | Default | Scope |
+|---|---:|---|
+| `dispatcher_num_sms` | `20` | Communication SM budget passed to the selected flex backend, including HybridEP dispatch/combine. |
+| `dispatcher_share_token_dispatcher` | `true` | Share a communication manager across MoE layers for the selected flex backend. |
+| `dispatcher_async_dispatch` | `false` | DeepEP/UCCL-EP only: request asynchronous dispatch/combine with outputs allocated on the communication stream. This does not enable HybridEP's capacity mode. |
+
+`enable_deepep` is removed and ignored with a warning. Set `dispatcher` and
+`experts` explicitly instead.
+
+## Configure PyTorch Dispatch
+
+Use `dispatcher: torch` to run without an additional EP communication package:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: torch
+```
+
+Use `experts: torch` for the per-expert loop instead. For EP, configure the
+FSDP2 strategy and EP group size as described above.
+
+## Configure DeepEP and UCCL-EP
+
+For DeepEP and HybridEP, use an AutoModel container with those dependencies or
+install the source checkout's `moe` extra with `uv sync --extra moe`.
+HybridEP needs the APIs provided by the pinned revision; an arbitrary DeepEP
+installation may not provide them.
+
+DeepEP and UCCL-EP use the same backend selection pattern:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: uccl_ep  # Use deepep for DeepEP.
+```
+
+The `moe` extra does not install UCCL-EP. See the repository's
+[`setup_uccl_ep.sh`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/scripts/setup_uccl_ep.sh)
+for native build requirements, or build a container with
+`INSTALL_UCCL_EP=True`. For Mellanox/Azure, the setup script provides
+`--no-efa` to disable AWS EFA support.
+
+Start from the
+[DeepEP Qwen3 MoE recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_moe_30b_te_deepep.yaml)
+or the
+[UCCL-EP Qwen3 MoE recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_moe_30b_uccl_ep.yaml),
+then match its EP size and batch settings to your allocation.
+
+## Configure HybridEP Routing
+
+Several large-scale MoE recipes use the [HybridEP dispatcher](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) to combine expert-parallel token permutation and communication. Select it in the model backend:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: hybridep
+```
+
+HybridEP supports two routing-metadata paths:
+
+- **Dense routing (default)**: Builds a Boolean routing map with shape `[tokens, experts]` and a matching dense probability tensor.
+- **Compact routing (opt-in)**: Passes top-k expert indices with shape `[tokens, top_k]` instead of the dense Boolean routing map. NeMo AutoModel still expands the routing probabilities to `[tokens, experts]` to preserve the existing router-gradient layout.
+
+Enable compact routing only after benchmarking the exact model, batch shape, GPU, and expert-parallel topology:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: hybridep
+    dispatcher_hybridep_compact_routing: true
+```
+
+Compact routing reduces routing-map size, but its additional metadata preprocessing can increase latency for some workloads. Dense routing therefore remains the default.
+
+The following advanced settings apply only when `dispatcher: hybridep`:
+
+| Setting | Default | Description |
+|---|---:|---|
+| `dispatcher_hybridep_compact_routing` | `false` | Pass top-k expert indices instead of a dense Boolean routing map. |
+| `dispatcher_hybridep_permute_fusion` | `false` | Fuse token permutation into dispatch and unpermutation into combine. |
+| `dispatcher_hybridep_num_sms_preprocessing` | `null` | Override the number of SMs used for routing-metadata preprocessing. |
+| `dispatcher_hybridep_num_blocks_permute` | `null` | Override the number of dispatch permutation blocks. |
+| `dispatcher_hybridep_num_blocks_unpermute` | `null` | Override the number of combine unpermutation blocks. |
+| `dispatcher_capacity_factor` | `null` | Capacity mode for dynamic routing: size the dispatch buffers once from the first real batch times this factor and run later dispatches non-blocking; an overflow trips a device-side assert. Not for experts with `expert_bias`. |
+| `dispatcher_equal_token_counts` | `false` | Declare that every EP rank dispatches the same row count, so the per-dispatch pad-size all-reduce and its host sync are skipped. Keep `false` for variable-length or packed inputs: with genuinely unequal (aligned) row counts the HybridEP collective hangs silently instead of raising. |
+
+Leave the numeric tuning settings unset to use HybridEP defaults unless a matched benchmark demonstrates an improvement. A value that improves performance on one GPU architecture or topology might reduce performance on another.
+
+With `dispatcher_share_token_dispatcher: true`, capacity mode calibrates once
+from the first local MoE layer's first microbatch and reuses that capacity across
+layers. Choose `dispatcher_capacity_factor` at least `1.0` and large enough for
+the largest routing skew across layers and batches. It cannot be combined with
+`benchmark_static_routing`.
+
+For jobs that reuse compiled HybridEP kernels, see
+[HybridEP JIT cache configuration](/get-started/configuration#reuse-hybridep-jit-kernels-across-jobs).
+
+## Configure Mixture-of-Kittens
+
+`dispatcher: mok` selects a fused communication and expert-compute backend;
+the `experts` field does not select its routed-expert kernels. Install the
+source checkout's optional MoK dependency with `uv sync --extra mok` on Linux
+with Python 3.12+, Blackwell GPUs, and a matching CUDA 13 toolkit.
+
+```yaml
+model:
+  backend:
+    dispatcher: mok
+    mok:
+      precision: bf16
+
+distributed:
+  strategy: fsdp2
+  ep_size: 4
+```
+
+The current adapter requires BF16 model tensors, hidden and expert intermediate
+dimensions divisible by 256, and exactly one shared expert with the same
+intermediate width as each routed expert. Both shared and routed experts must
+use SwiGLU. Expert biases, a shared-expert gate, a MoE latent projection, and
+clamping after the activation are unsupported. EP size must be one of
+`4`, `8`, `16`, `32`, or `64` and divide the routed-expert count.
+
+Every EP rank must provide the same physical token count for each MoE call.
+This count must be at least 512 and divisible by 256, including any padding
+rows. AutoModel does not pad MoK inputs automatically. Prepare local
+microbatches and packed inputs to meet these requirements after sequence or
+context parallel sharding.
+
+MoK-specific settings live under `model.backend.mok`:
+
+| Setting | Default | Description |
+|---|---:|---|
+| `precision` | `bf16` | Routed-expert compute: `bf16` or `mxfp8`; model weights remain BF16. |
+| `fwd_num_comm_sms` | `40` | Forward communication SMs; a positive even integer. |
+| `bwd_num_comm_sms` | `28` | Backward communication SMs; a positive even integer. |
+| `minibatch_size` | `4096` | Routed-token overlap granularity; a positive multiple of 256. |
+| `macrobatch_size` | `131072` | Routed-token ring-buffer capacity; a positive multiple of `minibatch_size`. |
+| `schedule_capacity_multiplier` | `0.5` | Worst-case fraction of routes sent to one EP rank; positive and finite. |
+| `all_gather_top_experts_chunk_bytes` | `2048` | Routing all-gather chunk size; a positive multiple of 16 bytes. |
+
+See the
+[four-GPU GLM-4.7-Flash MoK benchmark](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/glm/glm_4.7_flash_mok_4gpu.yaml)
+for a complete configuration. It uses random initialization and mock data,
+so it is not a pretrained fine-tuning recipe.
+
+## NCCL-EP (Pending)
+
+<Note>
+`dispatcher: nccl_ep` is proposed in
+[PR #4384](https://github.com/NVIDIA-NeMo/Automodel/pull/4384) and is not yet
+available on `main`. The configuration below describes that proposal. Use it
+only with a checkout or image containing the implementation.
+</Note>
+
+The proposed backend uses Transformer Engine's NCCL-EP dispatch/combine API
+for experimental, eager, dropless BF16 EP on Hopper/SM90 or newer GPUs:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: nccl_ep
+    nccl_ep:
+      max_tokens_per_rank: 4096
+```
+
+`max_tokens_per_rank` has no usable default and must bound the tokens entering
+each MoE layer on each rank per microbatch, including masked tokens. Account
+for local batch size and sequence parallelism. Use the same bound on every EP
+rank and layer. Inputs are padded with invalid routes to a common multiple of
+64; receive buffers use actual routing counts without dropping tokens.
+
+The proposed runtime requires an NCCL-EP-enabled Transformer Engine build
+exposing `transformer_engine.pytorch.ep`, NCCL 2.30.4+, and an NCCL EP group of
+at least two ranks. The default public-wheel installation disables NCCL-EP;
+installing the `moe` extra alone does not enable it. PR #4384 enables it for
+PyTorch-based CI container builds with `TE_WITH_NCCL_EP=1`.
+
+Communication CUDA Graph capture and `dispatcher_async_dispatch: true` are
+unsupported. All NCCL-EP layers in a process must share one EP group and the
+same capacity, hidden width, expert count, top-k, and SM budget. Routing state
+remains local to each layer regardless of `dispatcher_share_token_dispatcher`;
+`dispatcher_num_sms` sets the transport SM budget. The proposal does not add
+NCCL-EP to the `te_grouped_tensor` options.
+
+The PR reports historical two-H100 same-node parity validation. Native
+transport validation on its latest head, multi-node and composed PP/FSDP/EP
+training validation, and comparative performance remain pending. Check the
+PR's current validation status before using it for a training workload.
+
+## Implementation Reference
+
+The following source files define selection, defaults, and runtime constraints:
+
+| Source | Contract |
+|---|---|
+| [`BackendConfig` and `MoKBackendConfig`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/common/utils.py) | Public backend fields, dependency-dependent defaults, and configuration validation. |
+| [`MoE`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/moe/layers.py) | Dispatcher and expert implementation selection, including the single-rank fallback. |
+| [`GroupedExperts`, `GroupedExpertsDeepEP`, and `GroupedExpertsTE`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/moe/experts.py) | Expert compute and propagation of backend settings to the token dispatcher. |
+| [`MoEFlexTokenDispatcher`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/moe/megatron/token_dispatcher.py) | DeepEP, HybridEP, and UCCL-EP dispatch/combine paths. |
+| [`GroupedExpertsMoK`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/moe/mok_experts.py) | MoK model-shape, activation, dtype, and EP constraints. |
+| [Proposed NCCL-EP transport](https://github.com/NVIDIA-NeMo/Automodel/blob/6d45c14f287bcc0ae73da389ead6aff8bd720ff4/nemo_automodel/shared/nccl_ep.py) | Pending NCCL-EP capacity and process-wide transport requirements at the reviewed PR revision. |
