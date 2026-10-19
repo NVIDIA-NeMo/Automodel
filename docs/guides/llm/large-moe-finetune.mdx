@@ -96,26 +96,9 @@ distributed:
     layers_per_stage: 2
 ```
 
-## Choose a Token Dispatcher
-
-Set `model.backend.dispatcher` to select token communication separately from
-the expert-parallel group size, `distributed.ep_size`.
-
-| `dispatcher` | Backend |
-|---|---|
-| `torch` | PyTorch DTensor collectives for EP, or local experts without EP. |
-| `deepep` | DeepEP token dispatch and combine. |
-| `hybridep` | HybridEP dispatch and combine, with optional fused token permutation. |
-| `uccl_ep` | UCCL-EP dispatch and combine using libibverbs RDMA. |
-| `mok` | Mixture-of-Kittens fused communication and expert computation; Blackwell only. |
-| `nccl_ep` (pending) | Experimental Transformer Engine NCCL-EP; requires [PR #4384](https://github.com/NVIDIA-NeMo/Automodel/pull/4384), which is not yet merged. |
-
-For dependencies, hardware and model constraints, expert compute choices, and
-configuration defaults, see [MoE Backends and Dispatchers](/development/moe-backends).
-
 ## Configure HybridEP Routing
 
-Several large-scale MoE recipes select HybridEP in the model backend:
+Several large-scale MoE recipes use the [HybridEP dispatcher](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) to combine expert-parallel token permutation and communication. Select it in the model backend:
 
 ```yaml
 model:
@@ -124,9 +107,40 @@ model:
     dispatcher: hybridep
 ```
 
-The [HybridEP reference](/development/moe-backends#configure-hybridep-routing)
-explains dense and compact routing, fused permutation, capacity mode, and
-unequal token counts.
+HybridEP supports two routing-metadata paths:
+
+- **Dense routing (default)**: Builds a Boolean routing map with shape `[tokens, experts]` and a matching dense probability tensor.
+- **Compact routing (opt-in)**: Passes top-k expert indices with shape `[tokens, top_k]` instead of the dense Boolean routing map. NeMo AutoModel still expands the routing probabilities to `[tokens, experts]` to preserve the existing router-gradient layout.
+
+Enable compact routing only after benchmarking the exact model, batch shape, GPU, and expert-parallel topology:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: hybridep
+    dispatcher_hybridep_compact_routing: true
+```
+
+Compact routing reduces routing-map size, but its additional metadata preprocessing can increase latency for some workloads. Dense routing therefore remains the default.
+
+The following advanced settings apply only when `dispatcher: hybridep`:
+
+| Setting | Default | Description |
+|---|---:|---|
+| `dispatcher_hybridep_compact_routing` | `false` | Pass top-k expert indices instead of a dense Boolean routing map. |
+| `dispatcher_hybridep_permute_fusion` | `false` | Fuse token permutation into dispatch and unpermutation into combine. |
+| `dispatcher_hybridep_num_sms_preprocessing` | `null` | Override the number of SMs used for routing-metadata preprocessing. |
+| `dispatcher_hybridep_num_blocks_permute` | `null` | Override the number of dispatch permutation blocks. |
+| `dispatcher_hybridep_num_blocks_unpermute` | `null` | Override the number of combine unpermutation blocks. |
+| `dispatcher_capacity_factor` | `null` | Capacity mode for dynamic routing: size the dispatch buffers once from the first real batch times this factor and run later dispatches non-blocking; an overflow trips a device-side assert. Not for experts with `expert_bias`. |
+| `dispatcher_equal_token_counts` | `false` | Declare that every EP rank dispatches the same row count, so the per-dispatch pad-size all-reduce and its host sync are skipped. Keep `false` for variable-length or packed inputs: with genuinely unequal (aligned) row counts the HybridEP collective hangs silently instead of raising. |
+
+Leave the numeric tuning settings unset to use HybridEP defaults unless a matched benchmark demonstrates an improvement. A value that improves performance on one GPU architecture or topology might reduce performance on another.
+
+NeMo AutoModel also supports additional token dispatchers. See
+[MoE Backends and Dispatchers](/development/moe-backends) for the available
+options, their requirements, and configuration details.
 
 ## Launch Training
 
