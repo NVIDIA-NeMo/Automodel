@@ -21,7 +21,8 @@ shard installs the p2p ring, the forward embeds and splices the image on the ful
 keeps this rank's slice):
 
 * ``text``: plain causal text.
-* ``image``: one image block whose tokens attend bidirectionally on the sliding layers.
+* ``image``: one image block across the rank boundary whose tokens attend bidirectionally on the
+  sliding layers (the reference forward uses the same generation masks).
 * ``packed``: two documents in one row; the reference runs each document on its own.
 
 The loss is the token-sum cross entropy over the global token count, so the CP gradients summed
@@ -96,7 +97,7 @@ def _batches(seqlen, device, dtype):
     batches = {"text": {"input_ids": ids, "labels": labels, "position_ids": positions}}
 
     image_ids = ids.clone()
-    start = seqlen // 4
+    start = seqlen // 2 - NUM_PATCHES // 2  # the image block straddles the CP rank boundary
     image_ids[0, start : start + NUM_PATCHES] = IMAGE_TOKEN_ID
     mm = (image_ids == IMAGE_TOKEN_ID).long()
     image_labels = torch.cat([image_ids[:, 1:], torch.full((1, 1), -100)], dim=1)

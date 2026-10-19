@@ -167,11 +167,17 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
     ) -> Gemma4UnifiedCausalLMOutputWithPast:
         """Hugging Face's forward, or the context-parallel forward once CP is set up.
 
-        Without CP every argument goes to the Hugging Face forward unchanged. Under CP the forward
-        embeds the full ``input_ids`` and splices image features as Hugging Face does, builds the
-        vision-bidirectional block ids on the full sequence, then keeps this rank's contiguous
-        slice; the aux-only sharder already sliced ``position_ids``, ``padding_mask`` and
-        ``_packed_seq_ids`` to the same layout, and every text self-attention module runs the ring.
+        Image blocks marked by ``mm_token_type_ids`` attend bidirectionally on sliding-window layers
+        only, as in Hugging Face's generation masks for this model and in dense Gemma4. Hugging
+        Face's own training forward also applies that overlay to the full-attention layers, so
+        without CP the forward passes it the generation masks; CP and non-CP training then match
+        inference.
+
+        Under CP the forward embeds the full ``input_ids`` and splices image features as Hugging
+        Face does, builds the vision-bidirectional block ids on the full sequence, then keeps this
+        rank's contiguous slice; the aux-only sharder already sliced ``position_ids``,
+        ``padding_mask`` and ``_packed_seq_ids`` to the same layout, and every text self-attention
+        module runs the ring.
 
         Args:
             input_ids: Token ids ``[batch, sequence]``; full-length under CP.
@@ -185,7 +191,7 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
             video_position_ids: Video patch positions.
             past_key_values: KV cache; unused under CP.
             mm_token_type_ids: Modality ids ``[batch, sequence]``; image blocks attend bidirectionally on
-                sliding layers when set, under CP as in the Hugging Face forward.
+                sliding-window layers when set.
             inputs_embeds: Input embeddings; not supported under CP.
             labels: Labels for the Hugging Face loss; under CP the recipe computes the loss instead.
             use_cache: Whether to return a KV cache; off under CP.
@@ -201,6 +207,23 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
             ValueError: Under CP, for inputs the context-parallel forward does not support.
         """
         if not getattr(self, "_cp_enabled", False):
+            text_config = self.config.get_text_config()
+            if (
+                mm_token_type_ids is not None
+                and text_config.use_bidirectional_attention == "vision"
+                and not isinstance(attention_mask, dict)
+                and past_key_values is None
+            ):
+                # The mask builder reads only the batch/sequence shape, dtype and device.
+                shape_like = input_ids if inputs_embeds is None else inputs_embeds[..., 0]
+                attention_mask = self.create_masks_for_generate(
+                    self.config,
+                    shape_like.new_empty((*shape_like.shape[:2], 0), dtype=self.dtype),
+                    attention_mask,
+                    None,
+                    position_ids,
+                    mm_token_type_ids=mm_token_type_ids,
+                )
             return super().forward(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
