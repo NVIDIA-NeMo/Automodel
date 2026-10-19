@@ -144,6 +144,17 @@ class NcclEpManager:
         num_local_experts: int,
         top_k: int,
     ) -> None:
+        """Keep layer-local routing state for an initialized NCCL-EP context.
+
+        Args:
+            api: Transformer Engine NCCL-EP API owning the shared transport.
+            max_tokens: Upper bound on real input rows for this layer.
+            capacity: Group-uniform input extent, padded to a multiple of 64.
+            hidden_dim: Width of each dispatched token.
+            num_experts: Global expert count across the EP group.
+            num_local_experts: Number of contiguous experts owned by this EP rank.
+            top_k: Distinct expert selections per token.
+        """
         self.api = api
         self.max_tokens = max_tokens
         self.capacity = capacity
@@ -163,8 +174,9 @@ class NcclEpManager:
 
         Args:
             num_local_tokens: Local input token count.
-            probs: Tensor of shape [tokens, EP ranks, local_experts], with
-                zero weights for inactive routes.
+            probs: Tensor of shape [tokens, ep_size, local_experts], with zero weights
+                for inactive routes. The expert axes enumerate contiguous global expert
+                IDs; ep_size is the number of ranks in the EP group.
         """
         self.token_probs, indices = probs.reshape(num_local_tokens, self.num_experts).topk(self.top_k, dim=-1)
         self.token_indices = indices.masked_fill(self.token_probs == 0, -1)
@@ -226,7 +238,9 @@ class NcclEpManager:
             hidden_states: Tensor of shape [received_tokens, hidden], expert-packed.
 
         Returns:
-            The same activations and FP32 weights of shape [received_tokens].
+            The input activation tensor of shape [received_tokens, hidden], returned by
+            reference, and FP32 routing weights of shape [received_tokens], aligned with
+            its expert-packed rows.
         """
         if self.dispatched_probs is None:
             raise RuntimeError("NCCL-EP dispatch has not completed")
@@ -245,7 +259,8 @@ class NcclEpManager:
             hidden_states: Tensor of shape [received_tokens, hidden], expert-packed.
 
         Returns:
-            The same tensor, without copying or weighting it again.
+            The input tensor of shape [received_tokens, hidden], returned by reference
+            without copying or weighting it again.
         """
         return hidden_states
 

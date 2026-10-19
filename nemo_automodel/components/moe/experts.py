@@ -1728,8 +1728,17 @@ class GroupedExpertsDeepEP(nn.Module):
             # Preserve the dispatch autograd edge even when this rank receives no
             # tokens: its backward must still participate in EP communication.
             output1 = torch.matmul(permuted_local_hidden_states, gate_and_up_projs[0])
+            if self.expert_bias:
+                output1 = _apply_bias(output1, self.gate_up_proj_bias.to_local(), tokens_per_expert)
             output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
+            if self.expert_bias:
+                output2 = _apply_bias(
+                    output2,
+                    self.down_proj_bias.to_local(),
+                    tokens_per_expert,
+                    None if self.config.apply_router_weight_after_down else permuted_probs,
+                )
 
         if self.config.apply_router_weight_after_down and not router_weight_already_applied:
             # HybridEP/DeepEP combine expects the expert activation dtype. Keep

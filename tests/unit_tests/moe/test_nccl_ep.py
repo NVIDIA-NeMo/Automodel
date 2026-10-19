@@ -292,7 +292,8 @@ def test_production_expert_selection_and_dispatch(transport, group, monkeypatch)
 @pytest.mark.parametrize("tokens", [0, 3])
 @pytest.mark.parametrize("lora", [False, True])
 @pytest.mark.parametrize("packed", [False, True])
-def test_empty_experts_keep_dispatch_backward_edge(tokens, lora, packed):
+@pytest.mark.parametrize("expert_bias", [False, True])
+def test_empty_experts_keep_dispatch_backward_edge(tokens, lora, packed, expert_bias):
     config = MoEConfig(
         n_routed_experts=4,
         n_shared_experts=0,
@@ -308,6 +309,7 @@ def test_empty_experts_keep_dispatch_backward_edge(tokens, lora, packed):
         inter_dim=64,
         moe_inter_dim=64,
         norm_topk_prob=False,
+        expert_bias=expert_bias,
     )
     experts = GroupedExpertsDeepEP(config)
     with torch.no_grad():
@@ -329,8 +331,9 @@ def test_empty_experts_keep_dispatch_backward_edge(tokens, lora, packed):
     experts.n_routed_experts = 4
     # The production sharder supplies DTensors. These local weight wrappers let
     # the CPU test isolate empty-expert autograd without initializing a process group.
+    num_local_experts = config.n_routed_experts // experts.ep_size
     for parameter in experts.parameters():
-        parameter.to_local = lambda parameter=parameter: parameter
+        parameter.to_local = lambda parameter=parameter: parameter[:num_local_experts]
         if parameter.requires_grad:
             with torch.no_grad():
                 parameter.fill_(0.125)
@@ -366,6 +369,12 @@ def test_empty_experts_keep_dispatch_backward_edge(tokens, lora, packed):
         if parameter.requires_grad:
             assert parameter.grad is not None
             assert torch.count_nonzero(parameter.grad) == 0
+    trainable = [parameter for parameter in experts.parameters() if parameter.requires_grad]
+    if trainable:
+        expected = [parameter.detach().clone() * 0.99 for parameter in trainable]
+        torch.optim.SGD(trainable, lr=0.1, weight_decay=0.1).step()
+        for parameter, reference in zip(trainable, expected):
+            torch.testing.assert_close(parameter, reference)
 
 
 @pytest.mark.parametrize("experts", ["torch_mm", "te"])
