@@ -67,7 +67,7 @@ docker run --gpus all -it --rm --shm-size=8g \
   -e HF_TOKEN \
   -v "$PWD/checkpoints:/opt/Automodel/checkpoints" \
   nvcr.io/nvidia/nemo-automodel:26.10.00 \
-  automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+  automodel /opt/Automodel/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --nproc-per-node 2
 ```
 
@@ -114,15 +114,16 @@ Find the right guide for your task: fine-tuning, pretraining, distillation, diff
 
 ## Performance
 
-Training throughput on NVIDIA GPUs with optimized kernels for Hugging Face models.
+Recent BF16 full fine-tuning results on NVIDIA H100 80GB GPUs, using the workloads and sequence lengths below.
 
-| Model            | GPUs | TFLOPs/sec/GPU | Tokens/sec/GPU | Optimizations          |
-| ---------------- | ---- | -------------- | -------------- | ---------------------- |
-| DeepSeek V3 671B | 256  | 250            | 1,002          | TE + DeepEP            |
-| GPT-OSS 20B      | 8    | 279            | 13,058         | TE + DeepEP + FlexAttn |
-| Qwen3 MoE 30B    | 8    | 277            | 12,040         | TE + DeepEP            |
+| Model | GPUs | Workload | Sequence Length | Tokens/sec/GPU |
+| --- | ---: | --- | ---: | ---: |
+| [Qwen3.8-27B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml) | 8 | MedPix VLM | Variable | 233.07 |
+| [GLM-5.3](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml) | 256 | Tulu-3 packed | 4096 | 162.56 |
+| [MiMo-V2.6-Flash-RL](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml) | 64 | Tulu-3 packed | 4096 | 640.80 |
+| [Nemotron-3.5-Lightning-30B-A3B-BF16](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_tulu3_packed_cp8_64k.yaml) | 8 | Tulu-3 packed | 8192 | 6,895.85 |
 
-See the [full benchmark results](/performance/performance-summary) for configuration details and more models.
+Qwen3.8-27B freezes the vision encoder. See the [full benchmark results](/performance/performance-summary) for measurement settings, pinned recipes, and more models.
 
 ## Advanced Topics
 
