@@ -101,4 +101,5 @@ optimizer:
   betas: [0.9, 0.95]
 
 ci:
+  cluster_tag: h100
   recipe_owner: adil-a

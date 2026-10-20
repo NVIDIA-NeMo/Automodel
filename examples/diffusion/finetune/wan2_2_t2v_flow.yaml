@@ -101,5 +101,6 @@ checkpoint:
   restore_from: null
 
 ci:
+  cluster_tag: h100
   recipe_owner: linnanw
   time: "00:30:00"

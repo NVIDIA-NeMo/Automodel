@@ -127,3 +127,6 @@ checkpoint:
   save_consolidated: final
   dequantize_base_checkpoint: true
   # restore_from: LATEST
+
+ci:
+  cluster_tag: h100
