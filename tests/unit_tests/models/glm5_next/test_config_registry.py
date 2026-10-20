@@ -89,6 +89,18 @@ def test_saved_config_keeps_kda_layer_split(tmp_path, released_split):
     assert reloaded.text_config.layer_types[-1] == "deepseek_sparse_attention"
 
 
+def test_truncated_config_keeps_released_lists_for_its_layers(tmp_path):
+    # The first four layers of the release: layer_types shortened, the released lists left full.
+    config = Glm5NextConfig.from_dict(
+        _checkpoint_style_config(kda_layers=[0, 1, 2, 4, 5, 6, 8], full_attn_layers=[3, 7, 11])
+    )
+    config.save_pretrained(tmp_path)
+
+    saved = json.loads((tmp_path / "config.json").read_text())["text_config"]["linear_attn_config"]
+    assert saved["kda_layers"] == [0, 1, 2]
+    assert saved["full_attn_layers"] == [3]
+
+
 def test_config_rejects_kda_layers_that_disagree_with_layer_types():
     with pytest.raises(ValueError, match="kda_layers does not match layer_types"):
         Glm5NextConfig.from_dict(_checkpoint_style_config(kda_layers=[0, 1, 3], full_attn_layers=[2]))

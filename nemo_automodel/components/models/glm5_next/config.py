@@ -185,11 +185,14 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.linear_lower_bound = linear_lower_bound
         # The released config also lists the layer split as ``kda_layers`` / ``full_attn_layers``
         # (0-based), which SGLang and Miles read. Keep both lists and derive them from ``layer_types``.
+        # Indices at or past ``num_hidden_layers`` are ignored in the check, so a config truncated to its
+        # first layers (``num_hidden_layers`` and ``layer_types`` shortened, the lists left as released) loads.
         kda_layers = [idx for idx, layer_type in enumerate(self.layer_types) if layer_type == "linear_attention"]
         full_attn_layers = [idx for idx, layer_type in enumerate(self.layer_types) if layer_type != "linear_attention"]
         for key, layers in (("kda_layers", kda_layers), ("full_attn_layers", full_attn_layers)):
             if linear_attn_config is not None and key in linear_attn_config:
-                if sorted(linear_attn_config[key]) != layers:
+                provided = sorted(idx for idx in linear_attn_config[key] if idx < num_hidden_layers)
+                if provided != layers:
                     raise ValueError(f"linear_attn_config.{key} does not match layer_types")
         self.linear_attn_config = {
             **(linear_attn_config or {}),
