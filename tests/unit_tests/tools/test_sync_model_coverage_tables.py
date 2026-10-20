@@ -174,7 +174,8 @@ def _collect_fern_routes(
                 frontmatter_slug = _frontmatter_slug((config_dir / section_path).resolve())
                 if frontmatter_slug:
                     routes.add("/" + frontmatter_slug)
-            routes.update(_collect_fern_routes(item.get("contents", []), (*parents, slug), config_dir))
+            child_parents = parents if item.get("skip-slug") else (*parents, slug)
+            routes.update(_collect_fern_routes(item.get("contents", []), child_parents, config_dir))
         elif "page" in item:
             page_path = item.get("path")
             frontmatter_slug = None
@@ -186,6 +187,21 @@ def _collect_fern_routes(
                 slug = str(item.get("slug", _fern_slug(str(item["page"]))))
                 routes.add("/" + "/".join((*parents, slug)))
     return routes
+
+
+def test_regrouped_training_pages_preserve_published_urls():
+    config_path = Path(__file__).parents[3] / "docs" / "fern" / "versions" / "nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
+
+    assert {
+        "/recipes-e2e-examples/minimax-m3",
+        "/recipes-e2e-examples/databricks",
+        "/recipes-e2e-examples/eagle-speculative-decoding",
+        "/recipes-e2e-examples/diffusion-fine-tuning",
+        "/tutorials/overview",
+    } <= routes
+    assert "/job-launchers/databricks" not in routes
 
 
 def test_registry_table_is_generated_from_mapping_entries():
