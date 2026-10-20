@@ -118,3 +118,6 @@ wandb:
   entity: <your_wandb_entity>
   name: <your_wandb_name>
   dir: <your_wandb_save_dir>
+
+ci:
+  cluster_tag: h100

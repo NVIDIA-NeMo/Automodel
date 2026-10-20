@@ -123,3 +123,6 @@ checkpoint:
   checkpoint_dir: checkpoints/nemotron3_embed_1b_distill
   model_save_format: safetensors
   save_consolidated: true
+
+ci:
+  cluster_tag: h100

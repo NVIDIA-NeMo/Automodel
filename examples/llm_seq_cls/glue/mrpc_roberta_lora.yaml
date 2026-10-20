@@ -75,3 +75,6 @@ optimizer:
   eps: 1e-8
   lr: 2.0e-5  # Standard learning rate for BERT/RoBERTa fine-tuning
   weight_decay: 0.01  # Crucial for stable training on small datasets
+
+ci:
+  cluster_tag: h100

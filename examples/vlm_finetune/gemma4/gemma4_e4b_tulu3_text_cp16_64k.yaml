@@ -132,6 +132,7 @@ wandb:
   name: <your_wandb_name>
   dir: <your_wandb_save_dir>
 ci:
+  cluster_tag: h100
   nodes: 2
   time: "01:00:00"
   env_vars:

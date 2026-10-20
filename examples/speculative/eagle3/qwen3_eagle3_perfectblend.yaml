@@ -64,3 +64,6 @@ checkpoint:
   checkpoint_dir: ./outputs/eagle3_qwen3_8b_perfectblend/checkpoints
   model_save_format: safetensors
   save_consolidated: true
+
+ci:
+  cluster_tag: h100

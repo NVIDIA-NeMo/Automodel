@@ -101,6 +101,7 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  cluster_tag: h100
   recipe_owner: akoumpa
   vllm_deploy: true
   time: "00:40:00"
