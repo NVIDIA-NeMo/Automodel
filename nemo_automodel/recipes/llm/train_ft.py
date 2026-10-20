@@ -1143,27 +1143,35 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                     # Run validation every val_every_steps
                     val_losses = {}
+                    skip_best_checkpoint = False
                     if self.step_scheduler.is_val_step:
                         total_validation_tokens = 0
                         for val_name, val_dataloader in self.val_dataloaders.items():
                             val_log_data = self._run_validation_epoch(val_dataloader)
-                            if len(self.val_dataloaders) == 1:
-                                # Single dataset: best_metric_key has no dataset to select
-                                # among (BaseRecipe.save_checkpoint always promotes the lone
-                                # entry), so here it instead names a custom evaluator metric
-                                # inside this dataset's own metrics (e.g. tool_call_eval's
-                                # tool_call/args_exact_match). Falls back to val_loss when
-                                # best_metric_key isn't a key in this dataset's metrics.
-                                val_losses[val_name] = val_log_data.metrics.get(
-                                    self.best_metric_key, val_log_data.metrics["val_loss"]
-                                )
+                            if len(self.val_dataloaders) == 1 and val_name != self.best_metric_key:
+                                # The lone dataset isn't itself named best_metric_key (see the
+                                # else branch below for when it is), so here best_metric_key
+                                # instead names a custom evaluator metric inside this dataset's
+                                # own metrics (e.g. tool_call_eval's tool_call/args_exact_match).
+                                if self.best_metric_key in val_log_data.metrics:
+                                    val_losses[val_name] = val_log_data.metrics[self.best_metric_key]
+                                else:
+                                    val_losses[val_name] = val_log_data.metrics["val_loss"]
+                                    if self.best_metric_key not in ("default", "val_loss"):
+                                        # An explicit custom metric was requested but not
+                                        # computed this round (e.g. tool_call_evaluator skipped
+                                        # for FSDP2/separate_meshes). val_loss above is only for
+                                        # visibility: it must not be promoted or pruned under
+                                        # this metric's (possibly higher-is-better) comparison
+                                        # direction.
+                                        skip_best_checkpoint = True
                             else:
-                                # Multiple datasets (e.g. domain_mixture): best_metric_key
-                                # instead selects which *dataset* save_checkpoint promotes.
-                                # Keep every dataset's reported value as its own val_loss here
-                                # so that dataset-name selection isn't clobbered by a metric
-                                # key that coincidentally also appears inside every dataset's
-                                # metrics dict (e.g. "lr").
+                                # Multiple datasets (e.g. domain_mixture), or the lone dataset is
+                                # itself named best_metric_key: best_metric_key instead selects
+                                # which *dataset* save_checkpoint promotes. Report every
+                                # dataset's own val_loss here so dataset-name selection isn't
+                                # clobbered by a metric key that coincidentally also appears
+                                # inside every dataset's metrics (e.g. "lr").
                                 val_losses[val_name] = val_log_data.metrics["val_loss"]
                             total_validation_tokens += val_log_data.metrics["num_label_tokens"]
                             self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
@@ -1196,6 +1204,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             train_log_data.metrics["loss"],
                             val_losses,
                             best_metric_key=self.best_metric_key,
+                            skip_best_checkpoint=skip_best_checkpoint,
                         )
                     self._maybe_collect_garbage()
         finally:

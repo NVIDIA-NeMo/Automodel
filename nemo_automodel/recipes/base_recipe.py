@@ -237,6 +237,7 @@ class BaseRecipe:
         train_loss: float,
         val_loss: dict[str, float] | None = None,
         best_metric_key: str = "default",
+        skip_best_checkpoint: bool = False,
     ):
         """
         Save the current training state as a checkpoint.
@@ -249,6 +250,11 @@ class BaseRecipe:
             train_loss (float): The current training loss.
             val_loss (dict[str, float]): The current validation losses.
             best_metric_key (str): The validation metric key used to select the best checkpoint.
+            skip_best_checkpoint (bool): If True, record this step's checkpoint and losses as
+                usual but do not let it update or prune the ``LOWEST_VAL`` best-checkpoint
+                pointer. Use this when ``val_loss`` substitutes an unrelated value (e.g. falling
+                back to ``val_loss`` because a requested custom metric wasn't computed this
+                round) that must not be compared under the configured metric's direction.
         """
         if not self.checkpointer.config.enabled:
             return
@@ -271,7 +277,7 @@ class BaseRecipe:
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
 
         best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
-        best_val_metric = val_loss[best_metric_name] if val_loss else None
+        best_val_metric = val_loss[best_metric_name] if val_loss and not skip_best_checkpoint else None
 
         self.checkpointer.lifecycle.reserve(path)
 

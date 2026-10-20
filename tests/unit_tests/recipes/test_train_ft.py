@@ -1601,6 +1601,119 @@ def test_run_train_validation_loop_keeps_dataset_selection_distinct_from_inner_m
     assert saved_val_losses == {"lr": pytest.approx(0.2), "other": pytest.approx(0.5)}
 
 
+def test_run_train_validation_loop_preserves_named_dataset_selection_with_single_dataset():
+    """A lone validation dataset named the same as best_metric_key (e.g.
+    "validation_dataset_lr" configured with checkpoint.best_metric_key: lr) must
+    keep selecting that dataset's val_loss, exactly like the pre-existing
+    multi-dataset dataset-name-selection contract -- independent of dataset count.
+    Only when best_metric_key does NOT name an existing dataset should it be
+    interpreted as an inner evaluator-metric key.
+    """
+
+    class _OneValidationStep:
+        step = 1
+        epoch = 0
+        epochs = [0]
+        is_val_step = True
+        is_ckpt_step = True
+        sigterm_flag = False
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            yield ["dummy-batch"]
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.model_parts = [MagicMock()]
+    trainer.step_scheduler = _OneValidationStep()
+    trainer.max_grad_norm = 1.0
+    trainer.partial_cuda_graph_manager = None
+    trainer._partial_cuda_graph_capture_pending = False
+    trainer._enable_qat_if_delayed = MagicMock()
+    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    trainer.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.01}])]
+    trainer._collect_moe_load_balance = MagicMock()
+    trainer._maybe_collect_garbage = MagicMock()
+    trainer.log_train_metrics = MagicMock()
+    trainer.log_val_metrics = MagicMock()
+    trainer.save_checkpoint = MagicMock()
+    trainer.domain_mixture = None
+    trainer.val_dataloaders = {"lr": object()}
+    # The lone dataset is literally named "lr", which also happens to be an inner
+    # metrics-dict key (the learning rate, constant at 0.01) on every validation.
+    trainer._run_validation_epoch = MagicMock(
+        return_value=SimpleNamespace(metrics={"val_loss": 0.2, "lr": 0.01, "num_label_tokens": 10})
+    )
+    trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
+    trainer.metric_logger_valid = {"lr": SimpleNamespace(close=MagicMock())}
+    trainer.checkpointer = SimpleNamespace(finalize=MagicMock())
+    trainer.best_metric_key = "lr"
+
+    trainer.run_train_validation_loop()
+
+    saved_val_losses = trainer.save_checkpoint.call_args.args[3]
+    assert saved_val_losses == {"lr": pytest.approx(0.2)}
+
+
+def test_run_train_validation_loop_skips_best_checkpoint_when_configured_metric_is_unavailable():
+    """When checkpoint.best_metric_key names a custom evaluator metric that was
+    NOT computed this round (e.g. tool_call_evaluator skipped for FSDP2 or
+    separate_meshes), the validation loop must still report val_loss for
+    visibility but tell save_checkpoint to skip best-checkpoint promotion --
+    not silently substitute val_loss under the custom metric's comparison
+    direction (greater_is_better may be True for an accuracy-style metric).
+    """
+
+    class _OneValidationStep:
+        step = 1
+        epoch = 0
+        epochs = [0]
+        is_val_step = True
+        is_ckpt_step = True
+        sigterm_flag = False
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            yield ["dummy-batch"]
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.model_parts = [MagicMock()]
+    trainer.step_scheduler = _OneValidationStep()
+    trainer.max_grad_norm = 1.0
+    trainer.partial_cuda_graph_manager = None
+    trainer._partial_cuda_graph_capture_pending = False
+    trainer._enable_qat_if_delayed = MagicMock()
+    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    trainer.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.01}])]
+    trainer._collect_moe_load_balance = MagicMock()
+    trainer._maybe_collect_garbage = MagicMock()
+    trainer.log_train_metrics = MagicMock()
+    trainer.log_val_metrics = MagicMock()
+    trainer.save_checkpoint = MagicMock()
+    trainer.domain_mixture = None
+    trainer.val_dataloaders = {"default": object()}
+    # tool_call_evaluator was skipped this round (e.g. FSDP2 without
+    # run_on_fsdp2): no "tool_call/args_exact_match" key in metrics.
+    trainer._run_validation_epoch = MagicMock(
+        return_value=SimpleNamespace(
+            metrics={"val_loss": 0.9, "tool_call/_disabled_fsdp2": 1.0, "num_label_tokens": 10}
+        )
+    )
+    trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
+    trainer.metric_logger_valid = {"default": SimpleNamespace(close=MagicMock())}
+    trainer.checkpointer = SimpleNamespace(finalize=MagicMock())
+    trainer.best_metric_key = "tool_call/args_exact_match"
+
+    trainer.run_train_validation_loop()
+
+    saved_val_losses = trainer.save_checkpoint.call_args.args[3]
+    assert saved_val_losses == {"default": pytest.approx(0.9)}
+    assert trainer.save_checkpoint.call_args.kwargs["skip_best_checkpoint"] is True
+
+
 def test_compute_trust_remote_code_prefers_cfg_flag():
     cfg_model = ConfigNode({"trust_remote_code": False, "pretrained_model_name_or_path": "ignored"})
 

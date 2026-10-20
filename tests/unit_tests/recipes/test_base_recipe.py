@@ -1648,6 +1648,35 @@ def test_checkpoint_retention_preserves_lowest_val_pointer_target(tmp_path):
     assert recipe_inst.load_checkpoint(restore_from="epoch_0_step_100") is None
 
 
+def test_save_checkpoint_skip_best_checkpoint_does_not_promote(tmp_path):
+    """skip_best_checkpoint=True records the step's checkpoint and loss as usual but
+    must not move LOWEST_VAL, even when the passed val_loss is numerically better
+    than the current best.
+
+    This is how train_ft/kd skip best-checkpoint promotion for a validation whose
+    explicitly configured custom metric (e.g. a tool_call_eval accuracy key)
+    wasn't computed this round (evaluator skipped for FSDP2/separate_meshes),
+    instead of letting an unrelated val_loss get promoted under that metric's
+    comparison direction.
+    """
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    for step, val_loss, skip in [(100, 0.9, False), (200, 0.1, True)]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(
+            epoch=0,
+            step=step,
+            train_loss=float(loss.item()),
+            val_loss={"val_loss": val_loss},
+            skip_best_checkpoint=skip,
+        )
+
+    assert os.path.basename(str(read_checkpoint_pointer(tmp_path, "LOWEST_VAL"))) == "epoch_0_step_100"
+
+
 def test_checkpoint_restore_from_lowest_val_text_fallback(tmp_path):
     """restore_from=LOWEST_VAL resolves text fallback pointers, not only symlinks."""
     recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
