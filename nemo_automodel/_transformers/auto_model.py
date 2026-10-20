@@ -759,7 +759,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 or freeze_config. Requires checkpoint-free model construction.
             preserve_parameter_dtypes: Preserve constructor storage dtypes during
                 materialization; requires a model initializer supporting dtype=None.
-                Also enabled by parameter_config. Defaults to False.
+                Also enabled by parameter_config. Not supported with DDP. Defaults to False.
             **kwargs: Additional keyword arguments. Notable ones include:
                 - dtype (str | torch.dtype): Model storage dtype. Takes precedence
                   over ``torch_dtype`` when not ``None``; accepts ``auto``.

@@ -514,6 +514,22 @@ def test_apply_model_infrastructure_handles_unwrapped_single_rank_ddp_model():
     assert hasattr(model, "_pre_shard_hf_state_dict_keys")
 
 
+def test_apply_model_infrastructure_rejects_preserved_dtypes_with_ddp():
+    """DDP does not keep per-parameter storage dtypes, so it must reject a ParameterConfig."""
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+    from nemo_automodel.components.distributed import DDPConfig, MeshContext
+
+    with pytest.raises(ValueError, match="not supported with DDP"):
+        apply_model_infrastructure(
+            model=_DummyModel(),
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=MeshContext(strategy_config=DDPConfig()),
+            preserve_parameter_dtypes=True,
+        )
+
+
 class TestApplyModelInfrastructurePostShardInit:
     """Tests for initialize_model_weights being called in apply_model_infrastructure."""
 

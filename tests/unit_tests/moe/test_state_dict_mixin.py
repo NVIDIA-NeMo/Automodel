@@ -587,10 +587,10 @@ class TestFromHfWMergedExperts:
                 [[0, 1, 10, 11], [2, 3, 12, 13], [4, 5, 14, 15]],
                 [[20, 21, 30, 31], [22, 23, 32, 33], [24, 25, 34, 35]],
             ],
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
         )
         torch.testing.assert_close(grouped, expected, rtol=0, atol=0)
-        assert grouped.dtype == torch.bfloat16
+        assert grouped.dtype == torch.float32
         assert grouped.is_contiguous()
         collect.assert_called_once_with(0)
         empty_cache.assert_not_called()
@@ -621,14 +621,14 @@ class TestFromHfWMergedExperts:
                 [[0, 1], [2, 3], [4, 5]],
                 [[20, 21], [22, 23], [24, 25]],
             ],
-            dtype=torch.float32,
+            dtype=torch.float64,
         )
         expected_down = torch.tensor(
             [
                 [[10, 11, 12], [13, 14, 15]],
                 [[30, 31, 32], [33, 34, 35]],
             ],
-            dtype=torch.float32,
+            dtype=torch.float64,
         )
         torch.testing.assert_close(up, expected_up, rtol=0, atol=0)
         torch.testing.assert_close(down, expected_down, rtol=0, atol=0)

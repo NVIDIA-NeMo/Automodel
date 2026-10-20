@@ -5,7 +5,7 @@ description: "Recommended dtype patterns for fp32 master weights and optimizer s
 
 NeMo AutoModel uses FSDP2's [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) to control compute precision during forward and backward, and the model's storage dtype (`model.dtype`) to control the precision of the *resident* sharded parameter. Together, these decide what numeric precision the optimizer state ends up in, which is the part that determines whether long full-parameter training runs converge cleanly.
 
-This page describes the recommended precision patterns and the pattern to avoid. For any long full-parameter training run (pre-training or extended fine-tuning), the key rule is: do not combine `torch.optim.AdamW` with bf16 resident parameters unless you have explicitly accepted bf16 master weights and Adam state.
+This page describes the recommended precision patterns and the pattern to avoid. For any long full-parameter training run (pretraining or extended fine-tuning), the key rule is: do not combine `torch.optim.AdamW` with bf16 resident parameters unless you have explicitly accepted bf16 master weights and Adam state.
 
 For `NeMoAutoModel` loaders, use `model.dtype` to select storage precision. The deprecated `model.torch_dtype` spelling remains supported. If both are supplied, a non-null `dtype` takes precedence, including `dtype: auto`; `dtype: null` falls back to `torch_dtype`. String values such as `float32` and `torch.float32`, and Python `torch.dtype` values, are accepted by both spellings. Choose the storage dtype explicitly for full-parameter training; the optimizer does not select it for you. Diffusion pipelines use their separate `model.torch_dtype` and `model.compute_dtype` settings.
 
@@ -22,7 +22,7 @@ Precision settings have distinct effects:
 
 When `model.dtype: bfloat16` is used with `torch.optim.AdamW`, the AdamW EMA buffers (`exp_avg` and `exp_avg_sq`) are also stored in bf16. This is fragile for long full-parameter training runs: bf16 has only a 7-bit mantissa, so small EMA updates can be rounded away even though the values themselves are still in range. Symptoms range from silent degradation (slower convergence, that is, higher final loss at the same step count, with no visible instability) to overt failure: unstable `grad_norm`, loss bumps, loss spikes, or divergence.
 
-## Exact update surfaces before checkpoint loading
+## Exact Update Surfaces Before Checkpoint Loading
 
 For a partial-model update such as SpeechLM reinforcement learning, use
 `ParameterConfig` to select exact parameter names and their storage dtype before
@@ -52,14 +52,20 @@ raise an error. Construct the optimizer after the loader returns.
 
 This option requires a checkpoint-free construction path with an initializer
 supporting `dtype=None`, as implemented by native Nemotron V3. It cannot be
-combined with PEFT or `freeze_config`, or used after an HF constructor has
+combined with PEFT or `freeze_config`, or used after a Hugging Face constructor has
 already loaded weights. It preserves the selected storage precision through
-materialization, so an FP32 checkpoint is not rounded to BF16 before loading.
+materialization, so an fp32 checkpoint is not rounded to bf16 before loading.
 It does not change FSDP compute precision.
+
+In a Nemotron V3 Mamba block, select either every parameter outside
+`mixer._fp32_params` or none of them. The fused Mamba kernels read the
+`conv1d`, `norm`, and `out_proj` weights directly, so FSDP2 sharding rejects a
+partial selection.
 
 For native checkpoint conversion without changing trainability, use
 `preserve_parameter_dtypes=True` instead. Both modes verify that initialization
-preserves parameter dtypes. The default loader behavior is unchanged.
+preserves parameter dtypes, and both require FSDP2; DDP is rejected. The default
+loader behavior is unchanged.
 
 Nemotron V3 also accepts `compute_mtp=False` during an off-pipeline-parallel
 forward call. This skips auxiliary MTP computation while retaining all MTP
@@ -70,7 +76,7 @@ existing empty-vocabulary logits tensor remains the return contract.
 
 ## Recommended fp32 Master Weight and Optimizer-State Patterns
 
-Use one of these patterns for long full-parameter training (pre-training or extended fine-tuning):
+Use one of these patterns for long full-parameter training (pretraining or extended fine-tuning):
 
 | Pattern | Model Storage Dtype | Optimizer State | When to Use |
 | --- | --- | --- | --- |
@@ -177,7 +183,7 @@ distributed:
   strategy: fsdp2
 ```
 
-This keeps the resident model parameters in bf16 instead of fp32, so it can reduce memory usage compared to the torch AdamW and `model.dtype: float32` pattern. It is common in existing fine-tuning example configs and is probably acceptable for short fine-tuning runs or LoRA/PEFT. It is **not** recommended for long full-parameter training (pre-training or extended fine-tuning): bf16 EMA quantization can quietly slow convergence (higher final loss at the same step count) and, in worse cases, produce unstable `grad_norm`, loss bumps, loss spikes, or divergence.
+This keeps the resident model parameters in bf16 instead of fp32, so it can reduce memory usage compared to the torch AdamW and `model.dtype: float32` pattern. It is common in existing fine-tuning example configs and is probably acceptable for short fine-tuning runs or LoRA/PEFT. It is **not** recommended for long full-parameter training (pretraining or extended fine-tuning): bf16 EMA quantization can quietly slow convergence (higher final loss at the same step count) and, in worse cases, produce unstable `grad_norm`, loss bumps, loss spikes, or divergence.
 
 ## Example Configs
 
