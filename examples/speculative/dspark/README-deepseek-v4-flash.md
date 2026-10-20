@@ -114,7 +114,8 @@ into rows of that many tokens. The frozen target starts every document on a
 128-token compression-group boundary (the least common multiple of the CSA and
 HCA ratios), so no compressed group or indexer score mixes documents, and the
 draft keeps every block inside its anchor's document. Packing needs the online
-path (no `cached_target_path`) and `cp_size: 1`.
+path (no `cached_target_path`), `cp_size: 1` and the colocated target
+(`target_model_backend: colocated`, the default).
 
 ## Validation Status
 
