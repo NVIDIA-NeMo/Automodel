@@ -45,6 +45,10 @@ SFT vs PEFT is determined by whether `peft` appears in the recipe filename.
 
 Every recipe YAML under `examples/` must declare a nonempty `ci.cluster_tag`
 or boolean `ci.deprecated: true` (enforced by `tools/lint_example_yamls.py`).
+Deprecated configurations remain available as examples, but generate no training,
+checkpoint, deployment, or evaluation jobs in any CI scope. This applies even
+when a recipe also sets `allow_failure`, a hardware tag, or optional variants.
+An entirely excluded nonempty scope gets a lightweight completion job.
 Utility configs excluded by the linter are exempt. The tag selects GPU hardware,
 such as `h100`, `gb200`, or `gb10`, rather than a specific cluster.
 

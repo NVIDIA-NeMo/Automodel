@@ -194,13 +194,13 @@ def test_generate_deepseek_v3_1024_benchmark_job_uses_activation_checkpointing()
     assert recipe["step_scheduler"]["local_batch_size"] == 4
 
 
-def test_glm_4_5_air_benchmark_recipe_still_generates_with_checkpointing():
-    config = Path("examples/llm_benchmark/glm/glm_4.5_air_te_deepep.yaml")
+def test_glm_4_7_flash_benchmark_recipe_generates_with_checkpointing():
+    config = Path("examples/llm_benchmark/glm/glm_4.7_flash_te_deepep.yaml")
 
     jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
     recipe = YAML(typ="safe").load(config)
 
-    assert jobs[""]["variables"]["TEST_NODE_COUNT"] == 64
+    assert jobs[""]["variables"]["TEST_NODE_COUNT"] == 1
     assert recipe["distributed"]["activation_checkpointing"] is True
     assert parse_distributed_section(recipe["distributed"])["activation_checkpointing"] is True
 
@@ -210,7 +210,7 @@ def test_glm_4_5_air_benchmark_recipe_still_generates_with_checkpointing():
     [
         "examples/llm_benchmark/deepseek/deepseek_v3_te_deepep.yaml",
         "examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml",
-        "examples/llm_benchmark/glm/glm_4.5_air_te_deepep.yaml",
+        "examples/llm_benchmark/glm/glm_4.7_flash_te_deepep.yaml",
         "examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml",
         "examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml",
         "examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml",
@@ -483,3 +483,80 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
     assert "skip_resume" not in robustness
     assert robustness["trust_remote_code"] is True
     assert robustness["hf_device_map_auto"] is True
+
+
+@pytest.mark.parametrize("scope", ["test", "nightly", "release", "performance"])
+@pytest.mark.parametrize("deprecated", [True, False, "true"])
+def test_recipe_deprecation_filters_all_job_variants(tmp_path: Path, scope: str, deprecated: bool | str) -> None:
+    recipe = Path("examples/llm_finetune/family/model.yaml")
+    path = tmp_path / recipe
+    path.parent.mkdir(parents=True)
+    YAML().dump(
+        {
+            "ci": {
+                "deprecated": deprecated,
+                "allow_failure": True,
+                "vllm_deploy": True,
+                "embed_eval": True,
+                "rerank_eval": True,
+                "cluster_tag": "h100",
+            }
+        },
+        path,
+    )
+    jobs = generate_job(recipe, {}, scope, "llm_finetune", str(tmp_path))
+    if deprecated is True:
+        assert jobs == []
+    else:
+        assert {suffix for suffix, _ in jobs} == {"", "_vllm_deploy", "_embed_eval", "_rerank_eval"}
+
+
+def test_deprecated_nightly_scope_completes_without_gpu_jobs() -> None:
+    pipeline = generate_pipeline(".", "nightly", "retrieval_cross_encoder")
+    jobs = {name: job for name, job in pipeline.items() if name != "include"}
+    assert len(jobs) == 1
+    job = jobs["no_enrolled_retrieval_cross_encoder_tests"]
+    assert job["variables"] == {"GIT_STRATEGY": "none"}
+    assert "extends" not in job
+    assert "parallel" not in job
+    assert job["rules"] == [{"when": "always"}]
+
+
+@pytest.fixture(scope="module")
+def deprecated_recipe_paths() -> set[str]:
+    paths = set()
+    for path in Path("examples").rglob("*.yaml"):
+        recipe = YAML(typ="safe").load(path)
+        if isinstance(recipe, dict) and (recipe.get("ci") or {}).get("deprecated") is True:
+            paths.add(str(path))
+    assert paths
+    return paths
+
+
+@pytest.mark.parametrize("scope", ["test", "nightly", "release", "performance"])
+@pytest.mark.parametrize(
+    "folder",
+    [
+        "llm_finetune",
+        "llm_benchmark",
+        "llm_pretrain",
+        "vlm_finetune",
+        "retrieval_bi_encoder",
+        "retrieval_cross_encoder",
+    ],
+)
+def test_deprecated_recipes_are_not_scheduled(scope: str, folder: str, deprecated_recipe_paths: set[str]) -> None:
+    pipeline = generate_pipeline(".", scope, folder)
+    scheduled_paths = {
+        job["variables"]["CONFIG_PATH"]
+        for job in pipeline.values()
+        if isinstance(job, dict) and "CONFIG_PATH" in job.get("variables", {})
+    }
+    assert not deprecated_recipe_paths.intersection(scheduled_paths)
+
+
+@pytest.mark.parametrize("scope", ["nightly", "release"])
+def test_flux_examples_keep_gpu_ci_enrollment(scope: str) -> None:
+    pipeline = generate_pipeline(".", scope, "diffusion_finetune")
+    assert "flux_t2i_flow" in pipeline
+    assert "flux_t2i_flow_lora" in pipeline
