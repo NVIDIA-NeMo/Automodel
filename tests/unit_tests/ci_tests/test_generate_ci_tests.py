@@ -579,6 +579,7 @@ def test_flux_examples_keep_gpu_ci_enrollment(scope: str) -> None:
             "release",
             "llm_finetune",
             [
+                *sorted(str(path) for path in Path("examples/llm_finetune").rglob("*customizer*.yaml")),
                 "examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml",
                 "examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml",
                 "examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml",
