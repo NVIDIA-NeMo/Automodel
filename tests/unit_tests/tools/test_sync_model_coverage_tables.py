@@ -482,9 +482,83 @@ def test_model_card_path_aliases_preserve_published_paths():
         assert source_paths.count(canonical) == 1
 
 
+def _assert_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
+    document = card.read_text(encoding="utf-8")
+    recipe_ids: set[str] = set()
+    for match in re.finditer(
+        r"https://github\.com/NVIDIA-NeMo/Automodel/blob/(?:main|[0-9a-f]{40})/"
+        r"(examples/[A-Za-z0-9_./-]+\.yaml)",
+        document,
+    ):
+        recipe = yaml.safe_load(_read_documented_recipe(repo_root, match[1], match[0]))
+        assert isinstance(recipe, dict), f"{match[1]}: recipe must be a YAML mapping"
+        recipe_ids.update(_iter_pretrained_model_ids(recipe.get("model", {})))
+    if not recipe_ids:
+        return
+    metadata = yaml.safe_load(document.split("---", 2)[1])
+    title = metadata["title"]
+    names = {model_id.split("/", 1)[1] for model_id in recipe_ids}
+    assert title in names, f"{card}: title {title!r} must match a linked recipe model ID: {sorted(recipe_ids)}"
+    filename = re.sub(r"[^a-z0-9]+", "-", title.casefold()).strip("-") + ".mdx"
+    assert card.name == filename, f"{card}: filename must be {filename!r} for checkpoint {title!r}"
+    matching_ids = {model_id for model_id in recipe_ids if model_id.split("/", 1)[1] == title}
+    assert any(f"https://huggingface.co/{model_id}" in document for model_id in matching_ids), (
+        f"{card}: link the exact Hugging Face checkpoint from the recipe"
+    )
+
+
+def test_changed_model_cards_match_linked_recipe_identity():
+    repo_root = Path(__file__).parents[3]
+    base = subprocess.check_output(["git", "merge-base", "HEAD", "origin/main"], cwd=repo_root, text=True).strip()
+    changed = subprocess.check_output(
+        ["git", "diff", "--name-only", "--diff-filter=ACMR", base, "--", "docs/model-coverage"],
+        cwd=repo_root,
+        text=True,
+    ).splitlines()
+    changed += subprocess.check_output(
+        ["git", "ls-files", "--others", "--exclude-standard", "--", "docs/model-coverage"],
+        cwd=repo_root,
+        text=True,
+    ).splitlines()
+    # Keep the original Step-5 regression covered after the PR is merged.
+    changed += [f"docs/model-coverage/{kind}/stepfun-ai/step-5-preview-bf16.mdx" for kind in ("llm", "vlm")]
+    for relative in sorted(set(changed)):
+        card = repo_root / relative
+        if (
+            len(card.relative_to(repo_root / "docs/model-coverage").parts) == 3
+            and card.is_file()
+            and card.suffix == ".mdx"
+            and card.name != "index.mdx"
+        ):
+            _assert_model_card_recipe_identity(repo_root, card)
+
+
+@pytest.mark.parametrize(
+    ("title", "filename", "message"),
+    [
+        ("Step-5-Preview", "step-5-preview.mdx", "title .* must match a linked recipe model ID"),
+        ("Step-5-Preview-BF16", "step-5-preview.mdx", "filename must be 'step-5-preview-bf16.mdx'"),
+    ],
+)
+def test_model_card_identity_rejects_recipe_mismatch(tmp_path: Path, title: str, filename: str, message: str):
+    recipe = tmp_path / "examples/llm_finetune/step5.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("model:\n  pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16\n")
+    card = tmp_path / filename
+    card.write_text(
+        f'---\ntitle: "{title}"\n---\n'
+        "[Old checkpoint](https://huggingface.co/stepfun-ai/Step-5-Preview)\n"
+        "[BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)\n"
+        "[SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/step5.yaml)\n"
+    )
+    with pytest.raises(AssertionError, match=message):
+        _assert_model_card_recipe_identity(tmp_path, card)
+
+
 def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     repo_root = Path(__file__).parents[3]
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
+    redirects = {item["source"]: item["destination"] for item in docs_config["redirects"]}
     assert docs_config.get("theme", {}).get("sidebar") == "default", "Provider icons require the default sidebar"
     assert docs_config.get("layout", {}).get("breadcrumbs", {}).get("current-page") is True
     config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
@@ -530,7 +604,10 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                 index_document = index_path.read_text(encoding="utf-8")
                 for label, href in re.findall(r"^- \[`([^`]+)`\]\(([^)]+)\)$", index_document, re.MULTILINE):
                     checkpoint_name = href.rstrip("/").rsplit("/", 1)[-1]
-                    if label.casefold() != checkpoint_name.casefold():
+                    # A corrected checkpoint name can redirect to its stable published URL.
+                    label_route = href.rsplit("/", 1)[0] + "/" + label
+                    declared_alias = redirects.get("/nemo/automodel" + label_route) == "/nemo/automodel" + href
+                    if label.casefold() != checkpoint_name.casefold() and not declared_alias:
                         offenders.append(
                             f"{provider_slug}: provider index label {label!r} does not match {checkpoint_name!r}"
                         )
@@ -570,13 +647,18 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                     offenders.append(f"{path}: invalid model route {frontmatter_slug!r}")
                     continue
                 model_id = frontmatter_slug.rsplit("/", 1)[1]
+                document = model_path.read_text(encoding="utf-8")
+                title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
+                if title_match is not None:
+                    corrected_name = title_match.group(1)
+                    corrected_route = frontmatter_slug.rsplit("/", 1)[0] + "/" + corrected_name
+                    if redirects.get("/nemo/automodel/" + corrected_route) == "/nemo/automodel/" + frontmatter_slug:
+                        model_id = corrected_name
                 sidebar_label = page.get("page")
                 if not isinstance(sidebar_label, str) or not sidebar_label:
                     offenders.append(f"{path}: model entry has no sidebar label")
                 elif sidebar_label.casefold() != model_id.casefold():
                     offenders.append(f"{path}: sidebar label {sidebar_label!r} does not match {model_id!r}")
-                document = model_path.read_text(encoding="utf-8")
-                title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
                 if title_match is None or title_match.group(1).casefold() != model_id.casefold():
                     title = title_match.group(1) if title_match is not None else None
                     offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
