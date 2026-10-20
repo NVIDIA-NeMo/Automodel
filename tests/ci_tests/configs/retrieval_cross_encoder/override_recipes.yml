@@ -15,5 +15,7 @@
 exempt_models:
 
 exempt_configs:
+  llama_nemotron_rerank_1b_v2_finetune:
+    reason: "Example config; enroll after GPU training and memory validation"
 
 known_issue:
