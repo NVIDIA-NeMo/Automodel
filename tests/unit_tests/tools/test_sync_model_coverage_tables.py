@@ -477,6 +477,9 @@ def test_model_card_path_aliases_preserve_published_paths():
     for alias, canonical in MODEL_CARD_PATH_ALIASES.items():
         assert (repo_root / alias).is_file(), f"Published source URL must remain available: {alias}"
         assert (repo_root / canonical).is_file(), f"Published source URL must remain available: {canonical}"
+        assert (repo_root / alias).read_bytes() == (repo_root / canonical).read_bytes(), (
+            f"Compatibility card must stay synchronized with {canonical}: {alias}"
+        )
         assert _frontmatter_slug(repo_root / alias) == _frontmatter_slug(repo_root / canonical)
         assert alias not in source_paths
         assert source_paths.count(canonical) == 1
@@ -522,7 +525,8 @@ def test_changed_model_cards_match_linked_recipe_identity():
     ).splitlines()
     # Keep the original Step-5 regression covered after the PR is merged.
     changed += [f"docs/model-coverage/{kind}/stepfun-ai/step-5-preview-bf16.mdx" for kind in ("llm", "vlm")]
-    for relative in sorted(set(changed)):
+    canonical_paths = {MODEL_CARD_PATH_ALIASES.get(relative, relative) for relative in changed}
+    for relative in sorted(canonical_paths):
         card = repo_root / relative
         if (
             len(card.relative_to(repo_root / "docs/model-coverage").parts) == 3
