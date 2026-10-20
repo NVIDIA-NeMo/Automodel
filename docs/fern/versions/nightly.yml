@@ -892,51 +892,6 @@ navigation:
         path: ../../model-coverage/troubleshooting.mdx
         slug: troubleshooting
   # Keep published recipe URLs independent of the sidebar grouping.
-  - section: "Training Recipes"
-    slug: recipes-e2e-examples
-    contents:
-      - page: "Overview"
-        path: ../../guides/overview.mdx
-        slug: overview
-      - page: "SFT & PEFT"
-        path: ../../guides/llm/finetune.mdx
-        slug: sft-peft
-      - page: "Pretraining"
-        path: ../../guides/llm/pretraining.mdx
-        slug: pretraining
-      - page: "Knowledge Distillation"
-        path: ../../guides/llm/knowledge-distillation.mdx
-        slug: knowledge-distillation
-      - page: "Sequence Classification (SFT/PEFT)"
-        path: ../../guides/llm/sequence-classification.mdx
-        slug: sequence-classification
-      - page: "Retrieval Fine-Tuning"
-        path: ../../guides/llm/retrieval-finetune.mdx
-        slug: retrieval-finetune
-      - page: "Fine-Tune Large MoE LLMs"
-        path: ../../guides/llm/large-moe-finetune.mdx
-        slug: large-moe-fine-tuning
-      - page: "Diffusion Fine-Tuning"
-        path: ../../guides/diffusion/finetune.mdx
-        slug: diffusion-fine-tuning
-      - page: "dLLM Fine-Tuning"
-        path: ../../guides/dllm/finetune.mdx
-        slug: dllm-fine-tuning
-      - page: "Quantization-Aware Training (QAT)"
-        path: ../../guides/quantization-aware-training.mdx
-        slug: qat
-      - section: "Speculative Drafter Training"
-        skip-slug: true
-        contents:
-          - page: "Train an EAGLE Drafter for Speculative Decoding"
-            path: ../../guides/speculative/eagle.mdx
-            slug: eagle-speculative-decoding
-          - page: "Train a DFlash Drafter for Speculative Decoding"
-            path: ../../guides/speculative/dflash.mdx
-            slug: dflash-speculative-decoding
-          - page: "Train a DSpark Drafter for Speculative Decoding"
-            path: ../../guides/speculative/dspark.mdx
-            slug: dspark-speculative-decoding
   - section: "Tutorials"
     skip-slug: true
     contents:
@@ -1009,6 +964,51 @@ navigation:
           - page: "ASR with Qwen3-Omni"
             path: ../../guides/audio/qwen3-omni-asr.mdx
             slug: recipes-e2e-examples/qwen3-omni-asr
+  - section: "Training Recipes"
+    slug: recipes-e2e-examples
+    contents:
+      - page: "Overview"
+        path: ../../guides/overview.mdx
+        slug: overview
+      - page: "SFT & PEFT"
+        path: ../../guides/llm/finetune.mdx
+        slug: sft-peft
+      - page: "Pretraining"
+        path: ../../guides/llm/pretraining.mdx
+        slug: pretraining
+      - page: "Knowledge Distillation"
+        path: ../../guides/llm/knowledge-distillation.mdx
+        slug: knowledge-distillation
+      - page: "Sequence Classification (SFT/PEFT)"
+        path: ../../guides/llm/sequence-classification.mdx
+        slug: sequence-classification
+      - page: "Retrieval Fine-Tuning"
+        path: ../../guides/llm/retrieval-finetune.mdx
+        slug: retrieval-finetune
+      - page: "Fine-Tune Large MoE LLMs"
+        path: ../../guides/llm/large-moe-finetune.mdx
+        slug: large-moe-fine-tuning
+      - page: "Diffusion Fine-Tuning"
+        path: ../../guides/diffusion/finetune.mdx
+        slug: diffusion-fine-tuning
+      - page: "dLLM Fine-Tuning"
+        path: ../../guides/dllm/finetune.mdx
+        slug: dllm-fine-tuning
+      - page: "Quantization-Aware Training (QAT)"
+        path: ../../guides/quantization-aware-training.mdx
+        slug: qat
+      - section: "Speculative Drafter Training"
+        skip-slug: true
+        contents:
+          - page: "Train an EAGLE Drafter for Speculative Decoding"
+            path: ../../guides/speculative/eagle.mdx
+            slug: eagle-speculative-decoding
+          - page: "Train a DFlash Drafter for Speculative Decoding"
+            path: ../../guides/speculative/dflash.mdx
+            slug: dflash-speculative-decoding
+          - page: "Train a DSpark Drafter for Speculative Decoding"
+            path: ../../guides/speculative/dspark.mdx
+            slug: dspark-speculative-decoding
   - section: "Data"
     slug: datasets
     contents:
