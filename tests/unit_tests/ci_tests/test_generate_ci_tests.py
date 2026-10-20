@@ -574,12 +574,27 @@ def test_flux_examples_keep_gpu_ci_enrollment(scope: str) -> None:
 @pytest.mark.parametrize(
     ("scope", "folder", "retained_paths"),
     [
-        ("performance", "llm_benchmark", ["examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml"]),
+        (
+            "performance",
+            "llm_benchmark",
+            [
+                "examples/llm_benchmark/qwen/qwen2_5_7b_quack_baseline.yaml",
+                "examples/llm_benchmark/qwen/qwen2_5_7b_quack.yaml",
+                "examples/llm_benchmark/qwen/qwen2_5_7b_peft_benchmark.yaml",
+                "examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml",
+                "examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml",
+            ],
+        ),
         (
             "release",
             "llm_finetune",
             [
                 *sorted(str(path) for path in Path("examples/llm_finetune").rglob("*customizer*.yaml")),
+                "examples/llm_finetune/qwen/qwen2_5_7b_squad_peft.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_7b_hellaswag_fp8.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml",
                 "examples/llm_finetune/llama3_2/llama3_2_1b_squad_flashoptim.yaml",
                 "examples/llm_finetune/llama3_2/llama3_2_1b_squad_qat.yaml",
                 "examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot.yaml",
@@ -618,6 +633,7 @@ def test_flux_examples_keep_gpu_ci_enrollment(scope: str) -> None:
             "vlm_finetune",
             [
                 "examples/vlm_finetune/phi4/phi4_mm_cv17.yaml",
+                "examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml",
                 "examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_shopify.yaml",
             ],
         ),
