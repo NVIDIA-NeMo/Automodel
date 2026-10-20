@@ -1203,7 +1203,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             return
 
         if _HAS_WANDB and wandb.run is not None:
-            wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+            # W&B merges calls at the same step. Keep validation CE/KD losses
+            # and memory separate from the training metrics already logged.
+            metrics = {f"val_{val_name}/{key}": value for key, value in log_data.metrics.items()}
+            wandb.log(metrics, step=log_data.step)
         trackio_logger = getattr(self, "trackio_logger", None)
         if trackio_logger is not None:
             trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
