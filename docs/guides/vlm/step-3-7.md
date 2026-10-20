@@ -33,17 +33,17 @@ Use image/video instruction data that matches the target agent workflow. Good ca
 - structured data-processing tasks with visual context,
 - image/video question-answer pairs for bounded task execution.
 
-For a full walkthrough of how multimodal datasets are preprocessed and integrated into NeMo AutoModel, including chat-template conversion and collate functions, see the [Multi-Modal Dataset Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/dataset.mdx#multi-modal-datasets).
+For a full walkthrough of how multimodal datasets are preprocessed and integrated into NeMo AutoModel, including chat-template conversion and collate functions, see the [Multi-Modal Dataset Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/docs/guides/vlm/dataset.mdx#multi-modal-datasets).
 
 ## Launch Training
 
-Use the checked-in [full SFT recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml) or [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml). Both use `stepfun-ai/Step-3.7-Flash` for the model and processor and configure pipeline and expert parallelism for this large VLM MoE.
+Use the checked-in [full SFT recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml) or [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml). Both use `stepfun-ai/Step-3.7-Flash` for the model and processor and configure pipeline and expert parallelism for this large VLM MoE.
 
-NeMo AutoModel supports several ways to launch training: the AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on Slurm batch jobs, multi-node configuration, and environment variables, see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide.
+NeMo AutoModel supports several ways to launch training: the AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on Slurm batch jobs, multi-node configuration, and environment variables, see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/docs/launcher/slurm.mdx) guide.
 
 ### Standalone Slurm Skeleton
 
-Before running, make sure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide.
+Before running, make sure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/docs/launcher/slurm.mdx) guide.
 
 ```bash
 export TRANSFORMERS_OFFLINE=1
@@ -76,11 +76,11 @@ The SFT and LoRA training loss curves are shown below.
 **SFT**
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/step3_7_sft.png" alt="Step-3.7-Flash SFT training loss curve" width="700" />
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/r0.7.0/docs/guides/vlm/step3_7_sft.png" alt="Step-3.7-Flash SFT training loss curve" width="700" />
 </p>
 
 **LoRA**
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/step3_7_lora.png" alt="Step-3.7-Flash LoRA training loss curve" width="700" />
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/r0.7.0/docs/guides/vlm/step3_7_lora.png" alt="Step-3.7-Flash LoRA training loss curve" width="700" />
 </p>

@@ -184,7 +184,7 @@ step.
 The normalized preparation tool currently accepts local corpus ID-based JSON sources. Convert `hf://` or inline JSONL
 data to that layout first, or keep loading those sources directly. Refer to
 [Retrieval Dataset](/datasets/retrieval-dataset#normalized-arrow-for-large-vl-datasets) for the training config and to
-the [retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md)
+the [retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/tools/retrieval/README.md)
 for local and Slurm CPU commands.
 
 The key field requirements differ by source:
@@ -403,7 +403,7 @@ The following settings control bi-encoder behavior:
   or masking prevents sibling positives from becoming negatives.
 
 The complete example is
-[examples/retrieval/bi_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
+[examples/retrieval/bi_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
 
 ## Configure a Cross-Encoder
 
@@ -457,7 +457,7 @@ The following settings control cross-encoder behavior:
   to index `0`.
 
 The complete example is
-[examples/retrieval/cross_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml).
+[examples/retrieval/cross_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/retrieval/cross_encoder/llama3_2_1b.yaml).
 
 ## Distributed Launch and Batch Size
 
@@ -918,9 +918,9 @@ Use the following checks to diagnose common retrieval training problems:
 Refer to the following files for implementation and configuration details:
 
 - Bi-encoder recipe:
-  [nemo_automodel/recipes/retrieval/train_bi_encoder.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/retrieval/train_bi_encoder.py)
+  [nemo_automodel/recipes/retrieval/train_bi_encoder.py](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/nemo_automodel/recipes/retrieval/train_bi_encoder.py)
 - Cross-encoder recipe:
-  [nemo_automodel/recipes/retrieval/train_cross_encoder.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/retrieval/train_cross_encoder.py)
+  [nemo_automodel/recipes/retrieval/train_cross_encoder.py](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/nemo_automodel/recipes/retrieval/train_cross_encoder.py)
 - Retrieval dataset guide: [Retrieval Dataset](/datasets/retrieval-dataset)
 - Llama-Embed-Nemotron-8B example:
-  [examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml)
+  [examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml)

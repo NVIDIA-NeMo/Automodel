@@ -14,10 +14,10 @@ NeMo AutoModel is a PyTorch library for fine-tuning and pretraining large-scale 
 - **End-to-end workflows** with recipes for data preparation, training, and evaluation.
 
 ## Repository Structure
-The AutoModel source code is available under the [`nemo_automodel`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel) directory. It is organized into three directories:
-- [`components/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/components)  - Self-contained modules
-- [`recipes/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/recipes) - End-to-end training workflows
-- [`cli/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/cli) - CLI entry-point and job launcher dispatch.
+The AutoModel source code is available under the [`nemo_automodel`](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/nemo_automodel) directory. It is organized into three directories:
+- [`components/`](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/nemo_automodel/components)  - Self-contained modules
+- [`recipes/`](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/nemo_automodel/recipes) - End-to-end training workflows
+- [`cli/`](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/nemo_automodel/cli) - CLI entry-point and job launcher dispatch.
 
 ### Components Directory
 The `components/` directory contains isolated modules used in training loops.
@@ -100,7 +100,7 @@ Recipes are launched via the `automodel` CLI:
 automodel --nproc-per-node 2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-The above command will fine-tune the Llama3.2-1B model on the SQuAD dataset with two GPUs using the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config.
+The above command will fine-tune the Llama3.2-1B model on the SQuAD dataset with two GPUs using the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config.
 For a single-GPU run, omit `--nproc-per-node`:
 ```bash
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
@@ -111,10 +111,10 @@ The recipe/components structure enables you to:
 - Decouple individual components and replace them with custom implementations when needed.
 - Avoid rigid, class-based trainer structures by using linear scripts that expose training logic for maximum flexibility and control.
 
-{/* For an in-depth explanation of the LLM recipe please also see the [LLM recipe deep-dive guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/llm_recipe_deep_dive). */}
+{/* For an in-depth explanation of the LLM recipe please also see the [LLM recipe deep-dive guide](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/docs/llm_recipe_deep_dive). */}
 
 #### Configure a Recipe
-An example YAML configuration is shown below. The complete config is available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml):
+An example YAML configuration is shown below. The complete config is available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml):
 ```yaml
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -135,7 +135,7 @@ dataset:
   split: train
 ```
 
-More recipe examples are available under the [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
+More recipe examples are available under the [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples) directory.
 
 ### CLI Directory (`nemo_automodel/cli/`)
 The `automodel` (or `am`) CLI application simplifies job execution across different environments, from

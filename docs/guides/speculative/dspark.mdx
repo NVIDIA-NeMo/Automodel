@@ -112,7 +112,7 @@ rejects mismatches:
 | draft MoE | 128 routed experts, top-3 |
 
 Use the production-scale
-[`deepseek_v41_flash_dspark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/dspark/deepseek_v41_flash_dspark.yaml)
+[`deepseek_v41_flash_dspark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/speculative/dspark/deepseek_v41_flash_dspark.yaml)
 as the starting point. It uses FSDP2 for the trainable draft and the model's
 distributed EP/FSDP path for the frozen target. Pipeline parallelism, context
 parallelism, sequence packing, image inputs, and the serving-time dynamic

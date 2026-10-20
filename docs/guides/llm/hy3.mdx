@@ -21,7 +21,7 @@ We use [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag), a commonsen
 - **Tokenizer**: shared with the base model (`AutoTokenizer.from_pretrained` on the Hy3-preview checkpoint).
 - **Padding**: `pad_seq_len_divisible=64` via the default collater.
 
-For the full HellaSwag dataset wrapper used in NeMo Automodel, see [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/hellaswag.py).
+For the full HellaSwag dataset wrapper used in NeMo Automodel, see [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/nemo_automodel/components/datasets/llm/hellaswag.py).
 
 ## Architecture Notes
 
@@ -71,7 +71,7 @@ Keys at layer indices ≥ `num_hidden_layers` (default 80) are silently dropped 
 
 ## Launch Training
 
-A ready-to-use recipe ships at [`examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml). The yaml header documents how to adjust `ep_size` and `pp_size` for different cluster configurations.
+A ready-to-use recipe ships at [`examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml). The yaml header documents how to adjust `ep_size` and `pp_size` for different cluster configurations.
 
 NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 
@@ -100,4 +100,4 @@ srun --output=output.out \
 - Ensure your Hugging Face cache (`HF_HOME`) is configured and that the dataset is already cached locally.
 - To enable Weights & Biases logging, set your `WANDB_API_KEY` and uncomment the `wandb` section at the bottom of the YAML file.
 - The full recipe uses `pp_size=4` and `ep_size=32` (128 GPUs total). Valid `ep_size` values are any divisor of 192 (e.g. 8, 16, 24, 32, 48, 64, 96, 192); adjust `pp_size` and `--nproc-per-node` to match your node count.
-- For a quick end-to-end smoke test on 8 GPUs use [`examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml).
+- For a quick end-to-end smoke test on 8 GPUs use [`examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml).

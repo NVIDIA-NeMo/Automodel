@@ -125,7 +125,7 @@ hf upload <owner>/<dataset> dataset . --repo-type dataset --exclude '.git/*'
 
 ### Train on the Generated Traces
 
-Use the ready-made config at [`examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml). It reads `julien-c/synthtraces` through `refs/convert/parquet` and renders traces with [`qwen2_5_synthtraces_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_synthtraces_chat_template.jinja):
+Use the ready-made config at [`examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml). It reads `julien-c/synthtraces` through `refs/convert/parquet` and renders traces with [`qwen2_5_synthtraces_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/agent/qwen2_5_synthtraces_chat_template.jinja):
 
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml 2>&1 | tee train_synthtraces.log
@@ -325,7 +325,7 @@ For a rigorous, repeatable score, NeMo AutoModel ships a generation-based **tool
 
 ## Configure Your Training
 
-Use the ready-made config at [`examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml). The configuration file contains the following key blocks:
+Use the ready-made config at [`examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml). The configuration file contains the following key blocks:
 
 ```yaml
 model:
@@ -465,7 +465,7 @@ The numbers above are placeholders that show the expected *shape* of the result 
 
 ## Use PEFT with LoRA
 
-For a single-GPU run, use the LoRA config [`examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml), which adds a `peft` block on top of the same dataset and eval setup:
+For a single-GPU run, use the LoRA config [`examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml), which adds a `peft` block on top of the same dataset and eval setup:
 
 ```bash
 automodel examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml

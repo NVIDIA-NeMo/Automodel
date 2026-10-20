@@ -93,7 +93,7 @@ The [SQuAD (Stanford Question Answering Dataset)](https://huggingface.co/dataset
 
 #### Create Your Own Instruction Dataset
 
-The [`squad.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py) file contains the implementation for processing the SQuAD dataset into a format suitable for instruction tuning. It defines a dataset class and preprocessing functions that extract the context, question, and answer fields, concatenate them into a prompt-completion format, and apply tokenization, padding, and loss masking. This serves as a template for building custom instruction datasets by following a similar structure and adapting the extraction logic to your dataset's schema.
+The [`squad.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/nemo_automodel/components/datasets/llm/squad.py) file contains the implementation for processing the SQuAD dataset into a format suitable for instruction tuning. It defines a dataset class and preprocessing functions that extract the context, question, and answer fields, concatenate them into a prompt-completion format, and apply tokenization, padding, and loss masking. This serves as a template for building custom instruction datasets by following a similar structure and adapting the extraction logic to your dataset's schema.
 
 Based on the SQuAD implementation in `squad.py`, you can create your own instruction dataset using the `make_squad_dataset` pattern:
 

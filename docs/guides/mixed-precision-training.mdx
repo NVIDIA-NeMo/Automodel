@@ -155,5 +155,5 @@ The automatic warning about torch Adam/AdamW with trainable bf16 parameters curr
 
 ## Example Configs
 
-- [`examples/llm_pretrain/llama3_70b_pretrain.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml): TE FusedAdam example. This keeps model storage and training checkpoints in bf16 while using fp32 master weights and optimizer state.
-- [`examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml): torch AdamW example. This uses `model.torch_dtype: float32` so AdamW state stays fp32 while compute remains bf16 through FSDP2 mixed precision.
+- [`examples/llm_pretrain/llama3_70b_pretrain.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_pretrain/llama3_70b_pretrain.yaml): TE FusedAdam example. This keeps model storage and training checkpoints in bf16 while using fp32 master weights and optimizer state.
+- [`examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml): torch AdamW example. This uses `model.torch_dtype: float32` so AdamW state stays fp32 while compute remains bf16 through FSDP2 mixed precision.

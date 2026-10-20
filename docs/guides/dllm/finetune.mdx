@@ -42,13 +42,13 @@ The following table lists the supported models, their training modes, loss funct
 
 | Model Family | dLLM Mode | Loss | Inference | Example Config |
 |---|---|---|---|---|
-| LLaDA | `mdlm` | MDLM cross-entropy | Standalone full-forward denoising without a key-value (KV) cache | [llada_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_sft.yaml) |
-| LLaDA2 | `mdlm` | MDLM cross-entropy | Built-in block-refinement generation | [llada2_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada2_sft.yaml) |
-| SCDD (LLaDA backbone) | `scdd` | Self-correcting discrete-diffusion NELBO (denoise + correction terms) | Ancestral sampling over the whole canvas, with per-step self-correction | [llada_scdd.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_scdd.yaml) |
-| Nemotron-Labs-Diffusion | `hybrid` | Diffusion and AR (alpha-weighted) | Block diffusion with KV cache | [nemotron_labs_diffusion_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) |
-| DiffusionGemma | `block_diffusion` | Flat block-diffusion cross-entropy and encoder AR | Built-in Hugging Face diffusion sampler (entropy-bounded denoising) | [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) |
-| DFlash | `dflash` | Decay-weighted cross-entropy (Equation 4) | Training only (decoding occurs in the speculative-decoding stack) | [dflash_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) |
-| I-DLM | `idlm` | Two block-diffusion cross-entropy terms (`CE_noisy + α·CE_clean`) | Block-by-block diffusion decoding | [qwen3_8b_idlm.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_idlm.yaml) |
+| LLaDA | `mdlm` | MDLM cross-entropy | Standalone full-forward denoising without a key-value (KV) cache | [llada_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/llada_sft.yaml) |
+| LLaDA2 | `mdlm` | MDLM cross-entropy | Built-in block-refinement generation | [llada2_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/llada2_sft.yaml) |
+| SCDD (LLaDA backbone) | `scdd` | Self-correcting discrete-diffusion NELBO (denoise + correction terms) | Ancestral sampling over the whole canvas, with per-step self-correction | [llada_scdd.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/llada_scdd.yaml) |
+| Nemotron-Labs-Diffusion | `hybrid` | Diffusion and AR (alpha-weighted) | Block diffusion with KV cache | [nemotron_labs_diffusion_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) |
+| DiffusionGemma | `block_diffusion` | Flat block-diffusion cross-entropy and encoder AR | Built-in Hugging Face diffusion sampler (entropy-bounded denoising) | [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/diffusion_gemma_sft.yaml) |
+| DFlash | `dflash` | Decay-weighted cross-entropy (Equation 4) | Training only (decoding occurs in the speculative-decoding stack) | [dflash_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/dflash_sft.yaml) |
+| I-DLM | `idlm` | Two block-diffusion cross-entropy terms (`CE_noisy + α·CE_clean`) | Block-by-block diffusion decoding | [qwen3_8b_idlm.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/qwen3_8b_idlm.yaml) |
 
 For a dedicated walkthrough of DiffusionGemma fine-tuning, including full fine-tuning and LoRA with expert parallelism for its 26B-A4B MoE, refer to the [DiffusionGemma Fine-Tuning Guide](/recipes-e2e-examples/diffusiongemma).
 
@@ -75,7 +75,7 @@ For the full set of installation methods, see the [Installation Guide](/get-star
 
 The following components drive dLLM fine-tuning:
 
-1. A recipe script ([`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/dllm/train_ft.py)) orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
+1. A recipe script ([`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/nemo_automodel/recipes/dllm/train_ft.py)) orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
 2. A YAML configuration file specifies the model, data, optimizer, dLLM-specific settings, and distributed training strategy.
 
 The recipe uses a strategy pattern to handle differences between model families. The `dllm.mode` field in the YAML configuration selects the strategy.
@@ -91,7 +91,7 @@ The recipe uses a strategy pattern to handle differences between model families.
 
 ### Configure LLaDA
 
-Refer to [`llada_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_sft.yaml) for the full working configuration. The following example shows the key dLLM-specific sections:
+Refer to [`llada_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/llada_sft.yaml) for the full working configuration. The following example shows the key dLLM-specific sections:
 
 ```yaml
 model:
@@ -121,7 +121,7 @@ shows under parallel decoding.
 Because the objective covers every supervised position (corrupted or not), the loss denominator is
 the supervised-token count, not the corrupted-token count.
 
-Refer to [`llada_scdd.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_scdd.yaml)
+Refer to [`llada_scdd.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/llada_scdd.yaml)
 for the full working configuration. The following example shows the key dLLM-specific sections.
 
 ```yaml
@@ -159,7 +159,7 @@ backward tape. Lower `chunk_size` before reducing sequence length if the loss ru
 
 ### Configure Nemotron-Labs-Diffusion
 
-Refer to [`nemotron_labs_diffusion_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) for the full working configuration. The following example shows the key dLLM-specific sections:
+Refer to [`nemotron_labs_diffusion_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) for the full working configuration. The following example shows the key dLLM-specific sections:
 
 ```yaml
 model:
@@ -182,7 +182,7 @@ dataset:
 
 ### Configure DiffusionGemma
 
-Refer to [`diffusion_gemma_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) for the full working configuration. The following example shows the key block-diffusion sections:
+Refer to [`diffusion_gemma_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/diffusion_gemma_sft.yaml) for the full working configuration. The following example shows the key block-diffusion sections:
 
 ```yaml
 model:
@@ -235,7 +235,7 @@ The following table describes the key configuration fields for dLLM fine-tuning:
 DFlash trains a small draft model to predict tokens conditioned on a frozen causal target language model.
 Only the draft model weights are updated. The target language model loads one time and remains frozen.
 
-Refer to [`dflash_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) for the full working configuration. The following example shows the key DFlash-specific sections:
+Refer to [`dflash_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/dflash_sft.yaml) for the full working configuration. The following example shows the key DFlash-specific sections:
 
 ```yaml
 model:                                          # Draft model
@@ -313,7 +313,7 @@ You can then point the recipe configuration `dataset.path_or_dataset_id` to the 
 
 I-DLM ([Introspective Diffusion LM](https://arxiv.org/abs/2604.11035), Yu et al., 2026) converts a pretrained autoregressive LM into a diffusion LM by all-masked fine-tuning. Each step concatenates a fully masked copy `x_t` and the clean copy `x_0` into a length-`2L` sequence run under a block-diffusion attention mask, with a Dream-style next-token logit shift. Two cross-entropy terms, both over the response tokens, are combined: `CE_noisy` (decode `q`, the masked copy conditioned on the clean ground-truth prefix) and `CE_clean` (verify `p`, the clean copy under strict causal attention).
 
-See [`qwen3_8b_idlm.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_idlm.yaml) for the full working configuration. The following example shows the key I-DLM-specific sections.
+See [`qwen3_8b_idlm.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/qwen3_8b_idlm.yaml) for the full working configuration. The following example shows the key I-DLM-specific sections.
 
 ```yaml
 model:
@@ -391,7 +391,7 @@ uv run torchrun --nproc-per-node=8 \
 
 ## Run Inference
 
-The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_generate/generate.py)) supports chat and raw generation. Select the sampler that matches the trained family by using the `--sampler {llada,scdd,llada2,nemotron,gemma,idlm}` argument. Infilling (`--infill`) is available with the `llada` sampler only.
+The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_generate/generate.py)) supports chat and raw generation. Select the sampler that matches the trained family by using the `--sampler {llada,scdd,llada2,nemotron,gemma,idlm}` argument. Infilling (`--infill`) is available with the `llada` sampler only.
 
 The `--checkpoint` argument accepts several path types, including a path to a `consolidated/` directory, a step directory such as `.../epoch_0_step_499`, or the top-level checkpoint directory. The script automatically resolves the path to `LATEST/model/consolidated/`. Training with the provided example configs automatically writes this consolidated Hugging Face-format directory at the final checkpoint (`checkpoint.save_consolidated: final`). You can pass the directory printed at the end of training directly to `--checkpoint`.
 

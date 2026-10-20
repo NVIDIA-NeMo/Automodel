@@ -7,7 +7,7 @@ position: 13
 
 [Qwen/Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) is a vision-language model in the Qwen series developed by Alibaba. It is a 397B-parameter hybrid MoE model with 17B active parameters. The model repeats Gated DeltaNet and Gated Attention blocks, each paired with a sparse MoE layer that has 512 experts, including 10 routed experts and one active shared expert. Qwen3.5 combines vision and language capabilities, expands multilingual coverage, and improves efficiency. Qwen3.5-397B-A17B shows competitive benchmark performance across knowledge, reasoning, coding, and agent tasks.
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/qwen3_5scores.png" alt="Qwen3.5 benchmark" width="500" />
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/r0.7.0/docs/guides/vlm/qwen3_5scores.png" alt="Qwen3.5 benchmark" width="500" />
 </p>
 
 This guide describes how to fine-tune Qwen3.5 for a medical visual question answering task using NVIDIA NeMo AutoModel. It covers preparing the dataset, launching training on a Slurm cluster, and inspecting the results.
@@ -29,7 +29,7 @@ For details about how MedPix-VQA is preprocessed and integrated into NeMo AutoMo
 
 ## Launch Training
 
-A ready-to-use recipe is available at [`examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml). This recipe is configured for 32 nodes with eight NVIDIA H100 GPUs per node.
+A ready-to-use recipe is available at [`examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml). This recipe is configured for 32 nodes with eight NVIDIA H100 GPUs per node.
 
 <Info>
 Long-context Qwen3.5 runs can require prewarming during setup even when later training steps fit in memory. This occurs because first-use CUDA and communicator allocations overlap with the first backward-pass memory peak. The short-context MedPix recipe does not enable prewarming by default. If a longer hybrid-attention MoE run fails only during its first step, see [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization). Enable only the warmup that matches the failure signature. This behavior alone does not establish support for a specific context length.
@@ -68,5 +68,5 @@ srun --output=output.out \
 The following figure shows the training loss curves for Qwen3.5-VL fine-tuned on MedPix-VQA.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/qwen3_5.png" alt="Qwen3.5-VL Training Loss Curve" width="500" />
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/r0.7.0/docs/guides/vlm/qwen3_5.png" alt="Qwen3.5-VL Training Loss Curve" width="500" />
 </p>
