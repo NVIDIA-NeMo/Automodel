@@ -893,8 +893,8 @@ class Gemma4ContextParallelMixin:
         ``setup_cp_attention`` by ``attach_gemma4_cp_ring_attention`` at
         construction). Invoked from Gemma4's own batch-sharding callable
         (``_cp_shard_batch_aux_only``) the first time the recipe hands it the CP
-        submesh, so the install is fully model-owned -- no framework dispatch is
-        required.
+        submesh, so the install is fully model-owned and needs no framework
+        dispatch.
         """
         if getattr(self, "_cp_enabled", False):
             return
@@ -913,7 +913,7 @@ class Gemma4ContextParallelMixin:
         ``prepare_model_inputs_for_cp``. The CP dispatch calls it with the CP
         submesh, which is the one place Gemma4 reliably receives ``cp_mesh`` on a
         model-owned path (dense variants are not guaranteed to run the MoE
-        ``apply_cp``) -- so install the ring here (idempotent) and record
+        ``apply_cp``), so install the ring here (idempotent) and record
         ``cp_mesh`` for the forward, which embeds, splices vision and keeps this
         rank's contiguous slice per microbatch. Only the no-grad aux streams (and
         the synthesized ``_packed_seq_ids``) are sharded here; ``input_ids`` /

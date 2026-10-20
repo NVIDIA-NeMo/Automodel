@@ -23,7 +23,13 @@ keeps this rank's slice):
 * ``text``: plain causal text.
 * ``image``: one image block across the rank boundary whose tokens attend bidirectionally on the
   sliding layers (the reference forward uses the same generation masks).
+* ``long_image``: an image block longer than the sliding window across the rank boundary, so the
+  window also cuts attention inside the block.
 * ``packed``: two documents in one row; the reference runs each document on its own.
+* ``padded``: right padding that reaches into the last rank's shard.
+
+The CP pass runs with activation checkpointing, so the ring metadata is also read back during the
+backward recompute.
 
 The loss is the token-sum cross entropy over the global token count, so the CP gradients summed
 over ranks must equal the reference gradients.
@@ -42,6 +48,7 @@ import torch.nn.functional as F
 
 IMAGE_TOKEN_ID = 100
 NUM_PATCHES = 8
+LONG_IMAGE_PATCHES = 24  # longer than the sliding window of 16
 
 
 def _build_model(device, dtype):
@@ -96,21 +103,22 @@ def _batches(seqlen, device, dtype):
     positions = torch.arange(seqlen).unsqueeze(0)
     batches = {"text": {"input_ids": ids, "labels": labels, "position_ids": positions}}
 
-    image_ids = ids.clone()
-    start = seqlen // 2 - NUM_PATCHES // 2  # the image block straddles the CP rank boundary
-    image_ids[0, start : start + NUM_PATCHES] = IMAGE_TOKEN_ID
-    mm = (image_ids == IMAGE_TOKEN_ID).long()
-    image_labels = torch.cat([image_ids[:, 1:], torch.full((1, 1), -100)], dim=1)
-    image_labels[mm.bool()] = -100
-    grid = torch.arange(NUM_PATCHES)
-    batches["image"] = {
-        "input_ids": image_ids,
-        "labels": image_labels,
-        "position_ids": positions,
-        "mm_token_type_ids": mm,
-        "pixel_values": torch.randn(1, NUM_PATCHES, 48, generator=gen),
-        "image_position_ids": torch.stack([grid % 4, grid // 4], dim=-1).unsqueeze(0),
-    }
+    for name, num_patches in (("image", NUM_PATCHES), ("long_image", LONG_IMAGE_PATCHES)):
+        image_ids = ids.clone()
+        start = seqlen // 2 - num_patches // 2  # the image block straddles the CP rank boundary
+        image_ids[0, start : start + num_patches] = IMAGE_TOKEN_ID
+        mm = (image_ids == IMAGE_TOKEN_ID).long()
+        image_labels = torch.cat([image_ids[:, 1:], torch.full((1, 1), -100)], dim=1)
+        image_labels[mm.bool()] = -100
+        grid = torch.arange(num_patches)
+        batches[name] = {
+            "input_ids": image_ids,
+            "labels": image_labels,
+            "position_ids": positions,
+            "mm_token_type_ids": mm,
+            "pixel_values": torch.randn(1, num_patches, 48, generator=gen),
+            "image_position_ids": torch.stack([grid % 4, grid // 4], dim=-1).unsqueeze(0),
+        }
 
     split = seqlen // 2 + 6  # the document boundary falls inside a rank's shard
     doc_ids = torch.cat([torch.ones(split), torch.full((seqlen - split,), 2)]).long().unsqueeze(0)
@@ -123,6 +131,18 @@ def _batches(seqlen, device, dtype):
         "position_ids": packed_positions,
         "_packed_seq_ids": doc_ids,
     }
+
+    real = seqlen * 3 // 4  # the pad tail covers part of the last rank's shard
+    padded_ids = ids.clone()
+    padded_ids[0, real:] = 0
+    padded_labels = labels.clone()
+    padded_labels[0, real - 1 :] = -100
+    batches["padded"] = {
+        "input_ids": padded_ids,
+        "labels": padded_labels,
+        "position_ids": positions,
+        "attention_mask": (torch.arange(seqlen) < real).long().unsqueeze(0),
+    }
     for batch in batches.values():
         for key, value in batch.items():
             if torch.is_tensor(value):
@@ -131,6 +151,7 @@ def _batches(seqlen, device, dtype):
 
 
 def _token_loss_sum(logits, labels):
+    """Summed cross entropy of ``logits`` ``[batch, sequence, vocab]`` against ``labels`` ``[batch, sequence]``."""
     return F.cross_entropy(logits.float().flatten(0, 1), labels.flatten(), ignore_index=-100, reduction="sum")
 
 
@@ -190,6 +211,7 @@ def main():
     batches = _batches(32 * world, device, dtype)
     # The ring is installed for good by the first CP shard, so every reference runs first.
     references = {name: _reference(model, batch) for name, batch in batches.items()}
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     device_mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("cp",))
     results = {name: _context_parallel(model, batch, device_mesh) for name, batch in batches.items()}
 

@@ -82,14 +82,21 @@ class Gemma4UnifiedForConditionalGeneration(
             cp_mesh: The context-parallel device submesh.
 
         Raises:
-            ValueError: If the text model does not use SDPA attention, which the ring replaces.
+            ValueError: If the text model does not use SDPA attention, which the ring replaces, or attends
+                bidirectionally everywhere (``use_bidirectional_attention='all'``), which the causal ring cannot.
         """
-        attn_implementation = self.config.get_text_config()._attn_implementation
-        if not getattr(self, "_cp_enabled", False) and attn_implementation != "sdpa":
-            raise ValueError(
-                "Gemma4 Unified context parallelism runs its ring attention in place of SDPA; load the model "
-                f"with attn_implementation='sdpa' (got {attn_implementation!r})."
-            )
+        text_config = self.config.get_text_config()
+        if not getattr(self, "_cp_enabled", False):
+            if text_config._attn_implementation != "sdpa":
+                raise ValueError(
+                    "Gemma4 Unified context parallelism runs its ring attention in place of SDPA; load the model "
+                    f"with attn_implementation='sdpa' (got {text_config._attn_implementation!r})."
+                )
+            if text_config.use_bidirectional_attention == "all":
+                raise ValueError(
+                    "Gemma4 Unified context parallelism runs a causal ring and does not support "
+                    "use_bidirectional_attention='all'."
+                )
         super().setup_cp_attention(cp_mesh)
 
     def forward(
@@ -115,10 +122,10 @@ class Gemma4UnifiedForConditionalGeneration(
         """Hugging Face's forward, or the context-parallel forward once CP is set up.
 
         Image blocks marked by ``mm_token_type_ids`` attend bidirectionally on sliding-window layers
-        only, as in Hugging Face's generation masks for this model and in dense Gemma4. Hugging
-        Face's own training forward also applies that overlay to the full-attention layers, so
-        without CP the forward passes it the generation masks; CP and non-CP training then match
-        inference.
+        only, as in this model's ``create_masks_for_generate`` and in dense Gemma4. Hugging Face's own
+        forward, which training and ``generate()`` with a dynamic cache go through, also applies that
+        overlay to the full-attention layers, so without CP the forward passes it this model's masks;
+        training with and without CP then matches generation.
 
         Under CP the forward embeds the full ``input_ids`` and splices image features as Hugging
         Face does, builds the vision-bidirectional block ids on the full sequence, then keeps this
@@ -128,21 +135,26 @@ class Gemma4UnifiedForConditionalGeneration(
 
         Args:
             input_ids: Token ids ``[batch, sequence]``; full-length under CP.
-            pixel_values: Raw image patches for the vision embedder.
-            pixel_values_videos: Video patches; not supported under CP.
-            input_features: Audio frames; not supported under CP.
-            attention_mask: Attention mask; under CP the ring builds its own masks.
-            input_features_mask: Audio frame mask.
-            position_ids: Position ids; under CP this rank's slice ``[batch, local_sequence]``.
-            image_position_ids: Patch positions ``[images, patches, 2]`` (``-1`` marks padding).
-            video_position_ids: Video patch positions.
+            pixel_values: Image patches ``[images, max_patches, patch_dim]`` for the vision embedder.
+            pixel_values_videos: Video patches ``[videos, frames, max_patches, patch_dim]``; not supported
+                under CP.
+            input_features: Audio features ``[audios, tokens, audio_embed_dim]``; not supported under CP.
+            attention_mask: Padding mask ``[batch, sequence]`` (1 = keep), or a mapping from layer type to
+                prebuilt masks; under CP the ring builds its own masks.
+            input_features_mask: Valid-audio-token mask ``[audios, tokens]`` (True = valid).
+            position_ids: Position ids ``[batch, sequence]``; under CP this rank's slice
+                ``[batch, local_sequence]``.
+            image_position_ids: Patch positions ``[images, max_patches, 2]`` (``-1`` marks padding).
+            video_position_ids: Video patch positions ``[videos, frames, max_patches, 2]``.
             past_key_values: KV cache; unused under CP.
             mm_token_type_ids: Modality ids ``[batch, sequence]``; image blocks attend bidirectionally on
                 sliding-window layers when set.
-            inputs_embeds: Input embeddings; not supported under CP.
-            labels: Labels for the Hugging Face loss; under CP the recipe computes the loss instead.
+            inputs_embeds: Input embeddings ``[batch, sequence, hidden]``; not supported under CP.
+            labels: Labels ``[batch, sequence]`` for the Hugging Face loss; under CP the recipe computes the
+                loss instead.
             use_cache: Whether to return a KV cache; off under CP.
-            logits_to_keep: Integer suffix length or index tensor selecting the returned positions.
+            logits_to_keep: Integer suffix length, or an index tensor ``[kept_positions]`` selecting the
+                returned positions.
             mm_encoder_outputs: Precomputed multimodal encoder outputs; not supported under CP.
             **kwargs: Remaining keyword arguments. Under CP, ``padding_mask`` (True = pad) and
                 ``_packed_seq_ids`` (0 = pad) carry this rank's slices to the ring.
@@ -151,7 +163,8 @@ class Gemma4UnifiedForConditionalGeneration(
             Model outputs; under CP, logits for this rank's sequence shard ``[batch, local_sequence, vocab]``.
 
         Raises:
-            ValueError: Under CP, for inputs the context-parallel forward does not support.
+            ValueError: Under CP, for inputs the context-parallel forward does not support, or when the
+                image placeholder tokens do not match the image features.
         """
         if not getattr(self, "_cp_enabled", False):
             text_config = self.config.get_text_config()
@@ -159,7 +172,6 @@ class Gemma4UnifiedForConditionalGeneration(
                 mm_token_type_ids is not None
                 and text_config.use_bidirectional_attention == "vision"
                 and not isinstance(attention_mask, dict)
-                and past_key_values is None
             ):
                 # The mask builder reads only the batch/sequence shape, dtype and device.
                 shape_like = input_ids if inputs_embeds is None else inputs_embeds[..., 0]
@@ -167,7 +179,7 @@ class Gemma4UnifiedForConditionalGeneration(
                     self.config,
                     shape_like.new_empty((*shape_like.shape[:2], 0), dtype=self.dtype),
                     attention_mask,
-                    None,
+                    past_key_values,
                     position_ids,
                     mm_token_type_ids=mm_token_type_ids,
                 )
@@ -208,6 +220,12 @@ class Gemma4UnifiedForConditionalGeneration(
             image_features = torch.cat(image_features.pooler_output, dim=0).to(
                 inputs_embeds.device, inputs_embeds.dtype
             )
+            # Hugging Face's check: masked_scatter would otherwise silently take a prefix of the features.
+            if (num_image_tokens := int(image_mask.sum())) != image_features.shape[0]:
+                raise ValueError(
+                    f"Image features and image tokens do not match, tokens: {num_image_tokens}, "
+                    f"features: {image_features.shape[0]}"
+                )
             inputs_embeds = inputs_embeds.masked_scatter(
                 image_mask.unsqueeze(-1).expand_as(inputs_embeds), image_features
             )
@@ -230,8 +248,14 @@ class Gemma4UnifiedForConditionalGeneration(
             has_vision_tokens=has_vision_tokens,
         )
 
+        # The ring builds its own masks; a mask mapping keeps Hugging Face from materializing unused
+        # per-layer-type masks for this shard.
         text_outputs = self.model.language_model(
-            inputs_embeds=inputs_embeds, position_ids=position_ids, use_cache=False, **kwargs
+            inputs_embeds=inputs_embeds,
+            attention_mask={"full_attention": None, "sliding_attention": None},
+            position_ids=position_ids,
+            use_cache=False,
+            **kwargs,
         )
         logits = compute_lm_head_logits(self.lm_head, text_outputs.last_hidden_state, logits_to_keep).logits
         if (final_logit_softcapping := text_config.final_logit_softcapping) is not None:
