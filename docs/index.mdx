@@ -68,10 +68,10 @@ docker run --gpus all -it --rm --shm-size=8g \
   nvcr.io/nvidia/nemo-automodel:26.10.00 \
   automodel /opt/Automodel/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml \
   --nproc-per-node 2 \
-  --checkpoint.enabled true
+  --step_scheduler.max_steps 10
 ```
 
-This example fine-tunes [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) on HellaSwag using two GPUs. The model and dataset are public; no Hugging Face token is required. Checkpoints are enabled and saved to the mounted `checkpoints` directory.
+This 10-step example fine-tunes [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) on HellaSwag using two GPUs. The model and dataset are public; no Hugging Face token is required. Checkpoints are enabled and saved to the mounted `checkpoints` directory.
 
 See the [installation guide](/get-started/installation) for Docker prerequisites, source builds, and multi-node setup.
 See the [configuration guide](/get-started/configuration) for YAML recipes and CLI overrides.

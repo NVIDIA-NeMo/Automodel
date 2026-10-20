@@ -215,7 +215,21 @@ Planned
 
 ## Getting Started
 
-We recommend using **uv** for reproducible Python environments.
+Run a 10-step Qwen3-0.6B fine-tuning example on two GPUs with the container:
+
+```bash
+mkdir -p checkpoints
+docker run --gpus all -it --rm --shm-size=8g \
+  -v "$PWD/checkpoints:/opt/Automodel/checkpoints" \
+  nvcr.io/nvidia/nemo-automodel:26.10.00 \
+  automodel /opt/Automodel/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml \
+  --nproc-per-node 2 \
+  --step_scheduler.max_steps 10
+```
+
+The model and HellaSwag dataset are public; no Hugging Face token is required. Checkpoints are saved to the mounted `checkpoints` directory.
+
+For source installation, use **uv** for reproducible Python environments.
 
 ```bash
 # Setup environment before running any recipes
