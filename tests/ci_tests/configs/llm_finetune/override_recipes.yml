@@ -25,6 +25,38 @@ exempt_models:
   - starcoder
 
 exempt_configs:
+  aquila_7b_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  deepseek_llm_7b_chat_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  gpt_j_6b_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  gpt_neox_20b_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  bamba_9b_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  jais_13b_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  internlm3_8b_instruct_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  exaone_3_0_7_8b_instruct_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  llama_3_3_nemotron_super_49b_v1_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  minitron_8b_base_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  orion_14b_base_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  gritlm_7b_vllm_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  stablelm_3b_4e1t_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  falcon_7b_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  solar_pro_preview_instruct_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  chatglm3_6b_squad_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
   falcon3_7b_instruct_hellaswag_fp8:
     reason: "Deprecated for 26.10 (Falcon 3)"
   falcon3_7b_instruct_squad:
