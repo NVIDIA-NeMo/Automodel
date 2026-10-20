@@ -854,6 +854,8 @@ navigation:
             slug: meta
             path: ../../model-coverage/embedding/meta/index.mdx
             contents:
+              - page: "Llama-3.1-8B"
+                path: ../../model-coverage/embedding/meta/llama-3-1-8b.mdx
               - page: "Llama-3.2-1B"
                 path: ../../model-coverage/embedding/meta/llama-3-2-1b.mdx
           - section: "Mistral AI"
@@ -878,6 +880,13 @@ navigation:
           - page: "Overview"
             path: ../../model-coverage/reranker/index.mdx
             slug: overview
+          - section: "Meta"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRjoCAABXRUJQVlA4TC4CAAAvE8AEEN/jqJEkR8qe9YbTAl4+B+C+9/WmO2k4iCRJkbJnn8G/xjfA0I5j25aNfe79PYYSEaE4pWCkjH5z73Fc29bx3D+2bVvDFJBhVopJCakvU9u29b4vgABD4IToAekX9A/fBAow4FOA4hFRlqusEAz8A0eKGykTgoHXQqgvYiACIiACEiCaIRaxBr+IJY6GNBoRorZsBQ5pIBVtiXwnGtj6gieJdkQEtvx9bhAH5IiJfEom9BV2IQzFrxHjWirwy2w/urU6drfHLRnGqhBCJCUxUWTG+u9t/Efwd+JrVLD9vetn6qYQG7GEtJ6XNkcLe+msPySmjeax/O9Xmb+13XczeYTes/e3j97+PPn3OvIdL+rGT9Og+ni4Rqji2JLxUbsmN7jHdFXYWoIoDd9x3UFMkrJd7ivP6P/A53vx5dv1Ffqfbsvtdtb207N6vS+SA8qb9xMQbds23eS8m9o8r6+2rdS2bdvGa9ffx/mCiP5PADEvHj+RUNQCFwwYCaJQCKoYL0gA5XxrY/MUhtPSR94tC1C5XFs/2Js9KUspb0utUvVjf/GMi+2F8RKYSuoEPrma++GWm6Xd7ziHpgYBm/uZOy2gYnLliHltzx0Aw9PrquBLLD38vYaenD74ZHRMXTurmq/lHXV78zrApjm7mMqkbuV4+gFfchcYBhNqGuNb+fiMe8x/rqsvAtTTkpkxhMs/by8Ttf0EdhwEEPgDCeCCwd9SUAKLENQSYhg="/></svg>'
+            slug: meta
+            path: ../../model-coverage/reranker/meta/index.mdx
+            contents:
+              - page: "Llama-3.2-1B"
+                path: ../../model-coverage/reranker/meta/llama-3-2-1b.mdx
           - section: "NVIDIA"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRiACAABXRUJQVlA4TBQCAAAvE8AEAJfkqI0kScqsnnueQ2QZLH9Ic1QGDceR5MbNLgSAsv10OA7C+Qeim8A6biRJkapheX/rypp9PpxBzHc9VPMfiAVCIJABEUgEAFGRTCEIOnlLIUJUS+dtd19/MxO62rPJDFRIVUaTDgjy/NDNd96lkr4+MjNAJmQWmT+gkRrUUIr+oTOR6IIGgYBChasQGgCpoousYIAhCiAUDZAgAqsBJJC6kgBRRGaVElbSs4iCir7zKg9hWR9PUfZtN+qiZXgKKfkeYAIFCL4L/D+Y3JliW0dl6njP1jEYiylT52chCgPaZrtnbavZ1f+3W8fg+m5MMUdncrdkrwhALNmbwwjKFNvo2czkrkimEM3sZore8Z4t2ZvcmWJyN7mb3JmiTJnCFEv2RPj50YhBuVgsw1Z9nACibdumm/1wYttOldpGUtupbdu29cuNvyCi/xOAVGckEblYGCnilwKmptZgdc2nG1wUGLzZLc39I0OjjZBE4DlXgz8nM9fR1jdYEYmDvddZ780oqrUMh8sjgZO1BwrTB4Jp3b7OUBQexo5AcX5eidXWVRcFAuizCkrLvnrCYyESR/pv/q36+/mu9ICJoJhf0upUa+rVZWiwIAcgxOTm0cH98+H53snVxcr6O0QQ4u12+nh/52P7dHzj7Hp3S8myhJmJuamXx8Wnm8vp14fZuwWwSDBLLJGQJaGQiEgYIVUB"/></svg>'
             slug: nvidia

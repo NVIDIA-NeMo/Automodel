@@ -1,0 +1,42 @@
+---
+title: "Llama-3.2-1B"
+description: "Fine-tune Meta Llama-3.2-1B for pairwise relevance scoring with NeMo AutoModel, using the checked-in retrieval recipe and configurable attention policy."
+slug: model-coverage/reranking-models/meta/Llama-3.2-1B
+---
+
+[`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) is the
+base checkpoint configured by the retrieval recipe below. The recipe trains a
+retrieval model from that checkpoint; it does not initialize from an NVIDIA
+Nemotron embedding or reranking checkpoint.
+
+## Fine-Tune Llama-3.2-1B
+
+Follow the [installation instructions](/get-started/installation), accept the
+checkpoint publisher's access terms, and run from the repository root:
+
+```bash
+uv run automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-node 8
+```
+
+The [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml)
+defines the dataset, attention mode, pooling, optimizer, and checkpoint settings.
+Validate training and memory use on your hardware before scaling the workload.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| **Task** | pairwise relevance scoring |
+| **Architecture** | `LlamaBidirectionalForSequenceClassification` |
+| **Checkpoint** | `meta-llama/Llama-3.2-1B` |
+
+### Available Models
+
+- [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B)
+
+## Related Resources
+
+- [Embedding model coverage](/model-coverage/embedding-models/overview)
+- [Reranking model coverage](/model-coverage/reranking-models/overview)
