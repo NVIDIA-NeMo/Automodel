@@ -14,13 +14,15 @@
 
 """Gemma4 Unified model-owned context parallelism, on CPU.
 
-With ``cp_mesh`` unset the contiguous shard is the identity and no ring is installed, so the CP
-forward must reproduce the Hugging Face forward exactly; the ring itself is covered by the GPU
-parity test in ``tests/functional_tests/context_parallel/run_gemma4_unified_cp.py``.
+With ``cp_mesh`` unset the contiguous shard is the identity and no ring is installed. The CP forward
+leaves all masking to the ring, so on a model whose sliding window covers the sequence it must
+reproduce the Hugging Face forward exactly; the ring itself is covered by the GPU parity test in
+``tests/functional_tests/context_parallel/run_gemma4_unified_cp.py``.
 """
 
 import pytest
 import torch
+from transformers.cache_utils import DynamicCache
 from transformers.models.gemma4_unified.configuration_gemma4_unified import (
     Gemma4UnifiedConfig,
     Gemma4UnifiedTextConfig,
@@ -37,7 +39,7 @@ IMAGE_TOKEN_ID = 100
 
 
 def _model(attn_implementation="sdpa", **text_overrides):
-    text = Gemma4UnifiedTextConfig(
+    text_kwargs = dict(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
@@ -54,8 +56,8 @@ def _model(attn_implementation="sdpa", **text_overrides):
         num_kv_shared_layers=0,
         hidden_size_per_layer_input=0,
         pad_token_id=0,
-        **text_overrides,
     )
+    text = Gemma4UnifiedTextConfig(**{**text_kwargs, **text_overrides})
     vision = Gemma4UnifiedVisionConfig(
         mm_embed_dim=32, output_proj_dims=32, patch_size=2, pooling_kernel_size=2, model_patch_size=4, mm_posemb_size=16
     )
@@ -97,12 +99,18 @@ def test_cp_attention_backends_follow_the_text_config():
     assert all(m._gemma4_cp_sliding_backend == "fa" and m._gemma4_cp_use_ffpa for m in attention)
     with pytest.raises(ValueError, match="cp_sliding_attn_backend"):
         _model(cp_sliding_attn_backend="sdpa")
+    with pytest.raises(ValueError, match="cp_full_attn_backend"):
+        _model(cp_full_attn_backend="sdpa")
 
 
 @pytest.mark.parametrize("with_image", [False, True])
 def test_cp_forward_without_a_mesh_matches_the_hf_forward(with_image):
-    model = _model()
+    model = _model(sliding_window=32)  # covers the sequence: without the ring every layer is causal
     inputs = _image_inputs() if with_image else {"input_ids": torch.randint(1, IMAGE_TOKEN_ID, (1, 24))}
+    masks_seen = []
+    model.model.language_model.register_forward_pre_hook(
+        lambda module, args, kwargs: masks_seen.append(kwargs.get("attention_mask")), with_kwargs=True
+    )
     with torch.no_grad():
         expected = model(**inputs).logits
         expected_last = model(**inputs, logits_to_keep=1).logits
@@ -112,6 +120,42 @@ def test_cp_forward_without_a_mesh_matches_the_hf_forward(with_image):
     torch.testing.assert_close(out.logits, expected)
     torch.testing.assert_close(last, expected_last)
     assert out.loss is None  # the recipe computes the loss on the sharded labels
+    # The ring owns the masks, so Hugging Face builds none for the shard.
+    assert masks_seen[-1] == {"full_attention": None, "sliding_attention": None}
+
+
+def test_non_cp_forward_builds_the_vision_masks_against_the_cache(monkeypatch):
+    model = _model()
+    inputs = _image_inputs()
+    mm = (inputs["input_ids"] == IMAGE_TOKEN_ID).long()
+    builder = model.create_masks_for_generate
+    caches = []
+
+    def spy(config, inputs_embeds, attention_mask, past_key_values, position_ids, **kwargs):
+        caches.append(past_key_values)
+        return builder(config, inputs_embeds, attention_mask, past_key_values, position_ids, **kwargs)
+
+    monkeypatch.setattr(model, "create_masks_for_generate", spy)
+    cache = DynamicCache(config=model.config.get_text_config())
+    with torch.no_grad():
+        model(**inputs, mm_token_type_ids=mm, past_key_values=cache, use_cache=True)
+    assert caches == [cache]
+
+
+def test_non_cp_forward_vision_masks_from_inputs_embeds():
+    model = _model()
+    # Hugging Face looks up every placeholder embedding on this path; keep them inside the tiny vocab.
+    model.config.video_token_id, model.config.audio_token_id = IMAGE_TOKEN_ID + 1, IMAGE_TOKEN_ID + 2
+    ids = torch.randint(1, IMAGE_TOKEN_ID, (1, 24))
+    mm = torch.zeros_like(ids)
+    mm[0, 6:10] = 1
+    hf_forward = super(Gemma4UnifiedForConditionalGeneration, model).forward
+    with torch.no_grad():
+        embeds = model.get_input_embeddings()(ids)
+        masks = model.create_masks_for_generate(model.config, embeds, None, None, None, mm_token_type_ids=mm)
+        expected = hf_forward(inputs_embeds=embeds, mm_token_type_ids=mm, attention_mask=masks).logits
+        out = model(inputs_embeds=embeds, mm_token_type_ids=mm).logits
+    torch.testing.assert_close(out, expected)
 
 
 def test_non_cp_forward_uses_the_generation_vision_masks():
@@ -197,6 +241,22 @@ def test_setup_cp_attention_requires_sdpa():
     with pytest.raises(ValueError, match="attn_implementation='sdpa'"):
         model.setup_cp_attention("mesh")
     assert not getattr(model, "_cp_enabled", False)
+
+
+def test_setup_cp_attention_rejects_fully_bidirectional_attention():
+    model = _model(use_bidirectional_attention="all")
+    with pytest.raises(ValueError, match="use_bidirectional_attention='all'"):
+        model.setup_cp_attention("mesh")
+    assert not getattr(model, "_cp_enabled", False)
+
+
+def test_cp_forward_rejects_image_tokens_that_do_not_match_the_features():
+    model = _model()
+    model._cp_enabled = True
+    inputs = _image_inputs()
+    inputs["input_ids"][0, 9] = 1  # a truncated image keeps 3 of its 4 placeholder tokens
+    with pytest.raises(ValueError, match="Image features and image tokens do not match"):
+        model(**inputs)
 
 
 def test_cp_sharder_records_the_mesh_and_shards_aux_streams(monkeypatch):
