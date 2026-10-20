@@ -69,8 +69,8 @@ are provided in the `examples/dllm_sft/` directory:
 
 | Configuration File | Description |
 | :--- | :--- |
-| [`diffusion_gemma_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) | Full fine-tuning on the [GSM8K](https://huggingface.co/datasets/openai/gsm8k) dataset |
-| [`diffusion_gemma_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_lora.yaml) | LoRA fine-tuning (attention and dense-MLP linears; rank 16) |
+| [`diffusion_gemma_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/diffusion_gemma_sft.yaml) | Full fine-tuning on the [GSM8K](https://huggingface.co/datasets/openai/gsm8k) dataset |
+| [`diffusion_gemma_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/diffusion_gemma_lora.yaml) | LoRA fine-tuning (attention and dense-MLP linears; rank 16) |
 
 Both configurations automatically pull the checkpoint from the Hugging Face Hub
 (`google/diffusiongemma-26B-A4B-it`). Because the GSM8K dataset is consumed in the OpenAI
@@ -82,7 +82,7 @@ python examples/dllm_sft/prep_gsm8k.py
 ```
 
 The recipes also set `chat_template` to
-[`diffusion_gemma_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_chat_template.jinja).
+[`diffusion_gemma_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/dllm_sft/diffusion_gemma_chat_template.jinja).
 The released DiffusionGemma chat template has no Jinja generation tags, so without this
 copy the supervised region would start at the model turn header and teach the model to
 re-emit it.
@@ -112,11 +112,11 @@ first 200 steps.
 SFT training curves:
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/dllm/diffusiongemma_sft.png" alt="DiffusionGemma SFT training curves" width="900" />
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/r0.7.0/docs/guides/dllm/diffusiongemma_sft.png" alt="DiffusionGemma SFT training curves" width="900" />
 </p>
 
 LoRA training curves:
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/dllm/diffusiongemma_lora.png" alt="DiffusionGemma LoRA training curves" width="900" />
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/r0.7.0/docs/guides/dllm/diffusiongemma_lora.png" alt="DiffusionGemma LoRA training curves" width="900" />
 </p>

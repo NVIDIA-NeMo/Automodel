@@ -49,7 +49,7 @@ An isolated input-embedding defect is likely when several of these observations 
 - Most input-embedding rows have similar norms, while a small set is zero, non-finite, or separated from the healthy distribution by several orders of magnitude.
 - The corresponding output rows in `lm_head` are finite and have healthy norms.
 
-Inspect the checkpoint and choose `min_norm` from the observed gap between damaged and healthy rows. There is no model-independent threshold. The [Nemotron Nano 4B example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml) uses `1.0e-4` for its diagnosed checkpoint. The component default is `1.0e-6`.
+Inspect the checkpoint and choose `min_norm` from the observed gap between damaged and healthy rows. There is no model-independent threshold. The [Nemotron Nano 4B example](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml) uses `1.0e-4` for its diagnosed checkpoint. The component default is `1.0e-6`.
 
 ### Enable the Repair
 

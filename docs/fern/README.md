@@ -153,7 +153,7 @@ The same MDX backs every version slug — a hard-coded prefix would jump readers
 Repository source paths like `examples/llm_finetune/foo.yaml` or `nemo_automodel/components/...` are not part of the docs site. Link to them as **absolute GitHub URLs**:
 
 ```mdx
-[foo.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/foo.yaml)
+[foo.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/foo.yaml)
 ```
 
 ## Versioning
