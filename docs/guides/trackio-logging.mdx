@@ -1,0 +1,137 @@
+---
+title: "Trackio Logging in NeMo AutoModel"
+description: "Track NeMo AutoModel training runs locally or on a Hugging Face Space with Trackio."
+position: 6
+---
+## Introduction
+
+[Trackio](https://github.com/gradio-app/trackio) is a lightweight, local-first experiment tracker from Hugging Face with a `wandb`-style API. NeMo AutoModel logs training and validation metrics to Trackio from every recipe that supports Weights & Biases.
+
+With Trackio integration, you can:
+- Track runs in a local SQLite store with no account or server
+- Browse and compare runs in the Trackio dashboard
+- Sync a project to a Hugging Face Space to share it
+- Log alongside Weights & Biases, MLflow, or Comet in the same run
+
+## Prerequisites
+
+Trackio is included in the `tracking` and `all` extras and in the NeMo AutoModel container. For a base package installation, add the `trackio` extra:
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install "nemo-automodel[trackio]"
+```
+
+## Configuration
+
+Enable Trackio logging by adding a `trackio` section to your recipe YAML configuration:
+
+```yaml
+trackio:
+  project: "automodel-llm-llama3_2_1b_squad-finetune"
+  name: ""
+  group: null
+  space_id: null
+```
+
+### Configuration Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `project` | str | "automodel" | Trackio project. Runs of the same project share a dashboard. |
+| `name` | str | "" | Run name. If empty, it is derived from the model name (for example `meta-llama/Llama-3.2-1B` becomes `meta-llama_Llama-3.2-1B`). |
+| `group` | str | null | Group name used to organize related runs in the dashboard. |
+| `space_id` | str | null | Hugging Face Space (`user/space` or `space`) to sync the project to. If null, the run stays local unless `TRACKIO_SPACE_ID` is set. |
+| `enable` | bool | true | Set to `false` to keep the section in the YAML but turn Trackio off. |
+
+Any other key in the `trackio` section is passed to `trackio.init()` unchanged. Useful ones include:
+
+| Parameter | Description |
+|-----------|-------------|
+| `resume` | `"never"` (default), `"allow"`, or `"must"`: resume the run with the same `name` instead of creating a new one. |
+| `private` | Make a newly created Space private. |
+| `server_url` | Log to a self-hosted Trackio server instead of a local store or Space. |
+| `bucket_id` | Hugging Face Bucket used to persist a Space's metrics. |
+| `auto_log_gpu` | Log GPU utilization, memory, power, and temperature in the background. Defaults to on when an NVIDIA GPU is detected (the `trackio` extra installs `nvidia-ml-py` for this). |
+
+### Storage Location
+
+Local runs are written to a SQLite database under `TRACKIO_DIR`, which defaults to `~/.cache/huggingface/trackio`. On a cluster, point it at a shared filesystem so the dashboard can read runs from any node:
+
+```bash
+export TRACKIO_DIR=/shared/trackio
+```
+
+## What Gets Logged
+
+NeMo AutoModel logs the same metrics to Trackio as to Weights & Biases:
+
+- Training metrics at every remote-logging step (`step_scheduler.log_remote_every_steps`): loss, gradient norm, learning rate, memory, throughput, and recipe-specific metrics such as the dLLM losses or draft acceptance.
+- Validation metrics. Named validation sets are prefixed with `val_<name>/`.
+- MoE load-balance metrics when `moe_metrics` is configured.
+- The full resolved recipe configuration as the run config.
+
+Trackio records the step and timestamp of each row itself, so the `step` and `timestamp` fields of a metrics sample are not logged as metrics. Tensor values are logged as Python floats and non-numeric values are skipped.
+
+<Note>
+Only rank 0 in distributed training creates a Trackio run and logs to it, so a multi-GPU or multi-node job produces exactly one run. GPU auto-logging therefore reports the GPUs visible to rank 0.
+
+</Note>
+
+## Usage Example
+
+Add the `trackio` section to your recipe YAML (for example `llama3_2_1b_squad.yaml`) and launch training as usual:
+
+```bash
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 8 \
+    --trackio.project automodel-squad
+```
+
+The section can also be added entirely from the command line, for example `--trackio.project my-project --trackio.space_id my-user/automodel-runs`.
+
+### View Results
+
+Open the dashboard for a local project:
+
+```bash
+uv run trackio show --project automodel-squad
+```
+
+For a project synced to a Space, open the Space URL printed at the start of training.
+
+## Integration with Other Loggers
+
+Trackio can run alongside the other loggers; each one is enabled by its own YAML section:
+
+```yaml
+wandb:
+  project: "automodel-experiments"
+
+trackio:
+  project: "automodel-experiments"
+
+mlflow:
+  experiment_name: "automodel-experiments"
+```
+
+## Troubleshooting
+
+### Trackio Not Installed
+
+If you see `trackio is not installed`, install the extra:
+
+```bash
+uv pip install "nemo-automodel[trackio]"
+```
+
+### Runs Missing From the Dashboard
+
+- Check that the dashboard and the training job use the same `TRACKIO_DIR`.
+- Runs are created on rank 0 only; look for `Trackio experiment tracking enabled` in the rank-0 log.
+- Metrics are sent every `step_scheduler.log_remote_every_steps` steps, not every step.
+
+## References
+
+- [Trackio repository](https://github.com/gradio-app/trackio)
+- [Trackio documentation](https://huggingface.co/docs/trackio)

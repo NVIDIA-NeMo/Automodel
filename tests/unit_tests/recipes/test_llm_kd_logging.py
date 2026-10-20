@@ -15,11 +15,14 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.llm import kd
 
 
-def test_validation_preserves_training_and_other_validation_metrics(monkeypatch):
+@pytest.mark.parametrize("trackio_enabled", [False, True])
+def test_validation_preserves_training_and_other_validation_metrics(monkeypatch, trackio_enabled):
     """W&B merges all logs at one step; each dataset must retain its own values."""
     history = {}
 
@@ -32,6 +35,7 @@ def test_validation_preserves_training_and_other_validation_metrics(monkeypatch)
     recipe.dist_env = SimpleNamespace(is_main=True)
     recipe.step_scheduler = SimpleNamespace(is_remote_logging_step=True)
     recipe.metric_logger_train = Mock()
+    recipe.trackio_logger = Mock() if trackio_enabled else None
     recipe.kd_ratio = 0.5
     training = MetricsSample(
         step=9,
@@ -49,6 +53,8 @@ def test_validation_preserves_training_and_other_validation_metrics(monkeypatch)
         },
     )
     recipe.log_train_metrics(training)
+    if trackio_enabled:
+        recipe.trackio_logger.log_metrics.assert_called_once_with(training.to_dict(), step=training.step)
     for name, ce_loss, kd_loss in (("default", 5.0, 7.0), ("held_out", 9.0, 11.0)):
         validation = MetricsSample(
             step=9,
@@ -65,6 +71,8 @@ def test_validation_preserves_training_and_other_validation_metrics(monkeypatch)
         local_logger = Mock()
         recipe.log_val_metrics(name, validation, local_logger)
         local_logger.log.assert_called_once_with(validation)
+        if trackio_enabled:
+            recipe.trackio_logger.log_metrics.assert_called_with(validation.to_dict(), step=validation.step)
         assert history[9][f"val_{name}/ce_loss"] == ce_loss
         assert history[9][f"val_{name}/kd_loss"] == kd_loss
 
@@ -72,3 +80,5 @@ def test_validation_preserves_training_and_other_validation_metrics(monkeypatch)
     for key, value in training.to_dict().items():
         assert history[9][key] == value
     assert history[9]["val_default/ce_loss"] == 5.0
+    if trackio_enabled:
+        assert recipe.trackio_logger.log_metrics.call_count == 3

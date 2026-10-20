@@ -1207,6 +1207,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             # and memory separate from the training metrics already logged.
             metrics = {f"val_{val_name}/{key}": value for key, value in log_data.metrics.items()}
             wandb.log(metrics, step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         if not metric_logger is None:
             metric_logger.log(log_data)
@@ -1260,6 +1263,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # JSONL training log (always log for detailed local records).
         self.metric_logger_train.log(log_data)

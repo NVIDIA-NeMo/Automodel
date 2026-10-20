@@ -416,7 +416,8 @@ def corrupt_uniform_random(
             ``[0, vocab_size)``.
         block_size: If given, sample ``t`` per contiguous block of this length;
             otherwise sample one ``t`` per sequence.
-        eps: Minimum corruption level (lower bound of ``t``).
+        eps: Minimum corruption level (lower bound of ``t``). ``eps=1.0`` corrupts
+            every supervised position (Uno's full uniform noise).
         generator: Optional ``torch.Generator`` (on ``input_ids.device``) used for
             ALL random draws (``t``, the corruption mask, the replacement tokens).
             Pass a step-seeded generator so the corruption is a deterministic
