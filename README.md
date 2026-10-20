@@ -209,7 +209,21 @@ Planned
 
 ## Getting Started
 
-We recommend using **uv** for reproducible Python environments.
+Run a 10-step Qwen3-0.6B fine-tuning example on two GPUs with the container:
+
+```bash
+mkdir -p checkpoints
+docker run --gpus all -it --rm --shm-size=8g \
+  -v "$PWD/checkpoints:/opt/Automodel/checkpoints" \
+  nvcr.io/nvidia/nemo-automodel:26.10.00 \
+  automodel /opt/Automodel/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml \
+  --nproc-per-node 2 \
+  --step_scheduler.max_steps 10
+```
+
+The model and HellaSwag dataset are public; no Hugging Face token is required. Checkpoints are saved to the mounted `checkpoints` directory.
+
+For source installation, use **uv** for reproducible Python environments.
 
 ```bash
 # Setup environment before running any recipes
@@ -234,14 +248,14 @@ uv run python -c "import nemo_automodel; print('NeMo AutoModel ready')"
 ### Run a Recipe
 All recipes are launched via the `automodel` CLI (or its short alias `am`). Each YAML config specifies the recipe class and all training parameters:
 ```bash
-# LLM example: multi-GPU fine-tuning with FSDP2
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --nproc-per-node 8
+# LLM example: multi-GPU fine-tuning of Qwen3-0.6B with FSDP2 (no HF token required)
+automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml --nproc-per-node 8
 
 # VLM example: single-GPU fine-tuning (Gemma-3-VL) with LoRA
 automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml
 
 # Both commands also work with uv run:
-uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --nproc-per-node 8
+uv run automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml --nproc-per-node 8
 ```
 
 > [!TIP]
@@ -258,7 +272,7 @@ automodel examples/llm_pretrain/nanogpt_pretrain.yaml --nproc-per-node 8
 <!-- ### LLM Pre-training Multi Node -->
 
 ## LLM Supervised Fine-Tuning (SFT)
-We provide an example SFT experiment using the [SQuAD dataset](https://rajpurkar.github.io/SQuAD-explorer/).
+We provide an example SFT experiment using the [HellaSwag dataset](https://rowanzellers.com/hellaswag/).
 
 <!-- Refer to `examples/llm_finetune/annotated.yaml` for a full list of parameters that can be overridden. -->
 
@@ -267,15 +281,15 @@ We provide an example SFT experiment using the [SQuAD dataset](https://rajpurkar
 The default SFT configuration is set to run on a single GPU. To start the experiment:
 
 ```sh
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml
 ```
 
-This fine-tunes the `Llama3.2-1B` model on the SQuAD dataset using a single GPU.
+This fine-tunes [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) on HellaSwag using a single GPU. The model and dataset are public; no Hugging Face token is required.
 
 To use multiple GPUs on a single node, add the `--nproc-per-node` argument:
 
 ```sh
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 8
+automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml --nproc-per-node 8
 ```
 
 ### LLM SFT Multi Node
@@ -297,10 +311,10 @@ We provide a PEFT example using the [HellaSwag dataset](https://rowanzellers.com
 ### LLM PEFT Single Node
 ```bash
 # Memory-efficient SFT with LoRA
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml
+automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag_peft.yaml
 
 # Override any YAML parameter via the command line:
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml \
+automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag_peft.yaml \
   --step_scheduler.local_batch_size 16
 ```
 
