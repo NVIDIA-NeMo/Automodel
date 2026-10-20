@@ -21,5 +21,13 @@ exempt_models:
   - cohere_micro_vision
 
 exempt_configs:
+  smolvlm_instruct_medpix_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  llava_1_5_7b_hf_medpix_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  llama_4_scout_17b_16e_instruct_medpix_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
+  qwen3_vl_4b_instruct_medpix_peft:
+    reason: "Example config; enroll after GPU training and memory validation"
 
 known_issue:
