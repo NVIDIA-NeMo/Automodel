@@ -253,15 +253,15 @@ navigation:
                 path: ../../model-coverage/llm/microsoft/phi3.mdx
           - section: "MiniMax AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRtwCAABXRUJQVlA4TNACAAAvE8AEAAEFbdswSvfHn/E0DhH9nwBFdyv0wx40UNQ2khMUW66GP7Z7HxYlkSQ5DQ++f1kRn4JHERJI2vj17/z+xwMwPhKUYSKhKA0ZzIdqdWp+EGJ3Zv/PpJClbZNpO39V9ep1bNs+J/YAsu9iOwM4g8hMNAXrKpe2bRsLvSqYRD1PILWRJEhyZN/z+FM8FDclt7ZtVcvWPp9kuGQUQAuWWkYdtEFKU/Ti7vxyvrt35NDfJYXLElyimrM0fEhNG+7FZdKSZZGGsDwcawD/oMDf+/rRN5Uf+/l+X2SwcDEOCRHAIAawgBg7drpxR2G95o62deYOFh5czAwHYEaVqF91axul9rq23bqN0g577Og5fy0rCQ4zBB04iNLJ3kLGA9dPu6+19Ljrp598Ti7hYiQQAIcGpZBrse/3akG8RdzcmxUlNvcSTtuP2avKT0GgIAAdRB/+v/qWTOqbOEm1BqCRoqNEqxdqfPULLCAkLYT1P/ufVT4XVZaAf6Dv/CUpADO6MH6lZdNKfFWONBmDABgRk4OZmU6mOITLq5NH1aJBSBAmCOPHAegXFTOzguJ0f9qP7CH09aiMU/yhOPlZLXqpPk4at6h8FABwIGnE1IC8JGXVZk9XpTeNUdb0lNkjnDl+Pv0UUoAh6IJDQzRt1F1Pv8nZsvf+Txo3X47c9Mn5ddBMBDEAh66QALch/usc1hV1VWNRvrLxaVWV3cRDAYAgAIRQIJ3rNDdQl9WUP89VT8z4RsQFyxUpAIRElGO2SVX+aETn5OWH1D5asqTq844lXFZdLf7fy/wjAHTRxFQDhm8Svu762U6XN1WFRZHfu12yowO7WN25LwmIQLqCuHS4PNzNCru5/vBe++Zg8bRFvszf/vvd1Fv/1vN7qiAFxEAhnRvxKvSXsx/a/6hFPLuX0B/JvuLl0oMPBYADME8yR8z5v6tF8+AlEhlcZPHQBBg="/></svg>'
-            slug: minimax
-            path: ../../model-coverage/llm/minimax/index.mdx
+            slug: MiniMaxAI
+            path: ../../model-coverage/llm/MiniMaxAI/index.mdx
             contents:
               - page: "MiniMax-M2.1"
-                path: ../../model-coverage/llm/minimax/minimax-m2.mdx
+                path: ../../model-coverage/llm/MiniMaxAI/minimax-m2-1.mdx
               - page: "MiniMax-M2.5"
-                path: ../../model-coverage/llm/minimax/minimax-m2-5.mdx
+                path: ../../model-coverage/llm/MiniMaxAI/minimax-m2-5.mdx
               - page: "MiniMax-M2.7"
-                path: ../../model-coverage/llm/minimax/minimax-m2-7.mdx
+                path: ../../model-coverage/llm/MiniMaxAI/minimax-m2-7.mdx
           - section: "Mistral AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRp4CAABXRUJQVlA4TJECAAAvE8AEED/lNpJkV5m9Jz9aWbjknxi+hvc2DbeR7NbNAhRSh+4/dz2uw+GXBGBFki0ryr73PbZ/lOBfAjpWBzBzG25t26qqhbu7QwU0QSH0QxEMMgahQ0wFRO4u312uBMMABjAawAASdB1KAW/w9uENDoSbABsTRvAwXBySZqftGShAIIdvAQ0jQIMyT+Yc4RlWSofJu0M8aIqvGJ+DxmLUyjVc62v8t2BhUhyTl2PNstSR1zApcJkmUiWoHKPI8cxqNINMwiJbYIkQ8+9XYcXR17G27u+EUhnwH8tcuyMZy7fH8Y7hti+VPOMp/H3lHC/H9Z2ACgwYD2IKSgDGANDCIBCgTBT69jeg+ZxfMwRxNV99xAaCIDINQU0IvmqENyenxOC2mun5oFItnvSm9IUcDV8Zu+tztgpjYRRMXhp+YS/kMk/wkvhLAIaAR0eIt6t+kfGGCPBNK2t+TbDyEzhEwaTeWMd2/b4N+9vP7k5CMDBaZgWEvcLxVT/Dy9CgOyUMRi31vd3qetwVTxoQbds23cSq21i1bVuxjdq2bdt293++lzHyCRH9nwAEndXBCtDRESiozJPHO7L78wc6gYXTg+frzTWAsXnzdHgGJuH26PUKpJcvxxdkG/vbU7PzKtXczPTW3jo6CD0ry6s7k8DE7urS4gJZ93D/6MCYyTg+ONI31EvW2eawtts9bnu7zWI1B/C7XV630+nxuF0+kj9aUX2NxqCvrdYZtFV1xTQ1APyWVjahtay8GS0VJV0AkPqTkVeY853V2JD9lVuQn/mTAiRywsWCSG4sEMeOEIrCOAlAEk8pk8hD09Xq+BCFVKbkJQNR7598Pv8jGohJ++TzP9/fEGQK9Z9IASj/RCoFwQUA"/></svg>'
             slug: mistralai
@@ -559,11 +559,11 @@ navigation:
                 path: ../../model-coverage/vlm/meta-models/muse_glimmer.mdx
           - section: "MiniMax AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRtwCAABXRUJQVlA4TNACAAAvE8AEAAEFbdswSvfHn/E0DhH9nwBFdyv0wx40UNQ2khMUW66GP7Z7HxYlkSQ5DQ++f1kRn4JHERJI2vj17/z+xwMwPhKUYSKhKA0ZzIdqdWp+EGJ3Zv/PpJClbZNpO39V9ep1bNs+J/YAsu9iOwM4g8hMNAXrKpe2bRsLvSqYRD1PILWRJEhyZN/z+FM8FDclt7ZtVcvWPp9kuGQUQAuWWkYdtEFKU/Ti7vxyvrt35NDfJYXLElyimrM0fEhNG+7FZdKSZZGGsDwcawD/oMDf+/rRN5Uf+/l+X2SwcDEOCRHAIAawgBg7drpxR2G95o62deYOFh5czAwHYEaVqF91axul9rq23bqN0g577Og5fy0rCQ4zBB04iNLJ3kLGA9dPu6+19Ljrp598Ti7hYiQQAIcGpZBrse/3akG8RdzcmxUlNvcSTtuP2avKT0GgIAAdRB/+v/qWTOqbOEm1BqCRoqNEqxdqfPULLCAkLYT1P/ufVT4XVZaAf6Dv/CUpADO6MH6lZdNKfFWONBmDABgRk4OZmU6mOITLq5NH1aJBSBAmCOPHAegXFTOzguJ0f9qP7CH09aiMU/yhOPlZLXqpPk4at6h8FABwIGnE1IC8JGXVZk9XpTeNUdb0lNkjnDl+Pv0UUoAh6IJDQzRt1F1Pv8nZsvf+Txo3X47c9Mn5ddBMBDEAh66QALch/usc1hV1VWNRvrLxaVWV3cRDAYAgAIRQIJ3rNDdQl9WUP89VT8z4RsQFyxUpAIRElGO2SVX+aETn5OWH1D5asqTq844lXFZdLf7fy/wjAHTRxFQDhm8Svu762U6XN1WFRZHfu12yowO7WN25LwmIQLqCuHS4PNzNCru5/vBe++Zg8bRFvszf/vvd1Fv/1vN7qiAFxEAhnRvxKvSXsx/a/6hFPLuX0B/JvuLl0oMPBYADME8yR8z5v6tF8+AlEhlcZPHQBBg="/></svg>'
-            slug: minimax
-            path: ../../model-coverage/vlm/minimax/index.mdx
+            slug: MiniMaxAI
+            path: ../../model-coverage/vlm/MiniMaxAI/index.mdx
             contents:
               - page: "MiniMax-M3"
-                path: ../../model-coverage/vlm/minimax/minimax-m3.mdx
+                path: ../../model-coverage/vlm/MiniMaxAI/minimax-m3.mdx
           - section: "Mistral AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRp4CAABXRUJQVlA4TJECAAAvE8AEED/lNpJkV5m9Jz9aWbjknxi+hvc2DbeR7NbNAhRSh+4/dz2uw+GXBGBFki0ryr73PbZ/lOBfAjpWBzBzG25t26qqhbu7QwU0QSH0QxEMMgahQ0wFRO4u312uBMMABjAawAASdB1KAW/w9uENDoSbABsTRvAwXBySZqftGShAIIdvAQ0jQIMyT+Yc4RlWSofJu0M8aIqvGJ+DxmLUyjVc62v8t2BhUhyTl2PNstSR1zApcJkmUiWoHKPI8cxqNINMwiJbYIkQ8+9XYcXR17G27u+EUhnwH8tcuyMZy7fH8Y7hti+VPOMp/H3lHC/H9Z2ACgwYD2IKSgDGANDCIBCgTBT69jeg+ZxfMwRxNV99xAaCIDINQU0IvmqENyenxOC2mun5oFItnvSm9IUcDV8Zu+tztgpjYRRMXhp+YS/kMk/wkvhLAIaAR0eIt6t+kfGGCPBNK2t+TbDyEzhEwaTeWMd2/b4N+9vP7k5CMDBaZgWEvcLxVT/Dy9CgOyUMRi31vd3qetwVTxoQbds23cSq21i1bVuxjdq2bdt293++lzHyCRH9nwAEndXBCtDRESiozJPHO7L78wc6gYXTg+frzTWAsXnzdHgGJuH26PUKpJcvxxdkG/vbU7PzKtXczPTW3jo6CD0ry6s7k8DE7urS4gJZ93D/6MCYyTg+ONI31EvW2eawtts9bnu7zWI1B/C7XV630+nxuF0+kj9aUX2NxqCvrdYZtFV1xTQ1APyWVjahtay8GS0VJV0AkPqTkVeY853V2JD9lVuQn/mTAiRywsWCSG4sEMeOEIrCOAlAEk8pk8hD09Xq+BCFVKbkJQNR7598Pv8jGohJ++TzP9/fEGQK9Z9IASj/RCoFwQUA"/></svg>'
             slug: mistralai
@@ -874,101 +874,115 @@ navigation:
       - page: "Troubleshooting"
         path: ../../model-coverage/troubleshooting.mdx
         slug: troubleshooting
-  - section: "Recipes & E2E Examples"
+  # Keep published recipe URLs independent of the sidebar grouping.
+  - section: "Tutorials"
+    skip-slug: true
+    contents:
+      - page: "Overview"
+        path: ../../guides/tutorials.mdx
+        slug: tutorials/overview
+      - section: "Large Language Models"
+        skip-slug: true
+        contents:
+          - page: "Function Calling with FunctionGemma"
+            path: ../../guides/llm/toolcalling.mdx
+            slug: recipes-e2e-examples/function-calling
+          - page: "Multi-Turn Agent (Tool-Calling) SFT"
+            path: ../../guides/llm/agent-sft.mdx
+            slug: recipes-e2e-examples/agent-sft
+          - page: "NanoGPT Pretraining"
+            path: ../../guides/llm/nanogpt-pretraining.mdx
+            slug: recipes-e2e-examples/nanogpt-pretraining
+          - page: "DeepSeek-V4 Flash"
+            path: ../../guides/llm/dsv4-flash.mdx
+            slug: recipes-e2e-examples/deepseek-v4-flash
+          - page: "Hy3-preview"
+            path: ../../guides/llm/hy3.mdx
+            slug: recipes-e2e-examples/hy3-preview
+          - page: "Nemotron-3-Ultra-550B"
+            path: ../../guides/llm/nemotron-3-ultra.mdx
+            slug: recipes-e2e-examples/nemotron-3-ultra
+          - page: "Fine-Tuning DiffusionGemma"
+            path: ../../guides/dllm/diffusiongemma.mdx
+            slug: recipes-e2e-examples/diffusiongemma
+      - section: "Vision & Multimodal Models"
+        skip-slug: true
+        contents:
+          - page: "Gemma 3 / 3n"
+            path: ../../guides/omni/gemma3-3n.mdx
+            slug: recipes-e2e-examples/gemma-3-3n
+          - page: "Gemma 4 31B"
+            path: ../../guides/vlm/gemma4.mdx
+            slug: recipes-e2e-examples/gemma-4
+          - page: "Qwen3.5-VL"
+            path: ../../guides/vlm/qwen3-5.mdx
+            slug: recipes-e2e-examples/qwen3-5-vl
+          - page: "Fine-Tune Qwen3.8-27B"
+            path: ../../guides/vlm/qwen3-8.mdx
+            slug: recipes-e2e-examples/qwen3-8-27b
+          - page: "Nemotron-Omni"
+            path: ../../guides/vlm/nemotron-omni.mdx
+            slug: recipes-e2e-examples/nemotron-omni
+          - page: "Mistral Medium 3.5 VL"
+            path: ../../guides/vlm/mistral-medium-3-5.mdx
+            slug: recipes-e2e-examples/mistral-medium-3-5
+          - page: "MiniMax-M3"
+            path: ../../guides/vlm/minimax-m3.mdx
+            slug: recipes-e2e-examples/minimax-m3
+          - page: "Fine-Tune Step-3.7-Flash"
+            path: ../../guides/vlm/step-3-7.mdx
+            slug: recipes-e2e-examples/step-3-7
+      - section: "Audio"
+        skip-slug: true
+        contents:
+          - page: "ASR with Qwen3-Omni"
+            path: ../../guides/audio/qwen3-omni-asr.mdx
+            slug: recipes-e2e-examples/qwen3-omni-asr
+  - section: "Training Recipes"
     slug: recipes-e2e-examples
     contents:
-      - page: "Recipes and End-to-End Examples"
+      - page: "Overview"
         path: ../../guides/overview.mdx
         slug: overview
       - page: "SFT & PEFT"
         path: ../../guides/llm/finetune.mdx
         slug: sft-peft
-      - page: "Function Calling with FunctionGemma"
-        path: ../../guides/llm/toolcalling.mdx
-        slug: function-calling
-      - page: "Multi-Turn Agent (Tool-Calling) SFT"
-        path: ../../guides/llm/agent-sft.mdx
-        slug: agent-sft
-      - page: "Knowledge Distillation"
-        path: ../../guides/llm/knowledge-distillation.mdx
-        slug: knowledge-distillation
-      - page: "Fine-Tune Large MoE LLMs"
-        path: ../../guides/llm/large-moe-finetune.mdx
-        slug: large-moe-fine-tuning
-      - page: "DeepSeek-V4 Flash"
-        path: ../../guides/llm/dsv4-flash.mdx
-        slug: deepseek-v4-flash
-      - page: "Hy3-preview"
-        path: ../../guides/llm/hy3.mdx
-        slug: hy3-preview
-      - page: "Nemotron-3-Ultra-550B"
-        path: ../../guides/llm/nemotron-3-ultra.mdx
-        slug: nemotron-3-ultra
       - page: "Pretraining"
         path: ../../guides/llm/pretraining.mdx
         slug: pretraining
-      - page: "NanoGPT Pretraining"
-        path: ../../guides/llm/nanogpt-pretraining.mdx
-        slug: nanogpt-pretraining
+      - page: "Knowledge Distillation"
+        path: ../../guides/llm/knowledge-distillation.mdx
+        slug: knowledge-distillation
       - page: "Sequence Classification (SFT/PEFT)"
         path: ../../guides/llm/sequence-classification.mdx
         slug: sequence-classification
       - page: "Retrieval Fine-Tuning"
         path: ../../guides/llm/retrieval-finetune.mdx
         slug: retrieval-finetune
-      - page: "Gemma 3 / 3n"
-        path: ../../guides/omni/gemma3-3n.mdx
-        slug: gemma-3-3n
-      - page: "Gemma 4 31B"
-        path: ../../guides/vlm/gemma4.mdx
-        slug: gemma-4
-      - page: "Qwen3.5-VL"
-        path: ../../guides/vlm/qwen3-5.mdx
-        slug: qwen3-5-vl
-      - page: "Fine-Tune Qwen3.8-27B"
-        path: ../../guides/vlm/qwen3-8.mdx
-        slug: qwen3-8-27b
-      - page: "Nemotron-Omni"
-        path: ../../guides/vlm/nemotron-omni.mdx
-        slug: nemotron-omni
-      # Nemotron 3.5 Super VL guides remain in docs/guides/vlm/ for GitHub readers,
-      # but are intentionally excluded from the published documentation.
-      - page: "Mistral Medium 3.5 VL"
-        path: ../../guides/vlm/mistral-medium-3-5.mdx
-        slug: mistral-medium-3-5
-      - page: "MiniMax-M3"
-        path: ../../guides/vlm/minimax-m3.mdx
-        slug: minimax-m3
-      - page: "Fine-Tune Step-3.7-Flash"
-        path: ../../guides/vlm/step-3-7.mdx
-        slug: step-3-7
-      - page: "ASR with Qwen3-Omni"
-        path: ../../guides/audio/qwen3-omni-asr.mdx
-        slug: qwen3-omni-asr
-      - page: "Wan2.1-T2V Fine-Tuning"
+      - page: "Fine-Tune Large MoE LLMs"
+        path: ../../guides/llm/large-moe-finetune.mdx
+        slug: large-moe-fine-tuning
+      - page: "Diffusion Fine-Tuning"
         path: ../../guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
-      - page: "Fine-Tuning DiffusionGemma"
-        path: ../../guides/dllm/diffusiongemma.mdx
-        slug: diffusiongemma
-      - page: "Train an EAGLE Drafter for Speculative Decoding"
-        path: ../../guides/speculative/eagle.mdx
-        slug: eagle-speculative-decoding
-      - page: "Train a DFlash Drafter for Speculative Decoding"
-        path: ../../guides/speculative/dflash.mdx
-        slug: dflash-speculative-decoding
-      - page: "Train a DSpark Drafter for Speculative Decoding"
-        path: ../../guides/speculative/dspark.mdx
-        slug: dspark-speculative-decoding
       - page: "dLLM Fine-Tuning"
         path: ../../guides/dllm/finetune.mdx
         slug: dllm-fine-tuning
       - page: "Quantization-Aware Training (QAT)"
         path: ../../guides/quantization-aware-training.mdx
         slug: qat
-      - page: "Model Training on Databricks"
-        path: ../../guides/llm/databricks.mdx
-        slug: databricks
+      - section: "Speculative Drafter Training"
+        skip-slug: true
+        contents:
+          - page: "Train an EAGLE Drafter for Speculative Decoding"
+            path: ../../guides/speculative/eagle.mdx
+            slug: eagle-speculative-decoding
+          - page: "Train a DFlash Drafter for Speculative Decoding"
+            path: ../../guides/speculative/dflash.mdx
+            slug: dflash-speculative-decoding
+          - page: "Train a DSpark Drafter for Speculative Decoding"
+            path: ../../guides/speculative/dspark.mdx
+            slug: dspark-speculative-decoding
   - section: "Data"
     slug: datasets
     contents:
@@ -1014,6 +1028,9 @@ navigation:
       - page: "k8s with SkyPilot"
         path: ../../launcher/skypilot-kubernetes.mdx
         slug: skypilot-k8s
+      - page: "Model Training on Databricks"
+        path: ../../guides/llm/databricks.mdx
+        slug: databricks
   - section: "Advanced Training"
     slug: development
     contents:

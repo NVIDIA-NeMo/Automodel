@@ -57,7 +57,7 @@ PROVIDER_ORGS = {
     "lmms-lab": "lmms-lab",
     "meta": "meta-llama",
     "microsoft": "microsoft",
-    "minimax": "MiniMaxAI",
+    "MiniMaxAI": "MiniMaxAI",
     "mistralai": "mistralai",
     "moonshotai": "moonshotai",
     "meta-models": "meta-models",
