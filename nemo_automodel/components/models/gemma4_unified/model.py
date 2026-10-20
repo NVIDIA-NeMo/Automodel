@@ -26,11 +26,7 @@ from transformers.models.gemma4_unified.modeling_gemma4_unified import (
     Gemma4UnifiedForConditionalGeneration as HFGemma4UnifiedForConditionalGeneration,
 )
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
-    ContextParallelSharder,
-    contiguous_local_indices,
-    shard_sequence_for_cp_contiguous,
-)
+from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_contiguous
 from nemo_automodel.components.models.common import compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -40,27 +36,25 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.gemma4_moe.cp_attention import (
     apply_gemma4_cp_attention_backend_policy,
     gemma4_vision_group_ids,
+    set_gemma4_cp_dense_metadata,
 )
-from nemo_automodel.components.models.gemma4_moe.cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4ContextParallelMixin
 from nemo_automodel.components.models.gemma4_unified.state_dict_adapter import (
     Gemma4UnifiedStateDictAdapter,
 )
 
 
-class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4UnifiedForConditionalGeneration):
+class Gemma4UnifiedForConditionalGeneration(
+    Gemma4ContextParallelMixin, HFCheckpointingMixin, HFGemma4UnifiedForConditionalGeneration
+):
     """Gemma4 Unified with NeMo checkpoint key conversion and model-owned context parallelism.
 
     The text stack has the same attention layout as dense Gemma4 (sliding-window and full layers,
-    vision-bidirectional sliding layers), so context parallelism reuses Gemma4's contiguous
-    per-rank shards and its p2p ring attention. Without CP the forward is Hugging Face's.
+    vision-bidirectional sliding layers), so context parallelism reuses Gemma4's CP hooks, its
+    contiguous per-rank shards and its p2p ring attention. Without CP the forward is Hugging Face's.
     """
 
     tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
-    # Owns CP batch sharding and the per-layer ring attention transport.
-    _owns_cp_attention = True
-    # CP submesh, recorded by _cp_shard_batch_aux_only when the recipe first shards a batch;
-    # None means the forward runs without CP.
-    cp_mesh = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -90,58 +84,13 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
         Raises:
             ValueError: If the text model does not use SDPA attention, which the ring replaces.
         """
-        if getattr(self, "_cp_enabled", False):
-            return
         attn_implementation = self.config.get_text_config()._attn_implementation
-        if attn_implementation != "sdpa":
+        if not getattr(self, "_cp_enabled", False) and attn_implementation != "sdpa":
             raise ValueError(
                 "Gemma4 Unified context parallelism runs its ring attention in place of SDPA; load the model "
                 f"with attn_implementation='sdpa' (got {attn_implementation!r})."
             )
-        self._cp_enabled = True
-        for module in self.modules():
-            if module is not self and callable(getattr(module, "setup_cp_attention", None)):
-                module.setup_cp_attention(cp_mesh)
-
-    def _cp_shard_batch_aux_only(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
-        """Shard the no-grad batch streams contiguously and record ``cp_mesh`` for the forward.
-
-        ``labels``, ``position_ids``, ``loss_mask``, ``padding_mask`` and the synthesized
-        ``_packed_seq_ids`` document map are sharded here; ``input_ids`` and ``pixel_values``
-        stay full-length, since the forward embeds and splices images on the full sequence.
-        """
-        self.setup_cp_attention(cp_mesh)
-        self.cp_mesh = cp_mesh
-        return make_contiguous_aux_only_shard_cp_batch_and_ctx(
-            cp_mesh,
-            tp_mesh,
-            batch,
-            loss_mask=loss_mask,
-            padding_token_id=padding_token_id,
-        )
-
-    def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
-        """Return the model-owned contiguous CP sharder; the batch itself is left intact.
-
-        Args:
-            batch: The full-sequence batch.
-            num_chunks: Accepted for hook-signature parity; contiguous CP has one chunk.
-
-        Returns:
-            ``{"cp_sharder": ContextParallelSharder}`` for the CP dispatch.
-
-        Raises:
-            ValueError: If the batch has no ``input_ids``.
-        """
-        del num_chunks
-        if batch.get("input_ids") is None:
-            raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
-        return {
-            "cp_sharder": ContextParallelSharder(
-                shard_batch=self._cp_shard_batch_aux_only,
-                local_token_global_indices=contiguous_local_indices,
-            )
-        }
+        super().setup_cp_attention(cp_mesh)
 
     def forward(
         self,
@@ -272,20 +221,14 @@ class Gemma4UnifiedForConditionalGeneration(HFCheckpointingMixin, HFGemma4Unifie
                 cp_mesh, gemma4_vision_group_ids(mm_token_type_ids), seq_dim=1, pad_value=-1
             )[0]
         inputs_embeds = shard_sequence_for_cp_contiguous(cp_mesh, inputs_embeds, seq_dim=1)[0]
-
-        # Hugging Face's decoder layers do not hand this metadata to self_attn, so it is stashed on
-        # each ring-hooked module; it is overwritten every forward and kept for the activation
-        # checkpoint recompute in backward.
-        cp_meta = {
-            "mm_token_type_ids": mm_local,
-            "padding_mask": padding_mask,
-            "_packed_seq_ids": packed_seq_ids,
-            "_gemma4_vision_group_ids": vision_group_local,
-            "_gemma4_has_vision_tokens": has_vision_tokens,
-        }
-        for module in self.modules():
-            if getattr(module, "_cp_uses_attention_hook", False):
-                module._cp_dense_metadata = cp_meta
+        set_gemma4_cp_dense_metadata(
+            self,
+            mm_token_type_ids=mm_local,
+            padding_mask=padding_mask,
+            packed_seq_ids=packed_seq_ids,
+            vision_group_ids=vision_group_local,
+            has_vision_tokens=has_vision_tokens,
+        )
 
         text_outputs = self.model.language_model(
             inputs_embeds=inputs_embeds, position_ids=position_ids, use_cache=False, **kwargs

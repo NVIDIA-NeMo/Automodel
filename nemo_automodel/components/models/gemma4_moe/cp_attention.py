@@ -128,7 +128,10 @@ def _compiled_flex_attention(attention_module: torch.nn.Module):
 # Every layer shares one compiled ``flex_attention`` code object, whose guards split on the layer
 # type (window, K/V heads), the grad mode and whether the query and key chunks share their metadata
 # tensors. Dynamo's default of 8 recompiles runs out within the first step, after which flex silently
-# runs eagerly and materializes the full score matrix (several times slower, tens of GiB more).
+# runs eagerly and materializes the full score matrix (several times slower, tens of GiB more). A
+# process-level raise does not help: dynamo config writes are thread-local, so autograd's backward
+# threads, where the ring recompiles flex, still see the default. Hence the limit is raised in the
+# call scope, on the thread that compiles.
 _FLEX_RECOMPILE_LIMIT = 64
 
 
@@ -138,19 +141,13 @@ def _flex_compile_settings():
 
     Without the first, the compiled flex kernel guards on incidental dim-equalities and recompiles
     on every new sequence length; the second keeps the per-layer-type variants compiled (see
-    ``_FLEX_RECOMPILE_LIMIT``). Dynamo reads both at (re)trace time inside the flex call, so scoping
-    them to the call window avoids mutating the process-global configs.
+    ``_FLEX_RECOMPILE_LIMIT``). Dynamo reads both at (re)trace time inside the flex call.
     """
     from torch.fx.experimental import _config as _fx_config
 
-    prev = _fx_config.use_duck_shape
-    _fx_config.use_duck_shape = False
-    try:
-        limit = max(torch._dynamo.config.recompile_limit, _FLEX_RECOMPILE_LIMIT)
-        with torch._dynamo.config.patch(recompile_limit=limit):
-            yield
-    finally:
-        _fx_config.use_duck_shape = prev
+    limit = max(torch._dynamo.config.recompile_limit, _FLEX_RECOMPILE_LIMIT)
+    with _fx_config.patch(use_duck_shape=False), torch._dynamo.config.patch(recompile_limit=limit):
+        yield
 
 
 def _base_gemma4_cp_mask(attention_module: torch.nn.Module, ctx: Any, q_idx, kv_idx, kv_global_start: int = 0):
@@ -1337,6 +1334,41 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
     attention_module._cp_uses_attention_hook = True
     attention_module.register_forward_pre_hook(_pre_hook, with_kwargs=True)
     attention_module.register_forward_hook(_post_hook, always_call=True)
+
+
+def set_gemma4_cp_dense_metadata(
+    model: torch.nn.Module,
+    *,
+    mm_token_type_ids: torch.Tensor | None,
+    padding_mask: torch.Tensor | None,
+    packed_seq_ids: torch.Tensor | None,
+    vision_group_ids: torch.Tensor | None,
+    has_vision_tokens: bool,
+) -> None:
+    """Stash this rank's CP mask metadata on every ring-hooked attention module of ``model``.
+
+    Hugging Face's decoder layers do not hand the metadata to ``self_attn``, so the ring's pre-hook
+    falls back to this ``_cp_dense_metadata`` stash. Each CP forward overwrites it; it is not cleared,
+    so the activation-checkpoint recompute in backward sees the same metadata.
+
+    Args:
+        model: The Gemma4-family model.
+        mm_token_type_ids: This rank's modality ids ``[batch, local_sequence]``, or None.
+        padding_mask: This rank's padding mask ``[batch, local_sequence]`` (True = pad), or None.
+        packed_seq_ids: This rank's document ids ``[batch, local_sequence]`` (0 = pad), or None.
+        vision_group_ids: This rank's vision-block ids ``[batch, local_sequence]`` (-1 = none), or None.
+        has_vision_tokens: Rank-uniform flag that the batch carries vision-bidirectional blocks.
+    """
+    metadata = {
+        "mm_token_type_ids": mm_token_type_ids,
+        "padding_mask": padding_mask,
+        "_packed_seq_ids": packed_seq_ids,
+        "_gemma4_vision_group_ids": vision_group_ids,
+        "_gemma4_has_vision_tokens": has_vision_tokens,
+    }
+    for module in model.modules():
+        if getattr(module, "_cp_uses_attention_hook", False):
+            module._cp_dense_metadata = metadata
 
 
 def attach_gemma4_cp_ring_attention(
