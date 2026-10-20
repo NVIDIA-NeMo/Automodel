@@ -276,6 +276,60 @@ def test_replay_shape_mismatch_raises():
             run(gate, torch.randn(4, 16))
 
 
+def test_missing_rows_use_native_selection_and_recompute_reuses_effective():
+    torch.manual_seed(6)
+    gate = make_gate("sigmoid")
+    x_first = torch.randn(4, 16)
+    x_recompute = torch.randn(4, 16)
+
+    _, native_first, _ = run(gate, x_first)
+    _, native_recompute, _ = run(gate, x_recompute)
+    assert not torch.equal(native_first, native_recompute)
+
+    target = native_first.roll(1, dims=0)
+    target[1] = -1
+    target[3] = -1
+    expected = target.clone()
+    expected[1] = native_first[1]
+    expected[3] = native_first[3]
+
+    with gate.router_replay.replay_target(target):
+        _, first, _ = run(gate, x_first)
+        _, recompute, _ = run(gate, x_recompute)
+        assert torch.equal(gate.router_replay.native_indices, native_first)
+        assert torch.equal(gate.router_replay.effective_indices, expected)
+        assert gate.router_replay.apply_count == 2
+
+    assert torch.equal(first, expected)
+    assert torch.equal(recompute, expected)
+    assert gate.router_replay.target_indices is None
+    assert gate.router_replay.effective_indices is None
+
+
+@pytest.mark.parametrize("bad_row", [[-1, 2], [-2, -2]])
+def test_missing_route_rows_require_all_minus_one(bad_row):
+    gate = make_gate()
+    target = torch.tensor([[0, 1], bad_row], dtype=torch.long)
+    with pytest.raises(ValueError, match="all--1"):
+        with gate.router_replay.replay_target(target):
+            run(gate, torch.randn(2, 16))
+
+
+def test_instance_scope_does_not_change_other_model():
+    first = make_gate()
+    second = make_gate()
+    x = torch.randn(4, 16)
+    _, second_native, _ = run(second, x)
+    target = torch.tensor([[1, 2], [2, 3], [3, 4], [4, 5]])
+
+    with first.router_replay.replay_target(target):
+        _, first_replayed, _ = run(first, x)
+        _, second_during_scope, _ = run(second, x)
+
+    assert torch.equal(first_replayed, target)
+    assert torch.equal(second_during_scope, second_native)
+
+
 def test_context_managers_clear_state_on_exit():
     gate = make_gate()
     with RouterReplay.record():
@@ -381,6 +435,9 @@ def test_gemma4_gate_replay_keeps_gradient():
     captured = RouterReplay.collect()
     with RouterReplay.replay(captured):
         w_replay, _, _ = gate(torch.randn(4, 16))
-    w_replay.sum().backward()
+    # The normalized weights sum to a constant; unequal expert contributions
+    # are needed to test whether the router receives a meaningful gradient.
+    contributions = torch.arange(1, w_replay.shape[-1] + 1, dtype=w_replay.dtype)
+    (w_replay * contributions).sum().backward()
     assert gate.proj.weight.grad is not None
     assert torch.any(gate.proj.weight.grad != 0)

@@ -40,7 +40,7 @@ Usage::
     # Replay it on the training forward over the same tokens.
     with RouterReplay.replay(captured):
         loss = model(batch)
-    loss.backward()
+        loss.backward()
 
 Each :class:`Gate` constructed with routing replay enabled owns one
 :class:`RouterReplay` instance and registers it in a process-global list at
@@ -51,6 +51,7 @@ training); call :meth:`RouterReplay.clear_registry` before building a second
 model in the same process.
 """
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from enum import Enum
 from typing import Iterator, List, Optional
@@ -83,6 +84,10 @@ class RouterReplay:
         self.mode: Optional[RouterReplayMode] = None
         self.recorded_indices: Optional[torch.Tensor] = None
         self.target_indices: Optional[torch.Tensor] = None
+        self.native_indices: Optional[torch.Tensor] = None
+        self.effective_indices: Optional[torch.Tensor] = None
+        self.apply_count = 0
+        self.selection_observer: Callable[[torch.Tensor, torch.Tensor], None] | None = None
         RouterReplay._registry.append(self)
 
     def apply(self, indices: torch.Tensor) -> torch.Tensor:
@@ -95,6 +100,9 @@ class RouterReplay:
         Returns:
             ``indices`` unchanged when no mode is active or while recording; the
             stored target indices (moved to ``indices.device``) while replaying.
+            A target row containing only ``-1`` uses the native selection from
+            the first forward. The resulting effective selection is cached and
+            reused by activation-checkpoint recomputation.
         """
         if self.mode == RouterReplayMode.RECORD:
             # Indices are integer selection ids carrying no gradient; detach so the
@@ -113,19 +121,93 @@ class RouterReplay:
                     f"Replay indices shape {tuple(target.shape)} does not match the current "
                     f"selection shape {tuple(indices.shape)}; replay must run on the same tokens and topk."
                 )
-            return target
+            negative = target < 0
+            missing = negative.all(dim=-1)
+            partial_missing = negative.any(dim=-1) & ~missing
+            if bool(partial_missing.any().item()):
+                row = int(partial_missing.nonzero()[0].item())
+                raise ValueError(
+                    "Replay target rows must contain either all non-negative expert IDs or the all--1 "
+                    f"missing-route sentinel; got {target[row].detach().cpu().tolist()} at row {row}."
+                )
+            invalid_missing = missing & ~target.eq(-1).all(dim=-1)
+            if bool(invalid_missing.any().item()):
+                row = int(invalid_missing.nonzero()[0].item())
+                raise ValueError(
+                    "Replay missing-route rows must use the all--1 sentinel; "
+                    f"got {target[row].detach().cpu().tolist()} at row {row}."
+                )
+
+            if self.effective_indices is None:
+                self.native_indices = indices.detach().clone()
+                self.effective_indices = torch.where(missing.unsqueeze(-1), indices, target).detach().clone()
+            self.apply_count += 1
+            return self.effective_indices.to(indices.device)
         return indices
 
     # -- per-instance state -------------------------------------------------
 
     def set_target(self, indices: torch.Tensor) -> None:
-        """Set the selection to replay for this layer."""
+        """Set the selection to replay for this layer.
+
+        Args:
+            indices: Integer tensor of shape [tokens, topk]. Each row contains
+                global expert IDs, or all ``-1`` for native fallback.
+        """
         self.target_indices = indices
+        self.native_indices = None
+        self.effective_indices = None
+        self.apply_count = 0
 
     def clear(self) -> None:
         """Drop both the recorded and the target selection for this layer."""
         self.recorded_indices = None
         self.target_indices = None
+        self.native_indices = None
+        self.effective_indices = None
+        self.apply_count = 0
+
+    @contextmanager
+    def replay_target(
+        self,
+        indices: torch.Tensor,
+        selection_observer: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
+    ) -> Iterator[None]:
+        """Replay one layer's target without changing other registered models.
+
+        Args:
+            indices: Integer tensor of shape [tokens, topk]. Each row contains
+                global expert IDs, or all ``-1`` for native fallback.
+            selection_observer: Optional observer of native and returned
+                selections, both integer [tokens, topk] tensors. Called at the
+                Gate boundary independently of the replay implementation.
+
+        Yields:
+            Control while this handle is in replay mode. The target and cached
+            effective selection remain alive through backward recomputation.
+        """
+        previous = (
+            self.mode,
+            self.target_indices,
+            self.native_indices,
+            self.effective_indices,
+            self.apply_count,
+            self.selection_observer,
+        )
+        self.set_target(indices)
+        self.mode = RouterReplayMode.REPLAY
+        self.selection_observer = selection_observer
+        try:
+            yield
+        finally:
+            (
+                self.mode,
+                self.target_indices,
+                self.native_indices,
+                self.effective_indices,
+                self.apply_count,
+                self.selection_observer,
+            ) = previous
 
     # -- global control over every registered instance ---------------------
 
@@ -218,6 +300,9 @@ class RouterReplay:
             cls.set_mode(None)
             for inst in cls._registry:
                 inst.target_indices = None
+                inst.native_indices = None
+                inst.effective_indices = None
+                inst.apply_count = 0
 
 
 def replay_selection(router_replay: Optional[RouterReplay], indices: torch.Tensor) -> torch.Tensor:
@@ -228,4 +313,10 @@ def replay_selection(router_replay: Optional[RouterReplay], indices: torch.Tenso
     """
     if router_replay is None:
         return indices
-    return router_replay.apply(indices)
+    # Snapshot the independently selected route before replay can change it.
+    observer = router_replay.selection_observer
+    native = indices.detach().clone() if observer is not None else None
+    effective = router_replay.apply(indices)
+    if observer is not None:
+        observer(native, effective)
+    return effective
