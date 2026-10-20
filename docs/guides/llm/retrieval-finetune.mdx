@@ -22,6 +22,7 @@ For an end-to-end text bi-encoder workflow starting from your document corpus, f
 [Nemotron embedding recipe](https://github.com/NVIDIA-NeMo/Nemotron/tree/main/docs/nemotron/embed).
 It covers synthetic data generation, data preparation with hard-negative mining, fine-tuning with NeMo AutoModel,
 evaluation, model export when required, and deployment.
+
 </Tip>
 
 ## Workflow Overview
@@ -190,9 +191,9 @@ The key field requirements differ by source:
 
 | Source | Required Query Field | Required Document Fields |
 |--------|----------------------|--------------------------|
-| Corpus ID JSON | `question` | `question_id`, `corpus_id`, non-empty `pos_doc`, and present `neg_doc` |
+| Corpus ID JSON | `question` | `question_id`, `corpus_id`, non-empty `pos_doc`, and present `neg_doc`. |
 | `hf://` NeMo AutoModel schema | `question` | Non-empty `pos_doc`. `neg_doc` is optional in the source but required before training with negatives. |
-| Inline JSONL | `query` or `question` | Non-empty `pos_doc`, and present `neg_doc` |
+| Inline JSONL | `query` or `question` | Non-empty `pos_doc`, and present `neg_doc`. |
 
 `neg_doc` must be present for local JSON and JSONL sources. It can be `[]` only when `n_passages: 1`. When
 `n_passages > 1`, provide at least one negative.

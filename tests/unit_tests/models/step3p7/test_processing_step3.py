@@ -166,9 +166,9 @@ def test_processor_helpers_and_placeholder_replacement(processor):
     assert "<im_start>" in merged_text
     assert merged_ids.count(99) == processor.num_image_feature_size
 
-    assert processor.replace_placeholder("a <im_patch> b", "<im_patch>", ["IMG"]) == "a IMG b"
-    with pytest.raises(ValueError, match="placeholders"):
-        processor.replace_placeholder("<im_patch> <im_patch>", "<im_patch>", ["IMG"])
+    texts, offsets = processor.get_text_with_replacements(["a <im_patch> b"], ["IMG"])
+    assert texts == ["a IMG b"]
+    assert [(o["span"], o["new_span"]) for o in offsets[0]] == [((2, 12), (2, 5))]
 
     assert processor.batch_decode([1])[0] == "decoded"
     assert processor.decode([1]).startswith("decoded:")

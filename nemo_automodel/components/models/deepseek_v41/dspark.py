@@ -575,6 +575,9 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         "bias_vl",
         "confidence_head",
     ]
+    # Same fp32 holders as DeepseekV41ForCausalLM: when the draft is sharded on its own, its attention
+    # sinks share one FSDP unit across the draft blocks too (parallelizer_utils.fully_shard_across_blocks).
+    _fsdp_shard_across_blocks = ["attn.sinks_param"]
 
     def __init__(
         self,

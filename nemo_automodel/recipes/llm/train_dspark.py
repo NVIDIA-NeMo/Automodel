@@ -81,7 +81,6 @@ from nemo_automodel.components.models.deepseek_v41.dspark_target import (
 )
 from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
 from nemo_automodel.components.optim.optimizer import build_optimizer
-from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
 from nemo_automodel.components.speculative.dspark.config import (
     build_deepseek_v4_draft_config,
     build_gemma4_draft_config,
@@ -92,9 +91,9 @@ from nemo_automodel.components.speculative.dspark.config import (
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics, DSparkTrainerModule
 from nemo_automodel.components.speculative.dspark.registry import (
     ModelOwnedDSparkProvider,
-    build_target_layer_ids,
     resolve_dspark_draft_spec,
 )
+from nemo_automodel.components.speculative.dspark.remote import DSparkTargetInfo, RemoteDSparkTargetModel
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
 from nemo_automodel.components.speculative.dspark.target_utils import (
     DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
@@ -135,6 +134,7 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     distributed_section_dict,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
+    resolve_dspark_target_layer_ids,
     resolve_reduced_target_layers,
     unsupported_parallel_axes,
     validate_dspark_parallelism_axes,
@@ -204,6 +204,33 @@ def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_
             "Sequence packing with a FlashAttention target requires micro_batch_size=1 "
             f"(got {micro_batch_size}); set micro_batch_size=1 or load the target with "
             "attn_implementation='sdpa'."
+        )
+
+
+def _validate_remote_target_options(
+    *, cached_target_path: str | None, is_multimodal: bool, packed_sequence_size: int, cp_size: int
+) -> None:
+    """Reject the recipe options the remote target backend does not support.
+
+    The remote server receives only ``input_ids`` / ``attention_mask`` / ``loss_mask``
+    and runs one unsharded forward per request, so it cannot serve image inputs,
+    the block-causal packing metadata, or a context-parallel target. A precomputed
+    cache already replaces the target, so it cannot be combined with a remote one.
+    """
+    if cached_target_path is not None:
+        raise ValueError(
+            "recipe_args.target_model_backend='remote' and recipe_args.cached_target_path are mutually "
+            "exclusive: the cache already replaces the target. Unset one of them."
+        )
+    if is_multimodal:
+        raise NotImplementedError("recipe_args.target_model_backend='remote' does not support multimodal targets.")
+    if packed_sequence_size > 0:
+        raise NotImplementedError(
+            "recipe_args.target_model_backend='remote' does not support sequence packing; set packed_sequence_size=0."
+        )
+    if cp_size > 1:
+        raise NotImplementedError(
+            "recipe_args.target_model_backend='remote' does not support context parallelism; set cp_size=1."
         )
 
 
@@ -632,6 +659,24 @@ class TrainDSparkRecipe(BaseRecipe):
                 "Sequence packing (packed_sequence_size>0) is only supported on the online text-only "
                 "DSpark path; the VLM and cached-target paths do not carry the packing metadata."
             )
+        cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
+        # Where the frozen target runs: in this process ("colocated") or on separate
+        # serve_dspark_target servers ("remote") that send the captured features back.
+        target_model_backend = str(recipe_cfg.get("target_model_backend", "colocated"))
+        if target_model_backend not in ("colocated", "remote"):
+            raise ValueError(
+                f"Unknown recipe_args.target_model_backend={target_model_backend!r}; expected 'colocated' or 'remote'."
+            )
+        use_remote_target = target_model_backend == "remote"
+        if use_remote_target:
+            _validate_remote_target_options(
+                cached_target_path=self.cached_target_path,
+                is_multimodal=is_multimodal,
+                packed_sequence_size=self.packed_sequence_size,
+                cp_size=cp_size,
+            )
+        # Neither a precomputed cache nor a remote server needs the target weights here.
+        load_target = self.cached_target_path is None and not use_remote_target
 
         validate_dspark_parallelism_axes(self.cfg)
 
@@ -641,7 +686,6 @@ class TrainDSparkRecipe(BaseRecipe):
         # Restricted to the dense Qwen3-style target -- the DeepSeek V4 / GLM-5.2 /
         # Gemma4 / MiniMax M3 / Kimi K3 targets already run under their own
         # expert-parallel / FSDP mesh, which CP is not composed with here.
-        cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         if cp_size > 1:
             if (
                 is_deepseek_v4_target
@@ -693,7 +737,7 @@ class TrainDSparkRecipe(BaseRecipe):
         target_packed_forward = None
         if is_deepseek_v4_target:
             target_packed_forward = deepseek_v4_dspark_packed_forward
-            if self.cached_target_path is None:
+            if load_target:
                 # Full V4-Flash target loaded with the same expert-parallel / FSDP and
                 # FP8-dequant path as the V4 finetune recipe, so the 256 experts shard
                 # across ranks instead of replicating per rank.
@@ -719,7 +763,7 @@ class TrainDSparkRecipe(BaseRecipe):
             architectures = list(getattr(target_config, "architectures", None) or ["DeepseekV4ForCausalLM"])
         elif is_deepseek_v41_target:
             target_packed_forward = deepseek_v41_dspark_packed_forward
-            if self.cached_target_path is None:
+            if load_target:
                 target_options = DeepseekV41DSparkTargetConfig(
                     target_path=target_path,
                     trust_remote_code=trust_remote_code,
@@ -774,7 +818,7 @@ class TrainDSparkRecipe(BaseRecipe):
             architectures = list(
                 getattr(target_config, "architectures", None) or ["MiniMaxM3SparseForConditionalGeneration"]
             )
-            if self.cached_target_path is None:
+            if load_target:
                 self.distributed_setup = create_distributed_setup_from_config(
                     self.cfg,
                     world_size=self.dist_env.world_size,
@@ -813,7 +857,7 @@ class TrainDSparkRecipe(BaseRecipe):
             else:
                 self.target_model = None
         elif is_glm_5_2_target:
-            if self.cached_target_path is None:
+            if load_target:
                 # GLM-5.2 (GlmMoeDsaForCausalLM) is a ~355B-parameter MLA + DSA MoE LM: load
                 # it frozen through the same expert-parallel / FSDP distributed path the GLM
                 # finetune recipe uses, sharding the 256 routed experts across ranks instead
@@ -840,7 +884,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["GlmMoeDsaForCausalLM"])
         elif is_kimi_k3_target:
-            if self.cached_target_path is None:
+            if load_target:
                 target_config, self.target_model, self.distributed_setup = build_kimi_k3_target(
                     cfg=self.cfg,
                     world_size=self.dist_env.world_size,
@@ -866,7 +910,7 @@ class TrainDSparkRecipe(BaseRecipe):
             architectures = getattr(target_config, "architectures", []) or []
             is_gemma4_target = getattr(target_config, "model_type", "") in _GEMMA4_MODEL_TYPES
 
-            if self.cached_target_path is None:
+            if load_target:
                 target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
                 target_kwargs = {}
                 if target_attn_implementation is not None:
@@ -911,25 +955,35 @@ class TrainDSparkRecipe(BaseRecipe):
         )
         num_target_layers = int(target_text_config.num_hidden_layers)
         draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
-        target_layer_ids = list(
-            recipe_cfg.get("target_layer_ids", None)
-            or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
-        )
-        target_layer_ids = validate_target_layer_ids(target_layer_ids, num_target_layers)
+        target_layer_ids = resolve_dspark_target_layer_ids(recipe_cfg, num_target_layers)
         # HFDSparkTargetModel validates target_layer_ids against the actual (possibly
         # reduced) layer count via common.validate_target_layer_ids, which also accepts
         # -1 (the embedding output) and enforces strictly-increasing ids.
         self.target_layer_ids = target_layer_ids
-        self.target_wrapper = (
-            HFDSparkTargetModel(
+        if use_remote_target:
+            remote_urls = list(recipe_cfg.get("remote_urls", None) or [])
+            self.target_wrapper = RemoteDSparkTargetModel(
+                remote_urls,
+                device=self.device,
+                timeout=int(recipe_cfg.get("remote_timeout", 120)),
+                max_retries=int(recipe_cfg.get("remote_max_retries", 3)),
+                # A server pairs NCCL with one client, so ranks sharing servers use the wire plane.
+                enable_nccl=self.dist_env.world_size == 1,
+            )
+            self.target_wrapper.check_target_info(
+                DSparkTargetInfo.from_text_config(target_text_config, target_layer_ids)
+            )
+            if self.dist_env.is_main:
+                logger.info("DSpark REMOTE target: %d server(s) at %s.", len(remote_urls), remote_urls)
+        elif self.target_model is not None:
+            self.target_wrapper = HFDSparkTargetModel(
                 self.target_model,
                 target_layer_ids=target_layer_ids,
                 cp_mesh=self.cp_mesh,
                 packed_forward=target_packed_forward,
             )
-            if self.target_model is not None
-            else None
-        )
+        else:
+            self.target_wrapper = None
 
         self.block_size = int(recipe_cfg.get("block_size", 7))
         self.num_anchors = int(recipe_cfg.get("num_anchors", 512))
@@ -1666,6 +1720,16 @@ class TrainDSparkRecipe(BaseRecipe):
         if trackio_logger is not None:
             trackio_logger.log_metrics(data, step=step)
 
+    def _close_remote_target(self) -> None:
+        """Disconnect from the remote target servers, which then shut down.
+
+        Only the main rank disconnects: a server shuts down on the first disconnect
+        it receives, and every rank's last target request precedes a collective the
+        main rank also joins, so by now no rank still needs the servers.
+        """
+        if self.dist_env.is_main and isinstance(getattr(self, "target_wrapper", None), RemoteDSparkTargetModel):
+            self.target_wrapper.close()
+
     def _finish_wandb(self) -> None:
         trackio_logger = getattr(self, "trackio_logger", None)
         if trackio_logger is not None:
@@ -1695,6 +1759,7 @@ class TrainDSparkRecipe(BaseRecipe):
             if getattr(self, "metric_logger", None) is not None:
                 self.metric_logger.close()
             self._finish_wandb()
+            self._close_remote_target()
             return
 
         pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
@@ -1843,6 +1908,7 @@ class TrainDSparkRecipe(BaseRecipe):
             if getattr(self, "metric_logger", None) is not None:
                 self.metric_logger.close()
             self._finish_wandb()
+            self._close_remote_target()
 
 
 def main(config_path: str | None = None):

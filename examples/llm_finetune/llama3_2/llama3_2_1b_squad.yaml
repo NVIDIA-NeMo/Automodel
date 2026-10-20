@@ -118,4 +118,5 @@ lr_scheduler:
 #     framework: "automodel"
 
 ci:
+  cluster_tag: h100
   recipe_owner: akoumpa
