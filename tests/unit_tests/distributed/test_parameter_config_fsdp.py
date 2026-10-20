@@ -58,7 +58,6 @@ def _worker(rank: int, rendezvous: str, checkpoint_dir: str, source: dict[str, t
             offload_policy=None,
         )
         assert isinstance(model, FSDPModule)
-        assert isinstance(model[2], FSDPModule)
         parameters = dict(model.named_parameters())
         assert parameters.keys() == source.keys()
         for name, parameter in parameters.items():

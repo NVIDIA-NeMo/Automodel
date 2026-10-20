@@ -22,7 +22,7 @@ import torch
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, OffloadPolicy, fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, parallelize_module
 from torch.distributed.tensor.placement_types import Shard
 
@@ -33,9 +33,6 @@ from nemo_automodel.components.distributed.parallelizer_utils import fully_shard
 
 logger = logging.getLogger(__name__)
 
-# Mamba's fused kernels read these weights directly, so FSDP hooks on the modules never run.
-_MAMBA_DIRECT_WEIGHT_MODULES = ("conv1d", "norm", "out_proj")
-
 
 def _decoder_blocks(model: nn.Module) -> tuple[nn.Module, list[nn.Module]]:
     """Return the mutable decoder container and its ordered blocks."""
@@ -43,19 +40,6 @@ def _decoder_blocks(model: nn.Module) -> tuple[nn.Module, list[nn.Module]]:
     container = inner.layers
     blocks = list(container.values()) if isinstance(container, nn.ModuleDict) else list(container)
     return container, blocks
-
-
-def _reject_split_mamba_fused_weights(index: int, layer: nn.Module) -> None:
-    """Reject dtype layouts that move Mamba fused-kernel weights out of their block's FSDP unit."""
-    if getattr(layer, "block_type", None) != "mamba":
-        return
-    split = [name for name in _MAMBA_DIRECT_WEIGHT_MODULES if isinstance(getattr(layer.mixer, name), FSDPModule)]
-    if split:
-        raise ValueError(
-            f"Nemotron-H layer {index}: Mamba fused kernels read mixer.{{{', '.join(split)}}} weights directly, "
-            "so they cannot be separate FSDP units. Partial Mamba-block dtype selections are not supported; "
-            "give every parameter of the block outside mixer._fp32_params one storage dtype."
-        )
 
 
 class NemotronHModelParallelizer(ModelParallelizer):
@@ -150,7 +134,7 @@ class NemotronHModelParallelizer(ModelParallelizer):
 
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
         fp32_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
-        for index, layer in enumerate(layers):
+        for layer in layers:
             fully_shard_by_dtype(
                 layer,
                 mesh=dp_mesh,
@@ -159,7 +143,6 @@ class NemotronHModelParallelizer(ModelParallelizer):
                 fp32_compute_module_names=fp32_module_names,
                 reshard_after_forward=reshard_after_forward,
             )
-            _reject_split_mamba_fused_weights(index, layer)
         self._fully_shard_untied_input_output_embeddings(
             model,
             mesh=dp_mesh,

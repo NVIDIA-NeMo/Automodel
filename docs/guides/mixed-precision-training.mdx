@@ -58,11 +58,6 @@ already loaded weights. It preserves the selected storage precision through
 materialization, so an fp32 checkpoint is not rounded to bf16 before loading.
 It does not change FSDP compute precision.
 
-In a Nemotron V3 Mamba block, select either every parameter outside
-`mixer._fp32_params` or none of them. The fused Mamba kernels read the
-`conv1d`, `norm`, and `out_proj` weights directly, so FSDP2 sharding rejects a
-partial selection.
-
 For native checkpoint conversion without changing trainability, use
 `preserve_parameter_dtypes=True` instead. Both modes verify that initialization
 preserves parameter dtypes, and both require FSDP2; DDP is rejected. The default
