@@ -15,6 +15,18 @@ from typing import Any
 from transformers.configuration_utils import PretrainedConfig
 
 
+def _drop_unset_architectures(config_dict: dict[str, Any]) -> dict[str, Any]:
+    """Omit a sub-config's unset ``architectures`` from its serialized form.
+
+    The released checkpoint lists ``architectures`` only at the top level. A
+    ``null`` entry inside ``text_config`` replaces that list in loaders that
+    merge top-level keys into the text config.
+    """
+    if config_dict.get("architectures") is None:
+        config_dict.pop("architectures", None)
+    return config_dict
+
+
 def _json_safe_value(value: Any) -> Any:
     """Return a JSON-serializable representation of a config value."""
     if value.__class__.__module__ == "torch" and value.__class__.__name__ == "dtype":
@@ -234,7 +246,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         return self.n_routed_experts
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe_value(super().to_dict())
+        return _drop_unset_architectures(_json_safe_value(super().to_dict()))
 
 
 class Glm5NextVisionConfig(PretrainedConfig):
@@ -285,7 +297,7 @@ class Glm5NextVisionConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe_value(super().to_dict())
+        return _drop_unset_architectures(_json_safe_value(super().to_dict()))
 
 
 class Glm5NextConfig(PretrainedConfig):

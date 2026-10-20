@@ -114,3 +114,25 @@ def test_registry_resolves_native_config_and_model():
     capabilities = Glm5NextForConditionalGeneration.ModelCapabilities()
     assert capabilities.supports_ep and capabilities.supports_cp and capabilities.supports_thd
     assert not capabilities.supports_tp and not capabilities.supports_pp
+
+
+def test_export_config_json_keeps_released_fields():
+    # Consolidated HF exports serialize the full config (``to_json_string(use_diff=False)``).
+    config = Glm5NextConfig.from_dict(_checkpoint_style_config(kda_layers=[0, 1, 2], full_attn_layers=[3]))
+    exported = json.loads(config.to_json_string(use_diff=False))
+
+    assert exported["architectures"] == ["Glm5NextForConditionalGeneration"]
+    assert "architectures" not in exported["text_config"]
+    assert "architectures" not in exported["vision_config"]
+    linear_attn_config = exported["text_config"]["linear_attn_config"]
+    assert linear_attn_config["kda_layers"] == [0, 1, 2]
+    assert linear_attn_config["full_attn_layers"] == [3]
+
+
+def test_export_config_json_top_level_architectures_survive_text_config_merge():
+    # GLM-5.3 loaders such as SGLang's config merge top-level keys into ``text_config`` and read
+    # ``architectures`` back from it; a null entry in ``text_config`` would replace the list.
+    exported = json.loads(Glm5NextConfig.from_dict(_checkpoint_style_config()).to_json_string(use_diff=False))
+    merged = {"architectures": exported["architectures"], **exported["text_config"]}
+
+    assert merged["architectures"] == ["Glm5NextForConditionalGeneration"]
