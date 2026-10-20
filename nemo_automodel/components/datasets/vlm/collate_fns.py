@@ -2025,23 +2025,24 @@ def nemotron_omni_collate_fn(
         "attention_mask": torch.stack(padded_attention_masks),
     }
 
-    def _flatten_pv(per_sample_dict: Dict[int, Any]) -> List[torch.Tensor]:
+    def _flatten_pv(per_sample_dict: Dict[int, Any]) -> tuple[List[torch.Tensor], List[int]]:
         flat: List[torch.Tensor] = []
+        counts: List[int] = []
         for i in range(len(padded_input_ids)):
+            sample_start = len(flat)
             pv = per_sample_dict.get(i)
-            if pv is None:
-                continue
             if isinstance(pv, torch.Tensor):
                 if pv.dim() == 4:
                     for k in range(pv.shape[0]):
                         flat.append(pv[k])
                 else:
                     flat.append(pv)
-            else:
+            elif pv is not None:
                 flat.extend(pv)
-        return flat
+            counts.append(len(flat) - sample_start)
+        return flat, counts
 
-    flat_images = _flatten_pv(sample_pixel_values)
+    flat_images, image_counts = _flatten_pv(sample_pixel_values)
     if flat_images:
         if all(t.shape == flat_images[0].shape for t in flat_images):
             result["pixel_values"] = torch.stack(flat_images).to(torch.bfloat16)
@@ -2049,8 +2050,9 @@ def nemotron_omni_collate_fn(
             # Variable shapes — extract_feature handles list input.
             result["pixel_values"] = [t.to(torch.bfloat16) for t in flat_images]
         result["image_flags"] = torch.ones(len(flat_images), 1, dtype=torch.long)
+        result["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
 
-    flat_video_frames = _flatten_pv(sample_pixel_values_videos)
+    flat_video_frames, _ = _flatten_pv(sample_pixel_values_videos)
     if flat_video_frames:
         if all(t.shape == flat_video_frames[0].shape for t in flat_video_frames):
             result["pixel_values_videos"] = torch.stack(flat_video_frames).to(torch.bfloat16)

@@ -47,6 +47,8 @@ class _StubProjector(nn.Module):
 
 
 class _StubHFNemotronOmni(nn.Module):
+    __module__ = "transformers_modules.test.modeling_nemotron_h_omni"
+
     def __init__(self) -> None:
         super().__init__()
         self.config = SimpleNamespace(architectures=["NemotronH_Omni_Reasoning_V3"])
@@ -109,6 +111,7 @@ def test_runtime_patch_packs_variable_resolution_hf_features() -> None:
         input_ids=input_ids,
         pixel_values=pixel_values,
         image_flags=torch.ones(2, 1, dtype=torch.long),
+        n_images_per_sample=torch.ones(2, dtype=torch.long),
     )
 
     assert output.logits is not None
@@ -117,8 +120,51 @@ def test_runtime_patch_packs_variable_resolution_hf_features() -> None:
     torch.testing.assert_close(output.logits[image_mask], expected_images)
 
 
+def test_runtime_patch_discards_truncated_features_per_sample() -> None:
+    model = _StubHFNemotronOmni()
+    model = apply_model_runtime_patches(model, mesh=None)
+
+    input_ids = torch.tensor(
+        [
+            [18, 18, 18, 18, 5, 5, 5, 5],
+            [18, 18, 18, 18, 18, 18, 18, 18],
+        ]
+    )
+    image_mask = input_ids == model.img_context_token_id
+    pixel_values = [
+        torch.zeros(1, 3, 4, 4),
+        torch.zeros(1, 3, 8, 4),
+        torch.zeros(1, 3, 4, 8),
+    ]
+
+    output = model(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        image_flags=torch.ones(3, 1, dtype=torch.long),
+        n_images_per_sample=torch.tensor([2, 1]),
+    )
+
+    assert output.logits is not None
+    expected_images = torch.cat([torch.full((4, 4), 44.0), torch.full((8, 4), 48.0)])
+    torch.testing.assert_close(output.logits[image_mask], expected_images)
+
+
 def test_runtime_patch_skips_native_nemotron_omni() -> None:
     model = object.__new__(NemotronOmniForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(architectures=["NemotronH_Omni_Reasoning_V3"])
+    original_forward = model.forward.__func__
+
+    patched = apply_model_runtime_patches(model, mesh=None)
+
+    assert patched is model
+    assert model.forward.__func__ is original_forward
+
+
+def test_runtime_patch_skips_transformers_first_party_nemotron_omni() -> None:
+    from transformers.models.nemotron_h_omni.modeling_nemotron_h_omni import NemotronH_Omni_Reasoning_V3
+
+    model = object.__new__(NemotronH_Omni_Reasoning_V3)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(architectures=["NemotronH_Omni_Reasoning_V3"])
     original_forward = model.forward.__func__

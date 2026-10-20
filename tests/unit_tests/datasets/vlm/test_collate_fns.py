@@ -595,28 +595,45 @@ def test_nemotron_omni_collate_extracts_images(collate_mod, monkeypatch):
 
     from PIL import Image as PILImage
 
-    img = PILImage.new("RGB", (4, 4))
+    first_img = PILImage.new("RGB", (4, 4))
+    second_img = PILImage.new("RGB", (6, 4))
+    third_img = PILImage.new("RGB", (4, 6))
     examples = [
         {
             "conversation": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": img},
+                        {"type": "image", "image": first_img},
+                        {"type": "image", "image": second_img},
+                        {"type": "text", "text": "what are these?"},
+                    ],
+                },
+                {"role": "assistant", "content": "two images"},
+            ]
+        },
+        {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": third_img},
                         {"type": "text", "text": "what is this?"},
                     ],
                 },
-                {"role": "assistant", "content": "an image"},
+                {"role": "assistant", "content": "one image"},
             ]
-        }
+        },
     ]
     batch = collate_mod.nemotron_omni_collate_fn(examples, processor=processor)
 
-    # The image was extracted and forwarded to the processor, then surfaced in the batch.
-    assert processor.seen_kwargs and processor.seen_kwargs[0].get("images") == [img]
+    # Images retain their sample boundaries while pixel tensors are flattened.
+    assert processor.seen_kwargs[0].get("images") == [first_img, second_img]
+    assert processor.seen_kwargs[1].get("images") == [third_img]
     assert "pixel_values" in batch
     assert batch["pixel_values"].dtype == torch.bfloat16  # collate casts to bf16
-    assert "image_flags" in batch and batch["image_flags"].shape == (1, 1)
+    assert "image_flags" in batch and batch["image_flags"].shape == (3, 1)
+    torch.testing.assert_close(batch["n_images_per_sample"], torch.tensor([2, 1]))
 
 
 def test_qwen25_collate_shapes(collate_mod, monkeypatch):

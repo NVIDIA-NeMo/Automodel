@@ -14,16 +14,15 @@
 
 """Compatibility fixes for Hugging Face Nemotron Omni remote-code models."""
 
+import inspect
 from functools import wraps
 from types import MethodType
-from typing import Protocol, cast
+from typing import Protocol
 
 import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
-from nemo_automodel.components.models.nemotron_omni.model import NemotronOmniForConditionalGeneration
 
 
 class _HFNemotronOmni(Protocol):
@@ -42,6 +41,7 @@ def _merge_variable_resolution_images(
     input_ids: torch.Tensor,
     pixel_values: list[torch.Tensor] | tuple[torch.Tensor, ...],
     image_flags: torch.Tensor | None,
+    n_images_per_sample: torch.Tensor | None,
     inputs_embeds: torch.Tensor | None,
 ) -> torch.Tensor:
     """Encode and scatter a ragged image batch into the text embeddings.
@@ -53,6 +53,8 @@ def _merge_variable_resolution_images(
             [images, channels, height, width]. Spatial dimensions may differ.
         image_flags: Optional tensor of shape [images, 1], where one marks a
             real image and zero marks padding.
+        n_images_per_sample: Optional tensor of shape [batch] mapping the flat
+            image list back to each text row.
         inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
 
     Returns:
@@ -80,6 +82,7 @@ def _merge_variable_resolution_images(
             )
         per_image_features.extend(projected.unbind(0))
 
+    keep_flags = [True] * len(per_image_features)
     if image_flags is not None:
         flat_flags = image_flags.reshape(-1)
         if flat_flags.numel() != len(per_image_features):
@@ -87,24 +90,68 @@ def _merge_variable_resolution_images(
                 "Nemotron Omni image_flags must contain one value per image, "
                 f"got {flat_flags.numel()} flags for {len(per_image_features)} images."
             )
-        per_image_features = [features for features, keep in zip(per_image_features, flat_flags.tolist()) if keep == 1]
+        keep_flags = [flag == 1 for flag in flat_flags.tolist()]
 
-    if per_image_features:
-        image_embeds = torch.cat([features.reshape(-1, features.shape[-1]) for features in per_image_features], dim=0)
+    batch_size = input_ids.shape[0]
+    if n_images_per_sample is not None:
+        image_counts = [int(count) for count in n_images_per_sample.reshape(-1).tolist()]
+        if len(image_counts) != batch_size:
+            raise ValueError(
+                "Nemotron Omni n_images_per_sample must contain one value per text row, "
+                f"got {len(image_counts)} values for batch size {batch_size}."
+            )
+        if sum(image_counts) != len(per_image_features):
+            raise ValueError(
+                "Nemotron Omni n_images_per_sample must cover the flat image list, "
+                f"got a total of {sum(image_counts)} for {len(per_image_features)} images."
+            )
+    elif batch_size == 1:
+        image_counts = [len(per_image_features)]
+    elif len(per_image_features) == batch_size:
+        image_counts = [1] * batch_size
     else:
-        image_embeds = inputs_embeds.new_empty((0, inputs_embeds.shape[-1]))
+        raise ValueError("Nemotron Omni needs n_images_per_sample to align a multi-image batch with its text rows.")
 
-    image_embeds = image_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-    image_positions = input_ids == model.img_context_token_id
-    num_image_positions = int(image_positions.sum().item())
-    if image_embeds.shape[0] != num_image_positions:
+    if inputs_embeds.ndim != 3:
         raise ValueError(
-            "Nemotron Omni variable-resolution feature count must match the image-token count, "
-            f"got {image_embeds.shape[0]} features for {num_image_positions} positions."
+            "Nemotron Omni variable-resolution inputs_embeds must have shape [batch, sequence, hidden], "
+            f"got {tuple(inputs_embeds.shape)}."
         )
 
-    image_mask = image_positions.unsqueeze(-1).expand_as(inputs_embeds)
-    return inputs_embeds.masked_scatter(image_mask.to(inputs_embeds.device), image_embeds)
+    image_positions = input_ids == model.img_context_token_id
+    merged_rows: list[torch.Tensor] = []
+    image_offset = 0
+    for row_index, image_count in enumerate(image_counts):
+        row_end = image_offset + image_count
+        row_features = [
+            features.reshape(-1, features.shape[-1])
+            for features, keep in zip(per_image_features[image_offset:row_end], keep_flags[image_offset:row_end])
+            if keep
+        ]
+        image_offset = row_end
+
+        if row_features:
+            row_image_embeds = torch.cat(row_features, dim=0)
+        else:
+            row_image_embeds = inputs_embeds.new_empty((0, inputs_embeds.shape[-1]))
+        row_image_embeds = row_image_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+
+        row_positions = image_positions[row_index]
+        num_row_positions = int(row_positions.sum().item())
+        if row_image_embeds.shape[0] < num_row_positions:
+            raise ValueError(
+                "Nemotron Omni image features must cover each row's retained image-token positions, "
+                f"got {row_image_embeds.shape[0]} features for {num_row_positions} positions in row {row_index}."
+            )
+
+        # Right truncation can retain only a prefix of a row's image tokens.
+        # Drop that row's unused feature suffix before moving to the next row.
+        row_image_embeds = row_image_embeds[:num_row_positions]
+        row_inputs_embeds = inputs_embeds[row_index]
+        row_mask = row_positions.unsqueeze(-1).expand_as(row_inputs_embeds)
+        merged_rows.append(row_inputs_embeds.masked_scatter(row_mask.to(inputs_embeds.device), row_image_embeds))
+
+    return torch.stack(merged_rows, dim=0)
 
 
 def apply_hf_variable_resolution_patch(model: nn.Module, *, mesh: DeviceMesh | None) -> nn.Module:
@@ -125,82 +172,57 @@ def apply_hf_variable_resolution_patch(model: nn.Module, *, mesh: DeviceMesh | N
         The input model with its instance-local HF forward compatibility patch.
     """
     del mesh
-    if isinstance(model, NemotronOmniForConditionalGeneration):
+    if not type(model).__module__.startswith("transformers_modules."):
         return model
 
-    hf_model = cast(_HFNemotronOmni, model)
     original_forward = model.forward
+    forward_signature = inspect.signature(original_forward)
 
     @wraps(original_forward)
     def _forward(
         self: _HFNemotronOmni,
-        input_ids: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
-        sound_clips: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        image_flags: torch.Tensor | None = None,
-        past_key_values: list[torch.Tensor] | None = None,
-        labels: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        use_cache: bool | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        return_dict: bool | None = None,
+        *args: object,
         **kwargs: object,
     ) -> CausalLMOutputWithPast:
-        """Run HF Nemotron Omni with a ragged-image compatibility path.
+        """Run remote-code Nemotron Omni with a ragged-image compatibility path.
 
         Args:
-            input_ids: Optional tensor of shape [batch, sequence].
-            pixel_values: Optional tensor of shape [images, channels, height,
-                width], or a list of per-image tensors with variable height and width.
-            pixel_values_videos: Optional tensor of shape [frames, channels, height, width].
-            sound_clips: Optional tensor following the checkpoint sound projector contract.
-            attention_mask: Optional tensor of shape [batch, sequence].
-            position_ids: Optional tensor of shape [batch, sequence].
-            image_flags: Optional tensor of shape [images, 1].
-            past_key_values: Optional per-layer cache tensors following the checkpoint contract.
-            labels: Optional tensor of shape [batch, sequence].
-            inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
-            use_cache: Whether to return key/value caches.
-            output_attentions: Whether to return attention tensors.
-            output_hidden_states: Whether to return hidden-state tensors.
-            return_dict: Whether to return a model-output object.
+            *args: Positional arguments accepted by the checkpoint forward method.
             **kwargs: Additional arguments accepted by the checkpoint forward method.
 
         Returns:
             A causal language-model output whose logits have shape [batch, sequence, vocab].
         """
-        if isinstance(pixel_values, (list, tuple)) and input_ids is not None:
-            inputs_embeds = _merge_variable_resolution_images(
+        bound = forward_signature.bind_partial(*args, **kwargs)
+        forwarded_kwargs = bound.arguments.get("kwargs")
+        n_images_per_sample = None
+        if isinstance(forwarded_kwargs, dict):
+            n_images_per_sample = forwarded_kwargs.pop("n_images_per_sample", None)
+
+        input_ids = bound.arguments.get("input_ids")
+        pixel_values = bound.arguments.get("pixel_values")
+        image_flags = bound.arguments.get("image_flags")
+        inputs_embeds = bound.arguments.get("inputs_embeds")
+        if isinstance(pixel_values, (list, tuple)) and isinstance(input_ids, torch.Tensor):
+            if image_flags is not None and not isinstance(image_flags, torch.Tensor):
+                raise TypeError("Nemotron Omni image_flags must be a tensor or None.")
+            if n_images_per_sample is not None and not isinstance(n_images_per_sample, torch.Tensor):
+                raise TypeError("Nemotron Omni n_images_per_sample must be a tensor or None.")
+            if inputs_embeds is not None and not isinstance(inputs_embeds, torch.Tensor):
+                raise TypeError("Nemotron Omni inputs_embeds must be a tensor or None.")
+
+            bound.arguments["inputs_embeds"] = _merge_variable_resolution_images(
                 self,
                 input_ids,
                 pixel_values,
                 image_flags,
+                n_images_per_sample,
                 inputs_embeds,
             )
-            pixel_values = None
-            image_flags = None
+            bound.arguments["pixel_values"] = None
+            bound.arguments["image_flags"] = None
 
-        return original_forward(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            sound_clips=sound_clips,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            image_flags=image_flags,
-            past_key_values=past_key_values,
-            labels=labels,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs,
-        )
+        return original_forward(*bound.args, **bound.kwargs)
 
-    model.forward = MethodType(_forward, hf_model)
+    model.forward = MethodType(_forward, model)
     return model
