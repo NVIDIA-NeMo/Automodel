@@ -480,7 +480,6 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_num_blocks_unpermute: int | None = None,
         benchmark_static_routing: bool = False,
         moe_hybridep_capacity_factor: float | None = None,
-        moe_hybridep_equal_token_counts: bool = False,
     ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
@@ -502,8 +501,6 @@ class _HybridEPManager(_DispatchManager):
             )
         self.hybridep_capacity_factor = moe_hybridep_capacity_factor
         self._hybridep_capacity: int | None = None
-        # Equal row counts across the EP group: the pad size is the aligned local count, no collective.
-        self.equal_token_counts = moe_hybridep_equal_token_counts
         # Benchmark-only (TokenDispatcherConfig.moe_benchmark_static_routing):
         # persist num_permuted_tokens across dispatches, see dispatch()/reset.
         self.benchmark_static_routing = benchmark_static_routing
@@ -616,8 +613,6 @@ class _HybridEPManager(_DispatchManager):
         if target_tokens is not None:
             if num_tokens > target_tokens:
                 raise ValueError(f"HybridEP dispatch has {num_tokens} rows, exceeding proven capacity {target_tokens}")
-        elif self.equal_token_counts:
-            target_tokens = num_tokens
         elif pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
             target_tokens = self._static_target_tokens
         else:
@@ -977,10 +972,6 @@ class TokenDispatcherConfig:
     calibration dispatch, size every later dispatch to the calibrated permuted row count times this
     factor and run it non-blocking. None keeps the blocking path."""
 
-    moe_hybridep_equal_token_counts: bool = False
-    """HybridEP (mirrors BackendConfig.dispatcher_equal_token_counts): every EP rank dispatches the
-    same row count, so the per-dispatch pad-size all-reduce and its host sync are skipped."""
-
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP backend."""
 
@@ -1122,7 +1113,6 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                         benchmark_static_routing=self.config.moe_benchmark_static_routing,
                         moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
-                        moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
                 if (
@@ -1132,7 +1122,6 @@ class MoEFlexTokenDispatcher:
                     self._comm_manager.moe_hybridep_num_blocks_permute,
                     self._comm_manager.moe_hybridep_num_blocks_unpermute,
                     self._comm_manager.hybridep_capacity_factor,
-                    self._comm_manager.equal_token_counts,
                 ) != (
                     self.config.moe_hybridep_compact_routing,
                     self.config.moe_hybridep_permute_fusion,
@@ -1140,7 +1129,6 @@ class MoEFlexTokenDispatcher:
                     self.config.moe_hybridep_num_blocks_permute,
                     self.config.moe_hybridep_num_blocks_unpermute,
                     self.config.moe_hybridep_capacity_factor,
-                    self.config.moe_hybridep_equal_token_counts,
                 ):
                     raise ValueError(
                         "Shared HybridEP dispatchers must use identical routing, fusion, kernel tuning, and sync-free "
@@ -1161,7 +1149,6 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                     benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
-                    moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,

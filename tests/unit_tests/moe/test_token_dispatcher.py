@@ -483,7 +483,6 @@ def test_hybridep_preprocess_records_cuda_graph_sample(hybrid_ep_manager, monkey
         ("moe_hybridep_num_blocks_permute", 16),
         ("moe_hybridep_num_blocks_unpermute", 16),
         ("moe_hybridep_capacity_factor", 1.5),
-        ("moe_hybridep_equal_token_counts", True),
     ],
 )
 def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, setting, value):
@@ -943,51 +942,3 @@ class TestHybridEPCapacityMode:
     def test_no_factor_keeps_the_blocking_path(self, monkeypatch):
         m, passed, asserts = self._run(monkeypatch, None, [8, 8], tpe_rows=[5, 5])
         assert passed == [None, None] and asserts == []
-
-
-class TestHybridEPEqualTokenCounts:
-    """BackendConfig.dispatcher_equal_token_counts: the pad size is the aligned local row count, with no
-    EP-group all-reduce and no host sync; unset keeps the per-dispatch MAX all-reduce."""
-
-    def _run(self, monkeypatch, equal, num_tokens_seq, group_max):
-        import nemo_automodel.components.moe.megatron.token_dispatcher as td
-
-        with patch(
-            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
-        ):
-            m = _HybridEPManager(
-                group=None,
-                num_local_experts=2,
-                num_experts=8,
-                router_topk=2,
-                benchmark_static_routing=False,
-                moe_hybridep_equal_token_counts=equal,
-            )
-        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
-        monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
-        calls, sizes = [], []
-
-        def fake_all_reduce(tensor, op=None, group=None):
-            calls.append(int(tensor))
-            tensor.fill_(group_max)
-
-        def fake_dispatch(x, routing_map, probs, **kwargs):
-            sizes.append(kwargs["num_of_tokens_per_rank"])
-            return x, probs, None, routing_map.sum(dim=0), "handle"
-
-        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
-        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
-        for n in num_tokens_seq:
-            m.routing_map = torch.ones(n, 8, dtype=torch.bool)
-            m.token_probs = torch.full((n, 8), 0.125)
-            m.dispatch(torch.randn(n, 4))
-        return calls, sizes
-
-    def test_equal_counts_skip_the_collective_and_only_align(self, monkeypatch):
-        calls, sizes = self._run(monkeypatch, True, [6, 8, 9], group_max=99)
-        assert calls == [] and sizes == [6, 8, 9]
-
-    def test_default_keeps_the_per_dispatch_all_reduce(self, monkeypatch):
-        calls, sizes = self._run(monkeypatch, False, [6, 6], group_max=6)
-        assert calls == [6, 6] and sizes == [6, 6]

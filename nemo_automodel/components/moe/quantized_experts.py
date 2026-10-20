@@ -309,10 +309,9 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
         self.dispatcher_hybridep_num_blocks_permute = orig_module.dispatcher_hybridep_num_blocks_permute
         self.dispatcher_hybridep_num_blocks_unpermute = orig_module.dispatcher_hybridep_num_blocks_unpermute
-        # Sync-free dispatch knobs (BackendConfig.dispatcher_capacity_factor / dispatcher_equal_token_counts) travel
-        # with the other HybridEP settings: the shared dispatcher is built from the first (wrapped) layer.
+        # Capacity mode travels with the other HybridEP settings: the shared dispatcher
+        # is built from the first (wrapped) layer.
         self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
-        self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
         self.dispatch_rows_never_empty = orig_module.dispatch_rows_never_empty
         # These fresh parameters have no autograd history or optimizer references.
         for name in self._MXFP4_BASE_NAMES:
