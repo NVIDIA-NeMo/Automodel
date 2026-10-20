@@ -36,7 +36,7 @@ def test_example_recipe_targets_resolve(filename):
 
 @pytest.mark.parametrize("local_batch,global_batch", [(0, 4), (2, 0), (2, 3), (2, 2)])
 def test_clef_rejects_nonpositive_or_nondivisible_batches(local_batch, global_batch):
-    from nemo_automodel.components.decision.losses import DecisionLossConfig
+    from nemo_automodel.components.loss.decision import DecisionLossConfig
     from nemo_automodel.recipes.decision.train_clef import TrainClefDecisionRecipe
 
     recipe = TrainClefDecisionRecipe.__new__(TrainClefDecisionRecipe)
@@ -48,7 +48,7 @@ def test_clef_rejects_nonpositive_or_nondivisible_batches(local_batch, global_ba
 
 
 def test_clef_tiny_training_split_cannot_report_success_without_an_optimizer_step(tmp_path):
-    from nemo_automodel.components.decision.losses import DecisionLossConfig
+    from nemo_automodel.components.loss.decision import DecisionLossConfig
     from nemo_automodel.recipes.decision.train_clef import TrainClefDecisionRecipe
 
     recipe = TrainClefDecisionRecipe.__new__(TrainClefDecisionRecipe)
@@ -77,7 +77,8 @@ def test_clef_reward_only_validation_does_not_require_accuracy():
 def test_clm_reward_only_training_and_validation_use_explicit_utilities(tmp_path):
     import torch
 
-    from nemo_automodel.components.decision.losses import DecisionLossConfig
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.loss.decision import DecisionLossConfig
     from nemo_automodel.components.models.clm.heads import CLMHeadConfig, CLMHeadPair, EmbeddingTable, collect_clm_texts
     from nemo_automodel.recipes.decision.train_clm_heads import TrainCLMHeadsRecipe
 
@@ -88,8 +89,15 @@ def test_clm_reward_only_training_and_validation_use_explicit_utilities(tmp_path
         "rewards": {"pick": {"a": 0.0, "b": 1.0}},
     }
     torch.manual_seed(7)
-    recipe = TrainCLMHeadsRecipe.__new__(TrainCLMHeadsRecipe)
-    recipe.cfg = {"train.epochs": 1, "train.batch_size": 1, "train.eval_metric": "reward"}
+    recipe = TrainCLMHeadsRecipe(
+        ConfigNode(
+            {
+                "train": {"epochs": 1, "batch_size": 1, "eval_metric": "reward", "train_logit_scale": False},
+                "optimizer": {"_target_": "torch.optim.SGD", "lr": 0.1},
+                "lr_scheduler": {"lr_decay_style": "constant", "lr_warmup_steps": 0},
+            }
+        )
+    )
     recipe.loss_config = DecisionLossConfig(mode="rl", kl_coef=0.0)
     recipe.tag = "rl"
     recipe.seed = 7
@@ -102,6 +110,108 @@ def test_clm_reward_only_training_and_validation_use_explicit_utilities(tmp_path
     head = CLMHeadConfig(
         hidden_size=8, width=8, depth=2, projection_dim=4, activation="gelu", layer_norm=False, residual=False
     ).build()
+    before = {name: value.detach().clone() for name, value in head.named_parameters()}
     trained = recipe._train(head)
     assert isinstance(trained, CLMHeadPair)
     assert (tmp_path / "training_log.jsonl").exists()
+    assert not head.logit_scale.requires_grad
+    assert head.logit_scale.grad is None
+    torch.testing.assert_close(head.logit_scale, before["logit_scale"], atol=0, rtol=0)
+    assert any(not torch.equal(value, before[name]) for name, value in head.named_parameters() if name != "logit_scale")
+
+
+def test_primary_and_head_optimizers_resolve_independently_from_yaml():
+    import torch
+
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.recipes._typed_config import RecipeConfig
+
+    raw = ConfigNode(
+        {
+            "optimizer": {"_target_": "torch.optim.SGD", "lr": 0.02},
+            "head_optimizer": {"_target_": "torch.optim.AdamW", "lr": 0.003, "weight_decay": 0.0},
+        }
+    )
+    config = RecipeConfig(raw)
+    first = torch.nn.Linear(2, 1)
+    second = torch.nn.Linear(2, 1)
+    primary = config.optimizer.build(first)
+    head = config.head_optimizer.build(second)
+    assert isinstance(primary[0], torch.optim.SGD)
+    assert isinstance(head[0], torch.optim.AdamW)
+    assert primary[0].param_groups[0]["lr"] == 0.02
+    assert head[0].param_groups[0]["lr"] == 0.003
+    assert config.head_optimizer is config.head_optimizer
+    assert config.optimizer is config.optimizer
+    assert config.head_optimizer is not config.optimizer
+    assert RecipeConfig(ConfigNode({})).head_optimizer is None
+
+
+def test_clm_example_native_optimizer_and_schedule_build_without_gpu():
+    import torch
+
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
+    from nemo_automodel.recipes._typed_config import RecipeConfig
+
+    root = Path(__file__).resolve().parents[3]
+    config = RecipeConfig(ConfigNode(yaml.safe_load((root / "examples/decision/clm_soc_triage.yaml").read_text())))
+    model = torch.nn.Linear(2, 1)
+    optimizer = config.optimizer.build(model)
+    schedule = StepSchedulerConfig(global_batch_size=2, num_epochs=2, max_steps=6, preemption_signal=None).build(
+        dataloader=None, dp_group_size=1, local_batch_size=2
+    )
+    schedulers = config.lr_scheduler.build(optimizer, schedule)
+    assert len(schedulers) == 1
+    assert schedulers[0].lr_decay_steps == 6
+    assert schedulers[0].lr_warmup_steps == 0
+    schedulers[0].step(1)
+    assert 0 < optimizer[0].param_groups[0]["lr"] < 5e-4
+
+
+def test_clm_configured_sgd_update_matches_unpadded_ce_reference(tmp_path):
+    import copy
+
+    import torch
+    from torch.nn import functional
+
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.loss.decision import DecisionLossConfig
+    from nemo_automodel.components.models.clm.heads import CLMHeadConfig, EmbeddingTable, collect_clm_texts
+    from nemo_automodel.recipes.decision.train_clm_heads import TrainCLMHeadsRecipe
+
+    record = {
+        "id": "sgd-step",
+        "state": "A fictional event",
+        "questions": {"pick": {"type": "choice", "criteria": {"a": "A", "b": "B"}}},
+        "answers": {"pick": "b"},
+    }
+    torch.manual_seed(11)
+    recipe = TrainCLMHeadsRecipe(
+        ConfigNode(
+            {
+                "train": {"epochs": 1, "batch_size": 1, "grad_clip": 1e6},
+                "optimizer": {"_target_": "torch.optim.SGD", "lr": 0.03},
+            }
+        )
+    )
+    recipe.loss_config = DecisionLossConfig(label_smoothing=0.0, brier_weight=0.0, ordinal_weight=0.0)
+    recipe.tag = "sft"
+    recipe.seed = 11
+    recipe.device = torch.device("cpu")
+    recipe.output_dir = tmp_path
+    recipe.splits = {"train": [record]}
+    texts = collect_clm_texts([record])
+    recipe.table = EmbeddingTable(texts, torch.randn(len(texts), 8))
+    head = CLMHeadConfig(
+        hidden_size=8, width=8, depth=2, projection_dim=4, activation="gelu", layer_norm=False, residual=False
+    ).build()
+    reference = copy.deepcopy(head)
+    reference_logits, targets = recipe._forward(reference, [record])
+    loss = functional.cross_entropy(reference_logits[0][0].values[None], torch.tensor([targets[0][0].label]))
+    loss.backward()
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.03)
+    reference_optimizer.step()
+    trained = recipe._train(head)
+    for name, parameter in reference.named_parameters():
+        torch.testing.assert_close(dict(trained.named_parameters())[name], parameter, atol=1e-7, rtol=1e-6)

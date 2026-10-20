@@ -17,11 +17,19 @@
 import pytest
 import torch
 from transformers import Lfm2VlConfig
+from transformers.models.lfm2_vl.modeling_lfm2_vl import (
+    Lfm2VlForConditionalGeneration as HFLfm2VlForConditionalGeneration,
+)
 
+from nemo_automodel import NeMoAutoModelForImageTextToText
+from nemo_automodel._transformers.model_init import _init_model
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.checkpoint.conversion_mapping import get_combined_key_mapping
+from nemo_automodel.components.models.d1.causal import D1CausalRotaryEmbedding
 from nemo_automodel.components.models.d1.decision_head import D1TokenReadoutConfig
+from nemo_automodel.components.models.d1.records import D1TextExample
 from nemo_automodel.components.models.d1.vl_model import Lfm2VlForConditionalGeneration
+from nemo_automodel.shared.decision_records import QuestionTarget
 
 
 def tiny_config():
@@ -75,6 +83,31 @@ def test_checkpoint_conversion_preserves_released_parameter_names():
     assert converted == names
 
 
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"))],
+)
+def test_released_width_rotary_matches_device_local_frequencies_after_dtype_moves(device):
+    config = tiny_config().text_config
+    config.hidden_size = 256
+    rotary = D1CausalRotaryEmbedding(config).to(device=device, dtype=torch.bfloat16)
+    width = config.hidden_size // config.num_attention_heads
+    assert width == 64
+    expected = 1.0 / config.rope_parameters["rope_theta"] ** (torch.arange(0, width, 2, device=device).float() / width)
+    for dtype in (torch.bfloat16, torch.float32):
+        rotary.to(dtype=dtype)
+        assert rotary.inv_freq.dtype == torch.float32
+        torch.testing.assert_close(rotary.inv_freq, expected, rtol=0, atol=0)
+        torch.testing.assert_close(rotary.original_inv_freq, expected, rtol=0, atol=0)
+        positions = torch.tensor([[0, 17, 159, 4095, 32767], [1, 18, 160, 4096, 32766]], device=device)
+        cosine, sine = rotary(torch.empty(2, 5, config.hidden_size, device=device, dtype=dtype), positions)
+        angles = positions.float().unsqueeze(-1) * expected
+        angles = torch.cat((angles, angles), dim=-1)
+        assert cosine.dtype == sine.dtype == torch.float32
+        torch.testing.assert_close(cosine, angles.cos(), rtol=0, atol=0)
+        torch.testing.assert_close(sine, angles.sin(), rtol=0, atol=0)
+
+
 def test_causal_future_tokens_do_not_change_past():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = Lfm2VlForConditionalGeneration(tiny_config()).eval().to(device)
@@ -111,12 +144,101 @@ def test_image_context_has_gradients_and_frozen_adapter_preserves_tie():
     assert model.get_output_embeddings().weight is model.get_input_embeddings().weight
 
 
-def test_rejects_untying_and_invalid_logit_loss_slicing():
+def test_ordinary_untied_checkpoint_keeps_independent_vocabulary_head():
     config = tiny_config()
     config.tie_word_embeddings = False
-    with pytest.raises(NotImplementedError, match="tie_word_embeddings=False"):
-        Lfm2VlForConditionalGeneration(config)
-    model = Lfm2VlForConditionalGeneration(tiny_config())
-    ids = torch.tensor([[1, 2, 3]])
-    with pytest.raises(ValueError, match="logits_to_keep"):
-        model(ids, labels=ids, logits_to_keep=1)
+    model = Lfm2VlForConditionalGeneration(config)
+    assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight
+    model.tie_weights()
+    assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight
+    assert torch.isfinite(model.get_output_embeddings().weight).all()
+
+
+def test_causal_text_readout_preserves_full_model_alias_scores_and_head_gradients():
+    torch.manual_seed(145)
+    model = Lfm2VlForConditionalGeneration(tiny_config()).eval().requires_grad_(False)
+    examples = [
+        D1TextExample(
+            "record-a", (1, 2, 3), QuestionTarget("flag", 0, ("true", "false"), 0, None), (), ((7, 4), (9,)), 0, 1.0
+        ),
+        D1TextExample(
+            "record-b", (5, 6), QuestionTarget("flag", 0, ("false", "true"), 1, None), (), ((9,), (4, 7)), 0, 1.0
+        ),
+    ]
+    readout = model.prepare_text_readout(examples)
+    features, expected = [], []
+    for ex in examples:
+        ids = torch.tensor([ex.input_ids])
+        with torch.no_grad():
+            features.append(readout.extract_features(ids, torch.ones_like(ids, dtype=torch.bool)))
+            vocabulary_logits = model(ids, use_cache=False).logits[0, -1]
+            expected.append(torch.stack([vocabulary_logits[list(group)].amax() for group in ex.alias_token_ids]))
+    actual = readout.score(features, examples, head=readout.head)
+    for logits, full_model_logits in zip(actual, expected, strict=True):
+        torch.testing.assert_close(logits, full_model_logits, atol=2e-6, rtol=2e-5)
+    torch.nn.functional.cross_entropy(torch.stack(actual), torch.tensor([0, 1])).backward()
+    assert readout.head.delta_weight.grad.abs().sum() > 0
+    assert all(parameter.grad is None for parameter in model.parameters())
+    assert model.get_output_embeddings().weight is model.get_input_embeddings().weight
+    with pytest.raises(ValueError, match="counts"):
+        readout.score(features, examples[:1], head=readout.head)
+    with pytest.raises(ValueError, match="all-true"):
+        readout.extract_features(torch.tensor([[1, 2]]), torch.tensor([[True, False]]))
+
+
+@pytest.mark.parametrize("tied", [False, True])
+@pytest.mark.parametrize("use_cache", [False, True])
+@pytest.mark.parametrize("with_image", [False, True])
+def test_selected_model_generates_like_hf_for_ordinary_lfm2_vl(tied, use_cache, with_image):
+    """The actual default loader preserves text/image generation and cache behavior."""
+    torch.manual_seed(731)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config = tiny_config()
+    config.tie_word_embeddings = tied
+    is_custom, model = _init_model(
+        cls=NeMoAutoModelForImageTextToText,
+        pretrained_model_name_or_path_or_config=config,
+        attn_implementation="sdpa",
+        torch_dtype=torch.float32,
+        quantization_config=None,
+        force_hf=False,
+    )
+    assert is_custom
+    assert isinstance(model, Lfm2VlForConditionalGeneration)
+    assert model.can_generate()
+    reference = HFLfm2VlForConditionalGeneration(config)
+    reference.load_state_dict(model.state_dict(), strict=True)
+    model.to(device).eval()
+    reference.to(device).eval()
+    ids = (
+        torch.tensor([[1, 31, 31, 31, 31, 2, 3]], device=device)
+        if with_image
+        else torch.tensor([[1, 2, 3]], device=device)
+    )
+    image_args = (
+        {
+            "pixel_values": torch.randn(1, 16, 768, device=device),
+            "spatial_shapes": torch.tensor([[4, 4]], device=device),
+            "pixel_attention_mask": torch.ones(1, 16, dtype=torch.int32, device=device),
+        }
+        if with_image
+        else {}
+    )
+    generation_args = {
+        "max_new_tokens": 3,
+        "do_sample": False,
+        "eos_token_id": None,
+        "pad_token_id": 0,
+        "use_cache": use_cache,
+        "return_dict_in_generate": True,
+        "output_scores": True,
+    }
+    with torch.no_grad():
+        actual = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), **image_args, **generation_args)
+        expected = reference.generate(
+            input_ids=ids, attention_mask=torch.ones_like(ids), **image_args, **generation_args
+        )
+    assert actual.sequences.shape == (1, ids.shape[1] + 3)
+    torch.testing.assert_close(actual.sequences, expected.sequences, rtol=0, atol=0)
+    for score, reference_score in zip(actual.scores, expected.scores, strict=True):
+        torch.testing.assert_close(score, reference_score, atol=2e-6, rtol=2e-5)

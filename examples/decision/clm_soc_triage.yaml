@@ -24,7 +24,7 @@
 #       --output_dir runs/clm/sft
 #   # RL from the SFT heads
 #   automodel examples/decision/clm_soc_triage.yaml --nproc-per-node 8 --mode train --loss.mode rl \
-#       --heads.init_checkpoint runs/clm/sft/heads.pt --train.lr 1.0e-4 --train.epochs 10 --output_dir runs/clm/rl
+#       --heads.init_checkpoint runs/clm/sft/heads.pt --optimizer.lr 1.0e-4 --train.epochs 10 --output_dir runs/clm/rl
 
 recipe: nemo_automodel.recipes.decision.train_clm_heads.TrainCLMHeadsRecipe
 
@@ -64,16 +64,25 @@ data:
 train:
   epochs: 20
   batch_size: 64          # records per step (x5 questions)
-  lr: 5.0e-4              # CLM `finetune.py` choice-task default
-  weight_decay: 0.0
-  warmup_ratio: 0.1
   grad_clip: 1.0
   patience: 5
   eval_metric: accuracy  # accuracy | exact_match | reward (use reward for the RL stage)
   train_logit_scale: true
 
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-4              # CLM `finetune.py` choice-task default
+  weight_decay: 0.0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  # null derives warmup from the complete optimizer-step count (10%, capped at 1000).
+  lr_warmup_steps: null
+  init_lr: 0.0
+  min_lr: 0.0
+
 loss:
-  _target_: nemo_automodel.components.decision.losses.DecisionLossConfig
+  _target_: nemo_automodel.components.loss.decision.DecisionLossConfig
   mode: sft               # sft | rl
   label_smoothing: 0.05
   brier_weight: 1.0

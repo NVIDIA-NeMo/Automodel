@@ -59,6 +59,19 @@ class D1CausalShortConv(Lfm2ShortConv):
         Cached decoding and packed sequence indices retain HF's implementation.
         Training uses uncached chains and preserves the publisher's convolution
         accumulation rather than the optional fused causal-conv kernel.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+            past_key_values: Optional HF cache. Cached decoding delegates to HF
+                and updates its per-layer convolution state in place.
+            attention_mask: Optional Tensor of shape [batch, sequence], with
+                one/true for real tokens and zero/false for padding.
+            seq_idx: Optional integer Tensor of shape [batch, sequence] giving
+                packed sequence IDs. When present the HF path owns segment
+                boundary handling and its optional causal-convolution kernel.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden] in the input dtype.
         """
         if past_key_values is not None or seq_idx is not None:
             return super().forward(hidden_states, past_key_values, attention_mask, seq_idx)
@@ -78,7 +91,9 @@ class D1CausalRotaryEmbedding(Lfm2RotaryEmbedding):
 
     def _apply(self, fn, recurse: bool = True) -> D1CausalRotaryEmbedding:
         super()._apply(fn, recurse=recurse)
-        with torch.device("cpu"):
+        # The publisher builds frequencies on the execution device. CPU power
+        # rounding can change a later bfloat16 rotation at the released width.
+        with torch.device(self.inv_freq.device):
             frequencies, scaling = self.compute_default_rope_parameters(self.config)
         self.inv_freq = frequencies.to(self.inv_freq.device)
         self.original_inv_freq = self.inv_freq.clone()
@@ -86,7 +101,16 @@ class D1CausalRotaryEmbedding(Lfm2RotaryEmbedding):
         return self
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute float32 cosine/sine tensors [batch, length, head_dim]."""
+        """Compute the release's float32 rotary factors.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden], supplying the device.
+            position_ids: Long Tensor of shape [batch, sequence].
+
+        Returns:
+            Pair of float32 cosine and sine Tensors, each of shape
+            [batch, sequence, head_dim].
+        """
         return super().forward(x.float(), position_ids)
 
 
@@ -119,14 +143,19 @@ class D1CausalAttention(Lfm2Attention):
         """Run standard GQA after the checkpoint's float32 half-split rotation.
 
         Args:
-            hidden_states: Tensor [batch, length, hidden_size].
-            position_embeddings: Float32 cosines/sines [batch, length, head_dim].
-            attention_mask: Optional causal/padding attention mask.
-            past_key_values: Optional standard HF autoregressive cache.
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+            position_embeddings: Pair of float32 cosine/sine Tensors, each of
+                shape [batch, sequence, head_dim].
+            attention_mask: Optional additive Tensor of shape
+                [batch, 1, sequence, key_sequence], with zero for allowed keys
+                and a negative sentinel for causal/padding exclusions.
+            past_key_values: Optional HF autoregressive cache, updated in place.
             **kwargs: Additional HF attention dispatcher arguments.
 
         Returns:
-            Output [batch, length, hidden_size] and optional attention weights.
+            Pair of output Tensor of shape [batch, sequence, hidden] and
+            optional attention-weight Tensor of shape
+            [batch, heads, sequence, key_sequence]. SDPA returns no weights.
         """
         shape = (*hidden_states.shape[:-1], -1, self.head_dim)
         query = self.q_layernorm(self.q_proj(hidden_states).view(shape)).transpose(1, 2)

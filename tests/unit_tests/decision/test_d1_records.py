@@ -66,10 +66,11 @@ def test_causal_alias_order_preserves_gold_and_rewards():
 
 def test_omni_rejects_invalid_calibration_and_missing_markers():
     record, prompt, tokenizer = inputs()
-    with pytest.raises(ValueError, match="positive"):
-        encode_d1_record(
-            record, tokenizer=tokenizer, prompt=prompt, omni=True, max_length=64, temperatures={"noul:2": 0}
-        )
+    for invalid in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="positive"):
+            encode_d1_record(
+                record, tokenizer=tokenizer, prompt=prompt, omni=True, max_length=64, temperatures={"noul:2": invalid}
+            )
     prompt.encode = lambda *args: ([1, 2, 3], [2])
     with pytest.raises(ValueError, match="option counts"):
         encode_d1_record(record, tokenizer=tokenizer, prompt=prompt, omni=True, max_length=64)

@@ -592,6 +592,33 @@ def option_token_ids(encoded_records: Sequence[EncodedRecord]) -> list[int]:
     return sorted(ids)
 
 
+@torch.no_grad()
+def build_lexical_table(model: torch.nn.Module, records: Sequence[EncodedRecord]) -> "LexicalTable":
+    """Cache the frozen output-embedding rows consumed by the CLEF readout.
+
+    All model-parallel ranks must participate when the output weights are sharded.
+
+    Args:
+        model: Backbone exposing output embeddings of shape [vocabulary, hidden].
+        records: Encoded records whose option spans determine the cached token rows.
+
+    Returns:
+        Frozen table of shape [unique_option_tokens, hidden] on the embedding device.
+
+    Raises:
+        ValueError: If the output embeddings are trainable or no option tokens exist.
+    """
+    weight = model.get_output_embeddings().weight
+    if weight.requires_grad:
+        raise ValueError("CLEF lexical caching requires frozen output embeddings")
+    ids = option_token_ids(records)
+    if not ids:
+        raise ValueError("CLEF lexical caching requires at least one option token")
+    full = weight.full_tensor() if hasattr(weight, "full_tensor") else weight
+    rows = full[torch.tensor(ids, device=full.device)].detach().clone()
+    return LexicalTable(ids, rows).to(rows.device)
+
+
 class LexicalTable(torch.nn.Module):
     """Frozen cache of the output-embedding rows the head needs, indexed by token id.
 

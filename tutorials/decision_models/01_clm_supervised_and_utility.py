@@ -101,7 +101,7 @@ if ENABLE_UTILITY:
             f"--loss.rl_objective={UTILITY_OBJECTIVE}",
             f"--heads.init_checkpoint={RUN / 'sft/heads.pt'}",
             "--train.eval_metric=reward",
-            "--train.lr=0.0001",
+            "--optimizer.lr=0.0001",
             f"--output_dir={RUN / 'rl'}",
         ]
     )

@@ -17,7 +17,7 @@
 The output loads with Cloudflare's ``joint_schema_model.load_release_model`` / ``systemone`` unchanged::
 
     python examples/decision/export_clef_release.py --base Cloudflare/clef \\
-        --stage runs/clef/rl/best --out exports/clef-soc-triage
+        --stage runs/clef/rl/LOWEST_VAL --out exports/clef-soc-triage
 
 LoRA tensors saved by ``TrainClefDecisionRecipe`` are keyed by the Hugging Face module names
 (``<module>.lora_A.weight`` / ``<module>.lora_B.weight``); each pair is merged as
@@ -28,6 +28,7 @@ import argparse
 import logging
 from pathlib import Path
 
+from nemo_automodel.components.checkpoint.utils import read_checkpoint_pointer
 from nemo_automodel.components.models.clef.export import export_release
 
 
@@ -38,12 +39,18 @@ def main() -> None:
     ap.add_argument(
         "--revision", default="ed3eed331870db2eff4b0db01237128ede8a00ce", help="immutable base model revision"
     )
-    ap.add_argument("--stage", required=True, help="stage directory with adapter.safetensors and joint_head.*")
+    ap.add_argument("--stage", required=True, help="published native CLEF stage directory or LOWEST_VAL/LATEST pointer")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
 
-    export_release(args.base, revision=args.revision, stage=Path(args.stage), out=Path(args.out))
+    stage = Path(args.stage)
+    if stage.name in {"LOWEST_VAL", "LATEST"}:
+        resolved = read_checkpoint_pointer(stage.parent, stage.name)
+        if resolved is None:
+            raise FileNotFoundError(f"stage pointer {stage} has no published target")
+        stage = resolved
+    export_release(args.base, revision=args.revision, stage=stage, out=Path(args.out))
 
 
 if __name__ == "__main__":

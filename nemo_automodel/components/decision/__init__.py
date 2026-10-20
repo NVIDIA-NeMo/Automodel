@@ -15,16 +15,13 @@
 """Model-agnostic post-training components for System One / Jev-style decision models.
 
 Decision models read a ``state`` plus a schema of typed questions (``noul`` / ``choice`` / ``score``) and return a
-probability for every allowed option in a single forward pass.  This package holds the parts shared by every such
-model: SystemOne records and targets, SFT / RL objectives, and evaluation metrics.
+probability for every allowed option in a single forward pass. This package holds
+evaluation metrics. Objectives and their validated batch contract live in
+``components.loss.decision`` and ``components.loss.decision_batch``.
 """
 
-from nemo_automodel.components.decision.losses import DecisionLoss, DecisionLossConfig, DecisionTargets
 from nemo_automodel.components.decision.metrics import DecisionEvaluator
 
 __all__ = [
     "DecisionEvaluator",
-    "DecisionLoss",
-    "DecisionLossConfig",
-    "DecisionTargets",
 ]

@@ -45,6 +45,7 @@ import logging
 import math
 import random
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -52,10 +53,12 @@ import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.decision.losses import DecisionLossConfig, build_targets, pad_logits
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.decision.metrics import DecisionEvaluator, save_summary
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loss.decision import DecisionLossConfig
+from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
 from nemo_automodel.components.models.clm.heads import (
     CLM_MAX_TOKENS,
     CLMEmbeddingCacheConfig,
@@ -66,32 +69,22 @@ from nemo_automodel.components.models.clm.heads import (
     load_clm_heads,
     save_clm_heads,
 )
+from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.shared.decision_records import load_records, question_targets, validate_record
+from nemo_automodel.shared.decision_records import QuestionTarget, load_records, question_targets, validate_record
 
 logger = logging.getLogger(__name__)
 
 MODES = ("eval", "train")
 
 
-def _cosine_with_warmup(total_steps: int, warmup_ratio: float):
-    warmup = max(1, int(total_steps * warmup_ratio))
-
-    def fn(step: int) -> float:
-        if step < warmup:
-            return (step + 1) / warmup
-        progress = (step - warmup) / max(1, total_steps - warmup)
-        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-
-    return fn
-
-
 class TrainCLMHeadsRecipe(BaseRecipe):
     """Embed-once, train-heads recipe for CLM decision models (see module docstring)."""
 
-    def __init__(self, cfg: Any):
-        """Store the recipe configuration (a ``ConfigNode`` parsed from YAML)."""
-        self.cfg = cfg
+    def __init__(self, cfg: ConfigNode) -> None:
+        """Resolve the YAML boundary to typed optimizer and scheduler configs."""
+        self.cfg = RecipeConfig(cfg)
 
     # ------------------------------------------------------------------ setup
     def setup(self) -> None:
@@ -225,16 +218,36 @@ class TrainCLMHeadsRecipe(BaseRecipe):
         return EmbeddingTable.load(cache)
 
     # ------------------------------------------------------------------ forward / eval
-    def _forward(self, heads: CLMHeadPair, records: list[dict[str, Any]]):
-        """Per-question logits and aligned targets for a batch of records.
+    def _forward(
+        self, heads: CLMHeadPair, records: list[dict[str, Any]]
+    ) -> tuple[list[list[QuestionLogits]], list[list[QuestionTarget]]]:
+        """Score records while retaining actual question and option output order.
+
+        Args:
+            heads: CLM state/action projection heads.
+            records: Records in input batch order.
 
         Returns:
-            ``(logits, targets)``: ``logits`` is a flat list with one tensor of shape [options_i] per question of every
-            record (record-major); ``targets[r]`` lists the :class:`QuestionTarget` of record ``r`` in the same order.
+            Identified logits and targets grouped by record. Each logit values
+            tensor has shape [options] in the corresponding CLM option order.
         """
         states, options, counts, orders = clm_batch(records, self.table, self.device)
-        logits = heads.question_logits(states, options, counts)
-        targets = [question_targets(r, o) for r, o in zip(records, orders)]
+        flat_logits = heads.question_logits(states, options, counts)
+        if len(flat_logits) != sum(len(order) for order in orders):
+            raise ValueError("CLM output question count does not match the encoded option orders")
+        logits = []
+        targets = []
+        offset = 0
+        for record, order in zip(records, orders, strict=True):
+            rows = flat_logits[offset : offset + len(order)]
+            logits.append(
+                [
+                    QuestionLogits(str(record["id"]), question_id, tuple(option_ids), values)
+                    for (question_id, option_ids), values in zip(order.items(), rows, strict=True)
+                ]
+            )
+            targets.append(question_targets(record, order))
+            offset += len(order)
         return logits, targets
 
     @torch.no_grad()
@@ -247,10 +260,7 @@ class TrainCLMHeadsRecipe(BaseRecipe):
         for b in range(0, len(records), batch_size):
             batch = records[b : b + batch_size]
             logits, targets = self._forward(heads, batch)
-            probs, k = [], 0
-            for ts in targets:
-                probs.append([logits[k + j].float().softmax(-1).tolist() for j in range(len(ts))])
-                k += len(ts)
+            probs = [[question.values.float().softmax(-1).tolist() for question in record] for record in logits]
             evaluator.add_batch(batch, targets, probs)
         return evaluator.summary(), evaluator.predictions()
 
@@ -323,15 +333,26 @@ class TrainCLMHeadsRecipe(BaseRecipe):
             reference = copy.deepcopy(heads).eval()
             for p in reference.parameters():
                 p.requires_grad_(False)
-        params = [p for n, p in heads.named_parameters() if tget("train_logit_scale", True) or n != "logit_scale"]
-        optimizer = torch.optim.AdamW(params, lr=float(tget("lr", 5e-4)), weight_decay=float(tget("weight_decay", 0.0)))
+        if epochs <= 0 or batch_size <= 0 or not train_records:
+            raise ValueError("train.epochs, train.batch_size and the training split must be nonempty and positive")
+        heads.set_logit_scale_trainable(enabled=bool(tget("train_logit_scale", True)))
+        if self.cfg.optimizer is None:
+            raise ValueError("optimizer must be configured for CLM head training")
+        optimizers = self.cfg.optimizer.build(heads)
+        params = [parameter for parameter in heads.parameters() if parameter.requires_grad]
         steps_per_epoch = math.ceil(len(train_records) / batch_size)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, _cosine_with_warmup(epochs * steps_per_epoch, float(tget("warmup_ratio", 0.1)))
+        step_scheduler = StepSchedulerConfig(
+            global_batch_size=batch_size,
+            num_epochs=epochs,
+            max_steps=epochs * steps_per_epoch,
+            preemption_signal=None,
+        ).build(dataloader=None, dp_group_size=1, local_batch_size=batch_size)
+        schedulers = (
+            self.cfg.lr_scheduler.build(optimizers, step_scheduler) if self.cfg.lr_scheduler is not None else []
         )
         generator = torch.Generator(device=self.device).manual_seed(self.seed)
 
-        def val_score(h):
+        def val_score(h: CLMHeadPair) -> float | None:
             if not val_records:
                 return None
             summary, _ = self.evaluate(h, val_records)
@@ -351,27 +372,41 @@ class TrainCLMHeadsRecipe(BaseRecipe):
                 random.shuffle(train_records)
                 for b in range(0, len(train_records), batch_size):
                     batch = train_records[b : b + batch_size]
-                    logits_list, targets = self._forward(heads, batch)
-                    flat = [q for ts in targets for q in ts]
-                    ref = None
+                    logits, questions = self._forward(heads, batch)
+                    reference_logprobs = None
                     if reference is not None:
                         with torch.no_grad():
                             ref_logits, _ = self._forward(reference, batch)
-                            ref = [x.float().log_softmax(-1).tolist() for x in ref_logits]
-                    t = build_targets(flat, loss_cfg.question_weights, ref).to(self.device)
-                    logits, _ = pad_logits(logits_list)
-                    if float(loss_fn.normalization_weight(t)) <= 0:
+                            reference_logprobs = [
+                                [
+                                    replace(question, values=question.values.float().log_softmax(-1))
+                                    for question in record
+                                ]
+                                for record in ref_logits
+                            ]
+                    targets = DecisionTargets.from_questions(
+                        record_ids=[str(record["id"]) for record in batch],
+                        questions=questions,
+                        question_weights=loss_cfg.question_weights,
+                        reference_logprobs=reference_logprobs,
+                        device=self.device,
+                    )
+                    assembled = assemble_decision_batch(logits=logits, targets=targets)
+                    if float(loss_fn.normalization_weight(assembled.targets)) <= 0:
                         raise ValueError("training batch has no supervised labels or explicit rewards")
-                    loss, metrics = loss_fn(logits, t, generator=generator)
-                    optimizer.zero_grad(set_to_none=True)
+                    loss, metrics = loss_fn(assembled.logits, assembled.targets, generator=generator)
+                    for optimizer in optimizers:
+                        optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(params, float(tget("grad_clip", 1.0)))
-                    optimizer.step()
-                    scheduler.step()
+                    for optimizer in optimizers:
+                        optimizer.step()
+                    for scheduler in schedulers:
+                        scheduler.step(1)
                     step += 1
                     row = {"epoch": epoch, "step": step, "loss": loss.item(), "grad_norm": grad_norm.item()}
                     row.update({k: v.item() for k, v in metrics.items()})
-                    row["lr"] = scheduler.get_last_lr()[0]
+                    row["lr"] = optimizers[0].param_groups[0]["lr"]
                     log.write(json.dumps(row) + "\n")
                 score = val_score(heads)
                 logger.info("[%s] epoch %d loss=%.4f val %s=%s", self.tag, epoch, row["loss"], metric, score)

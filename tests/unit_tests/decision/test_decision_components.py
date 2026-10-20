@@ -19,11 +19,13 @@ import math
 import pytest
 import torch
 
-from nemo_automodel.components.decision import losses, metrics
-from nemo_automodel.shared import decision_records as schema
+from nemo_automodel.components.decision import metrics
+from nemo_automodel.components.loss import decision as losses
+from nemo_automodel.components.loss import decision_batch as batching
 from nemo_automodel.components.models.clef import joint_schema_head as clef
 from nemo_automodel.components.models.clm import heads as clm
 from nemo_automodel.components.models.clm import prompting as clm_prompting
+from nemo_automodel.shared import decision_records as schema
 
 QUESTIONS = {
     "verdict": {
@@ -84,7 +86,9 @@ def test_validate_rejects_unknown_answer():
 def test_sft_loss_prefers_gold_and_is_finite():
     record = make_record()
     order = {q: schema.canonical_option_ids(QUESTIONS[q]) for q in QUESTIONS}
-    t = losses.build_targets(schema.question_targets(record, order))
+    t = batching.DecisionTargets.from_questions(
+        record_ids=[record["id"]], questions=[schema.question_targets(record, order)]
+    )
     logits = torch.zeros(t.option_mask.shape, requires_grad=True)
     loss, m = losses.DecisionLossConfig(mode="sft").build()(logits, t)
     loss.backward()
@@ -97,7 +101,7 @@ def test_sft_loss_prefers_gold_and_is_finite():
 
 
 def test_expected_reward_gradient_is_exact_policy_gradient():
-    t = losses.DecisionTargets(
+    t = batching.DecisionTargets(
         labels=torch.tensor([0]),
         option_mask=torch.tensor([[True, True, True]]),
         question_types=torch.tensor([1]),
@@ -116,7 +120,7 @@ def test_expected_reward_gradient_is_exact_policy_gradient():
 
 
 def test_grpo_matches_expected_reward_in_expectation():
-    t = losses.DecisionTargets(
+    t = batching.DecisionTargets(
         labels=torch.tensor([0]),
         option_mask=torch.tensor([[True, True, True, False]]),
         question_types=torch.tensor([1]),
@@ -137,8 +141,11 @@ def test_grpo_matches_expected_reward_in_expectation():
 
 
 def test_kl_to_identical_reference_is_zero():
-    t = losses.build_targets(
-        schema.question_targets(make_record(), {q: schema.canonical_option_ids(QUESTIONS[q]) for q in QUESTIONS})
+    t = batching.DecisionTargets.from_questions(
+        record_ids=["r1"],
+        questions=[
+            schema.question_targets(make_record(), {q: schema.canonical_option_ids(QUESTIONS[q]) for q in QUESTIONS})
+        ],
     )
     logits = torch.randn(t.option_mask.shape)
     ref = losses.masked_log_softmax(logits, t.option_mask)
@@ -196,7 +203,6 @@ def test_clm_heads_match_reference_package(tmp_path):
     clm_heads = pytest.importorskip("clm.heads")
     import numpy as np
 
-    cfg = {"width": 64, "depth": 3, "projection_dim": 16, "layernorm": True, "residual": False, "hidden_size": 32}
     heads = clm.CLMHeadConfig(
         hidden_size=32, width=64, depth=3, projection_dim=16, activation="gelu", layer_norm=True, residual=False
     ).build(initial_temperature=math.exp(-2.0))
@@ -240,10 +246,16 @@ def test_clef_encode_head_and_targets():
     assert order["verdict"] == ("benign_authorized", "false_positive", "malicious")  # Clef sorts choice keys
     assert order["needs_human"] == ("true", "false")
     targets = [schema.question_targets(r, clef.clef_option_orders(e)) for r, e in zip(records, encoded)]
-    t = losses.build_targets([q for ts in targets for q in ts])
-    logits, mask = losses.pad_logits([q for rec in out for q in rec])
-    assert torch.equal(mask, t.option_mask)
-    loss, _ = losses.DecisionLossConfig(mode="sft").build()(logits, t)
+    t = batching.DecisionTargets.from_questions(record_ids=[r["id"] for r in records], questions=targets)
+    identified = [
+        [
+            batching.QuestionLogits(record["id"], target.question_id, target.option_ids, row)
+            for target, row in zip(record_targets, record_logits, strict=True)
+        ]
+        for record, record_targets, record_logits in zip(records, targets, out, strict=True)
+    ]
+    batch = batching.assemble_decision_batch(logits=identified, targets=t)
+    loss, _ = losses.DecisionLossConfig(mode="sft").build()(batch.logits, batch.targets)
     loss.backward()
     assert head.prior_logit_scale.grad is not None
 
@@ -274,7 +286,7 @@ def test_clef_head_save_load_roundtrip(tmp_path):
 
 @pytest.mark.parametrize("temperature", [0.5, 2.0])
 def test_grpo_temperature_scores_the_sampling_policy(temperature):
-    targets = losses.DecisionTargets(
+    targets = batching.DecisionTargets(
         labels=torch.tensor([0]),
         option_mask=torch.tensor([[True, True, True]]),
         question_types=torch.tensor([1]),
@@ -315,7 +327,7 @@ def test_invalid_objective_settings_are_rejected(settings):
 
 def test_rl_without_labels_or_rewards_does_not_invent_option_zero():
     logits = torch.zeros(1, 2, requires_grad=True)
-    targets = losses.DecisionTargets(
+    targets = batching.DecisionTargets(
         labels=torch.tensor([-100]), option_mask=torch.ones(1, 2, dtype=torch.bool), question_types=torch.tensor([1])
     )
     loss, metrics = losses.DecisionLossConfig(mode="rl").build()(logits, targets)
@@ -327,7 +339,7 @@ def test_rl_without_labels_or_rewards_does_not_invent_option_zero():
 
 def test_rl_explicit_reward_learns_without_gold_label():
     logits = torch.zeros(1, 2, requires_grad=True)
-    targets = losses.DecisionTargets(
+    targets = batching.DecisionTargets(
         labels=torch.tensor([-100]),
         option_mask=torch.ones(1, 2, dtype=torch.bool),
         question_types=torch.tensor([1]),
@@ -343,13 +355,13 @@ def test_rl_mixed_feedback_batch_matches_feedback_only_loss_and_gradient():
     cfg = losses.DecisionLossConfig(mode="rl", kl_coef=0.0, anchor_weight=0.2)
     mixed_logits = torch.tensor([[0.9, -0.4], [0.2, 0.7]], requires_grad=True)
     single_logits = mixed_logits.detach()[1:].clone().requires_grad_()
-    mixed_targets = losses.DecisionTargets(
+    mixed_targets = batching.DecisionTargets(
         labels=torch.tensor([-100, 1]),
         option_mask=torch.ones(2, 2, dtype=torch.bool),
         question_types=torch.tensor([1, 1]),
         weights=torch.tensor([17.0, 3.0]),
     )
-    single_targets = losses.DecisionTargets(
+    single_targets = batching.DecisionTargets(
         labels=torch.tensor([1]),
         option_mask=torch.ones(1, 2, dtype=torch.bool),
         question_types=torch.tensor([1]),
@@ -367,7 +379,7 @@ def test_rl_mixed_feedback_batch_matches_feedback_only_loss_and_gradient():
 @pytest.mark.parametrize("mask", [torch.tensor([[False, False]]), torch.tensor([[1, 1]]), torch.tensor([[True]])])
 def test_invalid_option_masks_fail_before_softmax(mask):
     logits = torch.zeros(1, 2, requires_grad=True)
-    targets = losses.DecisionTargets(labels=torch.tensor([0]), option_mask=mask, question_types=torch.tensor([1]))
+    targets = batching.DecisionTargets(labels=torch.tensor([0]), option_mask=mask, question_types=torch.tensor([1]))
     with pytest.raises(ValueError, match="option"):
         losses.DecisionLossConfig().build()(logits, targets)
     assert logits.grad is None

@@ -18,8 +18,8 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
-from safetensors.torch import load_file
 
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.models.clef.joint_schema_head import (
     ClefHeadConfig,
     EncodedQuestion,
@@ -60,7 +60,7 @@ class FrozenBackbone(nn.Module):
         return SimpleNamespace(hidden_states=(self.embedding(input_ids),))
 
 
-def recipe():
+def recipe(output):
     torch.manual_seed(7)
     result = TrainClefDecisionRecipe.__new__(TrainClefDecisionRecipe)
     result.model = FrozenBackbone()
@@ -72,11 +72,14 @@ def recipe():
     result.dist_env = SimpleNamespace(is_main=True)
     result.tag = "sft"
     result.cfg = {}
+    result.checkpointer = CheckpointingConfig(checkpoint_dir=output, is_peft=False, save_consolidated=False).build(
+        dp_rank=0, tp_rank=0, pp_rank=0
+    )
     return result
 
 
 def test_frozen_backbone_head_forward_update_and_stage_reload(tmp_path):
-    run = recipe()
+    run = recipe(tmp_path)
     record = EncodedRecord(
         input_ids=(1, 2, 3, 4),
         record_id="example",
@@ -93,12 +96,19 @@ def test_frozen_backbone_head_forward_update_and_stage_reload(tmp_path):
     assert any(not torch.equal(value, before_head[name]) for name, value in run.head.state_dict().items())
     for name, value in run.model.state_dict().items():
         torch.testing.assert_close(value, before_backbone[name], rtol=0, atol=0)
-    run._save_stage(tmp_path)
-    assert load_file(str(tmp_path / "adapter.safetensors")) == {}
-    saved = {name: value.clone() for name, value in run.head.state_dict().items()}
-    with torch.no_grad():
-        for parameter in run.head.parameters():
-            parameter.add_(1)
-    run._load_stage(tmp_path)
-    for name, value in run.head.state_dict().items():
-        torch.testing.assert_close(value, saved[name], rtol=0, atol=0)
+    stage = tmp_path / "stage"
+    try:
+        run._save_stage(stage)
+        assert not (stage / "model").exists()
+        assert (stage / "head" / ".metadata").exists()
+        saved = {name: value.clone() for name, value in run.head.state_dict().items()}
+        with torch.no_grad():
+            for parameter in run.head.parameters():
+                parameter.add_(1)
+        run._load_stage(stage)
+        for name, value in run.head.state_dict().items():
+            torch.testing.assert_close(value, saved[name], rtol=0, atol=0)
+        for name, value in run.model.state_dict().items():
+            torch.testing.assert_close(value, before_backbone[name], rtol=0, atol=0)
+    finally:
+        run.checkpointer.close()

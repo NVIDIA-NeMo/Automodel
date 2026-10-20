@@ -19,7 +19,6 @@ import torch
 from nemo_automodel.components.loss.decision import (
     group_masked_bidirectional_infonce,
     rlcr_loss,
-    typed_question_cross_entropy,
 )
 
 
@@ -39,14 +38,6 @@ def test_group_masked_bidirectional_infonce_prefers_aligned_pairs():
 
     assert aligned < permuted
     assert torch.isfinite(grouped)
-
-
-def test_typed_question_cross_entropy_supports_ragged_options():
-    logits = [[torch.tensor([3.0, 0.0]), torch.tensor([0.0, 1.0, 4.0])]]
-    loss = typed_question_cross_entropy(logits, [[0, 2]])
-
-    assert loss.ndim == 0
-    assert loss < 0.2
 
 
 def test_rlcr_loss_has_finite_gradient():

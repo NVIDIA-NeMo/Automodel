@@ -61,6 +61,14 @@ class D1TokenReadout(nn.Module):
     """
 
     def __init__(self, config: D1TokenReadoutConfig, vocabulary_weight: torch.Tensor) -> None:
+        """Copy frozen vocabulary rows and initialize independent additive updates.
+
+        Args:
+            config: Answer-alias vocabulary row selection and hidden width.
+            vocabulary_weight: Tensor of shape [vocab, hidden]. Selected base
+                rows are detached and cloned; neither buffer nor trainable
+                updates alias the original vocabulary weight.
+        """
         super().__init__()
         self.config = config
         if vocabulary_weight.ndim != 2 or vocabulary_weight.shape[1] != config.hidden_size:
@@ -76,11 +84,12 @@ class D1TokenReadout(nn.Module):
         """Score declared options by their maximum answer-alias logit.
 
         Args:
-            hidden_states: Tensor [..., hidden_size] at the answer position.
+            hidden_states: Tensor of shape [..., hidden], with arbitrary leading
+                dimensions, at each causal chain's answer position.
             alias_groups: Adapter row indices for each option, in target order.
 
         Returns:
-            Float32 logits with shape [..., options], before option softmax.
+            Float32 Tensor of shape [..., options], before option softmax.
         """
         if hidden_states.shape[-1] != self.config.hidden_size:
             raise ValueError("hidden_states must end in hidden_size")
@@ -143,14 +152,14 @@ class D1OmniDecisionHead(nn.Module):
         """Score each option marker in internal checkpoint order.
 
         Args:
-            hidden_states: Tensor [batch, text_length, hidden_size], excluding media prefixes.
-            valid_tokens: Boolean tensor [batch, text_length], true for non-padding tokens.
-            marker_positions: Long tensor [batch, options], indexing text positions.
-            valid_markers: Boolean tensor [batch, options], true for declared options.
-            question_types: Long tensor [batch] with choice=0, score=1, noul=2.
+            hidden_states: Tensor of shape [batch, sequence, hidden], excluding media prefixes.
+            valid_tokens: Boolean Tensor of shape [batch, sequence], true for non-padding tokens.
+            marker_positions: Long Tensor of shape [batch, options], indexing text positions.
+            valid_markers: Boolean Tensor of shape [batch, options], true for declared options.
+            question_types: Long Tensor of shape [batch] with choice=0, score=1, noul=2.
 
         Returns:
-            Float32 logits [batch, options], with padding options set to -10000.
+            Float32 Tensor of shape [batch, options], with padding options set to -10000.
         """
         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.config.hidden_size:
             raise ValueError("hidden_states must have shape [batch, text_length, hidden_size]")

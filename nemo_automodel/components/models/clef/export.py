@@ -20,7 +20,10 @@ import shutil
 from pathlib import Path
 
 import torch
+import torch.distributed.checkpoint as dcp
 from safetensors.torch import load_file
+
+from nemo_automodel.components.models.clef.joint_schema_head import ClefHeadConfig, save_joint_head
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +65,7 @@ def export_release(base: str | Path, *, revision: str, stage: Path, out: Path) -
     Args:
         base: Hub repository ID or existing local base release directory.
         revision: Immutable Hub commit ID for remote model files.
-        stage: Directory containing a head and optional LoRA tensors.
+        stage: Published native CLEF stage containing DCP head state and optional native PEFT model weights.
         out: Destination for the merged release.
     """
     from huggingface_hub import snapshot_download
@@ -70,9 +73,21 @@ def export_release(base: str | Path, *, revision: str, stage: Path, out: Path) -
 
     base = Path(base) if Path(base).is_dir() else Path(snapshot_download(base, revision=revision))
     stage, out = Path(stage), Path(out)
-    meta = json.loads((stage / "adapter_config.json").read_text())
-    adapter = load_file(str(stage / "adapter.safetensors"))
-    scale = float(meta["alpha"]) / float(meta["dim"]) if adapter else 0.0
+    manifest = json.loads((stage / "stage.json").read_text())
+    if manifest.get("format") != "clef-native-stage-v1":
+        raise ValueError("export requires a published native CLEF stage")
+    if (stage / ".incomplete").exists():
+        raise ValueError("cannot export an incomplete stage")
+    adapter, scale = {}, 0.0
+    if manifest["backbone_adapter"]:
+        meta = json.loads((stage / "model" / "adapter_config.json").read_text())
+        if meta.get("use_dora"):
+            raise ValueError("CLEF merged export currently supports ordinary LoRA, not DoRA")
+        adapter = {
+            name.removeprefix("base_model.model."): value
+            for name, value in load_file(str(stage / "model" / "adapter_model.safetensors")).items()
+        }
+        scale = float(meta["lora_alpha"]) / float(meta["r"])
 
     model = Qwen3_5ForConditionalGeneration.from_pretrained(base, dtype=torch.bfloat16)
     state = model.state_dict()
@@ -80,8 +95,11 @@ def export_release(base: str | Path, *, revision: str, stage: Path, out: Path) -
     model.load_state_dict(state)
     logger.info("merged %d LoRA modules (scale %.3f)", n, scale)
     model.save_pretrained(out)
-    for name in ("joint_head.safetensors", "joint_head_config.json"):
-        shutil.copy(stage / name, out / name)
+    head = ClefHeadConfig(**manifest["head_config"]).build()
+    head_state = head.state_dict()
+    dcp.load(head_state, checkpoint_id=str(stage / "head"))
+    head.load_state_dict(head_state, strict=True)
+    save_joint_head(head, out, dtype=torch.float32)
     # Tokenizer / processor files and Cloudflare's loader are copied verbatim from the base release.
     for name in (
         "tokenizer.json",

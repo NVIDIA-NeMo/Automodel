@@ -34,6 +34,8 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.d1.config import D1OmniConfig
 from nemo_automodel.components.models.d1.decision_head import D1OmniHeadConfig
 from nemo_automodel.components.models.d1.encoder import D1OmniEncoder
+from nemo_automodel.components.models.d1.records import D1TextExample
+from nemo_automodel.components.models.d1.text_readout import D1OmniTextReadout
 
 OMNI_REPOSITORY = "LiquidAI/d1-omni-600M"
 OMNI_REVISION = "02b55d7076f15129e59ab3f94783f32c4b088674"
@@ -88,12 +90,36 @@ class D1OmniModel(HFCheckpointingMixin, PreTrainedModel):
         """Replace the text embedding table."""
         self.encoder.embed_tokens = value
 
+    def prepare_text_readout(self, examples: list[D1TextExample]) -> D1OmniTextReadout:
+        """Prepare the released marker readout for text-only adaptation.
+
+        Args:
+            examples: Publisher-encoded questions; marker identity and calibration
+                remain attached to each example and are consumed when scoring.
+
+        Returns:
+            Sequence feature extractor and the released float32 marker head.
+        """
+        return D1OmniTextReadout(self)
+
     def encode_images(self, images: list[Any]) -> torch.Tensor:
-        """Encode ordered PIL images into a single [1, prefix_length, width] prefix."""
+        """Encode ordered PIL images into a perception prefix.
+
+        Returns:
+            Tensor of shape [1, prefix_sequence, hidden], concatenating all images.
+        """
         return self.vision(images)
 
     def encode_audio(self, audio: Any) -> torch.Tensor:
-        """Encode a mono 16 kHz clip into a [1, prefix_length, width] prefix."""
+        """Encode a mono 16 kHz clip into a perception prefix.
+
+        Args:
+            audio: Float Tensor or array of shape [samples], containing a mono
+                waveform sampled at 16 kHz, as accepted by the pinned perception module.
+
+        Returns:
+            Tensor of shape [1, prefix_sequence, hidden].
+        """
         return self.audio(audio)
 
     def encode_text(
@@ -106,13 +132,16 @@ class D1OmniModel(HFCheckpointingMixin, PreTrainedModel):
         """Encode text with optional precomputed perception prefixes.
 
         Args:
-            input_ids: Long tensor [batch, text_length], with right padding.
-            attention_mask: Boolean tensor [batch, text_length], true for text tokens.
-            media_prefix: Optional tensor [batch, padded_prefix_length, width].
-            media_lengths: Optional long tensor [batch] specifying prefix lengths.
+            input_ids: Long Tensor of shape [batch, sequence], with right padding.
+            attention_mask: Boolean Tensor of shape [batch, sequence], true for text tokens.
+            media_prefix: Optional Tensor of shape [batch, padded_prefix_sequence, hidden].
+            media_lengths: Optional long Tensor of shape [batch] specifying real prefix lengths.
 
         Returns:
-            Text states [batch, longest_real_text, width] and their boolean mask.
+            Pair of normalized text-state Tensor of shape
+            [batch, longest_real_text, hidden] and boolean Tensor of shape
+            [batch, longest_real_text] marking real text tokens. Prefix states
+            are excluded; outputs do not alias the supplied prefix.
         """
         if input_ids.ndim != 2 or input_ids.dtype != torch.long:
             raise ValueError("input_ids must be long with shape [batch, text_length]")
@@ -176,18 +205,20 @@ class D1OmniModel(HFCheckpointingMixin, PreTrainedModel):
         """Return differentiable option logits in the released internal ordering.
 
         Args:
-            input_ids: Long tensor [batch, text_length].
-            attention_mask: Boolean tensor [batch, text_length].
-            marker_positions: Long tensor [batch, options], relative to text.
-            marker_mask: Boolean tensor [batch, options] marking declared options.
-            question_types: Long tensor [batch], choice=0, score=1, noul=2.
-            media_prefix: Optional tensor [batch, padded_prefix_length, width].
-            media_lengths: Optional long tensor [batch] giving prefix lengths.
-            labels: Optional long tensor [batch] of internal option indices.
+            input_ids: Long Tensor of shape [batch, sequence], with right padding.
+            attention_mask: Boolean Tensor of shape [batch, sequence], true for text tokens.
+            marker_positions: Long Tensor of shape [batch, options], relative to text.
+            marker_mask: Boolean Tensor of shape [batch, options] marking declared options.
+            question_types: Long Tensor of shape [batch], choice=0, score=1, noul=2.
+            media_prefix: Optional Tensor of shape [batch, padded_prefix_sequence, hidden].
+            media_lengths: Optional long Tensor of shape [batch] giving real prefix lengths.
+            labels: Optional long Tensor of shape [batch] of internal option indices.
 
         Returns:
-            SequenceClassifierOutput containing logits [batch, options], optional
-            cross-entropy loss, and a tuple containing normalized text states.
+            SequenceClassifierOutput containing float32 logits Tensor of shape
+            [batch, options], optional scalar cross-entropy Tensor, and a
+            one-element hidden_states tuple containing normalized text Tensor
+            of shape [batch, longest_real_text, hidden].
         """
         text, valid = self.encode_text(input_ids, attention_mask, media_prefix, media_lengths)
         logits = self.head(text, valid, marker_positions, marker_mask, question_types)

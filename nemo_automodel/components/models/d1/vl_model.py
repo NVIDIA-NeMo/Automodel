@@ -21,9 +21,10 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
-from transformers import Lfm2VlConfig, PreTrainedModel
-from transformers.models.lfm2_vl.modeling_lfm2_vl import Lfm2VlCausalLMOutputWithPast, Lfm2VlModel
+from transformers import Lfm2VlConfig
+from transformers.models.lfm2_vl.modeling_lfm2_vl import (
+    Lfm2VlForConditionalGeneration as HFLfm2VlForConditionalGeneration,
+)
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -35,19 +36,23 @@ from nemo_automodel.components.models.d1.causal import (
     D1CausalRotaryEmbedding,
     D1CausalShortConv,
 )
+from nemo_automodel.components.models.d1.records import D1TextExample
+from nemo_automodel.components.models.d1.text_readout import D1CausalTextReadout
 
 
-class Lfm2VlForConditionalGeneration(HFCheckpointingMixin, PreTrainedModel):
+class Lfm2VlForConditionalGeneration(HFCheckpointingMixin, HFLfm2VlForConditionalGeneration):
     """D1-3B's chain execution, using HF vision and native precision-correct LFM2.
 
     Questions are independent causal chains. The release's shared-trunk tree
     batching is an inference optimization and is not used by this training path.
-    Parameter names and the shared input/output embedding identity are retained.
+    Parameter names and the checkpoint's input/output tying policy are retained.
+    Ordinary LFM2-VL checkpoints retain the inherited HuggingFace generation,
+    cache, forward-output and image-feature interfaces.
     """
 
     config_class = Lfm2VlConfig
     base_model_prefix = "model"
-    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     _supports_sdpa = True
 
@@ -63,7 +68,6 @@ class Lfm2VlForConditionalGeneration(HFCheckpointingMixin, PreTrainedModel):
     def __init__(self, config: Lfm2VlConfig) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
-        self.model = Lfm2VlModel(config)
         language = self.model.language_model
         for layer in language.layers:
             if layer.is_attention_layer:
@@ -72,20 +76,20 @@ class Lfm2VlForConditionalGeneration(HFCheckpointingMixin, PreTrainedModel):
                 layer.conv = D1CausalShortConv(layer.conv)
         with torch.device("cpu"):
             language.rotary_emb = D1CausalRotaryEmbedding(config.text_config)
-        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.tie_weights()
 
     def tie_weights(self, **kwargs: Any) -> None:
-        """Share the released vocabulary weight with the text input embeddings."""
+        """Honor the checkpoint's tied or independently initialized vocabulary head."""
         reject_unsupported_tie_word_embeddings(type(self), self.config)
-        self.lm_head.weight = self.model.language_model.embed_tokens.weight
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the released text embedding table."""
         return self.model.language_model.embed_tokens
 
     def get_output_embeddings(self) -> nn.Linear:
-        """Return the tied vocabulary projection."""
+        """Return the vocabulary projection, honoring the checkpoint's tying policy."""
         return self.lm_head
 
     def set_input_embeddings(self, value: nn.Embedding) -> None:
@@ -103,58 +107,13 @@ class Lfm2VlForConditionalGeneration(HFCheckpointingMixin, PreTrainedModel):
         """Dtype of the text embedding table."""
         return self.get_input_embeddings().weight.dtype
 
-    def forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        spatial_shapes: torch.Tensor | None = None,
-        pixel_attention_mask: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        labels: torch.Tensor | None = None,
-        logits_to_keep: int = 0,
-        **kwargs: Any,
-    ) -> Lfm2VlCausalLMOutputWithPast:
-        """Run a causal chain with optional processed images.
+    def prepare_text_readout(self, examples: list[D1TextExample]) -> D1CausalTextReadout:
+        """Prepare the released answer-alias adapter for text-only adaptation.
 
         Args:
-            input_ids: Optional long tensor [batch, length].
-            attention_mask: Optional tensor [batch, length] marking real tokens.
-            position_ids: Optional long tensor [batch, length].
-            pixel_values: Optional HF-processed image patches.
-            spatial_shapes: Optional image-grid dimensions [images, 2].
-            pixel_attention_mask: Optional real-patch mask.
-            inputs_embeds: Optional tensor [batch, length, hidden_size], replacing IDs.
-            labels: Optional long next-token targets [batch, length], -100 for ignored targets.
-            logits_to_keep: Number of trailing logits to return; zero returns all positions.
-            **kwargs: Additional HF backbone arguments, including use_cache.
+            examples: Publisher-encoded questions used to select answer vocabulary rows.
 
         Returns:
-            HF-compatible causal output with tied-vocabulary logits and optional loss.
+            Final-token feature extractor and zero-initialized answer-row adapter.
         """
-        if logits_to_keep < 0 or (labels is not None and logits_to_keep):
-            raise ValueError("logits_to_keep must be nonnegative and zero when computing a causal loss")
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            pixel_values=pixel_values,
-            spatial_shapes=spatial_shapes,
-            pixel_attention_mask=pixel_attention_mask,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
-        hidden = outputs.last_hidden_state[:, -logits_to_keep:] if logits_to_keep else outputs.last_hidden_state
-        logits = self.lm_head(hidden)
-        loss = None
-        if labels is not None:
-            loss = F.cross_entropy(logits[:, :-1].float().reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1))
-        return Lfm2VlCausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            image_hidden_states=outputs.image_hidden_states,
-        )
+        return D1CausalTextReadout(self, examples)

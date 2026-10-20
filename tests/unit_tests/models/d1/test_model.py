@@ -26,6 +26,8 @@ from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.d1 import model as model_module
 from nemo_automodel.components.models.d1.config import D1OmniConfig
 from nemo_automodel.components.models.d1.model import D1OmniModel
+from nemo_automodel.components.models.d1.records import D1TextExample
+from nemo_automodel.shared.decision_records import QuestionTarget
 
 
 class StubPerception(nn.Module):
@@ -130,3 +132,39 @@ def test_checkpoint_config_resolves_through_shared_automodel_path(config, tmp_pa
     assert isinstance(loaded, D1OmniConfig)
     assert loaded.text_config.hidden_size == 64
     assert loaded.architectures == ["D1OmniModel"]
+
+
+def test_omni_text_readout_preserves_full_model_scores_calibration_and_gradients(model):
+    model.requires_grad_(False)
+    examples = [
+        D1TextExample(
+            "record-a", (1, 2, 3, 4), QuestionTarget("flag", 0, ("false", "true"), 1, None), (1, 3), (), 2, 1.7
+        ),
+        D1TextExample("record-b", (5, 6, 7), QuestionTarget("flag", 0, ("false", "true"), 0, None), (0, 2), (), 2, 0.8),
+    ]
+    readout = model.prepare_text_readout(examples)
+    readout.head.requires_grad_(True)
+    features, expected = [], []
+    for ex in examples:
+        ids = torch.tensor([ex.input_ids])
+        valid = torch.ones_like(ids, dtype=torch.bool)
+        with torch.no_grad():
+            features.append(readout.extract_features(ids, valid))
+            expected.append(
+                model(
+                    ids,
+                    valid,
+                    torch.tensor([ex.marker_positions]),
+                    torch.ones(1, 2, dtype=torch.bool),
+                    torch.tensor([2]),
+                ).logits[0]
+                / ex.temperature
+            )
+    actual = readout.score(features, examples, head=readout.head)
+    for logits, full_model_logits in zip(actual, expected, strict=True):
+        torch.testing.assert_close(logits, full_model_logits, atol=2e-6, rtol=2e-5)
+    torch.nn.functional.cross_entropy(torch.stack(actual), torch.tensor([1, 0])).backward()
+    assert readout.head.scorer[3].weight.grad.abs().sum() > 0
+    assert all(parameter.grad is None for parameter in model.encoder.parameters())
+    with pytest.raises(ValueError, match="sequence features"):
+        readout.score([features[0][0]], examples[:1], head=readout.head)

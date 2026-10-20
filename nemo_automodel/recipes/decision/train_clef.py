@@ -30,8 +30,8 @@ head - on top of NeMo AutoModel's FSDP2 + PEFT stack:
 * ``mode: eval`` scores the model on validation/test (the *before* numbers); ``mode: train`` runs SFT
   (``loss.mode: sft``) or RL (``loss.mode: rl``).  For RL the reference log-probabilities of the starting policy are
   pre-computed in one inference pass, so no second model copy is needed.
-* Each stage writes ``adapter.safetensors`` (LoRA weights, by parameter name) and the head in the release layout
-  (``joint_head.safetensors`` + ``joint_head_config.json``); ``init_from`` chains stages (SFT -> RL).
+* Each immutable stage uses the native PEFT checkpoint and DCP joint-head state. ``init_from`` initializes a new
+  stage's weights (SFT -> RL); optimizers and schedules start afresh. Publisher export is a separate operation.
 
 Run with::
 
@@ -44,29 +44,31 @@ import json
 import logging
 import math
 import time
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete, read_checkpoint_pointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.decision.losses import DecisionLossConfig, build_targets, pad_logits
 from nemo_automodel.components.decision.metrics import DecisionEvaluator, save_summary
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loss.decision import DecisionLossConfig
+from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
 from nemo_automodel.components.models.clef.joint_schema_head import (
     EncodedRecord,
     JointSchemaHead,
-    LexicalTable,
+    build_lexical_table,
     clef_option_orders,
     collate_records,
     encode_record,
     load_joint_head,
-    option_token_ids,
-    save_joint_head,
 )
+from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -81,25 +83,6 @@ from nemo_automodel.shared.decision_records import (
 logger = logging.getLogger(__name__)
 
 MODES = ("eval", "train")
-_WRAPPER_PREFIXES = ("_checkpoint_wrapped_module.", "_orig_mod.", "_fsdp_wrapped_module.")
-
-
-def _canonical_name(name: str) -> str:
-    """Parameter name without activation-checkpoint / compile wrapper prefixes."""
-    for prefix in _WRAPPER_PREFIXES:
-        name = name.replace(prefix, "")
-    return name
-
-
-def _cosine_with_warmup(total_steps: int, warmup_ratio: float):
-    warmup = max(1, int(total_steps * warmup_ratio))
-
-    def fn(step: int) -> float:
-        if step < warmup:
-            return (step + 1) / warmup
-        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, (step - warmup) / max(1, total_steps - warmup))))
-
-    return fn
 
 
 class TrainClefDecisionRecipe(BaseRecipe):
@@ -166,6 +149,14 @@ class TrainClefDecisionRecipe(BaseRecipe):
             dropout=self.cfg.get("head.dropout", 0.0),
             revision=self.cfg.get("model.revision", None),
         ).to(self.device)
+        checkpoint_config = replace(self.cfg.checkpoint, checkpoint_dir=str(self.output_dir))
+        self.checkpointer = checkpoint_config.build(
+            dp_rank=self._get_dp_rank(),
+            tp_rank=0,
+            pp_rank=0,
+            moe_mesh=self.moe_mesh,
+            process_group=self._dp_group(),
+        )
         init_from = self.cfg.get("init_from", None)
         if init_from:
             self._load_stage(Path(init_from))
@@ -185,85 +176,95 @@ class TrainClefDecisionRecipe(BaseRecipe):
         if self.mode == "train" and "train" not in self.splits:
             raise ValueError("data.train is required for mode=train")
         self.slice_keys = list(self.cfg.get("data.slice_keys", []) or [])
-        self.lexical = self._build_lexical_table()
+        self.lexical = build_lexical_table(self.model, [e for split in self.splits.values() for _, e in split])
 
         self.optimizer = None
         if self.mode == "train":
+            train_backbone = any(parameter.requires_grad for parameter in self.model.parameters())
+            if train_backbone and self.peft_config is None:
+                raise ValueError("CLEF backbone adaptation requires peft; otherwise freeze the backbone")
+            if self.cfg.head_optimizer is None or (train_backbone and self.cfg.optimizer is None):
+                raise ValueError("training requires head_optimizer and, for backbone adaptation, optimizer")
             self.optimizer = (
-                self.cfg.optimizer.build(self.model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
-                if any(parameter.requires_grad for parameter in self.model.parameters())
+                self.cfg.optimizer.build(self.model, device_mesh=self.device_mesh, is_peft=True)
+                if train_backbone
                 else []
             )
-            self.head_optimizer = torch.optim.AdamW(
-                self.head.parameters(),
-                lr=float(self.cfg.get("train.head_lr", 5e-5)),
-                weight_decay=float(self.cfg.get("train.head_weight_decay", 0.0)),
-            )
+            self.head_optimizer = self.cfg.head_optimizer.build(self.head)[0]
 
     def _dp_group(self):
         return self._get_dp_group()
 
-    def _build_lexical_table(self) -> LexicalTable:
-        """Gather the frozen LM-head rows of every option token in the data (once)."""
-        ids = option_token_ids([e for split in self.splits.values() for _, e in split])
-        weight = self.model.get_output_embeddings().weight
-        with torch.no_grad():
-            full = weight.full_tensor() if isinstance(weight, DTensor) else weight
-            rows = full[torch.tensor(ids, device=full.device)].detach().clone()
-            del full
-        return LexicalTable(ids, rows).to(self.device)
-
     # ------------------------------------------------------------------ stage I/O
-    def _trainable_named_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
-        return [(_canonical_name(n), p) for n, p in self.model.named_parameters() if p.requires_grad]
+    def _save_stage(self, path: Path, *, selection_score: float | None = None) -> None:
+        """Publish immutable weights through native checkpoint/PEFT components.
 
-    def _save_stage(self, path: Path) -> None:
-        """Write LoRA weights (gathered to full tensors) and the head to ``path`` on rank 0."""
-        from safetensors.torch import save_file
+        Args:
+            path: Fresh checkpoint directory, shared by all data-parallel ranks.
+            selection_score: Higher-is-better validation score for the native LOWEST_VAL pointer.
+        """
+        if not self.checkpointer.config.enabled:
+            return
+        has_adapter = any(parameter.requires_grad for parameter in self.model.parameters())
+        self.checkpointer.lifecycle.reserve(str(path))
+        if has_adapter:
+            self.checkpointer.save_model(self.model, str(path), peft_config=self.peft_config)
+        self.checkpointer.save_distributed_state(self.head, "head", str(path))
+        manifest = {
+            "format": "clef-native-stage-v1",
+            "backbone_adapter": has_adapter,
+            "head_config": asdict(self.head.config),
+            "stage": self.tag,
+        }
+        metric_key = f"negative_{self.cfg.get('train.eval_metric', 'accuracy')}"
 
-        tensors = {}
-        for name, p in self._trainable_named_parameters():
-            full = p.full_tensor() if isinstance(p, DTensor) else p
-            if self.dist_env.is_main:
-                tensors[name] = full.detach().float().cpu().contiguous()
-        if self.dist_env.is_main:
-            path.mkdir(parents=True, exist_ok=True)
-            save_file(tensors, str(path / "adapter.safetensors"))
-            peft = self.peft_config
-            meta = {"dim": getattr(peft, "dim", None), "alpha": getattr(peft, "alpha", None), "stage": self.tag}
-            (path / "adapter_config.json").write_text(json.dumps(meta, indent=2))
-            save_joint_head(self.head, path, dtype=torch.float32)
-        if dist.is_initialized():
-            dist.barrier()
+        def write_metadata() -> None:
+            (path / "stage.json").write_text(json.dumps(manifest, indent=2))
+            if selection_score is not None:
+                (path / "losses.json").write_text(json.dumps({metric_key: -selection_score}))
+
+        self.checkpointer.lifecycle.run_coordinator_step(
+            write_metadata,
+            description="write CLEF stage initialization metadata",
+        )
+        self.checkpointer.async_wait()
+        self.checkpointer.lifecycle.publish(
+            str(path),
+            best_val_metric=-selection_score if selection_score is not None else None,
+            metric_key=metric_key,
+        )
 
     def _load_stage(self, path: Path) -> None:
-        """Load LoRA weights (re-sharded to each parameter's placement) and the head from a previous stage."""
-        from safetensors.torch import load_file
+        """Initialize model/head weights, leaving optimizer and schedule state fresh.
 
-        adapter = path / "adapter.safetensors"
-        if adapter.exists():
-            state = load_file(str(adapter))
-            params = dict(self._trainable_named_parameters())
-            unexpected = sorted(set(state) - set(params))
-            if unexpected:
-                raise KeyError(f"{adapter} has tensors outside this trainability policy, e.g. {unexpected[:3]}")
-            missing = sorted(set(params) - set(state))
-            if missing:
-                raise KeyError(f"{adapter} is missing {len(missing)} trainable tensors, e.g. {missing[:3]}")
-            with torch.no_grad():
-                for name, p in params.items():
-                    value = state[name].to(device=self.device, dtype=p.dtype)
-                    if isinstance(p, DTensor):
-                        value = distribute_tensor(value, p.device_mesh, p.placements)
-                    p.copy_(value)
-        head = load_joint_head(path, dtype=torch.float32, dropout=self.cfg.get("head.dropout", 0.0))
-        self.head.load_state_dict(head.state_dict())
+        Args:
+            path: Published native CLEF checkpoint or its LOWEST_VAL/LATEST pointer.
+        """
+        if path.name in {"LOWEST_VAL", "LATEST"}:
+            resolved = read_checkpoint_pointer(path.parent, path.name)
+            if resolved is None:
+                raise FileNotFoundError(f"stage pointer {path} has no published target")
+            path = resolved
+        self.checkpointer.lifecycle.validate_checkpoint_dir_exists(str(path), str(path))
+        if is_checkpoint_incomplete(path):
+            raise ValueError(f"cannot initialize from incomplete checkpoint {path}")
+        manifest = json.loads((path / "stage.json").read_text())
+        if manifest.get("format") != "clef-native-stage-v1":
+            raise ValueError("init_from requires a native CLEF stage checkpoint")
+        if manifest["backbone_adapter"]:
+            if self.peft_config is None:
+                raise ValueError("initializing a backbone adapter requires the matching peft configuration")
+            self.checkpointer.load_model(self.model, str(path / "model"))
+        self.checkpointer.load_distributed_state(self.head, "head", str(path))
         if self.dist_env.is_main:
-            logger.info("Loaded stage weights from %s", path)
+            logger.info("Initialized stage weights from %s; optimizer/scheduler state is fresh", path)
 
     # ------------------------------------------------------------------ forward
     def _forward(self, batch: list[tuple[dict[str, Any], EncodedRecord]]) -> list[list[torch.Tensor]]:
         """Run backbone + head on a batch.
+
+        Args:
+            batch: Record identities and publisher-ordered encoded question/option spans.
 
         Returns:
             For each record, a list with one tensor of shape [options_i] (fp32 logits) per question, in Clef order.
@@ -302,7 +303,7 @@ class TrainClefDecisionRecipe(BaseRecipe):
         shard = self._shard(items, shuffle=False)
         for b in range(0, len(shard), batch_size):
             batch = shard[b : b + batch_size]
-            for (record, _), logits in zip(batch, self._forward(batch)):
+            for (record, _), logits in zip(batch, self._forward(batch), strict=True):
                 local[str(record["id"])] = [q.float().log_softmax(-1).tolist() for q in logits]
         gathered: list[dict] = [None] * self._get_dp_group_size()  # type: ignore[list-item]
         if dist.is_initialized() and self._get_dp_group_size() > 1:
@@ -331,12 +332,13 @@ class TrainClefDecisionRecipe(BaseRecipe):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if self.mode == "train":
             self._train()
-            best = self.output_dir / "best"
-            if best.exists():
+            best = read_checkpoint_pointer(self.output_dir, "LOWEST_VAL")
+            if best is not None:
                 self._load_stage(best)
         for split in ("validation", "test"):
             if split in self.splits:
                 self._report(split)
+        self.checkpointer.finalize()
         if dist.is_initialized():
             dist.barrier()
 
@@ -399,15 +401,20 @@ class TrainClefDecisionRecipe(BaseRecipe):
                 "data.train contains no complete optimizer batch; reduce train.global_batch_size or add records"
             )
         total = epochs * steps_per_epoch
-        schedule = _cosine_with_warmup(total, float(self.cfg.get("train.warmup_ratio", 0.05)))
-        schedulers = [torch.optim.lr_scheduler.LambdaLR(o, schedule) for o in self.optimizer]
-        schedulers.append(torch.optim.lr_scheduler.LambdaLR(self.head_optimizer, schedule))
+        step_schedule = StepSchedulerConfig(
+            global_batch_size=global_bs, num_epochs=epochs, max_steps=total, preemption_signal=None
+        ).build(dataloader=None, dp_group_size=world, local_batch_size=local_bs, process_group=self._dp_group())
+        schedulers = (
+            self.cfg.lr_scheduler.build([*self.optimizer, self.head_optimizer], step_schedule)
+            if self.cfg.lr_scheduler is not None
+            else []
+        )
         generator = torch.Generator(device=self.device).manual_seed(self.seed + self._get_dp_rank())
 
         best_score = self._val_score(metric)
         if self.dist_env.is_main:
             logger.info("[%s] step 0 val %s=%s (%d steps, accum %d)", self.tag, metric, best_score, total, accum)
-        self._save_stage(self.output_dir / "best")
+        self._save_stage(self.output_dir / "step_00000000", selection_score=best_score)
         log = open(self.output_dir / "training_log.jsonl", "w") if self.dist_env.is_main else None
         step = 0
         for epoch in range(epochs):
@@ -421,13 +428,28 @@ class TrainClefDecisionRecipe(BaseRecipe):
                 window_targets = []
                 local_weights = []
                 for batch in window:
-                    flat_targets = []
-                    ref_rows = [] if reference is not None else None
-                    for record, encoded in batch:
-                        flat_targets.extend(question_targets(record, clef_option_orders(encoded)))
-                        if ref_rows is not None:
-                            ref_rows.extend(reference[str(record["id"])])
-                    targets = build_targets(flat_targets, loss_cfg.question_weights, ref_rows).to(self.device)
+                    questions = [question_targets(record, clef_option_orders(encoded)) for record, encoded in batch]
+                    ref_rows = None
+                    if reference is not None:
+                        ref_rows = [
+                            [
+                                QuestionLogits(
+                                    str(record["id"]),
+                                    target.question_id,
+                                    target.option_ids,
+                                    torch.tensor(row, device=self.device),
+                                )
+                                for target, row in zip(record_questions, reference[str(record["id"])], strict=True)
+                            ]
+                            for (record, _), record_questions in zip(batch, questions, strict=True)
+                        ]
+                    targets = DecisionTargets.from_questions(
+                        record_ids=[str(record["id"]) for record, _ in batch],
+                        questions=questions,
+                        question_weights=loss_cfg.question_weights,
+                        reference_logprobs=ref_rows,
+                        device=self.device,
+                    )
                     window_targets.append(targets)
                     local_weights.append(loss_fn.normalization_weight(targets))
                 global_weight = torch.stack(local_weights).sum()
@@ -437,24 +459,28 @@ class TrainClefDecisionRecipe(BaseRecipe):
                     raise ValueError("optimizer window has no supervised labels or explicit rewards on any DP rank")
                 for batch, targets, local_weight in zip(window, window_targets, local_weights):
                     per_record = self._forward(batch)
-                    flat_logits = [q for rec in per_record for q in rec]
-                    logits, _ = pad_logits(flat_logits)
-                    loss, metrics = loss_fn(logits, targets, generator=generator)
+                    identified = [
+                        [
+                            QuestionLogits(str(record["id"]), question.question_id, question.option_ids, values)
+                            for question, values in zip(encoded.questions, record_logits, strict=True)
+                        ]
+                        for (record, encoded), record_logits in zip(batch, per_record, strict=True)
+                    ]
+                    assembled = assemble_decision_batch(logits=identified, targets=targets)
+                    loss, metrics = loss_fn(assembled.logits, assembled.targets, generator=generator)
                     # FSDP and the replicated head each average over DP; compensate once,
                     # normalizing over all eligible questions in this complete optimizer window.
                     (loss * (world * local_weight / global_weight)).backward()
                     for k, v in {"loss": loss.detach(), **metrics}.items():
                         metrics_sum[k] = metrics_sum.get(k, 0.0) + float(v) / accum
                 self._sync_head_grads()
-                # Sharding-aware clipping for the FSDP2 (DTensor) LoRA parameters; the replicated head is clipped
-                # separately because its gradients are already identical on every rank.
-                grad_norm = clip_grad_norm(max_grad_norm, [self.model], device_mesh=self.device_mesh)
-                torch.nn.utils.clip_grad_norm_(self.head.parameters(), max_grad_norm)
+                # One coefficient preserves relative scaling and enforces a combined backbone/head budget.
+                grad_norm = clip_grad_norm(max_grad_norm, [self.model, self.head], device_mesh=self.device_mesh)
                 for o in [*self.optimizer, self.head_optimizer]:
                     o.step()
                     o.zero_grad(set_to_none=True)
                 for sch in schedulers:
-                    sch.step()
+                    sch.step(1)
                 step += 1
                 if log is not None:
                     grad_norm = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else grad_norm
@@ -473,8 +499,7 @@ class TrainClefDecisionRecipe(BaseRecipe):
                             log.write(json.dumps({"step": step, f"val_{metric}": score}) + "\n")
                     if best_score is None or (score is not None and score > best_score):
                         best_score = score
-                        self._save_stage(self.output_dir / "best")
-        self._save_stage(self.output_dir / "last")
+                    self._save_stage(self.output_dir / f"step_{step:08d}", selection_score=score)
         if log is not None:
             log.close()
 

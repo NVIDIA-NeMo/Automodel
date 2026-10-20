@@ -26,7 +26,7 @@ Every run takes `--mode eval|train` and `--loss.mode sft|rl`, and writes `metric
 automodel examples/decision/clm_soc_triage.yaml --nproc-per-node 8 --mode eval --output_dir runs/clm/base
 automodel examples/decision/clm_soc_triage.yaml --nproc-per-node 8 --mode train --loss.mode sft --output_dir runs/clm/sft
 automodel examples/decision/clm_soc_triage.yaml --nproc-per-node 8 --mode train --loss.mode rl \
-    --heads.init_checkpoint runs/clm/sft/heads.pt --train.lr 1.0e-4 --train.epochs 10 \
+    --heads.init_checkpoint runs/clm/sft/heads.pt --optimizer.lr 1.0e-4 --train.epochs 10 \
     --train.eval_metric reward --output_dir runs/clm/rl
 ```
 
@@ -37,7 +37,14 @@ The CLM feature cache requires immutable encoder and tokenizer commit IDs. Its i
 pooling, normalization, precision and library settings, so changing those settings generates a new cache.
 CLM/CLEF example configurations pin the public model versions whose prompt and checkpoint contracts they use.
 The CLEF frozen-backbone configuration installs no adapters and optimizes only the external joint head.
-Stages save weights for staged initialization; they are not full optimizer/scheduler resume checkpoints.
+CLEF stages use native AutoModel PEFT checkpoints under `model/` and DCP joint-head state under `head/`.
+Immutable `step_00000000`, `step_00000025`, etc. directories are published through the existing checkpoint lifecycle;
+`LATEST` selects the last saved stage and `LOWEST_VAL` selects the highest validation score (stored as its negative).
+Set `init_from: runs/clef/sft/LOWEST_VAL` to initialize the next stage with fresh optimizer and scheduler state.
+This is weights-only stage continuation; full optimizer/scheduler resume is not provided. Keep the base revision,
+PEFT configuration, and joint-head architecture consistent. Use `head_optimizer.lr` for the external head,
+`optimizer.lr` for the backbone adapters, and `lr_scheduler.lr_warmup_steps` for integer optimizer-step warmup.
+Publisher-layout merged export remains the explicit `examples/decision/export_clef_release.py` operation.
 
 D1 examples are experimental. Tiny configuration tests exercise causal/readout/gradient contracts; released-size
 GPU acceptance remains required for D1-3B. A prior released-size D1-3B baseline comparison exceeded the declared probability

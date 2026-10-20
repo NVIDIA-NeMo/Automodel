@@ -28,7 +28,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
-from nemo_automodel.components.decision.losses import DecisionLossConfig, build_targets, pad_logits
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.loss.decision import DecisionLossConfig
+from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
 from nemo_automodel.components.models.clef.joint_schema_head import (
     ClefHeadConfig,
     EncodedQuestion,
@@ -36,6 +39,7 @@ from nemo_automodel.components.models.clef.joint_schema_head import (
     LexicalTable,
     clef_option_orders,
 )
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.decision.train_clef import TrainClefDecisionRecipe
 from nemo_automodel.shared.decision_records import question_targets
 
@@ -102,14 +106,22 @@ def _recipe(items, output, rank, world, accumulation, max_norm):
     recipe.dist_env = SimpleNamespace(is_main=rank == 0)
     recipe.output_dir = output
     recipe.loss_config = DecisionLossConfig(label_smoothing=0.0, brier_weight=0.0, ordinal_weight=0.0)
-    recipe.cfg = {
-        "train.epochs": 1,
-        "train.local_batch_size": 1,
-        "train.global_batch_size": world * accumulation,
-        "train.warmup_ratio": 0.0,
-        "train.max_grad_norm": max_norm,
-        "train.val_every_steps": 100,
-    }
+    recipe.cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "train": {
+                    "epochs": 1,
+                    "local_batch_size": 1,
+                    "global_batch_size": world * accumulation,
+                    "max_grad_norm": max_norm,
+                    "val_every_steps": 100,
+                },
+            }
+        )
+    )
+    recipe.checkpointer = CheckpointingConfig(checkpoint_dir=str(output), is_peft=False, save_consolidated=False).build(
+        dp_rank=rank, tp_rank=0, pp_rank=0, process_group=dist.group.WORLD if dist.is_initialized() else None
+    )
     recipe.splits = {"train": items}
     recipe.optimizer = []
     recipe.head_optimizer = torch.optim.SGD(recipe.head.parameters(), lr=0.05)
@@ -123,6 +135,7 @@ def _worker(rank, rendezvous, output, accumulation, empty_rank, max_norm, all_em
     dist.init_process_group(
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
     )
+    run = None
     try:
         run = _recipe(_items(accumulation, empty_rank, all_empty), Path(output), rank, 2, accumulation, max_norm)
         try:
@@ -136,6 +149,8 @@ def _worker(rank, rendezvous, output, accumulation, empty_rank, max_norm, all_em
             if rank == 0:
                 torch.save(run.head.state_dict(), Path(output) / "actual.pt")
     finally:
+        if run is not None:
+            run.checkpointer.close()
         dist.destroy_process_group()
 
 
@@ -151,12 +166,19 @@ def test_replicated_head_dp_step_matches_single_process_question_mean(tmp_path, 
     )
     items = _items(accumulation, empty_rank)
     reference = _recipe(items, output, 0, 1, accumulation, max_norm)
-    targets = build_targets(
-        [q for record, encoded in items for q in question_targets(record, clef_option_orders(encoded))]
-    )
+    reference.checkpointer.close()
+    nested_targets = [question_targets(record, clef_option_orders(encoded)) for record, encoded in items]
+    targets = DecisionTargets.from_questions(record_ids=[record["id"] for record, _ in items], questions=nested_targets)
     nested_logits = reference._forward(items)
-    logits, _ = pad_logits([q for record in nested_logits for q in record])
-    loss, _ = reference.loss_config.build()(logits, targets)
+    identified = [
+        [
+            QuestionLogits(record["id"], target.question_id, target.option_ids, row)
+            for target, row in zip(record_targets, record_logits, strict=True)
+        ]
+        for (record, _), record_targets, record_logits in zip(items, nested_targets, nested_logits, strict=True)
+    ]
+    assembled = assemble_decision_batch(logits=identified, targets=targets)
+    loss, _ = reference.loss_config.build()(assembled.logits, assembled.targets)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(reference.head.parameters(), max_norm)
     reference.head_optimizer.step()
@@ -169,4 +191,5 @@ def test_all_feedback_free_ranks_fail_together_before_backward(tmp_path):
     output = tmp_path / "run"
     output.mkdir()
     mp.spawn(_worker, args=(str(tmp_path / "rendezvous"), str(output), 1, True, 1e6, True), nprocs=2, join=True)
-    assert not (output / "last").exists()
+    assert not (output / "step_00000001").exists()
+    assert not (output / "actual.pt").exists()

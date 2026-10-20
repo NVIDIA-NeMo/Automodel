@@ -41,12 +41,12 @@ class D1OmniShortConv(nn.Module):
         """Mix neighbouring positions without crossing the media/text boundary.
 
         Args:
-            hidden_states: Tensor [batch, length, hidden_size].
-            valid_tokens: Boolean tensor [batch, length] marking real positions.
-            media_lengths: Long tensor [batch] giving each row's media prefix length.
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+            valid_tokens: Boolean Tensor of shape [batch, sequence] marking real positions.
+            media_lengths: Long Tensor of shape [batch] giving each row's media prefix length.
 
         Returns:
-            Tensor [batch, length, hidden_size].
+            Tensor of shape [batch, sequence, hidden].
         """
         gates = self.in_proj(hidden_states * valid_tokens.unsqueeze(-1)).transpose(1, 2)
         input_gate, output_gate, values = gates.chunk(3, dim=1)
@@ -87,14 +87,14 @@ class D1OmniEncoderLayer(nn.Module):
         """Run a residual mixer followed by the gated feed-forward block.
 
         Args:
-            hidden_states: Tensor [batch, length, hidden_size].
-            position_embeddings: Cosine and sine tensors [batch, length, head_dim].
-            attention_mask: Additive mask [batch, 1, length, length].
-            valid_tokens: Boolean tensor [batch, length].
-            media_lengths: Long tensor [batch] of prefix lengths.
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+            position_embeddings: Pair of cosine and sine Tensors, each of shape [batch, sequence, head_dim].
+            attention_mask: Additive Tensor of shape [batch, 1, sequence, sequence].
+            valid_tokens: Boolean Tensor of shape [batch, sequence].
+            media_lengths: Long Tensor of shape [batch] of prefix lengths.
 
         Returns:
-            Tensor [batch, length, hidden_size].
+            Tensor of shape [batch, sequence, hidden].
         """
         normalized = self.operator_norm(hidden_states)
         if self.is_attention_layer:
@@ -146,12 +146,12 @@ class D1OmniEncoder(nn.Module):
         """Encode combined media and text embeddings.
 
         Args:
-            inputs_embeds: Tensor [batch, length, hidden_size].
-            valid_tokens: Boolean tensor [batch, length], including media positions.
-            media_lengths: Long tensor [batch], zero for text-only rows.
+            inputs_embeds: Tensor of shape [batch, sequence, hidden].
+            valid_tokens: Boolean Tensor of shape [batch, sequence], including media positions.
+            media_lengths: Long Tensor of shape [batch], zero for text-only rows.
 
         Returns:
-            Normalized encoder states [batch, length, hidden_size].
+            Normalized Tensor of shape [batch, sequence, hidden].
         """
         if inputs_embeds.ndim != 3 or inputs_embeds.shape[-1] != self.config.hidden_size:
             raise ValueError("inputs_embeds must have shape [batch, length, hidden_size]")

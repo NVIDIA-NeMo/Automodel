@@ -14,6 +14,7 @@
 
 """Published D1 text prompts with explicit supervision and option identities."""
 
+import math
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
@@ -86,8 +87,8 @@ def encode_d1_record(
             aliases = tuple(tuple(group) for group in prompt.readout_ids(tokenizer, question))
             head_type = target.question_type
             temperature = 1.0
-        if temperature <= 0:
-            raise ValueError("Released calibration temperatures must be positive")
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Released calibration temperatures must be finite and positive")
         if len(markers if omni else aliases) != len(order):
             raise ValueError("Published readout and supervision have different option counts")
         result.append(

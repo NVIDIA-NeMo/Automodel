@@ -202,6 +202,14 @@ class CLMHeadPair(nn.Module):
         self.action_head = _ProjectionHead(config)
         self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / initial_temperature), dtype=torch.float32))
 
+    def set_logit_scale_trainable(self, *, enabled: bool) -> None:
+        """Apply the decision-head temperature training policy before optimization.
+
+        Args:
+            enabled: Whether the scalar log inverse temperature receives gradients.
+        """
+        self.logit_scale.requires_grad_(enabled)
+
     def project_states(self, state_embeddings: torch.Tensor) -> torch.Tensor:
         """Project and normalize state embeddings.
 

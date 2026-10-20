@@ -94,7 +94,7 @@ if ENABLE_UTILITY:
             "--mode=train",
             "--loss.mode=rl",
             f"--loss.rl_objective={UTILITY_OBJECTIVE}",
-            f"--init_from={RUN / 'sft/best'}",
+            f"--init_from={RUN / 'sft/LOWEST_VAL'}",
             "--train.eval_metric=reward",
             f"--output_dir={RUN / 'rl'}",
         ]
@@ -152,7 +152,7 @@ if EXPORT_MODEL:
             "python",
             "examples/decision/export_clef_release.py",
             "--stage",
-            str(RUN / "sft/best"),
+            str(RUN / "sft/LOWEST_VAL"),
             "--out",
             str(RUN / "release"),
         ]

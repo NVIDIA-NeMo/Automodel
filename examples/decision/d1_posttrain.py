@@ -32,16 +32,20 @@ import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from nemo_automodel import NeMoAutoModelForImageTextToText
-from nemo_automodel.components.decision.losses import DecisionLossConfig, build_targets, pad_logits
 from nemo_automodel.components.decision.metrics import DecisionEvaluator, save_summary
-from nemo_automodel.components.models.d1.decision_head import D1TokenReadoutConfig
+from nemo_automodel.components.loss.decision import DecisionLossConfig
+from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
+from nemo_automodel.components.models.d1.model import D1OmniModel
 from nemo_automodel.components.models.d1.records import encode_d1_record
+from nemo_automodel.components.models.d1.text_readout import D1TextReadout
+from nemo_automodel.components.models.d1.vl_model import Lfm2VlForConditionalGeneration
 from nemo_automodel.shared.decision_records import load_records
 
 LOGGER = logging.getLogger(__name__)
@@ -58,20 +62,22 @@ class NativeD1Config:
 
     model: str
 
-    def build(self) -> torch.nn.Module:
+    def build(self) -> D1OmniModel | Lfm2VlForConditionalGeneration:
         """Load the registered native model with the released checkpoint weights."""
         repository, revision, _ = RELEASES[self.model]
-        return (
+        return cast(
+            D1OmniModel | Lfm2VlForConditionalGeneration,
             NeMoAutoModelForImageTextToText.from_pretrained(
                 repository,
                 revision=revision,
                 code_revision=revision,
                 trust_remote_code=True,
-                dtype=torch.bfloat16,
+                # Omni's pinned model card recommends float32 or float16 and warns against bfloat16.
+                dtype=torch.float32 if self.model == "d1-omni" else torch.bfloat16,
                 attn_implementation="sdpa",
             )
             .cuda()
-            .eval()
+            .eval(),
         )
 
 
@@ -119,27 +125,17 @@ class D1PostTraining:
         self.meta_by_id = {
             str(record["id"]): record.get("meta", {}) for records in self.records.values() for record in records
         }
-        self.alias_ids = tuple(
-            sorted(
-                {
-                    token
-                    for examples in self.examples.values()
-                    for ex in examples
-                    for group in ex.alias_token_ids
-                    for token in group
-                }
-            )
+        self.readout: D1TextReadout = self.model.prepare_text_readout(
+            [example for examples in self.examples.values() for example in examples]
         )
-        if self.omni:
-            self.head = self.model.head.float()
-        else:
-            weight = self.model.get_output_embeddings().weight
-            self.head = D1TokenReadoutConfig(weight.shape[1], self.alias_ids).build(weight).cuda()
+        self.head = self.readout.head
         self.head.requires_grad_(True)
         self.provenance = {
             "framework": FRAMEWORK,
             "model": self.repository,
             "revision": self.revision,
+            "backbone_dtype": str(self.model.dtype),
+            "readout_dtype": str(next(self.head.parameters()).dtype),
             "training_scope": "released marker head"
             if self.omni
             else "additive answer-token rows; tied backbone unchanged",
@@ -162,14 +158,27 @@ class D1PostTraining:
         manifest = self.cache / "manifest.json"
         cache_key = {
             key: self.provenance[key]
-            for key in ("framework", "model", "revision", "data_sha256", "native_source_sha256", "recipe_source_sha256")
+            for key in (
+                "framework",
+                "model",
+                "revision",
+                "backbone_dtype",
+                "data_sha256",
+                "native_source_sha256",
+                "recipe_source_sha256",
+            )
         }
         if manifest.exists() and json.loads(manifest.read_text()) != cache_key:
             raise ValueError("Frozen feature cache does not match the pinned model/framework/dataset")
         manifest.write_text(json.dumps(cache_key, indent=2) + "\n")
 
     def feature(self, split: str, index: int) -> torch.Tensor:
-        """Cache one native frozen encoding; never cache readout predictions."""
+        """Cache one native frozen encoding; never cache readout predictions.
+
+        Returns:
+            Tensor of shape [hidden] for D1-3B or [sequence, hidden] for Omni,
+            on the model device, detached from backbone training.
+        """
         path = self.cache / f"{split}-{index}.pt"
         if path.exists():
             return torch.load(path, map_location="cuda", weights_only=True)
@@ -177,44 +186,23 @@ class D1PostTraining:
         ids = torch.tensor([ex.input_ids], device="cuda", dtype=torch.long)
         valid = torch.ones_like(ids, dtype=torch.bool)
         with torch.no_grad():
-            if self.omni:
-                states, _ = self.model.encode_text(ids, valid)
-                feature = states[0]
-            elif FRAMEWORK == "automodel":
-                feature = self.model.model(input_ids=ids, attention_mask=valid, use_cache=False).last_hidden_state[
-                    0, -1
-                ]
-            else:
-                states, _ = self.model.encode_inputs(ids, attention_mask=valid)
-                feature = states[0, -1]
+            feature = self.readout.extract_features(ids, valid)
         if not torch.isfinite(feature).all():
             raise ValueError("Nonfinite frozen native features")
         torch.save(feature.detach().cpu(), path)
         return feature
 
     def logits(self, split: str, indices: list[int], head: torch.nn.Module | None = None) -> list[torch.Tensor]:
-        """Return calibrated differentiable logits in each example's internal order."""
+        """Return calibrated differentiable logits in each example's internal order.
+
+        Returns:
+            List of float32 Tensors of shape [options], one per requested
+            question, retaining gradients to the selected readout head.
+        """
         head = self.head if head is None else head
         examples = [self.examples[split][index] for index in indices]
         features = [self.feature(split, index) for index in indices]
-        if not self.omni:
-            token_index = {token: index for index, token in enumerate(self.alias_ids)}
-            return [
-                head(feature, tuple(tuple(token_index[token] for token in group) for group in ex.alias_token_ids))
-                for feature, ex in zip(features, examples)
-            ]
-        states = torch.nn.utils.rnn.pad_sequence(features, batch_first=True).float()
-        lengths = torch.tensor([feature.shape[0] for feature in features], device="cuda")
-        valid = torch.arange(states.shape[1], device="cuda")[None] < lengths[:, None]
-        width = max(len(ex.marker_positions) for ex in examples)
-        positions = torch.zeros(len(examples), width, device="cuda", dtype=torch.long)
-        markers = torch.zeros_like(positions, dtype=torch.bool)
-        for i, ex in enumerate(examples):
-            positions[i, : len(ex.marker_positions)] = torch.tensor(ex.marker_positions, device="cuda")
-            markers[i, : len(ex.marker_positions)] = True
-        types = torch.tensor([ex.head_question_type for ex in examples], device="cuda")
-        values = head(states, valid, positions, markers, types)
-        return [row[: len(ex.target.option_ids)] / ex.temperature for row, ex in zip(values, examples)]
+        return self.readout.score(features, examples, head=head)
 
     def evaluate(self, split: str, destination: Path | None = None) -> dict:
         """Evaluate every decision; selection callers use validation only."""
@@ -260,15 +248,33 @@ class D1PostTraining:
                     batch = indices[start : start + self.args.batch_size]
                     self.head.train()
                     optimizer.zero_grad(set_to_none=True)
-                    values, _ = pad_logits(self.logits("train", batch))
+                    examples = [self.examples["train"][index] for index in batch]
+                    values = self.logits("train", batch)
                     ref = None
                     if reference is not None:
                         with torch.no_grad():
-                            ref = [row.log_softmax(-1).tolist() for row in self.logits("train", batch, reference)]
-                    targets = build_targets(
-                        [self.examples["train"][index].target for index in batch], ref_logprobs=ref
-                    ).to("cuda")
-                    loss, metrics = criterion(values, targets)
+                            ref = [
+                                [
+                                    QuestionLogits(
+                                        ex.record_id, ex.target.question_id, ex.target.option_ids, row.log_softmax(-1)
+                                    )
+                                ]
+                                for ex, row in zip(examples, self.logits("train", batch, reference), strict=True)
+                            ]
+                    targets = DecisionTargets.from_questions(
+                        record_ids=[ex.record_id for ex in examples],
+                        questions=[[ex.target] for ex in examples],
+                        reference_logprobs=ref,
+                        device=values[0].device,
+                    )
+                    decision_batch = assemble_decision_batch(
+                        logits=[
+                            [QuestionLogits(ex.record_id, ex.target.question_id, ex.target.option_ids, row)]
+                            for ex, row in zip(examples, values, strict=True)
+                        ],
+                        targets=targets,
+                    )
+                    loss, metrics = criterion(decision_batch.logits, decision_batch.targets)
                     if not torch.isfinite(loss):
                         raise ValueError("Nonfinite D1 training objective")
                     loss.backward()
@@ -300,20 +306,23 @@ class D1PostTraining:
         """Compare released-size native decision probabilities with the pinned publisher.
 
         This probe uses validation examples, without training or selecting on test labels.
-        The 0.02 absolute probability bound allows different bfloat16 GPU kernels;
+        The 0.02 absolute probability bound allows floating-point kernel differences;
         exact readout option identities and all five task kinds are still required.
         """
         reference = (
             self.published_class.from_pretrained(
                 self.repository,
                 revision=self.revision,
-                dtype=torch.bfloat16,
+                dtype=self.model.dtype,
             )
             .cuda()
             .eval()
         )
+        reference_dtype = reference.dtype
         checks = []
         try:
+            if reference_dtype != self.model.dtype:
+                raise ValueError("Native and publisher baseline models must use the same dtype")
             # Publisher lazy properties otherwise load a tokenizer from the latest revision.
             if self.omni:
                 reference.tokenizer = self.tokenizer
@@ -352,6 +361,14 @@ class D1PostTraining:
                                 published_chain = reference(ids, use_cache=False).logits[0, -1].float()
 
                             def option_probabilities(vocabulary_logits: torch.Tensor) -> list[float]:
+                                """Reduce vocabulary scores using the encoded publisher aliases.
+
+                                Args:
+                                    vocabulary_logits: Tensor of shape [vocab].
+
+                                Returns:
+                                    Probabilities in the example's target option order.
+                                """
                                 return (
                                     torch.stack([vocabulary_logits[list(group)].amax() for group in ex.alias_token_ids])
                                     .softmax(-1)
@@ -390,7 +407,9 @@ class D1PostTraining:
                     "revision": self.revision,
                     "tokenizer_revision": self.revision,
                     "request_shape": "one independent question per forward pass",
-                    "dtype": "bfloat16",
+                    "dtype": str(self.model.dtype).removeprefix("torch."),
+                    "publisher_dtype": str(reference_dtype).removeprefix("torch."),
+                    "readout_dtype": str(next(self.head.parameters()).dtype).removeprefix("torch."),
                     "absolute_probability_tolerance": 0.02,
                     "validation_records": min(3, len(self.records["validation"])),
                     "checks": checks,
@@ -406,8 +425,16 @@ class D1PostTraining:
         destination.mkdir(parents=True, exist_ok=True)
         if self.args.input_dir is not None:
             prior = json.loads((self.args.input_dir / "provenance.json").read_text())
-            for key in ("framework", "model", "revision", "data_sha256", "training_scope"):
-                if prior[key] != self.provenance[key]:
+            for key in (
+                "framework",
+                "model",
+                "revision",
+                "backbone_dtype",
+                "readout_dtype",
+                "data_sha256",
+                "training_scope",
+            ):
+                if prior.get(key) != self.provenance[key]:
                     raise ValueError(f"Checkpoint provenance mismatch: {key}")
             self.head.load_state_dict(
                 torch.load(self.args.input_dir / "head.pt", map_location="cuda", weights_only=True), strict=True
