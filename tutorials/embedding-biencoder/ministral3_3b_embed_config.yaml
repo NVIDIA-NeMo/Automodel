@@ -59,7 +59,8 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
   model_type: bi_encoder
   data_dir_list:
-    # 8 toy conceptual pairs synthetically generated with Google Gemini 2.5 Pro for format demonstration
+    # 8 sample pairs from nvidia/embed-nemotron-dataset-v1/FEVER for local demonstration.
+    # For full training, specify 'hf://nvidia/embed-nemotron-dataset-v1/FEVER'
     - tutorials/embedding-biencoder/sample_retrieval_data.jsonl
   data_type: train
   n_passages: 2
