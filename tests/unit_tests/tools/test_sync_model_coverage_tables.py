@@ -47,6 +47,7 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _render_registry_table,
     _replace_generated_block,
     _resolve_model_card_routes,
+    _resolve_redirect,
     _strip_generated_tables,
     _sync_tables,
     _validate_dated_support_tables_are_generated,
@@ -880,6 +881,43 @@ def test_recipe_backed_model_sizes_have_exact_index_routes_and_one_card():
     )
     meta_destinations = {redirects[f"/nemo/automodel{route}"].removeprefix("/nemo/automodel") for route in meta_aliases}
     assert meta_destinations == {"/model-coverage/large-language-models/meta/Llama-3.1-8B"}
+
+
+def test_moved_pages_keep_their_previous_published_routes():
+    """Moved or rewritten pages retain their old URL or redirect to a live page."""
+    repo_root = Path(__file__).parents[3]
+    base = subprocess.check_output(["git", "merge-base", "HEAD", "origin/main"], cwd=repo_root, text=True).strip()
+    old_files = set(
+        subprocess.check_output(
+            ["git", "ls-tree", "-r", "--name-only", base, "docs"], cwd=repo_root, text=True
+        ).splitlines()
+    )
+    changed = subprocess.check_output(
+        ["git", "diff", "--no-renames", "--name-only", base, "HEAD", "--", "docs"], cwd=repo_root, text=True
+    ).splitlines()
+    previous_routes = set()
+    for relative in changed:
+        if relative not in old_files or Path(relative).suffix not in {".md", ".mdx"}:
+            continue
+        document = subprocess.check_output(["git", "show", f"{base}:{relative}"], cwd=repo_root, text=True)
+        header = re.match(r"\A---\r?\n(.*?)\r?\n---(?:\r?\n|$)", document, re.DOTALL)
+        metadata = yaml.safe_load(header[1]) if header else None
+        if isinstance(metadata, dict) and isinstance(metadata.get("slug"), str):
+            previous_routes.add("/" + metadata["slug"].strip("/"))
+
+    config_path = repo_root / "docs/fern/versions/nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text())["navigation"]
+    routes = {route.casefold() for route in _collect_fern_routes(navigation, config_dir=config_path.parent)}
+    config = yaml.safe_load((repo_root / "docs/fern/docs.yml").read_text())
+    redirects = {item["source"].casefold(): item["destination"] for item in config["redirects"]}
+    broken = []
+    for route in sorted(previous_routes):
+        for version in ("", "/nightly"):
+            source = version + route
+            destination = _resolve_redirect(source, redirects)
+            if destination.casefold() not in routes:
+                broken.append(f"/nemo/automodel{source} -> {destination}")
+    assert not broken, "Previously published routes no longer resolve:\n" + "\n".join(broken)
 
 
 def test_retired_model_routes_redirect_to_provider_indexes():
