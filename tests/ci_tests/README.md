@@ -43,6 +43,12 @@ SFT vs PEFT is determined by whether `peft` appears in the recipe filename.
 
 ## Recipe CI Configuration
 
+Recipes with boolean `ci.deprecated: true` remain available as examples, but
+generate no training, checkpoint, deployment, or evaluation jobs in any CI scope.
+This applies even when a recipe also sets `allow_failure`, a hardware tag, or
+optional variants. An entirely excluded nonempty scope gets a lightweight
+completion job.
+
 Each recipe YAML under `examples/` has a `ci:` section. It is required for
 newly added CI recipes, which must declare `recipe_owner`, `time`, and `nodes`
 (enforced by `validate_new_recipe_ci.py`); pre-existing recipes are grandfathered:

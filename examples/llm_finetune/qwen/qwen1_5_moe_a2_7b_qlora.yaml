@@ -101,4 +101,6 @@ optimizer:
   betas: [0.9, 0.95]
 
 ci:
+  # Retained for reproducibility; excluded from automatic GPU CI.
+  deprecated: true
   recipe_owner: adil-a
