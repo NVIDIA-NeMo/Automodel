@@ -115,6 +115,4 @@ lr_scheduler:
 #   dir: <your_wandb_save_dir>
 
 ci:
-  # Retained for reproducibility; excluded from automatic GPU CI.
-  deprecated: true
   cluster_tag: h100

@@ -100,6 +100,4 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 ci:
-  # Retained for reproducibility; excluded from automatic GPU CI.
-  deprecated: true
   cluster_tag: h100

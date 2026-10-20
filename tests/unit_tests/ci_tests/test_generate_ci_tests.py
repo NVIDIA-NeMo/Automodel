@@ -511,8 +511,17 @@ def test_recipe_deprecation_filters_all_job_variants(tmp_path: Path, scope: str,
         assert {suffix for suffix, _ in jobs} == {"", "_vllm_deploy", "_embed_eval", "_rerank_eval"}
 
 
-def test_deprecated_nightly_scope_completes_without_gpu_jobs() -> None:
-    pipeline = generate_pipeline(".", "nightly", "retrieval_cross_encoder")
+def test_deprecated_nightly_scope_completes_without_gpu_jobs(tmp_path: Path) -> None:
+    config_dir = tmp_path / "tests/ci_tests/configs/retrieval_cross_encoder"
+    config_dir.mkdir(parents=True)
+    (config_dir / "override_recipes.yml").write_text("exempt_models: []\nexempt_configs: {}\n")
+    (config_dir / "nightly_recipes.yml").write_text(
+        "examples_dir: retrieval\nconfigs: [cross_encoder/deprecated.yaml]\n"
+    )
+    recipe = tmp_path / "examples/retrieval/cross_encoder/deprecated.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("ci: {deprecated: true}\n")
+    pipeline = generate_pipeline(str(tmp_path), "nightly", "retrieval_cross_encoder")
     jobs = {name: job for name, job in pipeline.items() if name != "include"}
     assert len(jobs) == 1
     job = jobs["no_enrolled_retrieval_cross_encoder_tests"]
@@ -560,3 +569,60 @@ def test_flux_examples_keep_gpu_ci_enrollment(scope: str) -> None:
     pipeline = generate_pipeline(".", scope, "diffusion_finetune")
     assert "flux_t2i_flow" in pipeline
     assert "flux_t2i_flow_lora" in pipeline
+
+
+@pytest.mark.parametrize(
+    ("scope", "folder", "retained_paths"),
+    [
+        ("performance", "llm_benchmark", ["examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml"]),
+        (
+            "release",
+            "llm_finetune",
+            [
+                "examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml",
+                "examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml",
+                "examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml",
+                "examples/llm_finetune/llama3_1/llama3_1_8b_columnmapped_lora.yaml",
+                "examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp_dynamic_seq_len.yaml",
+                "examples/llm_finetune/llama3_1/llama3_1_8b_instruct_squad_qlora_2node.yaml",
+                "examples/llm_finetune/llama3_1/llama3_1_8b_squad_peft_rtx_spark.yaml",
+                "examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_hsdp.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_squad_neftune.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes_2nodes.yaml",
+                "examples/llm_finetune/phi/phi_4_hellaswag_fp8.yaml",
+                "examples/llm_finetune/phi/phi_4_squad.yaml",
+                "examples/llm_finetune/phi/phi_4_squad_peft.yaml",
+                "examples/llm_finetune/phi/phi_4_squad_tp2.yaml",
+                "examples/llm_finetune/phi/phi_4_squad_tp2_peft.yaml",
+                "examples/llm_finetune/qwen/qwen25_magi_prefix_tree_rollouts.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_7b_squad_muon.yaml",
+            ],
+        ),
+        (
+            "nightly",
+            "retrieval_bi_encoder",
+            [
+                "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
+            ],
+        ),
+        ("nightly", "retrieval_cross_encoder", ["examples/retrieval/cross_encoder/llama3_2_1b.yaml"]),
+        (
+            "release",
+            "vlm_finetune",
+            [
+                "examples/vlm_finetune/phi4/phi4_mm_cv17.yaml",
+                "examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_shopify.yaml",
+            ],
+        ),
+    ],
+)
+def test_retained_examples_remain_scheduled(scope: str, folder: str, retained_paths: list[str]) -> None:
+    pipeline = generate_pipeline(".", scope, folder)
+    scheduled = {
+        job["variables"]["CONFIG_PATH"]
+        for job in pipeline.values()
+        if isinstance(job, dict) and "CONFIG_PATH" in job.get("variables", {})
+    }
+    assert set(retained_paths) <= scheduled

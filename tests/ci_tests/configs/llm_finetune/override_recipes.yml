@@ -14,13 +14,11 @@
 
 # Models deprecated for 26.10 removal — skipped in release (auto-discover) scope.
 exempt_models:
-  - agent
   - baichuan
   - cohere
   - gemma
   - granite
   - olmo
-  - phi
   - seed
   - starcoder
 
@@ -67,11 +65,7 @@ exempt_configs:
     reason: "Deprecated for 26.10 (Qwen2.5)"
   qwen2_5_7b_squad:
     reason: "Deprecated for 26.10 (Qwen2.5)"
-  qwen2_5_7b_squad_muon:
-    reason: "Deprecated for 26.10 (Qwen2.5)"
   qwen2_5_7b_squad_peft:
-    reason: "Deprecated for 26.10 (Qwen2.5)"
-  qwen25_magi_prefix_tree_rollouts:
     reason: "Deprecated for 26.10 (Qwen2.5)"
 
 known_issue:
