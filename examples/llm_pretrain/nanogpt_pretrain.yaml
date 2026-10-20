@@ -85,3 +85,6 @@ distributed:
   cp_size: 1
 
   sequence_parallel: false
+
+ci:
+  cluster_tag: h100

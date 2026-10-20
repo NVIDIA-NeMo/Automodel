@@ -31,8 +31,6 @@ def _restore_buffer():
     saved_hybridep = fused_a2a._hybrid_ep_buffer
     saved_hybridep_signature = fused_a2a._hybrid_ep_runtime_signature
     saved_hybridep_capacity = fused_a2a._hybrid_ep_initialized_capacity
-    saved_recorder = fused_a2a._hybridep_dispatch_replay_state.recorder
-    saved_mode = fused_a2a._hybridep_dispatch_replay_state.mode
     try:
         yield
     finally:
@@ -40,8 +38,6 @@ def _restore_buffer():
         fused_a2a._hybrid_ep_buffer = saved_hybridep
         fused_a2a._hybrid_ep_runtime_signature = saved_hybridep_signature
         fused_a2a._hybrid_ep_initialized_capacity = saved_hybridep_capacity
-        fused_a2a._hybridep_dispatch_replay_state.recorder = saved_recorder
-        fused_a2a._hybridep_dispatch_replay_state.mode = saved_mode
 
 
 def test_free_buffer_destroys_and_clears():
@@ -373,8 +369,8 @@ def test_hybridep_checkpoint_replay_preserves_selective_op_trace():
 def test_hybridep_replay_recorder_reads_extents_lazily_and_once():
     """finalize() only starts the extent read; take()/resolve() turn it into an int, idempotently."""
     recorder = fused_a2a.HybridEPDispatchReplayRecorder()
-    recorder.record("layout-a", torch.tensor([2, 3]))
-    recorder.record("layout-b", torch.tensor([1, 2]))
+    recorder.record(["layout-a", torch.tensor([2, 3]), None])
+    recorder.record(["layout-b", torch.tensor([1, 2]), None])
     recorder.finalize()
     recorder.resolve()
     recorder.resolve()  # a second resolve has nothing left to do
@@ -385,7 +381,7 @@ def test_hybridep_replay_recorder_reads_extents_lazily_and_once():
     assert recorder.take() is None and recorder.replay_misses == 1
     # take() without an explicit resolve() still yields a host integer
     lazy = fused_a2a.HybridEPDispatchReplayRecorder()
-    lazy.record("layout-c", torch.tensor([4]))
+    lazy.record(["layout-c", torch.tensor([4]), None])
     lazy.finalize()
     assert lazy.take()[2] == 4
 
@@ -395,7 +391,7 @@ def test_hybridep_replay_recorder_reads_extents_lazily_and_once():
 def test_hybridep_replay_recorder_copies_cuda_extents_asynchronously():
     """On CUDA, finalize() leaves a pinned scalar and an event in flight; resolve()/take() yield the int."""
     recorder = fused_a2a.HybridEPDispatchReplayRecorder()
-    recorder.record("layout-a", torch.tensor([2, 3], device="cuda"))
+    recorder.record(["layout-a", torch.tensor([2, 3], device="cuda"), None])
     recorder.finalize()
     entry = recorder._records[0]
     assert entry[2] is None
@@ -406,7 +402,7 @@ def test_hybridep_replay_recorder_copies_cuda_extents_asynchronously():
     assert recorder._copies[0] is None
     # take() without an explicit resolve() still yields a host integer
     lazy = fused_a2a.HybridEPDispatchReplayRecorder()
-    lazy.record("layout-b", torch.tensor([4], device="cuda"))
+    lazy.record(["layout-b", torch.tensor([4], device="cuda"), None])
     lazy.finalize()
     assert lazy.take()[2] == 4
 
@@ -415,9 +411,9 @@ def test_hybridep_recorder_keeps_a_host_extent_without_reducing_tokens_per_exper
     recorder = fused_a2a.HybridEPDispatchReplayRecorder()
     tokens_per_expert = mock.MagicMock(spec=torch.Tensor)
     # capacity mode: the forward already ran with a host-side extent
-    recorder.record("layout", tokens_per_expert, 24)
+    recorder.record(["layout", tokens_per_expert, 24])
     # blocking dispatch: the extent comes from the reduction, after the checkpoint context exits
-    recorder.record("layout", torch.tensor([2, 3]))
+    recorder.record(["layout", torch.tensor([2, 3]), None])
     recorder.finalize()
 
     assert recorder.take() == ["layout", tokens_per_expert, 24]

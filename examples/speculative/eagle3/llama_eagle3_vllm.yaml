@@ -62,3 +62,6 @@ checkpoint:
   checkpoint_dir: ./outputs/eagle3_llama_vllm/checkpoints
   model_save_format: safetensors
   save_consolidated: true
+
+ci:
+  cluster_tag: h100

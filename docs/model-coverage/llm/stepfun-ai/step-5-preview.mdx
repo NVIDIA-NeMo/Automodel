@@ -1,6 +1,6 @@
 ---
-title: "Step 5 Preview"
-description: "Step 5 Preview architecture, sparse attention, context parallelism, and the full-depth H100 benchmark in NeMo AutoModel."
+title: "Step-5-Preview"
+description: "Step-5-Preview architecture, sparse attention, context parallelism, and the full-depth H100 benchmark in NeMo AutoModel."
 slug: model-coverage/large-language-models/stepfun-ai/Step-5-Preview
 ---
 
@@ -13,6 +13,8 @@ checkpoint also contains a perception encoder; see the
 for that path and its preprocessing requirements.
 
 ## Model Reference
+
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -37,6 +39,8 @@ parameters plus eight routed experts per MoE layer, including the full input
 embedding matrix. Excluding that matrix gives approximately 26.6B.
 
 ## Recipes
+
+Run the commands below from the AutoModel repository root on the `main` branch.
 
 | Recipe | Hardware and parallelism | Data |
 | --- | --- | --- |
@@ -132,7 +136,7 @@ contains the launch command.
 | Hardware | 16 nodes, 128 NVIDIA H100 80GB GPUs |
 | Model | All 92 decoder layers; random initialization through `from_config` |
 | Parallelism | EP32 / PP4 / CP1 / TP1; DP32 with EP over the data-parallel ranks |
-| Pipeline | 1F1B, one local stage per rank, 24 microbatches; layer partitions [0,24), [24,46), [46,70), [70,92) |
+| Pipeline | 1F1B, one local stage per rank, 24 microbatches; 23 decoder layers per stage |
 | Sequence / global batch | 8,192 tokens / 768 sequences |
 | Data and MoE routing | Mock documents; fake balanced static expert routing |
 | Attention | Learned CSA selection; SWA varlen and CSA forward/backward full-block paths enabled |
@@ -159,8 +163,8 @@ indexer's top-k budget, so selection drops regions there.
 
 | Query positions | Tokens | Mean logits KL | Maximum logits KL | Selected-region overlap |
 | --- | ---: | ---: | ---: | ---: |
-| 0–4,103 | 4,104 | 2.13e-6 | 2.36e-4 | 100% |
-| 4,104–8,191, where selection drops history | 4,088 | 2.36e-6 | 2.47e-4 | 99.11% |
+| 0-4,103 | 4,104 | 2.13e-6 | 2.36e-4 | 100% |
+| 4,104-8,191, where selection drops history | 4,088 | 2.36e-6 | 2.47e-4 | 99.11% |
 
 Region-selection differences occur at near-tied indexer scores. This
 comparison covers the forward pass of four layers; it is not full-depth
@@ -174,6 +178,7 @@ long-context validation.
 
 ## Related Resources
 
+- [Step-5-Preview](https://huggingface.co/stepfun-ai/Step-5-Preview)
 - [Hugging Face checkpoint](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
 - [Model implementation](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel/components/models/step5)
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

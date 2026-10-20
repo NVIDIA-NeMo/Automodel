@@ -15,7 +15,8 @@ Precision settings have distinct effects:
 
 | Setting | Controls | Effect on Optimizer State |
 | --- | --- | --- |
-| `model.dtype` | Storage dtype of the sharded parameter that PyTorch holds. | For `torch.optim.Adam`/`AdamW`, the EMA buffers (`exp_avg`, `exp_avg_sq`) use this dtype. Transformer Engine (TE) FusedAdam configures master weights and EMA dtypes separately. |
+| `model.dtype` | Base model storage dtype requested at loading. FSDP2 PEFT can lower eligible frozen parameters to the compute dtype before sharding. | For trainable parameters, `torch.optim.Adam`/`AdamW` EMA buffers (`exp_avg`, `exp_avg_sq`) use the resident parameter dtype. Frozen parameters have no Adam state. Transformer Engine (TE) FusedAdam configures master weights and EMA dtypes separately. |
+| `peft.lora_dtype` | Storage dtype of trainable LoRA adapters. | With `torch.optim.Adam`/`AdamW`, adapter EMA buffers use the adapter dtype, independently of frozen base storage. |
 | `mp_policy.param_dtype` | Compute dtype FSDP2 casts to during forward/backward. | None directly; this only affects matmul/activation precision. |
 | `mp_policy.reduce_dtype` | Dtype used for gradient reduce-scatter/all-reduce across data-parallel (DP) ranks. | None directly; this only affects how gradients are summed. |
 | `mp_policy.output_dtype` | Dtype FSDP2 casts module outputs to. | None directly; this affects activation tensors, including tensors that cross pipeline-parallel boundaries. |
@@ -183,7 +184,26 @@ distributed:
   strategy: fsdp2
 ```
 
-This keeps the resident model parameters in bf16 instead of fp32, so it can reduce memory usage compared to the torch AdamW and `model.dtype: float32` pattern. It is common in existing fine-tuning example configs and is probably acceptable for short fine-tuning runs or LoRA/PEFT. It is **not** recommended for long full-parameter training (pretraining or extended fine-tuning): bf16 EMA quantization can quietly slow convergence (higher final loss at the same step count) and, in worse cases, produce unstable `grad_norm`, loss bumps, loss spikes, or divergence.
+This keeps the resident model parameters in bf16 instead of fp32, so it can reduce memory usage compared to the torch AdamW and `model.dtype: float32` pattern. It is common in existing fine-tuning example configs, but convergence should be validated for the intended workload. It is **not** recommended for long full-parameter training (pretraining or extended fine-tuning): bf16 EMA quantization can quietly slow convergence (higher final loss at the same step count) and, in worse cases, produce unstable `grad_norm`, loss bumps, loss spikes, or divergence. For LoRA/PEFT, check adapter storage separately as described below.
+
+## LoRA Adapter Storage and Precision Warnings
+
+Frozen base parameters do not receive optimizer updates or acquire Adam state. Keeping them in bf16 therefore does not reduce the precision of adapter updates. With `torch.optim.Adam` or `AdamW`, it is the **trainable adapter storage dtype** that determines the precision of adapter updates and EMA buffers.
+
+For multi-rank, unquantized FSDP2 LoRA training, set the adapter dtype explicitly to keep adapter storage and Adam moments in fp32 while allowing frozen base storage and forward/backward compute to remain bf16:
+
+```yaml
+peft:
+  lora_dtype: float32
+```
+
+The default `peft.lora_dtype: null` inherits the base layer dtype when adapters are created; it does not guarantee fp32 adapters. Setting `peft.lora_dtype: bfloat16` explicitly gives bf16 adapter storage and, with torch Adam/AdamW, bf16 moments. Validate convergence before choosing that setting. In this multi-rank FSDP2 path, changing `model.dtype` alone does not override an explicit adapter dtype.
+
+On a single-rank FSDP2 setup, parameters remain unsharded and mixed LoRA submodules are cast to the compute dtype, so `peft.lora_dtype: float32` does not guarantee fp32 adapter storage or optimizer moments there.
+
+<Warning>
+The automatic warning about torch Adam/AdamW with trainable bf16 parameters currently skips PEFT runs. Absence of this warning does not mean your adapters or their optimizer state are fp32. Check `peft.lora_dtype` and the actual trainable parameter dtypes; use `peft.lora_dtype: float32` to request fp32 adapter storage with torch Adam/AdamW on multi-rank FSDP2 runs.
+</Warning>
 
 ## Example Configs
 

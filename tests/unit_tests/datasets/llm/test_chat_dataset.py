@@ -202,6 +202,7 @@ def test_load_openai_messages_local_and_errors(tmp_path, monkeypatch):
 
 
 def test_load_openai_messages_local_skip_invalid_samples(tmp_path):
+    
     jsonl = tmp_path / "broken.jsonl"
     jsonl.write_text(
         "\n".join(
@@ -221,7 +222,16 @@ def test_load_openai_messages_local_skip_invalid_samples(tmp_path):
     assert len(rows) == 2
     assert rows[0]["messages"][0]["content"] == "ok-1"
     assert rows[1]["messages"][0]["content"] == "ok-2"
+def test_load_openai_messages_keeps_rows_with_unicode_line_separators(tmp_path):
+    # JSON allows raw U+2028/U+2029/U+0085 inside strings; str.splitlines() would cut these rows in half.
+    row = {"messages": [{"role": "user", "content": "a\u2028b\u2029c\u0085d"}, {"role": "assistant", "content": "ok"}]}
+    jsonl = tmp_path / "data.jsonl"
+    jsonl.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
 
+    rows = tcd._load_openai_messages(str(jsonl))
+
+    assert len(rows) == 1
+    assert rows[0]["messages"][0]["content"] == "a\u2028b\u2029c\u0085d"
 
 def test_load_openai_messages_hf_shuffle_and_slice(monkeypatch):
     """Verify that HF datasets are shuffled before slicing."""
