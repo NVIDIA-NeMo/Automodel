@@ -15,7 +15,10 @@
 # Full-parameter MiMo-V2.6-Pro-RL fine-tuning on real MedPix-VQA.
 # Non-packed 4096-token inputs, 100 steps, LBS2 / GBS128 / GA1.
 # Hardware target: 32 nodes x 4 GB200 GPUs, EP64 / PP2 / CP1 / TP1.
-# Keep each 64-GPU EP group within one NVLink domain.
+# Use four-rank HybridEP domains matching the physical GB200 hosts.
+# Communication between these domains requires working GPU RDMA registration.
+# Set NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4 for direct launches too;
+# ci.env_vars applies this setting only in CI.
 
 recipe: FinetuneRecipeForVLM
 
@@ -163,6 +166,8 @@ ci:
   cluster_tag: gb200
   time: "01:00:00"
   max_steps: 5
+  env_vars:
+    NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "4"
 
 # wandb:
 #   enable: true
