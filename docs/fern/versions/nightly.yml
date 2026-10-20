@@ -898,7 +898,7 @@ navigation:
       - page: "Overview"
         path: ../../guides/tutorials.mdx
         slug: tutorials/overview
-      - section: "Language Models"
+      - section: "Large Language Models"
         skip-slug: true
         contents:
           - page: "Function Calling with FunctionGemma"

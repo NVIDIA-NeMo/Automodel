@@ -66,16 +66,12 @@ mkdir -p checkpoints
 docker run --gpus all -it --rm --shm-size=8g \
   -e HF_TOKEN \
   -v "$PWD/checkpoints:/opt/Automodel/checkpoints" \
-  nvcr.io/nvidia/nemo-automodel:26.10.00
+  nvcr.io/nvidia/nemo-automodel:26.10.00 \
+  automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+  --nproc-per-node 2
 ```
 
-Inside the container, run the example on two GPUs:
-
-```bash
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 2
-```
-
-The Llama example requires Hugging Face access. Export `HF_TOKEN` on the host before starting the container. Checkpoints are saved to the mounted `checkpoints` directory.
+This example uses two GPUs. The Llama example requires Hugging Face access. Export `HF_TOKEN` on the host before starting the container. Checkpoints are saved to the mounted `checkpoints` directory.
 
 See the [installation guide](/get-started/installation) for Docker prerequisites, source builds, and multi-node setup.
 See the [configuration guide](/get-started/configuration) for YAML recipes and CLI overrides.
