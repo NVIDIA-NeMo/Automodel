@@ -30,9 +30,6 @@ TABLE_ROW_COUNT = 10
 # Keep compatibility copies on disk, but catalog only their canonical cards.
 MODEL_CARD_PATH_ALIASES = {
     "docs/model-coverage/vlm/muse/muse_spark_open.mdx": "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx",
-    "docs/model-coverage/llm/stepfun-ai/step-5-preview.mdx": (
-        "docs/model-coverage/llm/stepfun-ai/step-5-preview-bf16.mdx"
-    ),
     "docs/model-coverage/vlm/stepfun-ai/step-5-preview.mdx": (
         "docs/model-coverage/vlm/stepfun-ai/step-5-preview-bf16.mdx"
     ),

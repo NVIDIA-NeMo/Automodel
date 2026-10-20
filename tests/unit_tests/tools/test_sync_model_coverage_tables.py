@@ -496,12 +496,17 @@ def _assert_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
         recipe = yaml.safe_load(_read_documented_recipe(repo_root, match[1], match[0]))
         assert isinstance(recipe, dict), f"{match[1]}: recipe must be a YAML mapping"
         recipe_ids.update(_iter_pretrained_model_ids(recipe.get("model", {})))
-    if not recipe_ids:
-        return
     metadata = yaml.safe_load(document.split("---", 2)[1])
     title = metadata["title"]
-    names = {model_id.split("/", 1)[1] for model_id in recipe_ids}
-    assert title in names, f"{card}: title {title!r} must match a linked recipe model ID: {sorted(recipe_ids)}"
+    if recipe_ids:
+        names = {model_id.split("/", 1)[1] for model_id in recipe_ids}
+        assert title in names, f"{card}: title {title!r} must match a linked recipe model ID: {sorted(recipe_ids)}"
+    else:
+        # Reference-only cards identify the checkpoint in their first HF model link.
+        hf_ids = re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document)
+        assert hf_ids, f"{card}: reference card must link its Hugging Face checkpoint"
+        assert title == hf_ids[0].split("/", 1)[1], f"{card}: title must match the primary HF checkpoint"
+        recipe_ids = {hf_ids[0]}
     filename = re.sub(r"[^a-z0-9]+", "-", title.casefold()).strip("-") + ".mdx"
     assert card.name == filename, f"{card}: filename must be {filename!r} for checkpoint {title!r}"
     matching_ids = {model_id for model_id in recipe_ids if model_id.split("/", 1)[1] == title}
@@ -557,6 +562,21 @@ def test_model_card_identity_rejects_recipe_mismatch(tmp_path: Path, title: str,
     )
     with pytest.raises(AssertionError, match=message):
         _assert_model_card_recipe_identity(tmp_path, card)
+
+
+@pytest.mark.parametrize("title,valid", [("Step-5-Preview", True), ("Step-5-Preview-BF16", False)])
+def test_reference_card_identifies_fp8_checkpoint_without_bf16_recipe(tmp_path: Path, title: str, valid: bool):
+    card = tmp_path / "step-5-preview.mdx"
+    card.write_text(
+        f'---\ntitle: "{title}"\n---\n'
+        "[FP8](https://huggingface.co/stepfun-ai/Step-5-Preview)\n"
+        "[BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)\n"
+    )
+    if valid:
+        _assert_model_card_recipe_identity(tmp_path, card)
+    else:
+        with pytest.raises(AssertionError, match="primary HF checkpoint"):
+            _assert_model_card_recipe_identity(tmp_path, card)
 
 
 def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():

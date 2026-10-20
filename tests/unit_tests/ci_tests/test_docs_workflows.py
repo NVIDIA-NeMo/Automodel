@@ -119,6 +119,28 @@ def test_preview_preserves_trusted_navigation_targets(tmp_path: Path) -> None:
         assert (preview / name).read_text() == trusted[name]
 
 
+def test_preview_drops_legacy_redirects_that_shadow_new_pages(tmp_path: Path) -> None:
+    preview = tmp_path / "runner/fern-preview/docs"
+    destination = preview / "fern/versions/nightly.yml"
+    destination.parent.mkdir(parents=True)
+    navigation = "navigation:\n  - page: BF16\n    path: ../../model.mdx\n"
+    destination.write_text(navigation)
+    (preview / "model.mdx").write_text("---\nslug: model-coverage/org/Model-BF16\n---\nBF16 page\n")
+    stale = {"source": "/nemo/automodel/nightly/model-coverage/org/Model-BF16", "destination": "/old"}
+    retained = {"source": "/nemo/automodel/nightly/old-guide", "destination": "/guide"}
+    trusted = {"title": "Trusted", "js": ["./trusted.js"], "redirects": [stale, retained]}
+    (preview / "fern/docs.yml").write_text(yaml.safe_dump(trusted))
+    source = tmp_path / "pr-source/docs/fern/versions/nightly.yml"
+    source.parent.mkdir(parents=True)
+    source.write_text(navigation)
+    (source.parent.parent / "docs.yml").write_text("js: ['https://untrusted.example/code.js']\n")
+
+    result = _run_pr_navigation(tmp_path)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert yaml.safe_load((preview / "fern/docs.yml").read_text()) == {**trusted, "redirects": [retained]}
+
+
 @pytest.mark.parametrize(
     "proposed",
     [

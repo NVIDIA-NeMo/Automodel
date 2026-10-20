@@ -172,6 +172,7 @@ jobs:
         run: |
           uv run --no-project --isolated --python 3.12 --with pyyaml==6.0.3 python -I - <<'PY'
           import os
+          import re
           from pathlib import Path
 
           import yaml
@@ -193,6 +194,8 @@ jobs:
               "section": {"section", "path", "contents", "slug", "skip-slug", "icon"},
               "folder": {"folder"},
           }
+
+          published_pages = set()
 
           def validate(items, depth=0):
               if not isinstance(items, list) or depth > 20:
@@ -229,12 +232,31 @@ jobs:
                           raise ValueError("Nightly pages must stay in the documentation content tree")
                       if target.suffix not in {".md", ".mdx"} or not target.is_file():
                           raise ValueError("Navigation paths must reference existing Markdown pages")
+                      header = re.match(r"\A---\r?\n(.*?)\r?\n---(?:\r?\n|$)", target.read_text(), re.DOTALL)
+                      if header:
+                          metadata = yaml.safe_load(header[1])
+                          slug = metadata.get("slug") if isinstance(metadata, dict) else None
+                          if isinstance(slug, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", slug):
+                              published_pages.update(
+                                  f"{prefix}/{slug}".casefold()
+                                  for prefix in ("/nemo/automodel", "/nemo/automodel/nightly")
+                              )
                   if kind == "section":
                       validate(item.get("contents", []), depth + 1)
 
           if not isinstance(proposed, dict) or set(proposed) != {"navigation"}:
               raise ValueError("Only the nightly navigation may be overridden")
           validate(proposed["navigation"])
+          # A newly canonical PR page must not be hidden by a legacy main redirect.
+          # Only remove trusted redirects to declared pages; never load PR site settings.
+          site_path = docs / "fern/docs.yml"
+          site = yaml.safe_load(site_path.read_text())
+          if isinstance(site, dict) and isinstance(site.get("redirects"), list):
+              redirects = site["redirects"]
+              remaining = [item for item in redirects if item["source"].casefold() not in published_pages]
+              if len(remaining) != len(redirects):
+                  site["redirects"] = remaining
+                  site_path.write_text(yaml.safe_dump(site, sort_keys=False, allow_unicode=True))
           destination.write_text(yaml.safe_dump(proposed, sort_keys=False, allow_unicode=True))
           PY
 
