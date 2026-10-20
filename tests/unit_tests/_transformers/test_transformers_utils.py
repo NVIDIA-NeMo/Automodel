@@ -301,6 +301,25 @@ class TestPatchSpecialTokensPattern:
 class TestApplyCacheCompatibilityPatchesIntegration:
     """Tests for apply_cache_compatibility_patches calling the new sub-patches."""
 
+    def test_restores_legacy_flash_attention_import(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Legacy remote code can import the FlashAttention availability predicate."""
+        import transformers.utils as transformers_utils
+
+        monkeypatch.delattr(transformers_utils, "is_flash_attn_available", raising=False)
+        apply_cache_compatibility_patches()
+        from transformers.utils import is_flash_attn_available
+
+        assert is_flash_attn_available() == transformers_utils.is_flash_attn_2_available()
+
+    def test_preserves_existing_flash_attention_predicate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An upstream predicate remains authoritative when it exists."""
+        import transformers.utils as transformers_utils
+
+        original = Mock(return_value=False)
+        monkeypatch.setattr(transformers_utils, "is_flash_attn_available", original, raising=False)
+        apply_cache_compatibility_patches()
+        assert transformers_utils.is_flash_attn_available is original
+
     def test_restores_legacy_torch_fx_import(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Checkpoint-owned v4 code can still import the removed FX predicate."""
         import transformers.utils.import_utils as import_utils
