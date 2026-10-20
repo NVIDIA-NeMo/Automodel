@@ -76,10 +76,11 @@ def test_tied_parameters_remain_shared_after_selection_and_loading():
     torch.testing.assert_close(model.decoder.weight, source, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.float16])
 @pytest.mark.parametrize("dtype_field", ["trainable_dtype", "frozen_dtype"])
-def test_invalid_storage_precision_fails_before_mutation(dtype_field):
+def test_invalid_storage_precision_fails_before_mutation(dtype_field, dtype):
     model = nn.Linear(2, 2, dtype=torch.bfloat16)
-    config = ParameterConfig(("weight",), **{dtype_field: torch.int32})
+    config = ParameterConfig(("weight",), **{dtype_field: dtype})
     with pytest.raises(ValueError):
         apply_parameter_config(model, config)
     assert all(p.requires_grad and p.dtype == torch.bfloat16 for p in model.parameters())

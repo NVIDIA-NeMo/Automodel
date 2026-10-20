@@ -1492,80 +1492,27 @@ def test_native_mixed_precision_survives_materialization_without_surface(tmp_pat
 
 
 @skip_if_no_gpu
-def test_factory_materialization_and_checkpoint_load_preserve_selected_fp32(tmp_path):
-    from safetensors.torch import save_file
+def test_factory_rejects_parameter_config_without_fsdp2_sharding(tmp_path):
+    """One-rank runs skip the FSDP2 mixed-precision casts that mixed storage needs."""
     from transformers import PretrainedConfig
 
     from nemo_automodel import NeMoAutoModelForCausalLM
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
     from nemo_automodel.components.utils.parameter_config import ParameterConfig
 
     config = PretrainedConfig(**MockNemotronV3Config().to_dict())
     config.architectures = ["NemotronHForCausalLM"]
     config.name_or_path = str(tmp_path)
-    backend = BackendConfig(
-        linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
-    )
-    seed = NemotronHForCausalLM(config, backend=backend)
-    seed.initialize_weights()
-    selected = "model.layers.0.norm.weight"
-    assert selected in dict(seed.named_parameters())
-    weights = {name: value.detach().clone() for name, value in seed.state_dict().items()}
-    weights[selected] = torch.full_like(weights[selected], 0.1234567, dtype=torch.float32)
-    save_file(weights, tmp_path / "model.safetensors")
-    model = NeMoAutoModelForCausalLM.from_config(
-        config,
-        backend=backend,
-        torch_dtype=torch.bfloat16,
-        use_liger_kernel=False,
-        use_sdpa_patching=False,
-        attn_implementation="sdpa",
-        load_base_model=True,
-        parameter_config=ParameterConfig((selected,), torch.float32, torch.bfloat16),
-    )
-    parameters = dict(model.named_parameters())
-    assert parameters[selected].dtype == torch.float32
-    assert parameters[selected].requires_grad
-    torch.testing.assert_close(parameters[selected].detach().cpu(), weights[selected], rtol=0, atol=0)
-    assert all(p.dtype == torch.bfloat16 and not p.requires_grad for name, p in parameters.items() if name != selected)
-
-
-@skip_if_no_gpu
-def test_factory_bin_checkpoint_adapter_preserves_selected_fp32_experts(tmp_path):
-    from transformers import PretrainedConfig
-
-    from nemo_automodel import NeMoAutoModelForCausalLM
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-    from nemo_automodel.components.utils.parameter_config import ParameterConfig
-
-    config = PretrainedConfig(**MockNemotronV3Config(layers_block_type=["mamba", "moe"]).to_dict())
-    config.architectures = ["NemotronHForCausalLM"]
-    config.name_or_path = str(tmp_path)
-    backend = BackendConfig(
-        linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=True
-    )
-    seed = NemotronHForCausalLM(config, backend=backend)
-    seed.initialize_weights()
-    selected = "model.layers.1.mixer.experts.gate_and_up_projs"
-    weights = {name: value.detach().clone() for name, value in seed.state_dict().items()}
-    shape = weights[selected].shape
-    expected = torch.linspace(0.01, 0.02, weights[selected].numel(), dtype=torch.float32).view(shape)
-    assert not torch.equal(expected, expected.bfloat16().float())
-    weights[selected] = expected.clone()
-    torch.save(seed.state_dict_adapter.to_hf(weights), tmp_path / "pytorch_model.bin")
-    model = NeMoAutoModelForCausalLM.from_config(
-        config,
-        backend=backend,
-        torch_dtype=torch.bfloat16,
-        use_liger_kernel=False,
-        use_sdpa_patching=False,
-        attn_implementation="sdpa",
-        load_base_model=True,
-        parameter_config=ParameterConfig((selected,), torch.float32, torch.bfloat16),
-    )
-    experts = dict(model.named_parameters())[selected]
-    assert experts.dtype == torch.float32
-    torch.testing.assert_close(experts.detach().cpu(), expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="requires FSDP2 sharding"):
+        NeMoAutoModelForCausalLM.from_config(
+            config,
+            backend=BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch"),
+            torch_dtype=torch.bfloat16,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+            attn_implementation="sdpa",
+            load_base_model=True,
+            parameter_config=ParameterConfig(("model.layers.0.norm.weight",), torch.float32, torch.bfloat16),
+        )
 
 
 @skip_if_no_gpu

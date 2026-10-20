@@ -47,21 +47,24 @@ model = NeMoAutoModelForCausalLM.from_pretrained(
 
 Use names from the unwrapped model's `named_parameters()`. All other parameters
 are frozen and retain their constructor storage dtype unless `frozen_dtype` is
-explicitly set. Tied parameters retain their shared identity and use the first
-name returned by `named_parameters()`. Unknown, duplicate, or empty selections
-raise an error. Construct the optimizer after the loader returns.
+explicitly set. `trainable_dtype` and `frozen_dtype` accept fp32 or bf16. Tied
+parameters retain their shared identity and use the first name returned by
+`named_parameters()`. Unknown, duplicate, or empty selections raise an error.
+Construct the optimizer after the loader returns.
 
 This option requires a checkpoint-free construction path with an initializer
 supporting `dtype=None`, as implemented by native Nemotron V3. It cannot be
 combined with PEFT or `freeze_config`, or used after a Hugging Face constructor has
 already loaded weights. It preserves the selected storage precision through
 materialization, so an fp32 checkpoint is not rounded to bf16 before loading.
-It does not change FSDP compute precision.
+It does not change FSDP compute precision. Mixed storage relies on the FSDP2
+mixed-precision policy to cast parameters to the compute dtype, so this option
+requires FSDP2 sharding across more than one rank; one-rank runs are rejected.
 
 For native checkpoint conversion without changing trainability, use
 `preserve_parameter_dtypes=True` instead. Both modes verify that initialization
-preserves parameter dtypes, and both require FSDP2; DDP is rejected. The default
-loader behavior is unchanged.
+preserves parameter dtypes, and both require FSDP2; DDP and Megatron-FSDP are
+rejected. The default loader behavior is unchanged.
 
 Nemotron V3 also accepts `compute_mtp=False` during an off-pipeline-parallel
 forward call. This skips auxiliary MTP computation while retaining all MTP

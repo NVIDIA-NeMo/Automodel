@@ -56,8 +56,10 @@ from transformers.utils import ContextManagers  # noqa: E402
 from nemo_automodel.components.distributed.config import (  # noqa: E402
     DDPConfig,
     DistributedSetup,
+    FSDP2Config,
     MegatronFSDPConfig,
 )
+from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled  # noqa: E402
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
@@ -427,6 +429,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         freeze_config = kwargs.pop("freeze_config", None)
         if parameter_config is not None and (freeze_config is not None or peft_config is not None):
             raise ValueError("parameter_config cannot be combined with freeze_config or PEFT")
+        if parameter_config is not None:
+            device_mesh = getattr(model_wrapper, "device_mesh", None)
+            if not (
+                isinstance(_get_strategy_config(model_wrapper), FSDP2Config)
+                and device_mesh is not None
+                and fsdp2_sharding_enabled(device_mesh)
+            ):
+                # Mixed storage relies on the FSDP2 mixed-precision casts, which unsharded runs skip.
+                raise ValueError("parameter_config requires FSDP2 sharding across more than one rank")
         load_metadata_with_gloo = kwargs.pop("load_metadata_with_gloo", False)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
         if isinstance(pretrained_model_name_or_path_or_config, str):
@@ -756,10 +767,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 If provided, the model will be compiled. Default: None.
             parameter_config: Exact trainable parameter names and storage dtypes,
                 applied before loading and sharding. Cannot be combined with PEFT
-                or freeze_config. Requires checkpoint-free model construction.
+                or freeze_config. Requires checkpoint-free model construction and
+                FSDP2 sharding across more than one rank.
             preserve_parameter_dtypes: Preserve constructor storage dtypes during
                 materialization; requires a model initializer supporting dtype=None.
-                Also enabled by parameter_config. Not supported with DDP. Defaults to False.
+                Also enabled by parameter_config. Not supported with DDP or Megatron-FSDP.
+                Defaults to False.
             **kwargs: Additional keyword arguments. Notable ones include:
                 - dtype (str | torch.dtype): Model storage dtype. Takes precedence
                   over ``torch_dtype`` when not ``None``; accepts ``auto``.

@@ -26,7 +26,8 @@ class ParameterConfig:
 
     Names refer to parameters before activation checkpoint wrapping. Storage
     precision is applied before checkpoint loading so native FP32 source
-    tensors never make an intermediate roundtrip through BF16.
+    tensors never make an intermediate roundtrip through BF16. Storage dtypes
+    must be float32 or bfloat16.
     """
 
     trainable_names: tuple[str, ...]
@@ -52,10 +53,11 @@ def apply_parameter_config(model: nn.Module, config: ParameterConfig) -> None:
     """
     if len(set(config.trainable_names)) != len(config.trainable_names):
         raise ValueError("ParameterConfig trainable_names must be unique")
-    if config.trainable_dtype not in (torch.float32, torch.bfloat16, torch.float16):
-        raise ValueError("Trainable parameter storage must be floating point")
-    if config.frozen_dtype not in (None, torch.float32, torch.bfloat16, torch.float16):
-        raise ValueError("Frozen parameter storage must be floating point")
+    # FP16 storage keeps FP16 compute under a BF16 policy and splits fused-kernel FSDP units.
+    if config.trainable_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("Trainable parameter storage must be float32 or bfloat16")
+    if config.frozen_dtype not in (None, torch.float32, torch.bfloat16):
+        raise ValueError("Frozen parameter storage must be float32 or bfloat16")
     parameters = dict(model.named_parameters())
     missing = set(config.trainable_names) - parameters.keys()
     if missing:

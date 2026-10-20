@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-rank FSDP coverage for selected FP32 storage in hybrid Nemotron-H Mamba blocks."""
+"""Two-rank FSDP coverage for selected FP32 storage in Nemotron-H."""
 
 from pathlib import Path
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
+from transformers import PretrainedConfig
 
+from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 from nemo_automodel.components.models.nemotron_v3.parallelization import PARALLELIZER
@@ -70,3 +73,79 @@ def _worker(rank: int, rendezvous: str) -> None:
 def test_mamba_fp32_selection_keeps_fused_kernel_weights_in_block_unit(tmp_path: Path) -> None:
     """Whole-block and block-norm-only FP32 selections keep Mamba fused-kernel weights in the block's FSDP unit."""
     mp.spawn(_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)
+
+
+# checkpoint format -> (layer types, selected parameter, use the HF state-dict adapter)
+_FACTORY_CASES = {
+    "safetensors": (["attention", "mlp"], "model.layers.0.norm.weight", False),
+    "bin": (["mamba", "moe"], "model.layers.1.mixer.experts.gate_and_up_projs", True),
+}
+
+
+def _factory_config(checkpoint_dir: str, checkpoint_format: str) -> tuple[PretrainedConfig, BackendConfig]:
+    layers, _, use_adapter = _FACTORY_CASES[checkpoint_format]
+    config = PretrainedConfig(**MockNemotronV3Config(layers_block_type=layers).to_dict())
+    config.architectures = ["NemotronHForCausalLM"]
+    config.name_or_path = checkpoint_dir
+    backend = BackendConfig(
+        linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=use_adapter
+    )
+    return config, backend
+
+
+def _factory_worker(rank: int, rendezvous: str, checkpoint_dir: str, checkpoint_format: str, expected) -> None:
+    from nemo_automodel import NeMoAutoModelForCausalLM
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        config, backend = _factory_config(checkpoint_dir, checkpoint_format)
+        selected = _FACTORY_CASES[checkpoint_format][1]
+        model = NeMoAutoModelForCausalLM.from_config(
+            config,
+            backend=backend,
+            torch_dtype=torch.bfloat16,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+            attn_implementation="sdpa",
+            load_base_model=True,
+            distributed_setup=DistributedSetup.build(
+                FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32))
+            ),
+            parameter_config=ParameterConfig((selected,), torch.float32, torch.bfloat16),
+        )
+        parameters = dict(model.named_parameters())
+        assert parameters[selected].dtype == torch.float32
+        assert parameters[selected].requires_grad
+        torch.testing.assert_close(parameters[selected].full_tensor().cpu(), expected, rtol=0, atol=0)
+        assert all(p.dtype == torch.bfloat16 and not p.requires_grad for n, p in parameters.items() if n != selected)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA devices for the FSDP2 factory path")
+@pytest.mark.parametrize("checkpoint_format", ["safetensors", "bin"])
+def test_factory_loads_selected_fp32_values_exactly(tmp_path: Path, checkpoint_format: str) -> None:
+    """Selected FP32 values, including grouped experts merged from a .bin checkpoint, load exactly."""
+    from safetensors.torch import save_file
+
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    config, backend = _factory_config(str(checkpoint_dir), checkpoint_format)
+    seed = NemotronHForCausalLM(config, backend=backend)
+    seed.initialize_weights()
+    selected = _FACTORY_CASES[checkpoint_format][1]
+    weights = {name: value.detach().clone() for name, value in seed.state_dict().items()}
+    expected = torch.linspace(0.01, 0.02, weights[selected].numel(), dtype=torch.float32).view(weights[selected].shape)
+    assert not torch.equal(expected, expected.bfloat16().float())
+    weights[selected] = expected.clone()
+    if checkpoint_format == "bin":
+        torch.save(seed.state_dict_adapter.to_hf(weights), checkpoint_dir / "pytorch_model.bin")
+    else:
+        save_file(weights, checkpoint_dir / "model.safetensors")
+    mp.spawn(
+        _factory_worker,
+        args=((tmp_path / "rendezvous").as_uri(), str(checkpoint_dir), checkpoint_format, expected),
+        nprocs=2,
+        join=True,
+    )

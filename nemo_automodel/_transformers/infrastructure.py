@@ -573,7 +573,8 @@ def apply_model_infrastructure(
             handles BnB quantization atomically). When True, checkpoint loading in
             this function is skipped. Default: False.
         preserve_parameter_dtypes: Keep per-parameter storage precision during
-            materialization. The model initializer must support dtype=None. Not supported with DDP.
+            materialization. The model initializer must support dtype=None. Not supported with
+            DDP or Megatron-FSDP.
         inject_te_attention: When True, inject TransformerEngine DotProductAttention
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
@@ -586,9 +587,11 @@ def apply_model_infrastructure(
     if mesh is None:
         mesh = MeshContext()
     strategy_config = _get_strategy_config(model_wrapper)
-    if preserve_parameter_dtypes and isinstance(strategy_config, DDPConfig):
-        # Single-rank CUDA DDP casts the whole model to BF16.
-        raise ValueError("preserve_parameter_dtypes and parameter_config are not supported with DDP; use FSDP2")
+    if preserve_parameter_dtypes and isinstance(strategy_config, (DDPConfig, MegatronFSDPConfig)):
+        # Single-rank DDP and Megatron-FSDP cast the whole model to BF16.
+        raise ValueError(
+            "preserve_parameter_dtypes and parameter_config are not supported with DDP or Megatron-FSDP; use FSDP2"
+        )
 
     # Create a checkpointer for loading base weights only. Keep consolidation disabled
     # so load-only infrastructure does not emit save/export warnings.

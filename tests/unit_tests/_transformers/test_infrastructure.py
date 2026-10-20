@@ -534,18 +534,20 @@ def test_apply_model_infrastructure_handles_unwrapped_single_rank_ddp_model():
     assert hasattr(model, "_pre_shard_hf_state_dict_keys")
 
 
-def test_apply_model_infrastructure_rejects_preserved_dtypes_with_ddp():
-    """DDP does not keep per-parameter storage dtypes, so it must reject a ParameterConfig."""
+@pytest.mark.parametrize("strategy", ["ddp", "megatron_fsdp"])
+def test_apply_model_infrastructure_rejects_preserved_dtypes_without_fsdp2(strategy):
+    """DDP and Megatron-FSDP do not keep per-parameter storage dtypes, so they must reject a ParameterConfig."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
-    from nemo_automodel.components.distributed import DDPConfig, MeshContext
+    from nemo_automodel.components.distributed import DDPConfig, MegatronFSDPConfig, MeshContext
 
-    with pytest.raises(ValueError, match="not supported with DDP"):
+    strategy_config = DDPConfig() if strategy == "ddp" else MegatronFSDPConfig()
+    with pytest.raises(ValueError, match="not supported with DDP or Megatron-FSDP"):
         apply_model_infrastructure(
             model=_DummyModel(),
             is_meta_device=False,
             device=torch.device("cpu"),
             load_base_model=False,
-            model_wrapper=MeshContext(strategy_config=DDPConfig()),
+            model_wrapper=MeshContext(strategy_config=strategy_config),
             preserve_parameter_dtypes=True,
         )
 
