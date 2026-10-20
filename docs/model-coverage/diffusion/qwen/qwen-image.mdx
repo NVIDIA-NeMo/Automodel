@@ -29,9 +29,9 @@ Qwen-Image-Edit-2511 training is intentionally limited to cached target latents,
 
 | Recipe | Description |
 |---|---|
-| [qwen_image_edit_2511_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) | 8-GPU BF16 FSDP2 baseline for full-parameter Qwen-Image-Edit-2511 training |
-| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune Qwen-Image with flow matching |
-| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain Qwen-Image with flow matching |
+| [qwen_image_edit_2511_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) | 8-GPU BF16 FSDP2 baseline for full-parameter Qwen-Image-Edit-2511 training |
+| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune Qwen-Image with flow matching |
+| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain Qwen-Image with flow matching |
 
 ## Prepare MagicBrush
 
@@ -149,7 +149,7 @@ The smoke test passes when the first launch writes the step-10 checkpoint, the s
 
 ## Generate
 
-Use [generate_qwen_image_edit.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml) to edit an image with the base model or a consolidated training checkpoint. Each entry in `inference.input_images` is paired with the prompt at the same position, so both lists must have the same length.
+Use [generate_qwen_image_edit.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml) to edit an image with the base model or a consolidated training checkpoint. Each entry in `inference.input_images` is paired with the prompt at the same position, so both lists must have the same length.
 
 Pass the epoch checkpoint directory, source image, and edit instruction to the generic generation script:
 

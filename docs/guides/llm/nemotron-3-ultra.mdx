@@ -23,11 +23,11 @@ This guide uses [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag), a 
 - **Tokenizer**: shared with the base model (instantiated from the Nemotron-3-Ultra checkpoint's config).
 - **Sequence packing**: THD packing with `packed_sequence_size=2048` (`packing_strategy: thd`) using the packed-sequence THD collater. Validation uses the same THD collater, so the whole run stays on the packed `(1, T)` path used by the Transformer Engine attention backend.
 
-For the full HellaSwag dataset wrapper used in NeMo AutoModel, refer to [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/hellaswag.py).
+For the full HellaSwag dataset wrapper used in NeMo AutoModel, refer to [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/nemo_automodel/components/datasets/llm/hellaswag.py).
 
 ## Launch Training
 
-A ready-to-use PEFT (LoRA) recipe ships at [`examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft_gb200.yaml), validated on 4 × GB200 (16 GPUs). An H100-oriented variant (same recipe, `deepep` dispatcher and `ep_size: 32` for a 4 × 8 H100 allocation) ships at [`examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml).
+A ready-to-use PEFT (LoRA) recipe ships at [`examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft_gb200.yaml), validated on 4 × GB200 (16 GPUs). An H100-oriented variant (same recipe, `deepep` dispatcher and `ep_size: 32` for a 4 × 8 H100 allocation) ships at [`examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml).
 
 NeMo AutoModel supports several ways to launch training — through the AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, and so on), refer to the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 
@@ -104,4 +104,4 @@ srun \
 
 The recorded validation used the 26.04 container with LoRA PEFT on HellaSwag on a 4 × GB200 (16-GPU) allocation, using the hybrid Mamba-2 and MoE Ultra backbone with MTP and Transformer Engine kernels. Training loss decreased steadily over the run (≈2.67 → ≈1.6), confirming healthy convergence end-to-end through model load, THD-packed data, FSDP2 and expert parallelism, and safetensors checkpointing.
 
-<img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/nemotron_ultra_loss.png" alt="Nemotron-3 Ultra Training Loss Curve" />
+<img src="https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/docs/guides/llm/nemotron_ultra_loss.png" alt="Nemotron-3 Ultra Training Loss Curve" />

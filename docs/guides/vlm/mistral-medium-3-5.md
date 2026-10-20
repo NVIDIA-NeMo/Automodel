@@ -48,12 +48,12 @@ medical image interpretation.
 For a full walkthrough of how MedPix-VQA is preprocessed and integrated
 into NeMo AutoModel — including the chat-template conversion and collate
 functions — see the
-[Multi-Modal Dataset Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/vlm/dataset.mdx#multi-modal-datasets).
+[Multi-Modal Dataset Guide](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/docs/guides/vlm/dataset.mdx#multi-modal-datasets).
 
 ## Launch Training
 
 We provide a ready-to-use recipe at
-[`examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml).
+[`examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml).
 This recipe is configured for **8 nodes × 8 H100-80GB GPUs (64 GPUs total)**
 with TP=8, PP=8, DP=1. The vision tower and multi-modal projector are
 frozen by default and only the Ministral-3 language model is trained;
@@ -64,7 +64,7 @@ NeMo AutoModel supports several ways to launch training — via the
 AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more.
 For full details on all launch options (Slurm batch jobs, multi-node
 configuration, environment variables, etc.), see the
-[Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx)
+[Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/docs/launcher/slurm.mdx)
 guide.
 
 
@@ -93,5 +93,5 @@ The training loss curves for Mistral Medium 3.5 fine-tuned on
 MedPix-VQA are shown below.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/mistralm35.png" alt="Mistral Medium 3.5 Training Loss Curve" width="500" />
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/r0.7.0/docs/guides/vlm/mistralm35.png" alt="Mistral Medium 3.5 Training Loss Curve" width="500" />
 </p>

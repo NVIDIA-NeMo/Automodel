@@ -35,7 +35,7 @@ For details on adapting another multimodal dataset, see the
 
 ## Run Full SFT
 
-The [full SFT recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml)
+The [full SFT recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml)
 uses BF16, FSDP2 data parallelism, activation checkpointing, and a global batch
 size of eight:
 
@@ -46,7 +46,7 @@ uv run automodel --nproc-per-node=8 \
 
 ## Run LoRA
 
-The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml)
+The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml)
 trains rank-8 adapters and excludes the vision tower, image encoder, audio
 modules, and language-model head from adapter injection:
 

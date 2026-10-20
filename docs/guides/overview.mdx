@@ -13,7 +13,7 @@ Components are modular, plug-and-play building blocks referenced using the `_tar
 
 This page maps the ready-to-run recipes found in the `examples/` directory to their intended use cases, representative model families, and the most relevant how-to guides.
 
-- Examples root: [examples/ (GitHub)](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples)
+- Examples root: [examples/ (GitHub)](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples)
 - Getting started: [Install NeMo AutoModel](/get-started/installation)
 
 ## Large Language Models (LLM)
@@ -23,7 +23,7 @@ This section provides practical recipes and configurations for working with larg
 
 End-to-end fine-tuning recipes for many open models. Each subfolder contains YAML configurations showing task setups (e.g., SQuAD, HellaSwag), precision options (e.g., FP8), and parameter-efficient methods (e.g., LoRA/QLoRA).
 
-- Folder: [examples/llm_finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune)
+- Folder: [examples/llm_finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples/llm_finetune)
 - Representative families: Llama 3.1/3.2/3.3, Gemma 2/3, Falcon 3, Mistral/Mixtral, Nemotron, Granite, Starcoder, Qwen, Baichuan, GLM, OLMo, Phi, GPT-OSS, Moonlight
 - How-to guide: [LLM finetuning](/recipes-e2e-examples/sft-peft)
 
@@ -31,7 +31,7 @@ End-to-end fine-tuning recipes for many open models. Each subfolder contains YAM
 
 Starter configurations and scripts for pretraining with datasets from different stacks (e.g., PyTorch, Megatron Core).
 
-- Folder: [examples/llm_pretrain](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_pretrain)
+- Folder: [examples/llm_pretrain](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples/llm_pretrain)
 - Example models: GPT-2 baseline, NanoGPT, DeepSeek-V3, Moonlight 16B TE (Slurm)
 - How-to guides:
   - [LLM pretraining](/recipes-e2e-examples/pretraining)
@@ -41,7 +41,7 @@ Starter configurations and scripts for pretraining with datasets from different 
 
 Recipes for distilling knowledge from a large teacher model into a smaller, more efficient student model.
 
-- Folder: [examples/llm_kd](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_kd)
+- Folder: [examples/llm_kd](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples/llm_kd)
 - Example model: Llama 3.2 1B
 - How-to guide: [Knowledge distillation](/recipes-e2e-examples/knowledge-distillation)
 
@@ -49,7 +49,7 @@ Recipes for distilling knowledge from a large teacher model into a smaller, more
 
 Curated configurations for benchmarking different training stacks and settings (e.g., Torch vs. TransformerEngine + DeepEP, various model sizes, MoE variants).
 
-- Folder: [examples/llm_benchmark](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark)
+- Folder: [examples/llm_benchmark](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples/llm_benchmark)
 - Representative configurations: DeepSeek-V3, GPT-OSS (20B/120B), Kimi K2, Moonlight 16B, Qwen3 MoE 30B
 
 ## Vision Language Models (VLM)
@@ -59,7 +59,7 @@ This section provides practical recipes and configurations for working with visi
 
 Fine-tuning recipes for VLMs.
 
-- Folder: [examples/vlm_finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_finetune)
+- Folder: [examples/vlm_finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples/vlm_finetune)
 - Representative family: Gemma 3 (various configurations)
 - How-to guide: [Gemma 3n: Efficient multimodal fine-tuning](/recipes-e2e-examples/gemma-3-3n)
 
@@ -67,7 +67,7 @@ Fine-tuning recipes for VLMs.
 
 Simple generation script and configurations for VLMs.
 
-- Folder: [examples/vlm_generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_generate)
+- Folder: [examples/vlm_generate](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples/vlm_generate)
 
 ## Audio Models (ASR)
 
@@ -77,7 +77,7 @@ This section provides recipes for fine-tuning omni / audio-capable models on aut
 
 End-to-end ASR fine-tuning of `Qwen3-Omni-30B-A3B-Instruct` on any HuggingFace audio dataset, including a thinker-only checkpoint export step for downstream `transformers` / vLLM loading.
 
-- Folder: [examples/audio_finetune/qwen3_omni_asr](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/audio_finetune/qwen3_omni_asr)
+- Folder: [examples/audio_finetune/qwen3_omni_asr](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples/audio_finetune/qwen3_omni_asr)
 - Representative model: Qwen3-Omni-30B-A3B-Instruct
 - How-to guide: [Fine-tune Qwen3-Omni for ASR](/recipes-e2e-examples/qwen3-omni-asr)
 
@@ -91,7 +91,7 @@ This section walks through the full workflow in NeMo AutoModel: preparing your d
 
 Fine-tuning recipes for adapting pretrained diffusion models to your data.
 
-- Folder: [examples/diffusion/finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/finetune)
+- Folder: [examples/diffusion/finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples/diffusion/finetune)
 - Representative models: FLUX.1-dev (T2I, 12B), Wan 2.1 T2V 1.3B, HunyuanVideo 1.5
 - How-to guide: [Diffusion fine-tuning](/recipes-e2e-examples/diffusion-fine-tuning)
 
@@ -99,7 +99,7 @@ Fine-tuning recipes for adapting pretrained diffusion models to your data.
 
 Pretraining recipes for training diffusion models from scratch on large-scale datasets.
 
-- Folder: [examples/diffusion/pretrain](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/pretrain)
+- Folder: [examples/diffusion/pretrain](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples/diffusion/pretrain)
 - Representative models: Wan 2.1 T2V 1.3B, FLUX.1-dev
 - How-to guide: [Diffusion fine-tuning (pretraining section)](/recipes-e2e-examples/diffusion-fine-tuning#configure-your-training-recipe)
 
@@ -107,7 +107,7 @@ Pretraining recipes for training diffusion models from scratch on large-scale da
 
 Generation scripts and configs for running inference with pretrained or fine-tuned diffusion models.
 
-- Folder: [examples/diffusion/generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/generate)
+- Folder: [examples/diffusion/generate](https://github.com/NVIDIA-NeMo/Automodel/tree/r0.7.0/examples/diffusion/generate)
 - Representative models: Wan 2.1 1.3B, FLUX.1-dev, HunyuanVideo
 - How-to guide: [Diffusion generation](/recipes-e2e-examples/diffusion-fine-tuning#generation--inference)
 

@@ -21,7 +21,7 @@ We use [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag), a commonsen
 - **Tokenizer**: shared with the base model (`AutoTokenizer.from_pretrained` on the DeepSeek-V4 Flash checkpoint).
 - **Padding**: `pad_seq_len_divisible=64` via the default collater.
 
-For the full HellaSwag dataset wrapper used in NeMo Automodel, see [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/hellaswag.py).
+For the full HellaSwag dataset wrapper used in NeMo Automodel, see [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/nemo_automodel/components/datasets/llm/hellaswag.py).
 
 ## Architecture Notes
 
@@ -51,7 +51,7 @@ A new in-tree `HuggingFaceStorageReader` recognizes `F8_E8M0` and `F8_E5M2` dtyp
 
 ## Launch Training
 
-A ready-to-use recipe ships at [`examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml). The yaml header documents how to scale `num_hidden_layers` and `ep_size` for the full 43-layer multi-node run.
+A ready-to-use recipe ships at [`examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml). The yaml header documents how to scale `num_hidden_layers` and `ep_size` for the full 43-layer multi-node run.
 
 NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 

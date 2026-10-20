@@ -167,7 +167,7 @@ Set `--workers` to the number of CPU cores to use for parallel tokenization.
 
 ## Use a Recipe for Pretraining
 
-This example demonstrates how to pretrain an LLM by using the NeMo AutoModel library. It uses the LLM [training recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py), specifically `TrainFinetuneRecipeForNextTokenPrediction`. This recipe orchestrates loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
+This example demonstrates how to pretrain an LLM by using the NeMo AutoModel library. It uses the LLM [training recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/nemo_automodel/recipes/llm/train_ft.py), specifically `TrainFinetuneRecipeForNextTokenPrediction`. This recipe orchestrates loading, dataset preparation, optimizer setup, distributed training, checkpointing, and logging.
 
 ### What is a Recipe?
 
@@ -323,7 +323,7 @@ need to be the same as the domain's desired contribution to the optimization
 objective. Configure both values with `domain_mixture`:
 
 See the complete runnable
-[`megatron_pretrain_gpt2_domain_mixture.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_gpt2_domain_mixture.yaml)
+[`megatron_pretrain_gpt2_domain_mixture.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_pretrain/megatron_pretrain_gpt2_domain_mixture.yaml)
 example for the full model, dataset, validation, optimizer, and scheduler setup.
 
 ```yaml

@@ -90,7 +90,7 @@ def _format_example(
 
 
 ## Run Full-Parameter SFT
-Use the ready-made config at [`examples/llm_finetune/gemma/functiongemma_xlam.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/functiongemma_xlam.yaml) to start fine-tuning:
+Use the ready-made config at [`examples/llm_finetune/gemma/functiongemma_xlam.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/r0.7.0/examples/llm_finetune/gemma/functiongemma_xlam.yaml) to start fine-tuning:
 
 
 
@@ -103,7 +103,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xlam.yaml
 You should be able to see a training loss curve similar to the one shown below:
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400" />
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/r0.7.0/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400" />
 </p>
 
 ## Run PEFT (LoRA)
@@ -123,5 +123,5 @@ automodel examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/llm/functiongemma-peft-loss.png" alt="FunctionGemma PEFT loss" width="400" />
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/r0.7.0/docs/guides/llm/functiongemma-peft-loss.png" alt="FunctionGemma PEFT loss" width="400" />
 </p>
