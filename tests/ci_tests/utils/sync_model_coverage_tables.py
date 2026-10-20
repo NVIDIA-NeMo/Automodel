@@ -26,13 +26,10 @@ from pathlib import Path
 import yaml
 
 TABLE_ROW_COUNT = 10
-# Preserve model-card source paths used by marketing and published blog posts.
-# Keep compatibility copies on disk, but catalog only their canonical cards.
+# Both Muse source paths are linked by published NVIDIA and Meta blog posts.
+# Keep the compatibility copy on disk, but catalog only the canonical card.
 MODEL_CARD_PATH_ALIASES = {
     "docs/model-coverage/vlm/muse/muse_spark_open.mdx": "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx",
-    "docs/model-coverage/vlm/stepfun-ai/step-5-preview.mdx": (
-        "docs/model-coverage/vlm/stepfun-ai/step-5-preview-bf16.mdx"
-    ),
 }
 HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
 HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"

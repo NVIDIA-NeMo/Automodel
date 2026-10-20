@@ -12,9 +12,8 @@ dist_env:
 
 model:
   # FLUX.3 checkpoints are modular pipelines (modular_model_index.json).
-  # Accept the Hugging Face repository access conditions before loading.
-  # Requires a Diffusers revision with FLUX.3 modular support; see the model guide.
-  pretrained_model_name_or_path: "black-forest-labs/flux-3-image-klein-base"
+  # Set the local modular checkpoint produced by the image-model converter.
+  pretrained_model_name_or_path: "PATH_TO_FLUX3_MODULAR_MODEL"
   # Required when peft block is present — selects pre-inject hook and is
   # passed to auto_diffusion_pipeline for model-specific setup.
   model_type: "flux3"

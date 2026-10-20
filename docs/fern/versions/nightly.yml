@@ -428,9 +428,6 @@ navigation:
               - page: "Step-5-Preview"
                 path: ../../model-coverage/llm/stepfun-ai/step-5-preview.mdx
                 slug: Step-5-Preview
-              - page: "Step-5-Preview-BF16"
-                path: ../../model-coverage/llm/stepfun-ai/step-5-preview-bf16.mdx
-                slug: Step-5-Preview-BF16
           - section: "Tencent"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRkYBAABXRUJQVlA4TDoBAAAvE8AEAK/iOJIkR6kacfqHV3hPYIzWYASDRpIU9ewcw0t4/wpewNuiOGokyZEy2/Dntyz2Z+9q/skmbdYk7SF7jgIIAeiPgyQgRL8nFC8gIQKhECCAFF4KhACnBxd+dmcs/1AKReZWBfinKjoERQcqgTIDIpMw0gr/VCnhlhmpPwMvQWlohfgzpAMpKGMvASL9mZCWOfz/1Oqmpz7lNbQwSoTuXLZjdVrdJTjep8MVcCTbtul8+yc3uA+xbds25z+ctNKP6P8E+APwt32/IACg43I/B2ReCsgALS/E86ddQZA9hhQzHF1yjXTEG04sJ7NVbzPuzNvrxWA7fdXFkHY4Pz7P5vuZvN73t+7lGEUINlKjciVTavVzw+I3W6taBEAxJUO2VVFURUM1FQ18AAw5ZUg5o5xSZBT+OA=="/></svg>'
             slug: tencent
@@ -661,8 +658,8 @@ navigation:
             contents:
               - page: "Step-3.7-Flash"
                 path: ../../model-coverage/vlm/stepfun-ai/step-3-7-flash.mdx
-              - page: "Step-5-Preview-BF16"
-                path: ../../model-coverage/vlm/stepfun-ai/step-5-preview-bf16.mdx
+              - page: "Step-5-Preview"
+                path: ../../model-coverage/vlm/stepfun-ai/step-5-preview.mdx
                 slug: Step-5-Preview
           - section: "Thinking Machines"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRvIAAABXRUJQVlA4TOYAAAAvE8AEAHVAsm3btNPqX7Jt24xt15Kibdu22YA3st/OmIAJ6P8EPPAL3wMQeAGQeOVzt5nnDJ5zyj0X3CEccwmuWEAk/ziA83pKpElgohYHZVrRkSZHmAEeuOMerNBFI24CJLCjQgfKxJDuIEiBB24hrzjiDO5xjrDOFUdsc8Il4jAX8B7+XyMKB9wwxAYPHLPHEdesMMkxY/AB9qLCcBtqGuimES8eUkiIoiFHNQrWeIAj6IkQw4qfNhopkiJLeSN2MgyiZBzyCt5wBo+Z5QjilBtuOWCVQ4R7+Cr4iSAAEiQAvPa7Ag=="/></svg>'
