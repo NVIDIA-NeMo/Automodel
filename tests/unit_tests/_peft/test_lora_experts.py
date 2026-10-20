@@ -706,7 +706,7 @@ def test_lora_backward_pass_values(moe_config, device):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_deepep_lora_zero_tokens(moe_config, device):
-    """Test DeepEP LoRA forward pass with zero tokens routed to experts."""
+    """A rank whose experts received no tokens returns an empty output and still gets gradients."""
     moe_config.n_routed_experts = 4
     moe_config.dim = 16
     moe_config.moe_inter_dim = 32
@@ -723,24 +723,28 @@ def test_deepep_lora_zero_tokens(moe_config, device):
     mock_dispatcher = MockDeepEPDispatcher()
 
     num_tokens = 8
-    # All experts get zero tokens
+    # All experts get zero tokens: the dispatcher hands this rank empty tensors.
     tokens_per_expert = torch.tensor([0, 0, 0, 0], dtype=torch.long, device="cpu")
 
     dtype = torch.bfloat16
-    permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
-    permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
+    permuted_x = torch.empty(0, 16, device=device, dtype=dtype)
+    permuted_probs = torch.empty(0, device=device, dtype=dtype)
 
     mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
     lora_module.token_dispatcher = mock_dispatcher
 
     x = torch.randn(num_tokens, 16, device=device).to(dtype)
-    weights = torch.ones(num_tokens, 1, device=device).to(dtype)
+    weights = torch.ones(num_tokens, 1, device=device, dtype=dtype, requires_grad=True)
     indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
     token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
 
-    # Should handle zero tokens gracefully
     out = lora_module(x, token_mask, weights, indices)
-    assert out.shape == (num_tokens, 16)
+    assert out.shape == (0, 16)
+    out.float().sum().backward()
+    assert weights.grad is not None and torch.count_nonzero(weights.grad) == 0
+    for name in ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"):
+        gradient = getattr(lora_module, name).grad
+        assert gradient is not None and torch.isfinite(gradient).all() and torch.count_nonzero(gradient) == 0, name
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
