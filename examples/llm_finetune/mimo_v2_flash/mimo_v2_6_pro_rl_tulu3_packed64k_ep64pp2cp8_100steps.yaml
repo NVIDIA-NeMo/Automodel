@@ -16,13 +16,15 @@
 # Packed THD sequences of 65536 tokens, 100 steps, LBS2 / GBS16 / GA1.
 # Hardware target: 32 nodes x 4 GB200 GPUs, EP64 / PP2 / CP8 / TP1.
 # DP = 128 / (PP2 * CP8) = 8; EP64 spans DP8 * CP8.
-# Keep each 64-GPU EP group within one NVLink domain.
+# Use four-rank HybridEP domains matching the physical GB200 hosts.
+# Communication between these domains requires working GPU RDMA registration.
 #
 # Requires Transformer Engine >= 2.19, cuDNN >= 9.26 and HybridEP with MNNVL.
 # Uses TE's native QK192/V128 CP and CUDA THD reordering on GB200.
 # Set these in the launch environment for a direct run (ci.env_vars is CI-only):
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-#   USE_MNNVL=1 NVTE_FUSED_ATTN=1 NVTE_FLASH_ATTN=0 NVTE_UNFUSED_ATTN=0
+#   USE_MNNVL=1 NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4
+#   NVTE_FUSED_ATTN=1 NVTE_FLASH_ATTN=0 NVTE_UNFUSED_ATTN=0
 # Launch through the standard multi-node AutoModel launcher, with four ranks/node.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -179,6 +181,7 @@ ci:
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     USE_MNNVL: "1"
+    NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "4"
     NVTE_FUSED_ATTN: "1"
     NVTE_FLASH_ATTN: "0"
     NVTE_UNFUSED_ATTN: "0"
