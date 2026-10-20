@@ -150,13 +150,19 @@ def _flex_compile_settings():
         yield
 
 
-def _base_gemma4_cp_mask(attention_module: torch.nn.Module, ctx: Any, q_idx, kv_idx, kv_global_start: int = 0):
+def _base_gemma4_cp_mask(
+    attention_module: torch.nn.Module, ctx: Any, q_idx, kv_idx, kv_global_start: int = 0, block_overlay=None
+):
     q_global_idx = q_idx + ctx.seq_global_start
     kv_global_idx = kv_idx + kv_global_start
     if not ctx.is_causal:
         allowed = torch.ones_like(q_global_idx >= kv_global_idx)
     else:
         allowed = kv_global_idx <= q_global_idx
+    if block_overlay is not None:
+        # Hugging Face's Gemma4 sliding masks are AND(window, OR(causal, vision block)): the window
+        # still cuts a vision block longer than itself.
+        allowed = allowed | block_overlay
 
     sliding_window = getattr(attention_module, "sliding_window", None)
     if sliding_window is not None:
@@ -326,12 +332,14 @@ def _run_gemma4_flex_chunk(
         ):
 
             def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
-                allowed = _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx, kv_global_start)
+                same_vision_group = None
                 if use_vision_bidirectional:
                     q_group = vision_group_ids_q[batch_idx, q_idx]
                     kv_group = vision_group_ids_kv[batch_idx, kv_idx]
                     same_vision_group = (q_group == kv_group) & (q_group >= 0)
-                    allowed = allowed | same_vision_group
+                allowed = _base_gemma4_cp_mask(
+                    attention_module, ctx, q_idx, kv_idx, kv_global_start, block_overlay=same_vision_group
+                )
                 if packed_seq_ids_q is not None and packed_seq_ids_kv is not None:
                     q_pack_id = packed_seq_ids_q[batch_idx, q_idx]
                     kv_pack_id = packed_seq_ids_kv[batch_idx, kv_idx]
