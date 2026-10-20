@@ -29,6 +29,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4 import dspark_target as v4_dspark_target
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
 from nemo_automodel.components.models.deepseek_v41 import dspark_target as v41_dspark_target
+from nemo_automodel.components.models.deepseek_v41 import quantization as v41_quantization
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 from nemo_automodel.components.speculative.dspark import Qwen3DSparkModel
 from nemo_automodel.components.speculative.dspark.config import build_deepseek_v4_draft_config
@@ -47,6 +48,17 @@ from tests.unit_tests.speculative.test_dspark_draft_deepseek_v4 import _tiny_tar
 # Document lengths per packed row. They are not multiples of the compression ratios,
 # so a target without alignment would pool groups across document boundaries.
 ROW_DOCUMENTS = ([7, 12, 5], [10, 14])
+# Packed-vs-alone parity gate; the negative controls must miss the expected features by 10 times it.
+PARITY_TOL = 2e-5
+
+
+def _unrounded_v41_caches(monkeypatch) -> None:
+    """Run V4.1 without its FP8/FP4 cache rounding.
+
+    The rounding stays inside a token, so it cannot mix documents, but a value on a rounding
+    threshold turns the packed-vs-alone reduction-order noise into a full FP8 step on some stacks.
+    """
+    monkeypatch.setattr(v41_quantization, "_quantize", lambda values, block_size, format: values)
 
 
 def _pack(row_documents, vocab_size: int, generator: torch.Generator):
@@ -98,28 +110,13 @@ def _v41_target():
     return _build_v41_model(config).eval()
 
 
-@pytest.mark.parametrize("hybridep", [False, True], ids=["local", "hybridep"])
-@pytest.mark.parametrize(
-    ("build_target", "packed_forward"),
-    [
-        (_v4_target, v4_dspark_target.dspark_packed_forward),
-        (_v41_target, v41_dspark_target.dspark_packed_forward),
-    ],
-    ids=["deepseek_v4", "deepseek_v41"],
-)
-def test_packed_target_features_match_each_document_alone(build_target, packed_forward, hybridep, monkeypatch):
-    model = build_target()
-    # Both rows align to 28 tokens (4-token alignment): 8 + 12 + 8 and 12 + 16.
-    aligned_width = 28
-    if hybridep:
-        # HybridEP pads every rank to the longest aligned row; pretend another rank's
-        # row is 16 tokens longer.
-        model.backend = dataclasses.replace(model.backend, dispatcher="hybridep")
-        monkeypatch.setattr(v41_dspark_target.dist, "is_initialized", lambda: True)
-        monkeypatch.setattr(v41_dspark_target.dist, "all_reduce", lambda tensor, op: tensor.add_(16))
-        aligned_width += 16
-    wrapper = HFDSparkTargetModel(model, target_layer_ids=[1, 3], packed_forward=packed_forward)
-    vocab_size = getattr(model.config, "text_config", model.config).vocab_size
+def _packed_and_alone_features(wrapper: HFDSparkTargetModel, vocab_size: int):
+    """Target outputs for the packed ``ROW_DOCUMENTS`` rows and for their documents run alone.
+
+    Returns:
+        The packed input_ids, position_ids and seq_lens, the packed batch, and per row the alone
+        runs' features and last hidden states concatenated to [1, sequence, ...].
+    """
     documents, input_ids, position_ids, doc_remaining, seq_lens = _pack(
         ROW_DOCUMENTS, vocab_size=vocab_size, generator=torch.Generator().manual_seed(1)
     )
@@ -132,17 +129,76 @@ def test_packed_target_features_match_each_document_alone(build_target, packed_f
             [wrapper.generate_batch(doc, torch.ones_like(doc), torch.ones_like(doc)) for doc in row]
             for row in documents
         ]
+    expected = [
+        (
+            torch.cat([batch.target_hidden_states for batch in row], dim=1),
+            torch.cat([batch.target_last_hidden_states for batch in row], dim=1),
+        )
+        for row in alone
+    ]
+    return input_ids, position_ids, seq_lens, packed, expected
+
+
+@pytest.mark.parametrize("hybridep", [False, True], ids=["local", "hybridep"])
+@pytest.mark.parametrize(
+    ("build_target", "packed_forward"),
+    [
+        (_v4_target, v4_dspark_target.dspark_packed_forward),
+        (_v41_target, v41_dspark_target.dspark_packed_forward),
+    ],
+    ids=["deepseek_v4", "deepseek_v41"],
+)
+def test_packed_target_features_match_each_document_alone(build_target, packed_forward, hybridep, monkeypatch):
+    if build_target is _v41_target:
+        _unrounded_v41_caches(monkeypatch)
+    model = build_target()
+    # Both rows align to 28 tokens (4-token alignment): 8 + 12 + 8 and 12 + 16.
+    aligned_width = 28
+    if hybridep:
+        # HybridEP pads every rank to the longest aligned row; pretend another rank's
+        # row is 16 tokens longer.
+        model.backend = dataclasses.replace(model.backend, dispatcher="hybridep")
+        monkeypatch.setattr(v41_dspark_target.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(v41_dspark_target.dist, "all_reduce", lambda tensor, op: tensor.add_(16))
+        aligned_width += 16
+    wrapper = HFDSparkTargetModel(model, target_layer_ids=[1, 3], packed_forward=packed_forward)
+    vocab_size = getattr(model.config, "text_config", model.config).vocab_size
+    input_ids, position_ids, seq_lens, packed, expected = _packed_and_alone_features(wrapper, vocab_size)
 
     assert packed.target_hidden_states.shape[:2] == input_ids.shape
-    for row, row_alone in enumerate(alone):
-        expected_features = torch.cat([batch.target_hidden_states for batch in row_alone], dim=1)
-        expected_last = torch.cat([batch.target_last_hidden_states for batch in row_alone], dim=1)
-        torch.testing.assert_close(packed.target_hidden_states[row : row + 1], expected_features, atol=2e-5, rtol=2e-5)
-        torch.testing.assert_close(packed.target_last_hidden_states[row : row + 1], expected_last, atol=2e-5, rtol=2e-5)
+    for row, (features, last) in enumerate(expected):
+        torch.testing.assert_close(
+            packed.target_hidden_states[row : row + 1], features, atol=PARITY_TOL, rtol=PARITY_TOL
+        )
+        torch.testing.assert_close(
+            packed.target_last_hidden_states[row : row + 1], last, atol=PARITY_TOL, rtol=PARITY_TOL
+        )
     assert packed.seq_lens is seq_lens and packed.position_ids is position_ids
     with torch.no_grad():
         layout = packed_forward(model, input_ids, seq_lens=seq_lens)
+        # Negative control: without the packing metadata a row runs as one sequence, sharing
+        # positions, attention and compressed groups across its documents. HybridEP does not reach it.
+        ones = torch.ones_like(input_ids)
+        unpacked = None if hybridep else wrapper.generate_batch(input_ids, ones, ones)
     assert layout.sequence_ids.shape == (len(ROW_DOCUMENTS), aligned_width)
+    if unpacked is not None:
+        for row, (features, _) in enumerate(expected):
+            assert not torch.allclose(
+                unpacked.target_hidden_states[row : row + 1], features, atol=10 * PARITY_TOL, rtol=0
+            )
+
+
+def test_v41_packed_target_parity_catches_documents_off_the_compression_grid(monkeypatch):
+    """Packing that keeps documents isolated but skips the compression alignment fails the parity gate."""
+    _unrounded_v41_caches(monkeypatch)
+    model = _v41_target()
+    model._packed_alignment = 1  # documents no longer start on a compressed-group boundary
+    wrapper = HFDSparkTargetModel(
+        model, target_layer_ids=[1, 3], packed_forward=v41_dspark_target.dspark_packed_forward
+    )
+    _, _, _, packed, expected = _packed_and_alone_features(wrapper, model.config.text_config.vocab_size)
+    for row, (features, _) in enumerate(expected):
+        assert not torch.allclose(packed.target_hidden_states[row : row + 1], features, atol=10 * PARITY_TOL, rtol=0)
 
 
 def test_aligned_packed_layout_skips_absent_documents_and_keeps_the_row_width():
@@ -196,7 +252,7 @@ def _v41_draft() -> DeepseekV41DSparkModel:
 
 
 @pytest.mark.parametrize("build_draft", [_v4_draft, _v41_draft], ids=["deepseek_v4", "deepseek_v41"])
-def test_packed_draft_blocks_match_the_document_alone(build_draft):
+def test_packed_draft_blocks_match_the_document_alone(build_draft, monkeypatch):
     """Blocks anchored in a document match the unpacked run of that document alone.
 
     The row packs an unsupervised document, the document under test, and a supervised
@@ -204,6 +260,8 @@ def test_packed_draft_blocks_match_the_document_alone(build_draft):
     document's blocks would read the first document or train on the last one. num_anchors
     exceeds the candidate count, so both runs sample every candidate anchor.
     """
+    if build_draft is _v41_draft:
+        _unrounded_v41_caches(monkeypatch)
     draft = build_draft()
     lengths = ROW_DOCUMENTS[0]
     start, end = lengths[0], lengths[0] + lengths[1]
@@ -242,8 +300,8 @@ def test_packed_draft_blocks_match_the_document_alone(build_draft):
         torch.testing.assert_close(
             getattr(packed, field)[:, :kept][eval_mask],
             getattr(alone, field)[:, :kept][eval_mask],
-            atol=2e-5,
-            rtol=2e-5,
+            atol=PARITY_TOL,
+            rtol=PARITY_TOL,
         )
 
 
