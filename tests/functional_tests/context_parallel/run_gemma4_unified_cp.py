@@ -122,7 +122,6 @@ def _batches(seqlen, device, dtype):
         "labels": packed_labels,
         "position_ids": packed_positions,
         "_packed_seq_ids": doc_ids,
-        "_split": split,
     }
     for batch in batches.values():
         for key, value in batch.items():
@@ -139,14 +138,14 @@ def _reference(model, batch):
     """Loss and gradients without CP; packed rows run one document at a time."""
     model.zero_grad(set_to_none=True)
     num_tokens = (batch["labels"] != -100).sum()
-    if "_split" in batch:
-        split = batch["_split"]
+    if "_packed_seq_ids" in batch:
+        split = int((batch["_packed_seq_ids"] == 1).sum())
         loss = 0.0
         for span in (slice(0, split), slice(split, None)):
             logits = model(input_ids=batch["input_ids"][:, span], position_ids=batch["position_ids"][:, span]).logits
             loss = loss + _token_loss_sum(logits, batch["labels"][:, span])
     else:
-        kwargs = {k: v for k, v in batch.items() if k not in ("labels", "_split")}
+        kwargs = {k: v for k, v in batch.items() if k != "labels"}
         loss = _token_loss_sum(model(**kwargs).logits, batch["labels"])
     loss = loss / num_tokens
     loss.backward()
@@ -157,7 +156,7 @@ def _context_parallel(model, batch, device_mesh):
     from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 
     model.zero_grad(set_to_none=True)
-    batch = {k: v.clone() for k, v in batch.items() if k != "_split"}
+    batch = {k: v.clone() for k, v in batch.items()}
     num_tokens = (batch["labels"] != -100).sum()
     cp_sharder = ContextParallelSharder(model, device_mesh, batch)
     train_ctx, batch = cp_sharder.shard(batch)
@@ -183,7 +182,7 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dtype = getattr(torch, os.environ.get("CP_DTYPE", "float32"))
+    dtype = torch.float32
 
     from torch.distributed.device_mesh import init_device_mesh
 
@@ -194,7 +193,7 @@ def main():
     device_mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("cp",))
     results = {name: _context_parallel(model, batch, device_mesh) for name, batch in batches.items()}
 
-    loss_tol, grad_tol = (2e-4, 2e-3) if dtype == torch.float32 else (3e-2, 6e-2)
+    loss_tol, grad_tol = 2e-4, 2e-3
     failed = []
     for name, (ref_loss, ref_grads) in references.items():
         cp_loss, cp_grads = results[name]

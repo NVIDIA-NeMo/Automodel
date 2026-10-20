@@ -28,7 +28,7 @@ from transformers.models.gemma4_unified.configuration_gemma4_unified import (
 )
 from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedTextAttention
 
-import nemo_automodel.components.models.gemma4_unified.model as unified_model
+import nemo_automodel.components.models.gemma4_moe.model as gemma4_model
 from nemo_automodel._transformers.capabilities import ModelSupports
 from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
 from nemo_automodel.components.models.gemma4_unified.model import Gemma4UnifiedForConditionalGeneration
@@ -67,6 +67,10 @@ def _model(attn_implementation="sdpa", **text_overrides):
     return Gemma4UnifiedForConditionalGeneration(config).eval()
 
 
+def _attention(model):
+    return [m for m in model.modules() if isinstance(m, Gemma4UnifiedTextAttention)]
+
+
 def _image_inputs():
     ids = torch.randint(1, IMAGE_TOKEN_ID, (1, 24))
     ids[0, 6:10] = IMAGE_TOKEN_ID
@@ -80,7 +84,7 @@ def _image_inputs():
 
 def test_capabilities_and_ring_attached_at_construction():
     model = _model()
-    attention = [m for m in model.modules() if isinstance(m, Gemma4UnifiedTextAttention)]
+    attention = _attention(model)
     assert len(attention) == 4
     assert all(callable(getattr(m, "setup_cp_attention", None)) for m in attention)
     assert not any(getattr(m, "_cp_uses_attention_hook", False) for m in attention)
@@ -89,11 +93,7 @@ def test_capabilities_and_ring_attached_at_construction():
 
 
 def test_cp_attention_backends_follow_the_text_config():
-    attention = [
-        m
-        for m in _model(cp_sliding_attn_backend="fa", cp_full_attn_backend="ffpa").modules()
-        if isinstance(m, Gemma4UnifiedTextAttention)
-    ]
+    attention = _attention(_model(cp_sliding_attn_backend="fa", cp_full_attn_backend="ffpa"))
     assert all(m._gemma4_cp_sliding_backend == "fa" and m._gemma4_cp_use_ffpa for m in attention)
     with pytest.raises(ValueError, match="cp_sliding_attn_backend"):
         _model(cp_sliding_attn_backend="sdpa")
@@ -132,7 +132,7 @@ def test_non_cp_forward_uses_the_generation_vision_masks():
 
 def test_cp_forward_stashes_ring_metadata_on_hooked_modules():
     model = _model()
-    attention = [m for m in model.modules() if isinstance(m, Gemma4UnifiedTextAttention)]
+    attention = _attention(model)
     for module in attention:
         module._cp_uses_attention_hook = True
     model._cp_enabled = True
@@ -184,9 +184,8 @@ def test_cp_forward_rejects_unsupported_inputs(kwargs, match):
 def test_setup_cp_attention_installs_the_ring_once(monkeypatch):
     model = _model()
     calls = []
-    for module in model.modules():
-        if isinstance(module, Gemma4UnifiedTextAttention):
-            monkeypatch.setattr(module, "setup_cp_attention", lambda mesh, m=module: calls.append((m, mesh)))
+    for module in _attention(model):
+        monkeypatch.setattr(module, "setup_cp_attention", lambda mesh, m=module: calls.append((m, mesh)))
     model.setup_cp_attention("mesh")
     model.setup_cp_attention("mesh")
     assert len(calls) == 4 and all(mesh == "mesh" for _, mesh in calls)
@@ -209,7 +208,7 @@ def test_cp_sharder_records_the_mesh_and_shards_aux_streams(monkeypatch):
         seen.update(cp_mesh=cp_mesh, tp_mesh=tp_mesh, batch=batch, loss_mask=loss_mask, pad=padding_token_id)
         return "ctx", batch
 
-    monkeypatch.setattr(unified_model, "make_contiguous_aux_only_shard_cp_batch_and_ctx", fake_shard)
+    monkeypatch.setattr(gemma4_model, "make_contiguous_aux_only_shard_cp_batch_and_ctx", fake_shard)
     batch = {"input_ids": torch.ones(1, 4, dtype=torch.long)}
     prepared = model.prepare_model_inputs_for_cp(batch, num_chunks=3)
     sharder = prepared["cp_sharder"]
