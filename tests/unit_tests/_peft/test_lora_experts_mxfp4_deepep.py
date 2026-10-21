@@ -319,7 +319,7 @@ def test_lora_deepep_mxfp4_forward_matches_bf16(moe_config, device):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_lora_deepep_mxfp4_no_routed_tokens(moe_config, device):
-    """The all-zero-tokens dummy path must run and keep LoRA gradients flowing."""
+    """A rank whose experts received no tokens returns an empty output and keeps LoRA gradients flowing."""
     orig = _make_deepep(moe_config, device)
     mx = GroupedExpertsDeepEPLoRAMXFP4(orig, lora_dim=8, alpha=16).to(device)
     # DeepEP base allocates fp32; make adapters bf16 to match activations (see note above).
@@ -329,9 +329,9 @@ def test_lora_deepep_mxfp4_no_routed_tokens(moe_config, device):
             p.data = p.data.to(torch.bfloat16)
 
     num_tokens = 8
-    # tokens_per_expert all zeros -> dummy path.
-    permuted_x = torch.randn(num_tokens, moe_config.dim, device=device, dtype=torch.bfloat16)
-    permuted_probs = torch.ones(num_tokens, device=device, dtype=torch.bfloat16)
+    # tokens_per_expert all zeros: the dispatcher hands this rank empty tensors.
+    permuted_x = torch.empty(0, moe_config.dim, device=device, dtype=torch.bfloat16)
+    permuted_probs = torch.empty(0, device=device, dtype=torch.bfloat16)
     tokens_per_expert = torch.zeros(4, dtype=torch.long, device="cpu")
     mx.n_routed_experts = 4
     mx.ep_size = 1
@@ -343,7 +343,7 @@ def test_lora_deepep_mxfp4_no_routed_tokens(moe_config, device):
     token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
 
     y = mx(x, token_mask, weights, indices)
-    assert y.shape == x.shape
+    assert y.shape == (0, moe_config.dim)
     assert torch.isfinite(y).all()
     y.float().sum().backward()
     assert mx.lora_gate_and_up_A.grad is not None

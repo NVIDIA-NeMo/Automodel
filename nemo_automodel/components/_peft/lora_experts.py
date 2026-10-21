@@ -28,6 +28,8 @@ from nemo_automodel.components.moe.experts import (
     _apply_bias,
     _apply_router_weight_fp32,
     _permute_tokens_for_grouped_mm,
+    _phantom_dispatch,
+    _phantom_local_routing,
 )
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -295,16 +297,19 @@ class GroupedExpertsLoRA(GroupedExperts):
         )
         y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
-        active_local_experts = 0
+        routed = []
         for i in range(experts_start_idx, experts_end_idx):
             indices_mask = torch.logical_and(indices == i, token_mask.unsqueeze(-1))
             idx, top = torch.where(indices_mask)
+            if idx.numel() > 0:
+                routed.append((i - experts_start_idx, idx, top, False))
+        if not routed:
+            # No local expert received a token: run the same body once on a phantom
+            # token with a zero routing weight (see _phantom_local_routing).
+            phantom_ids = torch.zeros(1, dtype=torch.long, device=indices.device)
+            routed.append((0, phantom_ids, phantom_ids, True))
 
-            if idx.numel() == 0:
-                continue
-            active_local_experts += 1
-
-            local_idx = i - experts_start_idx
+        for local_idx, idx, top, phantom in routed:
             idx_b = idx[:, None].expand(-1, x.size(1))
             x_idx = x.gather(dim=0, index=idx_b)
 
@@ -318,6 +323,8 @@ class GroupedExpertsLoRA(GroupedExperts):
                 gate_and_up_out = gate_and_up_out + self.gate_up_proj_bias[local_idx]
 
             w = weights[idx, top, None]
+            if phantom:
+                w = w * 0
             activation_weight = torch.ones_like(w) if self.config.apply_router_weight_after_down else w
             activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
 
@@ -342,25 +349,6 @@ class GroupedExpertsLoRA(GroupedExperts):
                 y.view(-1, x.size(1)).scatter_add_(dim=0, index=slot_ids_b, src=expert_out)
             else:
                 y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
-
-        # Dummy computation for gradient flow when no tokens routed locally
-        if active_local_experts == 0:
-            dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
-            gate_and_up_out = dummy_x @ gate_and_up_projs[0]
-            gate_and_up_out = gate_and_up_out + (dummy_x @ lora_gate_and_up_A[0] @ lora_gate_and_up_B[0]) * self.scale
-            dummy_weight = weights[0, 0, None].unsqueeze(0)
-            activation_weight = (
-                torch.ones_like(dummy_weight) if self.config.apply_router_weight_after_down else dummy_weight
-            )
-            activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
-            expert_out = activated @ down_projs[0]
-            expert_out = expert_out + (activated @ lora_down_A[0] @ lora_down_B[0]) * self.scale
-            if post_expert_output is not None:
-                expert_out = post_expert_output(expert_out)
-            if self.config.apply_router_weight_after_down:
-                y[0, 0] += expert_out[0]
-            else:
-                y[0] += expert_out[0]
 
         return y
 
@@ -395,72 +383,57 @@ class GroupedExpertsLoRA(GroupedExperts):
         )
         y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
-        if sorted_token_ids.numel() > 0:
-            permuted_x = x[sorted_token_ids]
-            permuted_probs = sorted_weights.unsqueeze(-1)
-            activation_probs = (
-                torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
+        if sorted_token_ids.numel() == 0:
+            # No local expert received a token: run the regular path once on a phantom
+            # token with a zero routing weight (see _phantom_local_routing).
+            sorted_token_ids, sorted_slot_ids, sorted_weights, tokens_per_expert, offs = _phantom_local_routing(
+                weights, tokens_per_expert
+            )
+        permuted_x = x[sorted_token_ids]
+        permuted_probs = sorted_weights.unsqueeze(-1)
+        activation_probs = (
+            torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
+        )
+
+        if self.expert_bias:
+            gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
+            down_proj_bias = _to_local(self.down_proj_bias)
+
+        # Gate+Up projection + LoRA
+        output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
+        lora_out1_A = torch._grouped_mm(permuted_x, lora_gate_and_up_A, offs=offs)
+        lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
+        output1 = output1 + lora_out1 * self.scale
+
+        if self.expert_bias:
+            output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+
+        output1 = self.expert_activation_grouped(output1, activation_probs)
+
+        # Down projection + LoRA
+        output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+        lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
+        lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
+        output2 = output2 + lora_out2 * self.scale
+
+        if self.expert_bias:
+            output2 = _apply_bias(
+                output2,
+                down_proj_bias,
+                tokens_per_expert,
+                None if self.config.apply_router_weight_after_down else permuted_probs,
             )
 
-            if self.expert_bias:
-                gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
-                down_proj_bias = _to_local(self.down_proj_bias)
+        if post_expert_output is not None:
+            output2 = post_expert_output(output2)
 
-            # Gate+Up projection + LoRA
-            output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
-            lora_out1_A = torch._grouped_mm(permuted_x, lora_gate_and_up_A, offs=offs)
-            lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
-            output1 = output1 + lora_out1 * self.scale
-
-            if self.expert_bias:
-                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
-
-            output1 = self.expert_activation_grouped(output1, activation_probs)
-
-            # Down projection + LoRA
-            output2 = torch._grouped_mm(output1, down_projs, offs=offs)
-            lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
-            lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
-            output2 = output2 + lora_out2 * self.scale
-
-            if self.expert_bias:
-                output2 = _apply_bias(
-                    output2,
-                    down_proj_bias,
-                    tokens_per_expert,
-                    None if self.config.apply_router_weight_after_down else permuted_probs,
-                )
-
-            if post_expert_output is not None:
-                output2 = post_expert_output(output2)
-
-            if self.config.apply_router_weight_after_down:
-                output2 = _apply_router_weight_fp32(output2, permuted_probs, torch.float32)
-                scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
-                y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2)
-            else:
-                scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-                y.scatter_add_(0, scatter_ids, output2.float())
+        if self.config.apply_router_weight_after_down:
+            output2 = _apply_router_weight_fp32(output2, permuted_probs, torch.float32)
+            scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
+            y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2)
         else:
-            # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1 = (
-                output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
-            )
-            dummy_weight = weights[0, 0, None].unsqueeze(0)
-            activation_weight = (
-                torch.ones_like(dummy_weight) if self.config.apply_router_weight_after_down else dummy_weight
-            )
-            output1_ = self.expert_activation_grouped(output1, activation_weight)
-            output2 = torch.matmul(output1_, down_projs[0])
-            output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
-            if post_expert_output is not None:
-                output2 = post_expert_output(output2)
-            if self.config.apply_router_weight_after_down:
-                y[0, 0] += output2[0]
-            else:
-                y[0] += output2[0]
+            scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
+            y.scatter_add_(0, scatter_ids, output2.float())
 
         return y
 
@@ -612,6 +585,15 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             x, token_mask, weights, indices
         )
 
+        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
+        # GroupedExpertsDeepEP.forward does.
+        phantom = not self.dispatch_rows_never_empty and torch.count_nonzero(tokens_per_expert) == 0
+        if phantom:
+            # No local expert received a token: run the regular path once on a phantom token
+            # with a zero routing weight and drop its row before combining (see _phantom_dispatch).
+            permuted_local_hidden_states, tokens_per_expert, permuted_probs = _phantom_dispatch(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs, weights
+            )
         activation_probs = (
             torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
         )
@@ -623,56 +605,43 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
-        # GroupedExpertsDeepEP.forward does.
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
-            lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
-                lora_gate_and_up_A, lora_gate_and_up_B
+        lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(lora_gate_and_up_A, lora_gate_and_up_B)
+        lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
+        tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
+        offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
+
+        # Gate+Up projection + LoRA
+        output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
+        lora_out1_A = torch._grouped_mm(permuted_local_hidden_states, lora_gate_and_up_A, offs=offs)
+        lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
+        output1 = output1 + lora_out1 * self.scale
+
+        if self.expert_bias:
+            gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
+            output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+
+        output1 = self.expert_activation(output1, activation_probs)
+
+        # Down projection + LoRA
+        output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+        lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
+        lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
+        output2 = output2 + lora_out2 * self.scale
+
+        if self.expert_bias:
+            down_bias = _to_local(self.down_proj_bias)
+            output2 = _apply_bias(
+                output2,
+                down_bias,
+                tokens_per_expert,
+                None if self.config.apply_router_weight_after_down else permuted_probs,
             )
-            lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
-            tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
-            offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
-
-            # Gate+Up projection + LoRA
-            output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
-            lora_out1_A = torch._grouped_mm(permuted_local_hidden_states, lora_gate_and_up_A, offs=offs)
-            lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
-            output1 = output1 + lora_out1 * self.scale
-
-            if self.expert_bias:
-                gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
-                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
-
-            output1 = self.expert_activation(output1, activation_probs)
-
-            # Down projection + LoRA
-            output2 = torch._grouped_mm(output1, down_projs, offs=offs)
-            lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
-            lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
-            output2 = output2 + lora_out2 * self.scale
-
-            if self.expert_bias:
-                down_bias = _to_local(self.down_proj_bias)
-                output2 = _apply_bias(
-                    output2,
-                    down_bias,
-                    tokens_per_expert,
-                    None if self.config.apply_router_weight_after_down else permuted_probs,
-                )
-        else:
-            # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1 = (
-                output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
-            )
-            output1_ = self.expert_activation(output1, activation_probs)
-            output2 = torch.matmul(output1_, down_projs[0])
-            output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
 
         if post_expert_output is not None:
             output2 = post_expert_output(output2)
         if self.config.apply_router_weight_after_down:
             output2 = _apply_router_weight_fp32(output2, permuted_probs, compute_dtype)
+        if phantom:
+            output2 = output2[:0]
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

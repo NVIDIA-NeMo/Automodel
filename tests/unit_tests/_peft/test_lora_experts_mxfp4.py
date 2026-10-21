@@ -247,10 +247,12 @@ def test_frozen_mxfp4_forward_matches_bf16(moe_config, device):
     mx = GroupedExpertsMXFP4(orig)
     x, token_mask, weights, indices = _routing_inputs(moe_config, 32, device, torch.bfloat16)
 
-    # Reference: bf16 grouped_mm path on the same (fp4-representable) weights.
+    # Reference: bf16 grouped_mm path on the same (fp4-representable) weights. The two
+    # grouped GEMM launches may pick different kernels for the same operands, so allow
+    # one bf16 ulp instead of requiring bitwise equality.
     y_ref = orig(x.detach(), token_mask, weights, indices)
     y_mx = mx(x.detach(), token_mask, weights, indices)
-    torch.testing.assert_close(y_mx, y_ref, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(y_mx, y_ref, atol=2**-14, rtol=2**-7)
 
 
 def test_passthrough_init_registers_packed_params_on_meta(moe_config):

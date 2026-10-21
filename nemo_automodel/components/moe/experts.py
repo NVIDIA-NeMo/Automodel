@@ -351,6 +351,78 @@ def _permute_tokens_for_grouped_mm(
     return sorted_token_ids, sorted_weights, tokens_per_expert, offs
 
 
+def _zero_routing_weight(weights: torch.Tensor) -> torch.Tensor:
+    """Return a zero routing weight of shape ``[1]`` that still depends on ``weights``.
+
+    The phantom token in :func:`_phantom_local_routing` and :func:`_phantom_dispatch` multiplies
+    its expert output by this weight, so it contributes exactly zero while the routing weights
+    stay in the autograd graph.
+    """
+    flat = weights.reshape(-1)
+    if flat.numel() == 0:
+        return weights.new_zeros(1, dtype=torch.float32)
+    return flat[:1].float() * 0
+
+
+def _phantom_local_routing(
+    weights: torch.Tensor, tokens_per_expert: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Route one phantom token to local expert 0 when no local expert received a token.
+
+    A rank whose experts received nothing must still produce (zero) gradients for every expert
+    parameter and for the routing weights, and enter the same backward collectives as the ranks
+    that did receive tokens. Rather than a separate dummy computation that mirrors the regular
+    forward, the regular forward runs once on token 0 with a zero routing weight: every output
+    contribution is exactly zero and the code path is the one real tokens take.
+
+    Args:
+        weights: Routing weights ``[tokens, top_k]``; the phantom weight is derived from them.
+        tokens_per_expert: All-zero per-local-expert counts, defining device and dtype.
+
+    Returns:
+        ``(sorted_token_ids, sorted_slot_ids, sorted_weights, tokens_per_expert, offs)`` in the
+        layout of :func:`_permute_tokens_for_grouped_mm`, describing the single phantom token.
+    """
+    token_ids = torch.zeros(1, dtype=torch.long, device=tokens_per_expert.device)
+    tokens_per_expert = torch.zeros_like(tokens_per_expert)
+    tokens_per_expert[0] = 1
+    offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
+    return token_ids, token_ids, _zero_routing_weight(weights), tokens_per_expert, offs
+
+
+def _phantom_dispatch(
+    hidden_states: torch.Tensor,
+    tokens_per_expert: torch.Tensor | None,
+    permuted_probs: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Append one phantom token for local expert 0 to an empty dispatch.
+
+    See :func:`_phantom_local_routing`. The dispatched tensors are kept (concatenated with the
+    phantom row) so the dispatcher's own autograd edges stay in the graph. Callers drop the
+    phantom row from the expert output before combining, so the dispatcher sees the zero rows
+    it produced.
+
+    Args:
+        hidden_states: Dispatched activations ``[0, hidden]``.
+        tokens_per_expert: All-zero per-local-expert counts, or None when the caller tracks
+            split sizes separately.
+        permuted_probs: Dispatched routing probabilities ``[0, 1]``.
+        weights: This rank's routing weights ``[tokens, top_k]``.
+
+    Returns:
+        ``(hidden_states [1, hidden], tokens_per_expert with expert 0 counting one token or None,
+        permuted_probs [1, 1] holding a zero weight derived from weights)``.
+    """
+    hidden_states = torch.cat([hidden_states, hidden_states.new_zeros((1, hidden_states.shape[-1]))], dim=0)
+    if tokens_per_expert is not None:
+        tokens_per_expert = tokens_per_expert.clone()
+        tokens_per_expert[0] = 1
+    zero = _zero_routing_weight(weights).to(device=permuted_probs.device, dtype=permuted_probs.dtype)
+    permuted_probs = torch.cat([permuted_probs, zero.reshape((1,) + tuple(permuted_probs.shape[1:]))], dim=0)
+    return hidden_states, tokens_per_expert, permuted_probs
+
+
 def _segment_reduce_bias_grad(
     grad_output: torch.Tensor,
     token_counts: torch.Tensor,
@@ -1008,16 +1080,19 @@ class GroupedExperts(nn.Module):
         )
         y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
-        active_local_experts = 0
+        routed = []
         for i in range(experts_start_idx, experts_end_idx):
             indices_mask = torch.logical_and(indices == i, token_mask.unsqueeze(-1))
             idx, top = torch.where(indices_mask)
+            if idx.numel() > 0:
+                routed.append((i - experts_start_idx, idx, top, False))
+        if not routed:
+            # No local expert received a token: run the same body once on a phantom
+            # token with a zero routing weight (see _phantom_local_routing).
+            phantom_ids = torch.zeros(1, dtype=torch.long, device=indices.device)
+            routed.append((0, phantom_ids, phantom_ids, True))
 
-            if idx.numel() == 0:
-                continue
-            active_local_experts += 1
-
-            local_idx = i - experts_start_idx
+        for local_idx, idx, top, phantom in routed:
             down_proj = down_projs[local_idx]
             expert_down_proj_bias = down_proj_bias[local_idx] if down_proj_bias is not None else None
 
@@ -1035,6 +1110,8 @@ class GroupedExperts(nn.Module):
             # Weighted activation (routing weight applied BETWEEN up and down projections)
             # Uses WeightedSwiGLUFunction with float32 backward precision
             w = weights[idx, top, None]
+            if phantom:
+                w = w * 0
             activation_weight = torch.ones_like(w) if self.config.apply_router_weight_after_down else w
             activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
 
@@ -1055,19 +1132,6 @@ class GroupedExperts(nn.Module):
                 y.view(-1, x.size(1)).scatter_add_(dim=0, index=slot_ids_b, src=expert_out.float())
             else:
                 y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
-
-        # Dummy computation for gradient flow when no tokens routed locally
-        if active_local_experts == 0:
-            dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
-            gate_and_up_out = dummy_x @ gate_and_up_projs[0]
-            activated = self.expert_activation_grouped(gate_and_up_out, weights[0, 0, None].unsqueeze(0))
-            expert_out = activated @ down_projs[0]
-            if post_expert_output is not None:
-                expert_out = post_expert_output(expert_out)
-            if self.config.apply_router_weight_after_down:
-                y[0, 0] += expert_out[0]
-            else:
-                y[0] += expert_out[0]
 
         return y
 
@@ -1106,69 +1170,63 @@ class GroupedExperts(nn.Module):
         )
         y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
-        if sorted_token_ids.numel() > 0:
-            permuted_x = x[sorted_token_ids]
-            permuted_probs = sorted_weights.unsqueeze(-1)
-            activation_probs = (
-                torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
+        if sorted_token_ids.numel() == 0:
+            # No local expert received a token: run the regular path once on a phantom
+            # token with a zero routing weight (see _phantom_local_routing).
+            sorted_token_ids, sorted_slot_ids, sorted_weights, tokens_per_expert, offs = _phantom_local_routing(
+                weights, tokens_per_expert
+            )
+        permuted_x = x[sorted_token_ids]
+        permuted_probs = sorted_weights.unsqueeze(-1)
+        activation_probs = (
+            torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
+        )
+
+        if self.expert_bias:
+            # torch._grouped_mm does not support bias yet (raises
+            # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
+            # Apply bias manually after each grouped GEMM via _apply_bias.
+            # select_grouped_mm routes through torchao MXFP8 (with the contiguous-
+            # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
+            # MXFP8: the grouped_mm wrapper clamps its quant input (see
+            # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
+            # block scale -> nan. The bias-add stays a bf16 separate add (torchao
+            # v0.17.0 has no bias arg). bf16 path byte-identical.
+            grouped_mm = select_grouped_mm(self.use_mxfp8)
+            output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
+            # Selective checkpointing may retain either GEMM output; bias must not mutate it.
+            output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+            output1 = self.expert_activation_grouped(output1, activation_probs)
+            output2 = grouped_mm(output1, down_projs, offs)
+            output2 = _apply_bias(
+                output2,
+                down_proj_bias,
+                tokens_per_expert,
+                None if self.config.apply_router_weight_after_down else permuted_probs,
+            )
+        else:
+            output2 = _torch_mm_experts_fwd(
+                permuted_x,
+                gate_and_up_projs,
+                down_projs,
+                tokens_per_expert,
+                activation_probs,
+                self.expert_activation_grouped,
+                use_mxfp8=self.use_mxfp8,
             )
 
-            if self.expert_bias:
-                # torch._grouped_mm does not support bias yet (raises
-                # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
-                # Apply bias manually after each grouped GEMM via _apply_bias.
-                # select_grouped_mm routes through torchao MXFP8 (with the contiguous-
-                # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
-                # MXFP8: the grouped_mm wrapper clamps its quant input (see
-                # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
-                # block scale -> nan. The bias-add stays a bf16 separate add (torchao
-                # v0.17.0 has no bias arg). bf16 path byte-identical.
-                grouped_mm = select_grouped_mm(self.use_mxfp8)
-                output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
-                # Selective checkpointing may retain either GEMM output; bias must not mutate it.
-                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
-                output1 = self.expert_activation_grouped(output1, activation_probs)
-                output2 = grouped_mm(output1, down_projs, offs)
-                output2 = _apply_bias(
-                    output2,
-                    down_proj_bias,
-                    tokens_per_expert,
-                    None if self.config.apply_router_weight_after_down else permuted_probs,
-                )
-            else:
-                output2 = _torch_mm_experts_fwd(
-                    permuted_x,
-                    gate_and_up_projs,
-                    down_projs,
-                    tokens_per_expert,
-                    activation_probs,
-                    self.expert_activation_grouped,
-                    use_mxfp8=self.use_mxfp8,
-                )
+        if post_expert_output is not None:
+            output2 = post_expert_output(output2)
 
-            if post_expert_output is not None:
-                output2 = post_expert_output(output2)
-
-            if self.config.apply_router_weight_after_down:
-                # Chunked custom-autograd multiply (saves the raw inputs only);
-                # the fp32 output feeds the fp32 scatter_add unchanged.
-                output2 = _apply_router_weight_fp32(output2, permuted_probs, torch.float32)
-                scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
-                y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2.float())
-            else:
-                scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-                y.scatter_add_(0, scatter_ids, output2.float())
+        if self.config.apply_router_weight_after_down:
+            # Chunked custom-autograd multiply (saves the raw inputs only);
+            # the fp32 output feeds the fp32 scatter_add unchanged.
+            output2 = _apply_router_weight_fp32(output2, permuted_probs, torch.float32)
+            scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
+            y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2.float())
         else:
-            # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
-            output2 = torch.matmul(output1_, down_projs[0])
-            if post_expert_output is not None:
-                output2 = post_expert_output(output2)
-            if self.config.apply_router_weight_after_down:
-                y[0, 0] += output2[0]
-            else:
-                y[0] += output2[0]
+            scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
+            y.scatter_add_(0, scatter_ids, output2.float())
 
         return y
 
@@ -1697,6 +1755,14 @@ class GroupedExpertsDeepEP(nn.Module):
         permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
             x, token_mask, weights, indices
         )
+        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read.
+        phantom = not self.dispatch_rows_never_empty and torch.count_nonzero(tokens_per_expert) == 0
+        if phantom:
+            # No local expert received a token: run the regular path once on a phantom token
+            # with a zero routing weight and drop its row before combining (see _phantom_dispatch).
+            permuted_local_hidden_states, tokens_per_expert, permuted_probs = _phantom_dispatch(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs, weights
+            )
         activation_probs = (
             torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
         )
@@ -1710,72 +1776,66 @@ class GroupedExpertsDeepEP(nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read.
         router_weight_already_applied = False
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
-            tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
-            gate_up_output_bytes = (
-                permuted_local_hidden_states.shape[0]
-                * gate_and_up_projs.shape[-1]
-                * permuted_local_hidden_states.element_size()
-            )
+        tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
+        gate_up_output_bytes = (
+            permuted_local_hidden_states.shape[0]
+            * gate_and_up_projs.shape[-1]
+            * permuted_local_hidden_states.element_size()
+        )
 
-            # Retain bounded MLP recomputation for biased experts. Bias-free
-            # dispatches use whole grouped GEMMs: small row chunks introduce
-            # expensive gradient copies and redundant activation recomputation.
-            chunk_applies_router_weight = self.config.apply_router_weight_after_down and post_expert_output is None
-            if self.expert_bias and not self.use_mxfp8 and gate_up_output_bytes > _EXPERT_MLP_CHUNK_BYTES:
-                output2 = _checkpointed_chunked_expert_mlp(
-                    permuted_local_hidden_states,
-                    gate_and_up_projs,
-                    down_projs,
-                    self.gate_up_proj_bias.to_local(),
-                    self.down_proj_bias.to_local(),
-                    tokens_per_expert_gpu,
-                    permuted_probs if post_expert_output is None else activation_probs,
-                    self.expert_activation,
-                    chunk_applies_router_weight,
-                )
-                router_weight_already_applied = chunk_applies_router_weight
-            elif self.expert_bias:
-                # torch._grouped_mm does not support bias yet (raises
-                # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
-                # Apply bias manually after each grouped GEMM via _apply_bias.
-                # select_grouped_mm routes through torchao MXFP8 (with the contiguous-
-                # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
-                offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
-                grouped_mm = select_grouped_mm(self.use_mxfp8)
-                output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
-                gate_up_proj_bias = self.gate_up_proj_bias.to_local()
-                # MXFP8: the grouped_mm wrapper clamps its quant input (see
-                # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
-                # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
-                # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
-                # Selective checkpointing can cache GEMM outputs for recomputation.
-                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
-                output1 = self.expert_activation(output1, activation_probs)
-                output2 = grouped_mm(output1, down_projs, offs)
-                down_bias = self.down_proj_bias.to_local()
-                output2 = _apply_bias(
-                    output2,
-                    down_bias,
-                    tokens_per_expert,
-                    None if self.config.apply_router_weight_after_down else permuted_probs,
-                )
-            else:
-                output2 = _torch_mm_experts_fwd(
-                    permuted_local_hidden_states,
-                    gate_and_up_projs,
-                    down_projs,
-                    tokens_per_expert_gpu,
-                    activation_probs,
-                    self.expert_activation,
-                    use_mxfp8=self.use_mxfp8,
-                )
+        # Retain bounded MLP recomputation for biased experts. Bias-free
+        # dispatches use whole grouped GEMMs: small row chunks introduce
+        # expensive gradient copies and redundant activation recomputation.
+        chunk_applies_router_weight = self.config.apply_router_weight_after_down and post_expert_output is None
+        if self.expert_bias and not self.use_mxfp8 and gate_up_output_bytes > _EXPERT_MLP_CHUNK_BYTES:
+            output2 = _checkpointed_chunked_expert_mlp(
+                permuted_local_hidden_states,
+                gate_and_up_projs,
+                down_projs,
+                self.gate_up_proj_bias.to_local(),
+                self.down_proj_bias.to_local(),
+                tokens_per_expert_gpu,
+                permuted_probs if post_expert_output is None else activation_probs,
+                self.expert_activation,
+                chunk_applies_router_weight,
+            )
+            router_weight_already_applied = chunk_applies_router_weight
+        elif self.expert_bias:
+            # torch._grouped_mm does not support bias yet (raises
+            # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
+            # Apply bias manually after each grouped GEMM via _apply_bias.
+            # select_grouped_mm routes through torchao MXFP8 (with the contiguous-
+            # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
+            offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
+            grouped_mm = select_grouped_mm(self.use_mxfp8)
+            output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
+            gate_up_proj_bias = self.gate_up_proj_bias.to_local()
+            # MXFP8: the grouped_mm wrapper clamps its quant input (see
+            # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
+            # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
+            # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
+            # Selective checkpointing can cache GEMM outputs for recomputation.
+            output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+            output1 = self.expert_activation(output1, activation_probs)
+            output2 = grouped_mm(output1, down_projs, offs)
+            down_bias = self.down_proj_bias.to_local()
+            output2 = _apply_bias(
+                output2,
+                down_bias,
+                tokens_per_expert,
+                None if self.config.apply_router_weight_after_down else permuted_probs,
+            )
         else:
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1_ = self.expert_activation(output1, activation_probs)
-            output2 = torch.matmul(output1_, down_projs[0])
+            output2 = _torch_mm_experts_fwd(
+                permuted_local_hidden_states,
+                gate_and_up_projs,
+                down_projs,
+                tokens_per_expert_gpu,
+                activation_probs,
+                self.expert_activation,
+                use_mxfp8=self.use_mxfp8,
+            )
 
         if post_expert_output is not None:
             output2 = post_expert_output(output2)
@@ -1786,6 +1846,8 @@ class GroupedExpertsDeepEP(nn.Module):
             # Chunked custom-autograd path: saves the raw inputs only, instead
             # of the full-size fp32 intermediates autograd would keep alive.
             output2 = _apply_router_weight_fp32(output2, permuted_probs, compute_dtype)
+        if phantom:
+            output2 = output2[:0]
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -2277,6 +2339,14 @@ class GroupedExpertsTE(nn.Module):
         m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
         if self.static_routing and self._static_m_splits is None:
             self._static_m_splits = m_splits
+        phantom = sum(m_splits) == 0
+        if phantom:
+            # No local expert received a token: run the regular path once on a phantom token
+            # with a zero routing weight and drop its row before combining (see _phantom_dispatch).
+            permuted_local_hidden_states, _, permuted_probs = _phantom_dispatch(
+                permuted_local_hidden_states, None, permuted_probs, weights
+            )
+            m_splits = [1] + [0] * (len(m_splits) - 1)
 
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
@@ -2310,61 +2380,44 @@ class GroupedExpertsTE(nn.Module):
             permuted_local_hidden_states, m_splits = padding(permuted_local_hidden_states, m_splits)
             permuted_probs, _ = padding(permuted_probs, actual_m_splits)
 
-        if sum(m_splits) > 0:
-            # The native grouped-tensor API consumes device-side int64 split sizes.
-            # Keep the host list for padding, unpadding, and the legacy TE path.
-            grouped_m_splits = (
-                torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
-                if self.use_grouped_tensor
-                else m_splits
-            )
-            output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
-            output1 = self.expert_activation(output1, permuted_probs)
-            output2 = self.down_linear(output1, grouped_m_splits)
-            # The down-projection bias must be weighted by the per-token routing probability
-            # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
-            # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
-            # TE's GroupedLinear adds the down bias UNWEIGHTED inside the GEMM, so each of the
-            # top-k expert contributions carries a full prob-independent bias that is then
-            # summed in the combine step, producing a large systematic offset (e.g. gpt-oss-20b
-            # step-0 loss ~8.2 vs the correct ~4.5). Add the missing (prob - 1) * down_bias term
-            # so the net down-bias contribution becomes prob * down_bias.
-            if self.expert_bias:
-                down_bias = self._get_stacked_bias(self.down_linear)
-                if down_bias is not None:
-                    splits_t = torch.as_tensor(m_splits, device=output2.device)
-                    output2 = _apply_bias(output2, down_bias, splits_t, permuted_probs - 1.0)
-        else:
-            # Handle edge case: no tokens routed to local experts
-            # Perform dummy computation for gradient flow.  Touching only
-            # ``weight0`` leaves every other local expert with ``grad=None``;
-            # that skips momentum decay, decoupled weight decay, and its
-            # optimizer step.  Grouped GEMM instead produces explicit zero
-            # gradients for all experts, so attach a zero-valued dependency to
-            # every local GroupedLinear parameter.  Indexing one element is
-            # sufficient for autograd to materialize the full zero gradient
-            # without reducing over the (potentially very large) weight.
-            def to_local(tensor):
-                if isinstance(tensor, DTensor):
-                    return tensor.to_local()
-                else:
-                    return tensor
+        # The native grouped-tensor API consumes device-side int64 split sizes.
+        # Keep the host list for padding, unpadding, and the legacy TE path.
+        grouped_m_splits = (
+            torch.tensor(m_splits, device=permuted_local_hidden_states.device, dtype=torch.int64)
+            if self.use_grouped_tensor
+            else m_splits
+        )
+        output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
+        output1 = self.expert_activation(output1, permuted_probs)
+        output2 = self.down_linear(output1, grouped_m_splits)
+        # The down-projection bias must be weighted by the per-token routing probability
+        # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
+        # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
+        # TE's GroupedLinear adds the down bias UNWEIGHTED inside the GEMM, so each of the
+        # top-k expert contributions carries a full prob-independent bias that is then
+        # summed in the combine step, producing a large systematic offset (e.g. gpt-oss-20b
+        # step-0 loss ~8.2 vs the correct ~4.5). Add the missing (prob - 1) * down_bias term
+        # so the net down-bias contribution becomes prob * down_bias.
+        if self.expert_bias:
+            down_bias = self._get_stacked_bias(self.down_linear)
+            if down_bias is not None:
+                splits_t = torch.as_tensor(m_splits, device=output2.device)
+                output2 = _apply_bias(output2, down_bias, splits_t, permuted_probs - 1.0)
 
-            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).T)
-            output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
+        if fp8_active and actual_m_splits is not None:
+            output2 = unpadding(output2, actual_m_splits)
+        if phantom:
+            # TE's grouped GEMM may leave experts without rows with grad=None, which would skip
+            # their optimizer step; tie every local parameter to the (zero) phantom output.
             all_expert_dependency = output2.new_zeros(())
             for grouped_linear in (self.gate_up_linear, self.down_linear):
                 for parameter in grouped_linear.parameters():
-                    local_parameter = to_local(parameter)
+                    local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
                     if local_parameter.numel() > 0:
                         all_expert_dependency = (
                             all_expert_dependency + local_parameter.reshape(-1)[0].to(output2.dtype) * 0
                         )
-            output2 = output2 + all_expert_dependency
-
-        if fp8_active and actual_m_splits is not None:
-            output2 = unpadding(output2, actual_m_splits)
+            output2 = (output2 + all_expert_dependency)[:0]
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

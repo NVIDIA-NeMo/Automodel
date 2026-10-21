@@ -38,11 +38,12 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsTE,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
+    _phantom_dispatch,
+    _phantom_local_routing,
 )
 from nemo_automodel.components.quantization.mxfp4 import (
     MXFP4_BLOCK_SIZE,
     MXFP4GroupedMM,
-    dequantize_mxfp4,
     quantize_mxfp4,
 )
 
@@ -153,12 +154,6 @@ class MXFP4ExpertStorageMixin:
         scales = _to_local(getattr(self, name + "_scales"))
         return MXFP4GroupedMM.apply(x, packed, scales, offs)
 
-    def _mxfp4_dequant_expert0(self, name: str, dtype: torch.dtype) -> torch.Tensor:
-        """Dequantize expert 0 of base weight ``name`` to compute layout ``[in, out]``."""
-        packed = _to_local(getattr(self, name + "_packed"))[0]
-        scales = _to_local(getattr(self, name + "_scales"))[0]
-        return dequantize_mxfp4(packed, scales, dtype).transpose(-2, -1)
-
 
 class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
     """Frozen routed experts with mxfp4-resident base weights and no adapter.
@@ -255,29 +250,26 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
         )
         y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
 
-        if tokens_per_expert.sum() > 0:
-            permuted_x = x[sorted_token_ids]
-            permuted_probs = sorted_weights.unsqueeze(-1)
+        if tokens_per_expert.sum() == 0:
+            # No local expert received a token: run the regular path once on a phantom
+            # token with a zero routing weight (see _phantom_local_routing).
+            sorted_token_ids, _, sorted_weights, tokens_per_expert, offs = _phantom_local_routing(
+                weights, tokens_per_expert
+            )
+        permuted_x = x[sorted_token_ids]
+        permuted_probs = sorted_weights.unsqueeze(-1)
 
-            output1 = self._mxfp4_base_mm(permuted_x, "gate_and_up_projs", offs)
-            if self.expert_bias:
-                output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
-            output1 = self.expert_activation_grouped(output1, permuted_probs)
+        output1 = self._mxfp4_base_mm(permuted_x, "gate_and_up_projs", offs)
+        if self.expert_bias:
+            output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
+        output1 = self.expert_activation_grouped(output1, permuted_probs)
 
-            output2 = self._mxfp4_base_mm(output1, "down_projs", offs)
-            if self.expert_bias:
-                output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
+        output2 = self._mxfp4_base_mm(output1, "down_projs", offs)
+        if self.expert_bias:
+            output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
 
-            scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-            y.scatter_add_(0, scatter_ids, output2.float())
-        else:
-            # Dummy computation for gradient flow when no tokens routed locally.
-            gate_up_w0 = self._mxfp4_dequant_expert0("gate_and_up_projs", x.dtype)
-            down_w0 = self._mxfp4_dequant_expert0("down_projs", x.dtype)
-            output1 = torch.matmul(x[0] * 0, gate_up_w0)
-            output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
-            output2 = torch.matmul(output1_, down_w0)
-            y[0] += output2[0]
+        scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
+        y.scatter_add_(0, scatter_ids, output2.float())
 
         return y
 
@@ -346,25 +338,25 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
 
         # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
         # GroupedExpertsDeepEP.forward does.
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
-            tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
-            offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
+        phantom = not self.dispatch_rows_never_empty and torch.count_nonzero(tokens_per_expert) == 0
+        if phantom:
+            # No local expert received a token: run the regular path once on a phantom token
+            # with a zero routing weight and drop its row before combining (see _phantom_dispatch).
+            permuted_local_hidden_states, tokens_per_expert, permuted_probs = _phantom_dispatch(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs, weights
+            )
+        tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
+        offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
 
-            output1 = self._mxfp4_base_mm(permuted_local_hidden_states, "gate_and_up_projs", offs)
-            if self.expert_bias:
-                output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
-            output1 = self.expert_activation(output1, permuted_probs)
-            output2 = self._mxfp4_base_mm(output1, "down_projs", offs)
-            if self.expert_bias:
-                output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
-        else:
-            # Dummy computation for gradient flow when no tokens routed locally.
-            gate_up_w0 = self._mxfp4_dequant_expert0("gate_and_up_projs", x.dtype)
-            down_w0 = self._mxfp4_dequant_expert0("down_projs", x.dtype)
-            output1 = torch.matmul(x[0] * 0, gate_up_w0)
-            output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, down_w0)
-
+        output1 = self._mxfp4_base_mm(permuted_local_hidden_states, "gate_and_up_projs", offs)
+        if self.expert_bias:
+            output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
+        output1 = self.expert_activation(output1, permuted_probs)
+        output2 = self._mxfp4_base_mm(output1, "down_projs", offs)
+        if self.expert_bias:
+            output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
+        if phantom:
+            output2 = output2[:0]
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
 
