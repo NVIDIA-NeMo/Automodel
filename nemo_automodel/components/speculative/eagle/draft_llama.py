@@ -161,6 +161,8 @@ _SUPPORTED_ATTN_IMPLEMENTATIONS = ("eager", "flash_attention_2")
 # ``architectures`` entry of an EAGLE-4 draft; the serving engines register the
 # draft class under this name.
 EAGLE4_ARCHITECTURE = "LlamaForCausalLMEagle4"
+# Rows of the ``[vocab, hidden]`` lm_head processed at a time by the candidate-head SVD init.
+_SVD_CHUNK_ROWS = 32768
 
 
 def _draft_sliding_window(config: PretrainedConfig) -> int | None:
@@ -327,8 +329,8 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         )
         self.rotary_emb = LlamaRotaryEmbedding(config)
         # EAGLE-4 sliding window over the Block-1 context keys (None = full
-        # causal attention). The eager path reads it through the mask built in
-        # ``LlamaEagle3DraftModel.forward``; FlashAttention takes it here.
+        # causal attention), applied to the eager mask and to FlashAttention's
+        # ``window_size``.
         self.sliding_window = _draft_sliding_window(config)
         # Set by attach_eagle3_cp_attention when the draft runs under context
         # parallelism: the sequence is sharded across this cp group and the mixed
@@ -454,6 +456,24 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         batch_size: int,
         seq_len: int,
     ) -> torch.Tensor:
+        """Eager EAGLE-3 attention: Block 1 against ``K_0`` plus the TTT diagonals.
+
+        Args:
+            q: Tensor of shape ``[batch, heads, sequence, head_dim]``, this step's queries.
+            cache_k: Per-TTT-step keys, each a tensor of shape ``[batch, heads, sequence, head_dim]``.
+            cache_v: Per-TTT-step values, same layout as ``cache_k``.
+            attention_mask: Tensor of shape ``[batch, 1, sequence, sequence]``, the
+                additive (query, key) Block-1 mask; an EAGLE-4 ``sliding_window`` is
+                applied on top of it here.
+            step_idx: Number of cached steps before this one.
+            batch_size: Batch size.
+            seq_len: Sequence length.
+
+        Returns:
+            Tensor of shape ``[batch, sequence, heads * head_dim]``.
+        """
+        if self.sliding_window is not None:
+            attention_mask = _apply_sliding_window(attention_mask, self.sliding_window)
         # Block 1: full T x T causal attention against the step-0 keys.
         k0, v0 = cache_k[0], cache_v[0]
         attn_weights = torch.matmul(q, k0.transpose(-2, -1)) * self.scaling
@@ -925,8 +945,8 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
                 or rank <= 0
             ):
                 raise ValueError(
-                    f"efficient_lm_head_config={head_config!r} is not supported; expected "
-                    "{'type': 'low_rank', 'rank': <positive int>, 'num_candidates': <positive int>}."
+                    f"efficient_lm_head_config={head_config!r} is not supported; expected a dict with "
+                    "type='low_rank' and a positive integer rank."
                 )
             if self.has_vocab_compression:
                 raise ValueError(
@@ -1074,7 +1094,7 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         return self.efficient_lm_head(self.efficient_lm_head_down_proj(self._lm_head_input(hidden_states)))
 
     @torch.no_grad()
-    def init_efficient_lm_head_from_lm_head(self, chunk_rows: int = 32768) -> None:
+    def init_efficient_lm_head_from_lm_head(self) -> None:
         """Initialize the candidate-head factors to the best rank-``r`` approximation of ``lm_head``.
 
         With ``lm_head.weight = U S V^T``, sets ``efficient_lm_head.weight =
@@ -1083,32 +1103,25 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         ``S_r`` come from an fp64 eigendecomposition of the ``[hidden, hidden]``
         Gram matrix, which is deterministic (so every rank initializes the same
         factors) and never materializes a full fp32 copy of the head: both
-        passes over the ``[vocab, hidden]`` weight run ``chunk_rows`` rows at a time.
+        passes over the ``[vocab, hidden]`` weight run ``_SVD_CHUNK_ROWS`` rows at a time.
         """
         if self.efficient_lm_head is None:
             raise RuntimeError("init_efficient_lm_head_from_lm_head requires config.efficient_lm_head_config.")
         weight = self.lm_head.weight  # [vocab, hidden]
         rank = self.efficient_lm_head.weight.shape[1]
         gram = torch.zeros(weight.shape[1], weight.shape[1], dtype=torch.float64, device=weight.device)
-        for rows in weight.split(chunk_rows):
+        for rows in weight.split(_SVD_CHUNK_ROWS):
             rows = rows.double()
             gram += rows.T @ rows
         eigenvalues, eigenvectors = torch.linalg.eigh(gram)  # ascending
         top_values = eigenvalues[-rank:].flip(0).clamp_min(torch.finfo(torch.float64).tiny)
         top_vectors = eigenvectors[:, -rank:].flip(1)  # V_r: [hidden, rank]
         root = top_values.pow(0.25)  # S_r^(1/2), since eigenvalues are S_r^2
-        # U_r S_r^(1/2) = W V_r S_r^(-1/2).
-        up = torch.cat([rows.double() @ (top_vectors / root) for rows in weight.split(chunk_rows)])
-        self.efficient_lm_head.weight.copy_(up.to(self.efficient_lm_head.weight.dtype))
-        self.efficient_lm_head_down_proj.weight.copy_((top_vectors * root).T.to(weight.dtype))
-
-    def freeze_all_but_efficient_lm_head(self) -> None:
-        """Freeze every draft parameter except the two candidate-head factors."""
-        if self.efficient_lm_head is None:
-            raise RuntimeError("freeze_all_but_efficient_lm_head requires config.efficient_lm_head_config.")
-        self.requires_grad_(False)
-        self.efficient_lm_head.requires_grad_(True)
-        self.efficient_lm_head_down_proj.requires_grad_(True)
+        # U_r S_r^(1/2) = W V_r S_r^(-1/2), written chunk by chunk.
+        projection = top_vectors / root
+        for rows, up in zip(weight.split(_SVD_CHUNK_ROWS), self.efficient_lm_head.weight.split(_SVD_CHUNK_ROWS)):
+            up.copy_(rows.double() @ projection)
+        self.efficient_lm_head_down_proj.weight.copy_((top_vectors * root).T)
 
     def forward(
         self,
@@ -1168,11 +1181,6 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
                     "attention_mask (each row must be contiguous 1s followed by 0s)."
                 )
             causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
-        # EAGLE-4: restrict the eager Block-1 mask to the sliding window (FA2 and
-        # the varlen path apply it through ``window_size`` instead).
-        sliding_window = self.model.layers[0].self_attn.sliding_window
-        if sliding_window is not None and causal_mask is not None and not is_fa2:
-            causal_mask = _apply_sliding_window(causal_mask, sliding_window)
 
         draft_input_embeds = self.embed_input_ids(input_ids)
         hidden_states = self.model.layers[0](

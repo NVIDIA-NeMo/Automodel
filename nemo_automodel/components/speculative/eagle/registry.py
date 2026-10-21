@@ -51,9 +51,17 @@ from nemo_automodel.components.speculative.eagle.vispec_draft import VispecDraft
 
 @dataclass(frozen=True)
 class DraftSpec:
-    """How to build an EAGLE draft model for a particular target architecture."""
+    """How to build an EAGLE draft model for a particular target architecture.
+
+    Attributes:
+        draft_cls: The draft model class.
+        supports_eagle4: Whether ``draft_cls`` builds the EAGLE-4 sliding-window
+            layer and candidate head in the ``LlamaForCausalLMEagle4`` layout
+            (``recipe_args.eagle4``).
+    """
 
     draft_cls: type[PreTrainedModel]
+    supports_eagle4: bool = False
 
 
 # Llama-style dense LLMs. The dense draft works for any architecture in this
@@ -72,7 +80,7 @@ _DENSE_ARCHITECTURES: tuple[str, ...] = (
 
 
 EAGLE3_DRAFT_REGISTRY: dict[str, DraftSpec] = {
-    arch: DraftSpec(draft_cls=LlamaEagle3DraftModel) for arch in _DENSE_ARCHITECTURES
+    arch: DraftSpec(draft_cls=LlamaEagle3DraftModel, supports_eagle4=True) for arch in _DENSE_ARCHITECTURES
 }
 
 # gpt-oss MoE target. The draft is still Llama-style dense (it only consumes

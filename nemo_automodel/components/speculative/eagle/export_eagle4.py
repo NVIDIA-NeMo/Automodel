@@ -46,6 +46,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from nemo_automodel.components.speculative.eagle.draft_llama import EAGLE4_ARCHITECTURE
+from nemo_automodel.components.speculative.eagle.eagle4 import CANDIDATE_HEAD_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ def _resolve_checkpoint_dir(path: Path) -> Path:
     )
 
 
-def _serving_config(config: dict[str, Any], dtype: torch.dtype) -> dict[str, Any]:
+def _serving_config(config: dict[str, Any]) -> dict[str, Any]:
     """Validate a training-side draft config and return the serving ``config.json``.
 
     Raises:
@@ -145,7 +146,6 @@ def _serving_config(config: dict[str, Any], dtype: torch.dtype) -> dict[str, Any
         num_hidden_layers=1,
         target_hidden_size=config["hidden_size"],
         tie_word_embeddings=False,
-        torch_dtype=str(dtype).removeprefix("torch."),
     )
     return serving
 
@@ -167,8 +167,7 @@ def _serving_state_dict(state_dict: dict[str, torch.Tensor], config: dict[str, A
         "fc.weight",
         "norm.weight",
         "lm_head.weight",
-        "efficient_lm_head.weight",
-        "efficient_lm_head_down_proj.weight",
+        *CANDIDATE_HEAD_KEYS,
         *(f"layers.0.{key}" for key in _LAYER_KEYS),
     }
     if config.get("fc_norm", False):
@@ -197,6 +196,7 @@ def export_eagle4_draft(checkpoint_dir: str | Path, output_dir: str | Path) -> P
     if output.resolve() == source.resolve():
         raise ValueError("output_dir must differ from the checkpoint directory.")
     config = json.loads((source / "config.json").read_text())
+    serving_config = _serving_config(config)  # before loading any weights
     shards = sorted(source.glob("*.safetensors"))
     if not shards:
         raise FileNotFoundError(f"No .safetensors files in {source}.")
@@ -205,13 +205,9 @@ def export_eagle4_draft(checkpoint_dir: str | Path, output_dir: str | Path) -> P
         state_dict.update(load_file(str(shard)))
 
     tensors = _serving_state_dict(state_dict, config)
-    serving_config = _serving_config(config, tensors["lm_head.weight"].dtype)
+    serving_config["torch_dtype"] = str(tensors["lm_head.weight"].dtype).removeprefix("torch.")
     output.mkdir(parents=True, exist_ok=True)
-    save_file(
-        {key: tensor.contiguous() for key, tensor in tensors.items()},
-        str(output / "model.safetensors"),
-        metadata={"format": "pt"},
-    )
+    save_file(tensors, str(output / "model.safetensors"), metadata={"format": "pt"})
     (output / "config.json").write_text(json.dumps(serving_config, indent=2, sort_keys=True) + "\n")
     logger.info("Exported EAGLE-4 draft (%d tensors) to %s", len(tensors), output)
     return output

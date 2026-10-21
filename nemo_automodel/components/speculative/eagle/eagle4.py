@@ -47,7 +47,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.loss.soft_ce import masked_soft_cross_entropy
-from nemo_automodel.components.speculative.eagle.core import Eagle3StepMetrics
+from nemo_automodel.components.speculative.eagle.core import Eagle3StepMetrics, _shift_left_with_zero
 from nemo_automodel.components.speculative.eagle.draft_llama import EAGLE4_ARCHITECTURE, LlamaEagle3DraftModel
 
 # The candidate head's state-dict keys (top-level, outside the ``model.`` backbone).
@@ -73,6 +73,10 @@ class Eagle4CandidateHeadConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"eagle4.candidate_head.{name} must be a positive integer, got {value!r}.")
+
+    def build(self, draft_model: LlamaEagle3DraftModel, *, ttt_steps: int) -> Eagle4CandidateHeadTrainerModule:
+        """Build the stage-2 trainer that fits ``draft_model``'s candidate head."""
+        return Eagle4CandidateHeadTrainerModule(draft_model, ttt_steps=ttt_steps, num_candidates=self.num_candidates)
 
 
 @dataclass(frozen=True)
@@ -124,21 +128,6 @@ class Eagle4Config:
                 "num_candidates": self.candidate_head.num_candidates,
             }
         return updates
-
-    def build_candidate_head_trainer(
-        self, draft_model: LlamaEagle3DraftModel, *, ttt_steps: int
-    ) -> Eagle4CandidateHeadTrainerModule:
-        """Build the stage-2 trainer for ``draft_model`` (requires ``candidate_head``)."""
-        if self.candidate_head is None:
-            raise ValueError("build_candidate_head_trainer requires eagle4.candidate_head.")
-        return Eagle4CandidateHeadTrainerModule(
-            draft_model, ttt_steps=ttt_steps, num_candidates=self.candidate_head.num_candidates
-        )
-
-
-def _shift_left(tensor: torch.Tensor) -> torch.Tensor:
-    """Shift a ``[batch, sequence, ...]`` tensor one position left, zero-filling the tail."""
-    return torch.cat((tensor[:, 1:], torch.zeros_like(tensor[:, :1])), dim=1)
 
 
 class Eagle4CandidateHeadTrainerModule(nn.Module):
@@ -233,7 +222,8 @@ class Eagle4CandidateHeadTrainerModule(nn.Module):
                     cache_hidden=cache_hidden,
                     seq_lens=seq_lens,
                 )
-                teacher_probs = torch.softmax(draft.compute_logits(hidden_states).float(), dim=-1)
+                teacher_logits = draft.compute_logits(hidden_states)
+                teacher_probs = torch.softmax(teacher_logits, dim=-1, dtype=torch.float32)
             student_logits = draft.compute_candidate_logits(hidden_states)
 
             step_valid = cur_valid if doc_remaining is None else cur_valid & (step_idx < doc_remaining)
@@ -242,14 +232,17 @@ class Eagle4CandidateHeadTrainerModule(nn.Module):
             )
             running_loss = running_loss + step_loss * (0.8**step_idx)
 
-            candidates = student_logits.detach().topk(self.num_candidates, dim=-1).indices
-            hits = (candidates == teacher_probs.argmax(dim=-1, keepdim=True)).any(dim=-1) & step_valid
+            with torch.no_grad():
+                # The full head's top-1 token is a candidate when fewer than K
+                # low-rank scores beat its own score (one pass, no vocab topk).
+                top1_score = student_logits.gather(-1, teacher_logits.argmax(dim=-1, keepdim=True))
+                hits = ((student_logits > top1_score).sum(dim=-1) < self.num_candidates) & step_valid
             running_hits = running_hits + hits.sum()
             running_valid = running_valid + step_valid.sum()
 
             if step_idx + 1 < self.ttt_steps:
-                cur_input_ids = _shift_left(cur_input_ids)
-                cur_valid = _shift_left(cur_valid)
+                cur_input_ids = _shift_left_with_zero(cur_input_ids)
+                cur_valid = _shift_left_with_zero(cur_valid)
 
         return Eagle3StepMetrics(
             loss=running_loss / weight_sum,

@@ -33,6 +33,7 @@ from nemo_automodel.components.speculative.eagle.eagle4 import (
     Eagle4CandidateHeadTrainerModule,
     Eagle4Config,
 )
+from nemo_automodel.components.speculative.eagle.registry import DraftSpec
 from nemo_automodel.recipes.llm.train_eagle3 import (
     _load_draft_weights,
     _parse_eagle4_config,
@@ -71,7 +72,7 @@ def test_parse_eagle4_config():
 
 def _gate_kwargs(**overrides):
     kwargs = dict(
-        draft_cls=LlamaEagle3DraftModel,
+        draft_spec=DraftSpec(draft_cls=LlamaEagle3DraftModel, supports_eagle4=True),
         parallel_drafting=False,
         cp_size=1,
         draft_vocab_size=None,
@@ -92,7 +93,7 @@ def test_gates_accept_both_stages():
 @pytest.mark.parametrize(
     "eagle4, overrides, error, match",
     [
-        (STAGE1, {"draft_cls": GptOssEagle3DraftModel}, ValueError, "GptOssEagle3DraftModel"),
+        (STAGE1, {"draft_spec": DraftSpec(draft_cls=GptOssEagle3DraftModel)}, ValueError, "GptOssEagle3DraftModel"),
         (STAGE1, {"parallel_drafting": True}, ValueError, "parallel_drafting"),
         (STAGE1, {"cp_size": 2}, NotImplementedError, "context parallelism"),
         (STAGE1, {"draft_vocab_size": 32000}, ValueError, "full target vocabulary"),
@@ -200,7 +201,9 @@ def _run_setup_to_trainer(recipe_overrides: dict, *, selected_vocab: int = TARGE
         patch.object(recipe_module, "AutoConfig") as auto_config,
         patch.object(recipe_module, "NeMoAutoTokenizer") as tokenizer,
         patch.object(
-            recipe_module, "resolve_eagle3_draft_spec", return_value=SimpleNamespace(draft_cls=LlamaEagle3DraftModel)
+            recipe_module,
+            "resolve_eagle3_draft_spec",
+            return_value=DraftSpec(draft_cls=LlamaEagle3DraftModel, supports_eagle4=True),
         ),
         patch.object(
             recipe_module.TrainEagle3Recipe, "_setup_online_target", autospec=True, side_effect=fake_online_target

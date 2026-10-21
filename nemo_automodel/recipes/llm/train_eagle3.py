@@ -71,7 +71,7 @@ from nemo_automodel.components.speculative.eagle.eagle4 import (
     Eagle4CandidateHeadConfig,
     Eagle4Config,
 )
-from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
+from nemo_automodel.components.speculative.eagle.registry import DraftSpec, resolve_eagle3_draft_spec
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.components.speculative.eagle.target import default_eagle3_aux_layer_ids
 from nemo_automodel.components.speculative.regen_loop import RegenRunner, resolve_regen_config
@@ -422,7 +422,7 @@ def _parse_eagle4_config(node) -> Eagle4Config | None:
 def _validate_eagle4_gates(
     eagle4: Eagle4Config,
     *,
-    draft_cls: type,
+    draft_spec: DraftSpec,
     parallel_drafting: bool,
     cp_size: int,
     draft_vocab_size: int | None,
@@ -432,12 +432,10 @@ def _validate_eagle4_gates(
     draft_weights_path: str | None,
 ) -> None:
     """Reject ``recipe_args.eagle4`` combinations the EAGLE-4 draft or its trainers cannot honor."""
-    # Subclasses swap the RoPE (gpt-oss YaRN, Gemma4's per-layer-type bases), which
-    # the LlamaForCausalLMEagle4 serving layout does not describe.
-    if draft_cls is not LlamaEagle3DraftModel:
+    if not draft_spec.supports_eagle4:
         raise ValueError(
-            f"eagle4 supports targets served by the dense Llama-style draft (LlamaEagle3DraftModel); this "
-            f"target's draft is {draft_cls.__name__}."
+            f"eagle4 is not supported for this target's draft ({draft_spec.draft_cls.__name__}); see "
+            "DraftSpec.supports_eagle4 in components/speculative/eagle/registry.py."
         )
     if parallel_drafting:
         raise ValueError("eagle4 does not support parallel_drafting (P-EAGLE).")
@@ -479,7 +477,9 @@ def _prepare_candidate_head_training(draft_model: LlamaEagle3DraftModel, missing
         raise ValueError(
             f"The warm-start checkpoint has only part of the candidate head (missing {sorted(missing_head_keys)})."
         )
-    draft_model.freeze_all_but_efficient_lm_head()
+    draft_model.requires_grad_(False)
+    draft_model.efficient_lm_head.requires_grad_(True)
+    draft_model.efficient_lm_head_down_proj.requires_grad_(True)
 
 
 def _load_draft_weights(
@@ -681,7 +681,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if self.eagle4 is not None:
             _validate_eagle4_gates(
                 self.eagle4,
-                draft_cls=draft_spec.draft_cls,
+                draft_spec=draft_spec,
                 parallel_drafting=bool(recipe_cfg.get("parallel_drafting", False)),
                 cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
                 draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
@@ -861,9 +861,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                         )
                 attach_eagle3_cp_attention(self.draft_model, self.cp_group, mode=self.cp_mode, zigzag=self.cp_zigzag)
             if train_candidate_head:
-                trainer_module = self.eagle4.build_candidate_head_trainer(
-                    self.draft_model, ttt_steps=recipe_cfg.ttt_steps
-                ).to(self.device)
+                trainer_module = self.eagle4.candidate_head.build(self.draft_model, ttt_steps=recipe_cfg.ttt_steps).to(
+                    self.device
+                )
             else:
                 trainer_module = Eagle3TrainerModule(
                     self.draft_model,

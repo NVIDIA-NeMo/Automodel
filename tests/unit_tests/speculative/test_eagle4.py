@@ -313,11 +313,12 @@ def test_candidate_head_requires_the_full_vocabulary():
         LlamaEagle3DraftModel(config)
 
 
-def test_svd_init_gives_the_best_rank_r_approximation():
+def test_svd_init_gives_the_best_rank_r_approximation(monkeypatch):
+    monkeypatch.setattr(draft_llama, "_SVD_CHUNK_ROWS", 10)  # exercise the chunked passes
     draft = _draft(rank=4)
     with torch.no_grad():
         draft.lm_head.weight.copy_(torch.randn(VOCAB, HIDDEN))
-    draft.init_efficient_lm_head_from_lm_head(chunk_rows=10)  # exercises the chunked passes
+    draft.init_efficient_lm_head_from_lm_head()
     product = draft.efficient_lm_head.weight @ draft.efficient_lm_head_down_proj.weight
     u, s, vh = torch.linalg.svd(draft.lm_head.weight.double(), full_matrices=False)
     best = (u[:, :4] * s[:4]) @ vh[:4]
@@ -326,23 +327,12 @@ def test_svd_init_gives_the_best_rank_r_approximation():
     torch.testing.assert_close(draft.efficient_lm_head.weight.double().norm(dim=0), s[:4].sqrt(), atol=1e-4, rtol=1e-4)
 
 
-def test_freeze_leaves_only_the_candidate_head_trainable():
-    draft = _draft(rank=4)
-    draft.freeze_all_but_efficient_lm_head()
-    trainable = {name for name, p in draft.named_parameters() if p.requires_grad}
-    assert trainable == CANDIDATE_HEAD_KEYS
-
-
-@pytest.mark.parametrize("method", ["compute_candidate_logits", "init_efficient_lm_head_from_lm_head", "freeze"])
-def test_candidate_head_methods_require_the_head(method):
+def test_candidate_head_methods_require_the_head():
     draft = _draft()
     with pytest.raises(RuntimeError, match="efficient_lm_head_config"):
-        if method == "compute_candidate_logits":
-            draft.compute_candidate_logits(torch.zeros(1, 1, HIDDEN))
-        elif method == "freeze":
-            draft.freeze_all_but_efficient_lm_head()
-        else:
-            draft.init_efficient_lm_head_from_lm_head()
+        draft.compute_candidate_logits(torch.zeros(1, 1, HIDDEN))
+    with pytest.raises(RuntimeError, match="efficient_lm_head_config"):
+        draft.init_efficient_lm_head_from_lm_head()
 
 
 # --- config -----------------------------------------------------------------
@@ -380,18 +370,11 @@ def test_candidate_head_config_rejects_non_positive_sizes(field, value):
         Eagle4CandidateHeadConfig(**{field: value})
 
 
-def test_candidate_head_trainer_needs_the_candidate_head_config():
-    with pytest.raises(ValueError, match="candidate_head"):
-        Eagle4Config(sliding_window=3).build_candidate_head_trainer(_draft(rank=4), ttt_steps=2)
-
-
 # --- candidate-head trainer -------------------------------------------------
 
 
 def _trainer(draft, ttt_steps=2, num_candidates=8):
-    return Eagle4Config(
-        sliding_window=3, candidate_head=Eagle4CandidateHeadConfig(rank=4, num_candidates=num_candidates)
-    ).build_candidate_head_trainer(draft, ttt_steps=ttt_steps)
+    return Eagle4CandidateHeadConfig(rank=4, num_candidates=num_candidates).build(draft, ttt_steps=ttt_steps)
 
 
 def _batch(loss_mask=None):
@@ -441,10 +424,23 @@ def test_exact_low_rank_head_has_full_recall_and_zero_kl():
     torch.testing.assert_close(metrics.loss, entropy, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("num_candidates, recall", [(1, 0.0), (VOCAB, 1.0)])
+def test_recall_counts_the_teacher_top1_inside_the_top_k(num_candidates, recall):
+    """A low-rank head that inverts the full head ranks the teacher's top-1 last."""
+    draft = _draft(rank=HIDDEN)
+    with torch.no_grad():
+        draft.efficient_lm_head_down_proj.weight.copy_(torch.eye(HIDDEN))
+        draft.efficient_lm_head.weight.copy_(-draft.lm_head.weight)
+    trainer = Eagle4CandidateHeadTrainerModule(draft, ttt_steps=2, num_candidates=num_candidates)
+    assert trainer(**_batch()).accuracy.item() == pytest.approx(recall)
+
+
 def test_training_reduces_the_loss_and_only_updates_the_factors():
     draft = _draft(rank=4)
     draft.init_efficient_lm_head_from_lm_head()
-    draft.freeze_all_but_efficient_lm_head()
+    draft.requires_grad_(False)
+    draft.efficient_lm_head.requires_grad_(True)
+    draft.efficient_lm_head_down_proj.requires_grad_(True)
     frozen_before = {n: p.detach().clone() for n, p in draft.named_parameters() if not p.requires_grad}
     trainer = _trainer(draft)
     optimizer = torch.optim.Adam([p for p in trainer.parameters() if p.requires_grad], lr=1e-2)
