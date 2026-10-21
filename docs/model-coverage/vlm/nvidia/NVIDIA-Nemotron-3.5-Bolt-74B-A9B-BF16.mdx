@@ -1,0 +1,62 @@
+---
+title: "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16"
+description: "Use NeMo AutoModel to LoRA fine-tune nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16 on one GB300 GPU through its Hugging Face implementation."
+slug: model-coverage/vision-language-models/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16
+---
+
+[NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16)
+has a checked-in NeMo AutoModel recipe for image-text-to-text LoRA fine-tuning. The recipe uses the model's
+Hugging Face remote implementation and keeps every parallelism axis, including expert parallelism, at one.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run the recipe on one GB300 GPU from the
+repository root:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 automodel \
+  examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_cord_v2_lora.yaml \
+  --nproc-per-node 1
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | CORD-v2; one GB300 GPU | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_cord_v2_lora.yaml) |
+
+## Model Context
+
+The checkpoint combines a MoE language backbone with a vision encoder. The recipe uses the Hugging Face remote implementation.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `NemotronH_Omni_Reasoning_V3` |
+| Parameters | 74B total; 9B active, as identified by the checkpoint name |
+| Hidden Size | 4,096 |
+| Attention | 32 query heads; 2 key-value heads |
+| Experts | 512 |
+| Vision Encoder | 32 layers; hidden size 1,280; 16 attention heads |
+
+Architecture dimensions follow the [pinned checkpoint configuration](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16/blob/567021037ff88364143e24ea05e6abd0f72086ff/config.json).
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 1 NVIDIA GB300 GPU |
+| Strategy | FSDP2; `dp_size=1`, `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=1` |
+| Sequence length | 4,096 tokens |
+| Features | BF16 LoRA, reshard after forward, frozen vision encoder and projector |
+| Advanced | Hugging Face remote implementation, eager attention |
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16) | BF16 checkpoint |
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)

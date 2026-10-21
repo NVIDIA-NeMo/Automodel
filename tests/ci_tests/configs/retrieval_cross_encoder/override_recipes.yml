@@ -15,8 +15,7 @@
 exempt_models:
 
 exempt_configs:
-  # Age-deprecated examples remain available outside GPU CI.
-  llama3_2_1b:
-    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  llama_nemotron_rerank_1b_v2_finetune:
+    reason: "Example config; enroll after GPU training and memory validation"
 
 known_issue:

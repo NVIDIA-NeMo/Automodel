@@ -20,9 +20,9 @@ uv run automodel examples/retrieval/bi_encoder/ministral_3_3b_base_2512_finetune
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| Embedding Fine-Tuning | FEVER and synthetic classification data; one node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/bi_encoder/ministral_3_3b_base_2512_finetune.yaml) |
-| Multimodal Embedding Fine-Tuning | Custom corpus-ID JSON; 8-GPU example; BF16 instruct checkpoint | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/bi_encoder/mistral3_vl_embedding.yaml) |
-| Multimodal Reranker Fine-Tuning | Custom corpus-ID JSON; 8-GPU example; BF16 instruct checkpoint | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/examples/retrieval/cross_encoder/mistral3_vl_reranker.yaml) |
+| Embedding Fine-Tuning | FEVER and synthetic classification data; one node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/ministral_3_3b_base_2512_finetune.yaml) |
+| Multimodal Embedding Fine-Tuning | Custom corpus-ID JSON; 8-GPU example; BF16 instruct checkpoint | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/mistral3_vl_embedding.yaml) |
+| Multimodal Reranker Fine-Tuning | Custom corpus-ID JSON; 8-GPU example; BF16 instruct checkpoint | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/mistral3_vl_reranker.yaml) |
 
 ## Model Context
 
@@ -79,7 +79,7 @@ The bi-encoder supports multiple pooling strategies to aggregate token represent
 
 ### Recipe Setup
 
-The [text-only fine-tuning recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/bi_encoder/ministral_3_3b_base_2512_finetune.yaml) uses average pooling with L2 normalization and trains for up to 100 steps. Query and passage lengths are each limited to 512 tokens.
+The [text-only fine-tuning recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/ministral_3_3b_base_2512_finetune.yaml) uses average pooling with L2 normalization and trains for up to 100 steps. Query and passage lengths are each limited to 512 tokens.
 
 ### Train Multimodal Embeddings or Rerankers
 

@@ -1,7 +1,7 @@
 ---
 title: "MiniMaxAI/MiniMax-M2.1"
 description: "Fine-tune MiniMaxAI/MiniMax-M2.1 on HellaSwag with NeMo AutoModel using pipeline and expert parallelism."
-slug: model-coverage/large-language-models/minimax/MiniMax-M2.1
+slug: model-coverage/large-language-models/MiniMaxAI/MiniMax-M2.1
 ---
 
 [MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1) is a mixture-of-experts (MoE) language model for text generation. NeMo AutoModel provides full fine-tuning recipes on HellaSwag using pipeline parallelism (PP) and expert parallelism (EP).

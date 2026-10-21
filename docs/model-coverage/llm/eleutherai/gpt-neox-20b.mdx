@@ -22,7 +22,7 @@ uv run automodel examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml -
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml) |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml) |
 
 ## Model Context
 
@@ -43,7 +43,7 @@ gpt-neox-20b is used for text generation. Its model size is 20B parameters.
 
 ### Recipe Setup
 
-The [gpt_neox_20b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml) example uses SQuAD (`rajpurkar/squad`) with 512-token sequences and runs for 100 steps. It loads the model in `bfloat16` and uses LoRA with rank 8, fully sharded data parallelism (FSDP2), and activation checkpointing.
+The [gpt_neox_20b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml) example uses SQuAD (`rajpurkar/squad`) with 512-token sequences and runs for 100 steps. It loads the model in `bfloat16` and uses LoRA with rank 8, fully sharded data parallelism (FSDP2), and activation checkpointing.
 
 ## Available Models
 

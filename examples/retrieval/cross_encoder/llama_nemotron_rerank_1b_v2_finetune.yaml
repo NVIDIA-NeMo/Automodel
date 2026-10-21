@@ -69,6 +69,7 @@ distributed:
   sequence_parallel: false
 
 ci:
+  cluster_tag: h100
   recipe_owner: akoumpa
   time: "00:20:00"
   nodes: 1

@@ -22,7 +22,7 @@ uv run automodel examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml -
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml) |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml) |
 
 ## Model Context
 
@@ -43,7 +43,7 @@ Minitron-8B-Base is used for text generation. Its model size is 8B parameters.
 
 ### Recipe Setup
 
-The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml) loads pretrained weights and configures 100 training steps with 1,024 training samples and 64 validation samples from `rajpurkar/squad`, truncated to 512 tokens. It uses Fully Sharded Data Parallel version 2 (FSDP2) with activation checkpointing. Checkpoint saving is enabled every 50 steps under `checkpoints/minitron_8b_base`.
+The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml) loads pretrained weights and configures 100 training steps with 1,024 training samples and 64 validation samples from `rajpurkar/squad`, truncated to 512 tokens. It uses Fully Sharded Data Parallel version 2 (FSDP2) with activation checkpointing. Checkpoint saving is enabled every 50 steps under `checkpoints/minitron_8b_base`.
 
 ## Available Models
 

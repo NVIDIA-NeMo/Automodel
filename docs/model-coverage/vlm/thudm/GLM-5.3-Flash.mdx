@@ -75,6 +75,14 @@ parallelism, pipeline parallelism, and video training are not enabled. An EP
 size must evenly divide the model's 288 routed experts and fit the available GPU
 memory; EP72 is the published validated topology, not a model requirement.
 
+For chat SFT through `ChatDataset`, set the dataset's `chat_template` to
+`examples/llm_finetune/glm5_next/glm5_3_flash_training_chat_template.jinja`.
+GLM ends an assistant turn with the next role token (`<|user|>`,
+`<|observation|>`, or `<|system|>`), which the released template renders as part
+of the following turn and omits after the final turn. The training template
+renders the same text, appends that token after the final turn, and marks each
+assistant span together with its end-of-turn token as the loss target.
+
 ### Attention Backends
 
 - KDA layers use Flash Linear Attention (FLA) kernels. For CP, FLA carries the

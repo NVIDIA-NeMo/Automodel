@@ -44,6 +44,7 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _ModelRelease,
     _parse_doc_arch_aliases,
     _parse_registry_entries,
+    _read_documented_recipe,
     _render_registry_table,
     _replace_generated_block,
     _resolve_model_card_routes,
@@ -189,7 +190,8 @@ def _collect_fern_routes(
                 frontmatter_slug = _frontmatter_slug((config_dir / section_path).resolve())
                 if frontmatter_slug:
                     routes.add("/" + frontmatter_slug)
-            routes.update(_collect_fern_routes(item.get("contents", []), (*parents, slug), config_dir))
+            child_parents = parents if item.get("skip-slug") else (*parents, slug)
+            routes.update(_collect_fern_routes(item.get("contents", []), child_parents, config_dir))
         elif "page" in item:
             page_path = item.get("path")
             frontmatter_slug = None
@@ -201,6 +203,21 @@ def _collect_fern_routes(
                 slug = str(item.get("slug", _fern_slug(str(item["page"]))))
                 routes.add("/" + "/".join((*parents, slug)))
     return routes
+
+
+def test_regrouped_training_pages_preserve_published_urls():
+    config_path = Path(__file__).parents[3] / "docs" / "fern" / "versions" / "nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
+
+    assert {
+        "/recipes-e2e-examples/minimax-m3",
+        "/recipes-e2e-examples/databricks",
+        "/recipes-e2e-examples/eagle-speculative-decoding",
+        "/recipes-e2e-examples/diffusion-fine-tuning",
+        "/tutorials/overview",
+    } <= routes
+    assert "/job-launchers/databricks" not in routes
 
 
 def test_registry_table_is_generated_from_mapping_entries():
@@ -377,6 +394,21 @@ def test_case_insensitive_redirect_cannot_shadow_a_canonical_card(tmp_path):
         _resolve_model_card_routes(tmp_path, [], {"org/Model": [model_doc]}, [model_doc])
 
 
+@pytest.mark.parametrize("deprecated", [False, True])
+def test_model_releases_follow_recipe_deprecation_metadata(tmp_path: Path, deprecated: bool) -> None:
+    recipe = tmp_path / "examples/llm_finetune/model.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text(
+        f"model:\n  pretrained_model_name_or_path: org/model\nci:\n  deprecated: {str(deprecated).lower()}\n"
+    )
+    _commit_recipes(tmp_path)
+
+    releases = _load_model_releases(tmp_path, {})
+
+    assert [release.hf_model_id for release in releases] == ([] if deprecated else ["org/model"])
+    assert recipe.is_file()
+
+
 def test_recipe_model_id_without_model_card_is_rejected(tmp_path):
     docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
     docs_config_path.parent.mkdir(parents=True)
@@ -487,7 +519,7 @@ def test_committed_generated_tables_are_rejected(tmp_path):
         _validate_generated_tables_are_not_committed(tmp_path)
 
 
-def test_pending_model_reference_guides_preserve_published_routes():
+def test_model_reference_guides_preserve_published_routes():
     repo_root = Path(__file__).parents[3]
     config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
     navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
@@ -495,23 +527,101 @@ def test_pending_model_reference_guides_preserve_published_routes():
     _, _, catalog = _load_model_doc_catalog(repo_root / "docs")
     card_routes = {model.docs_page for model in catalog}
     reference_guides = {
-        "diffusion/flux3-image-klein.mdx": "diffusion/black-forest-labs/flux-3-image-klein-base",
-        "llm/step-5-preview.mdx": "large-language-models/stepfun-ai/Step-5-Preview",
-        "vlm/muse-spark-open.mdx": "vision-language-models/meta-models/Muse-Spark-open-816B-A42B",
-        "vlm/step-5-preview.mdx": "vision-language-models/stepfun-ai/Step-5-Preview",
+        "diffusion/flux3-image-klein.mdx": "recipes-e2e-examples/model-reference-guides/flux3-image-klein",
+        "llm/step-5-preview.mdx": "model-coverage/large-language-models/stepfun-ai/Step-5-Preview",
+        "vlm/muse-spark-open.mdx": "recipes-e2e-examples/muse-spark-open",
+        "vlm/step-5-preview.mdx": "model-coverage/vision-language-models/stepfun-ai/Step-5-Preview",
     }
     for path, slug in reference_guides.items():
         guide = repo_root / "docs" / "guides" / path
-        route = "/model-coverage/" + slug
+        route = "/" + slug
         assert _frontmatter_slug(guide) == route.removeprefix("/")
         assert route in routes
         assert route not in card_routes
-        assert "implementation PRs are pending merge" in guide.read_text(encoding="utf-8")
+
+    # Muse's published coverage route now belongs to its recipe-backed card.
+    muse_route = "/model-coverage/vision-language-models/meta-models/Muse-Spark-open-816B-A42B"
+    assert muse_route in routes
+    assert muse_route in card_routes
+
+
+def _assert_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
+    document = card.read_text(encoding="utf-8")
+    recipe_ids: set[str] = set()
+    for match in re.finditer(
+        r"https://github\.com/NVIDIA-NeMo/Automodel/blob/(?:main|[0-9a-f]{40})/"
+        r"(examples/[A-Za-z0-9_./-]+\.yaml)",
+        document,
+    ):
+        recipe = yaml.safe_load(_read_documented_recipe(repo_root, match[1], match[0]))
+        assert isinstance(recipe, dict), f"{match[1]}: recipe must be a YAML mapping"
+        recipe_ids.update(_iter_pretrained_model_ids(recipe.get("model", {})))
+    metadata = yaml.safe_load(document.split("---", 2)[1])
+    title = metadata["title"].split("/")[-1]
+    if recipe_ids:
+        names = {model_id.split("/", 1)[1] for model_id in recipe_ids}
+        assert title in names, f"{card}: title {title!r} must match a linked recipe model ID: {sorted(recipe_ids)}"
+    else:
+        # Reference-only cards identify the checkpoint in their first HF model link.
+        hf_ids = re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document)
+        assert hf_ids, f"{card}: reference card must link its Hugging Face checkpoint"
+        assert title == hf_ids[0].split("/", 1)[1], f"{card}: title must match the primary HF checkpoint"
+        recipe_ids = {hf_ids[0]}
+    filename = title + ".mdx"
+    assert card.name == filename, f"{card}: filename must be {filename!r} for checkpoint {title!r}"
+    matching_ids = {model_id for model_id in recipe_ids if model_id.split("/", 1)[1] == title}
+    assert any(f"https://huggingface.co/{model_id}" in document for model_id in matching_ids), (
+        f"{card}: link the exact Hugging Face checkpoint from the recipe"
+    )
+
+
+def test_step5_card_matches_linked_recipe_identity():
+    repo_root = Path(__file__).parents[3]
+    card = repo_root / "docs/model-coverage/llm/stepfun-ai/Step-5-Preview-BF16.mdx"
+    _assert_model_card_recipe_identity(repo_root, card)
+
+
+@pytest.mark.parametrize(
+    ("title", "filename", "message"),
+    [
+        ("Step-5-Preview", "Step-5-Preview.mdx", "title .* must match a linked recipe model ID"),
+        ("Step-5-Preview-BF16", "Step-5-Preview.mdx", "filename must be 'Step-5-Preview-BF16.mdx'"),
+    ],
+)
+def test_model_card_identity_rejects_recipe_mismatch(tmp_path: Path, title: str, filename: str, message: str):
+    recipe = tmp_path / "examples/llm_finetune/step5.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("model:\n  pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16\n")
+    card = tmp_path / filename
+    card.write_text(
+        f'---\ntitle: "{title}"\n---\n'
+        "[Old checkpoint](https://huggingface.co/stepfun-ai/Step-5-Preview)\n"
+        "[BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)\n"
+        "[SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/step5.yaml)\n"
+    )
+    with pytest.raises(AssertionError, match=message):
+        _assert_model_card_recipe_identity(tmp_path, card)
+
+
+@pytest.mark.parametrize("title,valid", [("Step-5-Preview", True), ("Step-5-Preview-BF16", False)])
+def test_reference_card_identifies_fp8_checkpoint_without_bf16_recipe(tmp_path: Path, title: str, valid: bool):
+    card = tmp_path / "Step-5-Preview.mdx"
+    card.write_text(
+        f'---\ntitle: "{title}"\n---\n'
+        "[FP8](https://huggingface.co/stepfun-ai/Step-5-Preview)\n"
+        "[BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)\n"
+    )
+    if valid:
+        _assert_model_card_recipe_identity(tmp_path, card)
+    else:
+        with pytest.raises(AssertionError, match="primary HF checkpoint"):
+            _assert_model_card_recipe_identity(tmp_path, card)
 
 
 def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     repo_root = Path(__file__).parents[3]
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
+    redirects = {item["source"]: item["destination"] for item in docs_config["redirects"]}
     assert docs_config.get("theme", {}).get("sidebar") == "default", "Provider icons require the default sidebar"
     assert docs_config.get("layout", {}).get("breadcrumbs", {}).get("current-page") is True
     config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
@@ -557,7 +667,10 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                 index_document = index_path.read_text(encoding="utf-8")
                 for label, href in re.findall(r"^- \[`([^`]+)`\]\(([^)]+)\)$", index_document, re.MULTILINE):
                     checkpoint_name = href.rstrip("/").rsplit("/", 1)[-1]
-                    if label.casefold() != checkpoint_name.casefold():
+                    # A corrected checkpoint name can redirect to its stable published URL.
+                    label_route = href.rsplit("/", 1)[0] + "/" + label
+                    declared_alias = redirects.get("/nemo/automodel" + label_route) == "/nemo/automodel" + href
+                    if label.casefold() != checkpoint_name.casefold() and not declared_alias:
                         offenders.append(
                             f"{provider_slug}: provider index label {label!r} does not match {checkpoint_name!r}"
                         )
@@ -597,6 +710,13 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                     offenders.append(f"{path}: invalid model route {frontmatter_slug!r}")
                     continue
                 model_id = frontmatter_slug.rsplit("/", 1)[1]
+                document = model_path.read_text(encoding="utf-8")
+                title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
+                if title_match is not None:
+                    corrected_name = title_match.group(1)
+                    corrected_route = frontmatter_slug.rsplit("/", 1)[0] + "/" + corrected_name
+                    if redirects.get("/nemo/automodel/" + corrected_route) == "/nemo/automodel/" + frontmatter_slug:
+                        model_id = corrected_name
                 sidebar_label = page.get("page")
                 if not isinstance(sidebar_label, str) or not sidebar_label:
                     offenders.append(f"{path}: model entry has no sidebar label")
@@ -684,30 +804,25 @@ def test_model_card_descriptions_meet_seo_contract():
     assert not offenders, "Invalid model-card descriptions:\n" + "\n".join(f"  - {item}" for item in offenders)
 
 
-def _read_documented_recipe(repo_root: Path, recipe_path: str, document: str) -> str:
-    """Read the recipe at its documented commit, or from the current checkout."""
-    permalink = re.search(
-        rf"https://github\.com/NVIDIA-NeMo/Automodel/blob/([0-9a-f]{{40}})/{re.escape(recipe_path)}(?=[)#?])",
-        document,
-    )
-    if permalink:
-        url = f"https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/{permalink.group(1)}/{recipe_path}"
-        with urllib.request.urlopen(url, timeout=10) as response:
-            return response.read().decode("utf-8")
-    return (repo_root / recipe_path).read_text(encoding="utf-8")
-
-
 def test_documented_recipe_reads_current_checkout(tmp_path):
     recipe = tmp_path / "recipe.yaml"
     recipe.write_text("model: {}\n", encoding="utf-8")
     assert _read_documented_recipe(tmp_path, "recipe.yaml", "") == "model: {}\n"
 
 
-def test_documented_recipe_reads_permalink_instead_of_current_checkout(tmp_path, monkeypatch):
+def test_documented_recipe_rejects_permalink_for_checked_in_recipe(tmp_path):
     revision = "a" * 40
     recipe_path = "examples/model.yaml"
     (tmp_path / "examples").mkdir()
-    (tmp_path / recipe_path).write_text("current checkout", encoding="utf-8")
+    (tmp_path / recipe_path).write_text("model: {}\n", encoding="utf-8")
+    document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/{recipe_path})"
+    with pytest.raises(ValueError, match="replace its commit permalink with.*blob/main/examples/model.yaml"):
+        _read_documented_recipe(tmp_path, recipe_path, document)
+
+
+def test_documented_recipe_reads_permalink_when_absent_from_checkout(tmp_path, monkeypatch):
+    revision = "a" * 40
+    recipe_path = "examples/model.yaml"
     document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/{recipe_path})"
 
     def open_recipe(url, *, timeout):
@@ -753,8 +868,7 @@ def test_local_checkpoint_override(value, document, expected):
     assert _is_local_checkpoint_override(value, document) is expected
 
 
-def test_model_card_commands_use_checked_in_recipes():
-    repo_root = Path(__file__).parents[3]
+def _model_card_command_violations(repo_root: Path) -> list[str]:
     offenders: list[str] = []
 
     for path in _model_card_paths(repo_root):
@@ -792,10 +906,12 @@ def test_model_card_commands_use_checked_in_recipes():
                 continue
             try:
                 recipe_source = _read_documented_recipe(repo_root, recipe_paths[0], document)
-            except OSError as error:
+                recipe = yaml.safe_load(recipe_source)
+                if not isinstance(recipe, dict):
+                    raise ValueError("Recipe must be a YAML mapping")
+            except (OSError, ValueError, yaml.YAMLError) as error:
                 offenders.append(f"{path.relative_to(repo_root)}: cannot read recipe {recipe_paths[0]}: {error}")
                 continue
-            recipe = yaml.safe_load(recipe_source)
             recipe_model_ids = _iter_pretrained_model_ids(recipe.get("model", {}))
             documented_model_ids_by_case = {model_id.casefold() for model_id in documented_model_ids}
             recipe_model_ids_by_case = {model_id.casefold() for model_id in recipe_model_ids}
@@ -806,6 +922,11 @@ def test_model_card_commands_use_checked_in_recipes():
                     f"{', '.join(sorted(documented_model_ids)) or 'no Hugging Face model IDs'}"
                 )
 
+    return offenders
+
+
+def test_model_card_commands_use_checked_in_recipes():
+    offenders = _model_card_command_violations(Path(__file__).parents[3])
     assert not offenders, "Invalid model-card commands:\n" + "\n".join(f"  - {item}" for item in offenders)
 
 
@@ -1089,6 +1210,38 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     assert "| `TestDiffusionTransformer` | Hugging Face | `diffusers` |" in registry
     assert _sync_tables(tmp_path, check=True, validate_model_cards=False) == []
 
+    # A newly published card must enter every table before a recipe is merged.
+    new_card = tmp_path / "docs/model-coverage/llm/org/new.mdx"
+    new_card.parent.mkdir(parents=True)
+    new_card.write_text(
+        '---\ntitle: "New"\nslug: model-coverage/large-language-models/org/new\n---\n'
+        "[org/new](https://huggingface.co/org/new)\n"
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", str(new_card)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "publish new model card",
+            "--date=2026-10-15T12:00:00Z",
+        ],
+        check=True,
+        env={**os.environ, "GIT_COMMITTER_DATE": "2026-10-15T12:00:00Z"},
+    )
+    generated = _generate_tables(tmp_path, validate_model_cards=False)
+    for relative in ("docs/index.mdx", "docs/model-coverage/latest-models.mdx", "docs/model-coverage/llm/index.mdx"):
+        rows = [line for line in generated[tmp_path / relative].splitlines() if line.startswith("| 2026-")]
+        assert "[New](/model-coverage/large-language-models/org/new)" in rows[0]
+        assert "2026-10-15" in rows[0]
+        assert rows[0].endswith("|  |")
+
 
 def test_model_release_uses_first_recipe_addition_date(tmp_path):
     subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
@@ -1293,3 +1446,143 @@ def test_dated_support_tables_must_be_generated(tmp_path, table_header):
     manual_path.write_text(f"{table_header}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="manual.mdx"):
         _validate_dated_support_tables_are_generated(tmp_path)
+
+
+def test_recipe_pr_requires_main_links_when_its_recipe_arrives(tmp_path, monkeypatch):
+    from tests.ci_tests.utils import sync_model_coverage_tables as coverage
+
+    recipe_path = "examples/llm_finetune/new.yaml"
+    permalink = f"https://github.com/NVIDIA-NeMo/Automodel/blob/{'b' * 40}/{recipe_path}"
+    main_url = f"{coverage.REPOSITORY_URL}/{recipe_path}"
+    document = f"[Recipe]({permalink})\n"
+    monkeypatch.setattr(
+        coverage, "_read_remote_recipe", lambda url: "model: {pretrained_model_name_or_path: org/new}\n"
+    )
+    # The docs PR can publish a validated recipe from another PR.
+    assert coverage._validate_recipe_links(tmp_path, document) == permalink
+    with pytest.raises(ValueError, match="recipe is missing"):
+        coverage._validate_recipe_links(tmp_path, document + f"[Main]({main_url})")
+
+    # The implementation PR contains the recipe, so it must fix every pinned link.
+    local_recipe = tmp_path / recipe_path
+    local_recipe.parent.mkdir(parents=True)
+    local_recipe.write_text("model: {pretrained_model_name_or_path: org/new}\n")
+
+    def unexpected_remote(url):
+        pytest.fail("A checked-in recipe must never be read from a permalink")
+
+    monkeypatch.setattr(coverage, "_read_remote_recipe", unexpected_remote)
+    with pytest.raises(ValueError, match="exists in this checkout"):
+        coverage._validate_recipe_links(tmp_path, document)
+    # Adding a main link does not excuse a leftover permalink in the same card.
+    with pytest.raises(ValueError, match="exists in this checkout"):
+        coverage._validate_recipe_links(tmp_path, document + f"[Main]({main_url})")
+    assert coverage._validate_recipe_links(tmp_path, document.replace(permalink, main_url)) == main_url
+
+
+@pytest.mark.parametrize("source", ["[", "[]"])
+def test_linked_recipe_yaml_is_validated(tmp_path, monkeypatch, source):
+    from tests.ci_tests.utils import sync_model_coverage_tables as coverage
+
+    document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'c' * 40}/examples/new.yaml)"
+    monkeypatch.setattr(coverage, "_read_remote_recipe", lambda url: source)
+    with pytest.raises(ValueError, match="Invalid recipe links"):
+        coverage._validate_recipe_links(tmp_path, document)
+
+
+def test_missing_permalink_target_fails(tmp_path, monkeypatch):
+    from urllib.error import HTTPError
+
+    from tests.ci_tests.utils import sync_model_coverage_tables as coverage
+
+    document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'d' * 40}/examples/missing.yaml)"
+
+    def missing(url):
+        raise HTTPError(url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(coverage, "_read_remote_recipe", missing)
+    with pytest.raises(ValueError, match="404"):
+        coverage._validate_recipe_links(tmp_path, document)
+
+
+def test_recent_support_uses_permalink_for_documented_card(tmp_path, monkeypatch):
+    from tests.ci_tests.utils import sync_model_coverage_tables as coverage
+
+    model = coverage._ModelDoc("LLM", "/models/new", (), "New", "docs/model-coverage/llm/org/new.mdx")
+    recipe_url = f"https://github.com/NVIDIA-NeMo/Automodel/blob/{'a' * 40}/examples/llm_finetune/new.yaml"
+    monkeypatch.setattr(coverage, "_load_file_addition_date", lambda root, path: "2026-10-15")
+    old_releases = [
+        coverage._ModelRelease("2026-10-01", f"org/old-{i}", f"/models/old-{i}", "LLM", f"examples/old-{i}.yaml")
+        for i in range(10)
+    ]
+    entries = coverage._collect_support_entries(tmp_path, old_releases, [model], {model.docs_page: recipe_url})
+    for output in (
+        coverage._render_homepage_table(entries),
+        coverage._render_support_log_table(entries),
+        coverage._render_support_log_table(entries, include_type=False),
+    ):
+        assert "[New](/models/new)" in output
+        assert f"[recipe]({recipe_url})" in output
+    assert coverage._render_homepage_table(entries).count("| 2026-") == 10
+    assert coverage._render_support_log_table(entries).count("| 2026-") == 11
+    assert entries[0].date == "2026-10-15"
+
+    merged = coverage._ModelRelease("2026-10-16", "org/new", model.docs_page, "LLM", "examples/llm_finetune/new.yaml")
+    after = coverage._collect_support_entries(tmp_path, [*old_releases, merged], [model], {})
+    assert len(after) == len(entries)
+    assert "/blob/main/examples/llm_finetune/new.yaml" in after[0].recipe_link
+
+    without_recipe = coverage._collect_support_entries(tmp_path, old_releases, [model], {})
+    assert without_recipe[0].recipe_link == ""
+
+
+def test_recipe_link_errors_include_every_link_and_catalog_card(tmp_path):
+    from tests.ci_tests.utils import sync_model_coverage_tables as coverage
+
+    models = []
+    source_paths = ["docs/model-coverage/llm/first.mdx", "docs/model-coverage/llm/second.mdx"]
+    expected = []
+    for index, source_path in enumerate(source_paths):
+        path = tmp_path / source_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        links = []
+        for suffix in ("a", "b"):
+            recipe_path = f"examples/model_{index}_{suffix}.yaml"
+            recipe = tmp_path / recipe_path
+            recipe.parent.mkdir(parents=True, exist_ok=True)
+            recipe.write_text("model: {}\n")
+            links.append(f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'a' * 40}/{recipe_path})")
+            expected.append(recipe_path)
+        path.write_text("\n".join(links))
+        models.append(coverage._ModelDoc("LLM", f"/models/{index}", (), "Model", source_path))
+
+    with pytest.raises(ValueError) as caught:
+        coverage._collect_documented_recipe_urls(tmp_path, models)
+
+    message = str(caught.value)
+    for source_path in source_paths:
+        assert source_path in message
+    for recipe_path in expected:
+        assert f"replace its commit permalink with {coverage.REPOSITORY_URL}/{recipe_path}" in message
+
+
+def test_command_validation_collects_link_and_yaml_errors_across_cards(tmp_path):
+    recipe_sources = {"pinned": "model: {}\n", "syntax": "[", "mapping": "[]"}
+    for name, source in recipe_sources.items():
+        recipe = tmp_path / "examples" / f"{name}.yaml"
+        recipe.parent.mkdir(parents=True, exist_ok=True)
+        recipe.write_text(source)
+    for name in [*recipe_sources, "missing"]:
+        card = tmp_path / "docs" / "model-coverage" / "llm" / "test" / f"{name}.mdx"
+        card.parent.mkdir(parents=True, exist_ok=True)
+        revision = "a" * 40 if name == "pinned" else "main"
+        card.write_text(
+            f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/examples/{name}.yaml)\n"
+            f"```bash\nuv run automodel -c examples/{name}.yaml\n```\n"
+        )
+
+    offenders = _model_card_command_violations(tmp_path)
+
+    assert len(offenders) == 4
+    for name in [*recipe_sources, "missing"]:
+        assert any(f"{name}.mdx: cannot read recipe examples/{name}.yaml:" in item for item in offenders)

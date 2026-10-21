@@ -36,10 +36,9 @@ _DOC_ARCH_ALIASES = {
     # HF upstream renamed ``Gemma3nForConditionalGeneration`` between releases;
     # the "Gemma 3n" variant is covered on the Gemma 3 VL page.
     "Gemma3nForConditionalGeneration": "Gemma 3n",
-    # Checkpoint-facing alias of ``KimiK25VLForConditionalGeneration``, covered
-    # by the Kimi-VL page.
-    "KimiK25ForConditionalGeneration": "Kimi-K25-VL",
-    "KimiK25VLForConditionalGeneration": "Kimi-K25-VL",
+    # The Kimi-K2.5 card uses the checkpoint-facing architecture name;
+    # the registry also accepts the internal implementation class name.
+    "KimiK25VLForConditionalGeneration": "KimiK25ForConditionalGeneration",
     # Retrieval/bi-encoder variants of Llama, covered on the GritLM page.
     "LlamaBidirectionalForSequenceClassification": "GritLM",
     "LlamaBidirectionalModel": "GritLM",

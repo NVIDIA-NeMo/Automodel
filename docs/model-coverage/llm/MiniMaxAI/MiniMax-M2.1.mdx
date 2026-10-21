@@ -1,7 +1,7 @@
 ---
 title: "MiniMaxAI/MiniMax-M2.1"
 description: "Fine-tune MiniMaxAI/MiniMax-M2.1 on HellaSwag with NeMo AutoModel using the eight-node recipe with pipeline and expert parallelism."
-slug: model-coverage/large-language-models/minimax/MiniMax-M2.1
+slug: model-coverage/large-language-models/MiniMaxAI/MiniMax-M2.1
 ---
 
 [MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1) is MiniMax's mixture-of-experts (MoE) language model. Use the recipe below to fine-tune it on HellaSwag with NeMo AutoModel.
@@ -43,7 +43,7 @@ MiniMax-M2.1 is a mixture-of-experts model for text generation with approximatel
 
 Before launching, use an environment with Transformer Engine (`attn: te`, `linear: te`) and HybridEP (`dispatcher: hybridep`) on every node. Make the same repository checkout and recipe available on every node, and run from the repository root. Each node needs access to the `MiniMaxAI/MiniMax-M2.1` checkpoint and `rowan/hellaswag` dataset, through Hugging Face or a populated local cache.
 
-The [Quick Start recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/c79ba55eb77527138337288220df04bc5939483c/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml#L74-L75) sets `checkpoint.enabled` to `false`, so it does not save checkpoints or trained weights.
+The [Quick Start recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml#L74-L75) sets `checkpoint.enabled` to `false`, so it does not save checkpoints or trained weights.
 
 ## Available Models
 

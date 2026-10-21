@@ -1,0 +1,54 @@
+---
+title: "black-forest-labs/flux-3-image-klein-base"
+description: "Fine-tune black-forest-labs/flux-3-image-klein-base with NeMo AutoModel using the checked-in text-to-image LoRA recipe and documented environment setup."
+slug: model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base
+---
+
+FLUX 3 Image Klein Base is Black Forest Labs' non-distilled image-generation checkpoint. NeMo AutoModel includes a flow-matching LoRA configuration for its image transformer, using Qwen3-VL text conditioning and cached image latents.
+
+## Quick Start
+
+Complete the environment, checkpoint-access, and cache preparation steps in the detailed guide, then launch from the repository root on eight GPUs:
+
+```bash
+uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/flux3_t2i_flow_lora.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | Prepared image-caption cache; 8 data-parallel GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) |
+
+## Model Context
+
+The image transformer uses flow matching with text conditioning derived from selected Qwen3-VL hidden states.
+
+| Property | Value |
+| --- | --- |
+| Task | Text-to-image generation and instruction-based image editing |
+| Architecture | `Flux3Transformer2DModel` |
+| Parameters | 5.6B image-transformer parameters, excluding the text encoder and VAE |
+| Text Encoder | Qwen3-VL-4B; 36 layers in the documented base setup |
+| Hidden Size | 2,560 for the documented text encoder; 20,480 joint conditioning width |
+| Context Length | AutoModel prompt encoding supports up to 8,192 tokens |
+
+The conditioning dimensions and prompt limit follow the repository's [FLUX.3 text encoder](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/flux3/text_encoding.py). The image-transformer parameter count follows the detailed model guide.
+
+### Recipe Setup and Validation Scope
+
+The [detailed guide](/recipes-e2e-examples/model-reference-guides/flux3-image-klein) explains checkpoint access, the required Diffusers revision, offline preprocessing, cache and checkpoint directories, and image editing. Set the recipe's data and checkpoint paths for your environment.
+
+The recorded small-dataset validation used pinned preview weights and a development Diffusers revision. It does not independently validate the published release weights, eight-GPU training, or full-parameter fine-tuning.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [black-forest-labs/flux-3-image-klein-base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base) | Non-distilled base checkpoint |
+
+## Related Resources
+
+- [Detailed FLUX.3 guide](/recipes-e2e-examples/model-reference-guides/flux3-image-klein)
+- [Diffusion fine-tuning](/recipes-e2e-examples/diffusion-fine-tuning)

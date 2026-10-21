@@ -22,7 +22,7 @@ uv run automodel examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Fine-Tuning | MedPix-VQA; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml) |
+| LoRA Fine-Tuning | MedPix-VQA; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml) |
 
 ## Model Context
 
@@ -40,7 +40,7 @@ uv run automodel examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml
 
 ### Recipe Setup
 
-Install the `vlm` extra described in the [installation instructions](/get-started/installation). The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml) uses Fully Sharded Data Parallel 2 (FSDP2), rank-8 LoRA adapters, eager attention, and Adam. It freezes the vision tower and runs for 100 steps using the first 1,000 training examples and 100 validation examples from `mmoukouba/MedPix-VQA`. Checkpoint saving is enabled every 50 steps under `checkpoints/llava_1_5_7b_hf`.
+Install the `vlm` extra described in the [installation instructions](/get-started/installation). The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml) uses Fully Sharded Data Parallel 2 (FSDP2), rank-8 LoRA adapters, eager attention, and Adam. It freezes the vision tower and runs for 100 steps using the first 1,000 training examples and 100 validation examples from `mmoukouba/MedPix-VQA`. Checkpoint saving is enabled every 50 steps under `checkpoints/llava_1_5_7b_hf`.
 
 ## Available Models
 

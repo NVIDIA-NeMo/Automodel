@@ -22,7 +22,7 @@ uv run automodel examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct
 
 | Workflow | Example Setup | Recipe |
 | --- | --- | --- |
-| LoRA Fine-Tuning | MedPix-VQA; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml) |
+| LoRA Fine-Tuning | MedPix-VQA; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml) |
 
 ## Model Context
 
@@ -46,7 +46,7 @@ Llama-4-Scout-17B-16E-Instruct generates text from image and text inputs. The [u
 
 Follow the [installation instructions](/get-started/installation), including the VLM dependencies. Request access to the [Hugging Face checkpoint](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) and wait for approval. Authenticate the training environment with a token from the approved account that can read the checkpoint, for example by setting `HF_TOKEN`.
 
-The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml) loads pretrained weights for LoRA fine-tuning on 1,000 MedPix-VQA training examples and 100 validation examples. It saves checkpoints under `checkpoints/llama_4_scout_17b_16e_instruct`.
+The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml) loads pretrained weights for LoRA fine-tuning on 1,000 MedPix-VQA training examples and 100 validation examples. It saves checkpoints under `checkpoints/llama_4_scout_17b_16e_instruct`.
 
 ## Available Models
 

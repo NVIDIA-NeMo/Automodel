@@ -90,14 +90,11 @@ Failures report the file path and line number and exit nonzero.
 
 ### Recipe Removal
 
-Check `nemo_automodel/components/models/deprecation.py` before removing recipes.
-Keep files listed in `_DEPRECATED_MODEL_YAMLS` or `_DEPRECATED_CHECKPOINT_YAMLS`
-and their matching cards until the planned removal. The checkpoint list records
-the approved October 1, 2026 age review: 32 checkpoints dated before October 1,
-2024, including nine dated before October 1, 2023. Dates and sources are recorded
-beside each entry. Checkpoint deprecations do not deprecate newer models sharing
-an architecture, or models using an older checkpoint as a teacher or tokenizer.
-CI checks that every recipe referenced by either list still exists.
+Keep existing example YAMLs when marking a checkpoint deprecated. Use the
+recipe's `ci.deprecated: true` metadata to exclude it from CI scheduling, as
+implemented on `main`. Generated support tables also exclude deprecated recipes.
+Runtime architecture deprecation warnings continue to
+reference `_DEPRECATED_MODEL_YAMLS`; CI verifies those recipes remain available.
 
 When removing a recipe, update cards that reference it in the same PR. If another
 checked-in recipe still targets that exact checkpoint, update Quick Start and
@@ -135,11 +132,9 @@ PR and nightly recipe scopes use explicit recipe lists. Enroll a validated recip
 removing its exemption and adding it to the intended lists as needed. Keep the
 recipe's owner and resource metadata so that enrollment is reviewable.
 
-Recipes for the age-deprecated checkpoints in `deprecation.py` are exempt through
-the existing `override_recipes.yml` files in every CI scope. Keep those exemptions
-until the recipes are removed. Diffusion recipes retain their existing CI coverage.
-When exemptions remove every recipe from an enrolled scope, the generated child
-pipeline emits a short completion job without a GPU launch.
+Recipes with `ci.deprecated: true` remain checked in and are excluded from
+all CI scopes by the shared recipe generator. Diffusion recipes retain their
+existing CI coverage.
 
 CI verifies these deterministic contracts. Authors must also verify source facts,
 backend dependencies, data preparation, and GPU training before claiming a recipe

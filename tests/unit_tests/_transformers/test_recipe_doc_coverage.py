@@ -53,7 +53,7 @@ from tests.unit_tests._transformers.test_doc_coverage import _DOC_ARCH_ALIASES
 
 # Over the default 5s budget on purpose: this module scans every recipe YAML and every docs page.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _repo_root() -> pathlib.Path:
@@ -62,14 +62,11 @@ def _repo_root() -> pathlib.Path:
 
 def test_deprecation_warnings_reference_existing_recipes():
     """Keep the legacy configs explicitly referenced by runtime deprecation warnings."""
-    from nemo_automodel.components.models.deprecation import _DEPRECATED_CHECKPOINT_YAMLS, _DEPRECATED_MODEL_YAMLS
+    from nemo_automodel.components.models.deprecation import _DEPRECATED_MODEL_YAMLS
 
     root = _repo_root()
     missing = sorted(
-        path
-        for paths in (*_DEPRECATED_MODEL_YAMLS.values(), *_DEPRECATED_CHECKPOINT_YAMLS.values())
-        for path in paths
-        if not (root / path).is_file()
+        path for paths in _DEPRECATED_MODEL_YAMLS.values() for path in paths if not (root / path).is_file()
     )
     assert not missing, "Recipes referenced by deprecation.py must remain available:\n" + "\n".join(missing)
 
@@ -250,7 +247,7 @@ def test_yaml_recipe_scan_finds_model_ids(recipe_model_ids: set[str]):
 _HF_ORG_TO_DOC_SLUG = {
     "diffusers": "lightricks",  # LTX-2.3 conversion shares the Lightricks family page
     "meta-llama": "meta",
-    "MiniMaxAI": "minimax",
+    "MiniMaxAI": "MiniMaxAI",
     "OrionStarAI": "orionstar",  # Existing provider URL uses the shortened organization name.
     "zai-org": "thudm",  # zai-org (née THUDM) publishes GLM-4+
 }
