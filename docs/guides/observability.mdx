@@ -5,7 +5,7 @@ position: 6
 ---
 
 NeMo AutoModel can export OpenTelemetry spans and metrics through the optional
-[nemo-lens](https://github.com/NVIDIA-NeMo/Lens) package. They describe how a job runs: how long it
+[NeMo Lens](https://github.com/NVIDIA-NeMo/Lens) package. They describe how a job runs: how long it
 spends loading the model, waiting for data, running each optimizer step, evaluating, and reading and
 writing checkpoints, measured separately on every rank.
 
@@ -27,6 +27,7 @@ The NeMo AutoModel container already includes it.
 The extra pins nemo-lens to a Git commit through `[tool.uv.sources]`. A plain `pip install
 "nemo-automodel[telemetry]"` ignores that pin and resolves nemo-lens from PyPI, whose only release
 does not support this version of NeMo AutoModel. Install the extra with `uv`.
+
 </Note>
 
 Without the extra, every instrumentation site is inert and NeMo AutoModel runs unchanged.
@@ -111,9 +112,9 @@ The presets are:
 
 - `default`: `model_init`, `load_checkpoint`, `checkpoint`, `evaluate`, and `first_iteration`. These
   groups record a bounded number of spans per job.
-- `per_step`: everything in `default` plus `step`, `forward_backward`, `optimizer`, and
+- `per_step`: Everything in `default` plus `step`, `forward_backward`, `optimizer`, and
   `data_loading`.
-- `all`: every registered group.
+- `all`: Every registered group.
 
 The asynchronous checkpoint wait spans appear only while an asynchronous save is in flight.
 
