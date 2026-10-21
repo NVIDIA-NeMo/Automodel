@@ -1,15 +1,14 @@
-# Train Nemotron 3.5 Embedding and Reranking Models
+# Train Nemotron 3.5 8B Embedding and Reranking Models
 
-Use NeMo AutoModel retrieval recipes for multimodal embedding training,
-embedding distillation, or reranker training. Each example accepts text queries
-paired with documents containing an image, text, or both.
+Use NeMo AutoModel retrieval recipes to train the Nemotron 3.5 8B embedding and
+reranking models. Each example accepts text queries paired with documents
+containing an image, text, or both.
 
 Choose the configuration for your model and training stage:
 
 | Model | Configuration | Training Stage |
 | --- | --- | --- |
 | [Nemotron-3.5-Embed-8B-BF16](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16) | [embed_8b_multimodal.yaml](embed_8b_multimodal.yaml) | Contrastive training of the vision encoder and projector with a frozen language model |
-| [Nemotron-3.5-Embed-1B-BF16](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16) | [embed_1b_distill.yaml](embed_1b_distill.yaml) | Distillation from Embed 8B with cosine/MSE losses and a frozen student language model |
 | [Nemotron-3.5-Rerank-8B-BF16](https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16) | [rerank_8b_multimodal.yaml](rerank_8b_multimodal.yaml) | Multimodal training from a text-trained reranker, updating all parameters with listwise cross-entropy |
 
 These are representative stage examples. The model cards document the released
@@ -17,28 +16,18 @@ models' training methods and data sources. The
 [Nemotron-3-Embed-8B dataset overview](https://huggingface.co/nvidia/Nemotron-3-Embed-8B-BF16#dataset-overview)
 describes the earlier text training.
 
-> [!IMPORTANT]
-> The Embed 1B distillation example requires an update to AutoModel's student and
-> teacher wrappers to read `text_config.hidden_size` for Mistral3 checkpoints.
-> The current wrappers read `config.hidden_size` and fail during model construction.
-
 ## Prepare the Starting Checkpoint
 
 Follow the [installation guide](../../../docs/guides/installation.mdx), including
 vision dependencies, Transformer Engine, and FlashAttention 2. The launch command
 below uses eight NVIDIA GPUs with BF16 support on one node. Memory requirements
-depend on the model and document lengths. Distillation loads both the student and
-teacher.
+depend on the model and document lengths.
 
 Provide a local Hugging Face checkpoint with its configuration, weights, tokenizer,
 and image processor. Select the initialization for the stage:
 
 - **Embed 8B:** A prepared Mistral3 multimodal checkpoint with the Nemotron-3-Embed-8B
   language model and a compatible vision encoder and projector, as described in the model card.
-- **Embed 1B:** A prepared Mistral3 multimodal student with the Nemotron-3-Embed-1B
-  language model. The configuration loads the released Embed 8B teacher and learns
-  a projection from the student's 2,048 dimensions to the teacher's 4,096 dimensions.
-  Student and teacher must use compatible token IDs and image preprocessing.
 - **Rerank 8B:** A complete Mistral3 reranker checkpoint from text training,
   including the trained scoring head, vision encoder, and projector.
 
@@ -88,8 +77,6 @@ Training runs for one epoch using FSDP2 with BF16 model storage and compute.
 Transformer Engine FusedAdam uses AdamW mode with FP32 master weights.
 Under `checkpoint.checkpoint_dir`, check `training.jsonl` for finite losses and
 advancing steps. The final checkpoint contains the model in `model/consolidated`.
-Distillation exports the student encoder there and saves its training projection
-separately as `projection.pt` in the epoch checkpoint directory.
 
 Adjust the learning rate, schedule, batch sizes, and sequence lengths for your data
 and hardware. Keep `global_batch_size` divisible by `local_batch_size` times the

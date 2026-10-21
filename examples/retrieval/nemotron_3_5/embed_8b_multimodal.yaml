@@ -35,7 +35,6 @@ model:
 
 freeze_config:
   freeze_vision_tower: false
-  freeze_multimodal_projector: false
   freeze_language_model: true
 
 tokenizer:

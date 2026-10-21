@@ -41,7 +41,6 @@ model:
 # Full-model multimodal training, following the representative cross-encoder config.
 freeze_config:
   freeze_vision_tower: false
-  freeze_multimodal_projector: false
   freeze_language_model: false
 
 tokenizer:
