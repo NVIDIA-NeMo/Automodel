@@ -116,10 +116,10 @@ error is `4.8910178` and the mean absolute logit error is `0.0071718`.
 
 | Workflow | Recipe | Configuration |
 | --- | --- | --- |
-| Full-parameter text SFT | [flint_tulu3_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/3be365655737ab23e29d1086d181d8facabc1fd5/examples/llm_finetune/flint/flint_tulu3_sft.yaml) | 100 steps, 4K chat data, TE attention, EP2, FP32 master parameters |
-| Attention and expert LoRA | [flint_tulu3_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/3be365655737ab23e29d1086d181d8facabc1fd5/examples/llm_finetune/flint/flint_tulu3_lora.yaml) | 100 steps, 4K chat data, TE attention, EP2, frozen base weights |
-| Packed long-context training | [flint_tulu3_packed128k_te.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/3be365655737ab23e29d1086d181d8facabc1fd5/examples/llm_finetune/flint/flint_tulu3_packed128k_te.yaml) | 50 steps, 128K packed data, TE attention, CP4/EP4 |
-| Packed long-context training, H100 | [flint_tulu3_packed128k_magi_h100.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/3be365655737ab23e29d1086d181d8facabc1fd5/examples/llm_finetune/flint/flint_tulu3_packed128k_magi_h100.yaml) | 100 steps, 128K on-the-fly packed data, MagiAttention, CP8/EP8 on one node |
+| Full-parameter text SFT | [flint_tulu3_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_sft.yaml) | 100 steps, 4K chat data, TE attention, EP2, FP32 master parameters |
+| Attention and expert LoRA | [flint_tulu3_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_lora.yaml) | 100 steps, 4K chat data, TE attention, EP2, frozen base weights |
+| Packed long-context training | [flint_tulu3_packed128k_te.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_packed128k_te.yaml) | 50 steps, 128K packed data, TE attention, CP4/EP4 |
+| Packed long-context training, H100 | [flint_tulu3_packed128k_magi_h100.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_packed128k_magi_h100.yaml) | 100 steps, 128K on-the-fly packed data, MagiAttention, CP8/EP8 on one node |
 
 All recipes use BF16 computation with FP32 sinks and output head, and keep
 `checkpoint.cpu_offload: false`; that flag changes only where checkpoint
