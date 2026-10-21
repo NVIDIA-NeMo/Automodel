@@ -424,6 +424,35 @@ class TestCustomModelGenerationConfig:
         assert model.config.eos_token_id is None
         assert model.generation_config.eos_token_id is None
 
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_config_object_override_provenance_survives_legacy_fallback(
+        self, mock_resolve_cls, _mock_download, tmp_path
+    ):
+        """A public from_config override must win over eos_token_id in a legacy config.json."""
+        import json
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "llama", "architectures": ["SomeModel"], "eos_token_id": 2})
+        )
+        mock_resolve_cls.return_value = self._FakeModel
+        config = PretrainedConfig(architectures=["SomeModel"], eos_token_id=None)
+        config.name_or_path = str(tmp_path)
+
+        _, model = _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config=config,
+            attn_implementation="sdpa",
+            torch_dtype=torch.float32,
+            quantization_config=None,
+            force_hf=False,
+            _load_base_model=True,
+            _config_overrides={"eos_token_id"},
+        )
+
+        assert model.config.eos_token_id is None
+        assert model.generation_config.eos_token_id is None
+
     @patch("nemo_automodel._transformers.model_init.get_hf_config")
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
