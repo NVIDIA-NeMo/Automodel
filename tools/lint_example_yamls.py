@@ -141,14 +141,15 @@ def _lint_ci_cluster_tag(path: Path, data: dict, key_lines: list[tuple[str, int]
     """Require an explicit GPU tag unless the recipe is marked deprecated."""
     ci = data.get("ci")
     if isinstance(ci, dict):
-        cluster_tag = ci.get("cluster_tag")
-        if ci.get("deprecated") is True or (isinstance(cluster_tag, str) and cluster_tag.strip()):
+        tags = (ci.get("cluster_tag"), ci.get("device_tag"))
+        if ci.get("deprecated") is True or any(isinstance(tag, str) and tag.strip() for tag in tags):
             return []
     return [
         LintError(
             path,
             dict(key_lines).get("ci", 1),
-            "Recipe must declare a nonempty `ci.cluster_tag` (e.g. h100, gb200, gb10) or `ci.deprecated: true`.",
+            "Recipe must declare a nonempty `ci.cluster_tag` or `ci.device_tag` "
+            "(e.g. h100, gb200, gb10), or `ci.deprecated: true`.",
         )
     ]
 

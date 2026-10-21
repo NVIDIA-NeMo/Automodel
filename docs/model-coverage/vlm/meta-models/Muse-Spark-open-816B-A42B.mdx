@@ -1,0 +1,52 @@
+---
+title: "meta-models/Muse-Spark-open-816B-A42B"
+description: "Fine-tune meta-models/Muse-Spark-open-816B-A42B with NeMo AutoModel using a checked-in recipe and documented distributed setup."
+slug: model-coverage/vision-language-models/meta-models/Muse-Spark-open-816B-A42B
+---
+
+Muse Spark Open is a multimodal mixture-of-experts model. NeMo AutoModel provides image-text fine-tuning and packed text recipes with expert parallelism and a native checkpoint adapter.
+
+## Quick Start
+
+Follow [installation](/get-started/installation) and the [Muse Spark guide](/recipes-e2e-examples/muse-spark-open). Allocate eight nodes with four GB200 GPUs each. Set `NODE_RANK` from 0 through 7 and `MASTER_ADDR` to node 0. From the repository root on every node, launch MedPix LoRA training:
+
+```bash
+uv run torchrun --nnodes 8 --nproc-per-node 4 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_lora_ep32.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| LoRA Fine-Tuning | MedPix; 8 nodes x 4 GB200; EP32 | GB200 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_lora_ep32.yaml) |
+
+## Model Context
+
+Muse Spark Open combines a mixture-of-experts language backbone with vision and audio modules. The checked-in recipes cover text and image-text training.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| Architecture | `MuseSparkForConditionalGeneration`, `MuseSpark1xOmniForCausalLM` |
+| Parameters | Approximately 816B language backbone; 42B active per token |
+| Decoder Layers | 62 |
+| Hidden Size | 8,192 |
+| Attention | 128 query heads; 16 key-value heads; head dimension 64 |
+| Experts | 256 routed experts; 8 selected per token |
+
+### Recipe Setup
+
+The [detailed guide](/recipes-e2e-examples/muse-spark-open) covers model and dataset staging, full image-text SFT, packed 128K text training, precision, and checkpoint options. The LoRA recipe disables checkpoint writing by default. Audio and video training are outside these example recipes' scope.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [meta-models/Muse-Spark-open-816B-A42B](https://huggingface.co/meta-models/Muse-Spark-open-816B-A42B) | Pretrained checkpoint |
+
+## Related Resources
+
+- [Detailed Model Guide](/recipes-e2e-examples/muse-spark-open)
+- [Installation](/get-started/installation)

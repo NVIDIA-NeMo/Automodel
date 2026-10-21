@@ -25,6 +25,65 @@ import yaml
 _WORKFLOWS = Path(__file__).resolve().parents[3] / ".github/workflows"
 
 
+def test_preview_generates_tables_without_publishing_credentials() -> None:
+    workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
+    generation = workflow["jobs"]["generate-tables"]
+    publishing = workflow["jobs"]["preview"]
+    assert generation["permissions"] == {"contents": "read"}
+    assert "secrets." not in yaml.safe_dump(generation)
+    checkout = next(step for step in generation["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    assert checkout["with"]["persist-credentials"] is False
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
+    assert "generate-tables" in publishing["needs"]
+    assert "sync_model_coverage_tables.py" not in yaml.safe_dump(publishing)
+    upload = next(step for step in generation["steps"] if step["name"] == "Upload generated Markdown tables")
+    download = next(step for step in publishing["steps"] if step["name"] == "Download generated Markdown tables")
+    assert upload["with"]["name"] == download["with"]["name"] == "model-coverage-${{ github.sha }}"
+
+
+@pytest.mark.parametrize("invalid", [None, "missing", "artifact-symlink", "docs-symlink"])
+def test_preview_restores_only_generated_markdown(tmp_path: Path, invalid: str | None) -> None:
+    workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
+    upload = next(
+        step
+        for step in workflow["jobs"]["generate-tables"]["steps"]
+        if step["name"] == "Upload generated Markdown tables"
+    )
+    restore = next(
+        step for step in workflow["jobs"]["preview"]["steps"] if step["name"] == "Restore generated Markdown tables"
+    )
+    artifact = tmp_path / "runner/model-coverage"
+    docs = tmp_path / "pr-source/docs"
+    pages = [Path(path).relative_to("docs") for path in upload["with"]["path"].splitlines()]
+    for page in pages:
+        assert page.suffix == ".mdx" and ".." not in page.parts
+        for root, content in ((artifact, "generated table"), (docs, "original table")):
+            destination = root / page
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content)
+    (artifact / "injected.py").write_text("raise RuntimeError('must not execute')")
+    if invalid == "missing":
+        (artifact / pages[0]).unlink()
+    elif invalid in ("artifact-symlink", "docs-symlink"):
+        root = artifact if invalid == "artifact-symlink" else docs
+        (root / "symlink.mdx").symlink_to(artifact / pages[0])
+
+    result = subprocess.run(
+        ["bash", "-e", "-c", restore["run"]],
+        cwd=tmp_path,
+        env={**os.environ, "RUNNER_TEMP": str(tmp_path / "runner")},
+        capture_output=True,
+        text=True,
+    )
+
+    if invalid:
+        assert result.returncode != 0
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert all((docs / page).read_text() == "generated table" for page in pages)
+    assert not (docs / "injected.py").exists()
+
+
 def _run_pr_navigation(workspace: Path) -> subprocess.CompletedProcess[str]:
     workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
     step = next(
@@ -178,6 +237,105 @@ def test_preview_rejects_unsafe_navigation(tmp_path: Path, proposed: str) -> Non
     assert destination.read_text() == original
     assert "SENTINEL_SECRET" not in result.stdout + result.stderr
     assert not (tmp_path / "injected").exists()
+
+
+@pytest.mark.parametrize("invalid_slug", [False, True])
+def test_preview_navigation_uses_pr_cards_instead_of_retained_fallbacks(tmp_path: Path, invalid_slug: bool) -> None:
+    """Renames and deletions affect navigation even while old pages remain staged."""
+    categories = {
+        "llm": "large-language-models",
+        "vlm": "vision-language-models",
+        "multimodal": "multimodal",
+        "omni": "omni",
+        "dllm": "dllm",
+        "diffusion": "diffusion",
+        "embedding": "embedding-models",
+        "reranker": "reranking-models",
+    }
+    provider = {
+        "section": "Trusted Provider",
+        "slug": "provider",
+        "icon": "trusted-icon",
+        "path": "../../model-coverage/llm/provider/index.mdx",
+        "contents": [
+            {"page": "Model-V1", "path": "../../model-coverage/llm/provider/old-name.mdx"},
+            {"page": "Deleted", "path": "../../model-coverage/llm/provider/deleted.mdx"},
+        ],
+    }
+    navigation = [
+        {"page": "Guide", "path": "../../guides/guide.mdx"},
+        {
+            "section": "Model Coverage",
+            "contents": [
+                {"section": directory, "slug": slug, "contents": [provider] if directory == "llm" else []}
+                for directory, slug in categories.items()
+            ],
+        },
+    ]
+    route = "/nemo/automodel/nightly/model-coverage/large-language-models/provider/Model-V1"
+    unrelated_redirect = {"source": "/old-guide", "destination": "/guide"}
+    config = {"title": "Trusted Site", "redirects": [{"source": route, "destination": "/retired"}, unrelated_redirect]}
+    trusted = {
+        "fern/versions/nightly.yml": yaml.safe_dump({"navigation": navigation}),
+        "fern/docs.yml": yaml.safe_dump(config),
+        "guides/guide.mdx": "Trusted guide",
+        "model-coverage/llm/provider/index.mdx": "Trusted provider index",
+        # The old filename intentionally disagrees with its canonical slug.
+        "model-coverage/llm/provider/old-name.mdx": "---\nslug: model-coverage/large-language-models/provider/Model-V1\n---\nOld card",
+        "model-coverage/llm/provider/deleted.mdx": "---\nslug: model-coverage/large-language-models/provider/deleted\n---\nDeleted card",
+    }
+    slug = "wrong-route" if invalid_slug else route.removeprefix("/nemo/automodel/nightly/")
+    proposed = {
+        "fern/versions/nightly.yml": "PR navigation must not be used",
+        "fern/docs.yml": "PR configuration must not be used",
+        "model-coverage/llm/provider/index.mdx": "Updated provider index",
+        "model-coverage/llm/provider/Model-V1.mdx": f"---\nslug: {slug}\n---\nRenamed card",
+    }
+    for source, files in (("trusted-source", trusted), ("pr-source", proposed)):
+        for name, content in files.items():
+            path = tmp_path / source / "docs" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+
+    workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
+    steps = {step["name"]: step for step in workflow["jobs"]["preview"]["steps"]}
+    env = {**os.environ, "RUNNER_TEMP": str(tmp_path / "runner")}
+    subprocess.run(
+        ["bash", "-e", "-c", steps["Prepare preview docs"]["run"]],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-c", steps["Resolve model card paths in trusted navigation"]["run"]],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if invalid_slug:
+        assert result.returncode != 0
+        assert "Model card filename must match its public checkpoint URL" in result.stderr
+        assert "Model-V1.mdx" in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+
+    preview = tmp_path / "runner/fern-preview/docs"
+    assert (preview / "model-coverage/llm/provider/old-name.mdx").is_file()
+    assert (preview / "model-coverage/llm/provider/deleted.mdx").is_file()
+    actual = yaml.safe_load((preview / "fern/versions/nightly.yml").read_text())["navigation"]
+    assert actual[0] == navigation[0]
+    actual_provider = actual[1]["contents"][0]["contents"][0]
+    assert actual_provider == {
+        **provider,
+        "contents": [{"page": "Model-V1", "path": "../../model-coverage/llm/provider/Model-V1.mdx"}],
+    }
+    assert yaml.safe_load((preview / "fern/docs.yml").read_text()) == {
+        **config,
+        "redirects": [unrelated_redirect],
+    }
 
 
 @pytest.mark.parametrize("job", ["linting", "import_linting", "type_checking"])

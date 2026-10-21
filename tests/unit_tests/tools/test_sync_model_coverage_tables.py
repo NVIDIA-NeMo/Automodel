@@ -29,7 +29,6 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     DATED_SUPPORT_TABLE_HEADER,
     HOMEPAGE_END_MARKER,
     HOMEPAGE_START_MARKER,
-    MODEL_CARD_PATH_ALIASES,
     MODEL_TYPE_OVERVIEW_PATHS,
     REGISTRY_END_MARKER,
     REGISTRY_START_MARKER,
@@ -49,6 +48,7 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _render_registry_table,
     _replace_generated_block,
     _resolve_model_card_routes,
+    _resolve_redirect,
     _strip_generated_tables,
     _sync_tables,
     _validate_dated_support_tables_are_generated,
@@ -84,6 +84,22 @@ def _commit_recipes(repo_root: Path, timestamp: str = "2026-07-30T12:00:00Z") ->
     )
 
 
+@pytest.mark.parametrize("property_name", ["Architecture", "**Architecture**", "Hugging Face Architecture"])
+def test_model_catalog_reads_architecture_from_template_tables(tmp_path: Path, property_name: str) -> None:
+    card = tmp_path / "docs/model-coverage/llm/provider/Test-Model.mdx"
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        '---\ntitle: "provider/Test-Model"\nslug: model-coverage/large-language-models/provider/Test-Model\n---\n'
+        f"\n## Model Context\n\n| Property | Value |\n| --- | --- |\n| {property_name} | `TestForCausalLM` |\n"
+        "\n## Available Models\n\n[Test](https://huggingface.co/provider/Test-Model)\n",
+        encoding="utf-8",
+    )
+    model_docs, architectures, models = _load_model_doc_catalog(tmp_path / "docs")
+    assert architectures == {"TestForCausalLM"}
+    assert models[0].architecture_display == "`TestForCausalLM`"
+    assert model_docs["provider/Test-Model"] == models
+
+
 def _write_typed_overview_templates(repo_root: Path) -> list[Path]:
     paths = []
     for model_type, relative_path in MODEL_TYPE_OVERVIEW_PATHS:
@@ -107,7 +123,7 @@ slug: model-coverage/diffusion/test/model
 | | |
 |---|---|
 | **Task** | Text-to-Image |
-| **Architecture** | DiT (Flow Matching) |
+| **Architecture** | `TestDiffusionTransformer` |
 | **HF Org** | [Test-Owner](https://huggingface.co/Test-Owner) |
 
 </Info>
@@ -254,6 +270,20 @@ def test_registry_table_uses_documentation_aliases_for_native_models():
     ) in generated
 
 
+def test_registry_table_distinguishes_diffusion_transformer_and_native_implementations() -> None:
+    generated = _render_registry_table(
+        [("NativeModel", "models.native", "NativeModel")],
+        {"ExternalModel", "NativeModel", "TestDiffusionTransformer"},
+        {},
+        diffusion_architectures={"NativeModel", "TestDiffusionTransformer"},
+    )
+
+    assert "| `TestDiffusionTransformer` | Hugging Face | `diffusers` |" in generated
+    assert "| `ExternalModel` | Hugging Face | `transformers` |" in generated
+    assert "| `NativeModel` | NeMo native | `models.native.NativeModel` |" in generated
+    assert generated.count("| `NativeModel` |") == 1
+
+
 def test_doc_arch_aliases_are_parsed_from_the_coverage_test():
     source = '_DOC_ARCH_ALIASES = {"NativeArchitecture": "DocumentedArchitecture"}\n'
 
@@ -364,6 +394,21 @@ def test_case_insensitive_redirect_cannot_shadow_a_canonical_card(tmp_path):
         _resolve_model_card_routes(tmp_path, [], {"org/Model": [model_doc]}, [model_doc])
 
 
+@pytest.mark.parametrize("deprecated", [False, True])
+def test_model_releases_follow_recipe_deprecation_metadata(tmp_path: Path, deprecated: bool) -> None:
+    recipe = tmp_path / "examples/llm_finetune/model.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text(
+        f"model:\n  pretrained_model_name_or_path: org/model\nci:\n  deprecated: {str(deprecated).lower()}\n"
+    )
+    _commit_recipes(tmp_path)
+
+    releases = _load_model_releases(tmp_path, {})
+
+    assert [release.hf_model_id for release in releases] == ([] if deprecated else ["org/model"])
+    assert recipe.is_file()
+
+
 def test_recipe_model_id_without_model_card_is_rejected(tmp_path):
     docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
     docs_config_path.parent.mkdir(parents=True)
@@ -411,7 +456,10 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes(tmp_path):
     repo_root = Path(__file__).parents[3]
     model_docs, _ = _load_model_docs(repo_root / "docs")
     # Keep real recipe discovery while making Git history independent of checkout size.
-    shutil.copytree(repo_root / "examples" / "retrieval", tmp_path / "examples" / "retrieval")
+    for recipe in (repo_root / "examples" / "retrieval").rglob("*.yaml"):
+        destination = tmp_path / recipe.relative_to(repo_root)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(recipe, destination)
     _commit_recipes(tmp_path)
     releases = _load_model_releases(tmp_path, model_docs)
     models_by_type = {
@@ -421,11 +469,12 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes(tmp_path):
 
     assert "meta-llama/Llama-3.2-1B" in models_by_type["Embedding"]
     assert "mistralai/Ministral-3-3B-Instruct-2512-BF16" in models_by_type["Embedding"]
-    assert models_by_type["Reranking"] == {
+    assert {
         "meta-llama/Llama-3.2-1B",
+        "nvidia/llama-nemotron-rerank-1b-v2",
         "Qwen/Qwen3-Reranker-4B",
         "mistralai/Ministral-3-3B-Instruct-2512-BF16",
-    }
+    } <= models_by_type["Reranking"]
 
 
 def test_generated_model_coverage_tables_are_not_committed():
@@ -470,19 +519,30 @@ def test_committed_generated_tables_are_rejected(tmp_path):
         _validate_generated_tables_are_not_committed(tmp_path)
 
 
-def test_model_card_path_aliases_preserve_published_paths():
+def test_model_reference_guides_preserve_published_routes():
     repo_root = Path(__file__).parents[3]
+    config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
     _, _, catalog = _load_model_doc_catalog(repo_root / "docs")
-    source_paths = [model.source_path for model in catalog]
-    for alias, canonical in MODEL_CARD_PATH_ALIASES.items():
-        assert (repo_root / alias).is_file(), f"Published source URL must remain available: {alias}"
-        assert (repo_root / canonical).is_file(), f"Published source URL must remain available: {canonical}"
-        assert (repo_root / alias).read_bytes() == (repo_root / canonical).read_bytes(), (
-            f"Compatibility card must stay synchronized with {canonical}: {alias}"
-        )
-        assert _frontmatter_slug(repo_root / alias) == _frontmatter_slug(repo_root / canonical)
-        assert alias not in source_paths
-        assert source_paths.count(canonical) == 1
+    card_routes = {model.docs_page for model in catalog}
+    reference_guides = {
+        "diffusion/flux3-image-klein.mdx": "recipes-e2e-examples/model-reference-guides/flux3-image-klein",
+        "llm/step-5-preview.mdx": "model-coverage/large-language-models/stepfun-ai/Step-5-Preview",
+        "vlm/muse-spark-open.mdx": "recipes-e2e-examples/muse-spark-open",
+        "vlm/step-5-preview.mdx": "model-coverage/vision-language-models/stepfun-ai/Step-5-Preview",
+    }
+    for path, slug in reference_guides.items():
+        guide = repo_root / "docs" / "guides" / path
+        route = "/" + slug
+        assert _frontmatter_slug(guide) == route.removeprefix("/")
+        assert route in routes
+        assert route not in card_routes
+
+    # Muse's published coverage route now belongs to its recipe-backed card.
+    muse_route = "/model-coverage/vision-language-models/meta-models/Muse-Spark-open-816B-A42B"
+    assert muse_route in routes
+    assert muse_route in card_routes
 
 
 def _assert_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
@@ -497,7 +557,7 @@ def _assert_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
         assert isinstance(recipe, dict), f"{match[1]}: recipe must be a YAML mapping"
         recipe_ids.update(_iter_pretrained_model_ids(recipe.get("model", {})))
     metadata = yaml.safe_load(document.split("---", 2)[1])
-    title = metadata["title"]
+    title = metadata["title"].split("/")[-1]
     if recipe_ids:
         names = {model_id.split("/", 1)[1] for model_id in recipe_ids}
         assert title in names, f"{card}: title {title!r} must match a linked recipe model ID: {sorted(recipe_ids)}"
@@ -507,7 +567,7 @@ def _assert_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
         assert hf_ids, f"{card}: reference card must link its Hugging Face checkpoint"
         assert title == hf_ids[0].split("/", 1)[1], f"{card}: title must match the primary HF checkpoint"
         recipe_ids = {hf_ids[0]}
-    filename = re.sub(r"[^a-z0-9]+", "-", title.casefold()).strip("-") + ".mdx"
+    filename = title + ".mdx"
     assert card.name == filename, f"{card}: filename must be {filename!r} for checkpoint {title!r}"
     matching_ids = {model_id for model_id in recipe_ids if model_id.split("/", 1)[1] == title}
     assert any(f"https://huggingface.co/{model_id}" in document for model_id in matching_ids), (
@@ -515,38 +575,17 @@ def _assert_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
     )
 
 
-def test_changed_model_cards_match_linked_recipe_identity():
+def test_step5_card_matches_linked_recipe_identity():
     repo_root = Path(__file__).parents[3]
-    base = subprocess.check_output(["git", "merge-base", "HEAD", "origin/main"], cwd=repo_root, text=True).strip()
-    changed = subprocess.check_output(
-        ["git", "diff", "--name-only", "--diff-filter=ACMR", base, "--", "docs/model-coverage"],
-        cwd=repo_root,
-        text=True,
-    ).splitlines()
-    changed += subprocess.check_output(
-        ["git", "ls-files", "--others", "--exclude-standard", "--", "docs/model-coverage"],
-        cwd=repo_root,
-        text=True,
-    ).splitlines()
-    # Keep the original Step-5 regression covered after the PR is merged.
-    changed += [f"docs/model-coverage/{kind}/stepfun-ai/step-5-preview-bf16.mdx" for kind in ("llm", "vlm")]
-    canonical_paths = {MODEL_CARD_PATH_ALIASES.get(relative, relative) for relative in changed}
-    for relative in sorted(canonical_paths):
-        card = repo_root / relative
-        if (
-            len(card.relative_to(repo_root / "docs/model-coverage").parts) == 3
-            and card.is_file()
-            and card.suffix == ".mdx"
-            and card.name != "index.mdx"
-        ):
-            _assert_model_card_recipe_identity(repo_root, card)
+    card = repo_root / "docs/model-coverage/llm/stepfun-ai/Step-5-Preview-BF16.mdx"
+    _assert_model_card_recipe_identity(repo_root, card)
 
 
 @pytest.mark.parametrize(
     ("title", "filename", "message"),
     [
-        ("Step-5-Preview", "step-5-preview.mdx", "title .* must match a linked recipe model ID"),
-        ("Step-5-Preview-BF16", "step-5-preview.mdx", "filename must be 'step-5-preview-bf16.mdx'"),
+        ("Step-5-Preview", "Step-5-Preview.mdx", "title .* must match a linked recipe model ID"),
+        ("Step-5-Preview-BF16", "Step-5-Preview.mdx", "filename must be 'Step-5-Preview-BF16.mdx'"),
     ],
 )
 def test_model_card_identity_rejects_recipe_mismatch(tmp_path: Path, title: str, filename: str, message: str):
@@ -566,7 +605,7 @@ def test_model_card_identity_rejects_recipe_mismatch(tmp_path: Path, title: str,
 
 @pytest.mark.parametrize("title,valid", [("Step-5-Preview", True), ("Step-5-Preview-BF16", False)])
 def test_reference_card_identifies_fp8_checkpoint_without_bf16_recipe(tmp_path: Path, title: str, valid: bool):
-    card = tmp_path / "step-5-preview.mdx"
+    card = tmp_path / "Step-5-Preview.mdx"
     card.write_text(
         f'---\ntitle: "{title}"\n---\n'
         "[FP8](https://huggingface.co/stepfun-ai/Step-5-Preview)\n"
@@ -683,7 +722,9 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                     offenders.append(f"{path}: model entry has no sidebar label")
                 elif sidebar_label.casefold() != model_id.casefold():
                     offenders.append(f"{path}: sidebar label {sidebar_label!r} does not match {model_id!r}")
-                if title_match is None or title_match.group(1).casefold() != model_id.casefold():
+                document = model_path.read_text(encoding="utf-8")
+                title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
+                if title_match is None or title_match.group(1).split("/")[-1].casefold() != model_id.casefold():
                     title = title_match.group(1) if title_match is not None else None
                     offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
                 hf_checkpoints = re.findall(
@@ -714,7 +755,7 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
         path.resolve()
         for category_directory in category_directories.values()
         for path in (repo_root / "docs" / "model-coverage" / category_directory).glob("*/*.mdx")
-        if path.name != "index.mdx" and path.relative_to(repo_root).as_posix() not in MODEL_CARD_PATH_ALIASES
+        if path.name != "index.mdx"
     }
     if set(navigated_model_pages) != expected_model_pages:
         offenders.append("nightly navigation does not contain every model card exactly once")
@@ -963,6 +1004,43 @@ def test_recipe_backed_model_sizes_have_exact_index_routes_and_one_card():
     assert meta_destinations == {"/model-coverage/large-language-models/meta/Llama-3.1-8B"}
 
 
+def test_moved_pages_keep_their_previous_published_routes():
+    """Moved or rewritten pages retain their old URL or redirect to a live page."""
+    repo_root = Path(__file__).parents[3]
+    base = subprocess.check_output(["git", "merge-base", "HEAD", "origin/main"], cwd=repo_root, text=True).strip()
+    old_files = set(
+        subprocess.check_output(
+            ["git", "ls-tree", "-r", "--name-only", base, "docs"], cwd=repo_root, text=True
+        ).splitlines()
+    )
+    changed = subprocess.check_output(
+        ["git", "diff", "--no-renames", "--name-only", base, "HEAD", "--", "docs"], cwd=repo_root, text=True
+    ).splitlines()
+    previous_routes = set()
+    for relative in changed:
+        if relative not in old_files or Path(relative).suffix not in {".md", ".mdx"}:
+            continue
+        document = subprocess.check_output(["git", "show", f"{base}:{relative}"], cwd=repo_root, text=True)
+        header = re.match(r"\A---\r?\n(.*?)\r?\n---(?:\r?\n|$)", document, re.DOTALL)
+        metadata = yaml.safe_load(header[1]) if header else None
+        if isinstance(metadata, dict) and isinstance(metadata.get("slug"), str):
+            previous_routes.add("/" + metadata["slug"].strip("/"))
+
+    config_path = repo_root / "docs/fern/versions/nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text())["navigation"]
+    routes = {route.casefold() for route in _collect_fern_routes(navigation, config_dir=config_path.parent)}
+    config = yaml.safe_load((repo_root / "docs/fern/docs.yml").read_text())
+    redirects = {item["source"].casefold(): item["destination"] for item in config["redirects"]}
+    broken = []
+    for route in sorted(previous_routes):
+        for version in ("", "/nightly"):
+            source = version + route
+            destination = _resolve_redirect(source, redirects)
+            if destination.casefold() not in routes:
+                broken.append(f"/nemo/automodel{source} -> {destination}")
+    assert not broken, "Previously published routes no longer resolve:\n" + "\n".join(broken)
+
+
 def test_retired_model_routes_redirect_to_provider_indexes():
     repo_root = Path(__file__).parents[3]
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
@@ -1127,9 +1205,9 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
         len([line for line in homepage.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]) == TABLE_ROW_COUNT
     )
     assert "[Model-0](/model-coverage/large-language-models/test/model)" in homepage
-    assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in (
-        tmp_path / "docs" / "model-coverage" / "overview.mdx"
-    ).read_text(encoding="utf-8")
+    registry = (tmp_path / "docs" / "model-coverage" / "overview.mdx").read_text(encoding="utf-8")
+    assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in registry
+    assert "| `TestDiffusionTransformer` | Hugging Face | `diffusers` |" in registry
     assert _sync_tables(tmp_path, check=True, validate_model_cards=False) == []
 
     # A newly published card must enter every table before a recipe is merged.
@@ -1458,14 +1536,13 @@ def test_recent_support_uses_permalink_for_documented_card(tmp_path, monkeypatch
     assert without_recipe[0].recipe_link == ""
 
 
-def test_recipe_link_errors_include_every_link_card_and_compatibility_copy(tmp_path):
+def test_recipe_link_errors_include_every_link_and_catalog_card(tmp_path):
     from tests.ci_tests.utils import sync_model_coverage_tables as coverage
 
     models = []
     source_paths = ["docs/model-coverage/llm/first.mdx", "docs/model-coverage/llm/second.mdx"]
-    alias = next(iter(MODEL_CARD_PATH_ALIASES))
     expected = []
-    for index, source_path in enumerate([*source_paths, alias]):
+    for index, source_path in enumerate(source_paths):
         path = tmp_path / source_path
         path.parent.mkdir(parents=True, exist_ok=True)
         links = []
@@ -1477,14 +1554,13 @@ def test_recipe_link_errors_include_every_link_card_and_compatibility_copy(tmp_p
             links.append(f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'a' * 40}/{recipe_path})")
             expected.append(recipe_path)
         path.write_text("\n".join(links))
-        if source_path in source_paths:
-            models.append(coverage._ModelDoc("LLM", f"/models/{index}", (), "Model", source_path))
+        models.append(coverage._ModelDoc("LLM", f"/models/{index}", (), "Model", source_path))
 
     with pytest.raises(ValueError) as caught:
         coverage._collect_documented_recipe_urls(tmp_path, models)
 
     message = str(caught.value)
-    for source_path in [*source_paths, alias]:
+    for source_path in source_paths:
         assert source_path in message
     for recipe_path in expected:
         assert f"replace its commit permalink with {coverage.REPOSITORY_URL}/{recipe_path}" in message

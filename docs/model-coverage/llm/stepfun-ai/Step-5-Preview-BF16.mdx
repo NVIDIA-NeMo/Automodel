@@ -1,0 +1,52 @@
+---
+title: "stepfun-ai/Step-5-Preview-BF16"
+description: "Fine-tune stepfun-ai/Step-5-Preview-BF16 with NeMo AutoModel using a checked-in recipe and documented distributed setup."
+slug: model-coverage/large-language-models/stepfun-ai/Step-5-Preview-BF16
+---
+
+Step 5 Preview is StepFun's mixture-of-experts checkpoint with sliding-window and region-selected sparse attention. NeMo AutoModel provides language-model fine-tuning recipes and a separate multimodal implementation.
+
+## Quick Start
+
+Follow [installation](/get-started/installation) and the [Step 5 guide](/model-coverage/large-language-models/stepfun-ai/Step-5-Preview). Allocate two nodes with four GB200 GPUs each. Set `NODE_RANK` to 0 or 1 and `MASTER_ADDR` to node 0. From the repository root on both nodes, launch Tulu-3 LoRA training:
+
+```bash
+uv run torchrun --nnodes 2 --nproc-per-node 4 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/stepfun/step_5_preview_tulu3_lora.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| LoRA Fine-Tuning | Tulu-3; 2 nodes x 4 GB200; EP8 | GB200 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_lora.yaml) |
+
+## Model Context
+
+The language backbone uses 92 decoder layers with sliding-window and sparse attention. The checkpoint also contains perception and auxiliary prediction modules.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| Architecture | `Step5ForCausalLM` |
+| Parameters | Approximately 598.5B language backbone; 27.1B active under the guide's counting convention |
+| Decoder Layers | 92 |
+| Hidden Size | 4,096 |
+| Attention | 64 query heads; 4 key-value heads; head dimension 192 |
+| Vocabulary Size | 128,896 |
+
+### Recipe Setup
+
+The [detailed guide](/model-coverage/large-language-models/stepfun-ai/Step-5-Preview) records the parameter-counting convention, full SFT and long-context recipes, precision behavior, and benchmark scope. The multimodal class `Step5ForConditionalGeneration` is covered separately in the [vision-language reference](/model-coverage/vision-language-models/stepfun-ai/Step-5-Preview), which explains why raw-image SFT needs additional preprocessing. This card's command trains the language backbone.
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [stepfun-ai/Step-5-Preview-BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16) | Pretrained checkpoint |
+
+## Related Resources
+
+- [Detailed Model Guide](/model-coverage/large-language-models/stepfun-ai/Step-5-Preview)
+- [Installation](/get-started/installation)
