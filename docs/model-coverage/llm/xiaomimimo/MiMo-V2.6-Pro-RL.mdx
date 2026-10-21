@@ -20,11 +20,11 @@ uv run --extra all --group dev torchrun --nnodes 32 --nproc-per-node 4 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning (Packed Sequences) | Tulu3; 65,536-token packs; 32 GB200 nodes; EP64; PP2; CP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps.yaml) |
-| Vision-Language Fine-Tuning | MedPix-VQA; 32 GB200 nodes; EP64; PP2 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_medpix_nonpacked4k_ep64pp2_100steps.yaml) |
-| Vision-Language LoRA | MedPix-VQA; 8 GB200 nodes; EP16; PP2 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_medpix_nonpacked4k_lora_ep16pp2_100steps.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | Tulu3; 65,536-token packs; 32 GB200 nodes; EP64; PP2; CP8 | GB200 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 32 GB200 nodes; EP64; PP2 | GB200 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_medpix_nonpacked4k_ep64pp2_100steps.yaml) |
+| Vision-Language LoRA | MedPix-VQA; 8 GB200 nodes; EP16; PP2 | GB200 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_medpix_nonpacked4k_lora_ep16pp2_100steps.yaml) |
 
 ## Model Context
 

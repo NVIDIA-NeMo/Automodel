@@ -18,12 +18,12 @@ uv run --no-sync torchrun --nnodes 16 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) |
-| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; CP2; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp2_medpix_2k.yaml) |
-| Text Fine-Tuning | Tulu-3; 16 nodes; PP4; CP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml) |
-| LoRA Fine-Tuning | MedPix-VQA; eight nodes; PP4; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; EP32 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; CP2; EP32 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp2_medpix_2k.yaml) |
+| Text Fine-Tuning | Tulu-3; 16 nodes; PP4; CP8; EP32 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml) |
+| LoRA Fine-Tuning | MedPix-VQA; eight nodes; PP4; EP8 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml) |
 
 ## Model Context
 

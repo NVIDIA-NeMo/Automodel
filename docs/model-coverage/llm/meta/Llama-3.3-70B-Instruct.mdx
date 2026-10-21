@@ -19,10 +19,10 @@ uv run torchrun --nnodes 4 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning (Packed Sequences) | SQuAD; 4 nodes; tensor parallelism 4; pipeline parallelism 2; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml) |
-| LoRA Benchmark | Synthetic data; tensor parallelism 2 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | SQuAD; 4 nodes; tensor parallelism 4; pipeline parallelism 2; 1,024-token packs | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml) |
+| LoRA Benchmark | Synthetic data; tensor parallelism 2 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml) |
 
 ## Model Context
 

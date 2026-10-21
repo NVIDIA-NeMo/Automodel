@@ -18,6 +18,7 @@ const recipeUrl = `https://github.com/NVIDIA-NeMo/Automodel/blob/main/${recipe}`
 const recipeConfig = {
   recipe: "TrainFinetuneRecipeForNextTokenPrediction",
   model: { pretrained_model_name_or_path: "provider/Test-Model" },
+  ci: { cluster_tag: "h100" },
 };
 const recipes = new Map([[recipe, recipeConfig]]);
 const validCard = `---
@@ -38,9 +39,9 @@ uv run automodel ${recipe} --nproc-per-node 8
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Fine-tune | SQuAD; eight GPUs | [View YAML](${recipeUrl}) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Fine-tune | SQuAD; eight GPUs | H100 | [View YAML](${recipeUrl}) |
 
 ## Model Context
 
@@ -66,7 +67,7 @@ This model provides a compact decoder for text generation and fine-tuning.
 `;
 const check = (source, catalog = recipes, format = "mdx") => validateModelCard(source, template, format, catalog);
 const launch = `\`\`\`bash\nuv run automodel ${recipe} --nproc-per-node 8\n\`\`\``;
-const workflowRow = `| Fine-tune | SQuAD; eight GPUs | [View YAML](${recipeUrl}) |`;
+const workflowRow = `| Fine-tune | SQuAD; eight GPUs | H100 | [View YAML](${recipeUrl}) |`;
 
 test("the independent fixture conforms in Markdown and MDX", () => {
   assert.deepEqual(check(validCard), []);
@@ -79,6 +80,7 @@ test("filenames match checkpoint case, punctuation, and version in both formats"
     [
       recipe,
       {
+        ...recipeConfig,
         recipe: "TrainFinetuneRecipeForNextTokenPrediction",
         model: {
           pretrained_model_name_or_path: "provider/FLUX.1-dev",
@@ -250,16 +252,16 @@ for (const [name, source, diagnostic] of [
   ["empty workflow table", validCard.replace(workflowRow, ""), "at least one data row"],
   [
     "wrong workflow columns",
-    validCard.replace("| Workflow | Example Setup | Recipe |", "| Task | Setup | Configuration |"),
-    "Workflow | Example Setup | Recipe",
+    validCard.replace("| Workflow | Example Setup | Device | Recipe |", "| Task | Setup | Configuration |"),
+    "Workflow | Example Setup | Device | Recipe",
   ],
   [
     "legacy two-column chooser",
     validCard
-      .replace("| Workflow | Example Setup | Recipe |", "| Goal | Start Here |")
-      .replace("| --- | --- | --- |", "| --- | --- |")
+      .replace("| Workflow | Example Setup | Device | Recipe |", "| Goal | Start Here |")
+      .replace("| --- | --- | --- | --- |", "| --- | --- |")
       .replace(workflowRow, `| Fine-tune | [Recipe](${recipeUrl}) |`),
-    "Workflow | Example Setup | Recipe",
+    "Workflow | Example Setup | Device | Recipe",
   ],
   [
     "empty setup cell",
@@ -324,7 +326,7 @@ for (const [name, source, diagnostic] of [
   [
     "indistinguishable workflow choices",
     validCard.replace(workflowRow, `${workflowRow}\n${workflowRow.replace("test_model.yaml", "second_model.yaml")}`),
-    "workflow choices must differ in Workflow or Example Setup",
+    "workflow choices must differ in Workflow, Example Setup, or Device",
   ],
   [
     "chooser prose outside the table",
@@ -566,7 +568,7 @@ test("the CI command fails for bad content and newly added Markdown cards", asyn
     await fs.writeFile(card, validCard);
     await fs.writeFile(
       path.join(root, recipe),
-      "recipe: TrainFinetuneRecipeForNextTokenPrediction\nmodel:\n  pretrained_model_name_or_path: provider/Test-Model\n",
+      "recipe: TrainFinetuneRecipeForNextTokenPrediction\nmodel:\n  pretrained_model_name_or_path: provider/Test-Model\nci:\n  cluster_tag: h100\n",
     );
     const run = () =>
       spawnSync(process.execPath, [path.join(repoRoot, "tools/validate_model_cards.mjs")], {
@@ -574,6 +576,16 @@ test("the CI command fails for bad content and newly added Markdown cards", asyn
         env: { ...process.env, MDX_LINT_REPO_ROOT: root },
       });
     assert.equal(run().status, 0);
+    const taggedYaml = await fs.readFile(path.join(root, recipe), "utf8");
+    await fs.writeFile(path.join(root, recipe), taggedYaml.replace("cluster_tag: h100", "device_tag: gb200"));
+    let mismatch = run();
+    assert.equal(mismatch.status, 1);
+    assert.match(mismatch.stderr, /Device must be "GB200"/);
+    await fs.writeFile(path.join(root, recipe), taggedYaml.replace("ci:\n  cluster_tag: h100\n", ""));
+    mismatch = run();
+    assert.equal(mismatch.status, 1);
+    assert.match(mismatch.stderr, /must declare a nonempty ci.device_tag or ci.cluster_tag/);
+    await fs.writeFile(path.join(root, recipe), taggedYaml);
     const wrongName = path.join(root, "docs/model-coverage/provider/test-model.md");
     await fs.rename(card, wrongName);
     let result = run();
@@ -600,7 +612,7 @@ for (const format of ["md", "mdx"]) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "model-card-removal-"));
     const survivor = recipe.replace("test_model.yaml", "surviving_workflow.yaml");
     const controlRecipe = recipe.replace("test_model.yaml", "control_model.yaml");
-    const yaml = "recipe: TrainFinetuneRecipeForNextTokenPrediction\nmodel:\n  pretrained_model_name_or_path: provider/Test-Model\n";
+    const yaml = "recipe: TrainFinetuneRecipeForNextTokenPrediction\nmodel:\n  pretrained_model_name_or_path: provider/Test-Model\nci:\n  cluster_tag: h100\n";
     try {
       for (const directory of ["docs/templates", "docs/model-coverage/provider", path.dirname(recipe)])
         await fs.mkdir(path.join(root, directory), { recursive: true });
@@ -641,3 +653,48 @@ for (const format of ["md", "mdx"]) {
     }
   });
 }
+
+for (const format of ["md", "mdx"]) {
+  for (const [ci, label] of [
+    [{ cluster_tag: "h100" }, "H100"],
+    [{ device_tag: "gb10" }, "GB10"],
+    [{ cluster_tag: "gb300" }, "GB300"],
+    [{ device_tag: "h100|gb200" }, "H100 or GB200"],
+    [{ cluster_tag: "cluster-a", device_tag: "gb200" }, "GB200"],
+  ]) {
+    test(`workflow device ${label} matches its recipe in ${format}`, () => {
+      const catalog = new Map([[recipe, { ...recipeConfig, ci }]]);
+      const source = validCard.replace("| H100 |", `| ${label} |`);
+      assert.deepEqual(check(source, catalog, format), []);
+      assert.ok(check(source.replace(`| ${label} |`, "| A100 |"), catalog, format)
+        .some(({ message }) => message.includes(`Device must be "${label}"`)));
+    });
+  }
+  for (const ci of [undefined, {}, { device_tag: "" }, { cluster_tag: 100 }, { deprecated: true }]) {
+    test(`missing device metadata fails for ${JSON.stringify(ci)} in ${format}`, () => {
+      const catalog = new Map([[recipe, { ...recipeConfig, ci }]]);
+      assert.ok(check(validCard, catalog, format)
+        .some(({ message }) => message.includes("must declare a nonempty ci.device_tag or ci.cluster_tag")));
+    });
+  }
+  test(`different devices distinguish otherwise identical workflows in ${format}`, () => {
+    const other = recipe.replace("test_model", "gb200_model");
+    const catalog = new Map([
+      [recipe, recipeConfig],
+      [other, { ...recipeConfig, ci: { device_tag: "gb200" } }],
+    ]);
+    const source = validCard.replace(workflowRow,
+      `${workflowRow}\n${workflowRow.replace(recipe, other).replace("| H100 |", "| GB200 |")}`);
+    assert.deepEqual(check(source, catalog, format), []);
+  });
+}
+
+
+test("legacy workflow tables without a Device column fail", () => {
+  const source = validCard
+    .replace("| Example Setup | Device | Recipe |", "| Example Setup | Recipe |")
+    .replace("| --- | --- | --- | --- |", "| --- | --- | --- |")
+    .replace("| H100 |", "|");
+  assert.ok(check(source).some(({ message }) =>
+    message.includes("Workflow | Example Setup | Device | Recipe table")));
+});

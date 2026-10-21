@@ -18,10 +18,10 @@ uv run --extra fla automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning | HellaSwag; one node, 8 GPUs; expert parallelism (EP=8) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml) |
-| Full Fine-Tuning (Packed Sequences) | HellaSwag; one node, 8 GPUs; context parallelism (CP=8); EP=8; 32,768-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp8.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; one node, 8 GPUs; expert parallelism (EP=8) | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml) |
+| Full Fine-Tuning (Packed Sequences) | HellaSwag; one node, 8 GPUs; context parallelism (CP=8); EP=8; 32,768-token packs | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp8.yaml) |
 
 ## Model Context
 

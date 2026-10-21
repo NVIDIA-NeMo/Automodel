@@ -19,10 +19,10 @@ uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning | Prepared video and audio cache; 1 node; 8 data-parallel ranks | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) |
-| LoRA Fine-Tuning | Prepared video and audio cache; 1 node; 8 data-parallel ranks | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning | Prepared video and audio cache; 1 node; 8 data-parallel ranks | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) |
+| LoRA Fine-Tuning | Prepared video and audio cache; 1 node; 8 data-parallel ranks | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml) |
 
 ## Model Context
 

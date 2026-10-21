@@ -17,11 +17,11 @@ uv run torchrun --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning | Prepared video cache; 1 node; 8 data-parallel workers | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) |
-| LoRA Fine-Tuning | Prepared video cache; 1 node; 8 data-parallel workers | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml) |
-| Video Generation | Text prompts | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_ltx2.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning | Prepared video cache; 1 node; 8 data-parallel workers | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) |
+| LoRA Fine-Tuning | Prepared video cache; 1 node; 8 data-parallel workers | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml) |
+| Video Generation | Text prompts | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_ltx2.yaml) |
 
 ## Model Context
 

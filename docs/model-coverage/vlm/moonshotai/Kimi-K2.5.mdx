@@ -19,10 +19,10 @@ uv run --extra vlm --extra moe torchrun --nnodes 32 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Vision-Language Fine-Tuning | MedPix-VQA; 32 nodes; PP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/kimi25vl_medpix.yaml) |
-| LoRA Training Benchmark | Synthetic text; random initialization; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/kimi/kimi25vl_lora.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 32 nodes; PP8; EP32 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/kimi25vl_medpix.yaml) |
+| LoRA Training Benchmark | Synthetic text; random initialization; 16 nodes; PP4; EP32 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/kimi/kimi25vl_lora.yaml) |
 
 ## Model Context
 

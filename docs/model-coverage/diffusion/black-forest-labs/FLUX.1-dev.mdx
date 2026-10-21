@@ -20,10 +20,10 @@ uv run torchrun --nproc-per-node=8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning | Prepared image-text cache; 8 GPUs (`fsdp.dp_size: 8`) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml) |
-| Pretraining | Prepared image-text cache; 8 GPUs (`fsdp.dp_size: 8`) | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/flux_t2i_flow.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning | Prepared image-text cache; 8 GPUs (`fsdp.dp_size: 8`) | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml) |
+| Pretraining | Prepared image-text cache; 8 GPUs (`fsdp.dp_size: 8`) | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/flux_t2i_flow.yaml) |
 
 ## Model Context
 

@@ -126,6 +126,7 @@ CI_KEY_TO_VAR = {
     "ep_size": "EP_SIZE",
     "recipe_owner": "RECIPE_OWNER",
     "nproc_per_node": "CONFIG_NPROC_PER_NODE",
+    "device_tag": "RESERVED_CLUSTER_TAG",
     "cluster_tag": "RESERVED_CLUSTER_TAG",
 }
 
@@ -195,7 +196,8 @@ def _enrich_base_job(
         elif ci_var == "NODE_MULTIPLIER":
             job["variables"][ci_var] = str(value).lower()
         elif ci_var == "RESERVED_CLUSTER_TAG":
-            job["variables"][ci_var] = f"/{value}/"
+            if isinstance(value, str) and value.strip():
+                job["variables"][ci_var] = f"/{value.strip()}/"
         else:
             job["variables"][ci_var] = value
 
@@ -320,6 +322,11 @@ def generate_job(
             )
         )
 
+    # Every variant uses the same device route as its recipe's base job.
+    cluster_tag = base_job["variables"].get("RESERVED_CLUSTER_TAG")
+    if cluster_tag is not None:
+        for _, job in variants:
+            job["variables"]["RESERVED_CLUSTER_TAG"] = cluster_tag
     return variants
 
 

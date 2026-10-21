@@ -23,16 +23,19 @@ Every card must have a recipe; setup prose alone does not satisfy Quick Start.
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning | SQuAD; 8-GPU launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/MODEL/MODEL_squad.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning | SQuAD; 8-GPU launch | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/MODEL/MODEL_squad.yaml) |
 
 Each recipe must load a checkpoint listed in Available Models. Link additional
 recipes for this model, such as LoRA, packed sequences, or pretraining, when they
 exist. Keep the initial command and its corresponding table row consistent.
 Name the operation in Workflow (at most eight words). Put the dataset and key
 requirements in Example Setup (at most 12 words). Use one direct, checked-in
-YAML link labeled "View YAML" in Recipe. Each recipe appears once. Move setup
+YAML link labeled "View YAML" in Recipe. Each recipe appears once. Device must
+match the recipe's `ci.device_tag`, or
+`ci.cluster_tag` when no device tag is set. Display tags in uppercase, with
+` or ` between alternatives (for example, `H100 or GB200`). Move setup
 guides, extra commands, and detailed settings to Model Context.
 
 ## Model Context

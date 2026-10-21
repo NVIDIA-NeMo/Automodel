@@ -50,9 +50,10 @@ def test_linter_requires_recipe_target():
 
 
 @pytest.mark.parametrize("cluster_tag", ["h100", "gb200", "gb10", "h100|gb200"])
-def test_linter_accepts_explicit_cluster_tag(cluster_tag: str) -> None:
+@pytest.mark.parametrize("tag_key", ["cluster_tag", "device_tag"])
+def test_linter_accepts_explicit_cluster_tag(cluster_tag: str, tag_key: str) -> None:
     errors = lint_yaml_text(
-        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: {cluster_tag}\n",
+        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  {tag_key}: {cluster_tag}\n",
         Path("examples/llm_finetune/tagged.yaml"),
         Path.cwd(),
     )
@@ -83,9 +84,10 @@ def test_linter_requires_ci_cluster_metadata(ci_text: str) -> None:
 
 
 @pytest.mark.parametrize("value", ["null", "''", "'   '", "100", "true", "[]", "{}"])
-def test_linter_rejects_empty_or_nonstring_cluster_tag(value: str) -> None:
+@pytest.mark.parametrize("tag_key", ["cluster_tag", "device_tag"])
+def test_linter_rejects_empty_or_nonstring_cluster_tag(value: str, tag_key: str) -> None:
     errors = lint_yaml_text(
-        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: {value}\n",
+        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  {tag_key}: {value}\n",
         Path("examples/llm_finetune/invalid_tag.yaml"),
         Path.cwd(),
     )

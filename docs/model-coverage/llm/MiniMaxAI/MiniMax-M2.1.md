@@ -18,11 +18,11 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning | HellaSwag; 8 nodes; PP2; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml) |
-| Full Fine-Tuning (MiniMax-M2.5) | HellaSwag; 8 nodes; PP2; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) |
-| Full Fine-Tuning (MiniMax-M2.7) | HellaSwag; 8 nodes; PP2; EP16 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 8 nodes; PP2; EP32 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml) |
+| Full Fine-Tuning (MiniMax-M2.5) | HellaSwag; 8 nodes; PP2; EP32 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) |
+| Full Fine-Tuning (MiniMax-M2.7) | HellaSwag; 8 nodes; PP2; EP16 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml) |
 
 ## Model Context
 

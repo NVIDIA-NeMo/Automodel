@@ -25,6 +25,28 @@ from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeli
 pytestmark = pytest.mark.timeout(70)
 
 
+@pytest.mark.parametrize(
+    "ci_config,expected",
+    [
+        ({"cluster_tag": "gb200"}, "/gb200/"),
+        ({"device_tag": "h100"}, "/h100/"),
+        ({"device_tag": "h100|gb200"}, "/h100|gb200/"),
+        ({"cluster_tag": "gb200", "device_tag": "h100"}, "/gb200/"),
+        ({"cluster_tag": "", "device_tag": "gb10"}, "/gb10/"),
+    ],
+)
+def test_device_metadata_routes_generated_job(tmp_path: Path, ci_config: dict[str, str], expected: str) -> None:
+    recipe = Path("examples/llm_finetune/family/model.yaml")
+    path = tmp_path / recipe
+    path.parent.mkdir(parents=True)
+    YAML().dump({"ci": {**ci_config, "vllm_deploy": True, "embed_eval": True, "rerank_eval": True}}, path)
+
+    jobs = generate_job(recipe, {}, "nightly", "llm_finetune", str(tmp_path))
+
+    assert {suffix for suffix, _ in jobs} == {"", "_vllm_deploy", "_embed_eval", "_rerank_eval"}
+    assert all(job["variables"]["RESERVED_CLUSTER_TAG"] == expected for _, job in jobs)
+
+
 def test_llm_benchmark_configs_define_required_benchmark_fields():
     required_fields = {
         "warmup_steps",

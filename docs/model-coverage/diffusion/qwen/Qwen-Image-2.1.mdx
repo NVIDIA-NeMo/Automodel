@@ -18,11 +18,11 @@ uv run --extra all torchrun --nproc-per-node=8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning | Prepared image-text cache; one node; 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml) |
-| LoRA Fine-Tuning | Prepared image-text cache; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow_lora.yaml) |
-| Image Generation | Text prompts | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_21.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning | Prepared image-text cache; one node; 8 GPUs | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml) |
+| LoRA Fine-Tuning | Prepared image-text cache; 1 node | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow_lora.yaml) |
+| Image Generation | Text prompts | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_21.yaml) |
 
 ## Model Context
 

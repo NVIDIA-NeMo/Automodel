@@ -19,10 +19,10 @@ uv run torchrun --nnodes 4 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning | Tulu-3; 4 nodes | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml) |
-| Full Fine-Tuning | Prepared CoderForge data; context parallelism across 8 GPUs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning | Tulu-3; 4 nodes | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml) |
+| Full Fine-Tuning | Prepared CoderForge data; context parallelism across 8 GPUs | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml) |
 
 ## Model Context
 

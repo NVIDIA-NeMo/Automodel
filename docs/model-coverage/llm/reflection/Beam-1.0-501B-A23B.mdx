@@ -8,18 +8,20 @@ slug: model-coverage/large-language-models/reflection/Beam-1.0-501B-A23B
 
 ## Quick Start
 
-Follow the [installation instructions](/get-started/installation) and review the [recipe details](#recipe-details). From the repository root on one node with 8 H200 GPUs, launch LoRA training on Tulu-3:
+Follow the [installation instructions](/get-started/installation) and review the [recipe details](#recipe-details). Launch LoRA training on Tulu-3 across two nodes with four GB200 GPUs each. Run on both nodes with `NODE_RANK` set to 0 or 1 and `MASTER_ADDR` set to the first node:
 
 ```bash
-uv run automodel examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml --nproc-per-node 8
+uv run torchrun --nnodes=2 --nproc-per-node=4 \
+  --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml
 ```
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| LoRA Fine-Tuning | Tulu-3; 8 H200 GPUs; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml) |
-| Full Fine-Tuning | Tulu-3; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| LoRA Fine-Tuning | Tulu-3; 2 nodes; EP8 | GB200 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml) |
+| Full Fine-Tuning | Tulu-3; 16 nodes; EP64 | GB200 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml) |
 
 ## Model Context
 
@@ -49,7 +51,7 @@ uv run torchrun --nnodes=8 --nproc-per-node=8 --node-rank=$NODE_RANK --master-ad
 It trains all weights with EP64 on the same Tulu-3 data, packed to 4096 tokens, with a global batch of 64 packs. TE FusedAdam keeps fp32 master weights and Adam moments while the model weights and checkpoints stay bf16. Each checkpoint holds about 6 TB, so `checkpoint_dir` must be on a shared filesystem.
 
 
-### Configuration
+### Documented H200 Configuration
 
 | Setting | Configuration |
 | --- | --- |

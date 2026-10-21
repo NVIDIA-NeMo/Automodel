@@ -150,9 +150,9 @@ export function validateModelCard(source, template, format = "mdx", recipes = ne
       const table = content.find((node) => node.type === "table");
       if (
         !table ||
-        JSON.stringify(table.children[0].children.map(textContent)) !== JSON.stringify(["Workflow", "Example Setup", "Recipe"])
+        JSON.stringify(table.children[0].children.map(textContent)) !== JSON.stringify(["Workflow", "Example Setup", "Device", "Recipe"])
       ) {
-        report(heading, "Choose a Workflow requires a direct Workflow | Example Setup | Recipe table");
+        report(heading, "Choose a Workflow requires a direct Workflow | Example Setup | Device | Recipe table");
       } else if (table.children.length < 2) {
         report(table, "Choose a Workflow requires at least one data row");
       }
@@ -161,8 +161,8 @@ export function validateModelCard(source, template, format = "mdx", recipes = ne
       }
       const choices = new Set();
       for (const row of table?.children.slice(1) ?? []) {
-        if (row.children.length !== 3) {
-          report(row, "each workflow row requires exactly three cells: Workflow, Example Setup, Recipe");
+        if (row.children.length !== 4) {
+          report(row, "each workflow row requires exactly four cells: Workflow, Example Setup, Device, Recipe");
         }
         for (const [index, label, maxWords, maxCharacters] of [
           [0, "Workflow", 8, 80],
@@ -183,10 +183,10 @@ export function validateModelCard(source, template, format = "mdx", recipes = ne
         if (/primary recipe|alternate recipe|another checked-in recipe|model-specific recipe|prepare your environment|explore checkpoints|configure nemo automodel/i.test(textContent(row.children[0] ?? {}))) {
           report(row, "Workflow must name an operation such as fine-tuning, pretraining, generation, or benchmarking");
         }
-        const choice = row.children.slice(0, 2).map((cell) => textContent(cell).trim().toLowerCase()).join("\0");
-        if (choices.has(choice)) report(row, "workflow choices must differ in Workflow or Example Setup");
+        const choice = row.children.slice(0, 3).map((cell) => textContent(cell).trim().toLowerCase()).join("\0");
+        if (choices.has(choice)) report(row, "workflow choices must differ in Workflow, Example Setup, or Device");
         choices.add(choice);
-        const recipeCell = row.children[2];
+        const recipeCell = row.children[3];
         if (
           recipeCell?.children.length !== 1 ||
           !["link", "linkReference"].includes(recipeCell.children[0].type) ||
@@ -456,7 +456,7 @@ function validateRecipes(nodes, headings, modelId, recipes, report) {
   const workflow = area("Choose a Workflow").find((node) => node.type === "table");
   const workflowRecipes = new Map();
   for (const row of workflow?.children.slice(1) ?? []) {
-    const cellLinks = links(row.children[2] ? [row.children[2]] : [], definitions);
+    const cellLinks = links(row.children[3] ? [row.children[3]] : [], definitions);
     const recipeLinks = cellLinks
       .map((link) => recipePath(link.url))
       .filter((file) => file && /\.ya?ml$/.test(file));
@@ -468,6 +468,16 @@ function validateRecipes(nodes, headings, modelId, recipes, report) {
       if (!config) {
         report(row, `workflow recipe path does not exist: ${file}`);
         continue;
+      }
+      const tag = [config.ci?.device_tag, config.ci?.cluster_tag]
+        .find((value) => typeof value === "string" && value.trim());
+      if (!tag) {
+        report(row, `workflow recipe must declare a nonempty ci.device_tag or ci.cluster_tag: ${file}`);
+      } else {
+        const expectedDevice = tag.split("|").map((device) => device.trim().toUpperCase()).join(" or ");
+        const device = row.children[2] ? textContent(row.children[2]).trim() : "";
+        if (device !== expectedDevice)
+          report(row, `Device must be "${expectedDevice}" to match ${file}; found "${device}"`);
       }
       if (workflowRecipes.has(file)) report(row, `workflow recipe is listed more than once: ${file}`);
       const id = effectiveModel(config, row.children.map(textContent).join(" "));

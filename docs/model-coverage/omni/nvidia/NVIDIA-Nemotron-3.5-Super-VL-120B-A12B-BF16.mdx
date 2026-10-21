@@ -22,11 +22,11 @@ uv run automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Text Fine-Tuning | Tulu-3; four nodes; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml) |
-| Packed Text Fine-Tuning (256K) | Tulu-3; 16 GB200 GPUs; CP8; EP16 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200.yaml) |
-| LoRA Fine-Tuning | CORD-v2; one node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Text Fine-Tuning | Tulu-3; four nodes; EP32 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml) |
+| Packed Text Fine-Tuning (256K) | Tulu-3; 16 GB200 GPUs; CP8; EP16 | GB200 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_256k_cp8_ep16_gb200.yaml) |
+| LoRA Fine-Tuning | CORD-v2; one node; EP8 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml) |
 
 ## Model Context
 

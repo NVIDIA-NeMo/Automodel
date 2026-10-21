@@ -24,10 +24,10 @@ uv run --extra diffusion torchrun --nproc-per-node=8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning | Prepared video cache; 8 data-parallel ranks | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_2_t2v_flow.yaml) |
-| Video Generation | Text prompts and stage checkpoints | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_wan22.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning | Prepared video cache; 8 data-parallel ranks | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_2_t2v_flow.yaml) |
+| Video Generation | Text prompts and stage checkpoints | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_wan22.yaml) |
 
 ## Model Context
 

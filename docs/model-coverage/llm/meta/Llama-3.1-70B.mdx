@@ -23,10 +23,10 @@ uv run torchrun --nnodes 4 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning (Packed Sequences) | SQuAD; 4 nodes x 8 GPUs; TP4; PP4; 4,096-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml) |
-| Training Benchmark | Synthetic data; 8 nodes; CP2 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | SQuAD; 4 nodes x 8 GPUs; TP4; PP4; 4,096-token packs | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml) |
+| Training Benchmark | Synthetic data; 8 nodes; CP2 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml) |
 
 ## Model Context
 

@@ -36,13 +36,20 @@ headings, tables, code, and callouts after the table.
   example YAML. Use `automodel` only when the YAML has a `recipe` target; use
   the documented Python entry point otherwise. Include the required distributed
   launch for multiple nodes. Put preparation and alternate commands in context.
-- Choose a Workflow contains only a direct `Workflow | Example Setup | Recipe`
+- Choose a Workflow contains only a direct `Workflow | Example Setup | Device | Recipe`
   table and links the same recipe and checkpoint as Quick Start. Workflow names
   the operation, such as full fine-tuning, LoRA, pretraining, or benchmarking.
   Example Setup gives the dataset and essential requirements. Recipe contains
-  only one direct checked-in YAML link labeled `View YAML`. Each YAML appears
-  once, and each row differs in Workflow or Example Setup. Setup guides and
-  longer operational notes belong in Model Context.
+  only one direct checked-in YAML link labeled `View YAML`. Device shows the
+  uppercase `ci.device_tag`, or `ci.cluster_tag` when no device tag is set; join
+  alternative tags with ` or `, for example `H100 or GB200`. CI rejects missing
+  tags and device labels that differ from the linked recipe, including deprecated
+  recipes linked from a card. When both tags are present, Device uses
+  `ci.device_tag` and CI routes jobs with `ci.cluster_tag`.
+  A device target does not establish training or memory
+  validation. Each YAML appears once, and each row differs in Workflow,
+  Example Setup, or Device. Setup guides and longer operational notes belong
+  in Model Context.
   Workflow and Example Setup must be nonempty, without placeholders or links.
   Generic primary/alternate recipe labels fail. Recipe identities
   are read from YAML contents, including nested `model.config` fields, rather
@@ -72,6 +79,7 @@ headings, tables, code, and callouts after the table.
 | Choose a Workflow | 160 prose words, 1,600 visible characters, and six data rows |
 | Workflow cell | Eight words and 80 visible characters |
 | Example Setup cell | 12 words and 120 visible characters |
+| Device cell | Must match the linked recipe's device or cluster tag |
 | Recipe cell | One direct YAML link labeled `View YAML`; no extra prose |
 | Model Context introduction | 8-40 words and at most 400 visible characters |
 | Model Context | Free-form; no length limit |

@@ -25,13 +25,13 @@ uv run torchrun --nnodes 32 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Workflow | Example Setup | Recipe |
-| --- | --- | --- |
-| Full Fine-Tuning | HellaSwag; 32 nodes; PP4; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) |
-| Full Fine-Tuning (Packed Sequences) (GLM-5.3) | Tulu-3; 32 nodes; PP4; EP64; 4,096-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml) |
-| Full Fine-Tuning (Packed Sequences) (GLM-5.2) | Tulu-3; 64 nodes; PP4; CP8; EP64; 32,768-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) |
-| Full Fine-Tuning (Packed Sequences) (GLM-5.2) | Tulu-3; 32 nodes; PP4; EP64; 4,096-token packs; TileLang attention | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml) |
-| Full Fine-Tuning (Packed Sequences) (GLM-5.2) | Tulu-3; 32 nodes; PP4; EP64; 4,096-token packs; cuDNN attention | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_cudnn_100k.yaml) |
+| Workflow | Example Setup | Device | Recipe |
+| --- | --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 32 nodes; PP4; EP64 | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) |
+| Full Fine-Tuning (Packed Sequences) (GLM-5.3) | Tulu-3; 32 nodes; PP4; EP64; 4,096-token packs | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml) |
+| Full Fine-Tuning (Packed Sequences) (GLM-5.2) | Tulu-3; 64 nodes; PP4; CP8; EP64; 32,768-token packs | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) |
+| Full Fine-Tuning (Packed Sequences) (GLM-5.2) | Tulu-3; 32 nodes; PP4; EP64; 4,096-token packs; TileLang attention | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml) |
+| Full Fine-Tuning (Packed Sequences) (GLM-5.2) | Tulu-3; 32 nodes; PP4; EP64; 4,096-token packs; cuDNN attention | H100 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_cudnn_100k.yaml) |
 
 ## Model Context
 
