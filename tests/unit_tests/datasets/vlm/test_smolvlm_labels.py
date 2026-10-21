@@ -26,7 +26,8 @@ from nemo_automodel.components.datasets.vlm.loader import VlmProcessorConfig
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 _CHECKPOINT = "HuggingFaceTB/SmolVLM-Instruct"
-_REVISION = "81cd9a775a4d644f2faf4e7becff4559b46b14c7"
+# Public Hugging Face checkpoint commit, matching the recipe's inspected revision.
+_REVISION = "81cd9a775a4d644f2faf4e7becff4559b46b14c7"  # pragma: allowlist secret
 
 
 @pytest.fixture(scope="module")
