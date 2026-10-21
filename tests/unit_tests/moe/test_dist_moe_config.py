@@ -74,3 +74,36 @@ def test_rejects_different_clamped_swiglu_semantics() -> None:
         GroupedExpertsDistMoE(config, backend)
     with pytest.raises(ValueError, match="biased experts"):
         GroupedExpertsDistMoE(dataclasses.replace(config, swiglu_limit=0.0, expert_bias=True), backend)
+
+
+@pytest.mark.parametrize("budget", [-1, True, 1.5])
+def test_invalid_activation_byte_budget(budget: bool | int | float) -> None:
+    """Byte budgets reject invalid values before device initialization."""
+    with pytest.raises(ValueError, match="activation_slot_bytes"):
+        DistMoEConfig(activation_slot_bytes=budget)
+
+
+def test_conflicting_activation_policies() -> None:
+    """An explicit byte budget cannot silently override a capacity factor."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        DistMoEConfig(activation_slot_bytes=1024, activation_slot_capacity_factor=1.0)
+
+
+@pytest.mark.parametrize("sms", [0, -1, True, 2.5])
+def test_invalid_sm_budget(sms: bool | int | float) -> None:
+    """SM budgets must be positive counts."""
+    with pytest.raises(ValueError, match="num_sms"):
+        DistMoEConfig(num_sms=sms)
+
+
+def test_fast_math_requires_low_precision() -> None:
+    """Reject a precision flag that cannot affect BF16 computation."""
+    with pytest.raises(ValueError, match="requires mxfp8"):
+        DistMoEConfig(fast_math=True)
+
+
+@pytest.mark.parametrize("capacity", [1.0, float("nan"), float("inf")])
+def test_invalid_host_capacity(capacity: float) -> None:
+    """Host plus device capacity must cover the device allocation."""
+    with pytest.raises(ValueError, match="host_scratch_capacity_factor"):
+        DistMoEConfig(device_scratch_capacity_factor=2.0, host_scratch_capacity_factor=capacity)

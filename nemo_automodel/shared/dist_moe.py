@@ -43,6 +43,23 @@ class DistMoEConfig:
     pipeline: Literal["staged", "mega"] = "staged"
     activation_slot_capacity_factor: float | None = None
     device_scratch_capacity_factor: float = 8.0
+    activation_slot_bytes: int | None = None
+    host_scratch_capacity_factor: float | None = None
+    vmm_prefetch: bool = True
+    num_sms: int | None = None
+    fast_math: bool = False
+    bf16_grouped_gemm_preset: (
+        Literal[
+            "1cta1mma_bm64_bn128",
+            "1cta1mma_bm64_bn256",
+            "1cta1mma_bm128_bn128",
+            "1cta1mma_bm128_bn256",
+            "1cta2mma_bm256_bn256",
+            "2cta1mma_bm256_bn256",
+            "2cta2mma_bm512_bn256",
+        ]
+        | None
+    ) = None
 
     def __post_init__(self) -> None:
         """Validate capacities without importing the optional CUDA package."""
@@ -62,6 +79,26 @@ class DistMoEConfig:
         ):
             if value is not None and (not math.isfinite(value) or value < 0):
                 raise ValueError(f"dist_moe.{name} must be finite and nonnegative")
+        if self.activation_slot_bytes is not None:
+            if isinstance(self.activation_slot_bytes, bool) or not isinstance(self.activation_slot_bytes, int):
+                raise ValueError("dist_moe.activation_slot_bytes must be an integer")
+            if self.activation_slot_bytes < 0:
+                raise ValueError("dist_moe.activation_slot_bytes must be nonnegative")
+            if self.activation_slot_capacity_factor is not None:
+                raise ValueError("dist_moe.activation_slot_bytes and capacity factor are mutually exclusive")
+        if self.num_sms is not None and (
+            isinstance(self.num_sms, bool) or not isinstance(self.num_sms, int) or self.num_sms <= 0
+        ):
+            raise ValueError("dist_moe.num_sms must be a positive integer")
+        if not isinstance(self.fast_math, bool) or not isinstance(self.vmm_prefetch, bool):
+            raise ValueError("dist_moe.fast_math and vmm_prefetch must be boolean")
+        if self.fast_math and self.precision != "mxfp8":
+            raise ValueError("dist_moe.fast_math requires mxfp8")
+        if self.host_scratch_capacity_factor is not None and (
+            not math.isfinite(self.host_scratch_capacity_factor)
+            or self.host_scratch_capacity_factor < self.device_scratch_capacity_factor
+        ):
+            raise ValueError("dist_moe.host_scratch_capacity_factor must be finite and at least device capacity")
         if self.device_scratch_capacity_factor <= 0:
             raise ValueError("dist_moe.device_scratch_capacity_factor must be positive")
 
@@ -100,7 +137,14 @@ class DistMoEConfig:
             raise ValueError("Dist-MoE requires SM100 or newer; H100 is unsupported")
         policy = None
         if self.precision == "mxfp8":
-            policy = package.BlockScaledConfig(format=package.BlockScaledFormat.MXFP8_E4M3, pipeline=self.pipeline)
+            policy = package.BlockScaledConfig(
+                format=package.BlockScaledFormat.MXFP8_E4M3, pipeline=self.pipeline, fast_math=self.fast_math
+            )
+        host_scratch = None
+        if self.host_scratch_capacity_factor is not None:
+            host_scratch = package.VmmConfig(
+                total_scratch_capacity_factor=self.host_scratch_capacity_factor, prefetch=self.vmm_prefetch
+            )
         config = package.Config(
             max_num_local_input_tokens=self.max_tokens_per_rank,
             hidden_dim=hidden_dim,
@@ -110,6 +154,10 @@ class DistMoEConfig:
             max_moe_layers_per_activation_slot=num_layers,
             activation_slot_capacity_factor=self.activation_slot_capacity_factor,
             device_scratch_capacity_factor=self.device_scratch_capacity_factor,
+            activation_slot_bytes=self.activation_slot_bytes,
+            vmm=host_scratch,
+            num_sms=self.num_sms,
+            bf16_grouped_gemm_preset=self.bf16_grouped_gemm_preset,
             block_scaled=policy,
             wgrad_dtype=torch.bfloat16,
         )
