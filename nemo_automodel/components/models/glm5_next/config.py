@@ -27,6 +27,13 @@ def _drop_unset_architectures(config_dict: dict[str, Any]) -> dict[str, Any]:
     return config_dict
 
 
+def _layer_split(layer_types: list[str]) -> tuple[list[int], list[int]]:
+    """Return the 0-based ``kda_layers`` / ``full_attn_layers`` of a layer schedule."""
+    kda_layers = [idx for idx, layer_type in enumerate(layer_types) if layer_type == "linear_attention"]
+    full_attn_layers = [idx for idx, layer_type in enumerate(layer_types) if layer_type != "linear_attention"]
+    return kda_layers, full_attn_layers
+
+
 def _json_safe_value(value: Any) -> Any:
     """Return a JSON-serializable representation of a config value."""
     if value.__class__.__module__ == "torch" and value.__class__.__name__ == "dtype":
@@ -187,8 +194,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         # (0-based), which SGLang and Miles read. Keep both lists and derive them from ``layer_types``.
         # Indices at or past ``num_hidden_layers`` are ignored in the check, so a config truncated to its
         # first layers (``num_hidden_layers`` and ``layer_types`` shortened, the lists left as released) loads.
-        kda_layers = [idx for idx, layer_type in enumerate(self.layer_types) if layer_type == "linear_attention"]
-        full_attn_layers = [idx for idx, layer_type in enumerate(self.layer_types) if layer_type != "linear_attention"]
+        kda_layers, full_attn_layers = _layer_split(self.layer_types)
         for key, layers in (("kda_layers", kda_layers), ("full_attn_layers", full_attn_layers)):
             if linear_attn_config is not None and key in linear_attn_config:
                 provided = sorted(idx for idx in linear_attn_config[key] if idx < num_hidden_layers)
@@ -249,7 +255,14 @@ class Glm5NextTextConfig(PretrainedConfig):
         return self.n_routed_experts
 
     def to_dict(self) -> dict[str, Any]:
-        return _drop_unset_architectures(_json_safe_value(super().to_dict()))
+        config_dict = _drop_unset_architectures(_json_safe_value(super().to_dict()))
+        # Config overrides set ``layer_types`` / ``num_hidden_layers`` after construction, so the
+        # serialized split is derived from the schedule the model is built from.
+        if isinstance(config_dict.get("linear_attn_config"), dict):
+            kda_layers, full_attn_layers = _layer_split(self.layer_types[: self.num_hidden_layers])
+            config_dict["linear_attn_config"]["kda_layers"] = kda_layers
+            config_dict["linear_attn_config"]["full_attn_layers"] = full_attn_layers
+        return config_dict
 
 
 class Glm5NextVisionConfig(PretrainedConfig):

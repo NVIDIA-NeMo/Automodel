@@ -1,16 +1,20 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from nemo_automodel._transformers.model_init import _consume_config_overrides
 from nemo_automodel._transformers.registry import (
     _CUSTOM_CONFIG_REGISTRATIONS,
     MODEL_ARCH_MAPPING,
     resolve_custom_config_cls,
 )
+from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
 from nemo_automodel.components.models.glm5_next.config import Glm5NextConfig, Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
+from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config
 
 
 def test_checkpoint_style_nested_config_resolves_hybrid_patterns():
@@ -148,3 +152,58 @@ def test_export_config_json_top_level_architectures_survive_text_config_merge():
     merged = {"architectures": exported["architectures"], **exported["text_config"]}
 
     assert merged["architectures"] == ["Glm5NextForConditionalGeneration"]
+
+
+@pytest.mark.parametrize(
+    ("text_config_override", "kda_layers", "full_attn_layers"),
+    [
+        (
+            {
+                "layer_types": [
+                    "deepseek_sparse_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                ]
+            },
+            [1, 2, 3],
+            [0],
+        ),
+        (
+            {
+                "num_hidden_layers": 2,
+                "layer_types": ["linear_attention", "linear_attention"],
+                "mlp_layer_types": ["dense", "dense"],
+                "indexer_types": ["full", "full"],
+            },
+            [0, 1],
+            [],
+        ),
+    ],
+    ids=["reordered-schedule", "two-layer-prefix"],
+)
+def test_overridden_layer_schedule_exports_its_own_split(tmp_path, text_config_override, kda_layers, full_attn_layers):
+    # Recipe overrides reach the built config through ``setattr`` after construction.
+    config = tiny_glm5_next_config()
+    _consume_config_overrides(config, {"text_config": text_config_override})
+    model = Glm5NextForConditionalGeneration(config, backend=tiny_backend())
+    assert sorted(model.model.language_model.layers.keys(), key=int) == [
+        str(idx) for idx in range(text_config_override.get("num_hidden_layers", 4))
+    ]
+
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[model]),
+        hf_metadata_dir=str(tmp_path),
+        tokenizer=None,
+        fqn_to_file_index_mapping={},
+        fqn_to_dtype_mapping=None,
+        original_model_path=None,
+        v4_compatible=False,
+    )
+
+    saved = json.loads((tmp_path / "config.json").read_text())["text_config"]["linear_attn_config"]
+    assert saved["kda_layers"] == kda_layers
+    assert saved["full_attn_layers"] == full_attn_layers
+    reloaded = Glm5NextConfig.from_pretrained(tmp_path)
+    assert reloaded.text_config.layer_types == text_config_override["layer_types"]
+    assert reloaded.text_config.linear_attn_config["kda_layers"] == kda_layers
