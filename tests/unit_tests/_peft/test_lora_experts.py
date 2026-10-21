@@ -451,19 +451,47 @@ def test_grouped_experts_lora_forward(moe_config, device):
     assert not torch.isinf(out).any()
 
 
-def _assert_per_expert_std(lora_A: torch.Tensor, expected_std: float, rel: float = 0.1) -> None:
-    """Every expert's [in, rank] slice must have the std of one xavier-initialized [in, rank] matrix."""
-    for expert in range(lora_A.shape[0]):
+_STD_SIGMAS = 6.0  # width of the accepted band around the expected std, in sampling-error sigmas
+
+
+def _std_tolerance(n_samples: int) -> float:
+    """Relative tolerance for the sample std of ``n_samples`` draws: ``_STD_SIGMAS`` times its sampling error.
+
+    For normal draws the relative standard error of the sample std is 1 / sqrt(2 n); uniform draws have a smaller
+    one, so the same band is conservative for kaiming. Six sigmas keep a false failure below 1e-8 per check without
+    depending on the RNG seed.
+    """
+    return _STD_SIGMAS / math.sqrt(2.0 * n_samples)
+
+
+def _stacked_tensor_init_std(lora_A: torch.Tensor, init_method: str) -> float:
+    """The std the previous initializer gave every expert: the fans torch reads off the whole [E, in, rank] stack."""
+    n_experts, in_features, rank = lora_A.shape
+    fan_in, fan_out = in_features * rank, n_experts * rank
+    if init_method == "xavier":
+        return math.sqrt(2.0 / (fan_in + fan_out))
+    return 1.0 / math.sqrt(3.0 * fan_in)  # kaiming_uniform_(a=sqrt(5)): bound 1/sqrt(fan_in), std bound/sqrt(3)
+
+
+def _assert_per_expert_std(lora_A: torch.Tensor, expected_std: float, init_method: str = "xavier") -> None:
+    """Every expert's [in, rank] slice has the std of one 2-D xavier/kaiming matrix, within a sample-size-derived band.
+
+    The band is wide enough to accept any valid draw and still rejects the stacked-tensor initializer: that std is
+    asserted to lie more than two band widths away, so the test keeps its negative control on the old behaviour.
+    """
+    n_experts, in_features, rank = lora_A.shape
+    tol = _std_tolerance(in_features * rank)
+    legacy_std = _stacked_tensor_init_std(lora_A, init_method)
+    assert abs(legacy_std - expected_std) > 2.0 * tol * expected_std, (legacy_std, expected_std, tol)
+    for expert in range(n_experts):
         std = lora_A[expert].float().std().item()
-        assert std == pytest.approx(expected_std, rel=rel), (expert, std, expected_std)
+        assert std == pytest.approx(expected_std, rel=tol), (expert, std, expected_std, tol, legacy_std)
 
 
-def _assert_per_expert_uniform(lora_A: torch.Tensor, bound: float, rel: float = 0.1) -> None:
-    """Every expert's slice is uniform(-bound, bound): bounded and with the matching std bound / sqrt(3)."""
+def _assert_per_expert_uniform(lora_A: torch.Tensor, bound: float) -> None:
+    """Every expert's slice is uniform(-bound, bound): bounded, and with the std of that distribution per expert."""
     assert lora_A.abs().max().item() <= bound
-    for expert in range(lora_A.shape[0]):
-        std = lora_A[expert].float().std().item()
-        assert std == pytest.approx(bound / math.sqrt(3.0), rel=rel), (expert, std, bound)
+    _assert_per_expert_std(lora_A, bound / math.sqrt(3.0), init_method="kaiming")
 
 
 def _wide_moe_config(moe_config, n_routed_experts: int):
@@ -485,13 +513,8 @@ def test_grouped_experts_lora_xavier_init_is_per_expert_scale(moe_config, n_rout
     rank = 4
     torch.manual_seed(0)
     lora_experts = GroupedExpertsLoRA(GroupedExperts(config), lora_dim=rank, alpha=8, lora_A_init_method="xavier")
-    expected_up = math.sqrt(2.0 / (config.dim + rank))
-    expected_down = math.sqrt(2.0 / (config.moe_inter_dim + rank))
-    # The fans torch reads off the stacked [E, in, rank] tensor would give this much smaller scale.
-    stacked_up = math.sqrt(2.0 / (config.dim * rank + n_routed_experts * rank))
-    assert stacked_up < 0.6 * expected_up
-    _assert_per_expert_std(lora_experts.lora_gate_and_up_A, expected_up)
-    _assert_per_expert_std(lora_experts.lora_down_A, expected_down)
+    _assert_per_expert_std(lora_experts.lora_gate_and_up_A, math.sqrt(2.0 / (config.dim + rank)))
+    _assert_per_expert_std(lora_experts.lora_down_A, math.sqrt(2.0 / (config.moe_inter_dim + rank)))
     assert torch.count_nonzero(lora_experts.lora_gate_and_up_B) == 0
     assert torch.count_nonzero(lora_experts.lora_down_B) == 0
 
@@ -535,6 +558,7 @@ def test_grouped_experts_deepep_lora_xavier_init_is_per_expert_scale(moe_config,
 def test_lora_weight_initialization_xavier(moe_config, device):
     """Test Xavier initialization for LoRA weights."""
     moe_config = _wide_moe_config(moe_config, 4)  # enough elements per expert for a stable std estimate
+    torch.manual_seed(0)  # the std assertions below sample the initializer; do not inherit another test's RNG state
     orig_experts = GroupedExperts(moe_config).to(device)
     with torch.no_grad():
         orig_experts.init_weights(buffer_device=device)
@@ -554,6 +578,7 @@ def test_lora_weight_initialization_xavier(moe_config, device):
 def test_lora_weight_initialization_kaiming(moe_config, device):
     """Test Kaiming initialization for LoRA weights."""
     moe_config = _wide_moe_config(moe_config, 4)  # enough elements per expert for a stable std estimate
+    torch.manual_seed(0)  # the std assertions below sample the initializer; do not inherit another test's RNG state
     orig_experts = GroupedExperts(moe_config).to(device)
     with torch.no_grad():
         orig_experts.init_weights(buffer_device=device)
