@@ -1,8 +1,6 @@
 override-dependencies = [
-    # Pillow 13 requires Python 3.11+; retain the security floor on Python 3.10.
-    # Override Trackio's Pillow<13 cap on supported interpreters.
-    "pillow>=12.3.0,<13; python_version < '3.11'",
-    "pillow==13.0.0; python_version >= '3.11'",
+    # Override Trackio's Pillow<13 cap to enforce the security update.
+    "pillow==13.0.0",
     # leptonai (via nemo-run) caps anyio<=4.9.0; retain the security floor
     "anyio>=4.14.2",
     "cuda-bindings; sys_platform == 'never'",

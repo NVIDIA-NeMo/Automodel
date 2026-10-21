@@ -293,6 +293,12 @@ magi = [
 
 [tool.uv]
 managed = true
+# Pillow 13 requires Python 3.11+; keep package metadata unchanged.
+# Preserve the x86_64 lock partition consumed by the CUDA wheelhouse selector.
+environments = [
+    "python_version >= '3.11' and platform_machine == 'x86_64'",
+    "python_version >= '3.11' and platform_machine != 'x86_64'",
+]
 default-groups = ["build", "docs", "test"]
 no-build-isolation-package = [
     "bitsandbytes",
@@ -357,10 +363,8 @@ constraint-dependencies = [
     "apache-tvm-ffi<=0.1.11",
 ]
 override-dependencies = [
-    # Pillow 13 requires Python 3.11+; retain the security floor on Python 3.10.
-    # Override Trackio's Pillow<13 cap on supported interpreters.
-    "pillow>=12.3.0,<13; python_version < '3.11'",
-    "pillow==13.0.0; python_version >= '3.11'",
+    # Override Trackio's Pillow<13 cap to enforce the security update.
+    "pillow==13.0.0",
     # leptonai (via nemo-run) caps anyio<=4.9.0; override to keep the security floor
     "anyio>=4.14.2",
     # TE native grouped GEMM with current-scaling FP8 requires cuBLASLt 13.5+ on Hopper.
