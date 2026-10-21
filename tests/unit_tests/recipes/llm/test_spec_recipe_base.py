@@ -21,7 +21,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm import _spec_recipe_base
 from nemo_automodel.recipes.llm._spec_recipe_base import SpecDecodeRecipeBase
 
@@ -63,7 +66,7 @@ class _Cfg(SimpleNamespace):
         return getattr(self, key, default)
 
 
-def _make_recipe(cls, tmp_path, *, is_async=False, cp_mesh=None):
+def _make_recipe(cls, tmp_path, *, is_async=False, cp_mesh=None, cfg=None):
     events = []
     obj = cls.__new__(cls)
     obj.events = events
@@ -87,7 +90,7 @@ def _make_recipe(cls, tmp_path, *, is_async=False, cp_mesh=None):
     obj.lr_scheduler = object()
     obj.rng = object()
     obj.cp_mesh = cp_mesh
-    obj.cfg = SimpleNamespace(raw_config={})
+    obj.cfg = cfg if cfg is not None else ConfigNode({})
     obj.dist_env = SimpleNamespace(is_main=True)
     return obj, events
 
@@ -343,6 +346,37 @@ def test_load_checkpoint_early_returns(tmp_path, monkeypatch):
     )
     with pytest.raises(FileNotFoundError):
         obj.load_checkpoint("missing")
+
+
+def test_cli_override_survives_config_snapshot_and_auto_resume(tmp_path, monkeypatch, caplog):
+    # A LoRA YAML launched with `--peft None`, preempted, and relaunched with the same command
+    # must auto-resume from its own checkpoint instead of judging it incompatible.
+    monkeypatch.setenv("SPEC_RECIPE_TEST_MODEL", "org/model")
+    cfg_path = tmp_path / "recipe.yaml"
+    cfg_path.write_text(
+        "model:\n"
+        "  pretrained_model_name_or_path: ${oc.env:SPEC_RECIPE_TEST_MODEL}\n"
+        "peft:\n"
+        "  _target_: nemo_automodel.components._peft.lora.PeftConfig\n"
+        "  dim: 8\n"
+    )
+    argv = ["--config", str(cfg_path), "--peft", "None"]
+    ckpt_root = tmp_path / "ckpts"
+    ckpt = ckpt_root / "epoch_0_step_1"
+    ckpt.mkdir(parents=True)
+    first_run, _ = _make_recipe(_Recipe, ckpt_root, cfg=parse_args_and_load_config(argv=argv))
+    first_run.save_checkpoint(epoch=0, step=1)
+    saved = yaml.safe_load((ckpt / "config.yaml").read_text())
+
+    relaunch, events = _make_recipe(_Recipe, ckpt_root, cfg=parse_args_and_load_config(argv=argv))
+    with caplog.at_level(logging.WARNING):
+        relaunch.load_checkpoint()
+
+    assert saved["peft"] is None
+    # The snapshot keeps env placeholders unresolved rather than baking in their values.
+    assert saved["model"]["pretrained_model_name_or_path"] == "${oc.env:SPEC_RECIPE_TEST_MODEL}"
+    assert "Skipping restore" not in caplog.text
+    assert events == ["load_model", "load_optimizer", "load_rng_dp", ("extra_load", str(ckpt))]
 
 
 # --------------------------------------------------------------------------- #

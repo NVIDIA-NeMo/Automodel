@@ -31,6 +31,7 @@ checkpointer tests; this file only validates the EAGLE-specific wiring.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete, mark_checkpoint_incomplete
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
 
@@ -527,16 +529,22 @@ def test_eagle1_save_checkpoint_refuses_to_overwrite_published_dir(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_eagle1_save_checkpoint_config_snapshot_failure_nonfatal(tmp_path):
+def test_eagle1_save_checkpoint_config_snapshot_failure_nonfatal(tmp_path, monkeypatch, caplog):
     """If save_config raises, save_checkpoint logs a warning but does not crash."""
     recipe = _bare_eagle1_recipe(tmp_path)
     recipe.runtime.global_step = 5
-    del recipe.cfg.raw_config
+    recipe.cfg = ConfigNode({})
 
-    recipe.save_checkpoint(epoch=1, step=5, train_loss=0.5)
+    def _fail(cfg, path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm._spec_recipe_base.save_config", _fail)
+    with caplog.at_level(logging.WARNING):
+        recipe.save_checkpoint(epoch=1, step=5, train_loss=0.5)
 
     ckpt_path = os.path.join(recipe.checkpoint_config.checkpoint_dir, "epoch_1_step_5")
     assert os.path.isdir(ckpt_path)
+    assert "Failed to save config snapshot" in caplog.text
 
 
 # ---------------------------------------------------------------------------

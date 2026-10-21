@@ -115,7 +115,7 @@ def test_save_checkpoint_applies_retention_after_sync_save(tmp_path, monkeypatch
     obj.lr_scheduler = SimpleNamespace()
     obj.rng = SimpleNamespace()
     obj.runtime = SimpleNamespace(global_step=1)
-    obj.cfg = SimpleNamespace(raw_config={})
+    obj.cfg = ConfigNode({})
     obj.block_size = 4
     obj.num_anchors = 2
     obj.mask_token_id = 99
@@ -156,7 +156,7 @@ def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path
     obj.lr_scheduler = SimpleNamespace()
     obj.rng = SimpleNamespace()
     obj.runtime = SimpleNamespace(global_step=1)
-    obj.cfg = SimpleNamespace(raw_config={})
+    obj.cfg = ConfigNode({})
     obj.block_size = 4
     obj.num_anchors = 2
     obj.mask_token_id = 99

@@ -29,6 +29,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.recipes.llm import train_dflash
@@ -157,7 +158,7 @@ def test_save_checkpoint_applies_retention_after_sync_save(tmp_path, monkeypatch
     obj.lr_scheduler = SimpleNamespace()
     obj.rng = SimpleNamespace()
     obj.runtime = SimpleNamespace(global_step=1)
-    obj.cfg = SimpleNamespace(raw_config={})
+    obj.cfg = ConfigNode({})
     obj.block_size = 4
     obj.mask_token_id = 99
     obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
@@ -196,7 +197,7 @@ def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path
     obj.lr_scheduler = SimpleNamespace()
     obj.rng = SimpleNamespace()
     obj.runtime = SimpleNamespace(global_step=1)
-    obj.cfg = SimpleNamespace(raw_config={})
+    obj.cfg = ConfigNode({})
     obj.block_size = 4
     obj.mask_token_id = 99
     obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
