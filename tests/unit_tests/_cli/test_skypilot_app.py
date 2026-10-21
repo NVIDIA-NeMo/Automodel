@@ -152,6 +152,27 @@ def test_build_command_extra_args():
     assert "val" in cmd
 
 
+def test_build_command_extra_args_reach_recipe_verbatim(monkeypatch):
+    extra_args = [
+        "--peft.target_modules",
+        "['q_proj', 'v_proj']",
+        "--model.name",
+        "a b",
+        "--peft.exclude_modules=['x','y']",
+    ]
+    launcher = SkyPilotLauncher()
+    cmd = launcher._build_command(
+        RECIPE_TARGET,
+        "/tmp/config.yaml",
+        gpus_per_node=1,
+        num_nodes=1,
+        extra_args=extra_args,
+    )
+    argv = _torchrun_argv_under_bash(cmd, monkeypatch)
+    # The remote shell must not split or unquote overrides, so the recipe sees them as a local run would.
+    assert argv[-len(extra_args) :] == extra_args
+
+
 # ---------------------------------------------------------------------------
 # SkyPilotLauncher.launch
 # ---------------------------------------------------------------------------
