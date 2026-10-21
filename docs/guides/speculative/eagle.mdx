@@ -195,6 +195,59 @@ recipe_args:
   norm_output: true
 ```
 
+### EAGLE-4 Drafter
+
+[EAGLE-4](https://github.com/eagle-hq/EAGLE-4) keeps the single-layer EAGLE-3.1
+draft and adds two structures, both produced by the same `train_eagle3` recipe
+through `recipe_args.eagle4`:
+
+| Structure | Effect |
+|-----------|--------|
+| Sliding-window draft layer (`eagle4.sliding_window`) | Every query attends to the last `sliding_window` keys up to itself, as in the EAGLE-4 serving kernels: at TTT depth `i` the window holds the query's `i` chain keys and the `sliding_window - i` context keys before them. The draft's attention cost stops growing with the context. `sliding_window` must be at least `ttt_steps`. |
+| Low-rank candidate head (`eagle4.candidate_head`) | `efficient_lm_head(efficient_lm_head_down_proj(h))` scores the full vocabulary at rank `rank`; the serving engine keeps the top `num_candidates` tokens and rescores only those with the full `lm_head`, which removes most of the draft's LM-head cost. |
+
+EAGLE-4 drafts score the full target vocabulary, so leave `draft_vocab_size`
+unset, and keep `freeze_embeddings: true`: the serving adapters load the
+target's embeddings into the draft. Training runs in two stages:
+
+1. **Draft stage** ([`qwen3_8b_eagle4.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle4/qwen3_8b_eagle4.yaml)):
+   the standard TTT loss with the windowed layer.
+2. **Candidate-head stage** ([`qwen3_8b_eagle4_candidate_head.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle4/qwen3_8b_eagle4_candidate_head.yaml)):
+   warm-starts from the stage-1 checkpoint (`draft_weights_path`), freezes every
+   stage-1 parameter, initializes the two factors from the truncated SVD of the
+   draft `lm_head`, and fits them at every TTT depth to the full head's
+   distribution with forward KL. The logged accuracy is candidate recall: how
+   often the full head's top-1 token is among the top `num_candidates`
+   low-rank scores. At startup it checks that the stage-1 draft has the same
+   window, `fc_norm` / `norm_output`, auxiliary target layers (in order) and the
+   target's embeddings.
+
+```yaml
+recipe_args:
+  # ... standard EAGLE-3.1 fields, no draft_vocab_size ...
+  draft_weights_path: ./outputs/eagle4_qwen3_8b/checkpoints/<step>/model/consolidated  # stage 2 only
+  eagle4:
+    sliding_window: 2048  # below seq_length, so training exercises the window
+    candidate_head:   # stage 2 only
+      rank: 128
+      num_candidates: 128
+```
+
+The stage-2 checkpoint exports to the layout of the released
+`LlamaForCausalLMEagle4` drafts, the format the EAGLE-4 engine plugins read
+(serving config keys only, `model.` prefix dropped):
+
+```bash
+python -m nemo_automodel.components.speculative.eagle.export_eagle4 <stage-2 checkpoint>/model/consolidated --output-dir ./outputs/eagle4_export
+```
+
+EAGLE-4 supports Llama, Phi-3, Qwen3, Qwen3-MoE and Gemma4 targets (for
+Gemma4, set `target_force_hf: true` and `target_attn_implementation: sdpa` as in
+the EAGLE-3 Gemma4 examples). The draft is always built from a Llama-style
+config with a SwiGLU MLP, as the `LlamaForCausalLMEagle4` layout requires; for
+Gemma4 the target's global RoPE base is used. Context parallelism, P-EAGLE and
+`decode_eval` are rejected.
+
 ### How EAGLE-1 Differs
 
 EAGLE-1 is simpler: it uses a single transformer layer, predicts the full
@@ -385,6 +438,8 @@ checkpoint:
 | `target_attn_implementation` | Optional attention backend for the frozen target (e.g. `sdpa`); defaults to HF auto-select. Set `sdpa` if the target's FlashAttention path is broken on your build (e.g. the Qwen3 FA2 `s_aux` crash) |
 | `fc_norm` | EAGLE-3.1: per-chunk independent RMSNorm (`ModuleList`) on auxiliary hidden states before the `fc` projection (default `false`) |
 | `norm_output` | EAGLE-3.1: feed the post-`model.norm` hidden state into the next TTT step and `lm_head` (default `false`) |
+| `eagle4.sliding_window` | EAGLE-4: keys each draft query attends to, its TTT chain included (at least `ttt_steps`; `null` = full attention) |
+| `eagle4.candidate_head.rank`, `eagle4.candidate_head.num_candidates` | EAGLE-4 stage 2: train the low-rank candidate head (requires `draft_weights_path`) |
 | `warmup_ratio` | Fraction of total steps for LR warmup |
 
 ### Launch training
@@ -676,6 +731,8 @@ python -m nemo_automodel.components.speculative.serve_sglang \
 | [llama_eagle3_mvp_flash_attn.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle3/llama_eagle3_mvp_flash_attn.yaml) | Llama 3.2 1B | EAGLE-3 | With FlashAttention-2 |
 | [llama_eagle3_perfectblend.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle3/llama_eagle3_perfectblend.yaml) | Llama 3.1 8B | EAGLE-3 | Production config, 200k samples |
 | [llama_eagle3_1_perfectblend.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle3_1/llama_eagle3_1_perfectblend.yaml) | Llama 3.1 8B | EAGLE-3.1 | Production config with `fc_norm` + `norm_output` enabled |
+| [qwen3_8b_eagle4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle4/qwen3_8b_eagle4.yaml) | Qwen3 8B | EAGLE-4 | Stage 1: sliding-window draft, full vocabulary |
+| [qwen3_8b_eagle4_candidate_head.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle4/qwen3_8b_eagle4_candidate_head.yaml) | Qwen3 8B | EAGLE-4 | Stage 2: low-rank candidate head on the stage-1 draft |
 | [llama_eagle1_perfectblend.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle1/llama_eagle1_perfectblend.yaml) | Llama 3.2 1B | EAGLE-1 | Quick test, single GPU |
 | [llama_eagle2_perfectblend.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle2/llama_eagle2_perfectblend.yaml) | Llama 3.2 1B | EAGLE-2 | Same as EAGLE-1 (alias) |
 
