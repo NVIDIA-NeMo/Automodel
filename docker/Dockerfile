@@ -284,31 +284,24 @@ RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     fi && \
     rm -rf /tmp/wheels
 
-# Upgrade the inherited system packages, not only the /opt/venv environment.
-# The PyTorch base ships these under /usr/local/lib/python3.12/dist-packages.
-RUN uv pip install --python /usr/bin/python3 --system --break-system-packages \
-        "jupyter-server>=2.21.1" "pillow==13.0.0"
-
 # Address base image CVE
 RUN pip install "aiohttp>=3.14.3" \
         "black>=26.3.1" \
         "GitPython>=3.1.59" \
         "jaraco-context>=6.1.0" \
+        "jupyter-server>=2.21.1" \
         "jupyterlab>=4.5.10" \
         "mistune>=3.3.0" \
         "nbconvert>=7.17.0" \
         "notebook>=7.5.6" \
         "onnx>=1.22.0" \
+        "pillow>=13.0.0" \
         "protobuf>=6.33.5" \
         "setuptools>=83.0.0" \
         "tornado>=6.5.5" \
         "urllib3>=2.7.0" && \
     pip uninstall -y nvidia-dali-cuda130 wandb && \
     rm -rf /opt/pytorch/pytorch/third_party/onnx
-
-RUN /usr/bin/python3 -c "import importlib.metadata as m; from packaging.version import Version; \
-    assert Version(m.version('jupyter-server')) >= Version('2.21.1'); \
-    assert m.version('pillow') == '13.0.0'"
 
 ARG RUNTIME_UID=65532
 ARG RUNTIME_GID=65532

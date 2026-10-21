@@ -1,8 +1,7 @@
 override-dependencies = [
-    # Trackio caps Pillow<13; local image logging is covered by test_trackio_pillow_compat.py.
-    # Remove this override when Trackio accepts Pillow 13. Keep Python 3.10 supported.
-    "pillow>=12.3.0,<13; python_version < '3.11'",
-    "pillow==13.0.0; python_version >= '3.11'",
+    # Trackio caps Pillow<13; override to retain the security floor.
+    # Remove this override when Trackio accepts Pillow 13.
+    "pillow>=13.0.0",
     # leptonai (via nemo-run) caps anyio<=4.9.0; retain the security floor
     "anyio>=4.14.2",
     "cuda-bindings; sys_platform == 'never'",
