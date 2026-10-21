@@ -306,6 +306,24 @@ def test_candidate_head_rejects_unsupported_configs(head_config):
         LlamaEagle3DraftModel(config)
 
 
+def test_candidate_head_rank_must_stay_below_the_hidden_size():
+    config = _config(rank=4)
+    config.efficient_lm_head_config = {"type": "low_rank", "rank": HIDDEN + 1, "num_candidates": 8}
+    with pytest.raises(ValueError, match="exceeds min"):
+        LlamaEagle3DraftModel(config)
+
+
+def test_svd_init_zeroes_directions_beyond_the_numerical_rank():
+    """A head of rank 2 initialized at rank 4 keeps finite factors and still reproduces lm_head."""
+    draft = _draft(rank=4)
+    with torch.no_grad():
+        draft.lm_head.weight.copy_(torch.randn(VOCAB, 2) @ torch.randn(2, HIDDEN))
+    draft.init_efficient_lm_head_from_lm_head()
+    assert torch.isfinite(draft.efficient_lm_head.weight).all()
+    product = draft.efficient_lm_head.weight @ draft.efficient_lm_head_down_proj.weight
+    torch.testing.assert_close(product, draft.lm_head.weight, atol=1e-4, rtol=1e-4)
+
+
 def test_candidate_head_requires_the_full_vocabulary():
     config = _config(rank=4)
     config.draft_vocab_size = VOCAB // 2
@@ -409,7 +427,7 @@ def test_candidate_head_trainer_requires_a_candidate_head():
 
 
 def test_exact_low_rank_head_has_full_recall_and_zero_kl():
-    """When lm_head itself has rank r, the SVD init reproduces it: recall 1 and loss = teacher entropy."""
+    """When lm_head itself has rank r, the SVD init reproduces it: recall 1 and a zero KL."""
     draft = _draft(rank=4)
     with torch.no_grad():
         draft.lm_head.weight.copy_(torch.randn(VOCAB, 4) @ torch.randn(4, HIDDEN))
@@ -417,11 +435,7 @@ def test_exact_low_rank_head_has_full_recall_and_zero_kl():
     batch = _batch()
     metrics = _trainer(draft, ttt_steps=1, num_candidates=1)(**batch)
     assert metrics.accuracy.item() == pytest.approx(1.0)
-    with torch.no_grad():
-        hidden = _unroll(draft, batch["aux_hidden_states"], batch["input_ids"], steps=1)[0]
-        probs = torch.softmax(draft.compute_logits(hidden).float(), dim=-1)
-        entropy = -(probs * probs.log()).sum(-1).mean()
-    torch.testing.assert_close(metrics.loss, entropy, atol=1e-4, rtol=1e-4)
+    assert metrics.loss.item() == pytest.approx(0.0, abs=1e-4)
 
 
 @pytest.mark.parametrize("num_candidates, recall", [(1, 0.0), (VOCAB, 1.0)])
@@ -433,6 +447,16 @@ def test_recall_counts_the_teacher_top1_inside_the_top_k(num_candidates, recall)
         draft.efficient_lm_head.weight.copy_(-draft.lm_head.weight)
     trainer = Eagle4CandidateHeadTrainerModule(draft, ttt_steps=2, num_candidates=num_candidates)
     assert trainer(**_batch()).accuracy.item() == pytest.approx(recall)
+
+
+def test_tied_scores_count_against_the_teacher_top1():
+    """A head that scores every token the same retrieves nothing unless K covers the whole vocabulary."""
+    draft = _draft(rank=4)
+    with torch.no_grad():
+        draft.efficient_lm_head.weight.zero_()
+    for num_candidates, recall in ((VOCAB - 1, 0.0), (VOCAB, 1.0)):
+        trainer = Eagle4CandidateHeadTrainerModule(draft, ttt_steps=1, num_candidates=num_candidates)
+        assert trainer(**_batch()).accuracy.item() == pytest.approx(recall)
 
 
 def test_training_reduces_the_loss_and_only_updates_the_factors():

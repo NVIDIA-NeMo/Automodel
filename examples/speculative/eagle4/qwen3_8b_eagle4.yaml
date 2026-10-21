@@ -41,8 +41,9 @@ recipe_args:
 
   eagle4:
     # Context keys the draft layer attends to, itself included (null = full
-    # attention). The window only changes the draft on contexts longer than it.
-    sliding_window: 4096
+    # attention). Keep it below seq_length so training exercises the window
+    # the serving engine applies on long contexts.
+    sliding_window: 2048
 
 optimizer:
   lr: 1.0e-4

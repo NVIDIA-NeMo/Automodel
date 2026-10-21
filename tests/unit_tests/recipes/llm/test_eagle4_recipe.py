@@ -34,7 +34,9 @@ from nemo_automodel.components.speculative.eagle.eagle4 import (
     Eagle4Config,
 )
 from nemo_automodel.components.speculative.eagle.registry import DraftSpec
+from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.recipes.llm.train_eagle3 import (
+    _check_candidate_head_warm_start,
     _load_draft_weights,
     _parse_eagle4_config,
     _prepare_candidate_head_training,
@@ -231,6 +233,7 @@ def test_setup_trains_both_eagle4_stages(tmp_path):
     save_file(
         {k: v.contiguous() for k, v in stage1.draft_model.state_dict().items()}, str(tmp_path / "model.safetensors")
     )
+    (tmp_path / "config.json").write_text(stage1.draft_model.config.to_json_string(use_diff=False))
     stage2 = _run_setup_to_trainer(
         {
             "eagle4": {"sliding_window": 16, "candidate_head": {"rank": 4, "num_candidates": 8}},
@@ -255,3 +258,63 @@ def test_setup_rejects_a_compressed_draft_vocabulary():
 def test_setup_gates_eagle4_before_loading_the_target():
     with pytest.raises(ValueError, match="draft_weights_path"):
         _run_setup_to_trainer({"eagle4": {"candidate_head": {"rank": 4}}})
+
+
+def test_candidate_head_stage_must_keep_the_stage1_structure(tmp_path):
+    stage1 = _draft(STAGE1)
+    (tmp_path / "config.json").write_text(stage1.config.to_json_string(use_diff=False))
+    _check_candidate_head_warm_start(_draft(STAGE2).config, str(tmp_path))
+    _check_candidate_head_warm_start(_draft(STAGE2).config, str(tmp_path / "model.safetensors"))  # file path
+
+    other_window = Eagle4Config(sliding_window=2048, candidate_head=STAGE2.candidate_head)
+    with pytest.raises(ValueError, match="sliding_window"):
+        _check_candidate_head_warm_start(_draft(other_window).config, str(tmp_path))
+    no_norm_output = _draft(STAGE2).config
+    no_norm_output.norm_output = True
+    with pytest.raises(ValueError, match="norm_output"):
+        _check_candidate_head_warm_start(no_norm_output, str(tmp_path))
+
+
+def test_candidate_head_warm_start_without_config_is_not_checked(tmp_path, caplog):
+    _check_candidate_head_warm_start(_draft(STAGE2).config, str(tmp_path))
+    assert "no config.json" in caplog.text
+
+
+def _aux_ids(target_wrapper, cached=None, recipe_ids=None):
+    recipe = SimpleNamespace(target_wrapper=target_wrapper, _cached_aux_layer_ids=cached)
+    recipe_cfg = SimpleNamespace(get=lambda key, default=None: recipe_ids if key == "aux_layer_ids" else default)
+    base = LlamaConfig(num_hidden_layers=8)
+    return recipe_module.TrainEagle3Recipe._supervision_aux_layer_ids(recipe, recipe_cfg, base)
+
+
+def test_aux_layer_ids_come_from_the_supervision_source():
+    """The recorded layers are the ones the backend or cache produced, not a recomputed default."""
+    assert _aux_ids(SimpleNamespace(aux_layer_ids=[0, 2, 5]), recipe_ids=[1, 3, 4]) == [0, 2, 5]
+    remote = MagicMock(spec=RemoteEagle3TargetModel)
+    remote.model_info.return_value = {"aux_layer_ids": [2, 5, 6]}
+    assert _aux_ids(remote) == [2, 5, 6]
+    assert _aux_ids(None, cached=[2, 4, 6], recipe_ids=[1, 3, 4]) == [2, 4, 6]
+    assert _aux_ids(None, recipe_ids=[1, 3, 4]) == [1, 3, 4]
+    assert _aux_ids(None) == [1, 3, 4]  # default recipe for an 8-layer target
+
+
+def test_candidate_head_trainer_round_trips_the_checkpoint_metadata(tmp_path):
+    """The recipe saves and restores the trainer's vocab-mapping buffers; stage 2 must provide them."""
+    draft = _draft(STAGE2)
+    trainer = STAGE2.candidate_head.build(draft, ttt_steps=2)
+    saver = SimpleNamespace(runtime=SimpleNamespace(global_step=7), _module=lambda: trainer)
+    recipe_module.TrainEagle3Recipe._save_extra_state(saver, str(tmp_path), epoch=1)
+
+    resumed = STAGE2.candidate_head.build(_draft(STAGE2), ttt_steps=2)
+    loader = SimpleNamespace(
+        runtime=SimpleNamespace(global_step=0),
+        _resume_epoch=0,
+        checkpoint_config=SimpleNamespace(allow_legacy_pickle_restore=False),
+        _module=lambda: resumed,
+        draft_model=resumed.draft_model,
+        target_wrapper=None,
+    )
+    recipe_module.TrainEagle3Recipe._load_extra_state(loader, str(tmp_path))
+    assert loader.runtime.global_step == 7 and loader._resume_epoch == 1
+    torch.testing.assert_close(resumed.selected_token_ids, torch.arange(64))
+    assert resumed.selected_token_mask.all()

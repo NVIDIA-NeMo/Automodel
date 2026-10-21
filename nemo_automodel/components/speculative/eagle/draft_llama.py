@@ -948,6 +948,11 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
                     f"efficient_lm_head_config={head_config!r} is not supported; expected a dict with "
                     "type='low_rank' and a positive integer rank."
                 )
+            if rank > min(config.hidden_size, config.vocab_size):
+                raise ValueError(
+                    f"efficient_lm_head_config rank={rank} exceeds min(hidden_size, vocab_size)="
+                    f"{min(config.hidden_size, config.vocab_size)}, so the factorization would not be low-rank."
+                )
             if self.has_vocab_compression:
                 raise ValueError(
                     "The EAGLE-4 candidate head scores the full target vocabulary; got "
@@ -1114,11 +1119,16 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
             rows = rows.double()
             gram += rows.T @ rows
         eigenvalues, eigenvectors = torch.linalg.eigh(gram)  # ascending
-        top_values = eigenvalues[-rank:].flip(0).clamp_min(torch.finfo(torch.float64).tiny)
+        top_values = eigenvalues[-rank:].flip(0)
         top_vectors = eigenvectors[:, -rank:].flip(1)  # V_r: [hidden, rank]
-        root = top_values.pow(0.25)  # S_r^(1/2), since eigenvalues are S_r^2
+        # Directions with a negligible singular value carry no signal; zero them
+        # instead of dividing by ~0 (which would write inf into the factor).
+        significant = top_values > top_values[0] * 1e-12
+        root = top_values.clamp_min(0).pow(0.25)  # S_r^(1/2), since eigenvalues are S_r^2
+        inverse_root = torch.where(significant, root.reciprocal(), torch.zeros_like(root))
+        root = torch.where(significant, root, torch.zeros_like(root))
         # U_r S_r^(1/2) = W V_r S_r^(-1/2), written chunk by chunk.
-        projection = top_vectors / root
+        projection = top_vectors * inverse_root
         for rows, up in zip(weight.split(_SVD_CHUNK_ROWS), self.efficient_lm_head.weight.split(_SVD_CHUNK_ROWS)):
             up.copy_(rows.double() @ projection)
         self.efficient_lm_head_down_proj.weight.copy_((top_vectors * root).T)

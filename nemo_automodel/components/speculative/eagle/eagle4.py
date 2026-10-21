@@ -138,6 +138,10 @@ class Eagle4CandidateHeadTrainerModule(nn.Module):
     ``lm_head`` softmax is the teacher and the low-rank scores the student.
     Depth ``i`` is weighted by ``0.8 ** i`` and the sum normalized by the total
     weight, as in the draft stage.
+
+    Like every EAGLE-3-recipe trainer it carries the draft-vocab mapping buffers
+    (``selected_token_ids`` / ``selected_token_mask``) that the recipe saves to and
+    restores from the checkpoint metadata; an EAGLE-4 draft uses the full vocabulary.
     """
 
     def __init__(self, draft_model: LlamaEagle3DraftModel, *, ttt_steps: int, num_candidates: int) -> None:
@@ -146,13 +150,14 @@ class Eagle4CandidateHeadTrainerModule(nn.Module):
             raise ValueError(f"ttt_steps must be a positive integer, got {ttt_steps!r}.")
         if draft_model.efficient_lm_head is None:
             raise ValueError("Eagle4CandidateHeadTrainerModule requires a draft with efficient_lm_head_config.")
-        if num_candidates > draft_model.config.vocab_size:
-            raise ValueError(
-                f"num_candidates={num_candidates} exceeds the vocabulary size {draft_model.config.vocab_size}."
-            )
+        vocab_size = draft_model.config.vocab_size
+        if num_candidates > vocab_size:
+            raise ValueError(f"num_candidates={num_candidates} exceeds the vocabulary size {vocab_size}.")
         self.draft_model = draft_model
         self.ttt_steps = ttt_steps
         self.num_candidates = num_candidates
+        self.register_buffer("selected_token_ids", torch.arange(vocab_size), persistent=True)
+        self.register_buffer("selected_token_mask", torch.ones(vocab_size, dtype=torch.bool), persistent=True)
 
     def forward(
         self,
@@ -196,7 +201,7 @@ class Eagle4CandidateHeadTrainerModule(nn.Module):
                 while ``i < doc_remaining``.
 
         Returns:
-            ``Eagle3StepMetrics`` with the weighted loss, ``accuracy`` set to the
+            ``Eagle3StepMetrics`` with the weighted forward KL (0 for a perfect head), ``accuracy`` set to the
             candidate recall and ``valid_tokens`` summed over depths (no
             accept-length counters).
         """
@@ -227,16 +232,22 @@ class Eagle4CandidateHeadTrainerModule(nn.Module):
             student_logits = draft.compute_candidate_logits(hidden_states)
 
             step_valid = cur_valid if doc_remaining is None else cur_valid & (step_idx < doc_remaining)
-            step_loss = masked_soft_cross_entropy(
+            step_cross_entropy = masked_soft_cross_entropy(
                 logits=student_logits, target_probs=teacher_probs, position_mask=step_valid.unsqueeze(-1)
             )
-            running_loss = running_loss + step_loss * (0.8**step_idx)
-
             with torch.no_grad():
-                # The full head's top-1 token is a candidate when fewer than K
-                # low-rank scores beat its own score (one pass, no vocab topk).
+                # KL(p_full || q) = H(p_full, q) - H(p_full); the entropy term is
+                # constant in the factors, so subtracting it only fixes the
+                # logged value (0 for a perfect head).
+                valid = step_valid.to(teacher_probs.dtype)
+                entropy = torch.special.entr(teacher_probs).sum(dim=-1)
+                step_entropy = (entropy * valid).sum() / valid.sum().clamp_min(1.0)
+                # The full head's top-1 token is a candidate when at most K
+                # low-rank scores reach its score; ties count against it, as a
+                # serving top-K may drop a tied token (one pass, no vocab topk).
                 top1_score = student_logits.gather(-1, teacher_logits.argmax(dim=-1, keepdim=True))
-                hits = ((student_logits > top1_score).sum(dim=-1) < self.num_candidates) & step_valid
+                hits = ((student_logits >= top1_score).sum(dim=-1) <= self.num_candidates) & step_valid
+            running_loss = running_loss + (step_cross_entropy - step_entropy) * (0.8**step_idx)
             running_hits = running_hits + hits.sum()
             running_valid = running_valid + step_valid.sum()
 

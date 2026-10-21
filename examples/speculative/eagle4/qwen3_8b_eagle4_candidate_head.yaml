@@ -44,7 +44,7 @@ recipe_args:
   draft_weights_path: ./outputs/eagle4_qwen3_8b/checkpoints/<step>/model/consolidated
 
   eagle4:
-    sliding_window: 4096
+    sliding_window: 2048  # must match the stage-1 run (checked at startup)
     candidate_head:
       rank: 128
       num_candidates: 128

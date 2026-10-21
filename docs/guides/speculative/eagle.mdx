@@ -224,7 +224,7 @@ recipe_args:
   # ... standard EAGLE-3.1 fields, no draft_vocab_size ...
   draft_weights_path: ./outputs/eagle4_qwen3_8b/checkpoints/<step>/model/consolidated  # stage 2 only
   eagle4:
-    sliding_window: 4096
+    sliding_window: 2048  # below seq_length, so training exercises the window
     candidate_head:   # stage 2 only
       rank: 128
       num_candidates: 128

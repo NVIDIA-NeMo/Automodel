@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import pathlib
@@ -463,6 +464,32 @@ def _validate_eagle4_gates(
             raise ValueError("eagle4.candidate_head has its own loss; lk_loss_type does not apply.")
 
 
+def _check_candidate_head_warm_start(draft_config, path: str) -> None:
+    """Refuse a candidate-head stage whose draft structure differs from the warm-start draft's.
+
+    The sliding window and ``norm_output`` own no tensors, so a stage-2 YAML that
+    disagrees with stage 1 would load cleanly and fit the candidate head to a
+    draft that attends differently from the one that was trained (and export
+    that wrong structure).
+    """
+    checkpoint_dir = pathlib.Path(path)
+    config_path = (checkpoint_dir.parent if checkpoint_dir.is_file() else checkpoint_dir) / "config.json"
+    if not config_path.is_file():
+        logger.warning("draft_weights_path has no config.json; cannot check it against eagle4 (%s)", config_path)
+        return
+    saved = json.loads(config_path.read_text())
+    mismatched = {
+        key: {"warm start": saved.get(key), "this run": getattr(draft_config, key, None)}
+        for key in ("layer_types", "sliding_window", "fc_norm", "norm_output")
+        if saved.get(key) != getattr(draft_config, key, None)
+    }
+    if mismatched:
+        raise ValueError(
+            f"The candidate-head stage must keep the warm-start draft's structure; these differ: {mismatched}. "
+            "Set recipe_args.eagle4.sliding_window, fc_norm and norm_output as in the stage-1 run."
+        )
+
+
 def _prepare_candidate_head_training(draft_model: LlamaEagle3DraftModel, missing_head_keys: set[str]) -> None:
     """Set up the EAGLE-4 candidate-head stage on a warm-started draft.
 
@@ -664,6 +691,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # entirely and stream the cache instead. This is disk-heavy and largely
         # superseded by the online path -- see precompute_eagle3 for the warning.
         self.cached_target_path = recipe_cfg.get("cached_target_path", None)
+        self._cached_aux_layer_ids = None
         # P-EAGLE (parallel_drafting) only safely supports a colocated live target
         # on non-packed sequences; gate the unsupported combinations early, before
         # loading the target -- see _validate_peagle_gates.
@@ -764,10 +792,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     f"draft-vocab mapping selects {draft_config['draft_vocab_size']}; drop "
                     "recipe_args.selected_token_ids_path or point it at a full-vocabulary map."
                 )
-            aux_layer_ids = recipe_cfg.get("aux_layer_ids", None)
-            if aux_layer_ids is None:
-                aux_layer_ids = default_eagle3_aux_layer_ids(draft_base_config.num_hidden_layers)
-            draft_config.update(self.eagle4.draft_config_updates(aux_layer_ids=list(aux_layer_ids)))
+            draft_config.update(
+                self.eagle4.draft_config_updates(
+                    aux_layer_ids=self._supervision_aux_layer_ids(recipe_cfg, draft_base_config)
+                )
+            )
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
@@ -807,6 +836,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         draft_weights_path = recipe_cfg.get("draft_weights_path", None)
         train_candidate_head = self.eagle4 is not None and self.eagle4.candidate_head is not None
         if draft_weights_path:
+            if train_candidate_head:
+                _check_candidate_head_warm_start(self.draft_model.config, draft_weights_path)
             missing_head_keys = _load_draft_weights(
                 self.draft_model,
                 draft_weights_path,
@@ -1472,6 +1503,26 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             max_retries=recipe_cfg.get("remote_max_retries", 3),
         )
 
+    def _supervision_aux_layer_ids(self, recipe_cfg, draft_base_config) -> list[int]:
+        """Return the target layers the draft's aux hidden states actually come from.
+
+        Live backends report the layers they capture (a remote server through its
+        model info), and an offline cache records the layers ``precompute_eagle3``
+        used; only a cache without that record falls back to
+        ``recipe_args.aux_layer_ids`` or the default EAGLE-3 recipe.
+        """
+        target = self.target_wrapper
+        if isinstance(target, RemoteEagle3TargetModel):
+            return list(target.model_info()["aux_layer_ids"])
+        if getattr(target, "aux_layer_ids", None) is not None:
+            return list(target.aux_layer_ids)
+        if self._cached_aux_layer_ids is not None:
+            return list(self._cached_aux_layer_ids)
+        aux_layer_ids = recipe_cfg.get("aux_layer_ids", None)
+        if aux_layer_ids is None:
+            aux_layer_ids = default_eagle3_aux_layer_ids(draft_base_config.num_hidden_layers)
+        return list(aux_layer_ids)
+
     def _resolve_prefetch_depth(self, recipe_cfg) -> int:
         """Validate and cap the prefetch depth for the configured backend."""
         depth = int(recipe_cfg.get("target_prefetch_depth", 0))
@@ -1493,6 +1544,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
     def _setup_cached_target(self, recipe_cfg, draft_base_config):
         """Offline path: stream a precomputed cache; no target model is loaded.
 
+        Keeps the manifest's ``aux_layer_ids`` (``None`` for caches that predate it)
+        so an EAGLE-4 draft config records the layers the cache was built from.
+
         Reads the cache manifest for the draft-vocab mapping and loads the stored
         target embeddings (the one target tensor the draft still needs). Sets
         ``self.target_model`` / ``self.target_wrapper`` to ``None`` and builds the
@@ -1503,6 +1557,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_model = None
         self.target_wrapper = None
         manifest = read_manifest(self.cached_target_path)
+        self._cached_aux_layer_ids = manifest.get("aux_layer_ids")
         _validate_cached_eagle3_manifest(
             self.cached_target_path,
             manifest,
