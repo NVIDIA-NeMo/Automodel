@@ -1216,6 +1216,7 @@ def __init_model(
     restore_loaded_dtype = kwargs.pop("_restore_loaded_dtype", True)
     process_group = kwargs.pop("_process_group", None)
     load_base_model = kwargs.pop("_load_base_model", False)
+    inherited_config_overrides = set(kwargs.pop("_config_overrides", ()))
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
     if is_pretrained_init:
@@ -1373,7 +1374,7 @@ def __init_model(
                     kwargs.pop(key, None)
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
-            config_overrides = dict_config_overrides | _consume_config_overrides(
+            config_overrides = inherited_config_overrides | dict_config_overrides | _consume_config_overrides(
                 hf_config, kwargs, init_param_names=init_param_names
             )
             # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
