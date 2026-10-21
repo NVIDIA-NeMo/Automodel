@@ -149,6 +149,31 @@ def test_runtime_patch_discards_truncated_features_per_sample() -> None:
     torch.testing.assert_close(output.logits[image_mask], expected_images)
 
 
+def test_runtime_patch_merges_multi_image_rows_without_counts() -> None:
+    model = _StubHFNemotronOmni()
+    model = apply_model_runtime_patches(model, mesh=None)
+    input_ids = torch.tensor(
+        [
+            [18] * 12,
+            [18] * 8 + [5] * 4,
+        ]
+    )
+    image_mask = input_ids == model.img_context_token_id
+    text_embeddings = model.embedding(input_ids)[~image_mask].detach().clone()
+    pixel_values = [torch.zeros(3, 4, 4), torch.zeros(3, 4, 8), torch.zeros(3, 8, 4)]
+
+    output = model(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        image_flags=torch.ones(3, 1, dtype=torch.long),
+    )
+
+    assert output.logits is not None
+    torch.testing.assert_close(output.logits[~image_mask], text_embeddings)
+    expected_images = torch.cat([torch.full((4, 4), 44.0), torch.full((8, 4), 48.0), torch.full((8, 4), 84.0)])
+    torch.testing.assert_close(output.logits[image_mask], expected_images)
+
+
 def test_runtime_patch_skips_native_nemotron_omni() -> None:
     model = object.__new__(NemotronOmniForConditionalGeneration)
     nn.Module.__init__(model)

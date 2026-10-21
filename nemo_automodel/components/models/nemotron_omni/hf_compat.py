@@ -54,7 +54,9 @@ def _merge_variable_resolution_images(
         image_flags: Optional tensor of shape [images, 1], where one marks a
             real image and zero marks padding.
         n_images_per_sample: Optional tensor of shape [batch] mapping the flat
-            image list back to each text row.
+            image list back to each text row. When omitted, the concatenated
+            features are scattered across the whole batch, as in the checkpoint
+            forward.
         inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
 
     Returns:
@@ -92,26 +94,6 @@ def _merge_variable_resolution_images(
             )
         keep_flags = [flag == 1 for flag in flat_flags.tolist()]
 
-    batch_size = input_ids.shape[0]
-    if n_images_per_sample is not None:
-        image_counts = [int(count) for count in n_images_per_sample.reshape(-1).tolist()]
-        if len(image_counts) != batch_size:
-            raise ValueError(
-                "Nemotron Omni n_images_per_sample must contain one value per text row, "
-                f"got {len(image_counts)} values for batch size {batch_size}."
-            )
-        if sum(image_counts) != len(per_image_features):
-            raise ValueError(
-                "Nemotron Omni n_images_per_sample must cover the flat image list, "
-                f"got a total of {sum(image_counts)} for {len(per_image_features)} images."
-            )
-    elif batch_size == 1:
-        image_counts = [len(per_image_features)]
-    elif len(per_image_features) == batch_size:
-        image_counts = [1] * batch_size
-    else:
-        raise ValueError("Nemotron Omni needs n_images_per_sample to align a multi-image batch with its text rows.")
-
     if inputs_embeds.ndim != 3:
         raise ValueError(
             "Nemotron Omni variable-resolution inputs_embeds must have shape [batch, sequence, hidden], "
@@ -119,6 +101,28 @@ def _merge_variable_resolution_images(
         )
 
     image_positions = input_ids == model.img_context_token_id
+    if n_images_per_sample is None:
+        # Without per-row counts, follow the checkpoint forward and scatter the
+        # concatenated features across the whole batch. Counts are only needed
+        # to drop a truncated row's unused features before the next row.
+        kept_features = [
+            features.reshape(-1, features.shape[-1]) for features, keep in zip(per_image_features, keep_flags) if keep
+        ]
+        return _scatter_image_features(inputs_embeds, image_positions, kept_features, "the batch")
+
+    batch_size = input_ids.shape[0]
+    image_counts = [int(count) for count in n_images_per_sample.reshape(-1).tolist()]
+    if len(image_counts) != batch_size:
+        raise ValueError(
+            "Nemotron Omni n_images_per_sample must contain one value per text row, "
+            f"got {len(image_counts)} values for batch size {batch_size}."
+        )
+    if sum(image_counts) != len(per_image_features):
+        raise ValueError(
+            "Nemotron Omni n_images_per_sample must cover the flat image list, "
+            f"got a total of {sum(image_counts)} for {len(per_image_features)} images."
+        )
+
     merged_rows: list[torch.Tensor] = []
     image_offset = 0
     for row_index, image_count in enumerate(image_counts):
@@ -129,29 +133,50 @@ def _merge_variable_resolution_images(
             if keep
         ]
         image_offset = row_end
-
-        if row_features:
-            row_image_embeds = torch.cat(row_features, dim=0)
-        else:
-            row_image_embeds = inputs_embeds.new_empty((0, inputs_embeds.shape[-1]))
-        row_image_embeds = row_image_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-
-        row_positions = image_positions[row_index]
-        num_row_positions = int(row_positions.sum().item())
-        if row_image_embeds.shape[0] < num_row_positions:
-            raise ValueError(
-                "Nemotron Omni image features must cover each row's retained image-token positions, "
-                f"got {row_image_embeds.shape[0]} features for {num_row_positions} positions in row {row_index}."
+        merged_rows.append(
+            _scatter_image_features(
+                inputs_embeds[row_index], image_positions[row_index], row_features, f"row {row_index}"
             )
-
-        # Right truncation can retain only a prefix of a row's image tokens.
-        # Drop that row's unused feature suffix before moving to the next row.
-        row_image_embeds = row_image_embeds[:num_row_positions]
-        row_inputs_embeds = inputs_embeds[row_index]
-        row_mask = row_positions.unsqueeze(-1).expand_as(row_inputs_embeds)
-        merged_rows.append(row_inputs_embeds.masked_scatter(row_mask.to(inputs_embeds.device), row_image_embeds))
+        )
 
     return torch.stack(merged_rows, dim=0)
+
+
+def _scatter_image_features(
+    inputs_embeds: torch.Tensor,
+    image_positions: torch.Tensor,
+    image_features: list[torch.Tensor],
+    scope: str,
+) -> torch.Tensor:
+    """Scatter concatenated image features into the image-token positions.
+
+    Args:
+        inputs_embeds: Tensor of shape [..., sequence, hidden].
+        image_positions: Boolean tensor of shape [..., sequence] marking image tokens.
+        image_features: Per-image tensors of shape [image_tokens, hidden].
+        scope: Description of the scattered region used in error messages.
+
+    Returns:
+        Tensor with the same shape as ``inputs_embeds`` whose image-token
+        positions hold the corresponding image features.
+    """
+    if image_features:
+        image_embeds = torch.cat(image_features, dim=0)
+    else:
+        image_embeds = inputs_embeds.new_empty((0, inputs_embeds.shape[-1]))
+    image_embeds = image_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+
+    num_positions = int(image_positions.sum().item())
+    if image_embeds.shape[0] < num_positions:
+        raise ValueError(
+            "Nemotron Omni image features must cover the retained image-token positions, "
+            f"got {image_embeds.shape[0]} features for {num_positions} positions in {scope}."
+        )
+
+    # Right truncation can retain only a prefix of the image tokens; drop the unused suffix.
+    image_embeds = image_embeds[:num_positions]
+    mask = image_positions.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+    return inputs_embeds.masked_scatter(mask, image_embeds)
 
 
 def apply_hf_variable_resolution_patch(model: nn.Module, *, mesh: DeviceMesh | None) -> nn.Module:
