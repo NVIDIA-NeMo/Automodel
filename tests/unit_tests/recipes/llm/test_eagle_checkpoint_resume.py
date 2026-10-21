@@ -43,6 +43,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete, mark_checkpoint_incomplete
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
 
@@ -242,6 +243,25 @@ def test_eagle1_load_checkpoint_skips_incompatible_auto_detected_checkpoint(tmp_
     assert recipe._resume_epoch == 0
     recipe.checkpointer.load_model.assert_not_called()
     recipe.checkpointer.load_optimizer.assert_not_called()
+
+
+@pytest.mark.parametrize("recipe_factory", [_bare_eagle1_recipe, _bare_eagle3_recipe])
+def test_auto_resume_accepts_checkpoint_saved_with_cli_override(tmp_path, recipe_factory):
+    """config.yaml must record CLI overrides, or auto-resume rejects the run's own checkpoint."""
+    cfg = ConfigNode({"peft": {"dim": 8, "alpha": 32}})
+    cfg.set_by_dotted("peft", None)  # what `--peft None` does on the command line
+
+    recipe = recipe_factory(tmp_path)
+    recipe.cfg = cfg
+    recipe.runtime.global_step = 5
+    recipe.save_checkpoint(epoch=1, step=5, train_loss=0.5)
+
+    resumed = recipe_factory(tmp_path)
+    resumed.cfg = cfg
+    resumed.load_checkpoint(None)
+
+    assert resumed.runtime.global_step == 5
+    resumed.checkpointer.load_model.assert_called_once()
 
 
 def test_eagle1_save_checkpoint_skipped_when_disabled(tmp_path):
