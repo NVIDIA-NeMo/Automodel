@@ -470,7 +470,9 @@ class ChatDataset(Dataset):
 
         # Ensure pad token presence for downstream padding
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
-        self.pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
+        self.pad_token_id = _add_pad_token(self.tokenizer)
+        if self.pad_token_id is None:
+            self.pad_token_id = eos_token_id
 
     def __len__(self) -> int:
         return len(self.dataset)
