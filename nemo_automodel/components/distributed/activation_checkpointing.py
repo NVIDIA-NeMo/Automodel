@@ -418,6 +418,13 @@ def make_selective_checkpoint_context_fn():
                     if mm_counts[ctx.is_recompute] % 2 == 0
                     else CheckpointPolicy.MUST_SAVE
                 )
+            elif func.namespace == "dist_moe":
+                from torch._higher_order_ops.effects import has_effects
+
+                # Registered planner transitions own mutable activation slots.
+                # Replaying them would append new state instead of reusing the
+                # forward state whose matching backward will release it.
+                decision = CheckpointPolicy.MUST_SAVE if has_effects(func) else CheckpointPolicy.PREFER_RECOMPUTE
             elif func in _SELECTIVE_AC_MUST_SAVE_OPS or _is_cuda_to_cpu_copy(func, args, kwargs):
                 decision = CheckpointPolicy.MUST_SAVE
             else:
