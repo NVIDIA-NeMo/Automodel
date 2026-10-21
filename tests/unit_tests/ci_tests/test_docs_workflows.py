@@ -26,10 +26,11 @@ import yaml
 _WORKFLOWS = Path(__file__).resolve().parents[3] / ".github/workflows"
 # RecursiveSI's generated 20x20 logo from PR #4461, absent from trusted navigation.
 _PROVIDER_WEBP = (
-    "UklGRg4BAABXRUJQVlA4TAIBAAAvE8AEEHU4biRJkc5/d+97UhwNeVC9GAHHtrVjz2/bZmfbtm3/HWJOIaVtjiFtViagWaRN9edV4LaNkvEx"
-    "/CJJQMEyll82TCpPNjdEqvp5CSsyvNrMyd1LIOLJO024tcgTsB6OAf9OsSBlFdA6yR7nFsDp19qNrSkA+Z3UOmdez9PXFSot+tY5BEzA7fkET"
-    "h+0UDwGKKD1jzkWA4Rdf94oEDjtflKwf0wx2HGlOB8QZk0COsYWM8RNGJNcmwGWVxUZtFoniqokDEel2R1ihmRTDANPVRAqoA32LazvxIgS"
-    "8ujdt3INmILzaPTf9Abl8+NWgnXw9qkg8P7+aP0vkwJPXwI="
+    "UklGRg4BAABXRUJQVlA4TAIBAAAvE8AEEHU4biRJkc5/d+97UhwNeVC9GAHHtrVjz2/bZmfbtm3/HWJO"  # pragma: allowlist secret
+    "IaVtjiFtViagWaRN9edV4LaNkvEx/CJJQMEyll82TCpPNjdEqvp5CSsyvNrMyd1LIOLJO024tcgTsB6O"  # pragma: allowlist secret
+    "Af9OsSBlFdA6yR7nFsDp19qNrSkA+Z3UOmdez9PXFSot+tY5BEzA7fkETh+0UDwGKKD1jzkWA4Rdf94o"  # pragma: allowlist secret
+    "EDjtflKwf0wx2HGlOB8QZk0COsYWM8RNGJNcmwGWVxUZtFoniqokDEel2R1ihmRTDANPVRAqoA32Lazv"  # pragma: allowlist secret
+    "xIgS8ujdt3INmILzaPTf9Abl8+NWgnXw9qkg8P7+aP0vkwJPXwI="  # pragma: allowlist secret
 )
 _PROVIDER_ICON = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">'
