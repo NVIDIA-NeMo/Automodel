@@ -63,7 +63,8 @@ def test_native_initialization_and_checkpoint_aliases(dtype: torch.dtype) -> Non
         _init_weights(reference, torch.device("cpu"))
     expected_rng = torch.get_rng_state()
     torch.manual_seed(1234)
-    _init_weights(actual, torch.device("cpu"))
+    with torch.no_grad():
+        _init_weights(actual, torch.device("cpu"))
     assert torch.equal(torch.get_rng_state(), expected_rng)
     assert set(dict(actual.named_parameters())) == {"routed_gate_up_weights", "routed_down_weights"}
     for name, native in (
