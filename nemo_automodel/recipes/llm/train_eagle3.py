@@ -490,7 +490,7 @@ def _check_candidate_head_warm_start(draft_config, path: str) -> None:
         )
 
 
-def _prepare_candidate_head_training(draft_model: LlamaEagle3DraftModel, missing_head_keys: set[str]) -> None:
+def _prepare_candidate_head_training(draft_model: LlamaEagle3DraftModel, missing_head_keys: frozenset[str]) -> None:
     """Set up the EAGLE-4 candidate-head stage on a warm-started draft.
 
     A stage-1 draft (no candidate head in its checkpoint) gets the factors from
@@ -504,14 +504,13 @@ def _prepare_candidate_head_training(draft_model: LlamaEagle3DraftModel, missing
         raise ValueError(
             f"The warm-start checkpoint has only part of the candidate head (missing {sorted(missing_head_keys)})."
         )
-    draft_model.requires_grad_(False)
-    draft_model.efficient_lm_head.requires_grad_(True)
-    draft_model.efficient_lm_head_down_proj.requires_grad_(True)
+    for name, param in draft_model.named_parameters():
+        param.requires_grad_(name in CANDIDATE_HEAD_KEYS)
 
 
 def _load_draft_weights(
     draft_model: torch.nn.Module, path: str, *, optional_keys: frozenset[str] = frozenset()
-) -> set[str]:
+) -> frozenset[str]:
     """Warm-start the draft from a previously trained draft's consolidated safetensors export.
 
     ``path`` is either a single ``.safetensors`` file or a directory (flat or
@@ -834,16 +833,16 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # what makes LoRA meaningful (adapters over a pretrained draft, not random
         # init) and doubles as plain continued full-FT training.
         draft_weights_path = recipe_cfg.get("draft_weights_path", None)
-        train_candidate_head = self.eagle4 is not None and self.eagle4.candidate_head is not None
+        candidate_head = self.eagle4.candidate_head if self.eagle4 is not None else None
         if draft_weights_path:
-            if train_candidate_head:
+            if candidate_head is not None:
                 _check_candidate_head_warm_start(self.draft_model.config, draft_weights_path)
             missing_head_keys = _load_draft_weights(
                 self.draft_model,
                 draft_weights_path,
-                optional_keys=CANDIDATE_HEAD_KEYS if train_candidate_head else frozenset(),
+                optional_keys=CANDIDATE_HEAD_KEYS if candidate_head is not None else frozenset(),
             )
-            if train_candidate_head:
+            if candidate_head is not None:
                 _prepare_candidate_head_training(self.draft_model, missing_head_keys)
             # Adapter checkpoints record config.name_or_path as their base model;
             # point it at the actual warm-start draft, not the target the draft
@@ -891,10 +890,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                             f"cp_size ({self.cp_mesh.size()}); the all-to-all splits heads across cp ranks."
                         )
                 attach_eagle3_cp_attention(self.draft_model, self.cp_group, mode=self.cp_mode, zigzag=self.cp_zigzag)
-            if train_candidate_head:
-                trainer_module = self.eagle4.candidate_head.build(self.draft_model, ttt_steps=recipe_cfg.ttt_steps).to(
-                    self.device
-                )
+            if candidate_head is not None:
+                trainer_module = candidate_head.build(self.draft_model, ttt_steps=recipe_cfg.ttt_steps).to(self.device)
             else:
                 trainer_module = Eagle3TrainerModule(
                     self.draft_model,
@@ -1514,8 +1511,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         target = self.target_wrapper
         if isinstance(target, RemoteEagle3TargetModel):
             return list(target.model_info()["aux_layer_ids"])
-        if getattr(target, "aux_layer_ids", None) is not None:
-            return list(target.aux_layer_ids)
+        live_aux_layer_ids = getattr(target, "aux_layer_ids", None)
+        if live_aux_layer_ids is not None:
+            return list(live_aux_layer_ids)
         if self._cached_aux_layer_ids is not None:
             return list(self._cached_aux_layer_ids)
         aux_layer_ids = recipe_cfg.get("aux_layer_ids", None)

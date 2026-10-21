@@ -215,7 +215,9 @@ def export_eagle4_draft(checkpoint_dir: str | Path, output_dir: str | Path) -> P
 
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point; see the module docstring."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description="Export an Automodel EAGLE-4 draft in the LlamaForCausalLMEagle4 layout."
+    )
     parser.add_argument("checkpoint_dir", help="Consolidated Automodel EAGLE-4 checkpoint directory.")
     parser.add_argument("--output-dir", required=True, help="Directory to write config.json and model.safetensors.")
     args = parser.parse_args(argv)

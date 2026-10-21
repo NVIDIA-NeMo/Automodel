@@ -1094,7 +1094,7 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         Returns:
             Rank-``r`` logits, a tensor of shape ``[batch, sequence, vocab]``.
         """
-        if self.efficient_lm_head is None:
+        if self.efficient_lm_head is None or self.efficient_lm_head_down_proj is None:
             raise RuntimeError("compute_candidate_logits requires config.efficient_lm_head_config.")
         return self.efficient_lm_head(self.efficient_lm_head_down_proj(self._lm_head_input(hidden_states)))
 
@@ -1110,7 +1110,7 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         factors) and never materializes a full fp32 copy of the head: both
         passes over the ``[vocab, hidden]`` weight run ``_SVD_CHUNK_ROWS`` rows at a time.
         """
-        if self.efficient_lm_head is None:
+        if self.efficient_lm_head is None or self.efficient_lm_head_down_proj is None:
             raise RuntimeError("init_efficient_lm_head_from_lm_head requires config.efficient_lm_head_config.")
         weight = self.lm_head.weight  # [vocab, hidden]
         rank = self.efficient_lm_head.weight.shape[1]
