@@ -89,6 +89,7 @@ parallelizer:
   activation_checkpointing: false
 
 ci:
+  cluster_tag: h100
   time: "00:30:00"
   nproc_per_node: 4
   checkpoint_robustness:

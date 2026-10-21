@@ -156,6 +156,25 @@ Repository source paths like `examples/llm_finetune/foo.yaml` or `nemo_automodel
 [foo.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/foo.yaml)
 ```
 
+### Recipe links before implementation merges
+
+Model cards can link to recipes in another PR using a full 40-character commit
+permalink, such as `https://github.com/NVIDIA-NeMo/Automodel/blob/<commit>/examples/...yaml`.
+The coverage generator and command checks fetch and validate that YAML as data;
+they do not execute the other PR's code. Missing files and invalid YAML fail CI.
+
+Once a recipe exists in the current checkout, its links must use
+`https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/...yaml`.
+The implementation PR must update the existing cards' recipe permalinks to main,
+including compatibility copies. Merely adding a main link while retaining an old
+permalink still fails validation. No PR metadata is needed in frontmatter.
+
+The homepage, full support log, and per-type tables include published model cards
+as well as checked-in recipes. Cards without checked-in recipes use their original
+card date and their linked recipe permalink, if any. A card without a recipe has
+an empty Recipe cell. Once a recipe is checked in, the entry uses recipe history
+and a main link, without a duplicate card row. Source aliases are counted once.
+
 ## Versioning
 
 `docs.yml` `versions:` lists three entries (matching the published version dropdown):

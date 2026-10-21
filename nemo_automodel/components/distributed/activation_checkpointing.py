@@ -45,6 +45,22 @@ from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint
 
 from nemo_automodel.shared.import_utils import get_torch_version, safe_import
 
+__all__ = [
+    "SELECTIVE_AC_WRAPPER_FLAG",
+    "apply_full_layer_checkpointing_to_layers",
+    "apply_selective_checkpointing_to_layers",
+    "apply_submodule_checkpointing",
+    "detect_kv_sharing_and_maybe_disable_cache",
+    "ensure_fsdp_ops_sac_ignored",
+    "ensure_profiler_ops_sac_ignored",
+    "ignore_sac_ops",
+    "is_selective_activation_checkpointing",
+    "make_selective_checkpoint_context_fn",
+    "sdpa_backend_snapshot_context_fn",
+    "transformer_engine_attention_backend_snapshot_context_fn",
+    "unwrap_checkpoint_wrapper",
+]
+
 logger = logging.getLogger(__name__)
 
 _TORCH_PROFILER_SAC_IGNORE_MIN_VERSION = (2, 13)

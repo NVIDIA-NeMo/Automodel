@@ -2173,6 +2173,51 @@ def _make_trainer_for_moe(moe_cfg_dict, layer_loads=None):
     return trainer
 
 
+def _make_trainer_for_trackio(monkeypatch):
+    """Bare main-rank recipe with a mock Trackio logger and the other remote loggers disabled."""
+    import nemo_automodel.recipes.llm.train_ft as train_ft
+
+    monkeypatch.setattr(train_ft, "_HAS_WANDB", False)
+    monkeypatch.setattr(train_ft, "_HAS_MLFLOW", False)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)  # CPU-only test
+    trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief"}, _make_moe_layer_loads([[100.0, 300.0]]))
+    trainer.dist_env = SimpleNamespace(is_main=True)
+    trainer.step_scheduler = SimpleNamespace(is_remote_logging_step=True, step=7)
+    trainer.trackio_logger = MagicMock()
+    trainer.comet_logger = None
+    trainer.metric_logger_train = MagicMock()
+    return trainer
+
+
+def test_log_train_metrics_sends_metrics_and_moe_loads_to_trackio(monkeypatch):
+    from nemo_automodel.components.loggers.metric_logger import MetricsSample
+
+    trainer = _make_trainer_for_trackio(monkeypatch)
+    metrics = {"loss": 1.5, "grad_norm": 0.5, "lr": 1e-4, "mem": 1.0, "tps": 10.0, "tps_per_gpu": 10.0}
+    log_data = MetricsSample(step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8})
+
+    trainer.log_train_metrics(log_data)
+
+    first, second = trainer.trackio_logger.log_metrics.call_args_list
+    assert first.args[0] == log_data.to_dict() and first.kwargs == {"step": 7}
+    assert any(key.startswith("moe/") for key in second.args[0]) and second.kwargs == {"step": 7}
+    trainer.metric_logger_train.log.assert_called_once_with(log_data)
+
+
+@pytest.mark.parametrize(("val_name", "key"), [("default", "val_loss"), ("squad", "val_squad/val_loss")])
+def test_log_val_metrics_sends_metrics_to_trackio(monkeypatch, val_name, key):
+    from nemo_automodel.components.loggers.metric_logger import MetricsSample
+
+    trainer = _make_trainer_for_trackio(monkeypatch)
+    log_data = MetricsSample(step=3, epoch=0, metrics={"val_loss": 2.0, "lr": 1e-4, "num_label_tokens": 8})
+
+    trainer.log_val_metrics(val_name, log_data)
+
+    trainer.trackio_logger.log_metrics.assert_called_once()
+    logged, kwargs = trainer.trackio_logger.log_metrics.call_args
+    assert logged[0][key] == 2.0 and kwargs == {"step": 3}
+
+
 def test_log_moe_metrics_skips_when_no_loads():
     """wandb_log_fn should not be called when _moe_layer_loads is None."""
     trainer = _make_trainer_for_moe({"enabled": True, "mode": "brief"}, layer_loads=None)
