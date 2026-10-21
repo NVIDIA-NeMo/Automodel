@@ -27,8 +27,6 @@ frozen and LoRA experts, with Torch or DeepEP token dispatch.
 import logging
 
 import torch
-import torch.distributed as dist
-import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
@@ -207,7 +205,6 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
 
         if ep_size > 1:
             ep_group = ep_mesh.get_group()
-            local_num_tokens = x.size(0)
             x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
                 x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
             )
@@ -218,13 +215,7 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
         y = self._forward_grouped_mm_mxfp4(x, token_mask, weights, indices, n_local_experts, experts_start_idx)
 
         if ep_size > 1:
-            # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
-            y.add_(x.sum(dtype=torch.float32) * 0.0)
-
-            # Reduce and narrow to the original per-rank token boundaries.
-            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
-            start = sum(gathered_lens[:ep_rank])
-            y = y.narrow(0, start, local_num_tokens).contiguous()
+            y = self._combine_ep_outputs(y, x, ep_group=ep_group, gathered_lens=gathered_lens)
 
         return y.to(input_dtype)
 

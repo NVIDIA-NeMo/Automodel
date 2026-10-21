@@ -16,8 +16,6 @@ import math
 from collections.abc import Callable
 
 import torch
-import torch.distributed as dist
-import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
@@ -211,7 +209,6 @@ class GroupedExpertsLoRA(GroupedExperts):
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
-        local_num_tokens = x.size(0)
         if ep_size > 1:
             ep_group = ep_mesh.get_group()
             x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
@@ -261,12 +258,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             )
 
         if ep_size > 1:
-            # Ragged-aware combine, mirroring GroupedExperts.forward:
-            # redistribute(Shard(0)) would split the gathered output into equal chunks.
-            y.add_(x.sum(dtype=torch.float32) * 0.0)  # keep the differentiable gather attached
-            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
-            start = sum(gathered_lens[:ep_rank])
-            y = y.narrow(0, start, local_num_tokens).contiguous()
+            y = self._combine_ep_outputs(y, x, ep_group=ep_group, gathered_lens=gathered_lens)
 
         if self.config.apply_router_weight_after_down:
             y = y.sum(dim=1)
