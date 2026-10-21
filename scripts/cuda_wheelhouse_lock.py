@@ -23,6 +23,8 @@ import re
 from pathlib import Path
 from typing import TypedDict
 
+from packaging.markers import Marker
+
 try:
     import tomllib  # ty: ignore[unresolved-import]
 except ModuleNotFoundError:
@@ -73,18 +75,19 @@ def _select_package(
             if _normalize_registry(package.get("source", {}).get("registry", "")) == normalized_registry
         ]
 
-    if len(candidates) > 1:
-        major_minor = ".".join(python_version.split(".")[:2])
-        target_tokens = (
-            f"python_full_version == '{major_minor}.*'",
-            f"platform_machine == '{platform_machine}'",
-            f"sys_platform == '{sys_platform}'",
-        )
-        candidates = [
-            package
-            for package in candidates
-            if any(all(token in marker for token in target_tokens) for marker in package.get("resolution-markers", ()))
-        ]
+    major_minor = ".".join(python_version.split(".")[:2])
+    environment = {
+        "python_version": major_minor,
+        "python_full_version": python_version if len(python_version.split(".")) > 2 else f"{major_minor}.0",
+        "platform_machine": platform_machine,
+        "sys_platform": sys_platform,
+    }
+    candidates = [
+        package
+        for package in candidates
+        if not package.get("resolution-markers")
+        or any(Marker(marker).evaluate(environment) for marker in package["resolution-markers"])
+    ]
 
     if len(candidates) != 1:
         source_description = f" from {registry}" if registry is not None else ""

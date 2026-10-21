@@ -200,6 +200,7 @@ jobs:
 
           export PATH="./bin/:$PATH"
 
+          uv pip install --python ./venv/bin/python "packaging==25.0"
           requirements="$(
             python scripts/cuda_wheelhouse_lock.py \
               --output wheels \
@@ -284,6 +285,13 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.9.26
+      - name: Install lock marker evaluator
+        run: uv pip install --system --python "$(command -v python)" "packaging==25.0"
 
       - name: Compute CUDA wheelhouse cache key
         id: cuda-wheelhouse-key
@@ -449,6 +457,11 @@ jobs:
           merge-multiple: true
           path: ${{ env.WHEELHOUSE_DIR }}
 
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.9.26
+
       - name: Install automodel${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
         env:
           WHEELHOUSE_FINGERPRINT: ${{ needs.cuda-wheelhouse.outputs.fingerprint }}
@@ -467,6 +480,7 @@ jobs:
 
           . ./venv/bin/activate
 
+          uv pip install --python ./venv/bin/python "packaging==25.0"
           export PIP_FIND_LINKS="${WHEELHOUSE_DIR}"
           export PIP_PREFER_BINARY=1
 

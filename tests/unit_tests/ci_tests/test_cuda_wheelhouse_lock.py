@@ -188,3 +188,126 @@ def test_image_digest_invalidates_fingerprint(tmp_path: Path) -> None:
 def test_mutable_image_tag_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="pinned by sha256 digest"):
         _fingerprint(tmp_path, image=_CUDA_IMAGE.split("@")[0])
+
+
+@pytest.mark.parametrize(
+    ("marker", "python_version", "platform_machine", "sys_platform"),
+    [
+        (
+            "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+            "3.12",
+            "x86_64",
+            "linux",
+        ),
+        (
+            "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+            "3.12",
+            "x86_64",
+            "linux",
+        ),
+        ("python_full_version < '3.13' and platform_machine != 'aarch64'", "3.12.15", "x86_64", "linux"),
+        ("python_version >= '3.11' and python_version < '3.13'", "3.11", "aarch64", "linux"),
+        ("sys_platform == 'darwin' or sys_platform == 'win32'", "3.12", "arm64", "darwin"),
+        ("sys_platform == 'darwin' or sys_platform == 'win32'", "3.12", "AMD64", "win32"),
+    ],
+)
+def test_lock_selection_evaluates_target_markers(
+    tmp_path: Path, marker: str, python_version: str, platform_machine: str, sys_platform: str
+) -> None:
+    lock_path = tmp_path / "uv.lock"
+    contents = _lock_contents().replace(
+        'name = "numpy"\nversion = "1.26.4"',
+        f'name = "numpy"\nversion = "1.26.4"\nresolution-markers = ["{marker}"]',
+    )
+    lock_path.write_text(
+        contents
+        + """
+
+[[package]]
+name = "numpy"
+version = "2.4.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = ["python_full_version >= '3.13'"]
+"""
+    )
+    locked_inputs = load_locked_inputs(
+        lock_path,
+        torch_index=_TORCH_INDEX,
+        python_version=python_version,
+        platform_machine=platform_machine,
+        sys_platform=sys_platform,
+    )
+    assert "numpy==1.26.4" in locked_inputs["build_tools"]
+    assert "numpy==2.4.1" not in locked_inputs["constraints"]
+
+
+@pytest.mark.parametrize(
+    ("marker", "extra_package", "count"),
+    [
+        ("python_version >= '3.13'", "", 0),
+        (
+            "python_version >= '3.11'",
+            """
+
+[[package]]
+name = "numpy"
+version = "2.4.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = ["python_version < '3.13'"]
+""",
+            2,
+        ),
+    ],
+)
+def test_lock_selection_rejects_missing_or_ambiguous_target(
+    tmp_path: Path, marker: str, extra_package: str, count: int
+) -> None:
+    lock_path = tmp_path / "uv.lock"
+    contents = _lock_contents().replace(
+        'name = "numpy"\nversion = "1.26.4"',
+        f'name = "numpy"\nversion = "1.26.4"\nresolution-markers = ["{marker}"]',
+    )
+    lock_path.write_text(contents + extra_package)
+    with pytest.raises(ValueError, match=f"Expected one locked numpy package, found {count}"):
+        load_locked_inputs(
+            lock_path,
+            torch_index=_TORCH_INDEX,
+            python_version="3.12",
+            platform_machine="x86_64",
+            sys_platform="linux",
+        )
+
+
+def test_repository_lock_selects_cuda_build_inputs() -> None:
+    locked_inputs = load_locked_inputs(
+        Path("uv.lock"),
+        torch_index=_TORCH_INDEX,
+        python_version="3.12",
+        platform_machine="x86_64",
+        sys_platform="linux",
+    )
+    assert "numpy==1.26.4" in locked_inputs["build_tools"]
+    assert locked_inputs["torch"].endswith("+cu130")
+    assert locked_inputs["torchvision"].endswith("+cu130")
+
+
+def test_lock_selection_preserves_registry_filter(tmp_path: Path) -> None:
+    lock_path = tmp_path / "uv.lock"
+    lock_path.write_text(
+        _lock_contents()
+        + """
+
+[[package]]
+name = "torch"
+version = "2.10.0"
+source = { registry = "https://pypi.org/simple" }
+"""
+    )
+    locked_inputs = load_locked_inputs(
+        lock_path,
+        torch_index=_TORCH_INDEX + "/",
+        python_version="3.12",
+        platform_machine="x86_64",
+        sys_platform="linux",
+    )
+    assert locked_inputs["torch"] == "torch==2.10.0+cu130"
