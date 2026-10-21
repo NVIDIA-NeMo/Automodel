@@ -327,7 +327,6 @@ constraint-dependencies = [
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "mako>=1.4.2", # Address CVE-2026-102991
     "msgpack>=1.2.1", # Address CVE GHSA-6v7p-g79w-8964
-    "pillow>=12.3.0", # Address the Pillow 12.3.0 security fixes
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
     # PyArrow 26 requires NumPy 2; retain this cap while the build uses NumPy 1.26.
     "pyarrow>=23.0.1,<26", # Address CVE GHSA-rgxp-2hwp-jwgg
@@ -357,6 +356,10 @@ constraint-dependencies = [
     "apache-tvm-ffi<=0.1.11",
 ]
 override-dependencies = [
+    # Trackio caps Pillow<13; local image logging is covered by test_trackio_pillow_compat.py.
+    # Remove this override when Trackio accepts Pillow 13. Keep Python 3.10 supported.
+    "pillow>=12.3.0,<13; python_version < '3.11'",
+    "pillow==13.0.0; python_version >= '3.11'",
     # leptonai (via nemo-run) caps anyio<=4.9.0; override to keep the security floor
     "anyio>=4.14.2",
     # TE native grouped GEMM with current-scaling FP8 requires cuBLASLt 13.5+ on Hopper.
