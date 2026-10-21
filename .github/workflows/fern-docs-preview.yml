@@ -69,8 +69,58 @@ jobs:
         run: |
           printf 'Docs or preview workflow changed: %s\n' "$DOCS_CHANGED" | tee -a "$GITHUB_STEP_SUMMARY"
 
-  preview:
+  generate-tables:
     needs: changed-files
+    if: >-
+      github.repository == 'NVIDIA-NeMo/Automodel' &&
+      needs.changed-files.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout approved PR data and generator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.8.22
+
+      # The generator must match the PR's metadata contract. Execute it in a
+      # separate read-only job with no publishing secrets; export Markdown only.
+      - name: Generate model coverage tables without publishing credentials
+        run: |
+          uv run --no-project --isolated --python 3.12 --with pyyaml==6.0.3 \
+            python -I tests/ci_tests/utils/sync_model_coverage_tables.py
+          test -z "$(find docs -type l -print -quit)"
+
+      - name: Upload generated Markdown tables
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: model-coverage-${{ github.sha }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+          path: |
+            docs/index.mdx
+            docs/model-coverage/latest-models.mdx
+            docs/model-coverage/overview.mdx
+            docs/model-coverage/llm/index.mdx
+            docs/model-coverage/vlm/index.mdx
+            docs/model-coverage/multimodal/index.mdx
+            docs/model-coverage/omni/index.mdx
+            docs/model-coverage/dllm/index.mdx
+            docs/model-coverage/diffusion/index.mdx
+            docs/model-coverage/embedding/index.mdx
+            docs/model-coverage/reranker/index.mdx
+
+  preview:
+    needs: [changed-files, generate-tables]
     # An approved upstream mirror is the trust boundary, even for a fork PR.
     # The original PR head repository does not change when its commit is mirrored.
     if: >-
@@ -149,17 +199,36 @@ jobs:
               page.write_text(pattern.sub(pin, page.read_text()))
           PY
 
-      - name: Generate model coverage tables with trusted tooling
+      - name: Download generated Markdown tables
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: model-coverage-${{ github.sha }}
+          path: ${{ runner.temp }}/model-coverage
+
+      - name: Restore generated Markdown tables
         run: |
           set -euo pipefail
-          # Replace the helper, not the PR model/document data it inspects.
-          # Only inspect coverage inputs; unrelated source documentation may be symlinked.
-          test ! -L pr-source/nemo_automodel
-          test -z "$(find pr-source/tests pr-source/examples pr-source/nemo_automodel/_transformers -type l -print -quit)"
+          # Copy only the expected data files. Never execute PR tooling in this
+          # job, which can access the publishing secret in later steps.
           test -z "$(find pr-source/docs -type l -print -quit)"
-          cp trusted-source/tests/ci_tests/utils/sync_model_coverage_tables.py \
-            pr-source/tests/ci_tests/utils/sync_model_coverage_tables.py
-          python3 -I pr-source/tests/ci_tests/utils/sync_model_coverage_tables.py
+          test -z "$(find "$RUNNER_TEMP/model-coverage" -type l -print -quit)"
+          for PAGE in \
+            index.mdx \
+            model-coverage/latest-models.mdx \
+            model-coverage/overview.mdx \
+            model-coverage/llm/index.mdx \
+            model-coverage/vlm/index.mdx \
+            model-coverage/multimodal/index.mdx \
+            model-coverage/omni/index.mdx \
+            model-coverage/dllm/index.mdx \
+            model-coverage/diffusion/index.mdx \
+            model-coverage/embedding/index.mdx \
+            model-coverage/reranker/index.mdx
+          do
+            test -f "$RUNNER_TEMP/model-coverage/$PAGE"
+            test -f "pr-source/docs/$PAGE"
+            cp -- "$RUNNER_TEMP/model-coverage/$PAGE" "pr-source/docs/$PAGE"
+          done
 
       - name: Prepare preview docs
         run: |

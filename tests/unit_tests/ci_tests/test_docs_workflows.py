@@ -25,6 +25,65 @@ import yaml
 _WORKFLOWS = Path(__file__).resolve().parents[3] / ".github/workflows"
 
 
+def test_preview_generates_tables_without_publishing_credentials() -> None:
+    workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
+    generation = workflow["jobs"]["generate-tables"]
+    publishing = workflow["jobs"]["preview"]
+    assert generation["permissions"] == {"contents": "read"}
+    assert "secrets." not in yaml.safe_dump(generation)
+    checkout = next(step for step in generation["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    assert checkout["with"]["persist-credentials"] is False
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
+    assert "generate-tables" in publishing["needs"]
+    assert "sync_model_coverage_tables.py" not in yaml.safe_dump(publishing)
+    upload = next(step for step in generation["steps"] if step["name"] == "Upload generated Markdown tables")
+    download = next(step for step in publishing["steps"] if step["name"] == "Download generated Markdown tables")
+    assert upload["with"]["name"] == download["with"]["name"] == "model-coverage-${{ github.sha }}"
+
+
+@pytest.mark.parametrize("invalid", [None, "missing", "artifact-symlink", "docs-symlink"])
+def test_preview_restores_only_generated_markdown(tmp_path: Path, invalid: str | None) -> None:
+    workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
+    upload = next(
+        step
+        for step in workflow["jobs"]["generate-tables"]["steps"]
+        if step["name"] == "Upload generated Markdown tables"
+    )
+    restore = next(
+        step for step in workflow["jobs"]["preview"]["steps"] if step["name"] == "Restore generated Markdown tables"
+    )
+    artifact = tmp_path / "runner/model-coverage"
+    docs = tmp_path / "pr-source/docs"
+    pages = [Path(path).relative_to("docs") for path in upload["with"]["path"].splitlines()]
+    for page in pages:
+        assert page.suffix == ".mdx" and ".." not in page.parts
+        for root, content in ((artifact, "generated table"), (docs, "original table")):
+            destination = root / page
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content)
+    (artifact / "injected.py").write_text("raise RuntimeError('must not execute')")
+    if invalid == "missing":
+        (artifact / pages[0]).unlink()
+    elif invalid in ("artifact-symlink", "docs-symlink"):
+        root = artifact if invalid == "artifact-symlink" else docs
+        (root / "symlink.mdx").symlink_to(artifact / pages[0])
+
+    result = subprocess.run(
+        ["bash", "-e", "-c", restore["run"]],
+        cwd=tmp_path,
+        env={**os.environ, "RUNNER_TEMP": str(tmp_path / "runner")},
+        capture_output=True,
+        text=True,
+    )
+
+    if invalid:
+        assert result.returncode != 0
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert all((docs / page).read_text() == "generated table" for page in pages)
+    assert not (docs / "injected.py").exists()
+
+
 def _run_pr_navigation(workspace: Path) -> subprocess.CompletedProcess[str]:
     workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
     step = next(
