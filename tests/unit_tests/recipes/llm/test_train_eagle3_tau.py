@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Coverage for the simulated accept-length (tau) reporting in the EAGLE-3
-recipe: ``_all_reduce_sum`` / ``_window_tau_sim``, the training-window
+recipe: ``_window_tau_sim``, the training-window
 accumulation and progress-bar/log wiring, and the ``_run_eval`` tau column.
 
 The trainer-side math (per-step counts, :func:`simulated_accept_length`) is
@@ -34,7 +34,6 @@ from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
 from nemo_automodel.recipes.llm._spec_train_utils import optim_steps_per_epoch as _optim_steps_per_epoch
 from nemo_automodel.recipes.llm.train_eagle3 import (
     TrainEagle3Recipe,
-    _all_reduce_sum,
     _window_tau_sim,
 )
 
@@ -155,16 +154,6 @@ class _FakeProgressBar:
 
     def close(self):
         self.closed = True
-
-
-# ---------------------------------------------------------------------------
-# _all_reduce_sum / _window_tau_sim (non-distributed)
-# ---------------------------------------------------------------------------
-
-
-def test_all_reduce_sum_passthrough():
-    t = torch.tensor([1.0, 2.0])
-    assert _all_reduce_sum(t) is t
 
 
 def test_window_tau_sim_none_inputs():

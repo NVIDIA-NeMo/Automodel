@@ -227,6 +227,42 @@ def test_remote_setup_seeds_draft_from_server_and_feeds_colocated_features(monke
     assert recorded["seq_lens"] is None
 
 
+@pytest.mark.parametrize("wandb_disabled", [False, True])
+@pytest.mark.parametrize("run_name", ["", "explicit-name"])
+def test_remote_setup_initializes_trackio_without_wandb(monkeypatch, tmp_path, served_model, wandb_disabled, run_name):
+    from unittest.mock import Mock
+
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.loggers.trackio_utils import TrackioLogger
+
+    url, model = served_model
+    _patch_recipe_setup(monkeypatch, model.config)
+    cfg = _remote_cfg(tmp_path, remote_urls=[url])
+    cfg["trackio"] = {"project": "speculative", "name": run_name}
+    if wandb_disabled:
+        cfg["wandb"] = {"enable": False}
+    run = Mock()
+    builds = []
+
+    def build_trackio(config, run_config):
+        builds.append((config.project, config.name, run_config["recipe_args"]["target_model_backend"]))
+        return TrackioLogger(run)
+
+    monkeypatch.setattr(train_dspark_module.TrackioConfig, "build", build_trackio)
+    recipe = TrainDSparkRecipe(ConfigNode(cfg))
+    try:
+        recipe.setup()
+        assert recipe.wandb_run is None
+        assert builds == [("speculative", run_name or "dspark_tiny-qwen3", "remote")]
+        recipe._wandb_log({"train/loss": 0.5}, step=3)
+        run.log.assert_called_once_with({"train/loss": 0.5}, step=3)
+    finally:
+        recipe._finish_wandb()
+        if isinstance(getattr(recipe, "target_wrapper", None), RemoteDSparkTargetModel):
+            recipe.target_wrapper.close()
+    run.finish.assert_called_once_with()
+
+
 def test_remote_setup_rejects_a_server_with_different_capture_layers(monkeypatch, tmp_path, served_model):
     url, model = served_model
     _patch_recipe_setup(monkeypatch, model.config)
