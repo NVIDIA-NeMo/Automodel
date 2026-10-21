@@ -21,9 +21,9 @@ temperature: 0.02
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 4
-  ckpt_every_steps: 50
-  val_every_steps: 25
-  max_steps: 100
+  ckpt_every_steps: 10
+  # val_every_steps: 25  # No validation dataset configured for this tutorial
+  max_steps: 20
   num_epochs: null
   save_checkpoint_every_epoch: false
 
@@ -59,7 +59,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
   model_type: bi_encoder
   data_dir_list:
-    # 8 sample pairs from nvidia/embed-nemotron-dataset-v1/FEVER for local demonstration.
+    # 32 sample pairs from nvidia/embed-nemotron-dataset-v1/FEVER for local demonstration.
     # For full training, specify 'hf://nvidia/embed-nemotron-dataset-v1/FEVER'
     - tutorials/embedding-biencoder/sample_retrieval_data.jsonl
   data_type: train
@@ -86,7 +86,7 @@ optimizer:
   master_weights: true
 
 lr_scheduler:
-  lr_warmup_steps: 10
+  lr_warmup_steps: 2
   lr_decay_style: linear
 
 checkpoint:
