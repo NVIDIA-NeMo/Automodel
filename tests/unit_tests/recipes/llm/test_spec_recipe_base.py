@@ -348,9 +348,11 @@ def test_load_checkpoint_early_returns(tmp_path, monkeypatch):
         obj.load_checkpoint("missing")
 
 
-def test_cli_override_survives_config_snapshot_and_auto_resume(tmp_path, monkeypatch, caplog):
-    # A LoRA YAML launched with `--peft None`, preempted, and relaunched with the same command
-    # must auto-resume from its own checkpoint instead of judging it incompatible.
+def _save_peft_disabled_run(tmp_path, monkeypatch):
+    """Save a checkpoint from a LoRA YAML launched with `--peft None` and a tuple-valued CLI option.
+
+    Returns the argv without `--peft None` (i.e. LoRA enabled) and the checkpoint directory.
+    """
     monkeypatch.setenv("SPEC_RECIPE_TEST_MODEL", "org/model")
     cfg_path = tmp_path / "recipe.yaml"
     cfg_path.write_text(
@@ -360,15 +362,25 @@ def test_cli_override_survives_config_snapshot_and_auto_resume(tmp_path, monkeyp
         "  _target_: nemo_automodel.components._peft.lora.PeftConfig\n"
         "  dim: 8\n"
     )
-    argv = ["--config", str(cfg_path), "--peft", "None"]
-    ckpt_root = tmp_path / "ckpts"
-    ckpt = ckpt_root / "epoch_0_step_1"
+    lora_argv = ["--config", str(cfg_path), "--optimizer.betas", "(0.9, 0.95)"]
+    ckpt = tmp_path / "ckpts" / "epoch_0_step_1"
     ckpt.mkdir(parents=True)
-    first_run, _ = _make_recipe(_Recipe, ckpt_root, cfg=parse_args_and_load_config(argv=argv))
+    first_run, _ = _make_recipe(
+        _Recipe, ckpt.parent, cfg=parse_args_and_load_config(argv=lora_argv + ["--peft", "None"])
+    )
     first_run.save_checkpoint(epoch=0, step=1)
+    return lora_argv, ckpt
+
+
+def test_cli_override_survives_config_snapshot_and_auto_resume(tmp_path, monkeypatch, caplog):
+    # A LoRA YAML launched with `--peft None`, preempted, and relaunched with the same command
+    # must auto-resume from its own checkpoint instead of judging it incompatible.
+    lora_argv, ckpt = _save_peft_disabled_run(tmp_path, monkeypatch)
     saved = yaml.safe_load((ckpt / "config.yaml").read_text())
 
-    relaunch, events = _make_recipe(_Recipe, ckpt_root, cfg=parse_args_and_load_config(argv=argv))
+    relaunch, events = _make_recipe(
+        _Recipe, ckpt.parent, cfg=parse_args_and_load_config(argv=lora_argv + ["--peft", "None"])
+    )
     with caplog.at_level(logging.WARNING):
         relaunch.load_checkpoint()
 
@@ -377,6 +389,20 @@ def test_cli_override_survives_config_snapshot_and_auto_resume(tmp_path, monkeyp
     assert saved["model"]["pretrained_model_name_or_path"] == "${oc.env:SPEC_RECIPE_TEST_MODEL}"
     assert "Skipping restore" not in caplog.text
     assert events == ["load_model", "load_optimizer", "load_rng_dp", ("extra_load", str(ckpt))]
+
+
+def test_auto_resume_rejects_mismatched_peft_when_snapshot_has_tuple_option(tmp_path, monkeypatch, caplog):
+    # The tuple-valued option must not make the snapshot unreadable, which would let the
+    # compatibility guard pass a checkpoint trained without LoRA into a LoRA run.
+    lora_argv, ckpt = _save_peft_disabled_run(tmp_path, monkeypatch)
+
+    relaunch, events = _make_recipe(_Recipe, ckpt.parent, cfg=parse_args_and_load_config(argv=lora_argv))
+    with caplog.at_level(logging.WARNING):
+        relaunch.load_checkpoint()
+
+    assert "model signature mismatch" in caplog.text
+    assert "Skipping restore" in caplog.text
+    assert events == []
 
 
 # --------------------------------------------------------------------------- #
