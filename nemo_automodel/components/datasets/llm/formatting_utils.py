@@ -831,15 +831,9 @@ def format_prompt_completion(
     """
     full_text = prompt + answer
 
-    # Tokenize separately to locate answer start
-    if answer_only_loss_mask:
-        # don't add eos token here. NOTE: this is only for calculating the length of the prompt.
-        # we are not modifying the prompt to be returned here.
-        prompt_ids = [tokenizer.bos_token_id] if getattr(tokenizer, "add_bos_token", False) else []
-        prompt_ids += tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        len_prompt_ids = len(prompt_ids)
-    else:
-        len_prompt_ids = 0
+    prompt_ids = (
+        tokenizer(prompt, truncation=truncation, max_length=seq_length)["input_ids"] if answer_only_loss_mask else []
+    )
     # transformers 5.5.0 still honored `padding_side: "right"` baked into the
     # tokenizer's saved tokenizer_config.json, but 5.8.1 ignores that field and
     # uses the LlamaTokenizer class default ("left"). Hardcode "right" here so
@@ -859,6 +853,17 @@ def format_prompt_completion(
         if _saved_padding_side is not None:
             tokenizer.padding_side = _saved_padding_side
     input_ids = tokenized["input_ids"]
+
+    len_prompt_ids = 0
+    if answer_only_loss_mask:
+        # Appending the answer can merge the prompt's final space (or other
+        # suffix) into its first token. Mask only the unchanged token prefix,
+        # including the tokenizer's own leading special tokens. The first
+        # differing token contains answer text and must remain supervised.
+        for prompt_id, full_id in zip(prompt_ids, input_ids):
+            if prompt_id != full_id:
+                break
+            len_prompt_ids += 1
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
     assistant_masks = [0] * len_prompt_ids + [1] * (len(input_ids) - len_prompt_ids)
