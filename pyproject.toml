@@ -37,7 +37,7 @@ maintainers = [
     { name = "Huiying Li", email = "huiyingl@nvidia.com" },
     { name = "NVIDIA", email = "nemo-toolkit@nvidia.com" },
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     # How mature is this project? Common values are
     #  1 - Planning
@@ -64,7 +64,6 @@ classifiers = [
     'License :: OSI Approved :: Apache Software License',
     # Supported python versions
     'Programming Language :: Python :: 3',
-    'Programming Language :: Python :: 3.10',
     'Programming Language :: Python :: 3.11',
     'Programming Language :: Python :: 3.12',
     # Additional Setting
@@ -293,12 +292,8 @@ magi = [
 
 [tool.uv]
 managed = true
-# Pillow 13 requires Python 3.11+; keep package metadata unchanged.
 # Preserve the x86_64 lock partition consumed by the CUDA wheelhouse selector.
-environments = [
-    "python_version >= '3.11' and platform_machine == 'x86_64'",
-    "python_version >= '3.11' and platform_machine != 'x86_64'",
-]
+environments = ["platform_machine == 'x86_64'", "platform_machine != 'x86_64'"]
 default-groups = ["build", "docs", "test"]
 no-build-isolation-package = [
     "bitsandbytes",
@@ -503,7 +498,7 @@ omit = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 exclude = [
    "tests/",
 ]
@@ -669,7 +664,7 @@ allow_indirect_imports = true
 # To advance to the next phase, move module paths from the "Phase 2" comment
 # into the active overrides list and fix any new errors.
 [tool.ty.environment]
-python-version = "3.10"
+python-version = "3.11"
 
 [tool.ty.src]
 include = ["nemo_automodel", "examples"]
