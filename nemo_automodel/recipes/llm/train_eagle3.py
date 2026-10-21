@@ -29,7 +29,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig
+from transformers import AutoConfig, LlamaConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -433,10 +433,10 @@ def _validate_eagle4_gates(
     draft_weights_path: str | None,
 ) -> None:
     """Reject ``recipe_args.eagle4`` combinations the EAGLE-4 draft or its trainers cannot honor."""
-    if not draft_spec.supports_eagle4:
+    if draft_spec.eagle4_draft_config is None:
         raise ValueError(
             f"eagle4 is not supported for this target's draft ({draft_spec.draft_cls.__name__}); see "
-            "DraftSpec.supports_eagle4 in components/speculative/eagle/registry.py."
+            "DraftSpec.eagle4_draft_config in components/speculative/eagle/registry.py."
         )
     if parallel_drafting:
         raise ValueError("eagle4 does not support parallel_drafting (P-EAGLE).")
@@ -743,7 +743,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 )
             selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, draft_base_config)
 
-        draft_config = draft_base_config.to_dict()
+        # An EAGLE-4 draft is built from the Llama-style LlamaForCausalLMEagle4
+        # config, never from a target-specific config class (whose validators
+        # would reject or rewrite the single windowed draft layer).
+        if self.eagle4 is not None and draft_spec.eagle4_draft_config is not None:
+            draft_config = draft_spec.eagle4_draft_config(draft_base_config)
+            draft_config_cls, draft_cls = LlamaConfig, LlamaEagle3DraftModel
+        else:
+            draft_config = draft_base_config.to_dict()
+            draft_config_cls, draft_cls = type(draft_base_config), draft_spec.draft_cls
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
         draft_config["target_hidden_size"] = draft_base_config.hidden_size
         draft_config["architectures"] = ["LlamaEagle3DraftModel"]
@@ -803,9 +811,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # with ``expected mat1 and mat2 to have the same dtype``.
         # Reuse the base config's concrete class (LlamaConfig / Phi3Config /
         # Gemma4TextConfig / ...) so architecture-specific defaults like
-        # attention_bias and head_dim flow into the draft.
-        draft_config_obj = type(draft_base_config).from_dict(draft_config)
-        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        # attention_bias and head_dim flow into the draft (LlamaConfig for EAGLE-4).
+        draft_config_obj = draft_config_cls.from_dict(draft_config)
+        self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         # Seed draft embeddings from the target: directly from the live target,
         # or from the embeddings stored alongside the offline cache.
         embed_source = (

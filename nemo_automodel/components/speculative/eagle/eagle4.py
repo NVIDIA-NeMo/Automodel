@@ -108,6 +108,8 @@ class Eagle4Config:
         """
         updates: dict[str, Any] = {
             "architectures": [EAGLE4_ARCHITECTURE],
+            # The LlamaForCausalLMEagle4 layer is SwiGLU, whatever the target's MLP.
+            "hidden_act": "silu",
             # HF configs require one ``layer_types`` entry per layer, and the
             # draft has a single layer (the cloned target config has the
             # target's count).

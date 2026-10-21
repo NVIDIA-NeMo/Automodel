@@ -362,6 +362,7 @@ def test_draft_config_updates_describe_the_serving_layout():
     )
     assert updates == {
         "architectures": [EAGLE4_ARCHITECTURE],
+        "hidden_act": "silu",
         "num_hidden_layers": 1,
         "layer_types": ["sliding_attention"],
         "use_sliding_window": True,
@@ -510,3 +511,47 @@ def test_target_supervision_is_ignored():
         position_mask=torch.zeros(2, SEQ, 1, dtype=torch.bool),
     )
     torch.testing.assert_close(plain.loss, with_target.loss)
+
+
+# --- Gemma4 targets ---------------------------------------------------------
+
+
+def test_gemma4_target_builds_a_windowed_llama_style_draft():
+    """A Gemma4 target's EAGLE-4 draft keeps its window and the global RoPE, as a SwiGLU LlamaConfig."""
+    from transformers import Gemma4TextConfig
+
+    from nemo_automodel.components.speculative.eagle.registry import EAGLE3_DRAFT_REGISTRY
+
+    target = Gemma4TextConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        vocab_size=VOCAB,
+        max_position_embeddings=64,
+        hidden_activation="gelu_pytorch_tanh",
+    )
+    target.rope_parameters = {
+        "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1e6},
+        "sliding_attention": {"rope_type": "default", "rope_theta": 1e4},
+    }
+    to_draft = EAGLE3_DRAFT_REGISTRY["Gemma4ForConditionalGeneration"].eagle4_draft_config
+    config = to_draft(target)
+    assert target.rope_parameters["full_attention"]["rope_theta"] == 1e6  # the target config is untouched
+    assert config["rope_parameters"]["rope_theta"] == 1e6 and config["rope_parameters"]["rope_type"] == "default"
+    assert "per_layer_config" not in config
+    config.update(draft_vocab_size=VOCAB, target_hidden_size=32, fc_norm=True, norm_output=True)
+    config.update(
+        Eagle4Config(sliding_window=3, candidate_head=Eagle4CandidateHeadConfig(rank=4)).draft_config_updates(
+            aux_layer_ids=[0, 1, 2]
+        )
+    )
+    draft = LlamaEagle3DraftModel(LlamaConfig.from_dict(config))
+    assert draft.config.layer_types == ["sliding_attention"]  # not forced back to full attention
+    assert draft.model.layers[0].self_attn.sliding_window == 3
+    assert draft.config.hidden_act == "silu"
+    attn = draft.model.layers[0].self_attn
+    # The global base (1e6), not the sliding one (1e4), sets the rotary frequencies.
+    assert attn.rotary_emb.inv_freq[1].item() == pytest.approx(1e6 ** (-2 / attn.head_dim), rel=1e-5)

@@ -19,7 +19,7 @@ import json
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
-from transformers import Qwen3Config
+from transformers import LlamaConfig, Qwen3Config
 
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.eagle4 import Eagle4CandidateHeadConfig, Eagle4Config
@@ -90,7 +90,7 @@ SERVING_CONFIG_KEYS = {
 
 
 def _training_draft(candidate_head: bool = True, **config_overrides) -> LlamaEagle3DraftModel:
-    """Build a draft the way TrainEagle3Recipe does: a target config plus the recipe's draft keys."""
+    """Build a draft the way TrainEagle3Recipe does: the target config dict plus the recipe's draft keys, as a LlamaConfig."""
     target = Qwen3Config(
         hidden_size=32,
         intermediate_size=64,
@@ -116,7 +116,7 @@ def _training_draft(candidate_head: bool = True, **config_overrides) -> LlamaEag
     config.update(Eagle4Config(sliding_window=16, candidate_head=head).draft_config_updates(aux_layer_ids=[1, 2, 3]))
     config.update(config_overrides)
     torch.manual_seed(0)
-    return LlamaEagle3DraftModel(Qwen3Config.from_dict(config)).to(torch.bfloat16)
+    return LlamaEagle3DraftModel(LlamaConfig.from_dict(config)).to(torch.bfloat16)
 
 
 def _write_checkpoint(draft, root, *, num_shards=1, state_dict=None, config=None):

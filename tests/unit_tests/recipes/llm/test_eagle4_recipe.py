@@ -74,7 +74,7 @@ def test_parse_eagle4_config():
 
 def _gate_kwargs(**overrides):
     kwargs = dict(
-        draft_spec=DraftSpec(draft_cls=LlamaEagle3DraftModel, supports_eagle4=True),
+        draft_spec=DraftSpec(draft_cls=LlamaEagle3DraftModel, eagle4_draft_config=lambda config: config.to_dict()),
         parallel_drafting=False,
         cp_size=1,
         draft_vocab_size=None,
@@ -205,7 +205,9 @@ def _run_setup_to_trainer(recipe_overrides: dict, *, selected_vocab: int = TARGE
         patch.object(
             recipe_module,
             "resolve_eagle3_draft_spec",
-            return_value=DraftSpec(draft_cls=LlamaEagle3DraftModel, supports_eagle4=True),
+            return_value=DraftSpec(
+                draft_cls=LlamaEagle3DraftModel, eagle4_draft_config=lambda config: config.to_dict()
+            ),
         ),
         patch.object(
             recipe_module.TrainEagle3Recipe, "_setup_online_target", autospec=True, side_effect=fake_online_target
@@ -223,6 +225,7 @@ def test_setup_trains_both_eagle4_stages(tmp_path):
     stage1 = _run_setup_to_trainer({"eagle4": {"sliding_window": 16}, "fc_norm": True, "norm_output": True})
     assert isinstance(stage1, Eagle3TrainerModule)
     config = stage1.draft_model.config
+    assert isinstance(config, LlamaConfig) and config.hidden_act == "silu"
     assert config.architectures == ["LlamaForCausalLMEagle4"]
     assert config.num_hidden_layers == 1 and config.layer_types == ["sliding_attention"]
     assert config.sliding_window == 16 and config.draft_vocab_size == TARGET_VOCAB

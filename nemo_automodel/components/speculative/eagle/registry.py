@@ -36,12 +36,14 @@ rationale.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
-from transformers import PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel
 
 from nemo_automodel.components.speculative.eagle.draft_deepseek import DeepseekV3Eagle3DraftModel
-from nemo_automodel.components.speculative.eagle.draft_gemma import Gemma4Eagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_gemma import Gemma4Eagle3DraftModel, gemma4_eagle4_draft_config
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_kimi_k3 import KimiK3Eagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
@@ -55,13 +57,18 @@ class DraftSpec:
 
     Attributes:
         draft_cls: The draft model class.
-        supports_eagle4: Whether ``draft_cls`` builds the EAGLE-4 sliding-window
-            layer and candidate head in the ``LlamaForCausalLMEagle4`` layout
-            (``recipe_args.eagle4``).
+        eagle4_draft_config: Maps the target's (text) config to the Llama-style
+            ``LlamaForCausalLMEagle4`` draft config dict that ``recipe_args.eagle4``
+            builds the EAGLE-4 draft from; ``None`` when EAGLE-4 is unsupported.
     """
 
     draft_cls: type[PreTrainedModel]
-    supports_eagle4: bool = False
+    eagle4_draft_config: Callable[[PretrainedConfig], dict[str, Any]] | None = None
+
+
+def _target_config_dict(config: PretrainedConfig) -> dict[str, Any]:
+    """EAGLE-4 draft config of a dense Llama-style target: its own config, as a dict."""
+    return config.to_dict()
 
 
 # Llama-style dense LLMs. The dense draft works for any architecture in this
@@ -80,7 +87,8 @@ _DENSE_ARCHITECTURES: tuple[str, ...] = (
 
 
 EAGLE3_DRAFT_REGISTRY: dict[str, DraftSpec] = {
-    arch: DraftSpec(draft_cls=LlamaEagle3DraftModel, supports_eagle4=True) for arch in _DENSE_ARCHITECTURES
+    arch: DraftSpec(draft_cls=LlamaEagle3DraftModel, eagle4_draft_config=_target_config_dict)
+    for arch in _DENSE_ARCHITECTURES
 }
 
 # gpt-oss MoE target. The draft is still Llama-style dense (it only consumes
@@ -105,7 +113,9 @@ EAGLE3_DRAFT_REGISTRY["DeepseekV3ForCausalLM"] = DraftSpec(draft_cls=DeepseekV3E
 # it via ``config.get_text_config()`` in the recipe) and its decoder layers live
 # under ``model.language_model.layers`` (handled by the target wrapper's
 # ``_get_transformer_layers``). Only EAGLE-3 is wired up.
-EAGLE3_DRAFT_REGISTRY["Gemma4ForConditionalGeneration"] = DraftSpec(draft_cls=Gemma4Eagle3DraftModel)
+EAGLE3_DRAFT_REGISTRY["Gemma4ForConditionalGeneration"] = DraftSpec(
+    draft_cls=Gemma4Eagle3DraftModel, eagle4_draft_config=gemma4_eagle4_draft_config
+)
 
 # Kimi K3 target: a hybrid KDA / MLA backbone whose full-attention layers use NoPE
 # MLA with an output gate and a SiTU MLP, so neither the dense draft nor the
