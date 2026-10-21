@@ -31,8 +31,9 @@ navigation:
       - page: "Announcements"
         path: ./v0.5/pages/announcements.mdx
         slug: announcements
+      # Keep the cumulative release history current alongside the frozen GA guides.
       - page: "Release Notes"
-        path: ./v0.5/pages/release-notes.mdx
+        path: ../../release-notes.mdx
         slug: release-notes
       - page: "Model Release Log"
         path: ./v0.5/pages/model-coverage/latest-models.mdx
