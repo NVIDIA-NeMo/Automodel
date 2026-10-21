@@ -121,5 +121,6 @@ wandb:
   dir: ${oc.env:WANDB_DIR,result/wandb}
 
 ci:
+  cluster_tag: h100
   recipe_owner: yuekaizhang
   time: "00:30:00"

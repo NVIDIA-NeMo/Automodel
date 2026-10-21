@@ -71,3 +71,6 @@ checkpoint:
 #   project: jetspec
 #   entity: my-team
 #   name: qwen3-8b-jetspec
+
+ci:
+  cluster_tag: h100

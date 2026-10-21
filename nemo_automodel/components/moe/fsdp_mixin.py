@@ -171,6 +171,12 @@ class MoEFSDPSyncMixin:
       that pending split weight backwards still find the unsharded parameters.
     """
 
+    # fp32 holders whose forward ignores its input (dotted names relative to a decoder block, e.g.
+    # "attn.sinks_param"): one FSDP unit across all blocks instead of one per block — see
+    # parallelizer_utils.fully_shard_across_blocks. Models override it; the parallelizer reads it with getattr so
+    # models that do not inherit this mixin keep working.
+    _fsdp_shard_across_blocks: tuple[str, ...] = ()
+
     def prepare_for_grad_accumulation(self, pp_enabled: bool = False) -> None:
         """Prepare FSDP states before starting gradient accumulation.
 

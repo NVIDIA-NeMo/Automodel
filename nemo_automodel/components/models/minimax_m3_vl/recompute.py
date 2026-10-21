@@ -17,7 +17,7 @@
 
 import torch
 
-from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 
 # The existing shared contract gives every checkpointed forward its own recorder,
 # including interleaved microbatches and multiple calls of the same block. Retain

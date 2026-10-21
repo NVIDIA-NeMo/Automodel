@@ -102,6 +102,7 @@ freeze_config:
 #   name: <your-run-name>
 
 ci:
+  cluster_tag: h100
   recipe_owner: athitten
   nodes: 1
   time: "00:20:00"

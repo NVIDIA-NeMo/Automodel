@@ -151,6 +151,12 @@ at startup.
 For offline runs,
 [prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py)
 writes the same padded and prepacked layouts to disk.
+`tulu3_chat_template.jinja` accepts only system, user, and assistant turns.
+For data with tool calls or reasoning, use
+[`deepseek_v41_flash_training_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_training_chat_template.jinja)
+from the same directory, the released `chat_template.jinja` with loss spans
+(its header covers thinking-mode data). It renders those three roles
+identically.
 
 Three points apply to every H100 variant:
 

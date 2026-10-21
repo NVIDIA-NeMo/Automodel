@@ -110,5 +110,6 @@ checkpoint:
   restore_from: null
 
 ci:
+  cluster_tag: h100
   recipe_owner: pthombre
   time: "01:30:00"
