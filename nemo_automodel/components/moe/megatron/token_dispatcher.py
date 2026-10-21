@@ -66,27 +66,16 @@ class _DispatchManager(ABC):
     can be the number of local experts, or the size of sub_group.
     """
 
-    # Attributes that belong to one dispatch: setup_metadata()/dispatch() fill them and
-    # combine() releases them again. Subclasses declare their own list; _release_dispatch_state()
-    # is the single place that resets it (also used by __init__ to declare the attributes).
-    _PER_DISPATCH_ATTRS: tuple[str, ...] = ()
-
+    @abstractmethod
     def _release_dispatch_state(self) -> None:
-        """Drop every tensor that belongs to the dispatch that was just combined.
+        """Initialize or release this manager's per-dispatch state.
 
-        ``token_probs`` and ``dispatched_probs`` carry a ``grad_fn``. Under non-reentrant
-        activation checkpointing the last dispatch of a step is a backward recompute, and a
-        live reference into that recompute graph keeps the layer's recomputed activations
-        alive after ``backward()``; the allocator then cannot return those segments. Nothing
-        reads this state after ``combine()``: the next ``setup_metadata()``/``dispatch()``
-        rebuilds it. ``dispatch()`` and ``get_permuted_hidden_states_by_experts()`` already
-        drop the autograd-connected tensors they consume, because an early-stopped recompute
-        never reaches ``combine()``. State that is meant to persist across dispatches (for
-        example a calibrated capacity or the static-routing pins) is not listed in
-        ``_PER_DISPATCH_ATTRS`` and is left untouched.
+        Routing probabilities can retain recomputed activations through their
+        autograd graph. Dispatch and permutation must also release consumed
+        tensors early because checkpoint recomputation can stop before combine.
+        Persistent capacity and static-routing state must remain untouched.
         """
-        for name in self._PER_DISPATCH_ATTRS:
-            setattr(self, name, None)
+        raise NotImplementedError
 
     @abstractmethod
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
@@ -141,17 +130,6 @@ class _DeepepManager(_DispatchManager):
     separate permute+alltoall steps.
     """
 
-    _PER_DISPATCH_ATTRS = (
-        "handle",
-        "token_indices",
-        "token_probs",
-        "tokens_per_expert",
-        "dispatched_indices",
-        "dispatched_probs",
-        "dispatched_routing_map",
-        "reversed_mapping_for_combine",
-        "hidden_shape_before_permute",
-    )
     handle: object | None
     token_indices: torch.Tensor | None
     token_probs: torch.Tensor | None
@@ -161,6 +139,18 @@ class _DeepepManager(_DispatchManager):
     dispatched_routing_map: torch.Tensor | None
     reversed_mapping_for_combine: torch.Tensor | None
     hidden_shape_before_permute: torch.Size | None
+
+    def _release_dispatch_state(self) -> None:
+        """Initialize or release state owned by one dispatch."""
+        self.handle = None
+        self.token_indices = None
+        self.token_probs = None
+        self.tokens_per_expert = None
+        self.dispatched_indices = None
+        self.dispatched_probs = None
+        self.dispatched_routing_map = None
+        self.reversed_mapping_for_combine = None
+        self.hidden_shape_before_permute = None
 
     def __init__(
         self,
@@ -184,8 +174,8 @@ class _DeepepManager(_DispatchManager):
         self.router_dtype = router_dtype
         self.moe_router_expert_pad_multiple = moe_router_expert_pad_multiple
 
-        # Per-dispatch state (_PER_DISPATCH_ATTRS): dispatch()/get_permuted_hidden_states_by_experts()
-        # fill it and combine() releases it again.
+        # Initialize per-dispatch state; dispatch and permutation fill it,
+        # and combine releases the remaining state.
         self._release_dispatch_state()
 
         self._fused_dispatch = _dispatch_fn if _dispatch_fn is not None else fused_dispatch
@@ -473,16 +463,6 @@ class _HybridEPManager(_DispatchManager):
         and unpermute tokens for attention in single step
     """
 
-    _PER_DISPATCH_ATTRS = (
-        "handle",
-        "num_permuted_tokens",
-        "num_unpadded_tokens",
-        "token_probs",
-        "token_indices",
-        "routing_map",
-        "tokens_per_expert",
-        "dispatched_probs",
-    )
     handle: object | None
     num_permuted_tokens: int | torch.Tensor | None
     num_unpadded_tokens: int | None
@@ -491,6 +471,17 @@ class _HybridEPManager(_DispatchManager):
     routing_map: torch.Tensor | None
     tokens_per_expert: torch.Tensor | None
     dispatched_probs: torch.Tensor | None
+
+    def _release_dispatch_state(self) -> None:
+        """Initialize or release state owned by one dispatch."""
+        self.handle = None
+        self.num_permuted_tokens = None
+        self.num_unpadded_tokens = None
+        self.token_probs = None
+        self.token_indices = None
+        self.routing_map = None
+        self.tokens_per_expert = None
+        self.dispatched_probs = None
 
     def __init__(
         self,
@@ -539,9 +530,8 @@ class _HybridEPManager(_DispatchManager):
         # that computes it runs once. NEMO_STATIC_ROUTING_PAD_PIN=0 keeps the per-dispatch path (A/B).
         self._static_target_tokens: int | None = None
 
-        # Per-dispatch state (_PER_DISPATCH_ATTRS): setup_metadata()/dispatch() fill it and
-        # combine() releases it again. num_unpadded_tokens is set by dispatch() when this rank
-        # padded its tokens up to the EP-group maximum; combine() slices the padding back off.
+        # Initialize per-dispatch state; setup_metadata and dispatch fill it,
+        # and combine releases the remaining state after removing any token padding.
         self._release_dispatch_state()
         self.pad_multiple = None
 
