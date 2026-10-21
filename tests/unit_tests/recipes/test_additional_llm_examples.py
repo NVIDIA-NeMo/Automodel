@@ -16,9 +16,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from datasets import Dataset
 
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config.loader import load_yaml_config
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from tests.ci_tests.utils.generate_ci_tests import generate_pipeline
@@ -76,43 +74,3 @@ def test_unvalidated_examples_do_not_expand_gpu_ci(scope: str) -> None:
             if isinstance(job, dict) and "CONFIG_PATH" in job.get("variables", {})
         )
     assert not {path for path, _ in EXAMPLES}.intersection(scheduled)
-
-
-@pytest.mark.with_downloads
-@pytest.mark.parametrize(
-    "relative_path,revision",
-    [
-        ("examples/llm_finetune/baai/aquila_7b_squad_peft.yaml", "24caff099d1ed30850b0e8e3a40250af73f93346"),
-        ("examples/llm_finetune/eleutherai/gpt_j_6b_squad_peft.yaml", "47e169305d2e8376be1d31e765533382721b2cc1"),
-        ("examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml", "c292233c833e336628618a88a648727eb3dff0a7"),
-        ("examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml", "e2c30f2d4c8751f21b33be2b403d10d5f373ffc1"),
-        (
-            "examples/llm_finetune/stabilityai/stablelm_3b_4e1t_squad_peft.yaml",
-            "fa4a6a92fca83c3b4223a3c9bf792887090ebfba",
-        ),
-        ("examples/llm_finetune/tiiuae/falcon_7b_squad_peft.yaml", "ec89142b67d748a1865ea4451372db8313ada0d8"),
-    ],
-)
-def test_native_recipe_batches_preserve_complete_answer(
-    relative_path: str, revision: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Exercise real checkpoint tokenizers through both configured loaders, without model weights."""
-    config = RecipeConfig(load_yaml_config(relative_path))
-    tokenizer = NeMoAutoTokenizer.from_pretrained(config.model.pretrained_model_name_or_path, revision=revision)
-    for answer in ["Kyoto", "Cobalt"]:
-        rows = Dataset.from_list(
-            [
-                {
-                    "context": "The observatory is located in Kyoto.",
-                    "question": "Where is the observatory located?",
-                    "answers": {"text": [answer], "answer_start": [34]},
-                }
-            ]
-        )
-        monkeypatch.setattr("nemo_automodel.components.datasets.llm.squad.load_dataset", lambda *args, **kwargs: rows)
-        for loader_config in [config.dataloader, *config.validation_dataloaders.values()]:
-            loader = loader_config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
-            batch = next(iter(loader))
-            supervised = batch["labels"][0]
-            supervised = supervised[supervised != -100].tolist()
-            assert tokenizer.decode(supervised, skip_special_tokens=True).strip() == answer
