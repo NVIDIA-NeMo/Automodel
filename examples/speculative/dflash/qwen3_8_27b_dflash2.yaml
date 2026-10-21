@@ -79,3 +79,6 @@ checkpoint:
   checkpoint_dir: ./outputs/dflash2_qwen3_8_27b/checkpoints
   model_save_format: safetensors
   save_consolidated: true
+
+ci:
+  cluster_tag: h100

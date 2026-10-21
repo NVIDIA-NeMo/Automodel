@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from tools.lint_example_yamls import lint_yaml_text
 
 
@@ -26,6 +28,7 @@ def test_linter_accepts_valid_example_recipe():
                 "model:",
                 "  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained",
                 "ci:",
+                "  cluster_tag: h100",
                 "  recipe_owner: test",
                 "",
             ]
@@ -38,10 +41,82 @@ def test_linter_accepts_valid_example_recipe():
 
 
 def test_linter_requires_recipe_target():
-    errors = lint_yaml_text("model: {}\n", Path("examples/llm_finetune/missing_recipe.yaml"), Path.cwd())
+    errors = lint_yaml_text(
+        "model: {}\nci:\n  cluster_tag: h100\n", Path("examples/llm_finetune/missing_recipe.yaml"), Path.cwd()
+    )
 
     assert len(errors) == 1
     assert "Missing recipe target" in errors[0].message
+
+
+@pytest.mark.parametrize("cluster_tag", ["h100", "gb200", "gb10", "h100|gb200"])
+def test_linter_accepts_explicit_cluster_tag(cluster_tag: str) -> None:
+    errors = lint_yaml_text(
+        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: {cluster_tag}\n",
+        Path("examples/llm_finetune/tagged.yaml"),
+        Path.cwd(),
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize("text", ["", "# Empty recipe\n"])
+def test_linter_rejects_empty_recipe(text: str) -> None:
+    errors = lint_yaml_text(text, Path("examples/llm_finetune/empty.yaml"), Path.cwd())
+
+    assert len(errors) == 1
+    assert "`ci.cluster_tag`" in errors[0].message
+
+
+@pytest.mark.parametrize("ci_text", ["", "ci: null\n", "ci: []\n", "ci: h100\n", "ci: {}\n"])
+def test_linter_requires_ci_cluster_metadata(ci_text: str) -> None:
+    errors = lint_yaml_text(
+        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\n{ci_text}",
+        Path("examples/llm_finetune/untagged.yaml"),
+        Path.cwd(),
+    )
+
+    assert len(errors) == 1
+    assert "`ci.cluster_tag`" in errors[0].message
+    assert "`ci.deprecated: true`" in errors[0].message
+    assert errors[0].line == (2 if ci_text else 1)
+
+
+@pytest.mark.parametrize("value", ["null", "''", "'   '", "100", "true", "[]", "{}"])
+def test_linter_rejects_empty_or_nonstring_cluster_tag(value: str) -> None:
+    errors = lint_yaml_text(
+        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: {value}\n",
+        Path("examples/llm_finetune/invalid_tag.yaml"),
+        Path.cwd(),
+    )
+
+    assert len(errors) == 1
+    assert "`ci.cluster_tag`" in errors[0].message
+
+
+@pytest.mark.parametrize("deprecated", ["true", "false", "'true'", "1", "null"])
+def test_linter_only_exempts_boolean_deprecated_true(deprecated: str) -> None:
+    errors = lint_yaml_text(
+        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  deprecated: {deprecated}\n",
+        Path("examples/llm_finetune/deprecated.yaml"),
+        Path.cwd(),
+    )
+
+    if deprecated == "true":
+        assert errors == []
+    else:
+        assert len(errors) == 1
+        assert "`ci.cluster_tag`" in errors[0].message
+
+
+@pytest.mark.parametrize("folder", ["diffusion/finetune", "diffusion/generate/configs", "convergence/tulu3/models"])
+def test_linter_checks_cluster_tag_when_recipe_target_is_exempt(folder: str) -> None:
+    path = Path("examples") / folder / "untagged.yaml"
+    errors = lint_yaml_text("model: {}\n", path, Path.cwd())
+
+    assert len(errors) == 1
+    assert "`ci.cluster_tag`" in errors[0].message
+    assert lint_yaml_text("model: {}\nci:\n  cluster_tag: h100\n", path, Path.cwd()) == []
 
 
 def test_linter_exempts_command_only_precompute_configs():

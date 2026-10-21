@@ -123,3 +123,6 @@ lr_scheduler:
   lr_decay_style: cosine
   lr_warmup_steps: 10
   min_lr: 0.0
+
+ci:
+  cluster_tag: h100

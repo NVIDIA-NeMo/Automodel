@@ -12,8 +12,9 @@
 #
 # The frozen 40-layer target and its 384 experts are sharded with EP/FSDP2. The
 # 128-expert draft is independently FSDP2-sharded and is the only trainable
-# model. TP, PP, CP, sequence packing, image inputs, and the serving-time
-# confidence scheduler are not supported by the DSpark training path.
+# model. TP, PP, CP, image inputs, and the serving-time confidence scheduler
+# are not supported by the DSpark training path. Set
+# recipe_args.packed_sequence_size to pack documents into fixed-width rows.
 #
 # This is a production-scale configuration. Adapt the node count, EP size,
 # accumulation, data paths, and checkpoint path to the cluster. EP size must
@@ -127,3 +128,6 @@ checkpoint:
   save_consolidated: final
   dequantize_base_checkpoint: true
   # restore_from: LATEST
+
+ci:
+  cluster_tag: h100

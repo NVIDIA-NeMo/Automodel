@@ -141,6 +141,7 @@ wandb:
   tags: [muse-spark-open, medpix, nonpacked4k, ep64, pp4, fp32-residual]
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 32
   time: "01:00:00"

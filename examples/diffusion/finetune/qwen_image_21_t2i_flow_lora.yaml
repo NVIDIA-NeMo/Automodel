@@ -105,6 +105,7 @@ checkpoint:
   restore_from: null
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "01:00:00"
   nodes: 1

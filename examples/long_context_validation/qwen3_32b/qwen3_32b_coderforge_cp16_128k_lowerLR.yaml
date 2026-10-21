@@ -146,3 +146,6 @@ wandb:
   project: <your_wandb_project>
   entity: <your_wandb_entity>
   name: <your_wandb_name>
+
+ci:
+  cluster_tag: h100

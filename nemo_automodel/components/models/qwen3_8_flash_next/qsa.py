@@ -32,7 +32,6 @@ import torch
 from torch import nn
 from torch.utils._python_dispatch import _disable_current_modes
 
-from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
@@ -42,6 +41,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
 from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import FlexQSAMask, flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # The gathered implementation is a numerical oracle and CPU fallback, not the

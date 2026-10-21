@@ -105,5 +105,6 @@ freeze_config:
 #   save_dir:
 
 ci:
+  cluster_tag: h100
   time: "00:15:00"
   recipe_owner: akoumpa

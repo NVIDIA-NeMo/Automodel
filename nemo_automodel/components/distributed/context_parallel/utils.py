@@ -426,10 +426,11 @@ def _prepare_cp_sharder(
     has_hook = model is not None and hasattr(model, "prepare_model_inputs_for_cp")
     effective_cp_size = _mesh_dim_size(device_mesh, "cp")
 
-    # llm-domain magi replaces the whole batch prep (no model has both a CP
-    # hook and magi); vlm-domain magi composes with the vision pre-embed.
-    magi_replaces_hook = magi_enabled and getattr(magi_state, "domain", "llm") == "llm"
     model_owns_thd = batch_is_thd and bool(getattr(model, "supports_thd", False))
+    model_owns_magi = model_owns_thd and "magi" in getattr(model, "_packed_cp_attn_backends", ())
+    # Native THD models can own mask keys and token dispatch even for plain
+    # text. Generic HF Magi continues to prepare batches without a model hook.
+    magi_replaces_hook = magi_enabled and getattr(magi_state, "domain", "llm") == "llm" and not model_owns_magi
     if (effective_cp_size > 1 or model_owns_thd) and has_hook and not magi_replaces_hook and invoke_pre_embed:
         # Every CP hook is sharder-only: it constructs a ContextParallelSharder
         # and consumes nothing (embed / vision splice / sequence shard happen in the
