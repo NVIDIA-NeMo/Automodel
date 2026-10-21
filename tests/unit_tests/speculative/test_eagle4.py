@@ -143,11 +143,38 @@ def test_window_hides_context_keys_outside_the_window():
 
 def test_window_covering_the_sequence_matches_full_attention():
     aux, input_ids = _inputs()
-    windowed, full = _draft(sliding_window=SEQ), _draft(sliding_window=None)
+    # Depth i leaves W - i context keys, so W = SEQ + 2 still covers the sequence at depth 2.
+    windowed, full = _draft(sliding_window=SEQ + 2), _draft(sliding_window=None)
     full.load_state_dict(windowed.state_dict())
     with torch.no_grad():
         for a, b in zip(_unroll(windowed, aux, input_ids, steps=3), _unroll(full, aux, input_ids, steps=3)):
             torch.testing.assert_close(a, b)
+
+
+def test_window_slides_with_the_query_like_the_serving_kernel():
+    """Every query sees the last W keys up to itself, its chain included, as the EAGLE-4 serving kernels do.
+
+    With W = 4, uniform scores and only V_0[4] = 1: at depth 0 the row-7 query (position 7)
+    sees keys 4..7 and returns 1/4; at depth 1 the row-7 query stands at position 8 and sees
+    the context keys 5..7 plus its chain key, so key 4 is out of its window and it returns 0.
+    """
+    attn = _draft(sliding_window=4).model.layers[0].self_attn
+    zeros = torch.zeros(1, attn.num_heads, SEQ, attn.head_dim)
+    v0 = zeros.clone()
+    v0[:, :, 4] = 1.0
+    mask = draft_llama._build_causal_mask(torch.ones(1, SEQ, dtype=torch.long), torch.float32)
+    root = attn._eager_attention_forward(zeros, [zeros], [v0], mask, 0, 1, SEQ)
+    depth1 = attn._eager_attention_forward(zeros, [zeros, zeros], [v0, zeros], mask, 1, 1, SEQ)
+    torch.testing.assert_close(root[0, 7], torch.full_like(root[0, 7], 0.25))
+    torch.testing.assert_close(depth1[0, 7], torch.zeros_like(depth1[0, 7]))
+    # The depth-1 query of row 6 stands at position 7 and still sees key 4 (keys 4..6 plus its chain).
+    torch.testing.assert_close(depth1[0, 6], torch.full_like(depth1[0, 6], 0.25))
+
+
+def test_window_smaller_than_the_unroll_is_rejected():
+    aux, input_ids = _inputs()
+    with pytest.raises(ValueError, match="at least ttt_steps"):
+        _unroll(_draft(sliding_window=2), aux, input_ids, steps=3)
 
 
 def test_window_on_padded_rows_stays_finite():

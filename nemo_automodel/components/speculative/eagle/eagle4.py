@@ -84,8 +84,9 @@ class Eagle4Config:
     """``recipe_args.eagle4``: turns the EAGLE-3 recipe's draft into an EAGLE-4 draft.
 
     Attributes:
-        sliding_window: Context keys the draft layer attends to (itself
-            included), or ``None`` for full causal attention.
+        sliding_window: Keys each draft query attends to, itself and its TTT
+            chain included (so at least ``ttt_steps``), or ``None`` for full
+            causal attention.
         candidate_head: Set for the candidate-head stage; ``None`` trains the
             draft itself.
     """

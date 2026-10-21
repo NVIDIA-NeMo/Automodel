@@ -203,11 +203,12 @@ through `recipe_args.eagle4`:
 
 | Structure | Effect |
 |-----------|--------|
-| Sliding-window draft layer (`eagle4.sliding_window`) | A query attends to the last `sliding_window` context keys (itself included) plus its own TTT chain, so the draft's attention cost stops growing with the context. |
+| Sliding-window draft layer (`eagle4.sliding_window`) | Every query attends to the last `sliding_window` keys up to itself, as in the EAGLE-4 serving kernels: at TTT depth `i` the window holds the query's `i` chain keys and the `sliding_window - i` context keys before them. The draft's attention cost stops growing with the context. `sliding_window` must be at least `ttt_steps`. |
 | Low-rank candidate head (`eagle4.candidate_head`) | `efficient_lm_head(efficient_lm_head_down_proj(h))` scores the full vocabulary at rank `rank`; the serving engine keeps the top `num_candidates` tokens and rescores only those with the full `lm_head`, which removes most of the draft's LM-head cost. |
 
 EAGLE-4 drafts score the full target vocabulary, so leave `draft_vocab_size`
-unset. Training runs in two stages:
+unset, and keep `freeze_embeddings: true`: the serving adapters load the
+target's embeddings into the draft. Training runs in two stages:
 
 1. **Draft stage** ([`qwen3_8b_eagle4.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle4/qwen3_8b_eagle4.yaml)):
    the standard TTT loss with the windowed layer.
@@ -217,7 +218,9 @@ unset. Training runs in two stages:
    draft `lm_head`, and fits them at every TTT depth to the full head's
    distribution with forward KL. The logged accuracy is candidate recall: how
    often the full head's top-1 token is among the top `num_candidates`
-   low-rank scores.
+   low-rank scores. At startup it checks that the stage-1 draft has the same
+   window, `fc_norm` / `norm_output`, auxiliary target layers (in order) and the
+   target's embeddings.
 
 ```yaml
 recipe_args:
@@ -435,7 +438,7 @@ checkpoint:
 | `target_attn_implementation` | Optional attention backend for the frozen target (e.g. `sdpa`); defaults to HF auto-select. Set `sdpa` if the target's FlashAttention path is broken on your build (e.g. the Qwen3 FA2 `s_aux` crash) |
 | `fc_norm` | EAGLE-3.1: per-chunk independent RMSNorm (`ModuleList`) on auxiliary hidden states before the `fc` projection (default `false`) |
 | `norm_output` | EAGLE-3.1: feed the post-`model.norm` hidden state into the next TTT step and `lm_head` (default `false`) |
-| `eagle4.sliding_window` | EAGLE-4: context keys the draft layer attends to (`null` = full attention) |
+| `eagle4.sliding_window` | EAGLE-4: keys each draft query attends to, its TTT chain included (at least `ttt_steps`; `null` = full attention) |
 | `eagle4.candidate_head.rank`, `eagle4.candidate_head.num_candidates` | EAGLE-4 stage 2: train the low-rank candidate head (requires `draft_weights_path`) |
 | `warmup_ratio` | Fraction of total steps for LR warmup |
 

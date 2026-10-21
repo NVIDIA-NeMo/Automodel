@@ -94,11 +94,11 @@ EAGLE-3.1 layer and adds two config-driven structures, laid out like the
 ``LlamaForCausalLMEagle4`` drafts served by TokenSpeed and the EAGLE-4 engines:
 
 * a sliding-window draft layer (``layer_types == ["sliding_attention"]`` with
-  ``sliding_window`` W): a query at position ``t`` attends to the context keys
-  ``t - W + 1 .. t`` plus its own TTT chain (the per-position diagonals are
-  never windowed). The window is read only for an EAGLE-4 config, because a
-  draft config cloned from a Qwen-family target carries a ``sliding_window``
-  its EAGLE-3 draft never used.
+  ``sliding_window`` W): every query sees the last W keys up to itself, its TTT
+  chain included, as in the EAGLE-4 serving kernels (see
+  ``Eagle3LlamaAttention._block1_window``). The window is read only for an
+  EAGLE-4 config, because a draft config cloned from a Qwen-family target
+  carries a ``sliding_window`` its EAGLE-3 draft never used.
 * a low-rank candidate head (``config.efficient_lm_head_config`` with ``rank``
   r and ``num_candidates`` K): ``efficient_lm_head(efficient_lm_head_down_proj(h))``
   scores the full target vocabulary at rank r, the engine keeps the top K
@@ -328,9 +328,8 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             self.num_heads * self.head_dim, config.hidden_size, bias=getattr(config, "attention_bias", False)
         )
         self.rotary_emb = LlamaRotaryEmbedding(config)
-        # EAGLE-4 sliding window over the Block-1 context keys (None = full
-        # causal attention), applied to the eager mask and to FlashAttention's
-        # ``window_size``.
+        # EAGLE-4 sliding window W (None = full causal attention); each TTT step
+        # applies its share of it to Block 1 (see _block1_window).
         self.sliding_window = _draft_sliding_window(config)
         # Set by attach_eagle3_cp_attention when the draft runs under context
         # parallelism: the sequence is sharded across this cp group and the mixed
@@ -463,8 +462,8 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             cache_k: Per-TTT-step keys, each a tensor of shape ``[batch, heads, sequence, head_dim]``.
             cache_v: Per-TTT-step values, same layout as ``cache_k``.
             attention_mask: Tensor of shape ``[batch, 1, sequence, sequence]``, the
-                additive (query, key) Block-1 mask; an EAGLE-4 ``sliding_window`` is
-                applied on top of it here.
+                additive (query, key) Block-1 mask; this step's EAGLE-4 window
+                (``_block1_window``) is applied on top of it here.
             step_idx: Number of cached steps before this one.
             batch_size: Batch size.
             seq_len: Sequence length.
@@ -472,8 +471,9 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         Returns:
             Tensor of shape ``[batch, sequence, heads * head_dim]``.
         """
-        if self.sliding_window is not None:
-            attention_mask = _apply_sliding_window(attention_mask, self.sliding_window)
+        window = self._block1_window(step_idx)
+        if window is not None:
+            attention_mask = _apply_sliding_window(attention_mask, window)
         # Block 1: full T x T causal attention against the step-0 keys.
         k0, v0 = cache_k[0], cache_v[0]
         attn_weights = torch.matmul(q, k0.transpose(-2, -1)) * self.scaling
@@ -526,17 +526,19 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
 
         With ``cu_seqlens`` (packing), Block 1 uses ``flash_attn_varlen_func`` for
         document-level causal attention; the position-wise Block 2 is unchanged.
-        An EAGLE-4 ``sliding_window`` W limits Block 1 to the last W keys
-        (FlashAttention ``window_size=(W - 1, 0)``).
+        This step's EAGLE-4 window w (``_block1_window``) limits Block 1 to the
+        last w keys (FlashAttention ``window_size=(w - 1, 0)``).
         """
         # FA2 expects (B, T, H, D); eager cache is (B, H, T, D).
         k0, v0 = cache_k[0], cache_v[0]
         q_fa = q.transpose(1, 2).contiguous()
         k0_fa = k0.transpose(1, 2).contiguous()
         v0_fa = v0.transpose(1, 2).contiguous()
+        window = self._block1_window(step_idx)
+        window_size = (-1, -1) if window is None else (window - 1, 0)
         if cu_seqlens is not None:
             attn_output_bhtd, lse_fa = self._flash_block1_varlen(
-                q_fa, k0_fa, v0_fa, cu_seqlens, max_seqlen, batch_size, seq_len
+                q_fa, k0_fa, v0_fa, cu_seqlens, max_seqlen, batch_size, seq_len, window_size
             )
         else:
             # ``softmax_lse`` is fp32 with shape (B, H, T): the log-sum-exp of the
@@ -547,7 +549,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
                 v0_fa,
                 softmax_scale=self.scaling,
                 causal=True,
-                window_size=self._flash_window_size(),
+                window_size=window_size,
                 return_attn_probs=True,
             )
             # FA output is (B, T, H, D); bring back to (B, H, T, D) for the merge.
@@ -581,6 +583,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         max_seqlen: int,
         batch_size: int,
         seq_len: int,
+        window_size: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Document-level causal Block 1 via ``flash_attn_varlen_func``.
 
@@ -588,6 +591,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         outputs back to ``[B, H, T, D]`` / ``[B, H, T]`` for the dense-path merge.
         Note varlen ``softmax_lse`` is ``[H, total_tokens]`` (head-major), unlike
         the dense ``[B, H, T]`` -- hence the explicit reshape + shape check.
+        ``window_size`` is FlashAttention's ``(left, right)`` Block-1 window.
         """
         if _flash_attn_varlen_func is None:
             raise ImportError(
@@ -608,7 +612,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.scaling,
             causal=True,
-            window_size=self._flash_window_size(),
+            window_size=window_size,
             return_attn_probs=True,
         )
         # out_flat: [total_tokens, H, D] -> [B, H, T, D]
@@ -622,9 +626,23 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         lse_fa = lse_flat.transpose(0, 1).reshape(batch_size, seq_len, num_heads).permute(0, 2, 1)
         return attn_output_bhtd, lse_fa
 
-    def _flash_window_size(self) -> tuple[int, int]:
-        """FlashAttention ``window_size`` for Block 1: ``(-1, -1)`` is unbounded."""
-        return (-1, -1) if self.sliding_window is None else (self.sliding_window - 1, 0)
+    def _block1_window(self, step_idx: int) -> int | None:
+        """Context keys Block 1 exposes to each query at TTT depth ``step_idx`` (None = unbounded).
+
+        The EAGLE-4 serving kernels give every query the last ``sliding_window``
+        keys up to itself. The depth-``step_idx`` query of row ``t`` stands at
+        position ``t + step_idx`` and ``step_idx`` of those keys are its own
+        chain (Block 2), leaving ``sliding_window - step_idx`` context keys.
+        """
+        if self.sliding_window is None:
+            return None
+        window = self.sliding_window - step_idx
+        if window < 1:
+            raise ValueError(
+                f"EAGLE-4 sliding_window={self.sliding_window} leaves no context key at TTT depth {step_idx}; "
+                "the window must be at least ttt_steps."
+            )
+        return window
 
     def _cp_ulysses_attention_forward(
         self,

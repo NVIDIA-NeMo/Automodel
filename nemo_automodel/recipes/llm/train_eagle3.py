@@ -431,8 +431,14 @@ def _validate_eagle4_gates(
     has_peft: bool,
     has_decode_eval: bool,
     draft_weights_path: str | None,
+    ttt_steps: int,
+    freeze_embeddings: bool | None,
 ) -> None:
-    """Reject ``recipe_args.eagle4`` combinations the EAGLE-4 draft or its trainers cannot honor."""
+    """Reject ``recipe_args.eagle4`` combinations the EAGLE-4 draft or its trainers cannot honor.
+
+    ``freeze_embeddings`` is the raw ``recipe_args`` value; ``None`` keeps the
+    EAGLE-3 default, which freezes them.
+    """
     if draft_spec.eagle4_draft_config is None:
         raise ValueError(
             f"eagle4 is not supported for this target's draft ({draft_spec.draft_cls.__name__}); see "
@@ -440,6 +446,17 @@ def _validate_eagle4_gates(
         )
     if parallel_drafting:
         raise ValueError("eagle4 does not support parallel_drafting (P-EAGLE).")
+    if eagle4.sliding_window is not None and eagle4.sliding_window < ttt_steps:
+        raise ValueError(
+            f"eagle4.sliding_window ({eagle4.sliding_window}) must be at least ttt_steps ({ttt_steps}): the "
+            "depth-i query's window holds its i chain keys, so a smaller window leaves the deepest step no context."
+        )
+    if freeze_embeddings is not None and not freeze_embeddings:
+        raise ValueError(
+            "eagle4 drafts must keep the target's embeddings (recipe_args.freeze_embeddings: true): the EAGLE-4 "
+            "serving adapters load the target's embed_tokens into the draft, so trained draft embeddings would "
+            "be dropped at serving."
+        )
     if cp_size > 1:
         raise NotImplementedError("eagle4 does not support context parallelism (cp_size>1).")
     if draft_vocab_size is not None:
@@ -467,26 +484,40 @@ def _validate_eagle4_gates(
 def _check_candidate_head_warm_start(draft_config, path: str) -> None:
     """Refuse a candidate-head stage whose draft structure differs from the warm-start draft's.
 
-    The sliding window and ``norm_output`` own no tensors, so a stage-2 YAML that
-    disagrees with stage 1 would load cleanly and fit the candidate head to a
-    draft that attends differently from the one that was trained (and export
-    that wrong structure).
+    The sliding window, ``fc_norm`` / ``norm_output`` and the ordered auxiliary
+    target layers own no tensors, so a stage-2 run that disagrees with stage 1
+    would load cleanly and fit the candidate head to a frozen draft that attends
+    to, or is fed, something other than what it was trained on (and export that
+    wrong structure). Without the warm start's ``config.json`` none of this can
+    be checked, so it is required.
     """
     checkpoint_dir = pathlib.Path(path)
     config_path = (checkpoint_dir.parent if checkpoint_dir.is_file() else checkpoint_dir) / "config.json"
     if not config_path.is_file():
-        logger.warning("draft_weights_path has no config.json; cannot check it against eagle4 (%s)", config_path)
-        return
+        raise FileNotFoundError(
+            f"The candidate-head stage needs the warm-start draft's config.json to check its structure ({config_path})."
+        )
     saved = json.loads(config_path.read_text())
-    mismatched = {
-        key: {"warm start": saved.get(key), "this run": getattr(draft_config, key, None)}
+    pairs = {
+        key: (saved.get(key), getattr(draft_config, key, None))
         for key in ("layer_types", "sliding_window", "fc_norm", "norm_output")
-        if saved.get(key) != getattr(draft_config, key, None)
+    }
+    saved_eagle_config = saved.get("eagle_config") or {}
+    run_eagle_config = getattr(draft_config, "eagle_config", None) or {}
+    pairs["aux_layer_ids"] = (
+        saved_eagle_config.get("eagle_aux_hidden_state_layer_ids"),
+        run_eagle_config.get("eagle_aux_hidden_state_layer_ids"),
+    )
+    mismatched = {
+        key: {"warm start": warm_start, "this run": this_run}
+        for key, (warm_start, this_run) in pairs.items()
+        if warm_start != this_run
     }
     if mismatched:
         raise ValueError(
             f"The candidate-head stage must keep the warm-start draft's structure; these differ: {mismatched}. "
-            "Set recipe_args.eagle4.sliding_window, fc_norm and norm_output as in the stage-1 run."
+            "Set recipe_args.eagle4.sliding_window, fc_norm and norm_output as in the stage-1 run, and supervise "
+            "from the same target layers in the same order (aux_layer_ids, or the remote server / offline cache)."
         )
 
 
@@ -509,7 +540,11 @@ def _prepare_candidate_head_training(draft_model: LlamaEagle3DraftModel, missing
 
 
 def _load_draft_weights(
-    draft_model: torch.nn.Module, path: str, *, optional_keys: frozenset[str] = frozenset()
+    draft_model: torch.nn.Module,
+    path: str,
+    *,
+    optional_keys: frozenset[str] = frozenset(),
+    target_copied_keys: frozenset[str] = frozenset(),
 ) -> frozenset[str]:
     """Warm-start the draft from a previously trained draft's consolidated safetensors export.
 
@@ -521,13 +556,29 @@ def _load_draft_weights(
 
     ``optional_keys`` may be absent from the checkpoint (the EAGLE-4 candidate
     head, which a stage-1 draft does not have yet); every other missing key is
-    an error. Returns the optional keys the checkpoint did not provide.
+    an error. ``target_copied_keys`` hold the target's values in the draft right
+    now (an EAGLE-4 draft's embeddings, which the serving adapters replace with
+    the target's), and the checkpoint must not have trained them. Returns the
+    optional keys the checkpoint did not provide.
     """
     state_dict = load_hf_safetensors_state_dict(path)
     if not state_dict:
         raise FileNotFoundError(f"draft_weights_path={path!r} contains no .safetensors files")
-    if state_dict.keys().isdisjoint(draft_model.state_dict().keys()):
+    current_state = draft_model.state_dict()
+    if state_dict.keys().isdisjoint(current_state.keys()):
         raise ValueError(f"draft_weights_path={path!r} shares no keys with the draft model; wrong checkpoint?")
+    for key in target_copied_keys:
+        loaded, current = state_dict.get(key), current_state[key]
+        if loaded is None or loaded.shape != current.shape:
+            continue  # absent, or a shape mismatch that load_state_dict reports below
+        # Compare on the host (where the checkpoint already is) in the lower of the two precisions,
+        # so a stage that ran in another dtype does not read as trained.
+        dtype = loaded.dtype if loaded.element_size() <= current.element_size() else current.dtype
+        if not torch.equal(loaded.to(dtype), current.detach().to(device=loaded.device, dtype=dtype)):
+            raise ValueError(
+                f"draft_weights_path={path!r} has a trained {key}, but the EAGLE-4 serving adapters replace it "
+                "with the target's; retrain the draft stage with recipe_args.freeze_embeddings: true."
+            )
     # The checkpoint's persistent d2t/t2d buffers encode the draft-vocab mapping
     # its lm_head rows were trained for. This loads AFTER set_vocab_mapping, so
     # a silently differing checkpoint mapping would overwrite the run's freshly
@@ -716,6 +767,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 has_peft=self.cfg.get("peft", None) is not None,
                 has_decode_eval=recipe_cfg.get("decode_eval", None) is not None,
                 draft_weights_path=recipe_cfg.get("draft_weights_path", None),
+                ttt_steps=recipe_cfg.ttt_steps,
+                freeze_embeddings=recipe_cfg.get("freeze_embeddings", None),
             )
         self.dist_setup = None
         self.distributed_config = None
@@ -849,6 +902,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self.draft_model,
                 draft_weights_path,
                 optional_keys=CANDIDATE_HEAD_KEYS if candidate_head is not None else frozenset(),
+                target_copied_keys=(
+                    frozenset({"model.embed_tokens.weight"}) if self.eagle4 is not None else frozenset()
+                ),
             )
             if candidate_head is not None:
                 _prepare_candidate_head_training(self.draft_model, missing_head_keys)

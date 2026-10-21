@@ -26,7 +26,8 @@ export writes:
 * ``model.safetensors``: every tensor with the ``model.`` prefix dropped
   (``fc.weight``, ``layers.0.*``, ``norm.weight``, ``embed_tokens.weight``) next
   to the top-level ``lm_head.weight``, ``efficient_lm_head.weight`` and
-  ``efficient_lm_head_down_proj.weight``.
+  ``efficient_lm_head_down_proj.weight``. ``embed_tokens`` is the target's
+  (the recipe keeps it frozen), which the serving adapters load in its place.
 
 Usage::
 

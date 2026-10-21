@@ -82,6 +82,8 @@ def _gate_kwargs(**overrides):
         has_peft=False,
         has_decode_eval=False,
         draft_weights_path=None,
+        ttt_steps=7,
+        freeze_embeddings=None,
     )
     kwargs.update(overrides)
     return kwargs
@@ -90,6 +92,9 @@ def _gate_kwargs(**overrides):
 def test_gates_accept_both_stages():
     _validate_eagle4_gates(STAGE1, **_gate_kwargs(lk_loss_type="alpha"))
     _validate_eagle4_gates(STAGE2, **_gate_kwargs(draft_weights_path="/stage1"))
+    _validate_eagle4_gates(STAGE1, **_gate_kwargs(freeze_embeddings=True))
+    # The smallest window that still leaves the deepest TTT step one context key.
+    _validate_eagle4_gates(Eagle4Config(sliding_window=7), **_gate_kwargs())
 
 
 @pytest.mark.parametrize(
@@ -100,6 +105,8 @@ def test_gates_accept_both_stages():
         (STAGE1, {"cp_size": 2}, NotImplementedError, "context parallelism"),
         (STAGE1, {"draft_vocab_size": 32000}, ValueError, "full target vocabulary"),
         (STAGE1, {"has_decode_eval": True}, ValueError, "decode_eval"),
+        (Eagle4Config(sliding_window=6), {}, ValueError, "at least ttt_steps"),
+        (STAGE1, {"freeze_embeddings": False}, ValueError, "freeze_embeddings"),
         (STAGE2, {}, ValueError, "draft_weights_path"),
         (STAGE2, {"draft_weights_path": "/stage1", "has_peft": True}, ValueError, "peft"),
         (STAGE2, {"draft_weights_path": "/stage1", "lk_loss_type": "alpha"}, ValueError, "lk_loss_type"),
@@ -147,6 +154,32 @@ def test_partial_candidate_head_is_rejected():
         _prepare_candidate_head_training(_draft(STAGE2), {"efficient_lm_head.weight"})
 
 
+EMBED = "model.embed_tokens.weight"
+
+
+def test_target_copied_keys_tolerate_a_lower_precision_checkpoint(tmp_path):
+    """Untrained embeddings saved by a bf16 stage still match the fp32 copy this run seeded."""
+    state = _draft(STAGE1).state_dict()
+    state[EMBED] = state[EMBED].to(torch.bfloat16)
+    draft = _draft(STAGE1)
+    _load_draft_weights(draft, _save(state, tmp_path), target_copied_keys=frozenset({EMBED}))
+    torch.testing.assert_close(draft.model.embed_tokens.weight, state[EMBED].float())
+
+
+def test_target_copied_keys_reject_trained_values(tmp_path):
+    state = _draft(STAGE1).state_dict()
+    state[EMBED] = state[EMBED] + 1e-3
+    with pytest.raises(ValueError, match="trained model.embed_tokens.weight"):
+        _load_draft_weights(_draft(STAGE1), _save(state, tmp_path), target_copied_keys=frozenset({EMBED}))
+
+
+def test_target_copied_keys_leave_a_vocabulary_mismatch_to_load_state_dict(tmp_path):
+    state = _draft(STAGE1).state_dict()
+    state[EMBED] = torch.zeros(32, state[EMBED].shape[1])
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        _load_draft_weights(_draft(STAGE1), _save(state, tmp_path), target_copied_keys=frozenset({EMBED}))
+
+
 def test_missing_non_optional_keys_still_fail(tmp_path):
     state = _draft(STAGE1).state_dict()
     state.pop("model.fc.weight")
@@ -160,6 +193,8 @@ def test_missing_non_optional_keys_still_fail(tmp_path):
 # --- TrainEagle3Recipe.setup() with recipe_args.eagle4 ----------------------
 
 TARGET_VOCAB, TARGET_HIDDEN = 128, 32
+# One target embedding for every setup() run, as a real target gives both stages.
+TARGET_EMBEDDING = torch.randn(TARGET_VOCAB, TARGET_HIDDEN, generator=torch.Generator().manual_seed(0))
 
 
 class _TrainerBuilt(Exception):
@@ -184,7 +219,7 @@ def _run_setup_to_trainer(recipe_overrides: dict, *, selected_vocab: int = TARGE
 
     def fake_online_target(self, recipe_cfg, target_path, draft_base_config):
         self.target_wrapper = SimpleNamespace(
-            get_input_embeddings=lambda: torch.nn.Embedding(TARGET_VOCAB, TARGET_HIDDEN)
+            get_input_embeddings=lambda: torch.nn.Embedding.from_pretrained(TARGET_EMBEDDING.clone())
         )
         return torch.arange(selected_vocab), torch.ones(TARGET_VOCAB, dtype=torch.bool)
 
@@ -221,8 +256,18 @@ def _run_setup_to_trainer(recipe_overrides: dict, *, selected_vocab: int = TARGE
     return excinfo.value.trainer
 
 
+STAGE1_ARGS = {"eagle4": {"sliding_window": 16}, "fc_norm": True, "norm_output": True}
+STAGE2_ARGS = {**STAGE1_ARGS, "eagle4": {"sliding_window": 16, "candidate_head": {"rank": 4, "num_candidates": 8}}}
+
+
+def _save_stage1(draft, tmp_path):
+    """Write ``draft`` as a stage-1 consolidated checkpoint (weights plus config.json)."""
+    (tmp_path / "config.json").write_text(draft.config.to_json_string(use_diff=False))
+    return _save(draft.state_dict(), tmp_path)
+
+
 def test_setup_trains_both_eagle4_stages(tmp_path):
-    stage1 = _run_setup_to_trainer({"eagle4": {"sliding_window": 16}, "fc_norm": True, "norm_output": True})
+    stage1 = _run_setup_to_trainer(STAGE1_ARGS)
     assert isinstance(stage1, Eagle3TrainerModule)
     config = stage1.draft_model.config
     assert isinstance(config, LlamaConfig) and config.hidden_act == "silu"
@@ -233,24 +278,30 @@ def test_setup_trains_both_eagle4_stages(tmp_path):
     assert config.eagle_config["eagle_aux_hidden_state_layer_ids"] == [1, 3, 4]
     assert stage1.draft_model.model.layers[0].self_attn.sliding_window == 16
 
-    save_file(
-        {k: v.contiguous() for k, v in stage1.draft_model.state_dict().items()}, str(tmp_path / "model.safetensors")
-    )
-    (tmp_path / "config.json").write_text(stage1.draft_model.config.to_json_string(use_diff=False))
-    stage2 = _run_setup_to_trainer(
-        {
-            "eagle4": {"sliding_window": 16, "candidate_head": {"rank": 4, "num_candidates": 8}},
-            "fc_norm": True,
-            "norm_output": True,
-            "draft_weights_path": str(tmp_path),
-            "aux_layer_ids": [2, 4, 6],
-        }
-    )
+    stage2 = _run_setup_to_trainer({**STAGE2_ARGS, "draft_weights_path": _save_stage1(stage1.draft_model, tmp_path)})
     assert isinstance(stage2, Eagle4CandidateHeadTrainerModule)
     draft = stage2.draft_model
-    assert draft.config.eagle_config["eagle_aux_hidden_state_layer_ids"] == [2, 4, 6]
+    assert draft.config.eagle_config["eagle_aux_hidden_state_layer_ids"] == [1, 3, 4]
     assert {n for n, p in draft.named_parameters() if p.requires_grad} == CANDIDATE_HEAD_KEYS
     torch.testing.assert_close(draft.lm_head.weight, stage1.draft_model.lm_head.weight)
+
+
+@pytest.mark.parametrize("aux_layer_ids", [[4, 3, 1], [2, 4, 6]])
+def test_setup_rejects_candidate_head_stage_fed_other_aux_layers(tmp_path, aux_layer_ids):
+    """The frozen stage-1 fc expects its aux layers in their order; reordered or other layers change the teacher."""
+    stage1_path = _save_stage1(_run_setup_to_trainer(STAGE1_ARGS).draft_model, tmp_path)
+    with pytest.raises(ValueError, match="aux_layer_ids"):
+        _run_setup_to_trainer({**STAGE2_ARGS, "draft_weights_path": stage1_path, "aux_layer_ids": aux_layer_ids})
+
+
+@pytest.mark.parametrize("stage_args", [STAGE1_ARGS, STAGE2_ARGS])
+def test_setup_rejects_eagle4_warm_start_with_trained_embeddings(tmp_path, stage_args):
+    """The serving adapters replace the draft embeddings with the target's, so a warm start must not train them."""
+    stage1 = _run_setup_to_trainer(STAGE1_ARGS).draft_model
+    with torch.no_grad():
+        stage1.model.embed_tokens.weight[0] += 1.0
+    with pytest.raises(ValueError, match="trained model.embed_tokens.weight"):
+        _run_setup_to_trainer({**stage_args, "draft_weights_path": _save_stage1(stage1, tmp_path)})
 
 
 def test_setup_rejects_a_compressed_draft_vocabulary():
@@ -264,8 +315,7 @@ def test_setup_gates_eagle4_before_loading_the_target():
 
 
 def test_candidate_head_stage_must_keep_the_stage1_structure(tmp_path):
-    stage1 = _draft(STAGE1)
-    (tmp_path / "config.json").write_text(stage1.config.to_json_string(use_diff=False))
+    _save_stage1(_draft(STAGE1), tmp_path)
     _check_candidate_head_warm_start(_draft(STAGE2).config, str(tmp_path))
     _check_candidate_head_warm_start(_draft(STAGE2).config, str(tmp_path / "model.safetensors"))  # file path
 
@@ -276,11 +326,15 @@ def test_candidate_head_stage_must_keep_the_stage1_structure(tmp_path):
     no_norm_output.norm_output = True
     with pytest.raises(ValueError, match="norm_output"):
         _check_candidate_head_warm_start(no_norm_output, str(tmp_path))
+    reordered_aux = _draft(STAGE2).config
+    reordered_aux.eagle_config = {**reordered_aux.eagle_config, "eagle_aux_hidden_state_layer_ids": [3, 2, 1]}
+    with pytest.raises(ValueError, match="aux_layer_ids"):
+        _check_candidate_head_warm_start(reordered_aux, str(tmp_path))
 
 
-def test_candidate_head_warm_start_without_config_is_not_checked(tmp_path, caplog):
-    _check_candidate_head_warm_start(_draft(STAGE2).config, str(tmp_path))
-    assert "no config.json" in caplog.text
+def test_candidate_head_warm_start_requires_the_stage1_config(tmp_path):
+    with pytest.raises(FileNotFoundError, match="config.json"):
+        _check_candidate_head_warm_start(_draft(STAGE2).config, str(tmp_path))
 
 
 def _aux_ids(target_wrapper, cached=None, recipe_ids=None):
