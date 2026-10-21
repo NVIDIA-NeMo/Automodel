@@ -40,6 +40,7 @@ from nemo_automodel.recipes.llm.train_eagle3 import (
     _load_draft_weights,
     _parse_eagle4_config,
     _prepare_candidate_head_training,
+    _resolve_freeze_embeddings,
     _validate_eagle4_gates,
 )
 
@@ -72,6 +73,21 @@ def test_parse_eagle4_config():
         _parse_eagle4_config({"sliding_windw": 4096})
 
 
+@pytest.mark.parametrize(
+    "recipe_args, parallel_drafting, expected",
+    [
+        ({}, False, True),
+        ({}, True, False),
+        ({"freeze_embeddings": None}, False, True),
+        ({"freeze_embeddings": None}, True, False),
+        ({"freeze_embeddings": False}, False, False),
+        ({"freeze_embeddings": True}, True, True),
+    ],
+)
+def test_resolve_freeze_embeddings_treats_null_as_the_default(recipe_args, parallel_drafting, expected):
+    assert _resolve_freeze_embeddings(ConfigNode(recipe_args), parallel_drafting) is expected
+
+
 def _gate_kwargs(**overrides):
     kwargs = dict(
         draft_spec=DraftSpec(draft_cls=LlamaEagle3DraftModel, eagle4_draft_config=lambda config: config.to_dict()),
@@ -83,7 +99,7 @@ def _gate_kwargs(**overrides):
         has_decode_eval=False,
         draft_weights_path=None,
         ttt_steps=7,
-        freeze_embeddings=None,
+        freeze_embeddings=True,
     )
     kwargs.update(overrides)
     return kwargs
@@ -92,7 +108,6 @@ def _gate_kwargs(**overrides):
 def test_gates_accept_both_stages():
     _validate_eagle4_gates(STAGE1, **_gate_kwargs(lk_loss_type="alpha"))
     _validate_eagle4_gates(STAGE2, **_gate_kwargs(draft_weights_path="/stage1"))
-    _validate_eagle4_gates(STAGE1, **_gate_kwargs(freeze_embeddings=True))
     # The smallest window that still leaves the deepest TTT step one context key.
     _validate_eagle4_gates(Eagle4Config(sliding_window=7), **_gate_kwargs())
 
@@ -277,6 +292,7 @@ def test_setup_trains_both_eagle4_stages(tmp_path):
     # The default EAGLE-3 aux layers of an 8-layer target.
     assert config.eagle_config["eagle_aux_hidden_state_layer_ids"] == [1, 3, 4]
     assert stage1.draft_model.model.layers[0].self_attn.sliding_window == 16
+    assert not stage1.draft_model.model.embed_tokens.weight.requires_grad
 
     stage2 = _run_setup_to_trainer({**STAGE2_ARGS, "draft_weights_path": _save_stage1(stage1.draft_model, tmp_path)})
     assert isinstance(stage2, Eagle4CandidateHeadTrainerModule)
@@ -302,6 +318,17 @@ def test_setup_rejects_eagle4_warm_start_with_trained_embeddings(tmp_path, stage
         stage1.model.embed_tokens.weight[0] += 1.0
     with pytest.raises(ValueError, match="trained model.embed_tokens.weight"):
         _run_setup_to_trainer({**stage_args, "draft_weights_path": _save_stage1(stage1, tmp_path)})
+
+
+def test_setup_freezes_eagle4_embeddings_under_an_explicit_null():
+    """An explicit null means the default like a missing key, so stage 1 cannot train what stage 2 rejects."""
+    draft = _run_setup_to_trainer({**STAGE1_ARGS, "freeze_embeddings": None}).draft_model
+    assert not draft.model.embed_tokens.weight.requires_grad
+
+
+def test_setup_rejects_eagle4_trainable_embeddings():
+    with pytest.raises(ValueError, match="freeze_embeddings"):
+        _run_setup_to_trainer({**STAGE1_ARGS, "freeze_embeddings": False})
 
 
 def test_setup_rejects_a_compressed_draft_vocabulary():

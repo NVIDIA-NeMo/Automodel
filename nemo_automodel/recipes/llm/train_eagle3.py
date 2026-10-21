@@ -420,6 +420,16 @@ def _parse_eagle4_config(node) -> Eagle4Config | None:
     )
 
 
+def _resolve_freeze_embeddings(recipe_cfg, parallel_drafting: bool) -> bool:
+    """Effective ``recipe_args.freeze_embeddings``, where a missing or null value means the default.
+
+    EAGLE-3 TTT freezes the draft embeddings by default; P-EAGLE trains them
+    (speculators sets ``embed_requires_grad=True`` for parallel drafting).
+    """
+    freeze_embeddings = recipe_cfg.get("freeze_embeddings", None)
+    return not parallel_drafting if freeze_embeddings is None else bool(freeze_embeddings)
+
+
 def _validate_eagle4_gates(
     eagle4: Eagle4Config,
     *,
@@ -432,13 +442,9 @@ def _validate_eagle4_gates(
     has_decode_eval: bool,
     draft_weights_path: str | None,
     ttt_steps: int,
-    freeze_embeddings: bool | None,
+    freeze_embeddings: bool,
 ) -> None:
-    """Reject ``recipe_args.eagle4`` combinations the EAGLE-4 draft or its trainers cannot honor.
-
-    ``freeze_embeddings`` is the raw ``recipe_args`` value; ``None`` keeps the
-    EAGLE-3 default, which freezes them.
-    """
+    """Reject ``recipe_args.eagle4`` combinations the EAGLE-4 draft or its trainers cannot honor."""
     if draft_spec.eagle4_draft_config is None:
         raise ValueError(
             f"eagle4 is not supported for this target's draft ({draft_spec.draft_cls.__name__}); see "
@@ -451,7 +457,7 @@ def _validate_eagle4_gates(
             f"eagle4.sliding_window ({eagle4.sliding_window}) must be at least ttt_steps ({ttt_steps}): the "
             "depth-i query's window holds its i chain keys, so a smaller window leaves the deepest step no context."
         )
-    if freeze_embeddings is not None and not freeze_embeddings:
+    if not freeze_embeddings:
         raise ValueError(
             "eagle4 drafts must keep the target's embeddings (recipe_args.freeze_embeddings: true): the EAGLE-4 "
             "serving adapters load the target's embed_tokens into the draft, so trained draft embeddings would "
@@ -745,7 +751,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # P-EAGLE (parallel_drafting) only safely supports a colocated live target
         # on non-packed sequences; gate the unsupported combinations early, before
         # loading the target -- see _validate_peagle_gates.
-        if bool(recipe_cfg.get("parallel_drafting", False)):
+        parallel_drafting = bool(recipe_cfg.get("parallel_drafting", False))
+        # One value for the EAGLE-4 gate and the draft freeze below.
+        freeze_embeddings = _resolve_freeze_embeddings(recipe_cfg, parallel_drafting)
+        if parallel_drafting:
             _validate_peagle_gates(
                 backend=recipe_cfg.get("target_model_backend", "colocated"),
                 cached_target_path=self.cached_target_path,
@@ -760,7 +769,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             _validate_eagle4_gates(
                 self.eagle4,
                 draft_spec=draft_spec,
-                parallel_drafting=bool(recipe_cfg.get("parallel_drafting", False)),
+                parallel_drafting=parallel_drafting,
                 cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
                 draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
                 lk_loss_type=recipe_cfg.get("lk_loss_type", None),
@@ -768,7 +777,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 has_decode_eval=recipe_cfg.get("decode_eval", None) is not None,
                 draft_weights_path=recipe_cfg.get("draft_weights_path", None),
                 ttt_steps=recipe_cfg.ttt_steps,
-                freeze_embeddings=recipe_cfg.get("freeze_embeddings", None),
+                freeze_embeddings=freeze_embeddings,
             )
         self.dist_setup = None
         self.distributed_config = None
@@ -799,7 +808,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # An EAGLE-4 draft is built from the Llama-style LlamaForCausalLMEagle4
         # config, never from a target-specific config class (whose validators
         # would reject or rewrite the single windowed draft layer).
-        if self.eagle4 is not None and draft_spec.eagle4_draft_config is not None:
+        if self.eagle4 is not None:
             draft_config = draft_spec.eagle4_draft_config(draft_base_config)
             draft_config_cls, draft_cls = LlamaConfig, LlamaEagle3DraftModel
         else:
@@ -839,7 +848,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # token id placed at masked multi-token-prediction slots; ``num_depths``
         # and the COD ratios are serialized into the draft ``config.json`` so the
         # saved checkpoint loads into vLLM's parallel-drafting runtime unchanged.
-        parallel_drafting = bool(recipe_cfg.get("parallel_drafting", False))
         draft_config["parallel_drafting"] = parallel_drafting
         mask_token_id = None
         if parallel_drafting:
@@ -877,11 +885,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # compressed-vocab checkpoint carries the remap tables vLLM/SGLang need.
         # No-op when the vocab is not compressed. See set_vocab_mapping.
         self.draft_model.set_vocab_mapping(selected_token_ids)
-        # EAGLE-3 TTT freezes the draft embeddings by default; P-EAGLE trains them
-        # (speculators sets ``embed_requires_grad=True`` for parallel drafting).
-        # Either default can still be overridden via ``recipe_args.freeze_embeddings``.
-        freeze_embeddings_default = not parallel_drafting
-        freeze_embeddings = bool(recipe_cfg.get("freeze_embeddings", freeze_embeddings_default))
         if freeze_embeddings:
             self.draft_model.freeze_embeddings()
         # P-EAGLE memory knob: recompute the draft layers' activations in the
