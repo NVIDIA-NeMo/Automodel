@@ -1020,7 +1020,7 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)):
             # Delegate expert initialization to experts.py
             _init_expert_weights(module, buffer_device, init_std)
-        elif isinstance(module, GroupedExpertsMoK):
+        elif isinstance(module, (GroupedExpertsMoK, GroupedExpertsDistMoE)):
             module.init_weights(buffer_device, init_std)
         elif isinstance(module, MLP):
             to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
