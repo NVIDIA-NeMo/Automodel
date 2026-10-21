@@ -37,7 +37,7 @@ maintainers = [
     { name = "Huiying Li", email = "huiyingl@nvidia.com" },
     { name = "NVIDIA", email = "nemo-toolkit@nvidia.com" },
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 classifiers = [
     # How mature is this project? Common values are
     #  1 - Planning
@@ -64,6 +64,7 @@ classifiers = [
     'License :: OSI Approved :: Apache Software License',
     # Supported python versions
     'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.10',
     'Programming Language :: Python :: 3.11',
     'Programming Language :: Python :: 3.12',
     # Additional Setting
@@ -326,6 +327,7 @@ constraint-dependencies = [
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "mako>=1.4.2", # Address CVE-2026-102991
     "msgpack>=1.2.1", # Address CVE GHSA-6v7p-g79w-8964
+    "pillow>=12.3.0", # Address the Pillow 12.3.0 security fixes
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
     # PyArrow 26 requires NumPy 2; retain this cap while the build uses NumPy 1.26.
     "pyarrow>=23.0.1,<26", # Address CVE GHSA-rgxp-2hwp-jwgg
@@ -355,9 +357,10 @@ constraint-dependencies = [
     "apache-tvm-ffi<=0.1.11",
 ]
 override-dependencies = [
-    # Trackio caps Pillow<13; override to retain the security floor.
-    # Remove this override when Trackio accepts Pillow 13.
-    "pillow>=13.0.0",
+    # Pillow 13 requires Python 3.11+; retain the security floor on Python 3.10.
+    # Override Trackio's Pillow<13 cap on supported interpreters.
+    "pillow>=12.3.0,<13; python_version < '3.11'",
+    "pillow==13.0.0; python_version >= '3.11'",
     # leptonai (via nemo-run) caps anyio<=4.9.0; override to keep the security floor
     "anyio>=4.14.2",
     # TE native grouped GEMM with current-scaling FP8 requires cuBLASLt 13.5+ on Hopper.
@@ -496,7 +499,7 @@ omit = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py310"
 exclude = [
    "tests/",
 ]
@@ -662,7 +665,7 @@ allow_indirect_imports = true
 # To advance to the next phase, move module paths from the "Phase 2" comment
 # into the active overrides list and fix any new errors.
 [tool.ty.environment]
-python-version = "3.11"
+python-version = "3.10"
 
 [tool.ty.src]
 include = ["nemo_automodel", "examples"]

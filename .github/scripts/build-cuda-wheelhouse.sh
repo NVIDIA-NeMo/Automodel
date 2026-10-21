@@ -38,9 +38,6 @@ python -m venv ./venv
 
 . ./venv/bin/activate
 
-# The lock selector evaluates PEP 508 markers before resolving build tools.
-uv pip install --python ./venv/bin/python "packaging==25.0"
-
 build_tools="$(
   python scripts/cuda_wheelhouse_lock.py --output build-tools "${lock_args[@]}"
 )"
