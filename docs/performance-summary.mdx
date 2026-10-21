@@ -34,10 +34,13 @@ MFU is time-weighted over the same measurement window as step time and token thr
 
 | Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [Qwen3.5-4B](https://github.com/NVIDIA-NeMo/Automodel/blob/c9480acf208a940bf719a74316bd2e90f805264c/examples/vlm_finetune/qwen3_5/qwen3_5_4b_canva_automodel_sdpa_profile.yaml) | MedPix VLM, NEAT packed | 4 | 16 | 1 | 1 | 4 | 16384 | 1 | 1 | 1 | 1 | - | 4 | SDPA + torch | 13.698 | -- | 9,082 | 2,270.45 |
 | [DeepSeek-V4.1-Flash](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune/deepseek_v41/deepseek_v41_flash_medpix_4k_ep64.yaml) | MedPix VLM | 64 | 64 | 1 | 1 | 1 | 4096 | 1 | 1 | 1 | 64 | - | NR | TileLang + torch + torch_mm + HybridEP | 3.585 | -- | 5,473 | 85.52 |
 | [MiMo-V2.6-Pro-RL](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps.yaml) | Tulu-3 packed | 128 | 16 | 1 | 2 | 1 | 65536 | 1 | 2 | 8 | 64 | NR | NR | TE attention/linear + torch_mm + HybridEP | 16.973 | [90.96%](https://wandb.ai/Nemo-automodel/automodel-mimo-v26-pro/runs/mimo26-pro-sft64k-remainders-7588062) | 58,391 | 456.18 |
 
 FSDP2; MiMo-V2.6-Pro-RL includes profiler overhead.
+
+Qwen3.5-4B is a short profiled reference, averaging steps 3-5 of six updates: rank-0 CPU profiler-step time and recipe-logged token rates, including profiler overhead. Vision is trainable, MTP is disabled, and FP32 resident weights use BF16 compute. The linked profile recipe was run with SDPA and six updates; see the [measurement and source details](https://github.com/NVIDIA-NeMo/Automodel/pull/3753).
 
 <a id="fine-tuning-lora-performance" />
 
