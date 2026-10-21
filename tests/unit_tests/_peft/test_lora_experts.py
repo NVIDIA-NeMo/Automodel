@@ -1297,3 +1297,32 @@ def test_moe_rank_scaling_output_equivalence(moe_config, device):
         out_lora = model(x, token_mask, weights, indices)
 
     assert torch.allclose(out_orig, out_lora, atol=1e-6)
+
+
+@pytest.mark.parametrize("use_torch_mm", [False, True])
+def test_lora_after_down_zero_tokens_keeps_routing_weights_attached(moe_config, device, use_torch_mm):
+    """A rank with no routed tokens still backpropagates into its routing weights.
+
+    Under expert parallelism the routing weights come from an all-gather whose backward is
+    a collective, so every rank must reach it, including ranks whose experts got no tokens.
+    """
+    config = replace(moe_config, apply_router_weight_after_down=True)
+    orig_experts = GroupedExperts(config).to(device)
+    with torch.no_grad():
+        orig_experts.gate_and_up_projs.normal_(0, 0.02)
+        orig_experts.down_projs.normal_(0, 0.02)
+    orig_experts.use_torch_mm = use_torch_mm
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    num_tokens = 10
+    x = torch.randn(num_tokens, config.dim, device=device)
+    token_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, config.n_activated_experts, device=device, requires_grad=True)
+    indices = torch.randint(0, config.n_routed_experts, (num_tokens, config.n_activated_experts), device=device)
+
+    out = lora_experts(x, token_mask, weights, indices)
+    out.sum().backward()
+
+    torch.testing.assert_close(out, torch.zeros_like(out))
+    assert weights.grad is not None
+    torch.testing.assert_close(weights.grad, torch.zeros_like(weights))

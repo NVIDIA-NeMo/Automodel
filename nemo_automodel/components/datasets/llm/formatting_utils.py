@@ -700,6 +700,7 @@ def _package_tokenized_example(
     truncation="do_not_truncate",
     padding="do_not_pad",
     unshifted=False,
+    tokenizer_attention_mask=None,
 ):
     """
     Package a tokenized example with proper masking and padding.
@@ -716,10 +717,18 @@ def _package_tokenized_example(
         unshifted: If True, return unshifted format for dLLM training
             (``input_ids`` at full length with ``loss_mask`` instead of
             shifted ``input_ids``/``labels``).
+        tokenizer_attention_mask: Optional positional validity mask returned
+            with ``input_ids``. Preserve it instead of inferring padding from
+            token values, which can also represent valid EOS/content tokens.
     Returns:
         A dictionary with input_ids, labels, and attention_mask.
         When *unshifted* is True, ``labels`` is replaced by ``loss_mask``.
     """
+    if tokenizer_attention_mask is not None:
+        if len(tokenizer_attention_mask) != len(input_ids):
+            raise ValueError("Tokenizer attention_mask must match input_ids length")
+        tokenizer_attention_mask = [int(bool(value)) for value in tokenizer_attention_mask]
+
     if unshifted:
         # --- Unshifted dLLM format ---
         # No shift: input_ids stays at full length, loss_mask = assistant_masks.
@@ -735,7 +744,12 @@ def _package_tokenized_example(
                 content_length = min(end + 1, content_length)
             else:
                 content_length = end
-        attention_mask = [1] * content_length + [0] * (len(input_ids) - content_length)
+        attention_mask = (
+            list(tokenizer_attention_mask)
+            if tokenizer_attention_mask is not None
+            else [1] * content_length + [0] * (len(input_ids) - content_length)
+        )
+        loss_mask = [value if valid else 0 for value, valid in zip(loss_mask, attention_mask, strict=True)]
 
         if isinstance(seq_length, int) and padding in ("max_length",):
             input_ids = _pad_to_seq_length(input_ids, pad_token_id, seq_length)
@@ -772,11 +786,19 @@ def _package_tokenized_example(
             content_length = end
     input_ids = input_ids[:-1]
     content_length = max(0, min(content_length - 1, len(input_ids)))
-    attention_mask = [1] * content_length + [0] * (len(input_ids) - content_length)
+    attention_mask = (
+        tokenizer_attention_mask[:-1]
+        if tokenizer_attention_mask is not None
+        else [1] * content_length + [0] * (len(input_ids) - content_length)
+    )
     # Labels: mask out prompt tokens
     labels[:] = [label if bool(m) else -100 for label, m in zip(labels, assistant_masks)]
+    if tokenizer_attention_mask is not None:
+        labels[:] = [label if valid else -100 for label, valid in zip(labels, tokenizer_attention_mask, strict=True)]
     # remove BOS
     labels = labels[1:]
+    # Left padding can place a real target after an invalid input query.
+    labels[:] = [label if valid else -100 for label, valid in zip(labels, attention_mask, strict=True)]
     if not _has_chat_template(tokenizer) and truncation is None:
         assert labels[-1] == eos_token_id, f"labels[-1]={labels[-1]} != eos_token_id={eos_token_id}"
         assert input_ids[-1] != eos_token_id, f"input_ids[-1]={input_ids[-1]} == eos_token_id={eos_token_id}"
@@ -881,6 +903,7 @@ def format_prompt_completion(
         truncation=truncation,
         padding=padding,
         unshifted=unshifted,
+        tokenizer_attention_mask=tokenizer_attn_mask,
     )
 
 
@@ -1058,4 +1081,5 @@ def format_chat_template(
         truncation=truncation,
         padding=padding,
         unshifted=unshifted,
+        tokenizer_attention_mask=tokenizer_attn_mask,
     )
