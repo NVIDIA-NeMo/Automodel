@@ -1,0 +1,40 @@
+---
+title: "Nemotron-3-Embed-1B-BF16"
+description: "Reference Nemotron-3-Embed-1B-BF16 text embeddings and NeMo AutoModel's text distillation example, including the starting student and teacher checkpoints."
+slug: model-coverage/embedding-models/nvidia/Nemotron-3-Embed-1B-BF16
+---
+
+[Nemotron-3-Embed-1B-BF16](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16)
+is a multilingual text embedding model derived from Ministral3 through pruning
+and distillation. It uses bidirectional attention and average pooling to produce
+2,048-dimensional embeddings.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Ministral3Model` |
+| Task | Text embedding and dense retrieval |
+| AutoModel Wrapper | `NeMoAutoModelBiEncoder` |
+| Inputs | Text queries and text documents |
+| Embedding Dimensions | 2,048 |
+
+## Training Resources
+
+Use the [text distillation example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/distillation/nemotron3_embed_1b_distill.yaml)
+to continue training this student checkpoint with the frozen
+[Nemotron 3 Embed 8B](/model-coverage/embedding-models/nvidia/Nemotron-3-Embed-8B-BF16)
+teacher. A trainable projection maps student embeddings to the teacher's
+4,096-dimensional space for the distillation losses.
+
+The example starts from the released 1B student. It does not perform the pruning
+stages used to create that checkpoint. Follow the
+[example README](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/distillation/README.md)
+for dataset requirements and launch instructions, and the
+[model card](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16)
+for the original training method and inference examples.
+
+For image and text documents, refer to
+[Nemotron 3.5 Embed 1B](/model-coverage/embedding-models/nvidia/Nemotron-3.5-Embed-1B-BF16).
