@@ -203,6 +203,39 @@ class TestResolveMeshContext:
         assert context.strategy_config.multimodal.frozen_sharding == "replicate"
 
 
+class TestFromConfigLoadsBaseModel:
+    def test_from_config_forwards_load_base_model_to_build_model(self):
+        from transformers import PretrainedConfig
+
+        config = PretrainedConfig()
+        config.name_or_path = "test/checkpoint"
+        sentinel_model = object()
+
+        with (
+            patch(
+                "nemo_automodel._transformers.auto_model.AutoConfig.resolve_revision",
+                return_value=None,
+            ) as mock_resolve_revision,
+            patch("nemo_automodel._transformers.auto_model.resolve_trust_remote_code", return_value=False),
+            patch("nemo_automodel._transformers.auto_model.get_is_hf_model", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.resolve_sdpa_method", return_value=None),
+            patch.object(
+                NeMoAutoModelForCausalLM, "_build_model", return_value=sentinel_model
+            ) as mock_build,
+        ):
+            result = NeMoAutoModelForCausalLM.from_config(
+                config,
+                load_base_model=True,
+                use_liger_kernel=False,
+                use_sdpa_patching=False,
+            )
+
+        assert result is sentinel_model
+        mock_resolve_revision.assert_called_once()
+        assert mock_build.call_args.args[0] is config
+        assert mock_build.call_args.kwargs["load_base_model"] is True
+
+
 @pytest.mark.usefixtures("mock_hub_revision")
 class TestFromPretrainedDeviceMesh:
     def test_from_pretrained_accepts_device_mesh_as_topology_shortcut(self):

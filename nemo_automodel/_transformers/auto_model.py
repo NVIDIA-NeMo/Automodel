@@ -546,6 +546,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     force_hf,
                     *model_args,
                     _process_group=process_group,
+                    _load_base_model=load_base_model,
                     **kwargs,
                 )
         except (NotImplementedError, RuntimeError) as e:
@@ -576,6 +577,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                         force_hf,
                         *model_args,
                         _process_group=process_group,
+                        _load_base_model=load_base_model,
                         **kwargs,
                     )
             else:

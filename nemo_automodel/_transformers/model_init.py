@@ -1215,6 +1215,7 @@ def __init_model(
     # it. Pop here so the flag never reaches HF's ``from_pretrained``.
     restore_loaded_dtype = kwargs.pop("_restore_loaded_dtype", True)
     process_group = kwargs.pop("_process_group", None)
+    load_base_model = kwargs.pop("_load_base_model", False)
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
     if is_pretrained_init:
@@ -1391,12 +1392,11 @@ def __init_model(
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             with local_torch_dtype(torch_dtype, model_cls.__name__):
                 model = model_cls(hf_config, *model_args, **kwargs)
-            if is_pretrained_init:
+            if is_pretrained_init or (load_base_model and pretrained_model_name_or_path):
                 # Custom constructors only see the config. Restore the checkpoint's
-                # generation settings the way PreTrainedModel.from_pretrained does:
-                # generation_config.json carries stop tokens and sampling defaults that
-                # the config lacks, and the consolidated export writes
-                # model.generation_config back out.
+                # generation settings both for from_pretrained and from_config builds
+                # that explicitly load base weights. A plain from_config build must
+                # not read checkpoint metadata just because config.name_or_path is set.
                 restore_pretrained_generation_config(
                     model, pretrained_model_name_or_path, config_overrides=config_overrides, **loading_kwargs
                 )
