@@ -88,6 +88,24 @@ P-EAGLE (parallel-drafting EAGLE-3) adds one further optional toggle:
   today (https://github.com/sgl-project/sglang/issues/23171). The flag only ever
   adds the ``mask_hidden`` key, so EAGLE-3 / EAGLE-3.1 checkpoints round-trip
   unchanged.
+
+EAGLE-4 (``config.architectures == ["LlamaForCausalLMEagle4"]``) keeps the
+EAGLE-3.1 layer and adds two config-driven structures, laid out like the
+``LlamaForCausalLMEagle4`` drafts served by TokenSpeed and the EAGLE-4 engines:
+
+* a sliding-window draft layer (``layer_types == ["sliding_attention"]`` with
+  ``sliding_window`` W): a query at position ``t`` attends to the context keys
+  ``t - W + 1 .. t`` plus its own TTT chain (the per-position diagonals are
+  never windowed). The window is read only for an EAGLE-4 config, because a
+  draft config cloned from a Qwen-family target carries a ``sliding_window``
+  its EAGLE-3 draft never used.
+* a low-rank candidate head (``config.efficient_lm_head_config`` with ``rank``
+  r and ``num_candidates`` K): ``efficient_lm_head(efficient_lm_head_down_proj(h))``
+  scores the full target vocabulary at rank r, the engine keeps the top K
+  tokens and rescores only those with the full ``lm_head``. The factors are
+  top-level keys (``efficient_lm_head.weight`` of shape ``[vocab, r]`` and
+  ``efficient_lm_head_down_proj.weight`` of shape ``[r, hidden]``) and require
+  the full target vocabulary (no ``d2t`` / ``t2d`` compression).
 """
 
 from __future__ import annotations
@@ -139,6 +157,52 @@ def _load_flash_attn_func() -> tuple[bool, object | None, object | None]:
 _HAS_FA, _flash_attn_func, _flash_attn_varlen_func = _load_flash_attn_func()
 
 _SUPPORTED_ATTN_IMPLEMENTATIONS = ("eager", "flash_attention_2")
+
+# ``architectures`` entry of an EAGLE-4 draft; the serving engines register the
+# draft class under this name.
+EAGLE4_ARCHITECTURE = "LlamaForCausalLMEagle4"
+
+
+def _draft_sliding_window(config: PretrainedConfig) -> int | None:
+    """Return the EAGLE-4 draft layer's context window W, or None for full attention.
+
+    ``layer_types`` decides when present (``["sliding_attention"]``), otherwise
+    ``use_sliding_window``. Non-EAGLE-4 configs always use full attention (see
+    the module docstring).
+    """
+    if EAGLE4_ARCHITECTURE not in (getattr(config, "architectures", None) or ()):
+        return None
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None:
+        enabled = "sliding_attention" in layer_types
+    else:
+        enabled = bool(getattr(config, "use_sliding_window", False))
+    if not enabled:
+        return None
+    window = getattr(config, "sliding_window", None)
+    if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+        raise ValueError(f"EAGLE-4 draft enables a sliding window but sliding_window={window!r}.")
+    return window
+
+
+def _apply_sliding_window(causal_mask: torch.Tensor, sliding_window: int) -> torch.Tensor:
+    """Mask the keys that lie ``sliding_window`` or more positions behind each query.
+
+    The masked entries are set to ``finfo(dtype).min`` (finite), so a padding
+    query whose whole window is padding still yields a finite softmax.
+
+    Args:
+        causal_mask: Tensor of shape ``[batch, 1, sequence, sequence]``, the
+            additive (query, key) mask of Block 1 (``0`` = attend).
+        sliding_window: Number of context keys a query sees, itself included.
+
+    Returns:
+        A new tensor of shape ``[batch, 1, sequence, sequence]``; ``causal_mask``
+        is not modified.
+    """
+    positions = torch.arange(causal_mask.shape[-1], device=causal_mask.device)
+    too_old = positions.view(1, -1) <= positions.view(-1, 1) - sliding_window  # [query, key]
+    return causal_mask.masked_fill(too_old, torch.finfo(causal_mask.dtype).min)
 
 
 def _build_causal_mask(
@@ -262,6 +326,10 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             self.num_heads * self.head_dim, config.hidden_size, bias=getattr(config, "attention_bias", False)
         )
         self.rotary_emb = LlamaRotaryEmbedding(config)
+        # EAGLE-4 sliding window over the Block-1 context keys (None = full
+        # causal attention). The eager path reads it through the mask built in
+        # ``LlamaEagle3DraftModel.forward``; FlashAttention takes it here.
+        self.sliding_window = _draft_sliding_window(config)
         # Set by attach_eagle3_cp_attention when the draft runs under context
         # parallelism: the sequence is sharded across this cp group and the mixed
         # causal/TTT-diagonal attention runs distributed. None otherwise.
@@ -438,6 +506,8 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
 
         With ``cu_seqlens`` (packing), Block 1 uses ``flash_attn_varlen_func`` for
         document-level causal attention; the position-wise Block 2 is unchanged.
+        An EAGLE-4 ``sliding_window`` W limits Block 1 to the last W keys
+        (FlashAttention ``window_size=(W - 1, 0)``).
         """
         # FA2 expects (B, T, H, D); eager cache is (B, H, T, D).
         k0, v0 = cache_k[0], cache_v[0]
@@ -457,6 +527,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
                 v0_fa,
                 softmax_scale=self.scaling,
                 causal=True,
+                window_size=self._flash_window_size(),
                 return_attn_probs=True,
             )
             # FA output is (B, T, H, D); bring back to (B, H, T, D) for the merge.
@@ -517,6 +588,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.scaling,
             causal=True,
+            window_size=self._flash_window_size(),
             return_attn_probs=True,
         )
         # out_flat: [total_tokens, H, D] -> [B, H, T, D]
@@ -529,6 +601,10 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             )
         lse_fa = lse_flat.transpose(0, 1).reshape(batch_size, seq_len, num_heads).permute(0, 2, 1)
         return attn_output_bhtd, lse_fa
+
+    def _flash_window_size(self) -> tuple[int, int]:
+        """FlashAttention ``window_size`` for Block 1: ``(-1, -1)`` is unbounded."""
+        return (-1, -1) if self.sliding_window is None else (self.sliding_window - 1, 0)
 
     def _cp_ulysses_attention_forward(
         self,
@@ -601,6 +677,11 @@ def attach_eagle3_cp_attention(
     matched = 0
     for module in model.modules():
         if isinstance(module, Eagle3LlamaAttention):
+            if module.sliding_window is not None:
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) does not support the EAGLE-4 sliding-window draft "
+                    "layer; the ring and Ulysses paths attend over the full causal context."
+                )
             module._cp_group = cp_group
             module._cp_mode = mode
             module._cp_zigzag = zigzag
@@ -827,6 +908,33 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         # round-trip with no extra keys (see ``_PeagleDraftMixin``).
         if getattr(config, "parallel_drafting", False):
             self._init_peagle_parameters(config)
+            if _draft_sliding_window(config) is not None:
+                raise ValueError("The EAGLE-4 sliding-window draft layer does not support parallel_drafting.")
+
+        # EAGLE-4 low-rank candidate head, registered only when configured so
+        # EAGLE-3 checkpoints round-trip with no extra keys (see module docstring).
+        self.efficient_lm_head_down_proj: nn.Linear | None = None
+        self.efficient_lm_head: nn.Linear | None = None
+        head_config = getattr(config, "efficient_lm_head_config", None)
+        if head_config is not None:
+            rank = head_config.get("rank") if isinstance(head_config, dict) else None
+            if (
+                not isinstance(head_config, dict)
+                or head_config.get("type") != "low_rank"
+                or not isinstance(rank, int)
+                or rank <= 0
+            ):
+                raise ValueError(
+                    f"efficient_lm_head_config={head_config!r} is not supported; expected "
+                    "{'type': 'low_rank', 'rank': <positive int>, 'num_candidates': <positive int>}."
+                )
+            if self.has_vocab_compression:
+                raise ValueError(
+                    "The EAGLE-4 candidate head scores the full target vocabulary; got "
+                    f"draft_vocab_size={self.draft_vocab_size} < vocab_size={config.vocab_size}."
+                )
+            self.efficient_lm_head_down_proj = nn.Linear(config.hidden_size, rank, bias=False)
+            self.efficient_lm_head = nn.Linear(rank, config.vocab_size, bias=False)
 
         self.post_init()
 
@@ -930,9 +1038,77 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         already returned the post-norm state, so ``lm_head`` is applied
         directly to avoid a double normalisation.
         """
+        return self.lm_head(self._lm_head_input(hidden_states))
+
+    def _lm_head_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the post-``model.norm`` state the output heads read.
+
+        Args:
+            hidden_states: Tensor of shape ``[..., hidden]``, the output of
+                :meth:`forward` (already normed when ``config.norm_output`` is set).
+
+        Returns:
+            Tensor of shape ``[..., hidden]``; ``hidden_states`` itself when it
+            is already normed.
+        """
         if getattr(self.config, "norm_output", False):
-            return self.lm_head(hidden_states)
-        return self.lm_head(self.model.norm(hidden_states))
+            return hidden_states
+        return self.model.norm(hidden_states)
+
+    def compute_candidate_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Score the full vocabulary with the EAGLE-4 low-rank candidate head.
+
+        Serving keeps the top ``num_candidates`` of these scores and rescores
+        only those tokens with ``lm_head``; training fits the scores to the full
+        head's distribution (see ``Eagle4CandidateHeadTrainerModule``).
+
+        Args:
+            hidden_states: Tensor of shape ``[batch, sequence, hidden]``, the
+                output of :meth:`forward` (the same input as :meth:`compute_logits`).
+
+        Returns:
+            Rank-``r`` logits, a tensor of shape ``[batch, sequence, vocab]``.
+        """
+        if self.efficient_lm_head is None:
+            raise RuntimeError("compute_candidate_logits requires config.efficient_lm_head_config.")
+        return self.efficient_lm_head(self.efficient_lm_head_down_proj(self._lm_head_input(hidden_states)))
+
+    @torch.no_grad()
+    def init_efficient_lm_head_from_lm_head(self, chunk_rows: int = 32768) -> None:
+        """Initialize the candidate-head factors to the best rank-``r`` approximation of ``lm_head``.
+
+        With ``lm_head.weight = U S V^T``, sets ``efficient_lm_head.weight =
+        U_r S_r^(1/2)`` and ``efficient_lm_head_down_proj.weight = S_r^(1/2) V_r^T``
+        (the truncated SVD, split evenly between the two factors). ``V_r`` and
+        ``S_r`` come from an fp64 eigendecomposition of the ``[hidden, hidden]``
+        Gram matrix, which is deterministic (so every rank initializes the same
+        factors) and never materializes a full fp32 copy of the head: both
+        passes over the ``[vocab, hidden]`` weight run ``chunk_rows`` rows at a time.
+        """
+        if self.efficient_lm_head is None:
+            raise RuntimeError("init_efficient_lm_head_from_lm_head requires config.efficient_lm_head_config.")
+        weight = self.lm_head.weight  # [vocab, hidden]
+        rank = self.efficient_lm_head.weight.shape[1]
+        gram = torch.zeros(weight.shape[1], weight.shape[1], dtype=torch.float64, device=weight.device)
+        for rows in weight.split(chunk_rows):
+            rows = rows.double()
+            gram += rows.T @ rows
+        eigenvalues, eigenvectors = torch.linalg.eigh(gram)  # ascending
+        top_values = eigenvalues[-rank:].flip(0).clamp_min(torch.finfo(torch.float64).tiny)
+        top_vectors = eigenvectors[:, -rank:].flip(1)  # V_r: [hidden, rank]
+        root = top_values.pow(0.25)  # S_r^(1/2), since eigenvalues are S_r^2
+        # U_r S_r^(1/2) = W V_r S_r^(-1/2).
+        up = torch.cat([rows.double() @ (top_vectors / root) for rows in weight.split(chunk_rows)])
+        self.efficient_lm_head.weight.copy_(up.to(self.efficient_lm_head.weight.dtype))
+        self.efficient_lm_head_down_proj.weight.copy_((top_vectors * root).T.to(weight.dtype))
+
+    def freeze_all_but_efficient_lm_head(self) -> None:
+        """Freeze every draft parameter except the two candidate-head factors."""
+        if self.efficient_lm_head is None:
+            raise RuntimeError("freeze_all_but_efficient_lm_head requires config.efficient_lm_head_config.")
+        self.requires_grad_(False)
+        self.efficient_lm_head.requires_grad_(True)
+        self.efficient_lm_head_down_proj.requires_grad_(True)
 
     def forward(
         self,
@@ -992,6 +1168,11 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
                     "attention_mask (each row must be contiguous 1s followed by 0s)."
                 )
             causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
+        # EAGLE-4: restrict the eager Block-1 mask to the sliding window (FA2 and
+        # the varlen path apply it through ``window_size`` instead).
+        sliding_window = self.model.layers[0].self_attn.sliding_window
+        if sliding_window is not None and causal_mask is not None and not is_fa2:
+            causal_mask = _apply_sliding_window(causal_mask, sliding_window)
 
         draft_input_embeds = self.embed_input_ids(input_ids)
         hidden_states = self.model.layers[0](
