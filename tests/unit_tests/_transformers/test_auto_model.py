@@ -209,6 +209,7 @@ class TestFromConfigLoadsBaseModel:
 
         config = PretrainedConfig()
         config.name_or_path = "test/checkpoint"
+        config.eos_token_id = 2
         sentinel_model = object()
 
         with (
@@ -226,6 +227,7 @@ class TestFromConfigLoadsBaseModel:
             result = NeMoAutoModelForCausalLM.from_config(
                 config,
                 load_base_model=True,
+                eos_token_id=None,
                 use_liger_kernel=False,
                 use_sdpa_patching=False,
             )
@@ -234,6 +236,8 @@ class TestFromConfigLoadsBaseModel:
         mock_resolve_revision.assert_called_once()
         assert mock_build.call_args.args[0] is config
         assert mock_build.call_args.kwargs["load_base_model"] is True
+        assert mock_build.call_args.kwargs["_config_overrides"] == {"eos_token_id"}
+        assert config.eos_token_id is None
 
 
 @pytest.mark.usefixtures("mock_hub_revision")
