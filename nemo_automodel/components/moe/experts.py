@@ -1853,16 +1853,6 @@ class GroupedExpertsTE(nn.Module):
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
-        if config.apply_router_weight_after_down:
-            # GroupedExperts and GroupedExpertsDeepEP fold the router weight in after the
-            # down projection; this backend applies it inside the activation instead, which
-            # silently changes the numerics the flag exists to preserve. Fail loudly rather
-            # than train a model on the wrong reduction order.
-            raise ValueError(
-                "apply_router_weight_after_down is not supported by GroupedExpertsTE. "
-                "Use BackendConfig(experts='torch_mm') or the DeepEP expert backend."
-            )
-
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
         _patch_te_modules()
@@ -1886,6 +1876,8 @@ class GroupedExpertsTE(nn.Module):
         # first-microbatch copy, since forced-balanced routing makes it constant.
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self._static_m_splits: list | None = None
+        if backend is not None and backend.compile_router_weight:
+            _compile_router_weight_cores()
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
@@ -2242,6 +2234,7 @@ class GroupedExpertsTE(nn.Module):
         token_mask: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
+        post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Forward pass using TE's GroupedLinear with native FP8 support.
@@ -2251,6 +2244,9 @@ class GroupedExpertsTE(nn.Module):
             token_mask: Boolean tensor of shape [tokens] marking valid tokens.
             weights: Tensor of shape [tokens, top_k] with routing probabilities.
             indices: Integer tensor of shape [tokens, top_k] with global expert IDs.
+            post_expert_output: Optional operation applied to dispatched expert
+                outputs with shape ``[routed_tokens, expert_dim]`` after the
+                down projection and before token combine.
 
         Returns:
             Tensor of shape [tokens, hidden], local to this EP rank.
@@ -2273,6 +2269,14 @@ class GroupedExpertsTE(nn.Module):
         if not weights.requires_grad:
             permuted_probs = permuted_probs.detach()
         permuted_probs = permuted_probs.unsqueeze(-1)
+        # With apply_router_weight_after_down the expert MLP runs unweighted and the
+        # router weight scales its output after the down projection and
+        # post_expert_output, in fp32, as GroupedExpertsDeepEP does. router_probs keeps
+        # the unpadded [routed_tokens, 1] weights for that multiply.
+        router_probs = permuted_probs
+        compute_dtype = permuted_local_hidden_states.dtype
+        if self.config.apply_router_weight_after_down:
+            permuted_probs = torch.ones_like(permuted_probs)
 
         m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
         if self.static_routing and self._static_m_splits is None:
@@ -2328,8 +2332,9 @@ class GroupedExpertsTE(nn.Module):
             # top-k expert contributions carries a full prob-independent bias that is then
             # summed in the combine step, producing a large systematic offset (e.g. gpt-oss-20b
             # step-0 loss ~8.2 vs the correct ~4.5). Add the missing (prob - 1) * down_bias term
-            # so the net down-bias contribution becomes prob * down_bias.
-            if self.expert_bias:
+            # so the net down-bias contribution becomes prob * down_bias. After-down weighting
+            # scales the biased output below, giving (expert_out + down_bias) * prob.
+            if self.expert_bias and not self.config.apply_router_weight_after_down:
                 down_bias = self._get_stacked_bias(self.down_linear)
                 if down_bias is not None:
                     splits_t = torch.as_tensor(m_splits, device=output2.device)
@@ -2365,6 +2370,11 @@ class GroupedExpertsTE(nn.Module):
 
         if fp8_active and actual_m_splits is not None:
             output2 = unpadding(output2, actual_m_splits)
+
+        if post_expert_output is not None:
+            output2 = post_expert_output(output2)
+        if self.config.apply_router_weight_after_down:
+            output2 = _apply_router_weight_fp32(output2, router_probs, compute_dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

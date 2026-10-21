@@ -516,7 +516,7 @@ class BackendConfig:
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
             communication of the routed path; numerics unchanged. Default False.
         compile_router_weight: torch.compile the fp32 router-weight multiply applied to
-            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP``, all MoE models),
+            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP`` / ``GroupedExpertsTE``, all MoE models),
             so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
             cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
             numerics are allclose to eager but not bitwise-identical.
