@@ -404,6 +404,13 @@ navigation:
                 path: ../../model-coverage/llm/qwen/qwen3-8-flash-next.mdx
               - page: "QwQ-32B"
                 path: ../../model-coverage/llm/qwen/qwq-32b.mdx
+          - section: "RecursiveSI"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRg4BAABXRUJQVlA4TAIBAAAvE8AEEHU4biRJkc5/d+97UhwNeVC9GAHHtrVjz2/bZmfbtm3/HWJOIaVtjiFtViagWaRN9edV4LaNkvEx/CJJQMEyll82TCpPNjdEqvp5CSsyvNrMyd1LIOLJO024tcgTsB6OAf9OsSBlFdA6yR7nFsDp19qNrSkA+Z3UOmdez9PXFSot+tY5BEzA7fkETh+0UDwGKKD1jzkWA4Rdf94oEDjtflKwf0wx2HGlOB8QZk0COsYWM8RNGJNcmwGWVxUZtFoniqokDEel2R1ihmRTDANPVRAqoA32LazvxIgS8ujdt3INmILzaPTf9Abl8+NWgnXw9qkg8P7+aP0vkwJPXwI="/></svg>'
+            slug: recursivesi
+            path: ../../model-coverage/llm/recursivesi/index.mdx
+            contents:
+              - page: "flint"
+                path: ../../model-coverage/llm/recursivesi/flint.mdx
           - section: "Reflection AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRnABAABXRUJQVlA4TGMBAAAvE8AEAB/jppEkScrxlj+8A3Hn/dcdNNxGkqRIteL5b9e5QRrj/3Q5biRJkXLZf8/Wj9W+4LC7cv6DJk6LUAg66leFmmr34bCJ53LZKt/nbdMe82l+f//6I2797qhJFM2/adi0+QpD9A9CqhRpEHyvDwQBHKXaolCC8TreNo3YxPyLtCpGZBAhBhGDGEgjQkDiACgRgwwgEQIiCoBECIOIRAyARASVAEKhFBEDIMW4us1pEzgOAMBsrk1t27aN2LXt/ZeIXh0gov8K27ZtsnfSnkFR5F8iIZukBDi55GGSnOL0FJfzhm92TwT8OiKfLy7lbd0fC6bn97DV7GwvJcT1vd3bM1ItqoEG2A8iwNds7jlhhyk3MOoN2tIZESGTf4+ZYdKlEkBXvsAkSfI9z+D8iFYKEICAbS8JI5uaLx5IzG4hi8nRWssad0yjcyLh9270Xih8DLn6yf4KJRUQk//pfyIJAA=="/></svg>'
             slug: reflection
