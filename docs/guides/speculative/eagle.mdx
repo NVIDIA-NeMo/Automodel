@@ -238,9 +238,12 @@ The stage-2 checkpoint exports to the layout of the released
 python -m nemo_automodel.components.speculative.eagle.export_eagle4 <stage-2 checkpoint>/model/consolidated --output-dir ./outputs/eagle4_export
 ```
 
-EAGLE-4 supports the targets served by the dense Llama-style draft (Llama,
-Phi-3, Qwen3, Qwen3-MoE) and rejects context parallelism, P-EAGLE and
-`decode_eval`.
+EAGLE-4 supports Llama, Phi-3, Qwen3, Qwen3-MoE and Gemma4 targets (for
+Gemma4, set `target_force_hf: true` and `target_attn_implementation: sdpa` as in
+the EAGLE-3 Gemma4 examples). The draft is always built from a Llama-style
+config with a SwiGLU MLP, as the `LlamaForCausalLMEagle4` layout requires; for
+Gemma4 the target's global RoPE base is used. Context parallelism, P-EAGLE and
+`decode_eval` are rejected.
 
 ### How EAGLE-1 Differs
 
