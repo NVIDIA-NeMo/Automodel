@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -2322,9 +2323,21 @@ class GroupedExpertsTE(nn.Module):
                 if self.use_grouped_tensor
                 else m_splits
             )
-            output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
+            # No FSDP mixed-precision wrapper casts EP-local experts when ep_shard is 1, so
+            # FP32 master weights meet BF16 dispatched tokens here. TE accepts parameters
+            # in another dtype only under torch.autocast, which casts them per GEMM like
+            # GroupedExpertsDeepEP's ``.to(compute_dtype)``. An outer autocast already does.
+            cast_weights = (
+                torch.autocast("cuda", dtype=compute_dtype)
+                if next(self.gate_up_linear.parameters()).dtype != compute_dtype
+                and not torch.is_autocast_enabled("cuda")
+                else nullcontext()
+            )
+            with cast_weights:
+                output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
             output1 = self.expert_activation(output1, permuted_probs)
-            output2 = self.down_linear(output1, grouped_m_splits)
+            with cast_weights:
+                output2 = self.down_linear(output1, grouped_m_splits)
             # The down-projection bias must be weighted by the per-token routing probability
             # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
             # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
@@ -2355,9 +2368,10 @@ class GroupedExpertsTE(nn.Module):
                 else:
                     return tensor
 
-            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).T)
+            # Cast like the TE path above: FP32 master weights meet BF16 tokens here too.
+            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).to(x.dtype).T)
             output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
+            output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).to(x.dtype).T)
             all_expert_dependency = output2.new_zeros(())
             for grouped_linear in (self.gate_up_linear, self.down_linear):
                 for parameter in grouped_linear.parameters():
