@@ -16,6 +16,7 @@ import atexit
 import datetime
 import os
 import signal
+import tempfile
 from dataclasses import dataclass
 
 import torch
@@ -137,7 +138,14 @@ def initialize_distributed(
             init_pg_kwargs["world_size"] = 1
             init_pg_kwargs["rank"] = 0
             init_pg_kwargs["backend"] = "gloo"
-            init_pg_kwargs["store"] = torch.distributed.HashStore()
+            if hasattr(torch.distributed, "HashStore"):
+                init_pg_kwargs["store"] = torch.distributed.HashStore()
+            else:
+                # Windows builds omit HashStore. Retain the directory until after
+                # process-group teardown; atexit runs callbacks in reverse order.
+                store_dir = tempfile.TemporaryDirectory(prefix="automodel-store-")
+                atexit.register(store_dir.cleanup)
+                init_pg_kwargs["store"] = torch.distributed.FileStore(os.path.join(store_dir.name, "store"), 1)
 
         torch.distributed.init_process_group(**init_pg_kwargs)
         atexit.register(destroy_global_state)

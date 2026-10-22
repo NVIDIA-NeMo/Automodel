@@ -403,6 +403,25 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     return result
 
 
+def load_automodel_peft_config_dict(model_path: str) -> dict:
+    """Read back the PEFT configuration ``PeftAddon`` saved in a ``model/`` checkpoint directory.
+
+    ``automodel_peft_config.json`` holds every ``PeftConfig`` field except ``dim`` and ``alpha``, which are taken
+    from the PEFT ``adapter_config.json`` (``r`` / ``lora_alpha``).
+
+    Args:
+        model_path: The checkpoint's ``model/`` directory.
+
+    Returns:
+        A dict for ``PeftConfig.from_dict``.
+    """
+    with open(os.path.join(model_path, "automodel_peft_config.json")) as f:
+        fields = json.load(f)
+    with open(os.path.join(model_path, "adapter_config.json")) as f:
+        hf_config = json.load(f)
+    return {**fields, "dim": hf_config["r"], "alpha": hf_config["lora_alpha"]}
+
+
 def _has_trainable_moe_lora_parameters(
     model: "nn.Module | list[nn.Module]",
     pp_group: "torch.distributed.ProcessGroup | None" = None,

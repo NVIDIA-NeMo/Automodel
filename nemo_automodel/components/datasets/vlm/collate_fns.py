@@ -18,7 +18,9 @@ from unittest.mock import MagicMock
 
 import torch
 from PIL import Image as PILImage
+from transformers.processing_utils import ProcessorMixin
 
+from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
     PackedSequenceContract,
@@ -1166,14 +1168,24 @@ def nemotron_parse_collate_fn(
     return batch
 
 
-def _ensure_rgb(conversations):
-    """Convert any PIL images in conversations to RGB to handle RGBA/grayscale inputs."""
+def _ensure_rgb(conversations, preserve_alpha: bool = False):
+    """Convert any PIL images in conversations to RGB to handle RGBA/grayscale inputs.
+
+    Args:
+        conversations: Conversation samples whose image items are normalized in place.
+        preserve_alpha: When True, RGBA images are passed through unchanged so the
+            image processor can apply its own alpha handling (e.g. flattening onto
+            white). PIL's plain ``convert("RGB")`` discards the alpha channel,
+            exposing the raw RGB values of fully transparent pixels.
+    """
     for conv in conversations:
         for turn in conv:
             content = turn.get("content")
             if isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict) and isinstance(item.get("image"), PILImage.Image):
+                        if preserve_alpha and item["image"].mode == "RGBA":
+                            continue
                         item["image"] = item["image"].convert("RGB")
     return conversations
 
@@ -1299,6 +1311,7 @@ def default_collate_fn(
     processor,
     max_length: int | None = None,
     drop_overlong: bool = False,
+    preserve_alpha: bool = False,
     _post_tokenize_hook=None,
 ) -> dict[str, Any]:
     """Default collate function for multimodal VLM datasets.
@@ -1308,6 +1321,12 @@ def default_collate_fn(
         processor: Multimodal processor used to apply the chat template.
         max_length: Optional maximum token sequence length.
         drop_overlong: Whether to remove samples estimated to exceed ``max_length``.
+        preserve_alpha: When True, RGBA images keep their alpha channel until
+            the image processor runs, letting processors with alpha-aware
+            handling (e.g. flattening onto white) see the original
+            transparency. Defaults to False (alpha is dropped while converting
+            to RGB), matching the behavior of stock HuggingFace image
+            processors.
         _post_tokenize_hook: Optional callable ``(batch, processor) -> batch``
             invoked right after ``apply_chat_template`` and before
             ``build_labels``.  Used by model-specific collate wrappers
@@ -1321,7 +1340,7 @@ def default_collate_fn(
         whose tensor elements preserve their processor-defined shapes; image lists
         commonly contain tensors of shape [channels, height, width].
     """
-    conversations = _ensure_rgb([example["conversation"] for example in examples])
+    conversations = _ensure_rgb([example["conversation"] for example in examples], preserve_alpha=preserve_alpha)
 
     # Optionally drop overlong samples before processing
     if max_length is not None and drop_overlong:
@@ -1339,12 +1358,18 @@ def default_collate_fn(
         processing_kwargs["padding"] = "max_length"
         if drop_overlong:
             processing_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
+    chat_template = processor.chat_template if isinstance(processor, ProcessorMixin) else None
+    if isinstance(chat_template, dict):
+        chat_template = chat_template.get("default")
+    template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
+    template_kwargs = {"return_assistant_tokens_mask": True} if template_has_generation_kwd else {}
     batch = processor.apply_chat_template(
         conversations,
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
         processor_kwargs=processing_kwargs,
+        **template_kwargs,
     )
 
     if _post_tokenize_hook is not None:
@@ -1374,11 +1399,10 @@ def default_collate_fn(
                 value.to(torch.bfloat16) if isinstance(value, torch.Tensor) else value for value in pixel_values_videos
             ]
 
-    labels = build_labels_from_template(
-        batch["input_ids"],
-        conversations,
-        processor,
-    )
+    if template_has_generation_kwd:
+        labels = batch["input_ids"].masked_fill(batch.pop("assistant_masks") == 0, -100)
+    else:
+        labels = build_labels_from_template(batch["input_ids"], conversations, processor)
     batch["labels"] = labels[:, 1:]
 
     input_shape = batch["input_ids"].shape
@@ -1706,12 +1730,12 @@ def neat_packed_vlm_collater(
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)
-    for key in ("pixel_values", "pixel_values_videos"):
+    for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = _merge_media_values(tensors)
 
-    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts", "num_patches"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
@@ -1845,12 +1869,12 @@ def packed_sequence_thd_vlm_collater(
         "qkv_format": "thd",
     }
 
-    for key in ("pixel_values", "pixel_values_videos"):
+    for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = _merge_media_values(tensors)
 
-    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts", "num_patches"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
@@ -2145,6 +2169,12 @@ def _inject_thinking_prefix_tokens(
         seq_keys.append("mm_token_type_ids")
         fill_defaults["mm_token_type_ids"] = 0
         inject_defaults["mm_token_type_ids"] = 0
+    if "assistant_masks" in batch:
+        # Generation-template masks are read after this hook; injected prefix
+        # tokens and padding are never supervised.
+        seq_keys.append("assistant_masks")
+        fill_defaults["assistant_masks"] = 0
+        inject_defaults["assistant_masks"] = 0
 
     B = batch["input_ids"].size(0)
     new_seqs: Dict[str, List[torch.Tensor]] = {k: [] for k in seq_keys}
@@ -2221,6 +2251,7 @@ _TOKEN_AXIS_KEYS: tuple[str, ...] = (
     "labels",
     "token_type_ids",
     "mm_token_type_ids",
+    "assistant_masks",
 )
 
 

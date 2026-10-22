@@ -265,8 +265,9 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                     ).unsqueeze(0)
                 else:
                     seq_idx_for_conv = attention_mask.to(torch.int32).contiguous()
+                # HF's fallback calls this input hidden_states; the CUDA kernel uses x.
                 mixed_qkv = self.causal_conv1d_fn(
-                    x=mixed_qkv,
+                    mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
                     bias=self.conv1d.bias,
                     activation=self.activation,

@@ -109,5 +109,6 @@ optimizer:
   weight_decay: 0
 
 ci:
+  cluster_tag: h100
   time: "00:30:00"
   nodes: 8

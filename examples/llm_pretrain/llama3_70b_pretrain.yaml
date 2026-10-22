@@ -111,8 +111,6 @@ distributed:
     _target_: torch.distributed.fsdp.MixedPrecisionPolicy
     param_dtype: bfloat16
     reduce_dtype: float32
-    output_dtype: bfloat16
-    cast_forward_inputs: true
 
   pipeline:
     pp_schedule: interleaved1f1b
@@ -138,3 +136,6 @@ lr_scheduler:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+
+ci:
+  cluster_tag: h100

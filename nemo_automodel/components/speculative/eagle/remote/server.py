@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import torch
@@ -58,7 +59,7 @@ def compute_supervision(
     Mirrors the co-located path exactly: ``generate_batch`` runs the target and
     returns shifted logits / input_ids / loss_mask plus the aux hidden states;
     ``_compute_target_distribution`` then projects the shifted logits onto the
-    draft vocab. Returns tensors keyed by :data:`protocol.SUPERVISION_KEYS`.
+    draft vocab. Returns the tensors in the order they are sent over NCCL.
     """
     batch = target_wrapper.generate_batch(input_ids=input_ids, attention_mask=attention_mask, loss_mask=loss_mask)
     target_probs, position_mask = _compute_target_distribution(
@@ -78,6 +79,10 @@ def compute_supervision(
 
 class TargetModelServer:
     """Request-handling logic for the remote target server (HTTP-transport agnostic).
+
+    Subclasses serve other draft algorithms over the same transport by overriding
+    :meth:`_supervise`, :meth:`handle_model_info`, and, for extra endpoints,
+    :meth:`post_routes`.
 
     Parameters
     ----------
@@ -128,6 +133,23 @@ class TargetModelServer:
     def generate_lock(self) -> threading.Lock:
         return self._generate_lock
 
+    def post_routes(self) -> dict[str, tuple[Callable[[bytes], bytes], str]]:
+        """Return the POST endpoints other than ``/generate``.
+
+        Returns:
+            Mapping from endpoint name to ``(handler, content_type)``. ``/generate``
+            is not listed: the HTTP handler runs it, and its NCCL send, under
+            :attr:`generate_lock`.
+        """
+        return {
+            protocol.EP_SET_VOCAB_MAPPING: (self.handle_set_vocab_mapping, "application/json"),
+            protocol.EP_MODEL_INFO: (self.handle_model_info, "application/json"),
+            protocol.EP_INPUT_EMBEDDINGS: (self.handle_input_embeddings, "application/octet-stream"),
+            protocol.EP_INIT_NCCL: (self.handle_init_nccl, "application/json"),
+            protocol.EP_HEARTBEAT: (lambda _raw: b'{"status": "ok"}', "application/json"),
+            protocol.EP_DISCONNECT: (self.handle_disconnect, "application/json"),
+        }
+
     # -- handlers (return the HTTP response body as bytes) --
 
     def handle_model_info(self, _raw: bytes) -> bytes:
@@ -140,17 +162,30 @@ class TargetModelServer:
         }
         return json.dumps(info).encode("utf-8")
 
-    def handle_input_embeddings(self, _raw: bytes) -> bytes:
-        """Return the target input-embedding weight (used once to seed the draft)."""
-        weight = self._target.get_input_embeddings().weight
+    def _encode_weight(self, weight: torch.Tensor) -> bytes:
+        """Serialize one full weight as a ``{"weight": ...}`` wire blob.
+
+        Args:
+            weight: Tensor of shape [vocab, hidden], either a plain tensor or a
+                sharded DTensor that is gathered to the full tensor first.
+
+        Returns:
+            Wire bytes holding the full weight on CPU.
+        """
         if hasattr(weight, "full_tensor"):  # gather a sharded DTensor to full
             weight = weight.full_tensor()
         return wire.encode_to_bytes({"weight": weight.detach().cpu()})
 
+    def handle_input_embeddings(self, _raw: bytes) -> bytes:
+        """Return the target input-embedding weight (used once to seed the draft)."""
+        return self._encode_weight(self._target.get_input_embeddings().weight)
+
     def handle_set_vocab_mapping(self, raw: bytes) -> bytes:
         tensors = wire.decode(raw, map_location="cpu")
-        self._selected_token_ids = tensors["selected_token_ids"].to(self._device).long()
-        self._selected_token_mask = tensors["selected_token_mask"].to(self._device).bool()
+        # Held so a concurrent /generate never reads a half-swapped mapping.
+        with self._generate_lock:
+            self._selected_token_ids = tensors["selected_token_ids"].to(self._device).long()
+            self._selected_token_mask = tensors["selected_token_mask"].to(self._device).bool()
         return b'{"status": "ok"}'
 
     def handle_init_nccl(self, raw: bytes) -> bytes:
@@ -166,17 +201,22 @@ class TargetModelServer:
             return b'{"status": "failed"}'
         return b'{"status": "ok"}'
 
-    def handle_generate(self, raw: bytes, *, client_wants_nccl: bool) -> tuple[bytes, bool]:
-        """Run the target and serialize the supervision.
+    def _supervise(self, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Run the target on one decoded request and return its supervision tensors.
 
-        Returns ``(body, used_nccl)``. When NCCL is used the body is the JSON
-        metadata only and the tensors are queued for :meth:`flush_nccl_send`
-        (sent *after* the HTTP response is flushed, to avoid a recv deadlock).
+        Args:
+            tensors: Request tensors on the server device: ``input_ids``,
+                ``attention_mask`` and ``loss_mask``, each of shape [batch, sequence].
+
+        Returns:
+            Tensors in the order they are sent over NCCL: ``aux_hidden_states`` of shape
+            [batch, sequence, 3 * hidden], ``target_probs`` of shape [batch, sequence,
+            draft_vocab], ``position_mask`` of shape [batch, sequence, 1], and the
+            shifted ``input_ids`` and ``loss_mask`` of shape [batch, sequence].
         """
         if self._selected_token_ids is None or self._selected_token_mask is None:
             raise RuntimeError("set_vocab_mapping must be called before generate")
-        tensors = wire.decode(raw, map_location=str(self._device))
-        supervision = compute_supervision(
+        return compute_supervision(
             self._target,
             self._selected_token_ids,
             self._selected_token_mask,
@@ -184,13 +224,24 @@ class TargetModelServer:
             attention_mask=tensors["attention_mask"],
             loss_mask=tensors["loss_mask"],
         )
+
+    def handle_generate(self, raw: bytes, *, client_wants_nccl: bool) -> tuple[bytes, bool]:
+        """Run the target and serialize the supervision.
+
+        Returns ``(body, used_nccl)``. When NCCL is used the body is the JSON
+        metadata only and the tensors are queued for :meth:`flush_nccl_send`
+        (sent *after* the HTTP response is flushed, to avoid a recv deadlock).
+        """
+        tensors = wire.decode(raw, map_location=str(self._device))
+        supervision = self._supervise(tensors)
         use_nccl = client_wants_nccl and self._nccl is not None and self._nccl.is_initialized
         if use_nccl:
             for key, value in supervision.items():
                 if value.is_cuda and not value.is_contiguous():
                     supervision[key] = value.contiguous()
-            self._pending_nccl_send = (supervision, protocol.SUPERVISION_KEYS)
-            return protocol.encode_nccl_metadata(supervision, protocol.SUPERVISION_KEYS), True
+            keys_order = list(supervision)
+            self._pending_nccl_send = (supervision, keys_order)
+            return protocol.encode_nccl_metadata(supervision, keys_order), True
         cpu_supervision = {k: v.cpu() for k, v in supervision.items()}
         return wire.encode_to_bytes(cpu_supervision), False
 
@@ -221,6 +272,8 @@ class TargetModelServer:
 
 
 def _make_request_handler(server_logic: TargetModelServer):
+    routes = server_logic.post_routes()
+
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -272,20 +325,9 @@ def _make_request_handler(server_logic: TargetModelServer):
                                 # connection instead (flush_nccl_send already logged
                                 # and disabled NCCL for subsequent requests).
                                 self.close_connection = True
-                elif endpoint == protocol.EP_SET_VOCAB_MAPPING:
-                    with server_logic.generate_lock:
-                        body = server_logic.handle_set_vocab_mapping(raw)
-                    self._send(body, content_type="application/json")
-                elif endpoint == protocol.EP_MODEL_INFO:
-                    self._send(server_logic.handle_model_info(raw), content_type="application/json")
-                elif endpoint == protocol.EP_INPUT_EMBEDDINGS:
-                    self._send(server_logic.handle_input_embeddings(raw), content_type="application/octet-stream")
-                elif endpoint == protocol.EP_INIT_NCCL:
-                    self._send(server_logic.handle_init_nccl(raw), content_type="application/json")
-                elif endpoint == protocol.EP_HEARTBEAT:
-                    self._send(b'{"status": "ok"}', content_type="application/json")
-                elif endpoint == protocol.EP_DISCONNECT:
-                    self._send(server_logic.handle_disconnect(raw), content_type="application/json")
+                elif endpoint in routes:
+                    handler, content_type = routes[endpoint]
+                    self._send(handler(raw), content_type=content_type)
                 else:
                     self.send_error(404)
             except Exception as exc:  # surface as 500 rather than dropping the connection
@@ -301,7 +343,7 @@ def serve(server_logic: TargetModelServer, host: str, port: int) -> None:
     httpd.daemon_threads = True
     watcher = threading.Thread(target=lambda: (server_logic.shutdown_event.wait(), httpd.shutdown()), daemon=True)
     watcher.start()
-    logger.info("EAGLE-3 target server listening on %s:%d", host, port)
+    logger.info("Remote target server listening on %s:%d", host, port)
     try:
         httpd.serve_forever()
     finally:

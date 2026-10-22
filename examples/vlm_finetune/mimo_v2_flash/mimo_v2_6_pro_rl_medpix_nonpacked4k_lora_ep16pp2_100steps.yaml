@@ -88,7 +88,8 @@ peft:
   moe_rank_scaling: false
 
 processor:
-  _target_: transformers.AutoProcessor.from_pretrained
+  # sglang-aligned image preprocessing (bilinear/0-255); see mimo_v2_flash/processing.py
+  _target_: nemo_automodel.components.models.mimo_v2_flash.processing.build_mimo_v2_processor
   pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.6-Pro-RL
   trust_remote_code: false
   max_pixels: 1048576
@@ -145,6 +146,8 @@ dataloader:
   drop_last: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    # Keep RGBA alpha so the sglang-aligned processor flattens it onto white.
+    preserve_alpha: true
     max_length: 4097
 
 validation_dataset: none

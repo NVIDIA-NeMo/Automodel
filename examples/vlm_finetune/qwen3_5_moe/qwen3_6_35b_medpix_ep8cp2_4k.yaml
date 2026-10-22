@@ -122,4 +122,5 @@ wandb:
   dir: logs/qwen3_6_35b_medpix_ep8cp2_4k_100steps/wandb  # pragma: allowlist secret
 
 ci:
+  cluster_tag: h100
   time: "00:15:00"

@@ -42,15 +42,12 @@ from nemo_automodel.components.models.qwen3_5.model import (
     Qwen3_5DenseTextBackbone,
 )
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
+    CPAwareGatedDeltaNet,
     SSMGate,
     _resolve_ssm_dtype,
     _SSMGateParam,
     install_ssm_gate,
 )
-
-# Over the default 5s budget on purpose: CUDA gated-delta kernels take about 70s to compile on a cold worker.
-# Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(120)
 
 
 def _backend():
@@ -353,16 +350,67 @@ class TestDenseTextBackbone:
         assert out.past_key_values is None
 
     def test_forward_shape_mixed_layers(self):
-        # The linear_attention block runs FLA's gated-delta-rule / causal_conv1d
-        # kernels, which are CUDA-only (no CPU fallback when CUDA is present), so
-        # build the backbone and inputs on the GPU. Skip when no GPU is available.
-        if not torch.cuda.is_available():
-            pytest.skip("linear_attention forward requires CUDA (FLA kernels)")
-        device = torch.device("cuda")
-        cfg = _tiny_config(layer_types=("full_attention", "linear_attention"))
-        backbone = Qwen3_5DenseTextBackbone(cfg, _backend()).to(device)
-        out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=device))
+        import inspect
+
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_modeling
+
+        cfg = _tiny_config(
+            layer_types=("full_attention", "linear_attention"),
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
+        linear_attn = backbone.layers["1"].linear_attn
+        # Shape coverage uses the real CPU math even when FLA is installed.
+        linear_attn.causal_conv1d_fn = None
+        linear_attn.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
+        with torch.no_grad():
+            linear_attn._fp32_params.A_log.zero_()
+            linear_attn._fp32_params.dt_bias.zero_()
+        out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long))
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
+        assert torch.isfinite(out.last_hidden_state).all()
+
+    def test_linear_attention_torch_convolution_fallback_forward_backward(self):
+        """HF's convolution fallback matches the local grouped-convolution path."""
+        import copy
+        import inspect
+
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_modeling
+
+        torch.manual_seed(42)
+        cfg = _tiny_config(
+            layer_types=("linear_attention",),
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        actual = CPAwareGatedDeltaNet(cfg, layer_idx=0).float()
+        with torch.no_grad():
+            actual._fp32_params.A_log.zero_()
+            actual._fp32_params.dt_bias.zero_()
+        # Exercise the CPU references even when optional CUDA kernels are installed.
+        actual.causal_conv1d_fn = inspect.unwrap(hf_modeling.causal_conv1d_fn)
+        actual.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
+        reference = copy.deepcopy(actual)
+        reference.causal_conv1d_fn = None
+        hidden = torch.randn(2, 7, cfg.hidden_size, requires_grad=True)
+        reference_hidden = hidden.detach().clone().requires_grad_()
+
+        actual_output = actual(hidden)
+        reference_output = reference(reference_hidden)
+        torch.testing.assert_close(actual_output, reference_output, rtol=1e-5, atol=1e-6)
+        gradient = torch.randn_like(actual_output)
+        actual_output.backward(gradient)
+        reference_output.backward(gradient)
+        torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=1e-5, atol=1e-6)
+        for name, parameter in actual.named_parameters():
+            expected = reference.get_parameter(name).grad
+            assert parameter.grad is not None and expected is not None, name
+            torch.testing.assert_close(parameter.grad, expected, rtol=1e-5, atol=1e-6)
 
     def test_forward_accepts_inputs_embeds(self):
         cfg = _tiny_config(layer_types=("full_attention",))
@@ -385,7 +433,7 @@ class TestDenseTextBackbone:
 
         chunk_gated_delta_rule = MagicMock(side_effect=lambda *args, **_kwargs: (args[2], None))
         for linear_attn in linear_attn_modules:
-            linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda **kwargs: kwargs["x"])
+            linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda x, **kwargs: x)
             linear_attn.chunk_gated_delta_rule = chunk_gated_delta_rule
             linear_attn.norm.forward = MagicMock(side_effect=torch.add)
 

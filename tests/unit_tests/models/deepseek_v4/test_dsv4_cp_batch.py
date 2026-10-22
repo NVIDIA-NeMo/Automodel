@@ -189,6 +189,7 @@ def test_cp_size_one_native_thd_preserves_packed_batch_without_padding():
     assert "_dsv4_cp_group" not in out
     assert "packed_seq_ids" not in out
     assert "padding_mask" not in out
+    torch.testing.assert_close(out["_packed_seq_ids"], torch.tensor([[1, 1, 1, 1, 2, 2, 2, 2]]))
     for key, value in expected.items():
         torch.testing.assert_close(out[key], value)
 
@@ -546,3 +547,27 @@ def test_module_exposes_pad_helper_noops():
     assert cp_sharder._pad_tensor_seq_dim_(t, 1, 0, 0) is t
     pos = torch.arange(6).view(1, 6)
     assert cp_sharder._pad_position_ids_seq_dim_(pos, 1, 0) is pos
+
+
+@pytest.mark.parametrize("use_embeds", [False, True])
+@pytest.mark.parametrize("supplied_ids", [False, True])
+def test_native_cp1_physical_ids_keep_rows_and_existing_metadata(use_embeds, supplied_ids):
+    primary_key = "inputs_embeds" if use_embeds else "input_ids"
+    primary = torch.randn(2, 8, 4) if use_embeds else torch.arange(16).reshape(2, 8)
+    batch = {
+        primary_key: primary,
+        "labels": torch.arange(16).reshape(2, 8),
+        "position_ids": torch.arange(8).expand(2, -1).clone(),
+        "seq_lens": torch.tensor([[3, 2, -1000], [1, 2, -1000]]),
+        "seq_lens_padded": torch.tensor([[4, 4, -1000], [2, 3, -1000]]),
+        "qkv_format": "thd",
+    }
+    expected = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 2], [1, 1, 2, 2, 2, 0, 0, 0]])
+    if supplied_ids:
+        expected = expected + 7
+        batch["_packed_seq_ids"] = expected
+    originals = batch.copy()
+    _, out, _ = _shard(batch, cp_size=1, local_rank=0)
+    for key, value in originals.items():
+        assert out[key] is value
+    torch.testing.assert_close(out["_packed_seq_ids"], expected)

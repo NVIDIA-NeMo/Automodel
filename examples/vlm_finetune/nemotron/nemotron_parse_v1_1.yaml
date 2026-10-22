@@ -106,5 +106,6 @@ freeze_config:
 #   name: <your_experiment_name>
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "00:30:00"

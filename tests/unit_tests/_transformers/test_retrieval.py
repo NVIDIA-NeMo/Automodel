@@ -342,7 +342,9 @@ def test_cross_encoder_model_args_reach_backbone_constructor(tmp_path, monkeypat
             super().__init__(config)
             self.option = option
 
-    monkeypatch.setattr(retrieval, "_get_supported_backbone_class", lambda model_type, task: BertWithConstructorOption)
+    monkeypatch.setattr(
+        retrieval, "_get_supported_backbone_class", lambda model_type, task, config=None: BertWithConstructorOption
+    )
     encoder = retrieval.CrossEncoderModel.build(str(model_dir), True, model_args=("constructor-option",))
     assert encoder.model.option == "constructor-option"
 
@@ -945,6 +947,7 @@ def test_native_policy_rejects_ambiguous_attention(config_values, attention_poli
         retrieval._get_native_text_backbone_is_causal(backbone)
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
     """FP8 parent checkpoints are materialized without scalar scale parameters."""
     config = SimpleNamespace(
@@ -1013,6 +1016,7 @@ def test_extract_submodel_llama_embedding_selects_compatible_backbone(
     assert outputs.last_hidden_state.shape == (2, 8, backbone.config.hidden_size)
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 def test_embedding_fallback_forwards_hf_kwargs_and_disables_causal_attention(monkeypatch):
     """Embedding fallbacks preserve loader options and disable causal attention."""
     from nemo_automodel._transformers import retrieval
@@ -1267,6 +1271,7 @@ def test_ministral_embedding_preserves_hf_config_overrides(tmp_path):
     assert backbone.config.output_attentions is True
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monkeypatch):
     """The preliminary config load retains native HuggingFace loader behavior."""
     config = PretrainedConfig(is_causal=True)
@@ -1310,6 +1315,7 @@ def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monke
     )
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 def test_build_encoder_backbone_preserves_positional_loaded_config(monkeypatch):
     """A positional resolved config retains its meaning and avoids a second config load."""
     config = PretrainedConfig()
@@ -1326,9 +1332,10 @@ def test_build_encoder_backbone_preserves_positional_loaded_config(monkeypatch):
     assert result is backbone
     auto_config_from_pretrained.assert_not_called()
     assert result.config.is_causal is False
-    auto_model_from_pretrained.assert_called_once_with("org/model", trust_remote_code=False)
+    auto_model_from_pretrained.assert_called_once_with("org/model", trust_remote_code=False, revision=None)
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 def test_bi_encoder_build_preserves_positional_trust_remote_code(monkeypatch):
     """The existing remote-code position must not enable causal attention."""
     config = PretrainedConfig()
@@ -1346,7 +1353,7 @@ def test_bi_encoder_build_preserves_positional_trust_remote_code(monkeypatch):
 
     retrieval.BiEncoderModel.build("org/model", None, None, None, False, True, True)
 
-    auto_config_from_pretrained.assert_called_once_with("org/model", trust_remote_code=True)
+    auto_config_from_pretrained.assert_called_once_with("org/model", trust_remote_code=True, revision=None)
     assert build_encoder_backbone.call_args.kwargs["trust_remote_code"] is True
     assert build_encoder_backbone.call_args.kwargs["is_causal"] is False
 
