@@ -72,10 +72,33 @@ DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
 
-# Models build their CP/fp32-gate-aware modules at construction; no load-time
-# runtime patching is registered here. (Qwen3.5 dense/MoE build the native
-# CPAwareGatedDeltaNet + fp32 SSMGate in their model __init__.)
-_MODEL_RUNTIME_PATCHES = {}
+# Native models own their precision boundaries. HF compatibility hooks are
+# kept in the owning model packages and imported only for the selected model.
+_MODEL_RUNTIME_PATCHES = {
+    "axk2": ("nemo_automodel.components.models.axk2.hf_precision", "apply_hf_precision"),
+    "exaone_moe": ("nemo_automodel.components.models.exaone_moe.hf_precision", "apply_hf_precision"),
+    "glm5_next": ("nemo_automodel.components.models.glm5_next.hf_precision", "apply_hf_precision"),
+    "glm5_next_text": ("nemo_automodel.components.models.glm5_next.hf_precision", "apply_hf_precision"),
+    "deepseek_v3": ("nemo_automodel.components.models.deepseek_v3.hf_precision", "apply_hf_precision"),
+    "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.hf_precision", "apply_hf_precision"),
+    "dots1": ("nemo_automodel.components.models.dots1.hf_precision", "apply_hf_precision"),
+    "hy_v3": ("nemo_automodel.components.models.hy_v3.hf_precision", "apply_hf_precision"),
+    "deepseek_v2": ("nemo_automodel.components.models.deepseek_v2.hf_precision", "apply_hf_precision"),
+    "glm4_moe": ("nemo_automodel.components.models.glm4_moe.hf_precision", "apply_hf_precision"),
+    "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.hf_precision", "apply_hf_precision"),
+    "kimi_linear": ("nemo_automodel.components.models.kimi_linear.hf_precision", "apply_hf_precision"),
+    "nemotron_h": ("nemo_automodel.components.models.nemotron_v3.hf_precision", "apply_hf_precision"),
+    "glm4v_moe": ("nemo_automodel.components.models.glm4v_moe.hf_precision", "apply_hf_precision"),
+    "glm4v_moe_text": ("nemo_automodel.components.models.glm4v_moe.hf_precision", "apply_hf_precision"),
+    "deepseek_ocr2": ("nemo_automodel.components.models.deepseek_ocr2.hf_precision", "apply_hf_precision"),
+    "deepseek_ocr2_text": ("nemo_automodel.components.models.deepseek_ocr2.hf_precision", "apply_hf_precision"),
+    "glm4_moe_lite": ("nemo_automodel.components.models.glm4_moe_lite.hf_precision", "apply_hf_precision"),
+    "deepseek_v32": ("nemo_automodel.components.models.deepseek_v32.hf_precision", "apply_hf_precision"),
+    "solar_open": ("nemo_automodel.components.models.solar_open.hf_precision", "apply_hf_precision"),
+    "longcat_flash": ("nemo_automodel.components.models.longcat_flash.hf_precision", "apply_hf_precision"),
+    "hy_v4": ("nemo_automodel.components.models.hy_v4.hf_precision", "apply_hf_precision"),
+    "axk1": ("nemo_automodel.components.models.axk1.hf_precision", "apply_hf_precision"),
+}
 
 
 def _set_global_sdpa_backends(sdpa_method):
@@ -203,6 +226,9 @@ def _patch_liger_kernel(model):
 def _model_runtime_patch_keys(model):
     config = getattr(model, "config", None)
     keys = list(getattr(config, "architectures", None) or [])
+    model_type = getattr(config, "model_type", None)
+    if model_type is not None and model_type not in keys:
+        keys.append(model_type)
     model_cls_name = type(model).__name__
     if model_cls_name not in keys:
         keys.append(model_cls_name)
