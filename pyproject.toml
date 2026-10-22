@@ -292,8 +292,12 @@ magi = [
 
 [tool.uv]
 managed = true
-# Preserve the x86_64 lock partition consumed by the CUDA wheelhouse selector.
-environments = ["platform_machine == 'x86_64'", "platform_machine != 'x86_64'"]
+# Preserve the Linux x86_64 partition consumed by the CUDA wheelhouse selector.
+# Windows reports AMD64; a platform-independent x86_64 split requests nonexistent Windows wheels.
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform != 'linux' or platform_machine != 'x86_64'",
+]
 default-groups = ["build", "docs", "test"]
 no-build-isolation-package = [
     "bitsandbytes",
