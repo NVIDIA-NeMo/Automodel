@@ -29,6 +29,11 @@ __pycache__/
 .Python
 wandb
 build/
+# Documentation build helpers are source code, mirrored by regression tests.
+!tools/docs/build/
+!tools/docs/build/*.py
+!tests/unit_tests/tools/docs/build/
+!tests/unit_tests/tools/docs/build/*.py
 develop-eggs/
 dist/
 downloads/

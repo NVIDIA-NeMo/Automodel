@@ -221,12 +221,14 @@ uv run --script tools/docs/check_docs.py
 
 This validates documentation sources before generation, then runs the MDX and
 Fern checks with the pinned Fern CLI. It installs only the isolated docs
-dependencies (PyYAML and Pillow), requires Node.js 20 and `make`, and cleans generated tables
+dependencies (PyYAML), requires Node.js 20 and `make`, and cleans generated tables
 and styles after validation, including on failure.
 
 Add validation steps to the script so local checks and CI stay in sync.
 Keep source validation implementations in `tools/docs/`; pytest provides
 regression tests for the tools instead of owning documentation rules.
+Mirror the `checks/`, `build/`, and `assets/` layout under
+`tests/unit_tests/tools/docs/`; shared metadata belongs in `catalog.py`.
 The Makefile's `docs-check` and `docs-mdx-check` targets forward to the script
 for compatibility; `_docs-check` is internal to the script.
 

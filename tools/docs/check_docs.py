@@ -14,7 +14,7 @@
 
 # /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["pyyaml", "pillow"]
+# dependencies = ["pyyaml"]
 # ///
 
 """The single docs-check entry point for contributors, agents, and CI.
@@ -47,7 +47,7 @@ def main() -> int:
     try:
         # Source contracts must run before generation changes the checked files.
         sources = subprocess.run(
-            [sys.executable, "-m", "tools.docs.validate_model_cards"],
+            [sys.executable, "-m", "tools.docs.checks.sources"],
             cwd=repo_root,
             check=False,
         )
@@ -55,11 +55,11 @@ def main() -> int:
             return sources.returncode
 
         version = json.loads((repo_root / "docs/fern/fern.config.json").read_text(encoding="utf-8"))["version"]
-        generator = "tools/docs/sync_model_coverage_tables.py"
+        generator = [sys.executable, "-m", "tools.docs.build.coverage_tables"]
         status = 1
         keep_tables = False
         try:
-            status = subprocess.run([sys.executable, generator], cwd=repo_root, check=False).returncode
+            status = subprocess.run(generator, cwd=repo_root, check=False).returncode
             if status == 0:
                 status = subprocess.run(
                     ["npx", "--yes", f"--package=fern-api@{version}", "--", "make", "-C", "docs/fern", "_docs-check"],
@@ -74,7 +74,7 @@ def main() -> int:
             # The Makefile removes generated styles. Retain tables only when
             # publishing requested them and every check completed successfully.
             if not keep_tables:
-                cleanup = subprocess.run([sys.executable, generator, "--clean"], cwd=repo_root, check=False)
+                cleanup = subprocess.run([*generator, "--clean"], cwd=repo_root, check=False)
                 status = status or cleanup.returncode
         return status
     except OSError as error:

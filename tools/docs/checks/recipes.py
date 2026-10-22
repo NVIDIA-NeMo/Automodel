@@ -23,7 +23,9 @@ import pathlib
 
 import yaml
 
-from tools.docs.architecture import _DOC_ARCH_ALIASES
+from tools.docs.catalog import (
+    _DOC_ARCH_ALIASES,
+)
 
 
 def _collect_recipe_model_ids(examples_dir: pathlib.Path) -> set[str]:
@@ -181,7 +183,7 @@ def validate_recipe_architectures(repo_root: pathlib.Path) -> None:
             "Fix by either:\n"
             "  1. Adding a new .mdx file under docs/model-coverage/, or\n"
             "  2. Updating an existing .mdx file to mention the arch name, or\n"
-            "  3. Adding an entry to _DOC_ARCH_ALIASES in tools/docs/architecture.py "
+            "  3. Adding an entry to _DOC_ARCH_ALIASES in tools/docs/catalog.py "
             "with a comment explaining the mismatch."
         )
 

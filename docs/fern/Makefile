@@ -99,8 +99,8 @@ docs-login:
 # alone is enough after the first generate.
 docs: docs-model-tables docs-stitch docs-generate-library
 	@set -e; \
-	trap 'python3 "$(REPO_ROOT)/tools/docs/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
-	python3 "$(REPO_ROOT)/tools/docs/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
+	trap 'python3 "$(REPO_ROOT)/tools/docs/build/code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
+	python3 "$(REPO_ROOT)/tools/docs/build/code_styles.py" --repo-root "$(REPO_ROOT)"; \
 	fern docs dev
 
 docs-check docs-mdx-check:
@@ -110,20 +110,20 @@ docs-check docs-mdx-check:
 # The shared checker generates model tables before invoking this target.
 _docs-check: docs-stitch
 	@set -e; \
-	trap 'python3 "$(REPO_ROOT)/tools/docs/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
-	python3 "$(REPO_ROOT)/tools/docs/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
+	trap 'python3 "$(REPO_ROOT)/tools/docs/build/code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
+	python3 "$(REPO_ROOT)/tools/docs/build/code_styles.py" --repo-root "$(REPO_ROOT)"; \
 	$(MAKE) _docs-mdx-check; \
 	fern check
 
 docs-model-tables:
-	python3 "$(REPO_ROOT)/tools/docs/sync_model_coverage_tables.py"
+	cd "$(REPO_ROOT)" && python3 -m tools.docs.build.coverage_tables
 
 _docs-mdx-check:
 	@tmp_dir="$$(mktemp -d)"; \
 	trap 'rm -rf "$$tmp_dir"' EXIT; \
 	printf '%s\n' '{"private":true,"type":"module"}' > "$$tmp_dir/package.json"; \
 	npm --prefix "$$tmp_dir" install --silent @mdx-js/mdx@3 remark-frontmatter@5 remark-math@6 >/dev/null; \
-	MDX_LINT_PREFIX="$$tmp_dir" MDX_LINT_REPO_ROOT="$(REPO_ROOT)" node "$(REPO_ROOT)/tools/docs/validate_mdx_syntax.mjs" "$(REPO_ROOT)/docs"
+	MDX_LINT_PREFIX="$$tmp_dir" MDX_LINT_REPO_ROOT="$(REPO_ROOT)" node "$(REPO_ROOT)/tools/docs/checks/mdx.mjs" "$(REPO_ROOT)/docs"
 
 # Restore the frozen backward-version page trees into the working copy. They
 # live on the `$(ARCHIVE_REF)` branch (not on main), so a fresh clone has only
@@ -160,8 +160,8 @@ docs-generate-library:
 # (org secret of the same name is wired into CI).
 docs-preview: docs-model-tables docs-stitch docs-generate-library
 	@set -e; \
-	trap 'python3 "$(REPO_ROOT)/tools/docs/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
-	python3 "$(REPO_ROOT)/tools/docs/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
+	trap 'python3 "$(REPO_ROOT)/tools/docs/build/code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
+	python3 "$(REPO_ROOT)/tools/docs/build/code_styles.py" --repo-root "$(REPO_ROOT)"; \
 	fern generate --docs --preview
 
 # Trigger the Publish Fern Docs workflow on origin/main via workflow_dispatch.

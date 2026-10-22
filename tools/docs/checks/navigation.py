@@ -12,37 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Validate model-card identity, navigation, routes, commands, and generated coverage."""
+"""Validate navigation, provider hierarchy, routes, redirects, and links."""
 
 import base64
-import logging
 import re
-import subprocess
 from pathlib import Path
 from typing import TypedDict
 
 import yaml
 
-from tools.docs.architecture import (
-    validate_architecture_aliases,
-    validate_architecture_reference_tables,
-    validate_registered_architectures,
-)
-from tools.docs.recipe_coverage import validate_recipe_publisher_aliases, validate_recipe_publishers
-from tools.docs.sync_fern_provider_icons import MAX_TOTAL_ENCODED_BYTES, PROVIDER_ORGS
-from tools.docs.sync_model_coverage_tables import (
-    MODEL_CARD_PATH_ALIASES,
-    MODEL_TYPE_OVERVIEW_PATHS,
-    SUPPORT_LOG_END_MARKER,
-    SUPPORT_LOG_START_MARKER,
-    _generate_tables,
-    _iter_pretrained_model_ids,
+from tools.docs.build.coverage_tables import (
     _load_model_doc_catalog,
     _load_model_docs,
     _load_model_releases,
-    _read_documented_recipe,
     _resolve_model_card_routes,
-    _validate_generated_tables_are_not_committed,
+)
+from tools.docs.catalog import (
+    MAX_TOTAL_ENCODED_BYTES,
+    MODEL_CARD_PATH_ALIASES,
+    PROVIDER_ORGS,
+)
+from tools.docs.checks.model_cards import (
+    _frontmatter_slug,
 )
 
 _NavigationItem = TypedDict(
@@ -55,29 +46,6 @@ _NavigationItem = TypedDict(
 def _fern_slug(value: str) -> str:
     value = value.lower().replace("&", "and")
     return re.sub("[^a-z0-9]+", "-", value).strip("-")
-
-
-def _frontmatter_slug(path: Path) -> str | None:
-    document = path.read_text(encoding="utf-8")
-    if not document.startswith("---\n"):
-        return None
-    closing = document.find("\n---\n", 4)
-    if closing == -1:
-        return None
-    frontmatter = yaml.safe_load(document[4:closing]) or {}
-    slug = frontmatter.get("slug")
-    return str(slug).strip("/") if slug else None
-
-
-def _model_card_paths(repo_root: Path) -> list[Path]:
-    coverage_root = repo_root / "docs" / "model-coverage"
-    return sorted(
-        (
-            path
-            for path in coverage_root.rglob("*.mdx")
-            if path.name != "index.mdx" and len(path.relative_to(coverage_root).parts) == 3
-        )
-    )
 
 
 def _collect_fern_routes(
@@ -105,99 +73,6 @@ def _collect_fern_routes(
                 slug = str(item.get("slug", _fern_slug(str(item["page"]))))
                 routes.add("/" + "/".join((*parents, slug)))
     return routes
-
-
-def _validate_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
-    document = card.read_text(encoding="utf-8")
-    recipe_ids: set[str] = set()
-    for match in re.finditer(
-        "https://github\\.com/NVIDIA-NeMo/Automodel/blob/(?:main|[0-9a-f]{40})/(examples/[A-Za-z0-9_./-]+\\.yaml)",
-        document,
-    ):
-        recipe = yaml.safe_load(_read_documented_recipe(repo_root, match[1], match[0]))
-        if not isinstance(recipe, dict):
-            raise ValueError(f"{match[1]}: recipe must be a YAML mapping")
-        recipe_ids.update(_iter_pretrained_model_ids(recipe.get("model", {})))
-    metadata = yaml.safe_load(document.split("---", 2)[1])
-    title = metadata["title"]
-    if recipe_ids:
-        names = {model_id.split("/", 1)[1] for model_id in recipe_ids}
-        if title not in names:
-            raise ValueError(f"{card}: title {title!r} must match a linked recipe model ID: {sorted(recipe_ids)}")
-    else:
-        hf_ids = re.findall("https://huggingface\\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document)
-        if not hf_ids:
-            raise ValueError(f"{card}: reference card must link its Hugging Face checkpoint")
-        if title != hf_ids[0].split("/", 1)[1]:
-            raise ValueError(f"{card}: title must match the primary HF checkpoint")
-        recipe_ids = {hf_ids[0]}
-    filename = re.sub("[^a-z0-9]+", "-", title.casefold()).strip("-") + ".mdx"
-    if card.name != filename:
-        raise ValueError(f"{card}: filename must be {filename!r} for checkpoint {title!r}")
-    matching_ids = {model_id for model_id in recipe_ids if model_id.split("/", 1)[1] == title}
-    if not any((f"https://huggingface.co/{model_id}" in document for model_id in matching_ids)):
-        raise ValueError(f"{card}: link the exact Hugging Face checkpoint from the recipe")
-
-
-def _is_local_checkpoint_override(value: str, document: str) -> bool:
-    """Recognize literal local paths and paths exported earlier in the example."""
-    value = value.strip("\"'")
-    variable = re.fullmatch("\\$\\{([A-Za-z_][A-Za-z0-9_]*)\\}", value)
-    if variable:
-        assignment = re.search(f"^export {variable.group(1)}=([^\\r\\n]+)$", document, re.MULTILINE)
-        if assignment is None:
-            return False
-        value = assignment.group(1).strip().strip("\"'")
-    return Path(value).is_absolute()
-
-
-def _model_card_command_violations(repo_root: Path) -> list[str]:
-    offenders: list[str] = []
-    for path in _model_card_paths(repo_root):
-        document = path.read_text(encoding="utf-8")
-        lines = document.splitlines()
-        documented_model_ids = set(
-            re.findall("https://huggingface\\.co/([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)", document)
-        )
-        for index, line in enumerate(lines):
-            if re.search("(?:^|\\s)(?:uv run )?(?:automodel|torchrun)\\s", line) is None:
-                continue
-            command_lines = [line]
-            while command_lines[-1].rstrip().endswith("\\") and index + len(command_lines) < len(lines):
-                command_lines.append(lines[index + len(command_lines)])
-            command = "\n".join(command_lines)
-            if "<recipe-path>" in command:
-                offenders.append(f"{path.relative_to(repo_root)}: contains a recipe placeholder")
-                continue
-            checkpoint_override = re.search("--model\\.pretrained_model_name_or_path\\s+(\\S+)", command)
-            if checkpoint_override and (not _is_local_checkpoint_override(checkpoint_override.group(1), document)):
-                offenders.append(f"{path.relative_to(repo_root)}: substitutes a checkpoint into a different recipe")
-            recipe_paths = re.findall("examples/[A-Za-z0-9_./-]+\\.yaml", command)
-            if not recipe_paths and re.search("-c /[A-Za-z0-9_./-]+\\.yaml", command):
-                recipe_paths = re.findall(
-                    "Copy `(examples/[A-Za-z0-9_./-]+\\.yaml)` to a local configuration", document
-                )
-            if len(recipe_paths) != 1:
-                offenders.append(
-                    f"{path.relative_to(repo_root)}: command must reference exactly one recipe, found {recipe_paths}"
-                )
-                continue
-            try:
-                recipe_source = _read_documented_recipe(repo_root, recipe_paths[0], document)
-                recipe = yaml.safe_load(recipe_source)
-                if not isinstance(recipe, dict):
-                    raise ValueError("Recipe must be a YAML mapping")
-            except (OSError, ValueError, yaml.YAMLError) as error:
-                offenders.append(f"{path.relative_to(repo_root)}: cannot read recipe {recipe_paths[0]}: {error}")
-                continue
-            recipe_model_ids = _iter_pretrained_model_ids(recipe.get("model", {}))
-            documented_model_ids_by_case = {model_id.casefold() for model_id in documented_model_ids}
-            recipe_model_ids_by_case = {model_id.casefold() for model_id in recipe_model_ids}
-            if recipe_model_ids and documented_model_ids_by_case.isdisjoint(recipe_model_ids_by_case):
-                offenders.append(
-                    f"{path.relative_to(repo_root)}: {recipe_paths[0]} uses {', '.join(sorted(recipe_model_ids))}, but the card documents {', '.join(sorted(documented_model_ids)) or 'no Hugging Face model IDs'}"
-                )
-    return offenders
 
 
 def _model_size_key(hf_model_id: str) -> tuple[str, str]:
@@ -246,64 +121,6 @@ def _validate_release_navigation(repo_root: Path) -> None:
     missing_pages = sorted(internal_pages - _collect_fern_routes(navigation, config_dir=config_path.parent))
     if missing_pages:
         raise ValueError(f"Model release docs pages missing from nightly navigation: {missing_pages}")
-
-
-def _validate_generated_tables(repo_root: Path) -> None:
-    _validate_generated_tables_are_not_committed(repo_root)
-
-
-def _validate_overview_tables(repo_root: Path) -> None:
-    for _, relative_path in MODEL_TYPE_OVERVIEW_PATHS:
-        document = (repo_root / "docs" / "model-coverage" / relative_path).read_text(encoding="utf-8")
-        if document.count("## Supported Models") != 1:
-            raise ValueError(f"{relative_path}: expected exactly one Supported Models section")
-        if "## Model Support Log" in document:
-            raise ValueError(f"{relative_path}: remove the legacy Model Support Log section")
-        if document.count(SUPPORT_LOG_START_MARKER) != 1:
-            raise ValueError(f"{relative_path}: expected exactly one support log start marker")
-        if document.count(SUPPORT_LOG_END_MARKER) != 1:
-            raise ValueError(f"{relative_path}: expected exactly one support log end marker")
-
-
-def _validate_card_aliases(repo_root: Path) -> None:
-    (_, _, catalog) = _load_model_doc_catalog(repo_root / "docs")
-    source_paths = [model.source_path for model in catalog]
-    for alias, canonical in MODEL_CARD_PATH_ALIASES.items():
-        if not (repo_root / alias).is_file():
-            raise ValueError(f"Published source URL must remain available: {alias}")
-        if not (repo_root / canonical).is_file():
-            raise ValueError(f"Published source URL must remain available: {canonical}")
-        if (repo_root / alias).read_bytes() != (repo_root / canonical).read_bytes():
-            raise ValueError(f"Compatibility card must stay synchronized with {canonical}: {alias}")
-        if _frontmatter_slug(repo_root / alias) != _frontmatter_slug(repo_root / canonical):
-            raise ValueError(f"Compatibility card {alias} must use the same slug as {canonical}")
-        if alias in source_paths:
-            raise ValueError(f"Compatibility card must be excluded from the model catalog: {alias}")
-        if source_paths.count(canonical) != 1:
-            raise ValueError(f"Canonical card must appear exactly once in the model catalog: {canonical}")
-
-
-def _validate_changed_card_identity(repo_root: Path) -> None:
-    base = subprocess.check_output(["git", "merge-base", "HEAD", "origin/main"], cwd=repo_root, text=True).strip()
-    changed = subprocess.check_output(
-        ["git", "diff", "--name-only", "--diff-filter=ACMR", base, "--", "docs/model-coverage"],
-        cwd=repo_root,
-        text=True,
-    ).splitlines()
-    changed += subprocess.check_output(
-        ["git", "ls-files", "--others", "--exclude-standard", "--", "docs/model-coverage"], cwd=repo_root, text=True
-    ).splitlines()
-    changed += [f"docs/model-coverage/{kind}/stepfun-ai/step-5-preview-bf16.mdx" for kind in ("llm", "vlm")]
-    canonical_paths = {MODEL_CARD_PATH_ALIASES.get(relative, relative) for relative in changed}
-    for relative in sorted(canonical_paths):
-        card = repo_root / relative
-        if (
-            len(card.relative_to(repo_root / "docs/model-coverage").parts) == 3
-            and card.is_file()
-            and (card.suffix == ".mdx")
-            and (card.name != "index.mdx")
-        ):
-            _validate_model_card_recipe_identity(repo_root, card)
 
 
 def _validate_provider_sections(repo_root: Path) -> None:
@@ -456,35 +273,6 @@ def _validate_provider_sections(repo_root: Path) -> None:
         )
 
 
-def _validate_descriptions(repo_root: Path) -> None:
-    offenders: list[str] = []
-    for path in _model_card_paths(repo_root):
-        document = path.read_text(encoding="utf-8")
-        closing = document.find("\n---\n", 4)
-        frontmatter = yaml.safe_load(document[4:closing]) or {}
-        title = str(frontmatter.get("title", ""))
-        description = str(frontmatter.get("description", ""))
-        reasons = []
-        if not 120 <= len(description) <= 170:
-            reasons.append(f"length {len(description)} is outside 120-170 characters")
-        if title not in description:
-            reasons.append(f"does not contain the exact title {title!r}")
-        if "NeMo AutoModel" not in description:
-            reasons.append("does not contain 'NeMo AutoModel'")
-        if not description.isascii():
-            reasons.append("contains non-ASCII characters")
-        if reasons:
-            offenders.append(f"{path.relative_to(repo_root)}: {', '.join(reasons)}")
-    if offenders:
-        raise ValueError("Invalid model-card descriptions:\n" + "\n".join((f"  - {item}" for item in offenders)))
-
-
-def _validate_commands(repo_root: Path) -> None:
-    offenders = _model_card_command_violations(repo_root)
-    if offenders:
-        raise ValueError("Invalid model-card commands:\n" + "\n".join((f"  - {item}" for item in offenders)))
-
-
 def _validate_recipe_routes(repo_root: Path) -> None:
     (model_docs, _, documented_models) = _load_model_doc_catalog(repo_root / "docs")
     releases = _load_model_releases(repo_root, model_docs)
@@ -612,71 +400,3 @@ def _validate_internal_links(repo_root: Path) -> None:
             "Model coverage pages link to missing nightly routes:\n"
             + "\n".join((f"  - {page}: {link}" for (page, link) in broken_links))
         )
-
-
-def _validate_generated_coverage(repo_root: Path) -> None:
-    (_, _, documented_models) = _load_model_doc_catalog(repo_root / "docs")
-    generated = _generate_tables(repo_root)
-    overview_paths = {
-        model_type: repo_root / "docs" / "model-coverage" / relative_path
-        for (model_type, relative_path) in MODEL_TYPE_OVERVIEW_PATHS
-    }
-    overview_paths["Encoder-Decoder"] = overview_paths["LLM"]
-    missing = [
-        (model.model_type, model.docs_page)
-        for model in documented_models
-        if model.docs_page not in generated[overview_paths[model.model_type]]
-    ]
-    if missing:
-        raise ValueError(f"Documented model families missing from generated support tables: {missing}")
-
-
-def validate_model_cards(repo_root: Path) -> None:
-    """Validate repository documentation sources before generating derived files.
-
-    Args:
-        repo_root: AutoModel repository root.
-    """
-    errors: list[str] = []
-    for check in (
-        _validate_published_training_routes,
-        _validate_release_navigation,
-        _validate_generated_tables,
-        _validate_overview_tables,
-        _validate_card_aliases,
-        _validate_changed_card_identity,
-        _validate_provider_sections,
-        _validate_descriptions,
-        _validate_commands,
-        _validate_recipe_routes,
-        _validate_redirects,
-        _validate_internal_links,
-        _validate_generated_coverage,
-        validate_architecture_reference_tables,
-        validate_registered_architectures,
-        validate_architecture_aliases,
-        validate_recipe_publishers,
-        validate_recipe_publisher_aliases,
-    ):
-        try:
-            check(repo_root)
-        except (OSError, ValueError, yaml.YAMLError, subprocess.CalledProcessError) as error:
-            errors.append(f"{check.__name__}: {error}")
-    if errors:
-        raise ValueError("Documentation source validation failed:\n" + "\n".join(errors))
-
-
-def main() -> int:
-    """Validate documentation sources and return a failing exit status on errors."""
-    try:
-        validate_model_cards(Path(__file__).resolve().parents[2])
-    except (OSError, ValueError) as error:
-        logging.getLogger(__name__).error("%s", error)
-        return 1
-    logging.getLogger(__name__).info("Validated documentation source contracts.")
-    return 0
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    raise SystemExit(main())

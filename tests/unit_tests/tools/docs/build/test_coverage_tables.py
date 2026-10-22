@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+# Over the default 5s budget on purpose: this module drives git through subprocesses over throwaway repositories.
+# Shrink the work or the process count before raising this further.
+
 import io
 import os
 import re
@@ -23,7 +27,24 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tools.docs.sync_model_coverage_tables import (
+from tools.docs.build.coverage_tables import (
+    _generate_tables,
+    _load_model_doc_catalog,
+    _load_model_docs,
+    _load_model_releases,
+    _ModelDoc,
+    _ModelRelease,
+    _parse_registry_entries,
+    _read_documented_recipe,
+    _render_registry_table,
+    _replace_generated_block,
+    _resolve_model_card_routes,
+    _strip_generated_tables,
+    _sync_tables,
+    _validate_dated_support_tables_are_generated,
+    _validate_generated_tables_are_not_committed,
+)
+from tools.docs.catalog import (
     DATED_MODEL_TABLE_HEADER,
     DATED_SUPPORT_TABLE_HEADER,
     HOMEPAGE_END_MARKER,
@@ -35,44 +56,8 @@ from tools.docs.sync_model_coverage_tables import (
     SUPPORT_LOG_END_MARKER,
     SUPPORT_LOG_START_MARKER,
     TABLE_ROW_COUNT,
-    _generate_tables,
-    _load_model_doc_catalog,
-    _load_model_docs,
-    _load_model_releases,
-    _ModelDoc,
-    _ModelRelease,
-    _parse_doc_arch_aliases,
-    _parse_registry_entries,
-    _read_documented_recipe,
-    _render_registry_table,
-    _replace_generated_block,
-    _resolve_model_card_routes,
-    _strip_generated_tables,
-    _sync_tables,
-    _validate_dated_support_tables_are_generated,
-    _validate_generated_tables_are_not_committed,
-)
-from tools.docs.validate_model_cards import (
-    _is_local_checkpoint_override,
-    _model_card_command_violations,
-    _validate_card_aliases,
-    _validate_changed_card_identity,
-    _validate_commands,
-    _validate_descriptions,
-    _validate_generated_coverage,
-    _validate_generated_tables,
-    _validate_internal_links,
-    _validate_model_card_recipe_identity,
-    _validate_overview_tables,
-    _validate_provider_sections,
-    _validate_published_training_routes,
-    _validate_recipe_routes,
-    _validate_redirects,
-    _validate_release_navigation,
 )
 
-# Over the default 5s budget on purpose: this module drives git through subprocesses over throwaway repositories.
-# Shrink the work or the process count before raising this further.
 pytestmark = pytest.mark.timeout(70)
 
 
@@ -152,10 +137,6 @@ slug: model-coverage/large-language-models/test/model
     return paths
 
 
-def test_regrouped_training_pages_preserve_published_urls():
-    _validate_published_training_routes(Path(__file__).resolve().parents[3])
-
-
 def test_registry_table_is_generated_from_mapping_entries():
     source = """
 from collections import OrderedDict
@@ -206,12 +187,6 @@ def test_registry_table_uses_documentation_aliases_for_native_models():
     ) in generated
 
 
-def test_doc_arch_aliases_are_parsed_from_the_docs_tool():
-    source = '_DOC_ARCH_ALIASES = {"NativeArchitecture": "DocumentedArchitecture"}\n'
-
-    assert _parse_doc_arch_aliases(source) == {"NativeArchitecture": "DocumentedArchitecture"}
-
-
 def test_generated_registry_table_replaces_the_marked_block():
     document = f"before\n{REGISTRY_START_MARKER}\nstale\n{REGISTRY_END_MARKER}\nafter\n"
     generated = _render_registry_table([("NewModel", "models.new", "NewModel")], {"NewModel"}, {})
@@ -222,10 +197,6 @@ def test_generated_registry_table_replaces_the_marked_block():
     assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in updated
     assert updated.startswith("before\n")
     assert updated.endswith("\nafter\n")
-
-
-def test_model_release_docs_pages_exist_in_nightly_navigation():
-    _validate_release_navigation(Path(__file__).resolve().parents[3])
 
 
 def test_recipe_model_id_can_redirect_to_one_shared_model_card(tmp_path):
@@ -351,7 +322,7 @@ def test_recipe_model_id_with_multiple_model_cards_is_rejected(tmp_path):
 
 
 def test_embedding_and_reranking_releases_are_discovered_from_recipes(tmp_path):
-    repo_root = Path(__file__).parents[3]
+    repo_root = Path(__file__).parents[5]
     model_docs, _ = _load_model_docs(repo_root / "docs")
     # Keep real recipe discovery while making Git history independent of checkout size.
     shutil.copytree(repo_root / "examples" / "retrieval", tmp_path / "examples" / "retrieval")
@@ -369,14 +340,6 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes(tmp_path):
         "Qwen/Qwen3-Reranker-4B",
         "mistralai/Ministral-3-3B-Instruct-2512-BF16",
     }
-
-
-def test_generated_model_coverage_tables_are_not_committed():
-    _validate_generated_tables(Path(__file__).resolve().parents[3])
-
-
-def test_model_type_overviews_use_one_dated_supported_models_table():
-    _validate_overview_tables(Path(__file__).resolve().parents[3])
 
 
 def test_strip_generated_tables_preserves_empty_markers(tmp_path):
@@ -440,59 +403,6 @@ def test_trusted_catalog_resolves_cards_in_checkouts_before_and_after_a_rename(t
     assert [model.source_path for model in catalog] == [canonical if canonical_exists else alias]
 
 
-def test_model_card_path_aliases_preserve_published_paths():
-    _validate_card_aliases(Path(__file__).resolve().parents[3])
-
-
-def test_changed_model_cards_match_linked_recipe_identity():
-    _validate_changed_card_identity(Path(__file__).resolve().parents[3])
-
-
-@pytest.mark.parametrize(
-    ("title", "filename", "message"),
-    [
-        ("Step-5-Preview", "step-5-preview.mdx", "title .* must match a linked recipe model ID"),
-        ("Step-5-Preview-BF16", "step-5-preview.mdx", "filename must be 'step-5-preview-bf16.mdx'"),
-    ],
-)
-def test_model_card_identity_rejects_recipe_mismatch(tmp_path: Path, title: str, filename: str, message: str):
-    recipe = tmp_path / "examples/llm_finetune/step5.yaml"
-    recipe.parent.mkdir(parents=True)
-    recipe.write_text("model:\n  pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16\n")
-    card = tmp_path / filename
-    card.write_text(
-        f'---\ntitle: "{title}"\n---\n'
-        "[Old checkpoint](https://huggingface.co/stepfun-ai/Step-5-Preview)\n"
-        "[BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)\n"
-        "[SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/step5.yaml)\n"
-    )
-    with pytest.raises(ValueError, match=message):
-        _validate_model_card_recipe_identity(tmp_path, card)
-
-
-@pytest.mark.parametrize("title,valid", [("Step-5-Preview", True), ("Step-5-Preview-BF16", False)])
-def test_reference_card_identifies_fp8_checkpoint_without_bf16_recipe(tmp_path: Path, title: str, valid: bool):
-    card = tmp_path / "step-5-preview.mdx"
-    card.write_text(
-        f'---\ntitle: "{title}"\n---\n'
-        "[FP8](https://huggingface.co/stepfun-ai/Step-5-Preview)\n"
-        "[BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)\n"
-    )
-    if valid:
-        _validate_model_card_recipe_identity(tmp_path, card)
-    else:
-        with pytest.raises(ValueError, match="primary HF checkpoint"):
-            _validate_model_card_recipe_identity(tmp_path, card)
-
-
-def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
-    _validate_provider_sections(Path(__file__).resolve().parents[3])
-
-
-def test_model_card_descriptions_meet_seo_contract():
-    _validate_descriptions(Path(__file__).resolve().parents[3])
-
-
 def test_documented_recipe_reads_current_checkout(tmp_path):
     recipe = tmp_path / "recipe.yaml"
     recipe.write_text("model: {}\n", encoding="utf-8")
@@ -530,37 +440,6 @@ def test_missing_recipe_requires_matching_commit_permalink(tmp_path, revision, l
         _read_documented_recipe(tmp_path, "examples/model.yaml", document)
 
 
-@pytest.mark.parametrize(
-    "value,document,expected",
-    [
-        ("/data/model", "", True),
-        ('"/data/model"', "", True),
-        ('"${MODEL}"', "export MODEL=/data/model", True),
-        ('"${MODEL}"', "", False),
-        ('"${MODEL}"', "export MODEL=other/model", False),
-        ("other/model", "", False),
-    ],
-)
-def test_local_checkpoint_override(value, document, expected):
-    assert _is_local_checkpoint_override(value, document) is expected
-
-
-def test_model_card_commands_use_checked_in_recipes():
-    _validate_commands(Path(__file__).resolve().parents[3])
-
-
-def test_recipe_backed_model_sizes_have_exact_index_routes_and_one_card():
-    _validate_recipe_routes(Path(__file__).resolve().parents[3])
-
-
-def test_retired_model_routes_redirect_to_provider_indexes():
-    _validate_redirects(Path(__file__).resolve().parents[3])
-
-
-def test_internal_links_from_model_coverage_resolve_to_nightly_routes():
-    _validate_internal_links(Path(__file__).resolve().parents[3])
-
-
 def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     (tmp_path / "docs" / "model-coverage").mkdir(parents=True)
     (tmp_path / "nemo_automodel" / "_transformers").mkdir(parents=True)
@@ -596,7 +475,7 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     (tmp_path / "nemo_automodel" / "_transformers" / "registry.py").write_text(
         'MODEL_ARCH_MAPPING = OrderedDict([("NewModel", ("models.new", "NewModel"))])\n', encoding="utf-8"
     )
-    (tmp_path / "tools" / "docs" / "architecture.py").write_text("_DOC_ARCH_ALIASES = {}\n", encoding="utf-8")
+    (tmp_path / "tools" / "docs" / "catalog.py").write_text("_DOC_ARCH_ALIASES = {}\n", encoding="utf-8")
 
     model_docs, _ = _load_model_docs(tmp_path / "docs")
     releases = _load_model_releases(tmp_path, model_docs)
@@ -764,10 +643,6 @@ def test_model_release_uses_model_introduction_date_when_recipe_changes(tmp_path
     assert releases[0].release_date == "2026-08-07"
 
 
-def test_typed_support_tables_include_every_documented_model_family():
-    _validate_generated_coverage(Path(__file__).resolve().parents[3])
-
-
 def test_model_release_ignores_tokenizer_and_teacher_checkpoints(tmp_path):
     recipe_path = tmp_path / "examples" / "llm_kd" / "model.yaml"
     recipe_path.parent.mkdir(parents=True)
@@ -849,7 +724,7 @@ def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
     (tmp_path / "nemo_automodel" / "_transformers" / "registry.py").write_text(
         'MODEL_ARCH_MAPPING = OrderedDict([("NewModel", ("models.new", "NewModel"))])\n', encoding="utf-8"
     )
-    (tmp_path / "tools" / "docs" / "architecture.py").write_text("_DOC_ARCH_ALIASES = {}\n", encoding="utf-8")
+    (tmp_path / "tools" / "docs" / "catalog.py").write_text("_DOC_ARCH_ALIASES = {}\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="latest-models.mdx"):
         _sync_tables(tmp_path, check=True, validate_model_cards=False)
@@ -874,7 +749,7 @@ def test_dated_support_tables_must_be_generated(tmp_path, table_header):
 
 
 def test_recipe_pr_requires_main_links_when_its_recipe_arrives(tmp_path, monkeypatch):
-    from tools.docs import sync_model_coverage_tables as coverage
+    from tools.docs.build import coverage_tables as coverage
 
     recipe_path = "examples/llm_finetune/new.yaml"
     permalink = f"https://github.com/NVIDIA-NeMo/Automodel/blob/{'b' * 40}/{recipe_path}"
@@ -907,7 +782,7 @@ def test_recipe_pr_requires_main_links_when_its_recipe_arrives(tmp_path, monkeyp
 
 @pytest.mark.parametrize("source", ["[", "[]"])
 def test_linked_recipe_yaml_is_validated(tmp_path, monkeypatch, source):
-    from tools.docs import sync_model_coverage_tables as coverage
+    from tools.docs.build import coverage_tables as coverage
 
     document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'c' * 40}/examples/new.yaml)"
     monkeypatch.setattr(coverage, "_read_remote_recipe", lambda url: source)
@@ -918,7 +793,7 @@ def test_linked_recipe_yaml_is_validated(tmp_path, monkeypatch, source):
 def test_missing_permalink_target_fails(tmp_path, monkeypatch):
     from urllib.error import HTTPError
 
-    from tools.docs import sync_model_coverage_tables as coverage
+    from tools.docs.build import coverage_tables as coverage
 
     document = f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'d' * 40}/examples/missing.yaml)"
 
@@ -931,7 +806,7 @@ def test_missing_permalink_target_fails(tmp_path, monkeypatch):
 
 
 def test_recent_support_uses_permalink_for_documented_card(tmp_path, monkeypatch):
-    from tools.docs import sync_model_coverage_tables as coverage
+    from tools.docs.build import coverage_tables as coverage
 
     model = coverage._ModelDoc("LLM", "/models/new", (), "New", "docs/model-coverage/llm/org/new.mdx")
     recipe_url = f"https://github.com/NVIDIA-NeMo/Automodel/blob/{'a' * 40}/examples/llm_finetune/new.yaml"
@@ -959,57 +834,3 @@ def test_recent_support_uses_permalink_for_documented_card(tmp_path, monkeypatch
 
     without_recipe = coverage._collect_support_entries(tmp_path, old_releases, [model], {})
     assert without_recipe[0].recipe_link == ""
-
-
-def test_recipe_link_errors_include_every_link_card_and_compatibility_copy(tmp_path):
-    from tools.docs import sync_model_coverage_tables as coverage
-
-    models = []
-    source_paths = ["docs/model-coverage/llm/first.mdx", "docs/model-coverage/llm/second.mdx"]
-    alias = next(iter(MODEL_CARD_PATH_ALIASES))
-    expected = []
-    for index, source_path in enumerate([*source_paths, alias]):
-        path = tmp_path / source_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        links = []
-        for suffix in ("a", "b"):
-            recipe_path = f"examples/model_{index}_{suffix}.yaml"
-            recipe = tmp_path / recipe_path
-            recipe.parent.mkdir(parents=True, exist_ok=True)
-            recipe.write_text("model: {}\n")
-            links.append(f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'a' * 40}/{recipe_path})")
-            expected.append(recipe_path)
-        path.write_text("\n".join(links))
-        if source_path in source_paths:
-            models.append(coverage._ModelDoc("LLM", f"/models/{index}", (), "Model", source_path))
-
-    with pytest.raises(ValueError) as caught:
-        coverage._collect_documented_recipe_urls(tmp_path, models)
-
-    message = str(caught.value)
-    for source_path in [*source_paths, alias]:
-        assert source_path in message
-    for recipe_path in expected:
-        assert f"replace its commit permalink with {coverage.REPOSITORY_URL}/{recipe_path}" in message
-
-
-def test_command_validation_collects_link_and_yaml_errors_across_cards(tmp_path):
-    recipe_sources = {"pinned": "model: {}\n", "syntax": "[", "mapping": "[]"}
-    for name, source in recipe_sources.items():
-        recipe = tmp_path / "examples" / f"{name}.yaml"
-        recipe.parent.mkdir(parents=True, exist_ok=True)
-        recipe.write_text(source)
-    for name in [*recipe_sources, "missing"]:
-        card = tmp_path / "docs" / "model-coverage" / "llm" / "test" / f"{name}.mdx"
-        card.parent.mkdir(parents=True, exist_ok=True)
-        revision = "a" * 40 if name == "pinned" else "main"
-        card.write_text(
-            f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{revision}/examples/{name}.yaml)\n"
-            f"```bash\nuv run automodel -c examples/{name}.yaml\n```\n"
-        )
-
-    offenders = _model_card_command_violations(tmp_path)
-
-    assert len(offenders) == 4
-    for name in [*recipe_sources, "missing"]:
-        assert any(f"{name}.mdx: cannot read recipe examples/{name}.yaml:" in item for item in offenders)

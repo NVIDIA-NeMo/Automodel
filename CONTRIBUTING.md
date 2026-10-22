@@ -302,9 +302,12 @@ failure. A nonzero exit status identifies a failed check.
 Publishing uses `uv run --script tools/docs/check_docs.py --keep-generated` to retain
 validated model-coverage tables for deployment. Failures still clean them up.
 
-Validation rules and generation scripts live in `tools/docs/`. Pytest tests
-provide regression coverage for those tools and run separately in CI; the
-checker itself needs only PyYAML and Pillow, not pytest or the training stack.
+Validation rules and generation scripts live in `tools/docs/` (see its
+[layout guide](tools/docs/README.md)). Pytest tests under
+`tests/unit_tests/tools/docs/` mirror the `checks/`, `build/`, and `assets/`
+modules. They run separately in CI to test the tools and their failure cases.
+The checker itself needs only PyYAML; Pillow is used by the asset tool and
+its regression tests.
 
 If your contribution involves documentation changes, please refer to the [Fern docs maintenance guide](.agents/contributor-skills/fern-docs/SKILL.md) guide for detailed instructions on building and serving the documentation.
 

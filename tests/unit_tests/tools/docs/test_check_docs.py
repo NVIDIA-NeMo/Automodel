@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import json
 import os
 import shutil
@@ -26,7 +27,7 @@ import yaml
 @pytest.fixture
 def docs_checkout(tmp_path: Path) -> Path:
     root = tmp_path / "checkout"
-    source = Path(__file__).resolve().parents[3]
+    source = Path(__file__).resolve().parents[4]
     tool = root / "tools/docs/check_docs.py"
     tool.parent.mkdir(parents=True)
     shutil.copyfile(source / "tools/docs/check_docs.py", tool)
@@ -38,14 +39,15 @@ def docs_checkout(tmp_path: Path) -> Path:
         "{/* END GENERATED LATEST MODEL SUPPORT */}\nMore user content\n",
         encoding="utf-8",
     )
-    generator = root / "tools/docs/sync_model_coverage_tables.py"
+    generator = root / "tools/docs/build/coverage_tables.py"
     generator.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source / "tools/docs/catalog.py", root / "tools/docs/catalog.py")
     generator.write_text(
         "import os, runpy, sys\n"
         "from pathlib import Path\n"
-        "root = Path(__file__).resolve().parents[2]\n"
+        "root = Path(__file__).resolve().parents[3]\n"
         "if '--clean' in sys.argv:\n"
-        f"    helpers = runpy.run_path({str(source / 'tools/docs/sync_model_coverage_tables.py')!r})\n"
+        f"    helpers = runpy.run_path({str(source / 'tools/docs/build/coverage_tables.py')!r})\n"
         "    helpers['_strip_generated_tables'](root)\n"
         "else:\n"
         "    card = root / 'docs/index.mdx'\n"
@@ -54,7 +56,8 @@ def docs_checkout(tmp_path: Path) -> Path:
         "    sys.exit(int(os.environ.get('DOCS_GENERATION_EXIT', '0')))\n",
         encoding="utf-8",
     )
-    (root / "tools/docs/validate_model_cards.py").write_text(
+    (root / "tools/docs/checks").mkdir()
+    (root / "tools/docs/checks/sources.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
         "assert 'generated content' not in Path('docs/index.mdx').read_text()\n"
@@ -187,7 +190,7 @@ def test_publish_check_cleans_tables_if_whitespace_check_fails(docs_checkout: Pa
     ("workflow_name", "job"), [("fern-docs-ci.yml", "check"), ("publish-fern-docs.yml", "publish")]
 )
 def test_docs_ci_uses_the_shared_check(workflow_name: str, job: str):
-    root = Path(__file__).resolve().parents[3]
+    root = Path(__file__).resolve().parents[4]
     workflow = yaml.safe_load((root / ".github/workflows" / workflow_name).read_text())
     checks = [step for step in workflow["jobs"][job]["steps"] if step["name"] == "Check documentation"]
 
@@ -205,7 +208,7 @@ def test_docs_ci_uses_the_shared_check(workflow_name: str, job: str):
 @pytest.mark.parametrize(("tool_exit", "make_exit"), [(0, 0), (7, 2)])
 @pytest.mark.parametrize("target", ["docs-check", "docs-mdx-check"])
 def test_make_docs_check_forwards_to_the_shared_tool(docs_checkout: Path, tool_exit: int, make_exit: int, target: str):
-    root = Path(__file__).resolve().parents[3]
+    root = Path(__file__).resolve().parents[4]
     shutil.copyfile(root / "docs/fern/Makefile", docs_checkout / "docs/fern/Makefile")
     uv = docs_checkout / "bin/uv"
     uv.write_text(

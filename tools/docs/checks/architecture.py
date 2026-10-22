@@ -19,78 +19,12 @@ lands in ``MODEL_ARCH_MAPPING`` without any corresponding page under
 
 from pathlib import Path
 
-from tools.docs.sync_model_coverage_tables import _parse_registry_entries
-
-# Architectures documented under a different literal name in
-# docs/model-coverage/. Each value must appear verbatim in at least one .mdx
-# file under docs/model-coverage/.
-#
-# Add an entry here ONLY when the documentation legitimately uses a different
-# name than the registry / HF class name (e.g., HF class name differs from
-# registry alias, case differences, or a variant is grouped on a shared family
-# page). New entries should include a short inline comment explaining the
-# mismatch.
-#
-# Shared by registry validation, the generated architecture table, and
-# optional architecture resolution from example YAMLs.
-_DOC_ARCH_ALIASES = {
-    # HF ships the class as ``BaiChuanForCausalLM`` (CamelCase) — registry
-    # uses ``BaichuanForCausalLM``. Documented on the Baichuan page.
-    "BaichuanForCausalLM": "BaiChuanForCausalLM",
-    # HF upstream renamed ``Gemma3nForConditionalGeneration`` between releases;
-    # the "Gemma 3n" variant is covered on the Gemma 3 VL page.
-    "Gemma3nForConditionalGeneration": "Gemma 3n",
-    # Checkpoint-facing alias of ``KimiK25VLForConditionalGeneration``, covered
-    # by the Kimi-VL page.
-    "KimiK25ForConditionalGeneration": "Kimi-K25-VL",
-    "KimiK25VLForConditionalGeneration": "Kimi-K25-VL",
-    # Retrieval/bi-encoder variants of Llama, covered on the GritLM page.
-    "LlamaBidirectionalForSequenceClassification": "GritLM",
-    "LlamaBidirectionalModel": "GritLM",
-    # Multimodal retrieval variant covered by the existing NVIDIA Llama Nemotron embedding page.
-    "LlamaNemotronVLModel": "llama-nemotron-embed-1b-v2",
-    # HF ships ``LlavaOnevisionForConditionalGeneration`` (lowercase "n");
-    # registry uses ``LlavaOneVisionForConditionalGeneration`` (the NVIDIA
-    # re-impl for LLaVA-OneVision-1.5 with RICE ViT).
-    "LlavaOneVisionForConditionalGeneration": "LlavaOnevisionForConditionalGeneration",
-    # Registry also exposes the NVIDIA LLaVA-OneVision-1.5 re-impl under the
-    # class name ``LLaVAOneVision1_5_ForConditionalGeneration`` (all-caps
-    # "LLaVA" + explicit "1_5_" infix). The same model is documented on the
-    # lmms-lab/llava-onevision page under ``LlavaOneVisionForConditionalGeneration``.
-    "LLaVAOneVision1_5_ForConditionalGeneration": "LlavaOneVisionForConditionalGeneration",
-    # Ministral3 text model; covered on the Ministral3 / Ministral3-VL pages
-    # that list the VLM arch ``Mistral3ForConditionalGeneration``.
-    "Ministral3ForCausalLM": "Mistral3ForConditionalGeneration",
-    # Bi-encoder variant of Ministral3, covered on the same Ministral3 / Ministral3-VL pages.
-    "Ministral3BidirectionalModel": "Mistral3ForConditionalGeneration",
-    # Mistral4 text model is the backbone of Mistral-Small-4 VLM; documented
-    # on the Mistral-Small-4 page via the recipe path ``mistral4``.
-    "Mistral4ForCausalLM": "mistral4",
-    # OLMo2 page uses the vendor-branded spelling ``OLMo2`` (all caps "OLM");
-    # HF normalized the class name to ``Olmo2``.
-    "Olmo2ForCausalLM": "OLMo2ForCausalLM",
-    # HF upstream added an extra underscore between "5" and "VL"
-    # (``Qwen2_5_VLForConditionalGeneration``); the Qwen2.5-VL page still uses
-    # the pre-rename spelling.
-    "Qwen2_5_VLForConditionalGeneration": "Qwen2_5VLForConditionalGeneration",
-    # Qwen3-Omni and Qwen3-VL are documented with the VL-facing arch name; the
-    # registry wires their MoE backbones under these keys.
-    "Qwen3OmniMoeForConditionalGeneration": "Qwen3OmniForConditionalGeneration",
-    "Qwen3VLMoeForConditionalGeneration": "Qwen3VLForConditionalGeneration",
-    # Qwen3.5-MoE text and VL entry points share the unified Qwen3.5 page.
-    "Qwen3_5MoeForCausalLM": "Qwen3.5-MoE",
-    "Qwen3_5MoeForConditionalGeneration": "Qwen3.5-MoE",
-    # Dense Qwen3.5 text/VL backbone; grouped with the VL variants on the
-    # Qwen3.5-VL page.
-    "Qwen3_5ForCausalLM": "Qwen3.5",
-    "Qwen3_5ForConditionalGeneration": "Qwen3.5",
-    # Legacy checkpoint architecture name for the renamed Qwen3.8-Flash-Next
-    # implementation, documented under its current architecture name.
-    "Qwen4ExpForConditionalGeneration": "Qwen3_8_FlashNextForConditionalGeneration",
-    # HF split Seed-OSS into its own arch; the Seed page (``seed.mdx``) covers
-    # both Seed-Coder and Seed-OSS under the "Seed-OSS" name.
-    "SeedOssForCausalLM": "Seed-OSS",
-}
+from tools.docs.build.coverage_tables import (
+    _parse_registry_entries,
+)
+from tools.docs.catalog import (
+    _DOC_ARCH_ALIASES,
+)
 
 
 def _model_card_documents(repo_root: Path) -> list[tuple[Path, str]]:
@@ -185,7 +119,7 @@ def validate_registered_architectures(repo_root: Path) -> None:
     if missing:
         details = "\n".join((f"  - {arch} (looked for {repr(needle)})" for (arch, needle) in missing))
         raise ValueError(
-            f"The following registered architectures have no model card in docs/model-coverage/:\n{details}\n\nFix by either:\n  1. Adding a new .mdx file under docs/model-coverage/ (preferred for new architectures — e.g., docs/model-coverage/vlm/google/gemma4.mdx), or\n  2. Updating an existing .mdx file to mention the arch name, or\n  3. Adding an entry to _DOC_ARCH_ALIASES in tools/docs/architecture.py with a comment explaining the mismatch."
+            f"The following registered architectures have no model card in docs/model-coverage/:\n{details}\n\nFix by either:\n  1. Adding a new .mdx file under docs/model-coverage/ (preferred for new architectures — e.g., docs/model-coverage/vlm/google/gemma4.mdx), or\n  2. Updating an existing .mdx file to mention the arch name, or\n  3. Adding an entry to _DOC_ARCH_ALIASES in tools/docs/catalog.py with a comment explaining the mismatch."
         )
 
 

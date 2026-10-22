@@ -66,11 +66,5 @@ jobs:
         run: |
           uv run --no-project --isolated --python 3.12 \
             --with pytest --with pytest-timeout --with pyyaml --with pillow \
-            python -m pytest -q --noconftest \
-            tests/unit_tests/ci_tests/test_docs_workflows.py \
-            tests/unit_tests/tools/test_sync_model_coverage_tables.py \
-            tests/unit_tests/tools/test_check_docs.py \
-            tests/unit_tests/tools/test_apply_fern_code_styles.py \
-            tests/unit_tests/tools/test_validate_model_cards.py \
-            tests/unit_tests/_transformers/test_doc_coverage.py \
-            tests/unit_tests/_transformers/test_recipe_doc_coverage.py
+            python -m pytest -q --noconftest -o 'norecursedirs=.* node_modules __pycache__' \
+            tests/unit_tests/tools/docs

@@ -96,6 +96,9 @@ and styles after validation. It requires `uv`, Node.js 20 with `npm`/`npx`, Git,
 Report the command's result when handing off documentation changes.
 Documentation validation rules belong in `tools/docs/`; pytest tests should
 exercise those tools and their failure cases, not implement the rules.
+Group validators in `checks/`, rendering helpers in `build/`, and asset tools
+in `assets/`. Keep shared metadata in `catalog.py` and mirror tests under
+`tests/unit_tests/tools/docs/`. See `tools/docs/README.md` for the file map.
 
 ---
 

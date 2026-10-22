@@ -25,25 +25,22 @@ from pathlib import Path
 
 import yaml
 
-TABLE_ROW_COUNT = 10
-# Preserve model-card source paths used by marketing and published blog posts.
-# Keep compatibility copies on disk, but catalog only their canonical cards.
-MODEL_CARD_PATH_ALIASES = {
-    "docs/model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx": (
-        "docs/model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base.mdx"
-    ),
-    "docs/model-coverage/llm/flint/flint.mdx": "docs/model-coverage/llm/recursivesi/flint.mdx",
-    "docs/model-coverage/vlm/muse/muse_spark_open.mdx": "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx",
-    "docs/model-coverage/vlm/stepfun-ai/step-5-preview.mdx": (
-        "docs/model-coverage/vlm/stepfun-ai/step-5-preview-bf16.mdx"
-    ),
-}
-HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
-HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"
-SUPPORT_LOG_START_MARKER = "{/* BEGIN GENERATED MODEL SUPPORT LOG */}"
-SUPPORT_LOG_END_MARKER = "{/* END GENERATED MODEL SUPPORT LOG */}"
-REGISTRY_START_MARKER = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
-REGISTRY_END_MARKER = "{/* END GENERATED MODEL ARCHITECTURES */}"
+from tools.docs.catalog import (
+    DATED_MODEL_TABLE_HEADER,
+    DATED_SUPPORT_TABLE_HEADER,
+    GENERATED_MARKER_PAIRS,
+    HOMEPAGE_END_MARKER,
+    HOMEPAGE_START_MARKER,
+    MODEL_CARD_PATH_ALIASES,
+    MODEL_TYPE_OVERVIEW_PATHS,
+    MODEL_TYPE_ROUTE_CATEGORIES,
+    REGISTRY_END_MARKER,
+    REGISTRY_START_MARKER,
+    SUPPORT_LOG_END_MARKER,
+    SUPPORT_LOG_START_MARKER,
+    TABLE_ROW_COUNT,
+)
+
 HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DOCS_PAGE_PATTERN = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._/-]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
@@ -51,34 +48,6 @@ REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
 RECIPE_LINK_PATTERN = re.compile(
     r"https://github\.com/NVIDIA-NeMo/Automodel/blob/(?:main|[0-9a-f]{40})/"
     r"(examples/[A-Za-z0-9_./-]+\.yaml)"
-)
-DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model | Recipe |"
-DATED_MODEL_TABLE_HEADER = "| Date | Model | Architectures | Recipe |"
-MODEL_TYPE_OVERVIEW_PATHS = (
-    ("LLM", "llm/index.mdx"),
-    ("VLM", "vlm/index.mdx"),
-    ("Multimodal", "multimodal/index.mdx"),
-    ("Omni", "omni/index.mdx"),
-    ("dLLM", "dllm/index.mdx"),
-    ("Diffusion", "diffusion/index.mdx"),
-    ("Embedding", "embedding/index.mdx"),
-    ("Reranking", "reranker/index.mdx"),
-)
-MODEL_TYPE_ROUTE_CATEGORIES = {
-    "LLM": "large-language-models",
-    "Encoder-Decoder": "large-language-models",
-    "VLM": "vision-language-models",
-    "Multimodal": "multimodal",
-    "Omni": "omni",
-    "dLLM": "dllm",
-    "Diffusion": "diffusion",
-    "Embedding": "embedding-models",
-    "Reranking": "reranking-models",
-}
-GENERATED_MARKER_PAIRS = (
-    (HOMEPAGE_START_MARKER, HOMEPAGE_END_MARKER),
-    (SUPPORT_LOG_START_MARKER, SUPPORT_LOG_END_MARKER),
-    (REGISTRY_START_MARKER, REGISTRY_END_MARKER),
 )
 COMPACT_TABLE_STYLE = """<style>{`
   .compact-model-tables .fern-table-root {
@@ -843,7 +812,7 @@ def _generate_tables(repo_root: Path, *, validate_model_cards: bool = True) -> d
     homepage_path = repo_root / "docs" / "index.mdx"
     overview_path = repo_root / "docs" / "model-coverage" / "overview.mdx"
     registry_path = repo_root / "nemo_automodel" / "_transformers" / "registry.py"
-    aliases_path = repo_root / "tools" / "docs" / "architecture.py"
+    aliases_path = repo_root / "tools" / "docs" / "catalog.py"
 
     support_log = support_log_path.read_text(encoding="utf-8")
     typed_overview_paths = {
@@ -922,7 +891,7 @@ def main() -> None:
     mode.add_argument("--check", action="store_true", help="fail instead of writing when generated output is stale")
     mode.add_argument("--clean", action="store_true", help="remove generated tables while preserving their markers")
     args = parser.parse_args()
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     if args.clean:
         _strip_generated_tables(repo_root)
     else:
