@@ -34,6 +34,13 @@ Use one of these patterns for long full-parameter training (pre-training or exte
 
 Both patterns keep forward and backward compute in bf16 through FSDP2 mixed precision. They differ in where the fp32 master weight lives, how much peak memory they use for a specific model, and what dtype is written to the training checkpoint.
 
+On a single-rank or single-element mesh, AutoModel skips FSDP2 sharding and
+applies the policy's compute dtype through forward autocast instead. This also
+applies to direct model calls. Resident parameters and buffers retain their
+storage precision, and activation-checkpoint recomputation retains autocast.
+An explicit `distributed.autocast_dtype` overrides the policy's compute dtype
+on this unsharded path.
+
 ### Pattern A Using TE FusedAdam and bf16 Model Storage
 
 Use Transformer Engine FusedAdam when it has been validated for the model. The resident model parameters remain bf16, so model checkpoints can stay bf16, while TE keeps the optimizer's master weights and Adam EMA buffers in fp32.

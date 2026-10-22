@@ -2674,7 +2674,7 @@ class TestSingleGpuActivationCheckpointing:
         monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
         config = FSDP2Config(activation_checkpointing=activation_checkpointing)
         context = SimpleNamespace(
-            device_mesh=MagicMock(),
+            device_mesh=MagicMock(device_type="cpu"),
             cp_size=1,
             ep_size=1,
             strategy_config=config,
