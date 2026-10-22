@@ -170,7 +170,8 @@ def indexer_score_tile(
     else:
         for head in range(heads):
             q = query[:, start:stop, :, head].permute(0, 2, 1, 3).reshape(batch, groups * count, dim)
-            dots = torch.bmm(q.float(), summary.float().transpose(1, 2)).view(batch, groups, count, regions)
+            with torch.autocast(device_type=query.device.type, enabled=False):
+                dots = torch.bmm(q.float(), summary.float().transpose(1, 2)).view(batch, groups, count, regions)
             scores.add_(dots.relu_() * weights[:, start:stop, :, head].transpose(1, 2).unsqueeze(-1))
     return scores
 

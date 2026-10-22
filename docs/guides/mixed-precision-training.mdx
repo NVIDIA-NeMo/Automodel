@@ -40,6 +40,10 @@ applies to direct model calls. Resident parameters and buffers retain their
 storage precision, and activation-checkpoint recomputation retains autocast.
 An explicit `distributed.autocast_dtype` overrides the policy's compute dtype
 on this unsharded path.
+An explicit `mp_policy.output_dtype` casts floating forward outputs while
+preserving integer outputs and model-output containers. Routers, rotary angle
+construction, and other explicitly FP32 math retain their precision inside the
+forward autocast region.
 
 ### Pattern A Using TE FusedAdam and bf16 Model Storage
 
