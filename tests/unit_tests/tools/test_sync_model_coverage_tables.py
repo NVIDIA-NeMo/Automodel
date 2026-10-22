@@ -422,6 +422,7 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes(tmp_path):
     assert "meta-llama/Llama-3.2-1B" in models_by_type["Embedding"]
     assert "mistralai/Ministral-3-3B-Instruct-2512-BF16" in models_by_type["Embedding"]
     assert models_by_type["Reranking"] == {
+        "nvidia/llama-nemotron-rerank-1b-v2",
         "meta-llama/Llama-3.2-1B",
         "Qwen/Qwen3-Reranker-4B",
         "mistralai/Ministral-3-3B-Instruct-2512-BF16",
