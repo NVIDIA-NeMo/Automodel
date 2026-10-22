@@ -32,7 +32,12 @@ The CP pass runs with activation checkpointing, so the ring metadata is also rea
 backward recompute.
 
 The loss is the token-sum cross entropy over the global token count, so the CP gradients summed
-over ranks must equal the reference gradients.
+over ranks must equal the reference gradients. A NaN in any gradient fails the gate, and a negative
+control checks that it does.
+
+Finally, an FSDP2-wrapped CP model and an unwrapped CP=1 model each take an AdamW step on the image
+batch and then one on the text batch. In both, the text step must leave the vision embedder, which
+no rank used, and its optimizer state untouched while it updates the text weights.
 
 Run:
     torchrun --standalone --nproc-per-node=2 tests/functional_tests/context_parallel/run_gemma4_unified_cp.py
@@ -173,19 +178,32 @@ def _reference(model, batch):
     return loss.detach(), {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.grad is not None}
 
 
-def _context_parallel(model, batch, device_mesh):
+def _cp_backward(model, batch, device_mesh):
+    """Backward of the token-mean loss through the CP sharder, the recipe path.
+
+    Args:
+        model: The model; when FSDP2-wrapped, FSDP reduces its gradients over the CP ranks.
+        batch: Full-sequence tensors of shape [batch, sequence], plus the image tensors for an image batch.
+        device_mesh: Mesh with a ``cp`` dimension.
+
+    Returns:
+        This rank's share of the loss, a scalar tensor.
+    """
     from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 
-    model.zero_grad(set_to_none=True)
     batch = {k: v.clone() for k, v in batch.items()}
     num_tokens = (batch["labels"] != -100).sum()
-    cp_sharder = ContextParallelSharder(model, device_mesh, batch)
-    train_ctx, batch = cp_sharder.shard(batch)
+    train_ctx, batch = ContextParallelSharder(model, device_mesh, batch).shard(batch)
     labels = batch.pop("labels")
     with train_ctx():
-        logits = model(**batch).logits
-        loss = _token_loss_sum(logits, labels) / num_tokens
+        loss = _token_loss_sum(model(**batch).logits, labels) / num_tokens
         loss.backward()
+    return loss
+
+
+def _context_parallel(model, batch, device_mesh):
+    model.zero_grad(set_to_none=True)
+    loss = _cp_backward(model, batch, device_mesh)
     group = device_mesh["cp"].get_group()
     dist.all_reduce(loss, group=group)
     grads = {}
@@ -194,6 +212,80 @@ def _context_parallel(model, batch, device_mesh):
             dist.all_reduce(param.grad, group=group)
             grads[name] = param.grad.detach().clone()
     return loss.detach(), grads
+
+
+def _image_then_text_updates(model, image_batch, text_batch, backward):
+    """Take an AdamW step on the image batch, then one on the text batch.
+
+    Args:
+        model: The model to train, FSDP2-wrapped or not.
+        image_batch: Batch whose image runs the vision embedder.
+        text_batch: Text-only batch, which leaves the vision embedder unused.
+        backward: Callable ``(model, batch)`` that accumulates the batch's gradients.
+
+    Returns:
+        ``(vision_changed, text_changed, vision_steps)``: whether the text step changed any vision
+        embedder weight, whether it changed any other weight, and each vision weight's AdamW step count.
+    """
+    from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtensor
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    params = dict(model.named_parameters())
+
+    def _step(batch):
+        model.zero_grad(set_to_none=True)
+        backward(model, batch)
+        optimizer.step()
+
+    def _snapshot():
+        return {n: to_local_if_dtensor(p).clone() for n, p in params.items()}
+
+    _step(image_batch)
+    before = _snapshot()
+    _step(text_batch)
+    after = _snapshot()
+    changed = {n for n in params if not torch.equal(after[n], before[n])}
+    vision = {n for n in params if ".embed_vision." in n}
+    vision_steps = {n: int(optimizer.state[params[n]].get("step", 0)) for n in sorted(vision)}
+    return bool(changed & vision), bool(changed - vision), vision_steps
+
+
+def _compare(reference, result, loss_tol, grad_tol):
+    """Gate one batch: CP loss and gradients against the reference.
+
+    Args:
+        reference: ``(loss, grads)`` without CP; ``grads`` maps parameter names to gradients of any shape.
+        result: ``(loss, grads)`` with CP, in the same layout.
+        loss_tol: Maximum absolute loss difference.
+        grad_tol: Maximum relative L2 error of any parameter gradient.
+
+    Returns:
+        ``(ok, summary)``. Any nonfinite loss or gradient fails before the worst error is reduced, so a
+        NaN cannot hide behind the ``max`` comparison.
+    """
+    (ref_loss, ref_grads), (cp_loss, cp_grads) = reference, result
+    missing = sorted(set(ref_grads) ^ set(cp_grads))
+    nonfinite = sorted(
+        {n for grads in (ref_grads, cp_grads) for n, g in grads.items() if not torch.isfinite(g).all()}
+        | {label for label, loss in (("ref_loss", ref_loss), ("cp_loss", cp_loss)) if not torch.isfinite(loss)}
+    )
+    worst_name, worst = "-", float("inf")
+    if not nonfinite:
+        worst_name, worst = max(
+            (
+                (n, ((cp_grads[n].float() - g.float()).norm() / g.float().norm().clamp_min(1e-12)).item())
+                for n, g in ref_grads.items()
+                if n in cp_grads
+            ),
+            key=lambda item: item[1],
+        )
+    dloss = abs(ref_loss.item() - cp_loss.item())
+    ok = not missing and not nonfinite and dloss < loss_tol and worst < grad_tol
+    summary = (
+        f"loss ref={ref_loss.item():.6f} cp={cp_loss.item():.6f} |d|={dloss:.2e}  "
+        f"worst grad rel={worst:.2e} ({worst_name})  missing={missing}  nonfinite={nonfinite}"
+    )
+    return ok, summary
 
 
 def main():
@@ -217,27 +309,47 @@ def main():
 
     loss_tol, grad_tol = 2e-4, 2e-3
     failed = []
-    for name, (ref_loss, ref_grads) in references.items():
-        cp_loss, cp_grads = results[name]
-        missing = sorted(set(ref_grads) ^ set(cp_grads))
-        worst_name, worst = max(
-            (
-                (n, ((cp_grads[n].float() - g.float()).norm() / g.float().norm().clamp_min(1e-12)).item())
-                for n, g in ref_grads.items()
-                if n in cp_grads
-            ),
-            key=lambda item: item[1],
-        )
-        dloss = abs(ref_loss.item() - cp_loss.item())
-        ok = not missing and dloss < loss_tol and worst < grad_tol
+    for name, reference in references.items():
+        ok, summary = _compare(reference, results[name], loss_tol, grad_tol)
         if rank == 0:
-            print(
-                f"[{name}] loss ref={ref_loss.item():.6f} cp={cp_loss.item():.6f} |d|={dloss:.2e}  "
-                f"worst grad rel={worst:.2e} ({worst_name})  missing={missing}  {'PASS' if ok else 'FAIL'}",
-                flush=True,
-            )
+            print(f"[{name}] {summary}  {'PASS' if ok else 'FAIL'}", flush=True)
         if not ok:
             failed.append(name)
+
+    # Negative control: a NaN in a gradient after the first must fail the gate.
+    cp_loss, cp_grads = results["text"]
+    last = list(cp_grads)[-1]
+    corrupted = {**cp_grads, last: torch.full_like(cp_grads[last], float("nan"))}
+    control_ok, _ = _compare(references["text"], (cp_loss, corrupted), loss_tol, grad_tol)
+    if rank == 0:
+        print(f"[nan_control] NaN in {last}: {'FAIL (gate passed it)' if control_ok else 'PASS (gate rejected it)'}")
+    if control_ok:
+        failed.append("nan_control")
+
+    from torch.distributed.fsdp import fully_shard
+
+    from nemo_automodel.components.distributed.parallelizer_utils import configure_fsdp_unused_param_reduction
+
+    cp1 = _image_then_text_updates(_build_model(device, dtype), batches["image"], batches["text"], _reference)
+    fsdp_model = _build_model(device, dtype)
+    fully_shard(fsdp_model, mesh=device_mesh)
+    configure_fsdp_unused_param_reduction(fsdp_model)
+    cp = _image_then_text_updates(
+        fsdp_model, batches["image"], batches["text"], lambda model, batch: _cp_backward(model, batch, device_mesh)
+    )
+    vision_changed, text_changed, vision_steps = cp
+    # The image step stepped the vision weights once in both; the text step must step none of them.
+    updates_ok = cp == cp1 and not vision_changed and text_changed and 1 in vision_steps.values()
+    if rank == 0:
+        print(
+            f"[image_then_text] cp1 vision_changed={cp1[0]} text_changed={cp1[1]}  "
+            f"cp vision_changed={vision_changed} text_changed={text_changed}  "
+            f"vision steps cp1={sorted(set(cp1[2].values()))} cp={sorted(set(vision_steps.values()))}  "
+            f"{'PASS' if updates_ok else 'FAIL'}",
+            flush=True,
+        )
+    if not updates_ok:
+        failed.append("image_then_text")
     if rank == 0:
         print("RESULT:", "PASS" if not failed else f"FAIL {failed}", flush=True)
     dist.barrier()
