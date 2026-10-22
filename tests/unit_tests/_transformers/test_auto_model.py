@@ -440,19 +440,23 @@ class TestModelRuntimePatches:
             super().__init__()
             self.config = types.SimpleNamespace(architectures=architectures)
 
+    @staticmethod
+    def _mesh() -> MeshContext:
+        device_mesh = MagicMock(mesh_dim_names=("dp",), device_type="cpu")
+        device_mesh.size.return_value = 1
+        return MeshContext(device_mesh=device_mesh, strategy_config=FSDP2Config())
+
     def test_apply_model_runtime_patches_dispatches_by_architecture(self):
-        # The registry mechanism is exercised with a temporary test entry — the
-        # built-in registry no longer ships any entries (Qwen3.5 builds its
-        # CP/fp32-gate modules at construction instead of patching at load time).
+        # Exercise the provider contract without importing a full HF model.
         import nemo_automodel._transformers.kernel_patches as kp
         from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
 
         model = self._DummyModel(["FakeArchForCausalLM"])
-        mesh = types.SimpleNamespace(cp_size=1)
+        mesh = self._mesh()
         calls = []
 
-        def fake_hook(model, mesh):
-            calls.append((model, mesh))
+        def fake_hook(model, *, device_type):
+            calls.append((model, device_type))
             return model
 
         fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
@@ -468,7 +472,7 @@ class TestModelRuntimePatches:
             assert apply_model_runtime_patches(model, mesh) is model
 
         mock_import.assert_called_once_with("fake.module.path")
-        assert calls == [(model, mesh)]
+        assert calls == [(model, "cpu")]
 
     def test_apply_model_runtime_patches_deduplicates_hook_specs(self):
         # Two architectures sharing one hook spec must invoke the hook once.
@@ -476,11 +480,11 @@ class TestModelRuntimePatches:
         from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
 
         model = self._DummyModel(["FakeArchA", "FakeArchB"])
-        mesh = types.SimpleNamespace(cp_size=2)
+        mesh = self._mesh()
         calls = []
 
-        def fake_hook(model, mesh):
-            calls.append((model, mesh))
+        def fake_hook(model, *, device_type):
+            calls.append((model, device_type))
             return model
 
         fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
@@ -496,13 +500,13 @@ class TestModelRuntimePatches:
         ):
             assert apply_model_runtime_patches(model, mesh) is model
 
-        assert calls == [(model, mesh)]
+        assert calls == [(model, "cpu")]
 
     def test_apply_model_runtime_patches_is_noop_for_unregistered_model(self):
         from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
 
         model = self._DummyModel(["LlamaForCausalLM"])
-        mesh = types.SimpleNamespace(cp_size=1)
+        mesh = self._mesh()
 
         with patch("nemo_automodel._transformers.kernel_patches.importlib.import_module") as mock_import:
             assert apply_model_runtime_patches(model, mesh) is model
@@ -513,13 +517,33 @@ class TestModelRuntimePatches:
         from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
 
         model = self._DummyModel(["Qwen3_5ForCausalLM"])
-        mesh = types.SimpleNamespace(cp_size=1)
+        mesh = self._mesh()
 
         with patch(
             "nemo_automodel._transformers.kernel_patches.importlib.import_module",
             side_effect=ImportError,
         ):
             assert apply_model_runtime_patches(model, mesh) is model
+
+    @pytest.mark.parametrize("scenario", ["no_mesh", "no_strategy", "ddp", "sharded"])
+    def test_hf_precision_hooks_skip_other_strategies_and_meshes(self, scenario):
+        from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        model = self._DummyModel()
+        model.config.model_type = "deepseek_v3"
+        mesh = self._mesh()
+        if scenario == "no_mesh":
+            mesh.device_mesh = None
+        elif scenario == "no_strategy":
+            mesh.strategy_config = None
+        elif scenario == "ddp":
+            mesh.strategy_config = DDPConfig()
+        else:
+            mesh.device_mesh = MagicMock(mesh_dim_names=("dp",), device_type="cpu", size=lambda: 2)
+        with patch("nemo_automodel._transformers.kernel_patches.importlib.import_module") as mock_import:
+            assert apply_model_runtime_patches(model, mesh) is model
+        mock_import.assert_not_called()
 
 
 class TestPatchLegacyFlashAttnFlag:

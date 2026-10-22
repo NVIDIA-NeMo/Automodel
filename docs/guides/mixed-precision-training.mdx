@@ -45,7 +45,10 @@ preserving integer outputs and model-output containers. Routers, rotary angle
 construction, and other explicitly FP32 math retain their precision inside the
 forward autocast region. Model-owned compatibility hooks also protect the
 explicitly FP32 projections in supported Hugging Face routers loaded with
-`force_hf=True` or through the HF fallback.
+`force_hf=True` or through the HF fallback. These hooks preserve FP32 sparse
+indexer scores in DeepSeek-V3.2, GLM-MoE-DSA, and GLM-5-Next while their ordinary
+projections follow the compute dtype. GLM-5-Next hyperconnection math also
+retains its upstream FP32 precision.
 
 ### Pattern A Using TE FusedAdam and bf16 Model Storage
 

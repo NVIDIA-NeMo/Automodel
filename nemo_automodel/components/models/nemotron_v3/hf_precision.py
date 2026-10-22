@@ -16,26 +16,21 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from torch import nn
 
 from nemo_automodel.components.models.common.precision import preserve_fp32_module_compute
 
-if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.mesh import MeshContext
 
-
-def apply_hf_precision(model: nn.Module, *, mesh: MeshContext) -> nn.Module:
+def apply_hf_precision(model: nn.Module, *, device_type: str) -> nn.Module:
     """Keep the upstream HF router's FP32 projection and scoring outside autocast.
 
     Args:
         model: Loaded model, including HF modules retained by force_hf or fallback.
-        mesh: Requested strategy and execution device mesh.
+        device_type: Device selected by the single-rank compute policy.
 
     Returns:
         Model with its HF router computation protected and original state intact.
     """
     from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHTopkRouter
 
-    return preserve_fp32_module_compute(model, module_type=NemotronHTopkRouter, mesh_context=mesh)
+    return preserve_fp32_module_compute(model, module_type=NemotronHTopkRouter, device_type=device_type)

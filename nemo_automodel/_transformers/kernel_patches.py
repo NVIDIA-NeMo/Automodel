@@ -24,11 +24,16 @@ import importlib
 import inspect
 import logging
 import types
+from typing import TYPE_CHECKING
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.shared.import_utils import safe_import
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.mesh import MeshContext
 
 # Check availability without fully importing (avoids CUDA init at import time).
 # The actual ``liger_kernel.transformers`` module is imported lazily inside
@@ -235,8 +240,20 @@ def _model_runtime_patch_keys(model):
     return keys
 
 
-def apply_model_runtime_patches(model, mesh):
-    """Apply registered architecture-specific runtime patches to a model."""
+def apply_model_runtime_patches(model: torch.nn.Module, mesh: "MeshContext") -> torch.nn.Module:
+    """Apply model-owned HF precision compatibility for unsharded FSDP2.
+
+    Args:
+        model: Loaded model whose HF precision boundaries may need adaptation.
+        mesh: Resolved strategy and execution mesh.
+
+    Returns:
+        Model with its owning precision hook applied for a single-element FSDP2
+        mesh. Other strategies and meshes retain the original model behavior.
+    """
+    device_mesh = mesh.device_mesh
+    if not isinstance(mesh.strategy_config, FSDP2Config) or device_mesh is None or device_mesh.size() != 1:
+        return model
     seen_hooks = set()
     for key in _model_runtime_patch_keys(model):
         hook_spec = _MODEL_RUNTIME_PATCHES.get(key)
@@ -250,7 +267,7 @@ def apply_model_runtime_patches(model, mesh):
         except ImportError:
             logger.debug("Runtime patch hook for %s is unavailable: %s.%s", key, module_name, hook_name)
             continue
-        model = hook(model, mesh=mesh)
+        model = hook(model, device_type=device_mesh.device_type)
     return model
 
 
