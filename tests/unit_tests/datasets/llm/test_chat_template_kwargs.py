@@ -52,6 +52,14 @@ REASONING_TEMPLATE = (
     "{%- endif -%}"
     "{%- endfor -%}"
 )
+# Iterates a nested kwarg, so the mapping's order is part of the rendered text.
+OPTIONS_TEMPLATE = (
+    "{%- for m in messages -%}"
+    "{%- if m.role == 'user' -%}<u>{%- for k, v in options.items() -%}{{ k }}={{ v }};{%- endfor -%}{{ m.content }}"
+    "{%- elif m.role == 'assistant' -%}<a>{{ m.content }}</a>"
+    "{%- endif -%}"
+    "{%- endfor -%}"
+)
 TWO_TURNS = [
     {"role": "user", "content": "Q1"},
     {"role": "assistant", "content": "A1"},
@@ -145,6 +153,15 @@ def test_kwargs_reach_the_reasoning_mask():
     assert text == "<u>Q<a><r>R</r>A</a>"
     # Only the reasoning text is removed: the cleared render still shows the empty <r></r> block.
     assert supervised == "<a><r></r>A</a>"
+
+
+def test_nested_kwargs_order_reaches_the_render():
+    # Equal mappings under Python ==, rendered differently, so caches must record the order.
+    def render(options):
+        return _format(OPTIONS_TEMPLATE, TWO_TURNS[:2], chat_template_kwargs={"options": options})[0]
+
+    assert render({"b": 2, "a": 1}) == "<u>b=2;a=1;Q1<a>A1</a>"
+    assert render({"a": 1, "b": 2}) == "<u>a=1;b=2;Q1<a>A1</a>"
 
 
 def test_v41_training_template_takes_thinking_mode_from_kwargs():

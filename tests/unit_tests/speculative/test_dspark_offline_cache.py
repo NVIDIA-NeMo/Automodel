@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,7 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
     build_cached_dspark_dataloader,
     compute_batch_cache,
     existing_shard_indices,
+    manifest_path,
     read_manifest,
     read_target_weight_modules,
     write_manifest,
@@ -291,17 +293,40 @@ def test_resume_compatibility_rejects_manifest_mismatch(tmp_path):
         _ensure_resume_compatible(cache_dir, manifest, existing_shards={0})
 
 
-def test_resume_compatibility_rejects_kwargs_that_only_python_equality_merges(tmp_path):
+@pytest.mark.parametrize(
+    ("recorded_kwargs", "current_kwargs"),
+    [
+        ({"enable_thinking": False}, {"enable_thinking": 0}),
+        # A template iterating ``options.items()`` renders these differently.
+        ({"options": {"b": 2, "a": 1}}, {"options": {"a": 1, "b": 2}}),
+        ({"options": [{"b": 2, "a": 1}]}, {"options": [{"a": 1, "b": 2}]}),
+    ],
+)
+def test_resume_compatibility_rejects_kwargs_that_only_python_equality_merges(
+    tmp_path, recorded_kwargs, current_kwargs
+):
     cache_dir = str(tmp_path / "cache")
     _write_tiny_cache(cache_dir, num_samples=2, shard_size=2, seq_len=4)
-    recorded = {**read_manifest(cache_dir), "chat_template_kwargs": {"enable_thinking": False}}
+    recorded = {**read_manifest(cache_dir), "chat_template_kwargs": recorded_kwargs}
     write_manifest(cache_dir, recorded)
 
     with pytest.raises(ValueError, match="chat_template_kwargs"):
-        _ensure_resume_compatible(
-            cache_dir, {**recorded, "chat_template_kwargs": {"enable_thinking": 0}}, existing_shards={0}
-        )
-    _ensure_resume_compatible(cache_dir, recorded, existing_shards={0})  # same types -> ok
+        _ensure_resume_compatible(cache_dir, {**recorded, "chat_template_kwargs": current_kwargs}, existing_shards={0})
+    _ensure_resume_compatible(cache_dir, recorded, existing_shards={0})  # same kwargs -> ok
+
+
+def test_manifest_keeps_nested_kwargs_order_on_disk(tmp_path):
+    cache_dir = str(tmp_path / "cache")
+    _write_tiny_cache(cache_dir, num_samples=2, shard_size=2, seq_len=4)
+    kwargs = {"z": 0, "options": {"b": 2, "a": 1}, "items": [{"d": 1, "c": 2}]}
+    write_manifest(cache_dir, {**read_manifest(cache_dir), "chat_template_kwargs": kwargs})
+
+    recorded = read_manifest(cache_dir)["chat_template_kwargs"]
+    assert list(recorded["options"]) == ["b", "a"]
+    assert list(recorded["items"][0]) == ["d", "c"]
+    with open(manifest_path(cache_dir)) as f:
+        top_level = list(json.load(f))
+    assert top_level == sorted(top_level)  # top-level fields stay sorted by name
 
 
 def test_precompute_resume_mismatch_does_not_overwrite_target_weights(monkeypatch, tmp_path):

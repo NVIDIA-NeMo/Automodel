@@ -827,6 +827,8 @@ def test_chat_template_kwargs_from_reads_a_plain_mapping(recipe_args, expected):
         ({}, None),
         ({}, {}),
         ({"chat_template_kwargs": {"thinking_mode": "chat"}}, {"thinking_mode": "chat"}),
+        # Top-level kwargs are read by name, so their order does not change the render.
+        ({"chat_template_kwargs": {"a": 1, "opts": {"y": 1, "x": 2}}}, {"opts": {"y": 1, "x": 2}, "a": 1}),
     ],
 )
 def test_cached_dspark_manifest_accepts_matching_chat_template_kwargs(overrides, configured):
@@ -845,6 +847,9 @@ def test_cached_dspark_manifest_accepts_matching_chat_template_kwargs(overrides,
         # Equal under Python ==, but a template renders them differently (tojson: false vs 0).
         ({"chat_template_kwargs": {"mode": False}}, {"mode": 0}),
         ({"chat_template_kwargs": {"opts": {"mode": 1}}}, {"opts": {"mode": 1.0}}),
+        # Equal under Python ==, but a template iterating the nested mapping renders another order.
+        ({"chat_template_kwargs": {"opts": {"b": 2, "a": 1}}}, {"opts": {"a": 1, "b": 2}}),
+        ({"chat_template_kwargs": {"opts": [{"b": 2, "a": 1}]}}, {"opts": [{"a": 1, "b": 2}]}),
     ],
 )
 def test_cached_dspark_manifest_rejects_chat_template_kwargs_mismatch(overrides, configured):

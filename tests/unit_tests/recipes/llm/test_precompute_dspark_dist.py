@@ -208,10 +208,13 @@ def test_ensure_output_dir_compatible_rejects_different_input_identity(tmp_path)
         ({"mode": 1}, {"mode": 1.0}),
         ({"opts": {"mode": False}}, {"opts": {"mode": 0}}),
         ({"opts": [True]}, {"opts": [1]}),
+        # A template can iterate a nested mapping, so its order changes the render.
+        ({"opts": {"b": 2, "a": 1}}, {"opts": {"a": 1, "b": 2}}),
+        ({"opts": [{"b": 2, "a": 1}]}, {"opts": [{"a": 1, "b": 2}]}),
     ],
 )
 def test_ensure_output_dir_compatible_rejects_kwargs_that_only_python_equality_merges(tmp_path, recorded, current):
-    """``False == 0`` and ``1 == 1.0`` in Python, but a template renders them differently."""
+    """``False == 0``, ``1 == 1.0`` and reordered mappings compare equal in Python, but render differently."""
     from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest
 
     write_manifest(str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(chat_template_kwargs=recorded)))
@@ -224,9 +227,12 @@ def test_ensure_output_dir_compatible_rejects_kwargs_that_only_python_equality_m
 def test_ensure_output_dir_compatible_ignores_kwargs_key_order(tmp_path):
     from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest
 
-    write_manifest(str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(chat_template_kwargs={"a": 1, "b": 2})))
+    # Top-level kwargs are template variables read by name; only nested order is rendered.
+    recorded = {"a": 1, "b": 2, "opts": {"y": 1, "x": 2}}
+    write_manifest(str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(chat_template_kwargs=recorded)))
     pdd._ensure_output_dir_compatible(
-        str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(chat_template_kwargs={"b": 2, "a": 1}))
+        str(tmp_path),
+        pdd.build_cache_manifest(**_manifest_kwargs(chat_template_kwargs={"opts": {"y": 1, "x": 2}, "b": 2, "a": 1})),
     )  # no raise
 
 

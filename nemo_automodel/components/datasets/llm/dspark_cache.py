@@ -150,21 +150,27 @@ MANIFEST_DEFAULTS: dict[str, Any] = {
 
 
 def manifest_value_identity(value: Any) -> str:
-    """Return ``value`` in the canonical JSON form the manifest persists it in.
+    """Return the type- and order-sensitive JSON form manifest values are compared by.
 
-    Python equality treats ``False == 0`` and ``1 == 1.0`` as equal, recursively, but a
-    chat template renders them differently (``tojson`` gives ``false`` vs ``0``), so
-    manifest values are compared through this type-preserving form instead of ``==``.
+    Python equality treats ``False == 0`` and ``1 == 1.0`` as equal and ignores mapping
+    order, recursively, but a chat template observes both: ``tojson`` renders ``false`` vs
+    ``0``, and ``options.items()`` iterates a nested mapping in insertion order. JSON keeps
+    the types and the nested order. Only a top-level mapping's keys are sorted: those are the
+    named template arguments, which a template reads by name, so their order cannot change
+    a render.
     """
-    return json.dumps(value, sort_keys=True)
+    if isinstance(value, dict):
+        value = dict(sorted(value.items()))
+    return json.dumps(value)
 
 
 def manifest_mismatch_fields(recorded: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
     """Return the manifest keys whose values differ, ignoring bookkeeping fields.
 
-    Values are compared in their persisted JSON form (``manifest_value_identity``), so
-    ``False`` and ``0`` differ. ``format_version`` and the ``complete`` marker describe
-    the on-disk state, not the run configuration, so they never count as a mismatch.
+    Values are compared in their JSON form (``manifest_value_identity``), so ``False`` and
+    ``0`` differ, and so does a nested mapping in another order. ``format_version`` and the
+    ``complete`` marker describe the on-disk state, not the run configuration, so they never
+    count as a mismatch.
     """
     return sorted(
         k

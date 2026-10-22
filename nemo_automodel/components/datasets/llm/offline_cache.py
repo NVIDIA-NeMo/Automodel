@@ -77,11 +77,16 @@ def existing_shard_indices(cache_dir: str) -> set[int]:
 
 
 def write_manifest(cache_dir: str, manifest: dict[str, Any], format_version: int) -> str:
-    """Persist an offline-cache manifest atomically."""
+    """Persist an offline-cache manifest atomically.
+
+    Top-level fields are written sorted by name. Nested values keep their order, which a
+    recorded chat template argument (a mapping the template iterates) can depend on.
+    """
+    record = dict(sorted({"format_version": format_version, **manifest}.items()))
 
     def _write(tmp_path: str) -> None:
         with open(tmp_path, "w") as f:
-            json.dump({"format_version": format_version, **manifest}, f, indent=2, sort_keys=True)
+            json.dump(record, f, indent=2)
 
     return atomic_write(manifest_path(cache_dir), _write)
 
