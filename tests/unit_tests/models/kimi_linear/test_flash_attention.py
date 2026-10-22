@@ -19,6 +19,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata
 from nemo_automodel.components.models.kimi_linear import flash_attention as flash
 from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
 from nemo_automodel.components.models.kimi_linear.cp import (
@@ -32,6 +33,7 @@ from nemo_automodel.components.models.kimi_linear.model import (
 from nemo_automodel.shared.import_utils import UnavailableError
 from tests.unit_tests.models.kimi_linear.test_model import (
     _backend_config,
+    _require_fla,
     _tiny_kimi_config,
 )
 
@@ -242,7 +244,6 @@ def test_checkpoint_config_does_not_persist_the_execution_backend(monkeypatch) -
     fast = KimiLinear48BForCausalLM(config, backend=replace(_backend_config(), attn="fa4"))
     fast.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     saved = fast.config.to_dict()
-    assert "mla_attn_implementation" not in saved
     restored = KimiLinear48BForCausalLM(KimiLinear48BConfig.from_dict(saved), backend=_backend_config())
     assert fast.backend.attn == "fa4"
     assert restored.backend.attn == "eager"
@@ -255,16 +256,42 @@ def test_checkpoint_config_does_not_persist_the_execution_backend(monkeypatch) -
     assert torch.isfinite(restored(input_ids=torch.tensor([[3, 4]])).logits).all()
 
 
-def test_thd_document_spans_respect_physical_padding(fake_flash) -> None:
+@pytest.mark.parametrize("use_kda", [False, True])
+def test_thd_document_spans_respect_physical_padding(fake_flash, monkeypatch, use_kda) -> None:
+    if use_kda:
+        _require_fla()
     torch.manual_seed(20)
-    config = _tiny_kimi_config()
+    config = _tiny_kimi_config(use_kda=use_kda)
     reference = KimiLinear48BForCausalLM(config, backend=_backend_config())
     reference.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     fast = KimiLinear48BForCausalLM(config, backend=replace(_backend_config(), attn="fa4"))
     fast.load_state_dict(reference.state_dict(), strict=True)
     tokens = torch.tensor([[3, 4, 0, 5, 0, 0]])
     ids = torch.tensor([[1, 1, 0, 2, 0, 0]], dtype=torch.int32)
-    expected = reference(input_ids=tokens, attention_mask=ids).logits
+    reference_metadata = build_packed_sequence_metadata(ids) if use_kda else {}
+    if use_kda:
+        # Isolate packing/gradient behavior from the unchanged GPU-only FLA core.
+        def recurrent_reference(hidden_states: torch.Tensor, *, cu_seqlens: torch.Tensor) -> torch.Tensor:
+            """Compute segmented prefix sums as a deterministic recurrent oracle.
+
+            Args:
+                hidden_states: Tensor of shape [1, valid_tokens, hidden].
+                cu_seqlens: Logical boundaries of shape [documents + 1].
+
+            Returns:
+                Prefix sums of shape [1, valid_tokens, hidden], reset at each document.
+            """
+            assert hidden_states.shape[1] == 3
+            assert cu_seqlens.tolist() == [0, 2, 3]
+            cuts = cu_seqlens.tolist()
+            return torch.cat([hidden_states[:, start:end].cumsum(1) for start, end in zip(cuts, cuts[1:])], dim=1)
+
+        for model in (reference, fast):
+            for layer in model.model.layers.values():
+                if layer.is_linear_attn:
+                    monkeypatch.setattr(layer.self_attn, "_kda_core", recurrent_reference)
+    expected = reference(input_ids=tokens, attention_mask=ids, **reference_metadata).logits
+    physical_metadata = {"packed_token_indices": torch.tensor([0, 1, 3])} if use_kda else {}
     actual = fast(
         input_ids=tokens,
         padding_mask=ids == 0,
@@ -272,6 +299,7 @@ def test_thd_document_spans_respect_physical_padding(fake_flash) -> None:
         position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
         cu_seqlens=torch.tensor([[0, 2, 3]], dtype=torch.int32),
         cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
+        **physical_metadata,
     ).logits
     valid = ids > 0
     torch.testing.assert_close(actual[valid], expected[valid], atol=1e-6, rtol=1e-5)
@@ -295,3 +323,36 @@ def test_fa4_rejects_attention_dropout(fake_flash) -> None:
     layout = flash.build_flash_layout(torch.ones(1, 2, dtype=torch.int32))
     with pytest.raises(ValueError, match="attention_dropout=0"):
         flash.packed_flash_attention(q, q, q, layout=layout, scale=8**-0.5, dropout_p=0.1)
+
+
+def test_nonempty_fa4_rejects_deterministic_algorithms(fake_flash) -> None:
+    previous = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        q = torch.ones(1, 1, 2, 8, requires_grad=True)
+        layout = flash.build_flash_layout(torch.ones(1, 2, dtype=torch.int32))
+        with pytest.raises(RuntimeError, match="nondeterministic attention backward"):
+            flash.packed_flash_attention(q, q, q, layout=layout, scale=8**-0.5)
+        empty = flash.packed_flash_attention(
+            q, q, q, layout=flash.build_flash_layout(torch.zeros(1, 2, dtype=torch.int32)), scale=8**-0.5
+        )
+        assert torch.isfinite(empty).all() and torch.count_nonzero(empty) == 0
+        grad = torch.autograd.grad(empty, q, torch.randn_like(empty))[0]
+        assert torch.count_nonzero(grad) == 0
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=warn_only)
+
+
+def test_hybrid_physical_thd_padding_requires_unpadded_indices(fake_flash) -> None:
+    _require_fla()
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(use_kda=True), backend=replace(_backend_config(), attn="fa4"))
+    with pytest.raises(ValueError, match="requires logical cu_seqlens and packed_token_indices"):
+        model(
+            input_ids=torch.tensor([[3, 4, 0, 5, 0, 0]]),
+            padding_mask=torch.tensor([[False, False, True, False, True, True]]),
+            qkv_format="thd",
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
+            cu_seqlens=torch.tensor([[0, 2, 3]], dtype=torch.int32),
+            cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
+        )

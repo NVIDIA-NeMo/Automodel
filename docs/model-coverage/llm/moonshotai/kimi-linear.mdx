@@ -19,7 +19,8 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a
 The recipe selects `model.backend.attn: fa4` for non-CP MLA and requires a container
 built with `INSTALL_FA4=true`, CUDA FP16 or BF16 inputs, and zero attention dropout.
 The `fa` extra installs FlashAttention-2 and does not supply `flash_attn.cute`.
-For an environment without FA4, select eager MLA:
+Nonempty FA4 attention does not support deterministic algorithms. For an
+environment without FA4 or with `torch.use_deterministic_algorithms(True)`, select eager MLA:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml --model.backend.attn eager
@@ -66,8 +67,10 @@ NeMo AutoModel already carry the distinct identity and load without that overrid
 
 For independent documents at CP=1, pass document-ID masks or converted metadata.
 FA4 MLA supports physical THD boundaries through `cu_seqlens_padded` plus a boolean
-`padding_mask`. This does not convert a padded recurrent KDA stream: KDA still
-requires unpadded tokens consistent with its logical `cu_seqlens`.
+`padding_mask`. When physical and logical boundaries differ, hybrid KDA models
+also require logical `cu_seqlens` and flat `packed_token_indices` identifying the
+valid tokens in physical order. KDA gathers those tokens into its unpadded stream;
+omitting the indices raises `ValueError`.
 
 ### Available Models
 

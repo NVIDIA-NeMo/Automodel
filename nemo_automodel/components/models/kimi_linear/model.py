@@ -1120,8 +1120,10 @@ class KimiLinear48BModel(nn.Module):
                 flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
                 or [documents + 1] for THD inputs and gives physical boundaries
                 including per-document padding, rather than logical token counts.
-                These physical boundaries apply only to FA4 MLA; recurrent KDA
-                still requires its unpadded stream to agree with ``cu_seqlens``.
+                Physical boundaries apply to FA4 MLA. Hybrid models with internal
+                padding also require logical ``cu_seqlens`` and flat
+                ``packed_token_indices`` selecting valid tokens in physical order,
+                so KDA can gather its unpadded recurrent stream.
                 ``max_seqlen`` is an integer document length.
 
         Returns:
@@ -1153,6 +1155,20 @@ class KimiLinear48BModel(nn.Module):
             attention_mask=packed_seq_ids if packed_seq_ids is not None else attention_mask,
             cu_seqlens=physical_boundaries if physical_boundaries is not None else attn_kwargs.get("cu_seqlens"),
         )
+        if (
+            physical_boundaries is not None
+            and not (packed_context is not None and packed_context.cp_enabled)
+            and any(layer.is_linear_attn for layer in self.layers.values())
+        ):
+            logical_boundaries = attn_kwargs.get("cu_seqlens")
+            if logical_boundaries is None or (
+                not torch.equal(physical_boundaries.reshape(-1), logical_boundaries.reshape(-1))
+                and attn_kwargs.get("packed_token_indices") is None
+            ):
+                raise ValueError(
+                    "Kimi Linear physical THD padding with KDA requires logical cu_seqlens "
+                    "and packed_token_indices for the unpadded tokens"
+                )
         if use_flash and packed_context is None and padding_mask is not None:
             packed_context = KimiPackedContext(doc_ids=(~padding_mask).to(torch.int32))
         # Packed attention consumes document metadata, but MoE routing still
@@ -1332,9 +1348,10 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
                 and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
                 with row-local boundaries and -1 padding, or [documents + 1] for
                 flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
-                or [documents + 1] and describes physical THD boundaries for FA4 MLA
-                only; recurrent KDA still requires an unpadded stream matching
-                ``cu_seqlens``. ``max_seqlen`` is an integer document length.
+                or [documents + 1] and describes physical THD boundaries for FA4 MLA.
+                Hybrid models with internal padding also require logical ``cu_seqlens``
+                and flat ``packed_token_indices`` selecting valid physical positions
+                for KDA's unpadded stream. ``max_seqlen`` is an integer document length.
 
         Returns:
             Causal LM output whose logits have shape [batch, sequence, vocab] unless ``logits_to_keep`` trims sequence.

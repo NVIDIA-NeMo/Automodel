@@ -94,6 +94,8 @@ def packed_flash_attention(
     incorrect SM90 varlen backward results with narrower QK. Preserve the original
     QK softmax scale. Padding query outputs are zero. Attention dropout
     is unsupported; use the eager implementation when dropout is required.
+    Nonempty FA4 calls do not support deterministic algorithms because their
+    attention backward uses nondeterministic reductions; use eager for that mode.
 
     Args:
         query: CUDA fp16/bf16 tensor of shape [batch, heads, sequence, qk_dim].
@@ -114,6 +116,8 @@ def packed_flash_attention(
     if layout.indices.numel() == 0:
         zero = query[..., :0].sum() + key[..., :0].sum() + value[..., :0].sum()
         return torch.zeros_like(value) + zero
+    if torch.are_deterministic_algorithms_enabled():
+        raise RuntimeError("Kimi Linear FA4 uses nondeterministic attention backward; use backend.attn='eager'")
     batch, heads, sequence, value_dim = value.shape
     gathered = []
     for tensor in (query, key, value):
