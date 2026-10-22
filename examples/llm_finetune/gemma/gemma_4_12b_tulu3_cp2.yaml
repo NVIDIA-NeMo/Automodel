@@ -14,7 +14,9 @@
 
 # Gemma4 Unified 12B SFT on Tulu-3 with context parallelism (cp_size=2) on 8 GPUs.
 # Gemma4 Unified owns its CP: each rank keeps a contiguous slice of the sequence and the
-# sliding-window and full-attention layers exchange K/V over a p2p ring.
+# sliding-window and full-attention layers exchange K/V over a p2p ring. The sliding-window layers
+# run Flex and the head_dim=512 full-attention ring chunks run the FFPA kernel (install the `ffpa`
+# extra: uv sync --extra ffpa).
 #
 # To run:
 #   automodel examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp2.yaml --nproc-per-node 8
@@ -43,6 +45,8 @@ model:
   torch_dtype: bf16
   # The CP ring attention runs in place of SDPA.
   attn_implementation: sdpa
+  text_config:
+    cp_full_attn_backend: ffpa
 
 checkpoint:
   enabled: false
