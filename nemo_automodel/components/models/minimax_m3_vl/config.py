@@ -84,6 +84,8 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
         sparse_attention_config: dict | None = None,
         # Multi-token prediction
         num_mtp_modules: int = 1,
+        # Checkpoint quantization metadata from config.json (None for BF16 checkpoints)
+        quantization_config: dict[str, Any] | None = None,
         pad_token_id: int | None = None,
         **kwargs,
     ) -> None:
@@ -118,6 +120,7 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
         self.swiglu_limit = swiglu_limit
         self.sparse_attention_config = sparse_attention_config
         self.num_mtp_modules = num_mtp_modules
+        self.quantization_config = quantization_config
         super().__init__(pad_token_id=pad_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def to_dict(self):
@@ -197,6 +200,7 @@ class MiniMaxM3VLConfig(PretrainedConfig):
         vision_feature_select_strategy: str = "full",
         img_token_compression_config: dict | None = None,
         image_grid_pinpoints: str | None = None,
+        quantization_config: dict[str, Any] | None = None,
         **kwargs,
     ) -> None:
         if vision_config is None:
@@ -223,6 +227,7 @@ class MiniMaxM3VLConfig(PretrainedConfig):
         self.vision_feature_select_strategy = vision_feature_select_strategy
         self.img_token_compression_config = img_token_compression_config or {}
         self.image_grid_pinpoints = image_grid_pinpoints
+        self.quantization_config = quantization_config
         # Convenience mirror used by recipe/PP helpers.
         self.hidden_size = text_config.hidden_size
         self.max_position_embeddings = text_config.max_position_embeddings

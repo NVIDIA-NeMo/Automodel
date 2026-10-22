@@ -161,23 +161,30 @@ _MXFP8_INDEXER_RE = re.compile(r"\.self_attn\.index_[qk]_proj\.weight$")
 _NVFP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 
+_NVFP4_QUANTIZATION_CONFIG = {
+    "quant_method": "mxfp8",
+    "weight_block_size": [1, MXFP8_BLOCK_SIZE],
+    "moe_quant_format": "nvfp4-pack-quantized",
+    "group_size": _NVFP4_BLOCK_SIZE,
+}
+
+
 def _uses_nvfp4_experts(config: MiniMaxM3VLConfig | MiniMaxM3VLTextConfig) -> bool:
     """Recognize the released M3.1 mixed MXFP8/NVFP4 checkpoint layout."""
-    # Hugging Face owns this optional checkpoint field. Reading it once at the
-    # adapter boundary avoids declaring a None attribute that HF can mistake
-    # for a pre-quantized BF16 checkpoint.
-    quantization = vars(config).get("quantization_config") or {}
-    if quantization.get("moe_quant_algo") != "NVFP4":
+    quantization = config.quantization_config
+    if quantization is None or "moe_quant_algo" not in quantization:
         return False
-    if (
-        quantization.get("quant_method") != "mxfp8"
-        or quantization.get("weight_block_size") != [1, MXFP8_BLOCK_SIZE]
-        or quantization.get("moe_quant_format") != "nvfp4-pack-quantized"
-        or quantization.get("group_size") != _NVFP4_BLOCK_SIZE
-    ):
+    if quantization["moe_quant_algo"] != "NVFP4":
+        return False
+    mismatched = [
+        key
+        for key, value in _NVFP4_QUANTIZATION_CONFIG.items()
+        if key not in quantization or quantization[key] != value
+    ]
+    if mismatched:
         raise ValueError(
             "MiniMax M3 NVFP4 experts require mxfp8/nvfp4-pack-quantized "
-            "with weight_block_size=[1, 32] and group_size=16"
+            f"with weight_block_size=[1, 32] and group_size=16; mismatched fields: {mismatched}"
         )
     return True
 
