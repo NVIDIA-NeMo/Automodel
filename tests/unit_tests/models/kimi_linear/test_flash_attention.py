@@ -70,9 +70,10 @@ def _fake_varlen(
     """CPU replacement for only the external CUDA kernel.
 
     Args:
-        query: Tensor of shape [valid_tokens, heads, head_dim].
-        key: Tensor of shape [valid_tokens, heads, head_dim].
-        value: Tensor of shape [valid_tokens, heads, head_dim].
+        query: Tensor of shape [valid_tokens, heads, qk_dim], grouped in cu_seqlens_q order.
+        key: Tensor of shape [valid_tokens, heads, qk_dim].
+        value: Tensor of shape [valid_tokens, heads, value_dim], with qk_dim >= value_dim
+            after the wrapper pads narrower Q/K.
         cu_seqlens_q: Integer tensor of shape [documents + 1].
         cu_seqlens_k: Integer tensor of shape [documents + 1].
         max_seqlen_q: Maximum document length.
@@ -355,4 +356,13 @@ def test_hybrid_physical_thd_padding_requires_unpadded_indices(fake_flash) -> No
             position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
             cu_seqlens=torch.tensor([[0, 2, 3]], dtype=torch.int32),
             cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
+        )
+
+
+def test_flat_thd_boundaries_reject_a_mismatched_batch_layout(fake_flash) -> None:
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=replace(_backend_config(), attn="fa4"))
+    with pytest.raises(ValueError, match="document map must match"):
+        model(
+            input_ids=torch.tensor([[3, 4, 5, 6], [7, 8, 9, 10]]),
+            cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
         )

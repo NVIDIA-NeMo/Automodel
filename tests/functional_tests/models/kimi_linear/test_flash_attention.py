@@ -37,10 +37,18 @@ from nemo_automodel.components.models.kimi_linear.flash_attention import (
 )
 from nemo_automodel.components.models.kimi_linear.model import KimiLinear48BForCausalLM, KimiMLAAttention
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="requires CUDA FlashAttention forward/backward",
-)
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA FlashAttention forward/backward"),
+    pytest.mark.timeout(600),
+]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _require_fa4_gpu_architecture() -> None:
+    """Require at least SM90 for the FA4 CUDA tests."""
+    capability = torch.cuda.get_device_capability()
+    if capability < (9, 0):
+        pytest.fail(f"Kimi Linear FA4 CUDA tests require SM90 or newer; got SM{capability[0]}{capability[1]}")
 
 
 def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, tolerance: float) -> None:

@@ -1182,6 +1182,11 @@ class KimiLinear48BModel(nn.Module):
                 doc_ids = packed_context.doc_ids
             else:
                 doc_ids = torch.ones(inputs_embeds.shape[:2], dtype=torch.int32, device=inputs_embeds.device)
+            if doc_ids.shape != inputs_embeds.shape[:2]:
+                raise ValueError(
+                    f"Kimi Linear FA4 document map must match [batch, sequence] {tuple(inputs_embeds.shape[:2])}; "
+                    f"got {tuple(doc_ids.shape)}"
+                )
             if padding_mask is not None:
                 doc_ids = doc_ids.masked_fill(padding_mask, 0)
             flash_layout = build_flash_layout(doc_ids)
