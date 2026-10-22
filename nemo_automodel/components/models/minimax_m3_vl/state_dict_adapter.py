@@ -43,7 +43,11 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
+from nemo_automodel.components.models.minimax_m3_vl.config import (
+    MiniMaxM3QuantizationConfig,
+    MiniMaxM3VLConfig,
+    MiniMaxM3VLTextConfig,
+)
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 from nemo_automodel.components.moe.state_dict_utils import (
@@ -161,12 +165,12 @@ _MXFP8_INDEXER_RE = re.compile(r"\.self_attn\.index_[qk]_proj\.weight$")
 _NVFP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 
-_NVFP4_QUANTIZATION_CONFIG = {
-    "quant_method": "mxfp8",
-    "weight_block_size": [1, MXFP8_BLOCK_SIZE],
-    "moe_quant_format": "nvfp4-pack-quantized",
-    "group_size": _NVFP4_BLOCK_SIZE,
-}
+_NVFP4_QUANTIZATION_CONFIG = MiniMaxM3QuantizationConfig(
+    quant_method="mxfp8",
+    weight_block_size=[1, MXFP8_BLOCK_SIZE],
+    moe_quant_format="nvfp4-pack-quantized",
+    group_size=_NVFP4_BLOCK_SIZE,
+)
 
 
 def _uses_nvfp4_experts(config: MiniMaxM3VLConfig | MiniMaxM3VLTextConfig) -> bool:
@@ -177,9 +181,9 @@ def _uses_nvfp4_experts(config: MiniMaxM3VLConfig | MiniMaxM3VLTextConfig) -> bo
     if quantization["moe_quant_algo"] != "NVFP4":
         return False
     mismatched = [
-        key
-        for key, value in _NVFP4_QUANTIZATION_CONFIG.items()
-        if key not in quantization or quantization[key] != value
+        field
+        for field, value in _NVFP4_QUANTIZATION_CONFIG.items()
+        if field not in quantization or quantization[field] != value
     ]
     if mismatched:
         raise ValueError(

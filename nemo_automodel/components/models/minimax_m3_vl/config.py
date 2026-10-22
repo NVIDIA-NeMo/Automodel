@@ -25,9 +25,26 @@ Mirrors the canonical sglang reference ``sglang.srt.configs.minimax_vl`` and the
 field set in the checkpoint's ``config.json``; keep them in sync.
 """
 
-from typing import Any, Union
+from typing import Any, Required, TypedDict, Union
 
 from transformers.configuration_utils import PretrainedConfig
+
+
+class MiniMaxM3QuantizationConfig(TypedDict, total=False):
+    """``quantization_config`` block of the released MiniMax M3 checkpoints.
+
+    M3 stores MXFP8 projections described by ``quant_method``, ``activation_scheme``,
+    ``weight_block_size`` and ``ignored_layers``. M3.1 adds NVFP4 packed routed
+    experts described by ``moe_quant_algo``, ``moe_quant_format`` and ``group_size``.
+    """
+
+    quant_method: Required[str]
+    activation_scheme: str
+    weight_block_size: list[int]
+    ignored_layers: list[str]
+    moe_quant_algo: str
+    moe_quant_format: str
+    group_size: int
 
 
 def _json_safe_value(value: Any) -> Any:
@@ -85,7 +102,7 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
         # Multi-token prediction
         num_mtp_modules: int = 1,
         # Checkpoint quantization metadata from config.json (None for BF16 checkpoints)
-        quantization_config: dict[str, Any] | None = None,
+        quantization_config: MiniMaxM3QuantizationConfig | None = None,
         pad_token_id: int | None = None,
         **kwargs,
     ) -> None:
@@ -200,7 +217,7 @@ class MiniMaxM3VLConfig(PretrainedConfig):
         vision_feature_select_strategy: str = "full",
         img_token_compression_config: dict | None = None,
         image_grid_pinpoints: str | None = None,
-        quantization_config: dict[str, Any] | None = None,
+        quantization_config: MiniMaxM3QuantizationConfig | None = None,
         **kwargs,
     ) -> None:
         if vision_config is None:
