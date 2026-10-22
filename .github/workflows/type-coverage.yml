@@ -42,7 +42,7 @@ jobs:
             args+=(--base "$BASE_SHA")
           fi
           python tools/type_coverage.py "${args[@]}"
-          cat type-coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
+          tee -a "$GITHUB_STEP_SUMMARY" < type-coverage/summary.md
       - name: Upload annotation coverage
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:

@@ -195,6 +195,7 @@ python tools/lint_no_globals.py
 Every pull request, including documentation-only changes, runs the **Python type
 coverage** workflow. Open its **Python annotation coverage** job summary for
 package-wide and per-area coverage, plus changes from the PR's merge-base.
+The same report is printed in the **Report annotation coverage** step's log.
 The `type-coverage` artifact contains the summary and JSON with per-function
 annotations and exclusion reasons.
 
