@@ -75,7 +75,6 @@ distributed:
     param_dtype: bfloat16
     reduce_dtype: float32
     output_dtype: float32
-  autocast_dtype: bfloat16
   offload_policy: null
   # Per-layer FSDP2 prefetch: overlaps all-gather / reduce-scatter with compute.
   # Off by default in FSDP2Config; turn it on here for the throughput win.

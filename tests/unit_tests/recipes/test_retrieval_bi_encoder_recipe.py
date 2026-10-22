@@ -14,7 +14,6 @@
 
 import json
 from collections import deque
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -26,7 +25,6 @@ from nemo_automodel.recipes.retrieval import train_bi_encoder
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
     _configure_sentence_transformer_export,
-    _get_autocast_ctx,
     _get_model_instantiate_kwargs,
     _unwrap_model_for_attrs,
     _uses_multi_vector_scoring,
@@ -173,34 +171,6 @@ def test_configure_sentence_transformer_export_disables_export_for_custom_collat
 
     assert model.sentence_transformer_export_config is None
     assert "does not expose static query_prefix and passage_prefix metadata" in caplog.text
-
-
-def test_retrieval_autocast_ctx_disabled_by_default(monkeypatch):
-    def _unexpected_autocast(*args, **kwargs):
-        raise AssertionError("autocast should be disabled when autocast_dtype is unset")
-
-    monkeypatch.setattr(train_bi_encoder.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(train_bi_encoder.torch, "autocast", _unexpected_autocast)
-
-    with _get_autocast_ctx(SimpleNamespace(autocast_dtype=None)):
-        pass
-
-
-def test_retrieval_autocast_ctx_uses_configured_dtype(monkeypatch):
-    captured = {}
-
-    def _fake_autocast(*, device_type, dtype):
-        captured["device_type"] = device_type
-        captured["dtype"] = dtype
-        return nullcontext()
-
-    monkeypatch.setattr(train_bi_encoder.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(train_bi_encoder.torch, "autocast", _fake_autocast)
-
-    with _get_autocast_ctx(SimpleNamespace(autocast_dtype=torch.bfloat16)):
-        pass
-
-    assert captured == {"device_type": "cuda", "dtype": torch.bfloat16}
 
 
 def test_retrieval_model_instantiate_kwargs_include_compile_config():

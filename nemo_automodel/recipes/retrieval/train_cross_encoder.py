@@ -24,7 +24,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe, _get_autocast_ctx
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 from nemo_automodel.shared.import_utils import safe_import
 
 _, wandb = safe_import("wandb")
@@ -135,7 +135,6 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
         labels = batch.pop("labels")
 
         model = self.model_parts[0]
-        train_ctx = _get_autocast_ctx(self.distributed_config)
         sync_ctx = (
             get_sync_ctx(
                 model,
@@ -145,7 +144,7 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
             if is_train
             else nullcontext()
         )
-        with train_ctx, sync_ctx:
+        with sync_ctx:
             outputs = model(**batch, return_dict=True)
 
             # Listwise softmax over each query's candidates, scaled by the recipe-level
@@ -178,7 +177,6 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
             all_labels = []
 
             model = self.model_parts[0]
-            autocast_ctx = _get_autocast_ctx(self.distributed_config)
 
             with torch.no_grad():
                 for batch in val_dataloader:
@@ -188,11 +186,10 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
                     }
                     labels = batch.pop("labels")
 
-                    with autocast_ctx:
-                        outputs = model(**batch, return_dict=True)
-                        # fp32 before the temperature division, as in the train step.
-                        logits = outputs.logits.view(-1, self.val_n_passages).float() / self.temperature
-                        loss = F.cross_entropy(logits, labels)
+                    outputs = model(**batch, return_dict=True)
+                    # fp32 before the temperature division, as in the train step.
+                    logits = outputs.logits.view(-1, self.val_n_passages).float() / self.temperature
+                    loss = F.cross_entropy(logits, labels)
 
                     loss_buffer.append(loss.clone().detach())
                     all_logits.append(logits.detach())

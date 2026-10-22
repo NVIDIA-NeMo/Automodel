@@ -179,9 +179,7 @@ def _parallelize_unsharded_fsdp2(
     # No fully_shard hooks run on this path, so its mixed-precision policy
     # cannot provide compute casts. Autocast preserves resident/master weights
     # and precision-sensitive buffers, including during checkpoint recomputation.
-    compute_dtype = config.autocast_dtype
-    if compute_dtype is None and config.mp_policy is not None:
-        compute_dtype = config.mp_policy.param_dtype
+    compute_dtype = config.mp_policy.param_dtype if config.mp_policy is not None else None
     if compute_dtype in (torch.bfloat16, torch.float16):
         assert mesh_context.device_mesh is not None
         autocast = torch.autocast(device_type=mesh_context.device_mesh.device_type, dtype=compute_dtype)

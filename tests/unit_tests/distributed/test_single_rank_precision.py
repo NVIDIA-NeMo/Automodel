@@ -83,14 +83,13 @@ class _Model(nn.Module):
         return self.layers[0](inputs)
 
 
-def _parallelize(model, *, dtype=torch.bfloat16, autocast_dtype=None, output_dtype=None, checkpointing=False):
+def _parallelize(model, *, dtype=torch.bfloat16, output_dtype=None, checkpointing=False):
     context = SimpleNamespace(
         cp_size=1,
         ep_size=1,
         device_mesh=SimpleNamespace(size=lambda: 1, device_type="cpu"),
         strategy_config=FSDP2Config(
             mp_policy=MixedPrecisionPolicy(param_dtype=dtype, output_dtype=output_dtype),
-            autocast_dtype=autocast_dtype,
         ),
         activation_checkpointing=checkpointing,
         reapply_trainability=None,
@@ -143,17 +142,16 @@ def test_single_rank_compute_matches_autocast_training(checkpointing):
 
 
 @pytest.mark.parametrize(
-    ("dtype", "override", "expected"),
+    ("dtype", "expected"),
     [
-        (torch.float32, None, torch.float32),
-        (None, None, torch.float32),
-        (torch.float16, None, torch.float16),
-        (torch.bfloat16, torch.float16, torch.float16),
-        (torch.bfloat16, torch.float32, torch.float32),
+        (torch.float32, torch.float32),
+        (None, torch.float32),
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
     ],
 )
-def test_single_rank_respects_compute_dtype(dtype, override, expected):
-    model = _parallelize(_Model(), dtype=dtype, autocast_dtype=override)
+def test_single_rank_respects_compute_dtype(dtype, expected):
+    model = _parallelize(_Model(), dtype=dtype)
     assert model(torch.randn(2, 4)).dtype == expected
 
 

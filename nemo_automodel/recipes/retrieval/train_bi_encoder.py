@@ -106,14 +106,6 @@ def _configure_sentence_transformer_export(model, collate_fn, *, tokenizer=None)
     configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt, tokenizer=tokenizer)
 
 
-def _get_autocast_ctx(distributed_config):
-    """Return the optional recipe-level autocast context."""
-    autocast_dtype = getattr(distributed_config, "autocast_dtype", None)
-    if autocast_dtype is None or not torch.cuda.is_available():
-        return nullcontext()
-    return torch.autocast(device_type="cuda", dtype=autocast_dtype)
-
-
 def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
     """Return infrastructure kwargs forwarded to model instantiation."""
     kwargs = {
@@ -517,7 +509,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
         query, passage = _unpack_qp(batch)
 
         model = self.model_parts[0]
-        train_ctx = _get_autocast_ctx(self.distributed_config)
         sync_ctx = (
             get_sync_ctx(
                 model,
@@ -528,7 +519,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             else nullcontext()
         )
 
-        with train_ctx, sync_ctx:
+        with sync_ctx:
             if is_train:
                 if query is not None:
                     query["run_dummy_vision"] = False
@@ -604,7 +595,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
                 if attr_model.l2_normalize:
                     scores = scores / self.temperature
-            loss = F.cross_entropy(scores, labels)
+            loss = F.cross_entropy(scores.float(), labels)
 
             loss_buffer.append(loss.clone().detach())
 
@@ -716,7 +707,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     attr_model = _unwrap_model_for_attrs(model)
                     if attr_model.l2_normalize:
                         scores = scores / self.temperature
-                    loss = F.cross_entropy(scores, labels)
+                    loss = F.cross_entropy(scores.float(), labels)
 
                     loss_buffer.append(loss.clone().detach())
                     all_scores.append(scores.detach().cpu())
