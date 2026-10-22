@@ -373,6 +373,22 @@ def test_hybrid_backbone_requires_logical_boundaries_with_physical_thd_padding(f
         )
 
 
+@pytest.mark.parametrize("use_kda", [False, True], ids=["mla", "hybrid"])
+def test_physical_thd_padding_requires_a_padding_mask(fake_flash, use_kda) -> None:
+    if use_kda:
+        _require_fla()
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(use_kda=use_kda), backend=replace(_backend_config(), attn="fa4"))
+    with pytest.raises(ValueError, match="requires an explicit padding_mask"):
+        model(
+            input_ids=torch.tensor([[3, 4, 0, 5, 0, 0]]),
+            qkv_format="thd",
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
+            cu_seqlens=torch.tensor([[0, 2, 3]], dtype=torch.int32),
+            cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
+            packed_token_indices=torch.tensor([0, 1, 3]),
+        )
+
+
 def test_flat_thd_boundaries_reject_a_mismatched_batch_layout(fake_flash) -> None:
     model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=replace(_backend_config(), attn="fa4"))
     with pytest.raises(ValueError, match="document map must match"):

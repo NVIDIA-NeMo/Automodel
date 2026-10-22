@@ -67,11 +67,12 @@ NeMo AutoModel already carry the distinct identity and load without that overrid
 
 For independent documents at CP=1, use document-ID masks with the corresponding
 dataset-provided packed-token metadata, or converted metadata as described below.
-FA4 MLA supports physical THD boundaries through `cu_seqlens_padded` plus a boolean
-`padding_mask`. When physical and logical boundaries differ, hybrid KDA models
-also require logical `cu_seqlens` and flat `packed_token_indices` identifying the
-valid tokens in physical order. KDA gathers those tokens into its unpadded stream;
-omitting the indices raises `ValueError`.
+For converted THD inputs, supply logical `cu_seqlens` and physical
+`cu_seqlens_padded`. When the boundaries differ, FA4 requires an explicit boolean
+`padding_mask` so MLA excludes each document's padding slots. Hybrid KDA models
+with internal padding also require flat `packed_token_indices` selecting valid
+tokens in physical order. KDA gathers those tokens into its unpadded recurrent
+stream; incomplete packing metadata is rejected.
 This physical-boundary handling and validation apply to FA4. Eager does not
 interpret `cu_seqlens_padded`; use document-ID masks and their packing metadata
 when selecting eager instead.

@@ -1120,8 +1120,10 @@ class KimiLinear48BModel(nn.Module):
                 flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
                 or [documents + 1] for THD inputs and gives physical boundaries
                 including per-document padding, rather than logical token counts.
-                Physical boundaries apply to FA4 MLA. Hybrid models with internal
-                padding also require logical ``cu_seqlens`` and flat
+                Physical boundaries apply to FA4 MLA; when they differ from logical
+                boundaries, an explicit boolean ``padding_mask`` is required.
+                Hybrid models require logical ``cu_seqlens`` whenever physical
+                boundaries are supplied. With internal padding, also provide flat
                 ``packed_token_indices`` selecting valid tokens in physical order,
                 so KDA can gather its unpadded recurrent stream.
                 ``max_seqlen`` is an integer document length.
@@ -1155,15 +1157,15 @@ class KimiLinear48BModel(nn.Module):
             attention_mask=packed_seq_ids if packed_seq_ids is not None else attention_mask,
             cu_seqlens=physical_boundaries if physical_boundaries is not None else attn_kwargs.get("cu_seqlens"),
         )
-        if (
-            physical_boundaries is not None
-            and not (packed_context is not None and packed_context.cp_enabled)
-            and any(layer.is_linear_attn for layer in self.layers.values())
-        ):
+        if physical_boundaries is not None and not (packed_context is not None and packed_context.cp_enabled):
             logical_boundaries = attn_kwargs.get("cu_seqlens")
-            if logical_boundaries is None or (
-                not torch.equal(physical_boundaries.reshape(-1), logical_boundaries.reshape(-1))
-                and attn_kwargs.get("packed_token_indices") is None
+            has_internal_padding = logical_boundaries is not None and not torch.equal(
+                physical_boundaries.reshape(-1), logical_boundaries.reshape(-1)
+            )
+            if has_internal_padding and padding_mask is None:
+                raise ValueError("Kimi Linear FA4 physical THD padding requires an explicit padding_mask")
+            if any(layer.is_linear_attn for layer in self.layers.values()) and (
+                logical_boundaries is None or (has_internal_padding and attn_kwargs.get("packed_token_indices") is None)
             ):
                 raise ValueError(
                     "Kimi Linear physical THD padding with KDA requires logical cu_seqlens "
@@ -1354,8 +1356,11 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
                 with row-local boundaries and -1 padding, or [documents + 1] for
                 flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
                 or [documents + 1] and describes physical THD boundaries for FA4 MLA.
-                Hybrid models with internal padding also require logical ``cu_seqlens``
-                and flat ``packed_token_indices`` selecting valid physical positions
+                An explicit boolean ``padding_mask`` is required when physical and
+                logical boundaries differ.
+                Hybrid models require logical ``cu_seqlens`` whenever physical
+                boundaries are supplied. With internal padding, also provide flat
+                ``packed_token_indices`` selecting valid physical positions
                 for KDA's unpadded stream. ``max_seqlen`` is an integer document length.
 
         Returns:
