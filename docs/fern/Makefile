@@ -107,7 +107,8 @@ docs-check docs-mdx-check:
 	uv run --script "$(REPO_ROOT)/tools/check_docs.py"
 
 # Internal target invoked by tools/check_docs.py after the source tests pass.
-_docs-check: docs-model-tables docs-stitch
+# The shared checker generates model tables before invoking this target.
+_docs-check: docs-stitch
 	@set -e; \
 	trap 'python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
 	python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \

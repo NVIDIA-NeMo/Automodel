@@ -23,6 +23,7 @@ Run ``uv run --script tools/check_docs.py`` from the repository root. Keep docs
 validation orchestration here so local checks and CI enforce the same rules.
 """
 
+import argparse
 import json
 import logging
 import os
@@ -35,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 def main() -> int:
     """Check source contracts and rendered docs, returning the failing command's status."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--keep-generated",
+        action="store_true",
+        help="Keep generated model-coverage tables after a successful check for publication.",
+    )
+    args = parser.parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     try:
         # Source contracts must run before generation changes the checked files.
@@ -58,24 +66,28 @@ def main() -> int:
             return tests.returncode
 
         version = json.loads((repo_root / "docs/fern/fern.config.json").read_text(encoding="utf-8"))["version"]
+        generator = "tests/ci_tests/utils/sync_model_coverage_tables.py"
+        status = 1
+        keep_tables = False
         try:
-            docs = subprocess.run(
-                ["npx", "--yes", f"--package=fern-api@{version}", "--", "make", "-C", "docs/fern", "_docs-check"],
-                cwd=repo_root,
-                env={**os.environ, "FERN_NO_VERSION_REDIRECTION": "true"},
-                check=False,
-            )
+            status = subprocess.run([sys.executable, generator], cwd=repo_root, check=False).returncode
+            if status == 0:
+                status = subprocess.run(
+                    ["npx", "--yes", f"--package=fern-api@{version}", "--", "make", "-C", "docs/fern", "_docs-check"],
+                    cwd=repo_root,
+                    env={**os.environ, "FERN_NO_VERSION_REDIRECTION": "true"},
+                    check=False,
+                ).returncode
+            if status == 0:
+                status = subprocess.run(["git", "diff", "--check"], cwd=repo_root, check=False).returncode
+            keep_tables = args.keep_generated and status == 0
         finally:
-            # The Makefile removes generated styles; remove generated tables even
-            # when stitching, MDX parsing, or Fern validation fails.
-            cleanup = subprocess.run(
-                [sys.executable, "tests/ci_tests/utils/sync_model_coverage_tables.py", "--clean"],
-                cwd=repo_root,
-                check=False,
-            )
-        if docs.returncode or cleanup.returncode:
-            return docs.returncode or cleanup.returncode
-        return subprocess.run(["git", "diff", "--check"], cwd=repo_root, check=False).returncode
+            # The Makefile removes generated styles. Retain tables only when
+            # publishing requested them and every check completed successfully.
+            if not keep_tables:
+                cleanup = subprocess.run([sys.executable, generator, "--clean"], cwd=repo_root, check=False)
+                status = status or cleanup.returncode
+        return status
     except OSError as error:
         logger.error("Docs check could not run: %s", error)
         return 1

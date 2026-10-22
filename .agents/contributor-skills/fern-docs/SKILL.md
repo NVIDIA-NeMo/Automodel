@@ -228,6 +228,11 @@ Add validation steps to the script so local checks and CI stay in sync.
 The Makefile's `docs-check` and `docs-mdx-check` targets forward to the script
 for compatibility; `_docs-check` is internal to the script.
 
+Publishing invokes the same script with `--keep-generated` to retain validated
+model-coverage tables for deployment. The script owns table generation; the
+publish workflow must not invoke the generator separately. Failures always
+clean up generated tables.
+
 The shared check must pass before commit. It runs a no-secret MDX parser before `fern check`, so raw HTML must be valid JSX (for example, use `<img ... />`, not `<img ...>`). The dev server's broken-link warnings for version-prefixed routes (e.g. `/latest/get-started/installation` from MDX that uses `/get-started/installation`) are **false positives** — Fern's strict validator doesn't resolve version-agnostic links. The published site renders them correctly. The URLMap-based `validate_fern_internal_links.py` (under the convert-to-fern toolkit) is authoritative.
 
 To regenerate the autodoc library reference (gitignored under `docs/fern/product-docs/`):

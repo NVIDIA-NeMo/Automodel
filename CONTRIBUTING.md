@@ -299,6 +299,9 @@ tables, restores archived pages, and validates MDX and Fern configuration.
 Generated tables and styles are cleaned up after validation, including on
 failure. A nonzero exit status identifies a failed check.
 
+Publishing uses `uv run --script tools/check_docs.py --keep-generated` to retain
+validated model-coverage tables for deployment. Failures still clean them up.
+
 If your contribution involves documentation changes, please refer to the [Fern docs maintenance guide](.agents/contributor-skills/fern-docs/SKILL.md) guide for detailed instructions on building and serving the documentation.
 
 ## Signing Your Work
