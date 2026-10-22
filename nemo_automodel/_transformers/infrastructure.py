@@ -495,7 +495,11 @@ def _prepare_trainability_before_sharding(
 ) -> None:
     """Resolve trainability and prepare parameter-freezing storage before FSDP capture."""
     _apply_trainability_policy(model, peft_enabled=peft_enabled, freeze_config=freeze_config, strict=strict)
-    if freeze_config is not None and freeze_config.has_generic_selectors() and frozen_compute_dtype is not None:
+    if (
+        freeze_config is not None
+        and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters)
+        and frozen_compute_dtype is not None
+    ):
         prepare_frozen_parameters_for_sharding(model, frozen_compute_dtype)
 
 
@@ -954,7 +958,11 @@ def apply_model_infrastructure(
     compute_dtype = getattr(mp_policy, "param_dtype", None)
     # One-rank FSDP2 has no mixed-precision wrappers: retain uniform storage for
     # explicit parameter freezes instead of introducing a plain-tensor dtype seam.
-    if freeze_config is not None and freeze_config.has_generic_selectors() and not fsdp2_active:
+    if (
+        freeze_config is not None
+        and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters)
+        and not fsdp2_active
+    ):
         compute_dtype = None
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:

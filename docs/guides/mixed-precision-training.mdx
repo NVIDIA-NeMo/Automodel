@@ -65,7 +65,7 @@ optimizer after the loader returns. Exact exclusions of TE expert parameters
 with expert parallelism are rejected because repartitioning renumbers local
 expert parameters; freeze their owning module instead.
 
-For sharded FSDP2 with explicit module or parameter selectors, the existing frozen-storage
+For sharded FSDP2 with exact parameter selectors, the existing frozen-storage
 preparation reduces ordinary frozen parameters to the safe compute dtype while
 retaining trainable storage and model-protected FP32 parameters. With
 `dtype=torch.float32` and BF16 compute, trainable weights load directly into FP32
