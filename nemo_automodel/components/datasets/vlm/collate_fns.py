@@ -271,7 +271,7 @@ _IMSTART_TEMPLATE_PROCESSORS = frozenset(
 )
 
 
-def _derive_turn_markers(tokenizer) -> Tuple[List[int], int]:
+def _derive_turn_markers(tokenizer, *, structured_content: bool = False) -> Tuple[List[int], int]:
     """Derive the assistant-turn start marker and end-of-turn token id from the
     tokenizer's own chat template.
 
@@ -281,7 +281,11 @@ def _derive_turn_markers(tokenizer) -> Tuple[List[int], int]:
     the start of the sentinel becomes the **assistant marker**; the first token
     *after* the sentinel becomes the **end-of-turn id**.
 
-    This approach is robust to BPE context-sensitivity and works for any model
+    Dummy messages use the same content format as the real conversations.
+    A leading-space encoding is also tried because BPE can merge the first
+    sentinel character with whitespace from the assistant header.
+
+    This approach works for any model
     whose template wraps assistant turns with fixed token sequences — e.g.
     Gemma4's ``<start_of_turn>model\\n`` … ``<end_of_turn>``.
 
@@ -310,36 +314,38 @@ def _derive_turn_markers(tokenizer) -> Tuple[List[int], int]:
             return list(result)
 
     sentinel = "XSENTINELMARKERX"
+    user_content = [{"type": "text", "text": "u"}] if structured_content else "u"
+    assistant_content = [{"type": "text", "text": sentinel}] if structured_content else sentinel
     all_ids = _extract_ids(
         tokenizer.apply_chat_template(
-            [{"role": "user", "content": "u"}, {"role": "assistant", "content": sentinel}],
+            [{"role": "user", "content": user_content}, {"role": "assistant", "content": assistant_content}],
             tokenize=True,
             add_generation_prompt=False,
         )
     )
     user_ids = _extract_ids(
         tokenizer.apply_chat_template(
-            [{"role": "user", "content": "u"}],
+            [{"role": "user", "content": user_content}],
             tokenize=True,
             add_generation_prompt=False,
         )
     )
-    sentinel_ids = tokenizer.encode(sentinel, add_special_tokens=False)
+    for text in (sentinel, " " + sentinel):
+        sentinel_ids = tokenizer.encode(text, add_special_tokens=False)
+        for i in range(len(user_ids), len(all_ids) - len(sentinel_ids) + 1):
+            if all_ids[i : i + len(sentinel_ids)] == sentinel_ids:
+                end_idx = i + len(sentinel_ids)
+                if end_idx >= len(all_ids):
+                    raise ValueError(f"No token found after sentinel in template output {all_ids}.")
+                end_of_turn_id: int = all_ids[end_idx]
+                assistant_marker: List[int] = all_ids[len(user_ids) : i]
+                if not assistant_marker:
+                    raise ValueError(
+                        f"Assistant marker is empty (user_len={len(user_ids)}, sentinel_pos={i}). Full sequence: {all_ids}"
+                    )
+                return assistant_marker, end_of_turn_id
 
-    for i in range(len(all_ids) - len(sentinel_ids) + 1):
-        if all_ids[i : i + len(sentinel_ids)] == sentinel_ids:
-            end_idx = i + len(sentinel_ids)
-            if end_idx >= len(all_ids):
-                raise ValueError(f"No token found after sentinel in template output {all_ids}.")
-            end_of_turn_id: int = all_ids[end_idx]
-            assistant_marker: List[int] = all_ids[len(user_ids) : i]
-            if not assistant_marker:
-                raise ValueError(
-                    f"Assistant marker is empty (user_len={len(user_ids)}, sentinel_pos={i}). Full sequence: {all_ids}"
-                )
-            return assistant_marker, end_of_turn_id
-
-    raise ValueError(f"Sentinel '{sentinel}' (ids={sentinel_ids}) not found in template output {all_ids}.")
+    raise ValueError(f"Sentinel '{sentinel}' not found in template output {all_ids}.")
 
 
 def _build_labels_from_markers(
@@ -427,6 +433,15 @@ def build_labels_from_template(
     :func:`build_labels` (BPE pattern-matching), which logs a warning because
     it is sensitive to tokenisation context and may produce ``num_label_tokens=0``
     / nan loss on some samples.
+
+    Args:
+        input_ids_batch: Tensor of shape [batch, sequence], with processor-expanded
+            media tokens and any padding.
+        conversations: Chat messages for each sequence.
+        processor: Processor that rendered the conversations.
+
+    Returns:
+        Labels of shape [batch, sequence], with prompt tokens set to -100.
     """
     processor_type = type(processor).__name__
     tokenizer = getattr(processor, "tokenizer", processor)
@@ -463,7 +478,10 @@ def build_labels_from_template(
     # ------------------------------------------------------------------
     if hasattr(tokenizer, "apply_chat_template"):
         try:
-            assistant_marker, stop_id = _derive_turn_markers(tokenizer)
+            structured_content = any(
+                isinstance(message["content"], list) for conversation in conversations for message in conversation
+            )
+            assistant_marker, stop_id = _derive_turn_markers(tokenizer, structured_content=structured_content)
             return _build_labels_from_markers(input_ids_batch, assistant_marker, stop_id)
         except Exception as exc:
             logger.warning(
