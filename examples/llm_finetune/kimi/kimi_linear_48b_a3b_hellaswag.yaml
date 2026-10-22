@@ -53,6 +53,7 @@ model:
   trust_remote_code: true
   torch_dtype: bfloat16
   load_base_model: true
+  output_hidden_states: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: eager
@@ -84,7 +85,8 @@ distributed:
     wrap_outer_model: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
