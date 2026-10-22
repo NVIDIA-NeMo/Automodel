@@ -29,21 +29,26 @@ from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 from nemo_automodel.components.models.nemotron_v3.parallelization import PARALLELIZER
-from nemo_automodel.components.utils.parameter_config import ParameterConfig, apply_parameter_config
+from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, apply_parameter_freezing
 from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_model import MockNemotronV3Config
 
 # Mamba's fused kernels read these weights directly, bypassing child FSDP unshard hooks.
 _FUSED_KERNEL_MODULES = ("conv1d", "norm", "out_proj")
 
 
-def _shard_mamba_block(mesh, selected_prefix: str, frozen_dtype: torch.dtype | None) -> nn.Module:
+def _shard_mamba_block(mesh, freeze_mixer: bool) -> nn.Module:
     backend = BackendConfig(
         linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
     )
-    model = NemotronHForCausalLM(MockNemotronV3Config(layers_block_type=["mamba", "attention"]), backend=backend)
-    model.initialize_weights()
-    selected = tuple(name for name, _ in model.named_parameters() if name.startswith(selected_prefix))
-    apply_parameter_config(model, ParameterConfig(selected, torch.float32, frozen_dtype))
+    model = NemotronHForCausalLM(
+        MockNemotronV3Config(torch_dtype="float32", layers_block_type=["mamba", "attention"]), backend=backend
+    )
+    model.initialize_weights(dtype=torch.float32)
+    apply_parameter_freezing(
+        model, FreezeConfig(freeze_modules=[ModuleSelector(path="model.layers.0.mixer")] if freeze_mixer else [])
+    )
+    prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
     PARALLELIZER._apply(
         model,
         device_mesh=mesh,
@@ -56,12 +61,12 @@ def _worker(rank: int, rendezvous: str) -> None:
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
     try:
         mesh = init_device_mesh("cpu", (1, 2, 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"))
-        block = _shard_mamba_block(mesh, "model.layers.0.", torch.bfloat16)
+        block = _shard_mamba_block(mesh, False)
         assert isinstance(block, FSDPModule)
         assert not any(isinstance(getattr(block.mixer, name), FSDPModule) for name in _FUSED_KERNEL_MODULES)
         assert all(getattr(block.mixer, name).weight.dtype == torch.float32 for name in _FUSED_KERNEL_MODULES)
 
-        block = _shard_mamba_block(mesh, "model.layers.0.norm.", None)
+        block = _shard_mamba_block(mesh, True)
         assert isinstance(block, FSDPModule)
         assert not any(isinstance(getattr(block.mixer, name), FSDPModule) for name in _FUSED_KERNEL_MODULES)
         assert block.norm.weight.dtype == torch.float32
@@ -77,13 +82,18 @@ def test_mamba_fp32_selection_keeps_fused_kernel_weights_in_block_unit(tmp_path:
 
 # checkpoint format -> (layer types, selected parameter, use the HF state-dict adapter)
 _FACTORY_CASES = {
-    "safetensors": (["attention", "mlp"], "model.layers.0.norm.weight", False),
-    "bin": (["mamba", "moe"], "model.layers.1.mixer.experts.gate_and_up_projs", True),
+    "safetensors": (["attention", "mlp"], "model.layers.0.norm.weight", False, "model.layers.1.norm.weight"),
+    "bin": (
+        ["mamba", "moe"],
+        "model.layers.1.mixer.experts.gate_and_up_projs",
+        True,
+        "model.layers.1.mixer.experts.down_projs",
+    ),
 }
 
 
 def _factory_config(checkpoint_dir: str, checkpoint_format: str) -> tuple[PretrainedConfig, BackendConfig]:
-    layers, _, use_adapter = _FACTORY_CASES[checkpoint_format]
+    layers, _, use_adapter, _ = _FACTORY_CASES[checkpoint_format]
     config = PretrainedConfig(**MockNemotronV3Config(layers_block_type=layers).to_dict())
     config.architectures = ["NemotronHForCausalLM"]
     config.name_or_path = checkpoint_dir
@@ -101,10 +111,11 @@ def _factory_worker(rank: int, rendezvous: str, checkpoint_dir: str, checkpoint_
     try:
         config, backend = _factory_config(checkpoint_dir, checkpoint_format)
         selected = _FACTORY_CASES[checkpoint_format][1]
+        frozen = _FACTORY_CASES[checkpoint_format][3]
         model = NeMoAutoModelForCausalLM.from_config(
             config,
             backend=backend,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.float32,
             use_liger_kernel=False,
             use_sdpa_patching=False,
             attn_implementation="sdpa",
@@ -112,13 +123,16 @@ def _factory_worker(rank: int, rendezvous: str, checkpoint_dir: str, checkpoint_
             distributed_setup=DistributedSetup.build(
                 FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32))
             ),
-            parameter_config=ParameterConfig((selected,), torch.float32, torch.bfloat16),
+            freeze_config=FreezeConfig(freeze_parameters=(frozen,)),
         )
         parameters = dict(model.named_parameters())
         assert parameters[selected].dtype == torch.float32
         assert parameters[selected].requires_grad
         torch.testing.assert_close(parameters[selected].full_tensor().cpu(), expected, rtol=0, atol=0)
-        assert all(p.dtype == torch.bfloat16 and not p.requires_grad for n, p in parameters.items() if n != selected)
+        assert not parameters[frozen].requires_grad
+        assert parameters[frozen].dtype == torch.bfloat16
+        assert all(p.requires_grad for n, p in parameters.items() if n != frozen)
+        assert parameters["model.embed_tokens.weight"].dtype == torch.float32
     finally:
         dist.destroy_process_group()
 

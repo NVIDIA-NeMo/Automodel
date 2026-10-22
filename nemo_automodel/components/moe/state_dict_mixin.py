@@ -990,10 +990,14 @@ class MoESplitExpertsStateDictMixin:
             raise ValueError("At least one expert projection tensor is required")
 
         first_expert = expert_parts[0]
+        source_dtype = first_expert[0].dtype
+        for parts in expert_parts:
+            for part in parts:
+                source_dtype = torch.promote_types(source_dtype, part.dtype)
         leading_shape = first_expert[0].shape[:-1]
         grouped = torch.empty(
             (len(expert_parts), *leading_shape, sum(part.shape[-1] for part in first_expert)),
-            dtype=first_expert[0].dtype,
+            dtype=source_dtype,
             device=first_expert[0].device,
         )
         if len(first_expert) == 1:

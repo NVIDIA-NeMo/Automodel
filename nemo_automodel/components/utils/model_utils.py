@@ -391,6 +391,11 @@ class FreezeConfig:
     defaults to ``True`` only for legacy-only configurations; a configuration
     that declares ``freeze_modules`` or ``unfreeze_modules`` uses
     explicit-selector semantics and does not implicitly freeze vision modules.
+
+    ``freeze_parameters`` freezes exact canonical parameter names after module
+    selectors, including module unfreezes. Unlisted parameters retain their
+    existing trainability. Shared parameters can be frozen through any alias.
+    This option changes trainability only; model ``dtype`` owns trainable storage.
     """
 
     freeze_modules: list[ModuleSelector] | None = None
@@ -399,9 +404,12 @@ class FreezeConfig:
     freeze_audio_tower: bool = False
     freeze_language_model: bool = False
     freeze_video_embedder: bool = False
+    freeze_parameters: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate selectors and legacy compatibility options."""
+        if self.freeze_parameters is not None:
+            _validate_frozen_parameter_names(self)
         for field_name in ("freeze_modules", "unfreeze_modules"):
             selectors = getattr(self, field_name)
             if selectors is None:
@@ -423,10 +431,22 @@ class FreezeConfig:
 
     def has_generic_selectors(self) -> bool:
         """Return whether either generic selector field was explicitly declared."""
-        return self.freeze_modules is not None or self.unfreeze_modules is not None
+        return (
+            self.freeze_parameters is not None or self.freeze_modules is not None or self.unfreeze_modules is not None
+        )
+
+
+def _validate_frozen_parameter_names(config: FreezeConfig) -> None:
+    """Validate exact parameter exclusions without mutating the model."""
+    names = config.freeze_parameters
+    if not isinstance(names, tuple) or any(not isinstance(name, str) or not name for name in names):
+        raise ValueError("freeze_config.freeze_parameters must be a tuple of non-empty parameter names")
+    if len(set(names)) != len(names):
+        raise ValueError("freeze_config.freeze_parameters must be unique")
 
 
 _FREEZE_CONFIG_OPTIONS = {
+    "freeze_parameters",
     "freeze_modules",
     "unfreeze_modules",
     "freeze_vision_tower",
@@ -514,7 +534,11 @@ def parse_freeze_config(config: FreezeConfig | Mapping[str, Any] | None) -> Free
             raise ValueError(f"freeze_config.{option} must be a boolean; got {value!r}.")
         legacy_booleans[option] = value
 
+    freeze_parameters = config.get("freeze_parameters")
+    if "freeze_parameters" in config and not isinstance(freeze_parameters, (list, tuple)):
+        raise ValueError("freeze_config.freeze_parameters must be a list or tuple of parameter names")
     return FreezeConfig(
+        freeze_parameters=tuple(freeze_parameters) if freeze_parameters is not None else None,
         freeze_modules=_selectors("freeze_modules"),
         unfreeze_modules=_selectors("unfreeze_modules"),
         **legacy_booleans,
@@ -600,6 +624,29 @@ def _apply_module_selectors(
             )
 
 
+def _resolve_frozen_parameters(model: nn.Module, names: tuple[str, ...], *, strict: bool) -> list[nn.Parameter]:
+    """Resolve exact canonical exclusions before changing trainability.
+
+    Args:
+        model: Model whose registered parameters may have arbitrary shapes.
+        names: Canonical parameter names, including tied aliases.
+        strict: Whether names missing from this model or pipeline stage are errors.
+
+    Returns:
+        Original Parameter objects of arbitrary shapes; storage and aliases are retained.
+    """
+    if not names:
+        return []
+    parameters = {
+        canonical_parameter_fqn(name).replace("_orig_mod.", ""): parameter
+        for name, parameter in model.named_parameters(remove_duplicate=False)
+    }
+    missing = set(names) - parameters.keys()
+    if strict and missing:
+        raise ValueError(f"Unknown frozen parameters: {sorted(missing)}")
+    return [parameters[name] for name in names if name in parameters]
+
+
 def apply_parameter_freezing(
     model: nn.Module,
     freeze_config: FreezeConfig | Mapping[str, Any],
@@ -612,6 +659,8 @@ def apply_parameter_freezing(
     then ``unfreeze_modules`` unfreezes and wins on overlap. Framework-required
     freezes (dead K/V projections, indexer parameters) are applied separately
     by the infrastructure after this function, before and after sharding.
+    Exact ``freeze_parameters`` exclusions are applied last and do not change
+    the trainability of unlisted parameters, storage dtype, or parameter identity.
 
     Args:
         model: The model to apply freezing to.
@@ -632,6 +681,7 @@ def apply_parameter_freezing(
     if parsed_freeze_config is None:
         return
     freeze_config = parsed_freeze_config
+    frozen_parameters = _resolve_frozen_parameters(model, freeze_config.freeze_parameters or (), strict=strict)
 
     # Preserve the legacy attribute and substring matching independently of the
     # fnmatch semantics used by the generic selectors.
@@ -662,6 +712,9 @@ def apply_parameter_freezing(
     _apply_module_selectors(
         model, freeze_config.unfreeze_modules or [], requires_grad=True, strict=strict, field_name="unfreeze_modules"
     )
+
+    for parameter in frozen_parameters:
+        parameter.requires_grad_(False)
 
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
     # and disable KV cache (remote code uses legacy DynamicCache.key_cache

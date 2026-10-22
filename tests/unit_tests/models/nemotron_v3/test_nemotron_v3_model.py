@@ -1460,7 +1460,7 @@ def test_response_only_hidden_states_match_dense_logits_and_keep_mtp():
     assert all(parameter.grad is None for parameter in model.mtp.parameters())
 
 
-def test_native_mixed_precision_survives_materialization_without_surface(tmp_path):
+def test_parameter_freezing_survives_materialization_with_intrinsic_fp32(tmp_path):
     from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
     from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
@@ -1468,10 +1468,17 @@ def test_native_mixed_precision_survives_materialization_without_surface(tmp_pat
         linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
     )
     with torch.device("meta"):
-        model = NemotronHForCausalLM(MockNemotronV3Config(layers_block_type=["mamba", "moe"]), backend=backend)
-    before = {name: p.dtype for name, p in model.named_parameters()}
+        model = NemotronHForCausalLM(
+            MockNemotronV3Config(torch_dtype="float32", layers_block_type=["mamba", "moe"]), backend=backend
+        )
     before_buffers = {name: b.dtype for name, b in model.named_buffers()}
-    Checkpointer.initialize_model_weights(model, torch.device("cpu"), preserve_parameter_dtypes=True)
+    from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+    from nemo_automodel.components.utils.model_utils import FreezeConfig, apply_parameter_freezing
+
+    apply_parameter_freezing(model, FreezeConfig(freeze_parameters=("model.layers.0.mixer.in_proj.weight",)))
+    prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+    before = {name: p.dtype for name, p in model.named_parameters()}
+    Checkpointer.initialize_model_weights(model, torch.device("cpu"))
     assert {name: p.dtype for name, p in model.named_parameters()} == before
     assert all(not p.is_meta for p in model.parameters())
     assert dict(model.named_parameters())["model.layers.0.mixer._fp32_params.A_log"].dtype == torch.float32
@@ -1492,27 +1499,32 @@ def test_native_mixed_precision_survives_materialization_without_surface(tmp_pat
 
 
 @skip_if_no_gpu
-def test_factory_rejects_parameter_config_without_fsdp2_sharding(tmp_path):
-    """One-rank runs skip the FSDP2 mixed-precision casts that mixed storage needs."""
+def test_factory_freezes_only_explicit_parameters_on_one_rank(tmp_path):
+    """Unlisted parameters retain FP32 storage and trainability when FSDP is skipped."""
     from transformers import PretrainedConfig
 
     from nemo_automodel import NeMoAutoModelForCausalLM
-    from nemo_automodel.components.utils.parameter_config import ParameterConfig
+    from nemo_automodel.components.utils.model_utils import FreezeConfig
 
     config = PretrainedConfig(**MockNemotronV3Config().to_dict())
     config.architectures = ["NemotronHForCausalLM"]
-    config.name_or_path = str(tmp_path)
-    with pytest.raises(ValueError, match="requires FSDP2 sharding"):
-        NeMoAutoModelForCausalLM.from_config(
-            config,
-            backend=BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch"),
-            torch_dtype=torch.bfloat16,
-            use_liger_kernel=False,
-            use_sdpa_patching=False,
-            attn_implementation="sdpa",
-            load_base_model=True,
-            parameter_config=ParameterConfig(("model.layers.0.norm.weight",), torch.float32, torch.bfloat16),
-        )
+    model = NeMoAutoModelForCausalLM.from_config(
+        config,
+        backend=BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch"),
+        dtype=torch.float32,
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+        attn_implementation="sdpa",
+        freeze_config=FreezeConfig(freeze_parameters=("model.layers.0.norm.weight",)),
+    )
+    assert {name for name, p in model.named_parameters() if not p.requires_grad} == {"model.layers.0.norm.weight"}
+    assert all(p.dtype == torch.float32 for p in model.parameters())
+    ids = torch.tensor([[1, 2, 3]], device="cuda")
+    output = model(ids)
+    assert torch.isfinite(output.logits).all()
+    output.logits.square().mean().backward()
+    assert model.model.layers["0"].norm.weight.grad is None
+    assert model.model.layers["1"].norm.weight.grad is not None
 
 
 @skip_if_no_gpu
@@ -1533,7 +1545,7 @@ def test_factory_preserves_intrinsic_fp32_without_a_trainable_surface(tmp_path):
 
     with local_torch_dtype(torch.bfloat16, "NemotronHForCausalLM"):
         seed = NemotronHForCausalLM(config, backend=backend)
-    seed.initialize_weights(dtype=None)
+    seed.initialize_weights(dtype=torch.bfloat16)
     weights = {name: value.detach().clone() for name, value in seed.state_dict().items()}
     intrinsic = "model.layers.0.mixer._fp32_params.A_log"
     assert weights[intrinsic].dtype == torch.float32
@@ -1552,7 +1564,6 @@ def test_factory_preserves_intrinsic_fp32_without_a_trainable_surface(tmp_path):
         use_sdpa_patching=False,
         attn_implementation="sdpa",
         load_base_model=True,
-        preserve_parameter_dtypes=True,
     )
     parameters = dict(model.named_parameters())
     assert parameters[intrinsic].dtype == torch.float32

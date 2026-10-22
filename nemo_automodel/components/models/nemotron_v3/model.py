@@ -1212,7 +1212,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,
-        dtype: torch.dtype | None = torch.bfloat16,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         """Initialize model weights.
 
@@ -1222,8 +1222,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         Args:
             buffer_device: Device to use for buffer initialization
-            dtype: Target dtype for model weights, or None to preserve each
-                parameter's existing storage dtype during initialization.
+            dtype: Target dtype for model weights; prepared per-parameter storage is preserved.
         """
         buffer_device = buffer_device or next(self.parameters()).device
         with buffer_device:
@@ -1234,8 +1233,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 for sublayer in self.mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
 
-        if dtype is not None:
-            cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 
 NemotronHForCausalLM.parallelizer = PARALLELIZER

@@ -29,7 +29,8 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
-from nemo_automodel.components.utils.parameter_config import ParameterConfig, apply_parameter_config
+from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+from nemo_automodel.components.utils.model_utils import FreezeConfig, apply_parameter_freezing
 
 
 def _worker(rank: int, rendezvous: str, checkpoint_dir: str, source: dict[str, torch.Tensor]) -> None:
@@ -43,8 +44,9 @@ def _worker(rank: int, rendezvous: str, checkpoint_dir: str, source: dict[str, t
             nn.Tanh(),
             nn.Linear(4, 4, bias=False),
             nn.Linear(4, 2, bias=False),
-        ).to(device=device, dtype=torch.bfloat16)
-        apply_parameter_config(model, ParameterConfig(("2.weight",), torch.float32, torch.bfloat16))
+        ).to(device=device, dtype=torch.float32)
+        apply_parameter_freezing(model, FreezeConfig(freeze_parameters=("0.weight", "3.weight")))
+        prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.zero_()
@@ -117,7 +119,7 @@ def _worker(rank: int, rendezvous: str, checkpoint_dir: str, source: dict[str, t
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA devices for actual mixed-storage FSDP")
-def test_parameter_config_survives_fsdp_checkpoint_load_and_optimizer_step(tmp_path: Path) -> None:
+def test_parameter_freezes_survive_fsdp_checkpoint_load_and_optimizer_step(tmp_path: Path) -> None:
     """FP32 selected values load exactly, update as expected, and leave frozen BF16 values unchanged."""
     source = {
         "0.weight": torch.arange(1, 17, dtype=torch.bfloat16).reshape(4, 4) / 32,

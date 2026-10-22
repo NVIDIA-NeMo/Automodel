@@ -562,6 +562,27 @@ class TestToHfWSplitExperts:
 
 
 class TestFromHfWMergedExperts:
+    @pytest.mark.parametrize("gated", [False, True])
+    def test_merge_preserves_mixed_source_expert_precision(self, gated):
+        mixin = MockMoEStateDictMixin(
+            n_experts=2, inter_dim=2, dtype=torch.bfloat16, expert_activation="swiglu" if gated else "relu2"
+        )
+        source = {}
+        expected = torch.full((2, 3), 0.1234567, dtype=torch.float32)
+        for expert in range(2):
+            prefix = f"model.layers.0.mlp.experts.{expert}"
+            if gated:
+                source[f"{prefix}.gate_proj.weight"] = torch.ones((2, 3), dtype=torch.bfloat16)
+                source[f"{prefix}.up_proj.weight"] = expected.clone()
+            else:
+                source[f"{prefix}.up_proj.weight"] = expected.to(torch.bfloat16) if expert == 0 else expected.clone()
+        with patch.object(mixin, "_validate_expert_availability"):
+            converted = mixin._from_hf_w_merged_experts(source)
+        grouped = converted["model.layers.0.mlp.experts.gate_and_up_projs"]
+        assert grouped.dtype == torch.float32
+        actual = grouped[1, :, 2:] if gated else grouped[1]
+        torch.testing.assert_close(actual, expected.T, rtol=0, atol=0)
+
     def test_direct_fill_gated_experts_preserves_values_dtype_and_layout(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=2, dtype=torch.bfloat16)
         hf_state_dict = {}
