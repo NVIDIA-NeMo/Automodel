@@ -22,6 +22,8 @@ bounds; BF16 has a wider budget than FP16 because its mantissa is shorter.
 
 import pytest
 import torch
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
@@ -33,7 +35,7 @@ from nemo_automodel.components.models.kimi_linear.flash_attention import (
     build_flash_layout,
     packed_flash_attention,
 )
-from nemo_automodel.components.models.kimi_linear.model import KimiMLAAttention
+from nemo_automodel.components.models.kimi_linear.model import KimiLinear48BForCausalLM, KimiMLAAttention
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -59,7 +61,6 @@ def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, tolerance: floa
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("qk_dim,value_dim", [(192, 128), (48, 64)])
 def test_real_kernel_matches_dense_outputs_and_qkv_backward(dtype, qk_dim, value_dim) -> None:
-    pytest.importorskip("flash_attn.cute", reason="requires the optional FlashAttention-4 CUDA kernel")
     torch.manual_seed(74)
     ids = torch.tensor(
         [
@@ -87,7 +88,6 @@ def test_real_kernel_matches_dense_outputs_and_qkv_backward(dtype, qk_dim, value
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mla_projection_parameter_and_input_gradients(dtype) -> None:
-    pytest.importorskip("flash_attn.cute", reason="requires the optional FlashAttention-4 CUDA kernel")
     torch.manual_seed(19)
     config = KimiLinear48BConfig(
         hidden_size=64,
@@ -128,3 +128,52 @@ def test_mla_projection_parameter_and_input_gradients(dtype) -> None:
         assert name == other
         assert a.grad is not None and b.grad is not None, name
         _assert_parity(a.grad, b.grad, tolerance)
+
+
+def test_checkpointed_backbone_logits_and_parameter_gradients() -> None:
+    """Compare a real BF16 FA4 backbone under non-reentrant checkpoint recomputation."""
+    torch.manual_seed(41)
+    config = KimiLinear48BConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        kv_lora_rank=32,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        mla_use_nope=True,
+        num_experts=4,
+        num_experts_per_token=2,
+        num_shared_experts=0,
+        moe_intermediate_size=32,
+        first_k_dense_replace=1,
+        linear_attn_config={"kda_layers": [], "full_attn_layers": [1]},
+        torch_dtype=torch.bfloat16,
+    )
+    eager_backend = BackendConfig(
+        attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch"
+    )
+    fast_backend = BackendConfig(attn="fa4", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    eager = KimiLinear48BForCausalLM(config, backend=eager_backend).cuda()
+    eager.initialize_weights(buffer_device=torch.device("cuda"), dtype=torch.bfloat16)
+    fast = KimiLinear48BForCausalLM(config, backend=fast_backend).cuda()
+    fast.load_state_dict(eager.state_dict(), strict=True)
+    for model in (eager, fast):
+        for name, layer in list(model.model.layers.items()):
+            model.model.layers[name] = ptd_checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+    ids = torch.tensor([[1, 1, 0, 2, 2], [0, 1, 1, 0, 0]], device="cuda", dtype=torch.int32)
+    tokens = torch.tensor([[3, 4, 0, 5, 6], [0, 7, 8, 0, 0]], device="cuda")
+    expected = eager(input_ids=tokens, attention_mask=ids, padding_mask=ids == 0).logits
+    actual = fast(input_ids=tokens, attention_mask=ids, padding_mask=ids == 0).logits
+    valid = ids > 0
+    _assert_parity(actual[valid], expected[valid], 0.015)
+    grad = torch.randn_like(actual) * valid[..., None]
+    expected.backward(grad)
+    actual.backward(grad)
+    for (name, parameter), (other, reference) in zip(fast.named_parameters(), eager.named_parameters()):
+        assert name == other
+        assert parameter.grad is not None and reference.grad is not None, name
+        _assert_parity(parameter.grad, reference.grad, 0.015)
