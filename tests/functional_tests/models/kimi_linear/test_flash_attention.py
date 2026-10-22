@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real CUDA-kernel output and backward parity for packed Kimi MLA."""
+"""Real CUDA-kernel output and backward parity for packed Kimi MLA.
+
+These tests constrain replacement of dtype-matched eager attention, rather than
+claiming FP32 accuracy. The CPU dense oracle separately checks layout arithmetic
+in FP32. Both relative L2 and normalized maximum error must satisfy the fixed
+bounds; BF16 has a wider budget than FP16 because its mantissa is shorter.
+"""
 
 import pytest
 import torch

@@ -353,11 +353,12 @@ class KimiMLAAttention(nn.Module):
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden]; the sequence axis
                 holds this rank's contiguous shard under context parallelism.
-            attention_mask: Optional additive attention mask of shape [batch, 1, sequence, sequence].
+            attention_mask: Optional additive tensor of shape [batch, 1, sequence, sequence]
+                for eager attention. Must be None for FA4, which consumes flash_layout.
             packed_context: Optional document layout of the batch, required under
                 context parallelism.
-            flash_layout: Optional document-major metadata prepared outside
-                checkpointed layers; tensor layouts are documented by MLAFlashLayout.
+            flash_layout: Document-major metadata required by non-CP FA4 and prepared
+                outside checkpointed layers; tensor layouts are documented by MLAFlashLayout.
             **kwargs: Extra attention options accepted for HF compatibility.
 
         Returns:
@@ -391,12 +392,9 @@ class KimiMLAAttention(nn.Module):
             if attention_mask is not None:
                 raise ValueError("backend.attn='fa4' consumes document metadata, not an additive attention_mask")
             if flash_layout is None:
-                doc_ids = (
-                    packed_context.doc_ids
-                    if packed_context is not None
-                    else torch.ones((batch_size, seq_length), dtype=torch.int32, device=hidden_states.device)
+                raise ValueError(
+                    "backend.attn='fa4' requires flash_layout prepared by the backbone or build_flash_layout"
                 )
-                flash_layout = build_flash_layout(doc_ids)
             attn_output = packed_flash_attention(
                 query_states,
                 key_states,
@@ -866,7 +864,8 @@ class KimiDecoderLayer(nn.Module):
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden].
             attention_mask: KDA layers receive a binary mask [batch, sequence]; MLA layers receive an additive
-                causal mask [batch, 1, sequence, sequence].
+                causal mask [batch, 1, sequence, sequence], or None with a prepared
+                flash_layout for FA4.
             padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
             **attn_kwargs: Extra attention kwargs forwarded to KDA/MLA.
 
@@ -1106,7 +1105,8 @@ class KimiLinear48BModel(nn.Module):
             inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
             attention_mask: Optional binary or indexed packing mask of shape [batch, sequence].
             position_ids: Optional positions of shape [batch, sequence]; accepted for HF compatibility.
-            padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
+            padding_mask: Optional boolean tensor of shape [batch, sequence], where true
+                excludes tokens from MoE routing. FA4 also excludes them as MLA queries and keys.
             cache_position: Optional position vector of shape [sequence].
             kimi_packed_context: Optional document layout attached by
                 :func:`~nemo_automodel.components.models.kimi_linear.cp.shard_batch_for_kimi_cp`;
@@ -1120,6 +1120,8 @@ class KimiLinear48BModel(nn.Module):
                 flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
                 or [documents + 1] for THD inputs and gives physical boundaries
                 including per-document padding, rather than logical token counts.
+                These physical boundaries apply only to FA4 MLA; recurrent KDA
+                still requires its unpadded stream to agree with ``cu_seqlens``.
                 ``max_seqlen`` is an integer document length.
 
         Returns:
@@ -1316,10 +1318,11 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
 
         Args:
             input_ids: Optional token ids of shape [batch, sequence].
-            attention_mask: Optional binary padding mask of shape [batch, sequence].
+            attention_mask: Optional binary or indexed document mask of shape [batch, sequence].
             position_ids: Optional positions of shape [batch, sequence].
             inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
-            padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
+            padding_mask: Optional boolean tensor of shape [batch, sequence], where true
+                excludes tokens from MoE routing. FA4 also excludes them as MLA queries and keys.
             logits_to_keep: Number of trailing sequence logits to compute, or tensor indices.
             output_hidden_states: Whether to include hidden states in the output.
             **attn_kwargs: Packed or THD metadata: ``_packed_seq_ids`` has shape
@@ -1328,7 +1331,10 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
                 positions and -1 padding, or [tokens] indexing flattened batch
                 and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
                 with row-local boundaries and -1 padding, or [documents + 1] for
-                flattened/THD inputs. ``max_seqlen`` is an integer document length.
+                flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
+                or [documents + 1] and describes physical THD boundaries for FA4 MLA
+                only; recurrent KDA still requires an unpadded stream matching
+                ``cu_seqlens``. ``max_seqlen`` is an integer document length.
 
         Returns:
             Causal LM output whose logits have shape [batch, sequence, vocab] unless ``logits_to_keep`` trims sequence.

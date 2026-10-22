@@ -189,31 +189,11 @@ def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash,
             torch.testing.assert_close(right.grad, left.grad, atol=1e-6, rtol=1e-4, msg=name)
 
 
-def test_layer_fallback_builds_layout_and_preserves_outputs_and_gradients(fake_flash) -> None:
-    torch.manual_seed(18)
+def test_layer_requires_a_prepared_flash_layout() -> None:
     config = _tiny_kimi_config()
-    eager = KimiMLAAttention(config, 0)
-    fast = KimiMLAAttention(config, 0, backend=replace(_backend_config(), attn="fa4"))
-    fast.load_state_dict(eager.state_dict(), strict=True)
-    ids = torch.tensor([[1, 1, 2, 0]], dtype=torch.int32)
-    context = KimiPackedContext(ids)
-    x = torch.randn(1, 4, config.hidden_size, requires_grad=True)
-    y = x.detach().clone().requires_grad_()
-    mask = build_document_causal_mask(ids, ids, q_global_start=0, dtype=x.dtype)
-
-    expected = eager(x, attention_mask=mask, packed_context=context)
-    actual = fast(y, packed_context=context)
-
-    valid = ids > 0
-    torch.testing.assert_close(actual[valid], expected[valid], atol=1e-6, rtol=1e-5)
-    assert torch.count_nonzero(actual[~valid]) == 0
-    upstream = torch.randn_like(actual) * valid[..., None]
-    expected.backward(upstream)
-    actual.backward(upstream)
-    torch.testing.assert_close(y.grad, x.grad, atol=1e-6, rtol=1e-5)
-    for (name, left), (other, right) in zip(fast.named_parameters(), eager.named_parameters()):
-        assert name == other
-        torch.testing.assert_close(left.grad, right.grad, atol=1e-6, rtol=1e-5, msg=name)
+    layer = KimiMLAAttention(config, 0, backend=replace(_backend_config(), attn="fa4"))
+    with pytest.raises(ValueError, match="requires flash_layout"):
+        layer(torch.randn(1, 4, config.hidden_size))
 
 
 def test_cp_keeps_its_existing_attention_path(fake_flash, monkeypatch) -> None:
