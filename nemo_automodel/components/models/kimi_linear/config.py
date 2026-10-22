@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from transformers.configuration_utils import PretrainedConfig
 
@@ -83,6 +83,7 @@ class KimiLinear48BConfig(PretrainedConfig):
         kda_unpad_inputs: bool = True,
         kda_use_fused_gate: bool = True,
         kda_use_qk_l2norm_in_kernel: bool = True,
+        mla_attn_implementation: Literal["eager", "flash_attention_2"] = "eager",
         **kwargs: Any,
     ) -> None:
         self.vocab_size = vocab_size
@@ -127,6 +128,9 @@ class KimiLinear48BConfig(PretrainedConfig):
         self.kda_unpad_inputs = kda_unpad_inputs
         self.kda_use_fused_gate = kda_use_fused_gate
         self.kda_use_qk_l2norm_in_kernel = kda_use_qk_l2norm_in_kernel
+        if mla_attn_implementation not in ("eager", "flash_attention_2"):
+            raise ValueError("mla_attn_implementation must be 'eager' or 'flash_attention_2'.")
+        self.mla_attn_implementation = mla_attn_implementation
 
         if linear_attn_config is not None:
             if linear_attn_config.get("kda_layers") is None or linear_attn_config.get("full_attn_layers") is None:

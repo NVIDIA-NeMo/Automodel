@@ -46,6 +46,7 @@ model:
     _target_: nemo_automodel.components.models.kimi_linear.config.KimiLinear48BConfig.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
     name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
+    mla_attn_implementation: flash_attention_2
     kda_mode: chunk
     kda_unpad_inputs: false
     kda_use_fused_gate: true

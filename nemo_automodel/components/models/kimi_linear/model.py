@@ -54,6 +54,11 @@ from nemo_automodel.components.models.kimi_linear.cp import (
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
 )
+from nemo_automodel.components.models.kimi_linear.flash_attention import (
+    MLAFlashLayout,
+    build_flash_layout,
+    packed_flash_attention,
+)
 from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinear48BStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts
@@ -331,6 +336,8 @@ class KimiMLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         packed_context: "KimiPackedContext | None" = None,
+        *,
+        flash_layout: MLAFlashLayout | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Run MLA full attention.
@@ -341,6 +348,8 @@ class KimiMLAAttention(nn.Module):
             attention_mask: Optional additive attention mask of shape [batch, 1, sequence, sequence].
             packed_context: Optional document layout of the batch, required under
                 context parallelism.
+            flash_layout: Optional document-major metadata prepared outside
+                checkpointed layers; tensor layouts are documented by MLAFlashLayout.
             **kwargs: Extra attention options accepted for HF compatibility.
 
         Returns:
@@ -370,12 +379,31 @@ class KimiMLAAttention(nn.Module):
 
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        if self.config.mla_attn_implementation == "flash_attention_2":
+            if attention_mask is not None:
+                raise ValueError("Flash MLA consumes document metadata, not an additive attention_mask")
+            if flash_layout is None:
+                doc_ids = (
+                    packed_context.doc_ids
+                    if packed_context is not None
+                    else torch.ones((batch_size, seq_length), dtype=torch.int32, device=hidden_states.device)
+                )
+                flash_layout = build_flash_layout(doc_ids)
+            attn_output = packed_flash_attention(
+                query_states,
+                key_states,
+                value_states,
+                layout=flash_layout,
+                scale=self.scaling,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+            )
+        else:
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_length, -1)
         return self.o_proj(attn_output)
 
@@ -1098,19 +1126,36 @@ class KimiLinear48BModel(nn.Module):
             or attn_kwargs.get("packed_token_indices") is not None
             or attn_kwargs.get("cu_seqlens") is not None
         )
+        use_flash = self.config.mla_attn_implementation == "flash_attention_2"
+        if use_flash and attention_mask is not None and attention_mask.shape != inputs_embeds.shape[:2]:
+            raise ValueError("Flash MLA requires a binary/document attention_mask [batch, sequence]")
+        physical_boundaries = attn_kwargs.get("cu_seqlens_padded") if use_flash else None
         packed_context = kimi_packed_context or _packed_context_from_inputs(
             inputs_embeds,
             attention_mask=packed_seq_ids if packed_seq_ids is not None else attention_mask,
-            cu_seqlens=attn_kwargs.get("cu_seqlens"),
+            cu_seqlens=physical_boundaries if physical_boundaries is not None else attn_kwargs.get("cu_seqlens"),
         )
+        if use_flash and packed_context is None and padding_mask is not None:
+            packed_context = KimiPackedContext(doc_ids=(~padding_mask).to(torch.int32))
         # Packed attention consumes document metadata, but MoE routing still
         # needs a separate mask for padding tokens, including in full-attention layers.
         if padding_mask is None and packed_context is not None:
             padding_mask = packed_context.local_doc_ids == 0
         linear_attn_mask = None if has_packed_inputs else self._update_linear_attn_mask(attention_mask, cache_position)
+        flash_layout = None
+        if use_flash and not (packed_context is not None and packed_context.cp_enabled):
+            if packed_context is not None:
+                doc_ids = packed_context.doc_ids
+            elif padding_mask is not None:
+                doc_ids = (~padding_mask).to(torch.int32)
+            else:
+                doc_ids = torch.ones(inputs_embeds.shape[:2], dtype=torch.int32, device=inputs_embeds.device)
+            if padding_mask is not None:
+                doc_ids = doc_ids.masked_fill(padding_mask, 0)
+            flash_layout = build_flash_layout(doc_ids)
         causal_mask = (
             None
-            if packed_context is not None and packed_context.cp_enabled
+            if use_flash or (packed_context is not None and packed_context.cp_enabled)
             else _make_causal_mask(inputs_embeds, packed_context, dtype=inputs_embeds.dtype)
         )
         hidden_states = inputs_embeds
@@ -1125,6 +1170,7 @@ class KimiLinear48BModel(nn.Module):
                 attention_mask=layer_mask,
                 padding_mask=layer_padding_mask,
                 packed_context=packed_context,
+                flash_layout=flash_layout,
                 **attn_kwargs,
             )
 

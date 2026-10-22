@@ -1,0 +1,251 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""CPU arithmetic checks for packed MLA layouts, outputs and gradients."""
+
+import pytest
+import torch
+
+from nemo_automodel.components.models.kimi_linear import flash_attention as flash
+from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
+from nemo_automodel.components.models.kimi_linear.cp import (
+    KimiPackedContext,
+    build_document_causal_mask,
+)
+from nemo_automodel.components.models.kimi_linear.model import (
+    KimiLinear48BForCausalLM,
+    KimiMLAAttention,
+)
+from nemo_automodel.shared.import_utils import UnavailableError
+from tests.unit_tests.models.kimi_linear.test_model import _backend_config, _tiny_kimi_config
+
+
+def _reference(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, *, ids: torch.Tensor) -> torch.Tensor:
+    """Compute dense per-document causal attention.
+
+    Args:
+        query: Tensor of shape [batch, heads, sequence, qk_dim].
+        key: Tensor of shape [batch, heads, sequence, qk_dim].
+        value: Tensor of shape [batch, heads, sequence, value_dim].
+        ids: Integer tensor of shape [batch, sequence] with zero padding.
+
+    Returns:
+        Tensor of shape [batch, heads, sequence, value_dim]; padding outputs are zero.
+    """
+    mask = build_document_causal_mask(ids, ids, q_global_start=0, dtype=query.dtype)
+    probabilities = ((query @ key.transpose(-1, -2)) * query.shape[-1] ** -0.5 + mask).softmax(-1)
+    return (probabilities @ value) * (ids > 0)[:, None, :, None]
+
+
+def _fake_varlen(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    *,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    """CPU replacement for only the external CUDA kernel.
+
+    Args:
+        query: Tensor of shape [valid_tokens, heads, padded_dim].
+        key: Tensor of shape [valid_tokens, heads, padded_dim].
+        value: Tensor of shape [valid_tokens, heads, padded_dim].
+        cu_q: Integer tensor of shape [documents + 1].
+        cu_k: Integer tensor of shape [documents + 1].
+        max_q: Maximum document length.
+        max_k: Maximum document length.
+        dropout_p: Must be zero for this deterministic arithmetic check.
+        softmax_scale: Original QK scale, independent of padded_dim.
+        causal: Must be true.
+
+    Returns:
+        Tensor of shape [valid_tokens, heads, padded_dim].
+    """
+    assert causal and dropout_p == 0
+    assert torch.equal(cu_q, cu_k) and max_q == max_k
+    outputs = []
+    for start, end in zip(cu_q[:-1].tolist(), cu_q[1:].tolist()):
+        q, k, v = (tensor[start:end].transpose(0, 1) for tensor in (query, key, value))
+        scores = (q @ k.transpose(-1, -2)) * softmax_scale
+        future = torch.ones((end - start, end - start), dtype=torch.bool).triu(1)
+        outputs.append((scores.masked_fill(future, -torch.inf).softmax(-1) @ v).transpose(0, 1))
+    return torch.cat(outputs)
+
+
+@pytest.fixture
+def fake_flash(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(flash, "_FLASH_OK", True)
+    monkeypatch.setattr(flash, "flash_attn_varlen_func", _fake_varlen)
+
+
+@pytest.mark.parametrize("qk_dim,value_dim", [(16, 8), (8, 16), (192, 128)])
+@pytest.mark.parametrize(
+    "ids",
+    [
+        [[1, 1, 2, 2, 0], [0, 1, 1, 2, 0]],
+        [[2, 1, 2, 0, 1], [1, 0, 1, 0, 0]],
+        [[1, 1, 1, 1, 1], [0, 0, 0, 0, 0]],
+        [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+    ],
+)
+def test_outputs_and_all_qkv_gradients_match_dense_reference(fake_flash, ids, qk_dim, value_dim) -> None:
+    torch.manual_seed(3)
+    ids = torch.tensor(ids, dtype=torch.int32)
+    q = torch.randn(2, 2, 5, qk_dim, requires_grad=True)
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn(2, 2, 5, value_dim, requires_grad=True)
+    expected = _reference(q, k, v, ids=ids)
+    actual = flash.packed_flash_attention(q, k, v, layout=flash.build_flash_layout(ids), scale=qk_dim**-0.5)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+    grad = torch.randn_like(actual)
+    expected_grads = torch.autograd.grad(expected, (q, k, v), grad, retain_graph=True)
+    actual_grads = torch.autograd.grad(actual, (q, k, v), grad)
+    for left, right in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(left, right, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("mask_kind", ["indexed", "binary", "padding_only", "none"])
+def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash, monkeypatch, mask_kind) -> None:
+    torch.manual_seed(9)
+    config = _tiny_kimi_config()
+    eager = KimiLinear48BForCausalLM(config, backend=_backend_config())
+    eager.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    fast = KimiLinear48BForCausalLM(fast_config, backend=_backend_config())
+    fast.load_state_dict(eager.state_dict(), strict=True)
+    ids = torch.tensor([[1, 1, 2, 2, 0], [0, 1, 1, 1, 0]], dtype=torch.int32)
+    if mask_kind in ("binary", "padding_only"):
+        ids = (ids > 0).int()
+    elif mask_kind == "none":
+        ids = torch.ones_like(ids)
+    tokens = torch.tensor([[3, 4, 5, 6, 0], [0, 7, 8, 9, 0]])
+    expected = eager(input_ids=tokens, attention_mask=ids).logits
+
+    def reject_dense_mask(
+        inputs_embeds: torch.Tensor, packed_context: KimiPackedContext | None, *, dtype: torch.dtype
+    ) -> None:
+        """Reject dense-mask construction.
+
+        Args:
+            inputs_embeds: Tensor of shape [batch, sequence, hidden].
+            packed_context: Optional document map [batch, sequence].
+            dtype: Floating mask dtype.
+        """
+        raise AssertionError("Flash MLA must not allocate a sequence-square mask")
+
+    monkeypatch.setattr("nemo_automodel.components.models.kimi_linear.model._make_causal_mask", reject_dense_mask)
+    options = (
+        {"padding_mask": ids == 0}
+        if mask_kind == "padding_only"
+        else ({"attention_mask": ids} if mask_kind != "none" else {})
+    )
+    actual = fast(input_ids=tokens, **options).logits
+    valid = ids > 0
+    torch.testing.assert_close(actual[valid], expected[valid], atol=1e-6, rtol=1e-5)
+    expected[valid].square().sum().backward()
+    actual[valid].square().sum().backward()
+    for (name, left), (other, right) in zip(eager.named_parameters(), fast.named_parameters()):
+        assert name == other
+        if left.grad is not None:
+            torch.testing.assert_close(right.grad, left.grad, atol=1e-6, rtol=1e-4, msg=name)
+
+
+def test_cp_keeps_its_existing_attention_path(fake_flash, monkeypatch) -> None:
+    config = _tiny_kimi_config()
+    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    layer = KimiMLAAttention(config, 0)
+    context = KimiPackedContext(torch.ones(1, 4, dtype=torch.int32), cp_size=2)
+    calls = []
+
+    def cp_forward(hidden_states: torch.Tensor, packed_context: KimiPackedContext) -> torch.Tensor:
+        """Stand in for the unchanged CP kernel.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden].
+            packed_context: Global document map [batch, sequence].
+
+        Returns:
+            The input tensor [batch, local_sequence, hidden], aliased unchanged.
+        """
+        calls.append(packed_context)
+        return hidden_states
+
+    monkeypatch.setattr(layer, "_forward_with_cp", cp_forward)
+    x = torch.randn(1, 2, config.hidden_size)
+    assert layer(x, packed_context=context) is x
+    assert calls == [context]
+
+
+def test_missing_optional_dependency_and_explicit_dense_mask(monkeypatch) -> None:
+    monkeypatch.setattr(flash, "_FLASH_OK", False)
+    q = torch.randn(1, 1, 2, 8)
+    layout = flash.build_flash_layout(torch.ones(1, 2, dtype=torch.int32))
+    with pytest.raises(UnavailableError, match="flash-attn"):
+        flash.packed_flash_attention(q, q, q, layout=layout, scale=8**-0.5)
+    config = _tiny_kimi_config()
+    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    layer = KimiMLAAttention(config, 0)
+    with pytest.raises(ValueError, match="additive attention_mask"):
+        layer(torch.randn(1, 2, config.hidden_size), attention_mask=torch.zeros(1, 1, 2, 2))
+
+
+def test_config_roundtrip_and_invalid_backend() -> None:
+    config = KimiLinear48BConfig(mla_attn_implementation="flash_attention_2")
+    assert KimiLinear48BConfig.from_dict(config.to_dict()).mla_attn_implementation == "flash_attention_2"
+    assert KimiLinear48BConfig().mla_attn_implementation == "eager"
+    with pytest.raises(ValueError, match="mla_attn_implementation"):
+        KimiLinear48BConfig(mla_attn_implementation="invalid")
+
+
+def test_thd_document_spans_respect_physical_padding(fake_flash) -> None:
+    torch.manual_seed(20)
+    config = _tiny_kimi_config()
+    reference = KimiLinear48BForCausalLM(config, backend=_backend_config())
+    reference.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    fast = KimiLinear48BForCausalLM(fast_config, backend=_backend_config())
+    fast.load_state_dict(reference.state_dict(), strict=True)
+    tokens = torch.tensor([[3, 4, 0, 5, 0, 0]])
+    ids = torch.tensor([[1, 1, 0, 2, 0, 0]], dtype=torch.int32)
+    expected = reference(input_ids=tokens, attention_mask=ids).logits
+    actual = fast(
+        input_ids=tokens,
+        padding_mask=ids == 0,
+        qkv_format="thd",
+        position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
+        cu_seqlens=torch.tensor([[0, 2, 3]], dtype=torch.int32),
+        cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
+    ).logits
+    valid = ids > 0
+    torch.testing.assert_close(actual[valid], expected[valid], atol=1e-6, rtol=1e-5)
+    expected[valid].square().sum().backward()
+    actual[valid].square().sum().backward()
+    for (name, a), (other, b) in zip(fast.named_parameters(), reference.named_parameters()):
+        assert name == other
+        if b.grad is not None:
+            torch.testing.assert_close(a.grad, b.grad, atol=1e-6, rtol=1e-4, msg=name)
+
+
+def test_backbone_rejects_dense_mask_in_flash_mode() -> None:
+    config = _tiny_kimi_config()
+    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    model = KimiLinear48BForCausalLM(config, backend=_backend_config())
+    with pytest.raises(ValueError, match="binary/document attention_mask"):
+        model(input_ids=torch.tensor([[3, 4]]), attention_mask=torch.zeros(1, 1, 2, 2))
