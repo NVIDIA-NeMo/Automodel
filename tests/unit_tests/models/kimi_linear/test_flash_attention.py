@@ -188,6 +188,7 @@ def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash,
     actual[valid].square().sum().backward()
     for (name, left), (other, right) in zip(eager.named_parameters(), fast.named_parameters()):
         assert name == other
+        assert (left.grad is None) == (right.grad is None), name
         if left.grad is not None:
             torch.testing.assert_close(right.grad, left.grad, atol=1e-6, rtol=1e-4, msg=name)
 
@@ -308,6 +309,7 @@ def test_thd_document_spans_respect_physical_padding(fake_flash, monkeypatch, us
     actual[valid].square().sum().backward()
     for (name, a), (other, b) in zip(fast.named_parameters(), reference.named_parameters()):
         assert name == other
+        assert (a.grad is None) == (b.grad is None), name
         if b.grad is not None:
             torch.testing.assert_close(a.grad, b.grad, atol=1e-6, rtol=1e-4, msg=name)
 
@@ -356,6 +358,18 @@ def test_hybrid_physical_thd_padding_requires_unpadded_indices(fake_flash) -> No
             position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
             cu_seqlens=torch.tensor([[0, 2, 3]], dtype=torch.int32),
             cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
+        )
+
+
+def test_hybrid_backbone_requires_logical_boundaries_with_physical_thd_padding(fake_flash) -> None:
+    _require_fla()
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(use_kda=True), backend=replace(_backend_config(), attn="fa4"))
+    with pytest.raises(ValueError, match="requires logical cu_seqlens and packed_token_indices"):
+        model.model(
+            input_ids=torch.tensor([[3, 4, 0, 5, 0, 0]]),
+            padding_mask=torch.tensor([[False, False, True, False, True, True]]),
+            cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
+            packed_token_indices=torch.tensor([0, 1, 3]),
         )
 
 
