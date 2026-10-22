@@ -100,6 +100,8 @@ dataset:
     trust_remote_code: true
 
 packed_sequence:
+  # NEAT delivers document boundaries to both MLA attention and KDA recurrence.
+  packing_strategy: neat
   packed_sequence_size: 4096
 
 dataloader:
