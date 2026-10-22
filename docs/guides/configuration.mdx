@@ -249,8 +249,8 @@ pipeline stages and activation-checkpoint recomputation. VLM profiling uses
 forward hooks only; it does not add module-level backward ranges. Nsight Systems
 still captures the CUDA kernels launched during backward.
 
-From a checkout with NeMo AutoModel installed, run the following command on a
-single GPU with [Nsight Systems](https://developer.nvidia.com/nsight-systems)
+With the NeMo AutoModel environment activated in a checkout, run the following
+command on a single GPU with [Nsight Systems](https://developer.nvidia.com/nsight-systems)
 available on `PATH`:
 
 ```bash

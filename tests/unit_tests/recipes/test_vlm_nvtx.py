@@ -217,7 +217,10 @@ def test_nvtx_forward_error_closes_ranges_and_preserves_exception(nvtx_ranges):
 
 @pytest.mark.parametrize("run_before_failure", [False, True])
 @pytest.mark.parametrize("global_hook", [False, True])
-def test_nvtx_existing_pre_hook_error_closes_owned_ranges(nvtx_ranges, request, run_before_failure, global_hook):
+@pytest.mark.parametrize("add_backward_hooks", [False, True])
+def test_nvtx_existing_pre_hook_error_closes_owned_ranges(
+    nvtx_ranges, request, run_before_failure, global_hook, add_backward_hooks
+):
     fail = False
 
     def existing_pre_hook(module, inputs):
@@ -237,7 +240,7 @@ def test_nvtx_existing_pre_hook_error_closes_owned_ranges(nvtx_ranges, request, 
         handle = child.register_forward_pre_hook(existing_pre_hook)
     request.addfinalizer(handle.remove)
     model = torch.nn.Sequential(child)
-    autonvtx.patch(model, add_backward_hooks=False)
+    autonvtx.patch(model, add_backward_hooks=add_backward_hooks)
     if run_before_failure:
         model(torch.ones(1, 3)).sum().backward()
     fail = True
