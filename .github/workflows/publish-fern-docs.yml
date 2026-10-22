@@ -30,10 +30,8 @@ on:
     paths:
       - 'docs/**'
       - 'nemo_automodel/_transformers/registry.py'
-      - 'tests/ci_tests/utils/sync_model_coverage_tables.py'
       - 'tests/unit_tests/_transformers/test_doc_coverage.py'
-      - 'tools/apply_fern_code_styles.py'
-      - 'tools/check_docs.py'
+      - 'tools/docs/**'
       - 'tests/unit_tests/tools/test_check_docs.py'
     tags:
       - 'docs/v*'
@@ -71,7 +69,7 @@ jobs:
       - name: Check documentation
         # Validate through the same entry point as contributors and PR CI.
         # This also restores archived pages, without access to the publish token.
-        run: uv run --script tools/check_docs.py --keep-generated
+        run: uv run --script tools/docs/check_docs.py --keep-generated
 
       - name: Publish Docs
         env:
@@ -88,5 +86,5 @@ jobs:
           # prep needed. Without it, `generate --docs` fatals with "Folder not
           # found: ../product-docs/nemo-automodel/Full-Library-Reference".
           npx -y "fern-api@$fern_version" docs md generate
-          python3 "$GITHUB_WORKSPACE/tools/apply_fern_code_styles.py" --repo-root "$GITHUB_WORKSPACE"
+          python3 "$GITHUB_WORKSPACE/tools/docs/apply_fern_code_styles.py" --repo-root "$GITHUB_WORKSPACE"
           npx -y "fern-api@$fern_version" generate --docs

@@ -218,7 +218,7 @@ def _check(navigation_path: Path, legacy_dir: Path, legacy_sprite: Path) -> list
 
 def main() -> int:
     """Fetch or validate the checked-in provider icon set."""
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--navigation",

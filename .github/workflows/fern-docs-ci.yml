@@ -59,4 +59,18 @@ jobs:
 
       - name: Check documentation
         # Single validation entry point, also used by contributors and agents.
-        run: uv run --script tools/check_docs.py
+        run: uv run --script tools/docs/check_docs.py
+
+      - name: Test documentation tools
+        # Regression tests exercise tool behavior; validation rules live in tools/docs.
+        run: |
+          uv run --no-project --isolated --python 3.12 \
+            --with pytest --with pytest-timeout --with pyyaml --with pillow \
+            python -m pytest -q --noconftest \
+            tests/unit_tests/ci_tests/test_docs_workflows.py \
+            tests/unit_tests/tools/test_sync_model_coverage_tables.py \
+            tests/unit_tests/tools/test_check_docs.py \
+            tests/unit_tests/tools/test_apply_fern_code_styles.py \
+            tests/unit_tests/tools/test_validate_model_cards.py \
+            tests/unit_tests/_transformers/test_doc_coverage.py \
+            tests/unit_tests/_transformers/test_recipe_doc_coverage.py

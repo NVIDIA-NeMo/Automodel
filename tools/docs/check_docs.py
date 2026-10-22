@@ -14,12 +14,12 @@
 
 # /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["pytest", "pytest-timeout", "pyyaml", "pillow"]
+# dependencies = ["pyyaml", "pillow"]
 # ///
 
 """The single docs-check entry point for contributors, agents, and CI.
 
-Run ``uv run --script tools/check_docs.py`` from the repository root. Keep docs
+Run ``uv run --script tools/docs/check_docs.py`` from the repository root. Keep docs
 validation orchestration here so local checks and CI enforce the same rules.
 """
 
@@ -43,30 +43,19 @@ def main() -> int:
         help="Keep generated model-coverage tables after a successful check for publication.",
     )
     args = parser.parse_args()
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
     try:
         # Source contracts must run before generation changes the checked files.
-        tests = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                "--noconftest",
-                "tests/unit_tests/ci_tests/test_docs_workflows.py",
-                "tests/unit_tests/tools/test_sync_model_coverage_tables.py",
-                "tests/unit_tests/tools/test_check_docs.py",
-                "tests/unit_tests/_transformers/test_doc_coverage.py::"
-                "test_every_model_card_has_architecture_reference_table",
-            ],
+        sources = subprocess.run(
+            [sys.executable, "-m", "tools.docs.validate_model_cards"],
             cwd=repo_root,
             check=False,
         )
-        if tests.returncode:
-            return tests.returncode
+        if sources.returncode:
+            return sources.returncode
 
         version = json.loads((repo_root / "docs/fern/fern.config.json").read_text(encoding="utf-8"))["version"]
-        generator = "tests/ci_tests/utils/sync_model_coverage_tables.py"
+        generator = "tools/docs/sync_model_coverage_tables.py"
         status = 1
         keep_tables = False
         try:

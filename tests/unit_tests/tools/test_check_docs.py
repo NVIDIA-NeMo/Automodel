@@ -27,9 +27,9 @@ import yaml
 def docs_checkout(tmp_path: Path) -> Path:
     root = tmp_path / "checkout"
     source = Path(__file__).resolve().parents[3]
-    tool = root / "tools/check_docs.py"
+    tool = root / "tools/docs/check_docs.py"
     tool.parent.mkdir(parents=True)
-    shutil.copyfile(source / "tools/check_docs.py", tool)
+    shutil.copyfile(source / "tools/docs/check_docs.py", tool)
     config = root / "docs/fern/fern.config.json"
     config.parent.mkdir(parents=True)
     config.write_text('{"version": "5.999.0"}', encoding="utf-8")
@@ -38,14 +38,14 @@ def docs_checkout(tmp_path: Path) -> Path:
         "{/* END GENERATED LATEST MODEL SUPPORT */}\nMore user content\n",
         encoding="utf-8",
     )
-    generator = root / "tests/ci_tests/utils/sync_model_coverage_tables.py"
-    generator.parent.mkdir(parents=True)
+    generator = root / "tools/docs/sync_model_coverage_tables.py"
+    generator.parent.mkdir(parents=True, exist_ok=True)
     generator.write_text(
         "import os, runpy, sys\n"
         "from pathlib import Path\n"
-        "root = Path(__file__).resolve().parents[3]\n"
+        "root = Path(__file__).resolve().parents[2]\n"
         "if '--clean' in sys.argv:\n"
-        f"    helpers = runpy.run_path({str(source / 'tests/ci_tests/utils/sync_model_coverage_tables.py')!r})\n"
+        f"    helpers = runpy.run_path({str(source / 'tools/docs/sync_model_coverage_tables.py')!r})\n"
         "    helpers['_strip_generated_tables'](root)\n"
         "else:\n"
         "    card = root / 'docs/index.mdx'\n"
@@ -54,22 +54,13 @@ def docs_checkout(tmp_path: Path) -> Path:
         "    sys.exit(int(os.environ.get('DOCS_GENERATION_EXIT', '0')))\n",
         encoding="utf-8",
     )
-    for relative in (
-        "ci_tests/test_docs_workflows.py",
-        "tools/test_sync_model_coverage_tables.py",
-        "tools/test_check_docs.py",
-        "_transformers/test_doc_coverage.py",
-    ):
-        test = root / "tests/unit_tests" / relative
-        test.parent.mkdir(parents=True, exist_ok=True)
-        test.write_text(
-            "import os\n"
-            "from pathlib import Path\n"
-            "def test_every_model_card_has_architecture_reference_table():\n"
-            "    assert 'generated content' not in Path('docs/index.mdx').read_text()\n"
-            "    assert os.environ.get('DOCS_SOURCE_FAILURE') != '1'\n",
-            encoding="utf-8",
-        )
+    (root / "tools/docs/validate_model_cards.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "assert 'generated content' not in Path('docs/index.mdx').read_text()\n"
+        "assert os.environ.get('DOCS_SOURCE_FAILURE') != '1'\n",
+        encoding="utf-8",
+    )
     bin_dir = root / "bin"
     bin_dir.mkdir()
     npx = bin_dir / "npx"
@@ -94,7 +85,7 @@ def docs_checkout(tmp_path: Path) -> Path:
 
 def _check_docs(root: Path, *arguments: str, **overrides: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(root / "tools/check_docs.py"), *arguments],
+        [sys.executable, str(root / "tools/docs/check_docs.py"), *arguments],
         # Invoke outside the checkout to exercise root discovery.
         cwd=root.parent,
         env={**os.environ, "PATH": f"{root / 'bin'}{os.pathsep}{os.environ['PATH']}", **overrides},
@@ -105,6 +96,7 @@ def _check_docs(root: Path, *arguments: str, **overrides: str) -> subprocess.Com
 
 @pytest.mark.parametrize("validation_exit", [0, 7])
 def test_docs_check_cleans_generated_tables_and_preserves_validator_status(docs_checkout: Path, validation_exit: int):
+    assert not (docs_checkout / "tests").exists(), "Validation must work without a pytest tree"
     card = docs_checkout / "docs/index.mdx"
     original = card.read_bytes()
 
@@ -200,7 +192,7 @@ def test_docs_ci_uses_the_shared_check(workflow_name: str, job: str):
     checks = [step for step in workflow["jobs"][job]["steps"] if step["name"] == "Check documentation"]
 
     assert len(checks) == 1
-    expected = "uv run --script tools/check_docs.py"
+    expected = "uv run --script tools/docs/check_docs.py"
     if job == "publish":
         expected += " --keep-generated"
         assert all(
@@ -220,7 +212,7 @@ def test_make_docs_check_forwards_to_the_shared_tool(docs_checkout: Path, tool_e
         f"#!{sys.executable}\n"
         "import json, os, sys\n"
         "from pathlib import Path\n"
-        "root = Path(sys.argv[-1]).resolve().parents[1]\n"
+        "root = Path(sys.argv[-1]).resolve().parents[2]\n"
         "(root / 'alias.json').write_text(json.dumps(sys.argv[1:]))\n"
         "sys.exit(int(os.environ['DOCS_TOOL_EXIT']))\n",
         encoding="utf-8",
@@ -243,5 +235,5 @@ def test_make_docs_check_forwards_to_the_shared_tool(docs_checkout: Path, tool_e
     assert json.loads((docs_checkout / "alias.json").read_text()) == [
         "run",
         "--script",
-        str(docs_checkout / "tools/check_docs.py"),
+        str(docs_checkout / "tools/docs/check_docs.py"),
     ]

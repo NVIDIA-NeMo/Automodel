@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.apply_fern_code_styles import (
+from tools.docs.apply_fern_code_styles import (
     DARK_CODE_BLOCK_SELECTOR,
     DARK_INLINE_CODE_SELECTOR,
     GENERATED_STYLE,

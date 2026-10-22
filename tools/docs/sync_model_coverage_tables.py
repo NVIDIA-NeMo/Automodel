@@ -843,7 +843,7 @@ def _generate_tables(repo_root: Path, *, validate_model_cards: bool = True) -> d
     homepage_path = repo_root / "docs" / "index.mdx"
     overview_path = repo_root / "docs" / "model-coverage" / "overview.mdx"
     registry_path = repo_root / "nemo_automodel" / "_transformers" / "registry.py"
-    aliases_path = repo_root / "tests" / "unit_tests" / "_transformers" / "test_doc_coverage.py"
+    aliases_path = repo_root / "tools" / "docs" / "architecture.py"
 
     support_log = support_log_path.read_text(encoding="utf-8")
     typed_overview_paths = {
@@ -922,7 +922,7 @@ def main() -> None:
     mode.add_argument("--check", action="store_true", help="fail instead of writing when generated output is stale")
     mode.add_argument("--clean", action="store_true", help="remove generated tables while preserving their markers")
     args = parser.parse_args()
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = Path(__file__).resolve().parents[2]
     if args.clean:
         _strip_generated_tables(repo_root)
     else:

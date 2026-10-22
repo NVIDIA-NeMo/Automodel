@@ -59,10 +59,8 @@ jobs:
               - nemo_automodel/_transformers/registry.py
               - examples/**
               - tests/unit_tests/_transformers/test_doc_coverage.py
-              - tests/ci_tests/utils/sync_model_coverage_tables.py
-              - tools/check_docs.py
+              - tools/docs/**
               - tests/unit_tests/tools/test_check_docs.py
-              - tools/apply_fern_code_styles.py
               - .github/workflows/fern-docs-ci.yml
               - .github/workflows/fern-docs-preview.yml
       - name: Report docs preview gate
@@ -138,11 +136,14 @@ jobs:
           # Replace the helper, not the PR model/document data it inspects.
           # Only inspect coverage inputs; unrelated source documentation may be symlinked.
           test ! -L pr-source/nemo_automodel
+          test ! -L pr-source/tools
+          mkdir -p pr-source/tools/docs
+          test -z "$(find pr-source/tools/docs -type l -print -quit)"
           test -z "$(find pr-source/tests pr-source/examples pr-source/nemo_automodel/_transformers -type l -print -quit)"
           test -z "$(find pr-source/docs -type l -print -quit)"
-          cp trusted-source/tests/ci_tests/utils/sync_model_coverage_tables.py \
-            pr-source/tests/ci_tests/utils/sync_model_coverage_tables.py
-          python3 -I pr-source/tests/ci_tests/utils/sync_model_coverage_tables.py
+          cp trusted-source/tools/docs/sync_model_coverage_tables.py \
+            pr-source/tools/docs/sync_model_coverage_tables.py
+          python3 -I pr-source/tools/docs/sync_model_coverage_tables.py
 
       - name: Prepare preview docs
         run: |
@@ -309,7 +310,7 @@ jobs:
         run: '"$RUNNER_TEMP/fern-cli/node_modules/.bin/fern" docs md generate'
 
       - name: Style generated pages with trusted tooling
-        run: python3 -I trusted-source/tools/apply_fern_code_styles.py --repo-root "$RUNNER_TEMP/fern-preview"
+        run: python3 -I trusted-source/tools/docs/apply_fern_code_styles.py --repo-root "$RUNNER_TEMP/fern-preview"
 
       - name: Generate preview
         env:

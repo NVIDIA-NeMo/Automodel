@@ -280,10 +280,10 @@ Before pushing documentation changes, run the same check used by CI from the
 repository root:
 
 ```bash
-uv run --script tools/check_docs.py
+uv run --script tools/docs/check_docs.py
 ```
 
-`tools/check_docs.py` is the only docs-check entry point for contributors,
+`tools/docs/check_docs.py` is the only docs-check entry point for contributors,
 agents, and CI. Add validation steps to that tool to keep local checks and CI
 in sync. The existing `make -C docs/fern docs-check` and `docs-mdx-check`
 targets forward to it.
@@ -294,13 +294,17 @@ dependencies and uses the Fern CLI version pinned in `docs/fern/fern.config.json
 Use a full Git checkout with `origin/main` available; the check fetches archived
 documentation from `docs-archive` through `origin`.
 
-The command runs the documentation source tests, generates model-coverage
+The command validates documentation sources, generates model-coverage
 tables, restores archived pages, and validates MDX and Fern configuration.
 Generated tables and styles are cleaned up after validation, including on
 failure. A nonzero exit status identifies a failed check.
 
-Publishing uses `uv run --script tools/check_docs.py --keep-generated` to retain
+Publishing uses `uv run --script tools/docs/check_docs.py --keep-generated` to retain
 validated model-coverage tables for deployment. Failures still clean them up.
+
+Validation rules and generation scripts live in `tools/docs/`. Pytest tests
+provide regression coverage for those tools and run separately in CI; the
+checker itself needs only PyYAML and Pillow, not pytest or the training stack.
 
 If your contribution involves documentation changes, please refer to the [Fern docs maintenance guide](.agents/contributor-skills/fern-docs/SKILL.md) guide for detailed instructions on building and serving the documentation.
 

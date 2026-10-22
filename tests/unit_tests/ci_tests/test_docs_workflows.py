@@ -282,3 +282,45 @@ def test_lint_gate_accepts_only_success_or_intentional_docs_skip(
         text=True,
     )
     assert result.returncode == expected, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("symlink", [None, "tools", "tools/docs", "tools/docs/sync_model_coverage_tables.py"])
+def test_preview_generator_uses_trusted_docs_tool_and_rejects_symlinks(tmp_path: Path, symlink: str | None) -> None:
+    trusted = tmp_path / "trusted-source/tools/docs/sync_model_coverage_tables.py"
+    trusted.parent.mkdir(parents=True)
+    trusted.write_text(
+        "from pathlib import Path\n"
+        "root = Path(__file__).resolve().parents[2]\n"
+        "(root / 'generated').write_text('trusted generator')\n"
+    )
+    pr = tmp_path / "pr-source"
+    for directory in ("tests", "examples", "nemo_automodel/_transformers", "docs"):
+        (pr / directory).mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sync_model_coverage_tables.py"
+    sentinel.write_text("original outside file")
+    if symlink:
+        link = pr / symlink
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(sentinel if link.suffix == ".py" else outside)
+    else:
+        proposed = pr / "tools/docs/sync_model_coverage_tables.py"
+        proposed.parent.mkdir(parents=True)
+        proposed.write_text("raise RuntimeError('untrusted generator must not execute')\n")
+
+    workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
+    step = next(
+        step
+        for step in workflow["jobs"]["preview"]["steps"]
+        if step["name"] == "Generate model coverage tables with trusted tooling"
+    )
+    result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=tmp_path, capture_output=True, text=True)
+
+    assert sentinel.read_text() == "original outside file"
+    if symlink:
+        assert result.returncode != 0
+        assert not (pr / "generated").exists()
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (pr / "generated").read_text() == "trusted generator"
