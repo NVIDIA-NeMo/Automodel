@@ -61,25 +61,6 @@ NeMo AutoModel already carry the distinct identity and load without that overrid
 |---|---|
 | Kimi Linear 48B A3B Instruct | [`moonshotai/Kimi-Linear-48B-A3B-Instruct`](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) |
 
-## Packed MLA attention
-
-Kimi Linear can use FlashAttention-2 for its non-context-parallel MLA layers.
-Install the optional kernel with `uv sync --extra fa` and set this field on
-`model.config` (the explicit `KimiLinear48BConfig.from_pretrained` target):
-
-```yaml
-model:
-  config:
-    mla_attn_implementation: flash_attention_2
-```
-
-The default is `eager`. The packed HellaSwag recipe selects `flash_attention_2`.
-The model uses document boundaries and omits padding before calling the variable-length
-kernel, then restores the batch layout. It pads the 128-wide value heads to the
-192-wide query/key heads while preserving the original attention scale. CUDA fp16
-and bf16 are supported; dense additive masks are rejected for this path.
-Context-parallel MLA retains its existing compressed-KV gather and FlexAttention path.
-
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
