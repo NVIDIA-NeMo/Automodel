@@ -45,7 +45,11 @@ from nemo_automodel.recipes._typed_config import RecipeConfig
 
 class DummyProcessor:
     def __init__(self):
-        self.tokenizer = type("Tokenizer", (), {"pad_token_id": 0})()
+        self.tokenizer = SimpleNamespace(pad_token_id=0)
+
+
+def _collate_prefixed_examples(examples, *, processor, prefix):
+    return [prefix + example for example in examples], processor.tokenizer.pad_token_id
 
 
 @dataclass
@@ -138,7 +142,8 @@ def test_recipe_config_accepts_cord_v2_sample_limit():
     assert config.dataset_config.limit_dataset_samples == 100
 
 
-def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterates(monkeypatch):
+@pytest.mark.parametrize("multiprocessing_context", [None, "spawn"])
+def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterates(monkeypatch, multiprocessing_context):
     monkeypatch.setattr(vlm_loader.os, "sched_getaffinity", lambda _: {0, 1})
     events = []
     processor = DummyProcessor()
@@ -147,13 +152,10 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
         events.append("processor")
         return processor
 
-    def collate(examples, *, processor, prefix):
-        return [prefix + example for example in examples], processor.tokenizer.pad_token_id
-
     config = VlmDataloaderConfig(
         dataset_config=StaticDatasetConfig(events),
         processor_config=VlmProcessorConfig(factory=build_processor),
-        collator=VlmCollatorConfig(factory=collate, kwargs={"prefix": "item:"}),
+        collator=VlmCollatorConfig(factory=_collate_prefixed_examples, kwargs={"prefix": "item:"}),
         shuffle=False,
         num_workers=0,
     )
@@ -165,6 +167,7 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
         batch_size=2,
         dataset_build_context=BuildContext(events),
     )
+    result.dataloader.multiprocessing_context = multiprocessing_context
     batches = list(result.dataloader)
     batch, padding_idx = batches[0]
 
