@@ -56,7 +56,7 @@ def test_exact_freezing_preserves_dtype_and_tied_alias_identity():
 def test_unknown_names_fail_before_any_trainability_mutation():
     model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
     config = parse_freeze_config({"freeze_modules": [{"path": "0"}], "freeze_parameters": ["missing"]})
-    with pytest.raises(ValueError, match="Unknown frozen parameters"):
+    with pytest.raises(ValueError, match="Unknown selected parameters"):
         apply_parameter_freezing(model, config)
     assert all(p.requires_grad for p in model.parameters())
 
@@ -81,6 +81,30 @@ def test_unlisted_parameters_keep_existing_frozen_state():
     model.bias.requires_grad_(False)
     apply_parameter_freezing(model, FreezeConfig(freeze_parameters=("weight",)))
     assert not model.weight.requires_grad and not model.bias.requires_grad
+
+
+def test_exact_unfreeze_does_not_train_other_parameters_in_the_same_module():
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
+    config = parse_freeze_config({"freeze_modules": [{"glob": "*"}], "unfreeze_parameters": ["0.weight"]})
+    apply_parameter_freezing(model, config)
+    assert {name for name, p in model.named_parameters() if p.requires_grad} == {"0.weight"}
+    model(torch.ones(1, 2)).sum().backward()
+    assert model[0].weight.grad is not None
+    assert model[0].bias.grad is None
+    assert model[1].weight.grad is None
+
+
+def test_exact_freeze_wins_over_exact_unfreeze():
+    model = nn.Linear(2, 2)
+    apply_parameter_freezing(model, FreezeConfig(unfreeze_parameters=("weight",), freeze_parameters=("weight",)))
+    assert not model.weight.requires_grad
+    assert model.bias.requires_grad
+
+
+@pytest.mark.parametrize("names", [["weight", "weight"], [None], [""], "weight", None])
+def test_invalid_parameter_unfreezes_are_rejected(names):
+    with pytest.raises(ValueError, match="unfreeze_parameters"):
+        parse_freeze_config({"unfreeze_parameters": names})
 
 
 def test_parameter_exclusions_rebind_across_wrappers_and_pipeline_partitions():

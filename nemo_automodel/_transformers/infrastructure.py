@@ -495,7 +495,7 @@ def _prepare_trainability_before_sharding(
 ) -> None:
     """Resolve trainability and prepare parameter-freezing storage before FSDP capture."""
     _apply_trainability_policy(model, peft_enabled=peft_enabled, freeze_config=freeze_config, strict=strict)
-    if freeze_config is not None and freeze_config.freeze_parameters and frozen_compute_dtype is not None:
+    if freeze_config is not None and freeze_config.has_generic_selectors() and frozen_compute_dtype is not None:
         prepare_frozen_parameters_for_sharding(model, frozen_compute_dtype)
 
 
@@ -503,22 +503,25 @@ def _validate_parameter_freezing_backend(
     model: torch.nn.Module, mesh: MeshContext, freeze_config: FreezeConfig | None
 ) -> None:
     """Reject exact parameter exclusions across unsupported TE expert renumbering."""
-    if freeze_config is None or not freeze_config.freeze_parameters:
+    if freeze_config is None:
+        return
+    selected_names = set(freeze_config.freeze_parameters or ()) | set(freeze_config.unfreeze_parameters or ())
+    if not selected_names:
         return
     if mesh.ep_size <= 1:
         return
     frozen_ids = {
         id(parameter)
         for name, parameter in model.named_parameters(remove_duplicate=False)
-        if canonical_parameter_fqn(name).replace("_orig_mod.", "") in freeze_config.freeze_parameters
+        if canonical_parameter_fqn(name).replace("_orig_mod.", "") in selected_names
     }
     for module in model.modules():
         if isinstance(module, GroupedExpertsTE) and any(
             id(parameter) in frozen_ids for parameter in module.parameters()
         ):
             raise ValueError(
-                "freeze_config.freeze_parameters cannot name TE expert parameters with expert parallelism; "
-                "freeze their owning module instead"
+                "freeze_config exact parameter selectors cannot name TE expert parameters with expert parallelism; "
+                "select their owning module instead"
             )
 
 
@@ -951,7 +954,7 @@ def apply_model_infrastructure(
     compute_dtype = getattr(mp_policy, "param_dtype", None)
     # One-rank FSDP2 has no mixed-precision wrappers: retain uniform storage for
     # explicit parameter freezes instead of introducing a plain-tensor dtype seam.
-    if freeze_config is not None and freeze_config.freeze_parameters and not fsdp2_active:
+    if freeze_config is not None and freeze_config.has_generic_selectors() and not fsdp2_active:
         compute_dtype = None
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:

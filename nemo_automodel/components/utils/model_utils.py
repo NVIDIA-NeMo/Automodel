@@ -396,6 +396,9 @@ class FreezeConfig:
     selectors, including module unfreezes. Unlisted parameters retain their
     existing trainability. Shared parameters can be frozen through any alias.
     This option changes trainability only; model ``dtype`` owns trainable storage.
+    ``unfreeze_parameters`` enables exact parameters after module selectors and
+    before exact exclusions. Combined with a whole-model module freeze, it defines
+    a narrow update surface without unfreezing sibling weights or biases.
     """
 
     freeze_modules: list[ModuleSelector] | None = None
@@ -405,11 +408,17 @@ class FreezeConfig:
     freeze_language_model: bool = False
     freeze_video_embedder: bool = False
     freeze_parameters: tuple[str, ...] | None = None
+    unfreeze_parameters: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate selectors and legacy compatibility options."""
-        if self.freeze_parameters is not None:
-            _validate_frozen_parameter_names(self)
+        for field_name in ("freeze_parameters", "unfreeze_parameters"):
+            names = getattr(self, field_name)
+            if names is not None:
+                if not isinstance(names, tuple) or any(not isinstance(name, str) or not name for name in names):
+                    raise ValueError(f"freeze_config.{field_name} must be a tuple of non-empty parameter names")
+                if len(set(names)) != len(names):
+                    raise ValueError(f"freeze_config.{field_name} must be unique")
         for field_name in ("freeze_modules", "unfreeze_modules"):
             selectors = getattr(self, field_name)
             if selectors is None:
@@ -432,21 +441,16 @@ class FreezeConfig:
     def has_generic_selectors(self) -> bool:
         """Return whether either generic selector field was explicitly declared."""
         return (
-            self.freeze_parameters is not None or self.freeze_modules is not None or self.unfreeze_modules is not None
+            self.freeze_parameters is not None
+            or self.unfreeze_parameters is not None
+            or self.freeze_modules is not None
+            or self.unfreeze_modules is not None
         )
-
-
-def _validate_frozen_parameter_names(config: FreezeConfig) -> None:
-    """Validate exact parameter exclusions without mutating the model."""
-    names = config.freeze_parameters
-    if not isinstance(names, tuple) or any(not isinstance(name, str) or not name for name in names):
-        raise ValueError("freeze_config.freeze_parameters must be a tuple of non-empty parameter names")
-    if len(set(names)) != len(names):
-        raise ValueError("freeze_config.freeze_parameters must be unique")
 
 
 _FREEZE_CONFIG_OPTIONS = {
     "freeze_parameters",
+    "unfreeze_parameters",
     "freeze_modules",
     "unfreeze_modules",
     "freeze_vision_tower",
@@ -537,8 +541,12 @@ def parse_freeze_config(config: FreezeConfig | Mapping[str, Any] | None) -> Free
     freeze_parameters = config.get("freeze_parameters")
     if "freeze_parameters" in config and not isinstance(freeze_parameters, (list, tuple)):
         raise ValueError("freeze_config.freeze_parameters must be a list or tuple of parameter names")
+    unfreeze_parameters = config.get("unfreeze_parameters")
+    if "unfreeze_parameters" in config and not isinstance(unfreeze_parameters, (list, tuple)):
+        raise ValueError("freeze_config.unfreeze_parameters must be a list or tuple of parameter names")
     return FreezeConfig(
         freeze_parameters=tuple(freeze_parameters) if freeze_parameters is not None else None,
+        unfreeze_parameters=tuple(unfreeze_parameters) if unfreeze_parameters is not None else None,
         freeze_modules=_selectors("freeze_modules"),
         unfreeze_modules=_selectors("unfreeze_modules"),
         **legacy_booleans,
@@ -624,8 +632,8 @@ def _apply_module_selectors(
             )
 
 
-def _resolve_frozen_parameters(model: nn.Module, names: tuple[str, ...], *, strict: bool) -> list[nn.Parameter]:
-    """Resolve exact canonical exclusions before changing trainability.
+def _resolve_selected_parameters(model: nn.Module, names: tuple[str, ...], *, strict: bool) -> list[nn.Parameter]:
+    """Resolve exact canonical names before changing trainability.
 
     Args:
         model: Model whose registered parameters may have arbitrary shapes.
@@ -643,7 +651,7 @@ def _resolve_frozen_parameters(model: nn.Module, names: tuple[str, ...], *, stri
     }
     missing = set(names) - parameters.keys()
     if strict and missing:
-        raise ValueError(f"Unknown frozen parameters: {sorted(missing)}")
+        raise ValueError(f"Unknown selected parameters: {sorted(missing)}")
     return [parameters[name] for name in names if name in parameters]
 
 
@@ -659,6 +667,7 @@ def apply_parameter_freezing(
     then ``unfreeze_modules`` unfreezes and wins on overlap. Framework-required
     freezes (dead K/V projections, indexer parameters) are applied separately
     by the infrastructure after this function, before and after sharding.
+    Exact ``unfreeze_parameters`` are enabled after module selectors.
     Exact ``freeze_parameters`` exclusions are applied last and do not change
     the trainability of unlisted parameters, storage dtype, or parameter identity.
 
@@ -681,7 +690,8 @@ def apply_parameter_freezing(
     if parsed_freeze_config is None:
         return
     freeze_config = parsed_freeze_config
-    frozen_parameters = _resolve_frozen_parameters(model, freeze_config.freeze_parameters or (), strict=strict)
+    frozen_parameters = _resolve_selected_parameters(model, freeze_config.freeze_parameters or (), strict=strict)
+    unfrozen_parameters = _resolve_selected_parameters(model, freeze_config.unfreeze_parameters or (), strict=strict)
 
     # Preserve the legacy attribute and substring matching independently of the
     # fnmatch semantics used by the generic selectors.
@@ -713,6 +723,8 @@ def apply_parameter_freezing(
         model, freeze_config.unfreeze_modules or [], requires_grad=True, strict=strict, field_name="unfreeze_modules"
     )
 
+    for parameter in unfrozen_parameters:
+        parameter.requires_grad_(True)
     for parameter in frozen_parameters:
         parameter.requires_grad_(False)
 
