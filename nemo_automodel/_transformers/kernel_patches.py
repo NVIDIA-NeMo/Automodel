@@ -24,16 +24,11 @@ import importlib
 import inspect
 import logging
 import types
-from typing import TYPE_CHECKING
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.shared.import_utils import safe_import
-
-if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.mesh import MeshContext
 
 # Check availability without fully importing (avoids CUDA init at import time).
 # The actual ``liger_kernel.transformers`` module is imported lazily inside
@@ -77,33 +72,10 @@ DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
 
-# Native models own their precision boundaries. HF compatibility hooks are
-# kept in the owning model packages and imported only for the selected model.
-_MODEL_RUNTIME_PATCHES = {
-    "axk2": ("nemo_automodel.components.models.axk2.hf_precision", "apply_hf_precision"),
-    "exaone_moe": ("nemo_automodel.components.models.exaone_moe.hf_precision", "apply_hf_precision"),
-    "glm5_next": ("nemo_automodel.components.models.glm5_next.hf_precision", "apply_hf_precision"),
-    "glm5_next_text": ("nemo_automodel.components.models.glm5_next.hf_precision", "apply_hf_precision"),
-    "deepseek_v3": ("nemo_automodel.components.models.deepseek_v3.hf_precision", "apply_hf_precision"),
-    "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.hf_precision", "apply_hf_precision"),
-    "dots1": ("nemo_automodel.components.models.dots1.hf_precision", "apply_hf_precision"),
-    "hy_v3": ("nemo_automodel.components.models.hy_v3.hf_precision", "apply_hf_precision"),
-    "deepseek_v2": ("nemo_automodel.components.models.deepseek_v2.hf_precision", "apply_hf_precision"),
-    "glm4_moe": ("nemo_automodel.components.models.glm4_moe.hf_precision", "apply_hf_precision"),
-    "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.hf_precision", "apply_hf_precision"),
-    "kimi_linear": ("nemo_automodel.components.models.kimi_linear.hf_precision", "apply_hf_precision"),
-    "nemotron_h": ("nemo_automodel.components.models.nemotron_v3.hf_precision", "apply_hf_precision"),
-    "glm4v_moe": ("nemo_automodel.components.models.glm4v_moe.hf_precision", "apply_hf_precision"),
-    "glm4v_moe_text": ("nemo_automodel.components.models.glm4v_moe.hf_precision", "apply_hf_precision"),
-    "deepseek_ocr2": ("nemo_automodel.components.models.deepseek_ocr2.hf_precision", "apply_hf_precision"),
-    "deepseek_ocr2_text": ("nemo_automodel.components.models.deepseek_ocr2.hf_precision", "apply_hf_precision"),
-    "glm4_moe_lite": ("nemo_automodel.components.models.glm4_moe_lite.hf_precision", "apply_hf_precision"),
-    "deepseek_v32": ("nemo_automodel.components.models.deepseek_v32.hf_precision", "apply_hf_precision"),
-    "solar_open": ("nemo_automodel.components.models.solar_open.hf_precision", "apply_hf_precision"),
-    "longcat_flash": ("nemo_automodel.components.models.longcat_flash.hf_precision", "apply_hf_precision"),
-    "hy_v4": ("nemo_automodel.components.models.hy_v4.hf_precision", "apply_hf_precision"),
-    "axk1": ("nemo_automodel.components.models.axk1.hf_precision", "apply_hf_precision"),
-}
+# Models build their CP/fp32-gate-aware modules at construction; no load-time
+# runtime patching is registered here. (Qwen3.5 dense/MoE build the native
+# CPAwareGatedDeltaNet + fp32 SSMGate in their model __init__.)
+_MODEL_RUNTIME_PATCHES = {}
 
 
 def _set_global_sdpa_backends(sdpa_method):
@@ -231,29 +203,14 @@ def _patch_liger_kernel(model):
 def _model_runtime_patch_keys(model):
     config = getattr(model, "config", None)
     keys = list(getattr(config, "architectures", None) or [])
-    model_type = getattr(config, "model_type", None)
-    if model_type is not None and model_type not in keys:
-        keys.append(model_type)
     model_cls_name = type(model).__name__
     if model_cls_name not in keys:
         keys.append(model_cls_name)
     return keys
 
 
-def apply_model_runtime_patches(model: torch.nn.Module, mesh: "MeshContext") -> torch.nn.Module:
-    """Apply model-owned HF precision compatibility for unsharded FSDP2.
-
-    Args:
-        model: Loaded model whose HF precision boundaries may need adaptation.
-        mesh: Resolved strategy and execution mesh.
-
-    Returns:
-        Model with its owning precision hook applied for a single-element FSDP2
-        mesh. Other strategies and meshes retain the original model behavior.
-    """
-    device_mesh = mesh.device_mesh
-    if not isinstance(mesh.strategy_config, FSDP2Config) or device_mesh is None or device_mesh.size() != 1:
-        return model
+def apply_model_runtime_patches(model, mesh):
+    """Apply registered architecture-specific runtime patches to a model."""
     seen_hooks = set()
     for key in _model_runtime_patch_keys(model):
         hook_spec = _MODEL_RUNTIME_PATCHES.get(key)
@@ -267,7 +224,7 @@ def apply_model_runtime_patches(model: torch.nn.Module, mesh: "MeshContext") -> 
         except ImportError:
             logger.debug("Runtime patch hook for %s is unavailable: %s.%s", key, module_name, hook_name)
             continue
-        model = hook(model, device_type=device_mesh.device_type)
+        model = hook(model, mesh=mesh)
     return model
 
 

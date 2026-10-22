@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise HF DeepSeek-V3 routing through checkpoint loading and single-rank training."""
+"""Exercise native DeepSeek routing through checkpoint loading and single-rank training."""
 
 from dataclasses import dataclass
 from datetime import timedelta
@@ -23,14 +23,17 @@ import torch
 import torch.distributed as dist
 from transformers import PreTrainedModel
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM, DeepseekV3TopkRouter
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
-from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32ForCausalLM, DeepseekV32TopkRouter
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32ForCausalLM
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3ForCausalLM as NativeDeepseekV3ForCausalLM
+from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32ForCausalLM as NativeDeepseekV32ForCausalLM
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -39,18 +42,51 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 class _Checkpoint:
     path: Path
     model_class: type[PreTrainedModel]
+    native_class: type[torch.nn.Module]
+
+
+def _per_expert_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Expand grouped HF weights to the native loader's per-expert checkpoint layout.
+
+    Args:
+        state: HF state with gate/up weights [experts, 2 * intermediate, hidden]
+            and down weights [experts, hidden, intermediate].
+
+    Returns:
+        State with individual two-dimensional gate, up and down projection weights.
+    """
+    result = {}
+    for name, value in state.items():
+        if name.endswith(".experts.gate_up_proj"):
+            prefix = name.removesuffix(".gate_up_proj")
+            for expert, weight in enumerate(value):
+                gate, up = weight.chunk(2, dim=0)
+                result[f"{prefix}.{expert}.gate_proj.weight"] = gate.clone()
+                result[f"{prefix}.{expert}.up_proj.weight"] = up.clone()
+        elif name.endswith(".experts.down_proj"):
+            prefix = name.removesuffix(".down_proj")
+            for expert, weight in enumerate(value):
+                result[f"{prefix}.{expert}.down_proj.weight"] = weight.clone()
+        else:
+            result[name] = value
+    return result
 
 
 @pytest.fixture(
     params=[
-        (DeepseekV3Config, DeepseekV3ForCausalLM, {}),
-        (DeepseekV32Config, DeepseekV32ForCausalLM, dict(index_n_heads=2, index_head_dim=32, index_topk=4)),
+        (DeepseekV3Config, DeepseekV3ForCausalLM, NativeDeepseekV3ForCausalLM, {}),
+        (
+            DeepseekV32Config,
+            DeepseekV32ForCausalLM,
+            NativeDeepseekV32ForCausalLM,
+            dict(index_n_heads=2, index_head_dim=32, index_topk=4),
+        ),
     ],
     ids=["deepseek_v3", "deepseek_v32"],
 )
 def checkpoint(tmp_path, request):
     torch.manual_seed(42)
-    config_type, model_class, index_kwargs = request.param
+    config_type, model_class, native_class, index_kwargs = request.param
     config = config_type(
         vocab_size=64,
         hidden_size=64,
@@ -76,8 +112,9 @@ def checkpoint(tmp_path, request):
     )
     config._attn_implementation = "sdpa"
     path = tmp_path / "checkpoint"
-    model_class(config).save_pretrained(path)
-    return _Checkpoint(path, model_class)
+    model = model_class(config)
+    model.save_pretrained(path, state_dict=_per_expert_state(model.state_dict()))
+    return _Checkpoint(path, model_class, native_class)
 
 
 @pytest.fixture
@@ -92,37 +129,39 @@ def single_rank_group(tmp_path):
 
 
 def _check_router(module, inputs, output):
-    # The untouched upstream implementation, outside autocast, is the oracle.
+    # Native routing must retain the values and selections computed outside AMP.
     with torch.no_grad(), torch.autocast("cuda", enabled=False):
-        expected = type(module).forward(module, inputs[0])
-        projected = torch.nn.functional.linear(inputs[0].reshape(-1, module.hidden_dim).float(), module.weight.float())
-    assert output[0].dtype == output[1].dtype == torch.float32
-    torch.testing.assert_close(output[0], projected, rtol=0, atol=0)
+        expected = type(module).forward(module, *inputs)
+    assert module.gate_precision == output[0].dtype == torch.float32
     for actual, oracle in zip(output, expected):
-        torch.testing.assert_close(actual, oracle, rtol=0, atol=0)
+        if oracle is not None:
+            torch.testing.assert_close(actual, oracle, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])
-def test_force_hf_router_precision_and_training(checkpoint, single_rank_group, tmp_path, checkpointing):
+def test_native_router_precision_and_training(checkpoint, single_rank_group, tmp_path, checkpointing):
     model = NeMoAutoModelForCausalLM.from_pretrained(
         str(checkpoint.path),
-        force_hf=True,
         dtype=torch.float32,
         attn_implementation="sdpa",
         use_liger_kernel=False,
         use_sdpa_patching=False,
+        backend=BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False),
+        moe_overrides=dict(
+            router_weights_fp32=True, force_e_score_correction_bias=True, gate_bias_update_factor=0, aux_loss_coeff=0
+        ),
         distributed_setup=DistributedSetup.build(
             strategy=FSDP2Config(), world_size=1, activation_checkpointing=checkpointing
         ),
     ).train()
-    assert isinstance(model, checkpoint.model_class)
+    assert isinstance(model, checkpoint.native_class)
     source = checkpoint.model_class.from_pretrained(checkpoint.path, dtype=torch.float32).state_dict()
-    for name, value in model.state_dict().items():
-        assert value.dtype == source[name].dtype
-        torch.testing.assert_close(value.cpu(), source[name], rtol=0, atol=0)
-    gate = next(
-        module for module in model.modules() if isinstance(module, (DeepseekV3TopkRouter, DeepseekV32TopkRouter))
-    )
+    expected_state = model.state_dict_adapter.from_hf(_per_expert_state(source))
+    loaded = model.state_dict()
+    for name, value in expected_state.items():
+        assert loaded[name].dtype == value.dtype
+        torch.testing.assert_close(loaded[name].cpu(), value.cpu(), rtol=0, atol=0)
+    gate = model.model.layers["0"].mlp.gate
     original = gate.weight.detach().clone()
     buffers = {name: value.clone() for name, value in model.named_buffers()}
     router_calls, projection_dtypes = [], []
@@ -135,10 +174,13 @@ def test_force_hf_router_precision_and_training(checkpoint, single_rank_group, t
     inputs = torch.tensor([[2, 4, 6, 8, 10, 12, 14, 16]], device="cuda")
     try:
         for _ in range(2):
-            output = model(input_ids=inputs, labels=inputs)
+            output = model(input_ids=inputs)
             assert output.logits.dtype == torch.bfloat16
-            assert torch.isfinite(output.loss)
-            output.loss.backward()
+            loss = torch.nn.functional.cross_entropy(
+                output.logits[:, :-1].float().flatten(0, 1), inputs[:, 1:].flatten()
+            )
+            assert torch.isfinite(loss)
+            loss.backward()
             assert gate.weight.grad is not None and gate.weight.grad.abs().max() > 0
             assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
             optimizer.step()
@@ -166,5 +208,6 @@ def test_force_hf_router_precision_and_training(checkpoint, single_rank_group, t
     )
     model.save_pretrained(str(exported), checkpointer=checkpointer)
     reloaded = checkpoint.model_class.from_pretrained(exported / "model/consolidated", dtype=torch.float32)
-    for name, value in model.state_dict().items():
-        torch.testing.assert_close(reloaded.state_dict()[name], value.cpu(), rtol=0, atol=0)
+    reloaded_state = model.state_dict_adapter.from_hf(_per_expert_state(reloaded.state_dict()))
+    for name, value in reloaded_state.items():
+        torch.testing.assert_close(value.cpu(), model.state_dict()[name].cpu(), rtol=0, atol=0)
