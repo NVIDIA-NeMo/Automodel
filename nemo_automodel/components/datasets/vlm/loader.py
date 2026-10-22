@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Sized
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
@@ -167,6 +168,7 @@ class VlmDataloaderConfig:
     chat_template: str | None = None
     shuffle: bool = True
     num_workers: int = 0
+    """Worker processes per dataloader; zero selects the available CPU count with a warning."""
     pin_memory: bool = False
     persistent_workers: bool = False
     prefetch_factor: int | None = None
@@ -315,12 +317,26 @@ class VlmDataloaderConfig:
             rank=dp_rank,
             shuffle=self.shuffle,
         )
+        num_workers = self.num_workers
+        if num_workers == 0:
+            try:
+                available_cpus = len(os.sched_getaffinity(0))
+            except (AttributeError, OSError, NotImplementedError):
+                available_cpus = None
+            num_workers = available_cpus or os.cpu_count() or 1
+            logger.warning(
+                "VLM dataloader num_workers=0 disables background preprocessing and prefetching; "
+                "using num_workers=%d based on the CPUs available to this process. "
+                "This count is per dataloader; set an explicit positive num_workers "
+                "to limit workers when training ranks share CPUs.",
+                num_workers,
+            )
         dataloader = StatefulDataLoader(
             dataset=dataset,
             sampler=sampler,
             collate_fn=collate_fn,
             batch_size=batch_size,
-            num_workers=self.num_workers,
+            num_workers=num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             prefetch_factor=self.prefetch_factor,

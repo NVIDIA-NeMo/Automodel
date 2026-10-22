@@ -135,6 +135,31 @@ dataset:
 ```
 This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
 
+## DataLoader Workers
+
+For VLM training and validation, `num_workers: 0` automatically selects one worker
+per CPU available to the training process and logs a warning with the resolved
+count. This enables background preprocessing and batch prefetching. The count
+respects CPU affinity when available, falls back to the system CPU count, and
+uses one worker if neither count is available.
+
+The count applies to each dataloader independently. When several training ranks
+share CPUs, set an explicit positive worker count to limit CPU and host-memory
+use. For example:
+
+```yaml
+dataloader:
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+
+validation_dataloader:
+  num_workers: 2
+```
+
+Custom datasets and collators run in worker processes and must prepare data on
+the CPU. Move batches to the GPU in the training process.
+
 ## Custom Chat Template
 
 By default, VLM fine-tuning uses the chat template built into the model's `AutoProcessor`. To use a custom template, add `chat_template` under `dataset:` in your YAML config:

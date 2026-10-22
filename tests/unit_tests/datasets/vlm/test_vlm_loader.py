@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from transformers import ProcessorMixin
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDatasetConfig
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+from nemo_automodel.components.datasets.vlm import loader as vlm_loader
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
     packed_sequence_thd_vlm_collater,
@@ -136,7 +138,8 @@ def test_recipe_config_accepts_cord_v2_sample_limit():
     assert config.dataset_config.limit_dataset_samples == 100
 
 
-def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterates():
+def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterates(monkeypatch):
+    monkeypatch.setattr(vlm_loader.os, "sched_getaffinity", lambda _: {0, 1})
     events = []
     processor = DummyProcessor()
 
@@ -145,7 +148,7 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
         return processor
 
     def collate(examples, *, processor, prefix):
-        return [prefix + example for example in examples], processor
+        return [prefix + example for example in examples], processor.tokenizer.pad_token_id
 
     config = VlmDataloaderConfig(
         dataset_config=StaticDatasetConfig(events),
@@ -162,12 +165,115 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
         batch_size=2,
         dataset_build_context=BuildContext(events),
     )
-    batch, batch_processor = next(iter(result.dataloader))
+    batches = list(result.dataloader)
+    batch, padding_idx = batches[0]
 
     assert events == ["enter", "processor", "dataset", "exit"]
     assert result.processor is processor
     assert batch == ["item:one", "item:two"]
-    assert batch_processor is processor
+    assert padding_idx == processor.tokenizer.pad_token_id
+
+
+@pytest.mark.parametrize(
+    ("affinity", "cpu_count", "expected"),
+    [
+        ({4, 5}, 128, 2),
+        (OSError("unavailable"), 3, 3),
+        (AttributeError("unavailable"), 4, 4),
+        (NotImplementedError(), None, 1),
+        (set(), 2, 2),
+    ],
+)
+def test_zero_vlm_workers_uses_available_cpus_without_mutating_config(
+    monkeypatch, caplog, affinity, cpu_count, expected
+):
+    def get_affinity(_):
+        if isinstance(affinity, Exception):
+            raise affinity
+        return affinity
+
+    monkeypatch.setattr(vlm_loader, "os", SimpleNamespace(sched_getaffinity=get_affinity, cpu_count=lambda: cpu_count))
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        num_workers=0,
+        persistent_workers=True,
+        prefetch_factor=3,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=vlm_loader.__name__):
+        for _ in range(2):
+            result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1)
+            assert result.dataloader.num_workers == expected
+            assert result.dataloader.persistent_workers is True
+            assert result.dataloader.prefetch_factor == 3
+
+    assert config.num_workers == 0
+    messages = [record.getMessage() for record in caplog.records if record.name == vlm_loader.__name__]
+    worker_messages = [message for message in messages if "num_workers=0" in message]
+    assert len(worker_messages) == 2
+    assert all(f"using num_workers={expected}" in message for message in worker_messages)
+    assert all("prefetching" in message and "per dataloader" in message for message in worker_messages)
+
+
+def test_positive_vlm_workers_is_preserved_without_auto_selection_warning(monkeypatch, caplog):
+    monkeypatch.setattr(vlm_loader.os, "sched_getaffinity", lambda _: set(range(8)))
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        num_workers=3,
+    )
+
+    result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1)
+
+    assert result.dataloader.num_workers == 3
+    assert config.num_workers == 3
+    assert "num_workers=0" not in caplog.text
+
+
+def test_negative_vlm_workers_is_rejected():
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=DummyProcessor),
+        num_workers=-1,
+    )
+
+    with pytest.raises(ValueError, match="num_workers"):
+        config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1)
+
+
+def _collate_worker_samples(examples, *, processor):
+    return examples, torch.utils.data.get_worker_info().id
+
+
+@pytest.mark.parametrize("validation", [False, True])
+def test_vlm_recipe_auto_workers_prefetch_and_iterate_in_workers(monkeypatch, validation):
+    monkeypatch.setattr(vlm_loader.os, "sched_getaffinity", lambda _: {0, 1})
+    recipe = RecipeConfig(
+        ConfigNode(
+            {
+                "validation_dataset" if validation else "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset",
+                },
+                "validation_dataloader" if validation else "dataloader": {
+                    "num_workers": 0,
+                    "shuffle": False,
+                },
+            }
+        )
+    )
+    config = recipe.vlm_validation_dataloader if validation else recipe.vlm_dataloader
+    config.dataset_config = StaticDatasetConfig([])
+    config.processor_config = VlmProcessorConfig(factory=lambda: None)
+    config.collator = VlmCollatorConfig(factory=_collate_worker_samples)
+    result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1)
+
+    batches = list(result.dataloader)
+
+    assert result.dataloader.num_workers == 2
+    assert result.dataloader.prefetch_factor == 2
+    assert batches == [(["one"], 0), (["two"], 1)]
+    assert config.num_workers == 0
 
 
 def test_vlm_processor_builds_independently_configured_video_processor():
