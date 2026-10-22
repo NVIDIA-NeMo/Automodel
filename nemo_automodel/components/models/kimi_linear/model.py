@@ -1107,7 +1107,10 @@ class KimiLinear48BModel(nn.Module):
                 positions and -1 padding, or [tokens] indexing flattened batch
                 and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
                 with row-local boundaries and -1 padding, or [documents + 1] for
-                flattened/THD inputs. ``max_seqlen`` is an integer document length.
+                flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
+                or [documents + 1] for THD inputs and gives physical boundaries
+                including per-document padding, rather than logical token counts.
+                ``max_seqlen`` is an integer document length.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
