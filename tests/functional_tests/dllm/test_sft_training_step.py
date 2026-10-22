@@ -68,7 +68,7 @@ def test_mdlm_sft_step_corrupts_tokens_and_updates_model() -> None:
     recipe.lr_scheduler = None
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.dist_env = SimpleNamespace(device=device, world_size=1)
-    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None)
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.device_mesh = None
     recipe.moe_mesh = None
     recipe.pp_enabled = False

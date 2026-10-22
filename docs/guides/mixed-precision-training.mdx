@@ -38,8 +38,7 @@ On a single-rank or single-element mesh, AutoModel skips FSDP2 sharding and
 applies the policy's compute dtype through forward autocast instead. This also
 applies to direct model calls. Resident parameters and buffers retain their
 storage precision, and activation-checkpoint recomputation retains autocast.
-An explicit `distributed.autocast_dtype` overrides the policy's compute dtype
-on this unsharded path.
+The compute dtype comes from `distributed.mp_policy.param_dtype`.
 An explicit `mp_policy.output_dtype` casts floating forward outputs while
 preserving integer outputs and model-output containers. Native AutoModel
 implementations protect explicitly FP32 math, including routing, rotary angle

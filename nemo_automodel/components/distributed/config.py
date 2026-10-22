@@ -281,11 +281,6 @@ class FSDP2Config:
             See ``docs/guides/mixed-precision-training.md`` for the full set of recommended
             patterns and the bf16-storage trap.
         offload_policy (Optional[CPUOffloadPolicy]): CPUOffloadPolicy for CPU offloading.
-        autocast_dtype (Optional[torch.dtype]): If set, wraps the forward pass in
-            ``torch.autocast(device_type="cuda", dtype=autocast_dtype)``.  Use with
-            ``output_dtype=float32`` in mp_policy to keep the residual stream in fp32
-            while running matmuls in lower precision.  Set to ``None`` to disable.
-            Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
         activation_checkpointing (bool | "full" | "selective" | "moe"): Enable activation checkpointing. ``True`` or
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
             blocks with PyTorch selective activation checkpointing. ``"moe"`` (expert-parallel models only)
@@ -335,7 +330,6 @@ class FSDP2Config:
         )
     )
     offload_policy: CPUOffloadPolicy | None = None
-    autocast_dtype: torch.dtype | None = None
     activation_checkpointing: ActivationCheckpointingMode = False
     activation_checkpointing_scope: ActivationCheckpointingScope = "all"
     defer_fsdp_grad_sync: bool = True
@@ -457,9 +451,6 @@ class DDPConfig:
         static_graph (bool): Tell DDP the used/unused parameter set is stable.
         bucket_cap_mb (Optional[float]): DDP gradient bucket size in MiB. ``None`` uses PyTorch's default.
         gradient_as_bucket_view (bool): Make gradients views into DDP buckets after the first iteration.
-        autocast_dtype (Optional[torch.dtype]): If set, recipes can wrap the forward pass in
-            ``torch.autocast(device_type="cuda", dtype=autocast_dtype)``. Set to ``None`` to disable.
-            Can be set from YAML as a string (e.g. ``autocast_dtype: bfloat16``).
     """
 
     activation_checkpointing: ActivationCheckpointingMode = False
@@ -469,7 +460,6 @@ class DDPConfig:
     static_graph: bool = False
     bucket_cap_mb: float | None = None
     gradient_as_bucket_view: bool = False
-    autocast_dtype: torch.dtype | None = None
 
     def __post_init__(self):
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(

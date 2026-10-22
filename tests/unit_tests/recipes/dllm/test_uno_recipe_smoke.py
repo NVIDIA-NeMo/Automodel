@@ -80,7 +80,7 @@ def _recipe(model, loss_fn, step: int, seed: int):
     recipe = types.SimpleNamespace(
         dist_env=types.SimpleNamespace(device=torch.device("cpu")),
         model_parts=[model],
-        distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+        distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True),
         te_fp8=None,
         device_mesh=None,
         dllm_loss_fn=loss_fn,

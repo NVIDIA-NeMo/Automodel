@@ -414,7 +414,7 @@ class TestIDLMStrategy:
         recipe = types.SimpleNamespace(
             dist_env=types.SimpleNamespace(device=torch.device("cpu")),
             model_parts=[model],
-            distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+            distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True),
             te_fp8=None,
             device_mesh=None,
             dllm_loss_fn=loss_fn,
@@ -550,7 +550,6 @@ class TestUnoStrategy:
             model_parts=[model],
             distributed_config=types.SimpleNamespace(
                 defer_fsdp_grad_sync=True,
-                autocast_dtype=None,
                 mp_policy=types.SimpleNamespace(param_dtype=torch.bfloat16),
             ),
             te_fp8=None,
@@ -601,7 +600,7 @@ class TestUnoStrategy:
         recipe = types.SimpleNamespace(
             dist_env=types.SimpleNamespace(device=torch.device("cpu")),
             model_parts=[model],
-            distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+            distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True),
             te_fp8=None,
             device_mesh=None,
             dllm_loss_fn=recording_loss,
@@ -1001,7 +1000,7 @@ def test_dflash_forward_backward_uses_precomputed_multiblock_tensors(use_fused_l
     recipe = types.SimpleNamespace(
         dist_env=types.SimpleNamespace(device=torch.device("cpu")),
         model_parts=[draft],
-        distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+        distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True),
         te_fp8=None,
         device_mesh=None,
         _dllm_loss_buffer=[],
@@ -1054,7 +1053,7 @@ def test_dflash_forward_backward_fallback_skips_mask_for_single_sdpa_block():
         mask_token_id=31,
         dist_env=types.SimpleNamespace(device=torch.device("cpu")),
         model_parts=[draft],
-        distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+        distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True),
         te_fp8=None,
         device_mesh=None,
         _dllm_loss_buffer=[],
