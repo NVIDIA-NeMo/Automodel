@@ -89,8 +89,10 @@ def packed_flash_attention(
 ) -> torch.Tensor:
     """Apply causal attention per document without dense sequence-square masks.
 
-    FlashAttention-4 consumes the native, unequal QK/value widths and uses the
-    original QK softmax scale. Padding query outputs are zero. Attention dropout
+    FlashAttention-4 consumes native unequal widths when QK is at least as wide
+    as V, including Kimi's 192/128 heads. Otherwise pad Q/K to V's width to avoid
+    incorrect SM90 varlen backward results with narrower QK. Preserve the original
+    QK softmax scale. Padding query outputs are zero. Attention dropout
     is unsupported; use the eager implementation when dropout is required.
 
     Args:
@@ -116,6 +118,8 @@ def packed_flash_attention(
     for tensor in (query, key, value):
         tokens = tensor.transpose(1, 2).reshape(batch * sequence, heads, tensor.shape[-1])
         tokens = tokens.index_select(0, layout.indices)
+        if tokens.shape[-1] < value_dim:
+            tokens = F.pad(tokens, (0, value_dim - tokens.shape[-1]))
         gathered.append(tokens)
     attended, _lse = kernel(
         *gathered,
