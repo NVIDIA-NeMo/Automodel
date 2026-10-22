@@ -17,6 +17,7 @@
 import pytest
 import torch
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
 from nemo_automodel.components.models.kimi_linear.cp import (
     KimiPackedContext,
@@ -94,8 +95,7 @@ def test_mla_projection_parameter_and_input_gradients(dtype) -> None:
         torch_dtype=dtype,
     )
     eager = KimiMLAAttention(config, 0).cuda()
-    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
-    fast = KimiMLAAttention(fast_config, 0).cuda()
+    fast = KimiMLAAttention(config, 0, backend=BackendConfig(attn="fa4")).cuda()
     fast.load_state_dict(eager.state_dict(), strict=True)
     ids = torch.tensor(
         [[1] * 7 + [0] + [2] * 5 + [0] * 3, [0] * 3 + [1] * 5 + [2] * 8],

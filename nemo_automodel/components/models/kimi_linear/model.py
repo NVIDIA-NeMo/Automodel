@@ -282,9 +282,17 @@ class KimiRMSNorm(nn.Module):
 class KimiMLAAttention(nn.Module):
     """Kimi MLA full-attention layer copied from the HF reference math."""
 
-    def __init__(self, config: KimiLinear48BConfig, layer_idx: int) -> None:
+    def __init__(self, config: KimiLinear48BConfig, layer_idx: int, *, backend: BackendConfig | None = None) -> None:
+        """Initialize MLA projections and the runtime attention backend.
+
+        Args:
+            config: Model architecture and projection dimensions.
+            layer_idx: Decoder layer index.
+            backend: Runtime backend selection; defaults to eager attention.
+        """
         super().__init__()
         self.config = config
+        self.backend = backend if backend is not None else BackendConfig(attn="eager")
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -379,9 +387,9 @@ class KimiMLAAttention(nn.Module):
 
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
-        if self.config.mla_attn_implementation == "fa4":
+        if self.backend.attn == "fa4":
             if attention_mask is not None:
-                raise ValueError("Flash MLA consumes document metadata, not an additive attention_mask")
+                raise ValueError("backend.attn='fa4' consumes document metadata, not an additive attention_mask")
             if flash_layout is None:
                 doc_ids = (
                     packed_context.doc_ids
@@ -829,7 +837,9 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % getattr(config, "moe_layer_freq", 1) == 0
         )
         self.self_attn = (
-            KimiDeltaAttention(config, layer_idx) if self.is_linear_attn else KimiMLAAttention(config, layer_idx)
+            KimiDeltaAttention(config, layer_idx)
+            if self.is_linear_attn
+            else KimiMLAAttention(config, layer_idx, backend=backend)
         )
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
@@ -1129,9 +1139,12 @@ class KimiLinear48BModel(nn.Module):
             or attn_kwargs.get("packed_token_indices") is not None
             or attn_kwargs.get("cu_seqlens") is not None
         )
-        use_flash = self.config.mla_attn_implementation == "fa4"
+        use_flash = self.backend.attn == "fa4"
         if use_flash and attention_mask is not None and attention_mask.shape != inputs_embeds.shape[:2]:
-            raise ValueError("Flash MLA requires a binary/document attention_mask [batch, sequence]")
+            raise ValueError(
+                f"backend.attn='fa4' requires a binary/document attention_mask [batch, sequence]; "
+                f"got {tuple(attention_mask.shape)}"
+            )
         physical_boundaries = attn_kwargs.get("cu_seqlens_padded") if use_flash else None
         packed_context = kimi_packed_context or _packed_context_from_inputs(
             inputs_embeds,
@@ -1149,8 +1162,6 @@ class KimiLinear48BModel(nn.Module):
         if use_flash and not (packed_context is not None and packed_context.cp_enabled):
             if packed_context is not None:
                 doc_ids = packed_context.doc_ids
-            elif padding_mask is not None:
-                doc_ids = (~padding_mask).to(torch.int32)
             else:
                 doc_ids = torch.ones(inputs_embeds.shape[:2], dtype=torch.int32, device=inputs_embeds.device)
             if padding_mask is not None:

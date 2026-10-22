@@ -14,6 +14,8 @@
 
 """CPU arithmetic checks for packed MLA layouts, outputs and gradients."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -142,8 +144,7 @@ def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash,
     config = _tiny_kimi_config()
     eager = KimiLinear48BForCausalLM(config, backend=_backend_config())
     eager.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
-    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
-    fast = KimiLinear48BForCausalLM(fast_config, backend=_backend_config())
+    fast = KimiLinear48BForCausalLM(config, backend=replace(_backend_config(), attn="fa4"))
     fast.load_state_dict(eager.state_dict(), strict=True)
     ids = torch.tensor([[1, 1, 2, 2, 0], [0, 1, 1, 1, 0]], dtype=torch.int32)
     if mask_kind in ("binary", "padding_only"):
@@ -188,10 +189,36 @@ def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash,
             torch.testing.assert_close(right.grad, left.grad, atol=1e-6, rtol=1e-4, msg=name)
 
 
+def test_layer_fallback_builds_layout_and_preserves_outputs_and_gradients(fake_flash) -> None:
+    torch.manual_seed(18)
+    config = _tiny_kimi_config()
+    eager = KimiMLAAttention(config, 0)
+    fast = KimiMLAAttention(config, 0, backend=replace(_backend_config(), attn="fa4"))
+    fast.load_state_dict(eager.state_dict(), strict=True)
+    ids = torch.tensor([[1, 1, 2, 0]], dtype=torch.int32)
+    context = KimiPackedContext(ids)
+    x = torch.randn(1, 4, config.hidden_size, requires_grad=True)
+    y = x.detach().clone().requires_grad_()
+    mask = build_document_causal_mask(ids, ids, q_global_start=0, dtype=x.dtype)
+
+    expected = eager(x, attention_mask=mask, packed_context=context)
+    actual = fast(y, packed_context=context)
+
+    valid = ids > 0
+    torch.testing.assert_close(actual[valid], expected[valid], atol=1e-6, rtol=1e-5)
+    assert torch.count_nonzero(actual[~valid]) == 0
+    upstream = torch.randn_like(actual) * valid[..., None]
+    expected.backward(upstream)
+    actual.backward(upstream)
+    torch.testing.assert_close(y.grad, x.grad, atol=1e-6, rtol=1e-5)
+    for (name, left), (other, right) in zip(fast.named_parameters(), eager.named_parameters()):
+        assert name == other
+        torch.testing.assert_close(left.grad, right.grad, atol=1e-6, rtol=1e-5, msg=name)
+
+
 def test_cp_keeps_its_existing_attention_path(fake_flash, monkeypatch) -> None:
     config = _tiny_kimi_config()
-    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
-    layer = KimiMLAAttention(config, 0)
+    layer = KimiMLAAttention(config, 0, backend=replace(_backend_config(), attn="fa4"))
     context = KimiPackedContext(torch.ones(1, 4, dtype=torch.int32), cp_size=2)
     calls = []
 
@@ -222,8 +249,7 @@ def test_missing_optional_dependency_and_explicit_dense_mask(monkeypatch) -> Non
     with pytest.raises(UnavailableError, match="flash_attn.cute"):
         flash.packed_flash_attention(q, q, q, layout=layout, scale=8**-0.5)
     config = _tiny_kimi_config()
-    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
-    layer = KimiMLAAttention(config, 0)
+    layer = KimiMLAAttention(config, 0, backend=replace(_backend_config(), attn="fa4"))
     with pytest.raises(ValueError, match="additive attention_mask"):
         layer(
             torch.randn(1, 2, config.hidden_size),
@@ -231,12 +257,22 @@ def test_missing_optional_dependency_and_explicit_dense_mask(monkeypatch) -> Non
         )
 
 
-def test_config_roundtrip_and_invalid_backend() -> None:
-    config = KimiLinear48BConfig(mla_attn_implementation="fa4")
-    assert KimiLinear48BConfig.from_dict(config.to_dict()).mla_attn_implementation == "fa4"
-    assert KimiLinear48BConfig().mla_attn_implementation == "eager"
-    with pytest.raises(ValueError, match="mla_attn_implementation"):
-        KimiLinear48BConfig(mla_attn_implementation="invalid")
+def test_checkpoint_config_does_not_persist_the_execution_backend(monkeypatch) -> None:
+    config = _tiny_kimi_config()
+    fast = KimiLinear48BForCausalLM(config, backend=replace(_backend_config(), attn="fa4"))
+    fast.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    saved = fast.config.to_dict()
+    assert "mla_attn_implementation" not in saved
+    restored = KimiLinear48BForCausalLM(KimiLinear48BConfig.from_dict(saved), backend=_backend_config())
+    assert fast.backend.attn == "fa4"
+    assert restored.backend.attn == "eager"
+    restored.load_state_dict(fast.state_dict(), strict=True)
+
+    def reject_flash():
+        raise AssertionError("A restored checkpoint must run without the optional FA4 kernel")
+
+    monkeypatch.setattr(flash, "_load_fa4_varlen", reject_flash)
+    assert torch.isfinite(restored(input_ids=torch.tensor([[3, 4]])).logits).all()
 
 
 def test_thd_document_spans_respect_physical_padding(fake_flash) -> None:
@@ -244,8 +280,7 @@ def test_thd_document_spans_respect_physical_padding(fake_flash) -> None:
     config = _tiny_kimi_config()
     reference = KimiLinear48BForCausalLM(config, backend=_backend_config())
     reference.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
-    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
-    fast = KimiLinear48BForCausalLM(fast_config, backend=_backend_config())
+    fast = KimiLinear48BForCausalLM(config, backend=replace(_backend_config(), attn="fa4"))
     fast.load_state_dict(reference.state_dict(), strict=True)
     tokens = torch.tensor([[3, 4, 0, 5, 0, 0]])
     ids = torch.tensor([[1, 1, 0, 2, 0, 0]], dtype=torch.int32)
@@ -270,8 +305,7 @@ def test_thd_document_spans_respect_physical_padding(fake_flash) -> None:
 
 def test_backbone_rejects_dense_mask_in_flash_mode() -> None:
     config = _tiny_kimi_config()
-    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
-    model = KimiLinear48BForCausalLM(config, backend=_backend_config())
+    model = KimiLinear48BForCausalLM(config, backend=replace(_backend_config(), attn="fa4"))
     with pytest.raises(ValueError, match="binary/document attention_mask"):
         model(input_ids=torch.tensor([[3, 4]]), attention_mask=torch.zeros(1, 1, 2, 2))
 

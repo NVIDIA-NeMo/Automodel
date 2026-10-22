@@ -46,11 +46,6 @@ model:
     _target_: nemo_automodel.components.models.kimi_linear.config.KimiLinear48BConfig.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
     name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
-    # Packed non-CP MLA requires CUDA fp16/bf16 and a container built with INSTALL_FA4=true.
-    # Document boundaries/padding use the THD metadata; dense additive masks are unsupported.
-    # FA4 requires attention_dropout=0; use eager for attention dropout.
-    # CP retains compressed-KV gather and FlexAttention.
-    mla_attn_implementation: fa4
     kda_mode: chunk
     kda_unpad_inputs: false
     kda_use_fused_gate: true
@@ -61,7 +56,12 @@ model:
   output_hidden_states: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: eager
+    # Non-CP MLA requires CUDA fp16/bf16 and INSTALL_FA4=true in the container.
+    # FA4 requires attention_dropout=0; use eager for attention dropout.
+    # This raw-THD recipe retains whole-pack causal attention at CP=1.
+    # Document-ID masks or converted THD metadata isolate documents; dense masks are unsupported.
+    # CP retains compressed-KV gather and FlexAttention.
+    attn: fa4
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
