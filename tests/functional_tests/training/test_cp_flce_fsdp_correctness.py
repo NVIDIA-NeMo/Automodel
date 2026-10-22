@@ -220,9 +220,65 @@ def _assert_accumulated_unused_param_grad_dtype(device: torch.device) -> None:
             expected_used += grad.float()
     expected_used /= world
 
-    unused_grad = _full_grad(model.unused.weight)
-    torch.testing.assert_close(unused_grad, torch.zeros_like(unused_grad), rtol=0, atol=0)
+    # No rank used `unused`, so its reduced zero is dropped and the optimizer skips it as without CP.
+    assert model.unused.weight.grad is None
     torch.testing.assert_close(_full_grad(model.used.weight), expected_used, rtol=2e-2, atol=2e-2)
+
+
+def _assert_globally_unused_param_keeps_none_grad(device: torch.device) -> None:
+    """A parameter no rank used in a window keeps ``grad is None``, so AdamW leaves it and its state alone.
+
+    Reduction runs after every micro-batch, the default without deferred gradient sync: a
+    micro-batch in which no rank runs the conditional branch creates a reduced zero, which must
+    not turn into an AdamW step (decoupled weight decay alone would move the weight), while a
+    branch that one rank runs in another micro-batch of the same window keeps its gradient.
+    """
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("dp_cp",))
+
+    torch.manual_seed(2468)
+    model = _ConditionalFSDPModel().to(device)
+    reference = _ConditionalFSDPModel().to(device)
+    reference.load_state_dict(model.state_dict())
+    fully_shard(model, mesh=mesh, reshard_after_forward=False)
+    assert configure_fsdp_unused_param_reduction(model) >= 1
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.1)
+
+    def _inputs(window: int, micro_index: int, data_rank: int) -> torch.Tensor:
+        generator = torch.Generator(device=device).manual_seed(8000 + 100 * window + 10 * micro_index + data_rank)
+        return torch.randn(2, 3, 8, device=device, generator=generator)
+
+    def _run_window(window: int, users_per_micro_batch: list[tuple[int, ...]]) -> None:
+        for micro_index, users in enumerate(users_per_micro_batch):
+            model(_inputs(window, micro_index, rank), use_conditional=rank in users).sum().backward()
+
+    # Only rank 0 runs the branch, in the second micro-batch: the first micro-batch's reduced
+    # zero is dropped and the second one's contribution survives.
+    _run_window(0, [(), (0,)])
+    reference(_inputs(0, 1, 0), use_conditional=True).sum().div(world).backward()
+    torch.testing.assert_close(
+        _full_grad(model.conditional.weight), reference.conditional.weight.grad.float(), rtol=1e-5, atol=1e-6
+    )
+    optimizer.step()
+    optimizer.zero_grad()
+
+    # A contribution from the first micro-batch is kept through a later micro-batch nobody used it in.
+    _run_window(1, [(0,), ()])
+    assert model.conditional.weight.grad is not None
+    optimizer.step()
+    optimizer.zero_grad()
+
+    conditional_before = model.conditional.weight.to_local().clone()
+    output_before = model.output.weight.to_local().clone()
+    conditional_step = optimizer.state[model.conditional.weight]["step"].clone()
+    _run_window(2, [(), ()])
+    assert model.conditional.weight.grad is None
+    optimizer.step()
+    optimizer.zero_grad()
+    assert torch.equal(model.conditional.weight.to_local(), conditional_before)
+    assert torch.equal(optimizer.state[model.conditional.weight]["step"], conditional_step)
+    assert not torch.equal(model.output.weight.to_local(), output_before)
 
 
 def _run_worker() -> None:
@@ -239,6 +295,8 @@ def _run_worker() -> None:
         _assert_empty_rank_fsdp_grad_parity(device)
         dist.barrier()
         _assert_accumulated_unused_param_grad_dtype(device)
+        dist.barrier()
+        _assert_globally_unused_param_keeps_none_grad(device)
         dist.barrier()
 
         if dist.get_rank() == 0:
