@@ -62,6 +62,7 @@ pytestmark = pytest.mark.timeout(70)
 
 
 def _commit_recipes(repo_root: Path, timestamp: str = "2026-07-30T12:00:00Z") -> None:
+    # Disposable recipe-history commits must not run contributor hooks on fixture files.
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo_root)], check=True)
     subprocess.run(["git", "-C", str(repo_root), "add", "examples"], check=True)
     subprocess.run(
@@ -73,6 +74,8 @@ def _commit_recipes(repo_root: Path, timestamp: str = "2026-07-30T12:00:00Z") ->
             "user.name=Test User",
             "-c",
             "user.email=test@example.com",
+            "-c",
+            f"core.hooksPath={os.devnull}",
             "commit",
             "-q",
             "-m",
@@ -1182,6 +1185,8 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
             "user.name=Test User",
             "-c",
             "user.email=test@example.com",
+            "-c",
+            f"core.hooksPath={os.devnull}",
             "commit",
             "-qm",
             "publish new model card",
@@ -1218,6 +1223,8 @@ def test_model_release_uses_first_recipe_addition_date(tmp_path):
                 "user.name=Test User",
                 "-c",
                 "user.email=test@example.com",
+                "-c",
+                f"core.hooksPath={os.devnull}",
                 "commit",
                 "-q",
                 "-am",
@@ -1257,6 +1264,8 @@ def test_model_release_uses_model_introduction_date_when_recipe_changes(tmp_path
                 "user.name=Test User",
                 "-c",
                 "user.email=test@example.com",
+                "-c",
+                f"core.hooksPath={os.devnull}",
                 "commit",
                 "-q",
                 "-m",

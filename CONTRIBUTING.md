@@ -276,6 +276,29 @@ After installing the git hooks, `git commit` will automatically run incremental 
 
 ## Adding Documentation
 
+Before pushing documentation changes, run the same check used by CI from the
+repository root:
+
+```bash
+uv run --script tools/check_docs.py
+```
+
+`tools/check_docs.py` is the only docs-check entry point for contributors,
+agents, and CI. Add validation steps to that tool to keep local checks and CI
+in sync. The existing `make -C docs/fern docs-check` and `docs-mdx-check`
+targets forward to it.
+
+Install `uv`, Node.js 20 (including `npm`/`npx`), Git, and `make` first. The
+script creates an isolated Python 3.12 environment with only the docs test
+dependencies and uses the Fern CLI version pinned in `docs/fern/fern.config.json`.
+Use a full Git checkout with `origin/main` available; the check fetches archived
+documentation from `docs-archive` through `origin`.
+
+The command runs the documentation source tests, generates model-coverage
+tables, restores archived pages, and validates MDX and Fern configuration.
+Generated tables and styles are cleaned up after validation, including on
+failure. A nonzero exit status identifies a failed check.
+
 If your contribution involves documentation changes, please refer to the [Fern docs maintenance guide](.agents/contributor-skills/fern-docs/SKILL.md) guide for detailed instructions on building and serving the documentation.
 
 ## Signing Your Work

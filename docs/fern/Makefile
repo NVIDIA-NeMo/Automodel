@@ -7,7 +7,8 @@
 #
 # CI workflows under `.github/workflows/fern-docs-*.yml` are the source of
 # truth for the published pipeline; these targets just mirror the
-# local-developer entry points.
+# local-developer entry points. Full validation is owned by tools/check_docs.py;
+# docs-check below forwards to it, and _docs-check is its internal render check.
 #
 # First time on this machine? Run `make docs-login` before `make docs`.
 # Without dashboard provisioning, `fern docs md generate` fails with
@@ -17,13 +18,13 @@ PUBLISH_WORKFLOW := Publish Fern Docs
 
 # Git ref holding the frozen backward-version page trees (see docs-stitch).
 # Override to pull a version from an immutable tag instead, e.g.
-#   make docs-check ARCHIVE_REF=docs/v0.4.0
+#   ARCHIVE_REF=docs/v0.4.0 uv run --script tools/check_docs.py
 ARCHIVE_REF ?= docs-archive
 REPO_ROOT := $(shell git rev-parse --show-toplevel)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check docs-model-tables _docs-mdx-check
+.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check docs-model-tables _docs-mdx-check _docs-check
 
 help:
 	@echo ""
@@ -36,8 +37,8 @@ help:
 	@echo "  make docs-login             FIRST-TIME SETUP — provision Fern account + CLI auth"
 	@echo "  make docs                   Generate library reference and start Fern dev server"
 	@echo "  make docs-stitch            Restore frozen backward-version pages from the $(ARCHIVE_REF) branch"
-	@echo "  make docs-check             Run MDX syntax validation + 'fern check'"
-	@echo "  make docs-mdx-check         Run MDX syntax validation"
+	@echo "  make docs-check             Forward to uv run --script tools/check_docs.py"
+	@echo "  make docs-mdx-check         Compatibility alias for make docs-check"
 	@echo "  make docs-model-tables      Generate release-log and model-registry tables"
 	@echo "  make docs-preview           Build a shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)"
 	@echo "  make docs-publish           Trigger the 'Publish Fern Docs' workflow on origin/main"
@@ -102,7 +103,11 @@ docs: docs-model-tables docs-stitch docs-generate-library
 	python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
 	fern docs dev
 
-docs-check: docs-model-tables docs-stitch
+docs-check docs-mdx-check:
+	uv run --script "$(REPO_ROOT)/tools/check_docs.py"
+
+# Internal target invoked by tools/check_docs.py after the source tests pass.
+_docs-check: docs-model-tables docs-stitch
 	@set -e; \
 	trap 'python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
 	python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
@@ -111,12 +116,6 @@ docs-check: docs-model-tables docs-stitch
 
 docs-model-tables:
 	python3 "$(REPO_ROOT)/tests/ci_tests/utils/sync_model_coverage_tables.py"
-
-docs-mdx-check: docs-model-tables docs-stitch
-	@set -e; \
-	trap 'python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)" --clean' EXIT; \
-	python3 "$(REPO_ROOT)/tools/apply_fern_code_styles.py" --repo-root "$(REPO_ROOT)"; \
-	$(MAKE) _docs-mdx-check
 
 _docs-mdx-check:
 	@tmp_dir="$$(mktemp -d)"; \

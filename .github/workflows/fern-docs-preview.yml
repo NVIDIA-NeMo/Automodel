@@ -60,6 +60,8 @@ jobs:
               - examples/**
               - tests/unit_tests/_transformers/test_doc_coverage.py
               - tests/ci_tests/utils/sync_model_coverage_tables.py
+              - tools/check_docs.py
+              - tests/unit_tests/tools/test_check_docs.py
               - tools/apply_fern_code_styles.py
               - .github/workflows/fern-docs-ci.yml
               - .github/workflows/fern-docs-preview.yml
