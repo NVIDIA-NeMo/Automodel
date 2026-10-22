@@ -27,9 +27,9 @@ from transformers import PretrainedConfig
 
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
 from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 from nemo_automodel.components.models.nemotron_v3.parallelization import PARALLELIZER
-from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
 from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, apply_parameter_freezing
 from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_model import MockNemotronV3Config
 
@@ -103,7 +103,9 @@ def _factory_config(checkpoint_dir: str, checkpoint_format: str) -> tuple[Pretra
     return config, backend
 
 
-def _factory_worker(rank: int, rendezvous: str, checkpoint_dir: str, checkpoint_format: str, expected) -> None:
+def _factory_worker(
+    rank: int, rendezvous: str, checkpoint_dir: str, checkpoint_format: str, exact_allowlist: bool, expected
+) -> None:
     from nemo_automodel import NeMoAutoModelForCausalLM
 
     torch.cuda.set_device(rank)
@@ -112,6 +114,11 @@ def _factory_worker(rank: int, rendezvous: str, checkpoint_dir: str, checkpoint_
         config, backend = _factory_config(checkpoint_dir, checkpoint_format)
         selected = _FACTORY_CASES[checkpoint_format][1]
         frozen = _FACTORY_CASES[checkpoint_format][3]
+        freeze_config = (
+            FreezeConfig(freeze_modules=[ModuleSelector(glob="*")], unfreeze_parameters=(selected,))
+            if exact_allowlist
+            else FreezeConfig(freeze_parameters=(frozen,))
+        )
         model = NeMoAutoModelForCausalLM.from_config(
             config,
             backend=backend,
@@ -123,7 +130,7 @@ def _factory_worker(rank: int, rendezvous: str, checkpoint_dir: str, checkpoint_
             distributed_setup=DistributedSetup.build(
                 FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32))
             ),
-            freeze_config=FreezeConfig(freeze_parameters=(frozen,)),
+            freeze_config=freeze_config,
         )
         parameters = dict(model.named_parameters())
         assert parameters[selected].dtype == torch.float32
@@ -131,15 +138,22 @@ def _factory_worker(rank: int, rendezvous: str, checkpoint_dir: str, checkpoint_
         torch.testing.assert_close(parameters[selected].full_tensor().cpu(), expected, rtol=0, atol=0)
         assert not parameters[frozen].requires_grad
         assert parameters[frozen].dtype == torch.bfloat16
-        assert all(p.requires_grad for n, p in parameters.items() if n != frozen)
-        assert parameters["model.embed_tokens.weight"].dtype == torch.float32
+        if exact_allowlist:
+            assert {name for name, p in parameters.items() if p.requires_grad} == {selected}
+            assert parameters["model.embed_tokens.weight"].dtype == torch.bfloat16
+        else:
+            assert all(p.requires_grad for n, p in parameters.items() if n != frozen)
+            assert parameters["model.embed_tokens.weight"].dtype == torch.float32
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA devices for the FSDP2 factory path")
 @pytest.mark.parametrize("checkpoint_format", ["safetensors", "bin"])
-def test_factory_loads_selected_fp32_values_exactly(tmp_path: Path, checkpoint_format: str) -> None:
+@pytest.mark.parametrize("exact_allowlist", [False, True])
+def test_factory_loads_selected_fp32_values_exactly(
+    tmp_path: Path, checkpoint_format: str, exact_allowlist: bool
+) -> None:
     """Selected FP32 values, including grouped experts merged from a .bin checkpoint, load exactly."""
     from safetensors.torch import save_file
 
@@ -159,7 +173,7 @@ def test_factory_loads_selected_fp32_values_exactly(tmp_path: Path, checkpoint_f
         save_file(weights, checkpoint_dir / "model.safetensors")
     mp.spawn(
         _factory_worker,
-        args=((tmp_path / "rendezvous").as_uri(), str(checkpoint_dir), checkpoint_format, expected),
+        args=((tmp_path / "rendezvous").as_uri(), str(checkpoint_dir), checkpoint_format, exact_allowlist, expected),
         nprocs=2,
         join=True,
     )

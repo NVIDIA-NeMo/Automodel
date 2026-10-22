@@ -53,9 +53,10 @@ def test_exact_freezing_preserves_dtype_and_tied_alias_identity():
     assert all(p.requires_grad and p.dtype == torch.bfloat16 for p in model.other.parameters())
 
 
-def test_unknown_names_fail_before_any_trainability_mutation():
+@pytest.mark.parametrize("selector", ["freeze_parameters", "unfreeze_parameters"])
+def test_unknown_names_fail_before_any_trainability_mutation(selector):
     model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
-    config = parse_freeze_config({"freeze_modules": [{"path": "0"}], "freeze_parameters": ["missing"]})
+    config = parse_freeze_config({"freeze_modules": [{"path": "0"}], selector: ["missing"]})
     with pytest.raises(ValueError, match="Unknown selected parameters"):
         apply_parameter_freezing(model, config)
     assert all(p.requires_grad for p in model.parameters())
@@ -139,7 +140,26 @@ def test_pre_shard_rebinding_freezes_only_explicit_exclusions():
     assert model.new_weight.requires_grad and model.new_weight.dtype == torch.float32
 
 
-def test_parameter_exclusions_reject_unsupported_te_expert_renumbering():
+def test_pre_shard_allowlist_rebinds_replaced_parameters_and_keeps_fp32_values():
+    from nemo_automodel._transformers.infrastructure import _prepare_trainability_before_sharding
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
+    config = parse_freeze_config({"freeze_modules": [{"glob": "*"}], "unfreeze_parameters": ["0.weight"]})
+    expected = torch.full_like(model[0].weight, 0.1234567)
+    assert not torch.equal(expected, expected.bfloat16().float())
+    for strict in (True, False):
+        model[0].weight = nn.Parameter(expected.clone(), requires_grad=False)
+        model[1].weight = nn.Parameter(torch.ones_like(model[1].weight, dtype=torch.float32))
+        _prepare_trainability_before_sharding(
+            model, peft_enabled=False, freeze_config=config, frozen_compute_dtype=torch.bfloat16, strict=strict
+        )
+        assert {name for name, p in model.named_parameters() if p.requires_grad} == {"0.weight"}
+        torch.testing.assert_close(model[0].weight, expected, rtol=0, atol=0)
+        assert all(p.dtype == torch.bfloat16 for name, p in model.named_parameters() if name != "0.weight")
+
+
+@pytest.mark.parametrize("selector", ["freeze_parameters", "unfreeze_parameters"])
+def test_parameter_exclusions_reject_unsupported_te_expert_renumbering(selector):
     from nemo_automodel._transformers.infrastructure import _validate_parameter_freezing_backend
     from nemo_automodel.components.moe.experts import GroupedExpertsTE
 
@@ -150,7 +170,7 @@ def test_parameter_exclusions_reject_unsupported_te_expert_renumbering():
     model.experts = expert
     with pytest.raises(ValueError, match="TE expert parameters"):
         _validate_parameter_freezing_backend(
-            model, SimpleNamespace(ep_size=2), FreezeConfig(freeze_parameters=("experts.weight0",))
+            model, SimpleNamespace(ep_size=2), parse_freeze_config({selector: ["experts.weight0"]})
         )
 
     _validate_parameter_freezing_backend(model, SimpleNamespace(ep_size=2), FreezeConfig(freeze_parameters=("weight",)))
