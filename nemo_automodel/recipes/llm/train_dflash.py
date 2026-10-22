@@ -838,7 +838,7 @@ class TrainDFlashRecipe(BaseRecipe):
         def write_recipe_metadata() -> None:
             self._save_extra_state(path, epoch=epoch)
             try:
-                save_config(self.cfg.raw_config, path)
+                save_config(self.cfg.to_yaml_dict(use_orig_values=True), path)
             except (AttributeError, OSError) as e:
                 logger.warning("Failed to save config snapshot: %s", e)
 

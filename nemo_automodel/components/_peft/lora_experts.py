@@ -358,6 +358,10 @@ class GroupedExpertsLoRA(GroupedExperts):
             if post_expert_output is not None:
                 expert_out = post_expert_output(expert_out)
             if self.config.apply_router_weight_after_down:
+                # Apply the routing weight after the down projection, as the token path and
+                # GroupedExpertsDeepEPLoRA do. This keeps the weights attached: under EP their
+                # all-gather backward is a collective that every rank must enter.
+                expert_out = _apply_router_weight_fp32(expert_out, dummy_weight, torch.float32)
                 y[0, 0] += expert_out[0]
             else:
                 y[0] += expert_out[0]
@@ -458,6 +462,8 @@ class GroupedExpertsLoRA(GroupedExperts):
             if post_expert_output is not None:
                 output2 = post_expert_output(output2)
             if self.config.apply_router_weight_after_down:
+                # Same after-down weighting as the token path; see _forward_loop.
+                output2 = _apply_router_weight_fp32(output2, dummy_weight, torch.float32)
                 y[0, 0] += output2[0]
             else:
                 y[0] += output2[0]
