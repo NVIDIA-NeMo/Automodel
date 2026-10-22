@@ -51,7 +51,8 @@ class TestAttentionSelectionLogging:
         model = nn.Module()
         model.config = PretrainedConfig(attn_implementation=hf)
         if native is not None:
-            model.backend = BackendConfig(attn=native)
+            # Do not let CUDA-dependent RoPE setup warnings pollute attention-log assertions.
+            model.backend = BackendConfig(attn=native, rope_fusion=False)
         if vision is not None:
             model.config.vision_config = PretrainedConfig(attn_implementation=vision)
         if uses_hf:
