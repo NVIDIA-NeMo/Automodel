@@ -535,27 +535,17 @@ def test_native_te_grouped_tensor_is_opt_in(dispatcher: Literal["deepep", "hybri
 
 
 class TestBackendConfigHybridEPSyncFree:
-    """The two HybridEP sync-free knobs default off, pass through unchanged, and are HybridEP-only."""
+    """HybridEP capacity mode defaults off, passes through unchanged, and is HybridEP-only."""
 
     def test_dispatcher_capacity_factor_defaults_off(self):
         assert BackendConfig().dispatcher_capacity_factor is None
         config = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_capacity_factor=1.5)
         assert config.dispatcher_capacity_factor == 1.5
 
-    def test_dispatcher_equal_token_counts_defaults_off(self):
-        assert BackendConfig().dispatcher_equal_token_counts is False
-        config = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_equal_token_counts=True)
-        assert config.dispatcher_equal_token_counts is True
-
     @pytest.mark.parametrize("dispatcher", ["torch", "deepep"])
-    @pytest.mark.parametrize(
-        "knob",
-        [{"dispatcher_capacity_factor": 1.5}, {"dispatcher_equal_token_counts": True}],
-        ids=["capacity", "equal"],
-    )
-    def test_sync_free_knobs_require_hybridep(self, dispatcher, knob):
-        with pytest.raises(ValueError, match="require dispatcher='hybridep'"):
-            BackendConfig(experts="torch_mm", dispatcher=dispatcher, **knob)
+    def test_capacity_factor_requires_hybridep(self, dispatcher):
+        with pytest.raises(ValueError, match="requires dispatcher='hybridep'"):
+            BackendConfig(experts="torch_mm", dispatcher=dispatcher, dispatcher_capacity_factor=1.5)
 
     def test_capacity_factor_below_one_is_rejected(self):
         with pytest.raises(ValueError, match="must be >= 1.0"):

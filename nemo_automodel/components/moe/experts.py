@@ -1523,7 +1523,6 @@ class GroupedExpertsDeepEP(nn.Module):
         # device-side tokens_per_expert and buffers of a fixed capacity, so the per-microbatch
         # count_nonzero host read in forward is skipped as well (rows are never empty).
         self.dispatcher_capacity_factor = backend.dispatcher_capacity_factor if backend is not None else None
-        self.dispatcher_equal_token_counts = backend.dispatcher_equal_token_counts if backend is not None else False
         # One flag for the four expert classes' forward: with static routing (forced balance, no noise)
         # every expert receives tokens by construction, and capacity mode never dispatches an empty
         # buffer, so the count_nonzero device-to-host read (one per microbatch, and again per
@@ -1583,7 +1582,6 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
             moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
-            moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
             moe_benchmark_static_routing=self.static_routing,
         )
 

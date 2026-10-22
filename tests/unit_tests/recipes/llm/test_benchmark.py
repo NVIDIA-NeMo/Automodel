@@ -1120,3 +1120,96 @@ class TestBenchmarkingRecipeLossCalculation:
         # Verify loss reduction includes context parallelism
         loss_reduction_calls = [call for call in dp_allreduce_calls if call["include_cp"]]
         assert len(loss_reduction_calls) >= 1
+
+
+@pytest.mark.parametrize("pp_enabled,expected", [(False, 8192), (True, 2048)])
+def test_mock_dataset_infers_hybridep_capacity(mock_recipe, monkeypatch, pp_enabled, expected):
+    from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDataset
+
+    mock_recipe.dataloader.dataset = MockIterableDataset(seq_len=2048, batch_size=4)
+    mock_recipe.dataloader.batch_size = None
+    mock_recipe.pp_enabled = pp_enabled
+    mock_recipe.pp = SimpleNamespace(pp_microbatch_size=1)
+    context = MagicMock()
+    monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.hybrid_ep_token_capacity", context)
+    mock_recipe._run_benchmark = MagicMock()
+    mock_recipe.run_benchmark()
+    context.assert_called_once_with(expected)
+    context.return_value.__enter__.assert_called_once()
+    context.return_value.__exit__.assert_called_once()
+    mock_recipe._run_benchmark.assert_called_once()
+
+
+@pytest.mark.parametrize("axis", ["tp_size", "cp_size"])
+def test_sharded_token_layout_retains_negotiation(mock_recipe, monkeypatch, axis):
+    from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDataset
+
+    mock_recipe.dataloader.dataset = MockIterableDataset(seq_len=2048, batch_size=4)
+    mock_recipe.dataloader.batch_size = None
+    mock_recipe.cfg.distributed = SimpleNamespace(**{axis: 2})
+    context = MagicMock()
+    monkeypatch.setattr("nemo_automodel.recipes.llm.benchmark.hybrid_ep_token_capacity", context)
+    mock_recipe._run_benchmark = MagicMock()
+    mock_recipe.run_benchmark()
+    context.assert_called_once_with(None)
+
+
+@pytest.mark.parametrize("loader_batch_size,expected_rows", [(None, 34), (1, 34), (2, 68)])
+@pytest.mark.parametrize("custom_collator", [False, True])
+def test_mock_capacity_respects_real_loader_contract(
+    mock_recipe, monkeypatch, loader_batch_size, expected_rows, custom_collator
+):
+    """Infer slots only when the real loader preserves the dataset's prebatched shape."""
+    from torch.utils.data import default_convert
+
+    import nemo_automodel.components.moe.megatron.token_dispatcher as td
+    from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDatasetConfig
+    from nemo_automodel.components.datasets.loader import DataloaderConfig
+    from nemo_automodel.components.datasets.utils import default_collater
+
+    collator = (default_convert if loader_batch_size is None else default_collater) if custom_collator else None
+    mock_recipe.cfg.dataloader = DataloaderConfig(
+        dataset_config=MockIterableDatasetConfig(seq_len=17, batch_size=2),
+        batch_size=loader_batch_size,
+        collate_fn=collator,
+    )
+    mock_recipe.untrack_state("dataloader")
+    mock_recipe.dataloader = mock_recipe.cfg.dataloader.build(dp_rank=0, dp_world_size=1)
+    batch = next(iter(mock_recipe.dataloader))
+
+    def dispatch(x, routing_map, probs, **kwargs):
+        """Retain input rows and record the slots passed to the downstream kernel.
+
+        Args:
+            x: Tensor of shape [tokens, hidden].
+            routing_map: Boolean tensor of shape [tokens, experts].
+            probs: Tensor of shape [tokens, experts].
+            **kwargs: Scalar dispatch settings, including the slot extent.
+
+        Returns:
+            The input hidden tensor of shape [tokens, hidden], input probability tensor of shape
+            [tokens, experts], no scaling metadata, counts of shape [experts], and no handle.
+        """
+        seen_slots.append(kwargs["num_of_tokens_per_rank"])
+        return x, probs, None, routing_map.sum(0), None
+
+    monkeypatch.setattr(td, "hybrid_ep_dispatch", dispatch)
+    manager = td._HybridEPManager(group=None, num_local_experts=2, num_experts=8, router_topk=2)
+    seen_slots = []
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    reduce = MagicMock()
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+
+    def run_batch():
+        rows = batch["input_ids"].numel()
+        assert rows == expected_rows
+        hidden = torch.ones(rows, 4)
+        manager.routing_map = torch.ones(rows, 8, dtype=torch.bool)
+        manager.token_probs = torch.full((rows, 8), 0.125)
+        assert manager.dispatch(hidden) is hidden
+
+    mock_recipe._run_benchmark = run_batch
+    mock_recipe.run_benchmark()
+    assert seen_slots == [expected_rows]
+    assert reduce.call_count == int(loader_batch_size is not None or custom_collator)

@@ -14,12 +14,9 @@
 
 """HybridEP dispatch/combine and router-gradient parity with unequal token counts.
 
-Every rank in a HybridEP group must dispatch the same token extent; the
-dispatcher now pads shorter ranks up to the group maximum. With distinct
-linear expert scales, each token's combined output depends only on its own routing, so
-running the same data once with equal unaligned counts and once with rank 1
-truncated must produce identical outputs for the common tokens. Both runs
-exercise alignment padding, and truncation additionally exercises unequal counts.
+Ranks retain their real token counts while HybridEP pads routing metadata to a
+common slot extent. Compare outputs and activation/router gradients for negotiated
+slots and a larger fixed capacity, including checkpoint recomputation.
 
 Run:
     torchrun --standalone --nproc_per_node=2 \
@@ -35,7 +32,11 @@ unequal run then dispatches non-blocking into capacity-sized buffers (rows
 past the routed count are padding), and the checkpoint replay reuses the host
 extent. The pytest launcher uses --all-variants to run the complete matrix,
 including dense and compact capacity-mode variants, in one worker launch and
-process group.
+process group. It also runs the dynamic-batch regression from PR #3641 with no
+fixed capacity: counts change between calls, the larger rank swaps, and either
+rank can be empty, with and without checkpointing, across routing/fusion variants.
+Profiler assertions also check that fixed slot capacity removes token-count
+collectives and that nested scopes restore negotiation and capacity correctly.
 """
 
 import argparse
@@ -51,6 +52,7 @@ from nemo_automodel.components.moe.megatron.fused_a2a import reset_hybrid_ep_buf
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
     TokenDispatcherConfig,
+    hybrid_ep_token_capacity,
 )
 from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
 
@@ -207,6 +209,111 @@ def _run_variant(
         )
 
 
+def _run_dynamic_token_counts(ep_group: dist.ProcessGroup, *, compact_routing: bool, permute_fusion: bool) -> None:
+    """Exercise PR #3641's negotiated path across changing two-rank batches.
+
+    Reuse one dispatcher so a stale group maximum or shape cannot be hidden by
+    reconstructing it between steps. No fixed/equal-count/static-routing shortcut
+    is enabled; the production NCCL collective and HybridEP kernels run normally.
+    """
+    assert dist.get_world_size(ep_group) == 2
+    rank = dist.get_rank(ep_group)
+    torch.manual_seed(3641 + rank)
+    num_local = NUM_EXPERTS // 2
+    dispatcher = MoEFlexTokenDispatcher(
+        num_local_experts=num_local,
+        local_expert_indices=list(range(rank * num_local, (rank + 1) * num_local)),
+        config=TokenDispatcherConfig(
+            moe_flex_dispatcher_backend="hybridep",
+            num_moe_experts=NUM_EXPERTS,
+            moe_router_topk=TOPK,
+            moe_share_token_dispatcher=False,
+            moe_benchmark_static_routing=False,
+            moe_hybridep_compact_routing=compact_routing,
+            moe_hybridep_permute_fusion=permute_fusion,
+        ),
+        ep_group=ep_group,
+    )
+    # Original unequal/unaligned cases, then changing the max-owning rank,
+    # crossing upstream's 16-token slot boundary, empty ranks, and aligned counts.
+    token_counts = ((8, 3), (6, 6), (5, 3), (13, 7), (3, 13), (17, 5), (5, 17), (0, 7), (7, 0), (4, 4))
+    with hybrid_ep_token_capacity(None):
+        for counts in token_counts:
+            num_tokens = counts[rank]
+            hidden = torch.randn(num_tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
+            indices = (torch.arange(num_tokens * TOPK, device="cuda").reshape(num_tokens, TOPK) + rank) % NUM_EXPERTS
+            indices[:1] = -1
+            probs = torch.rand(num_tokens, TOPK, dtype=torch.float32, device="cuda").softmax(dim=-1)
+            # Each execution also checks output and both gradients against the
+            # local FP32 oracle with distinct expert scales.
+            eager = run_dispatch_combine(dispatcher, hidden, indices, probs)
+            recomputed = run_dispatch_combine(dispatcher, hidden, indices, probs, activation_checkpointing=True)
+            for actual, expected in zip(recomputed, eager):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            print(
+                f"[rank {rank}] OK: PR #3641 dynamic counts={counts}, "
+                f"compact={compact_routing}, fusion={permute_fusion}; negotiated slots, "
+                "output, hidden/router gradients, and checkpoint replay",
+                flush=True,
+            )
+
+
+def _run_slot_capacity_collectives(ep_group: dist.ProcessGroup) -> None:
+    """Verify real collective counts and numerical parity as capacity scopes change."""
+    rank = dist.get_rank(ep_group)
+    torch.manual_seed(744 + rank)
+    num_local = NUM_EXPERTS // dist.get_world_size(ep_group)
+    dispatcher = MoEFlexTokenDispatcher(
+        num_local_experts=num_local,
+        local_expert_indices=list(range(rank * num_local, (rank + 1) * num_local)),
+        config=TokenDispatcherConfig(
+            moe_flex_dispatcher_backend="hybridep",
+            num_moe_experts=NUM_EXPERTS,
+            moe_router_topk=TOPK,
+            moe_share_token_dispatcher=False,
+            moe_benchmark_static_routing=False,
+        ),
+        ep_group=ep_group,
+    )
+    num_tokens = (17, 5)[rank]
+    hidden = torch.randn(num_tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    indices = (torch.arange(num_tokens * TOPK, device="cuda").reshape(num_tokens, TOPK) + rank) % NUM_EXPERTS
+    probs = torch.rand(num_tokens, TOPK, dtype=torch.float32, device="cuda").softmax(dim=-1)
+    with hybrid_ep_token_capacity(None):
+        # Warm up outside profiling and retain a numerical baseline for every scope.
+        reference = run_dispatch_combine(dispatcher, hidden, indices, probs)
+        for activation_checkpointing in (False, True):
+
+            def check_collectives(expected: int) -> None:
+                """Profile real c10d calls while also checking outputs and both gradients."""
+                with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+                    result = run_dispatch_combine(
+                        dispatcher, hidden, indices, probs, activation_checkpointing=activation_checkpointing
+                    )
+                collective_count = sum(event.count for event in prof.key_averages() if event.key == "c10d::allreduce_")
+                assert collective_count == expected, (
+                    f"rank {rank}, checkpoint={activation_checkpointing}: "
+                    f"expected {expected} token-count all-reduces, got {collective_count}"
+                )
+                for actual, baseline in zip(result, reference):
+                    torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
+
+            negotiated_count = 2 if activation_checkpointing else 1
+            check_collectives(negotiated_count)
+            with hybrid_ep_token_capacity(32):
+                check_collectives(0)
+                with hybrid_ep_token_capacity(None):
+                    check_collectives(negotiated_count)
+                check_collectives(0)
+            check_collectives(negotiated_count)
+            print(
+                f"[rank {rank}] OK: slot-capacity scopes, checkpoint={activation_checkpointing}; "
+                f"all-reduces={negotiated_count}/0/{negotiated_count}/0/{negotiated_count}, "
+                "output and hidden/router gradients match",
+                flush=True,
+            )
+
+
 def main() -> None:
     """Run individual diagnostics or the complete CI matrix in one worker launch."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -233,15 +340,22 @@ def main() -> None:
     else:
         variants = [(args.compact_routing, args.permute_fusion, args.activation_checkpointing, args.capacity_factor)]
     try:
+        if args.all_variants:
+            for compact in (False, True):
+                for fusion in (False, True):
+                    _run_dynamic_token_counts(ep_group, compact_routing=compact, permute_fusion=fusion)
+            _run_slot_capacity_collectives(ep_group)
         for compact, fusion, activation_checkpointing, capacity_factor in variants:
             start = time.perf_counter()
-            _run_variant(
-                ep_group,
-                compact_routing=compact,
-                permute_fusion=fusion,
-                activation_checkpointing=activation_checkpointing,
-                capacity_factor=capacity_factor,
-            )
+            for slot_capacity in (None, max(32, FULL_TOKENS)):
+                with hybrid_ep_token_capacity(slot_capacity):
+                    _run_variant(
+                        ep_group,
+                        compact_routing=compact,
+                        permute_fusion=fusion,
+                        activation_checkpointing=activation_checkpointing,
+                        capacity_factor=capacity_factor,
+                    )
             # Reuse the buffer: routing/fusion are per-call options, and all variants share its shape.
             # Keep the native buffer and loaded kernels alive until all variants finish.
             torch.cuda.synchronize()

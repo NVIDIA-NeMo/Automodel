@@ -864,23 +864,20 @@ class TestGroupedExpertsForwardLoopDTensorBias:
 
 
 class TestGroupedExpertsDeepEPCapacityMode:
-    """BackendConfig.dispatcher_capacity_factor / dispatcher_equal_token_counts reach GroupedExpertsDeepEP."""
+    """BackendConfig.dispatcher_capacity_factor reaches GroupedExpertsDeepEP."""
 
-    def test_capacity_knobs_are_read_from_backend(self, moe_config):
+    def test_capacity_factor_is_read_from_backend(self, moe_config):
         backend = BackendConfig(
             dispatcher="hybridep",
             experts="torch_mm",
             dispatcher_capacity_factor=1.5,
-            dispatcher_equal_token_counts=True,
         )
         experts = GroupedExpertsDeepEP(moe_config, backend=backend)
         assert experts.dispatcher_capacity_factor == 1.5
-        assert experts.dispatcher_equal_token_counts is True
 
-    def test_capacity_knobs_default_off_without_backend(self, moe_config):
+    def test_capacity_factor_defaults_off_without_backend(self, moe_config):
         experts = GroupedExpertsDeepEP(moe_config)
         assert experts.dispatcher_capacity_factor is None
-        assert experts.dispatcher_equal_token_counts is False
 
     def test_capacity_factor_rejects_expert_bias(self, moe_config):
         """Capacity mode pads the dispatched buffer past the routed rows; the bias add cannot size itself to that."""
