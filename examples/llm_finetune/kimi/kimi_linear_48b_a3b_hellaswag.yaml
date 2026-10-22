@@ -60,7 +60,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
-    dispatcher: torch
+    # Standard DeepEP uses intra-node token dispatch for EP=8.
+    dispatcher: deepep
     gate_precision: float32
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
