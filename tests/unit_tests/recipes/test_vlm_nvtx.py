@@ -28,14 +28,28 @@ from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 def nvtx_ranges(monkeypatch):
     active = []
     entered = []
+    underflows = []
 
     def push(name):
         active.append(name)
         entered.append(name)
 
+    def pop():
+        # PyTorch warns instead of propagating always_call hook errors during
+        # an existing forward exception. Record underflows for teardown instead.
+        if active:
+            active.pop()
+        else:
+            underflows.append(True)
+
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", push)
-    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: active.pop())
-    return active, entered
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", pop)
+    yield active, entered
+    leaked = set(autonvtx._get_active_ranges())
+    autonvtx._get_active_ranges().clear()
+    assert not underflows
+    assert not active
+    assert not leaked
 
 
 class _Config(SimpleNamespace):

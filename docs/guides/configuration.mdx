@@ -257,13 +257,16 @@ available on `PATH`:
 nsys profile --trace=cuda,nvtx,osrt --output=vlm-profile \
   python -m nemo_automodel.recipes.vlm.finetune \
   --config examples/vlm_finetune/qwen3_5/qwen3_5_4b_neat_packing.yaml \
-  --nvtx true --step_scheduler.max_steps 10
+  --nvtx true --step_scheduler.max_steps 10 \
+  --checkpoint.enabled false --step_scheduler.validate_on_checkpoint false
 ```
 
 Use the generated `vlm-profile.nsys-rep` timeline to correlate module ranges with
 CUDA kernels and gaps between steps. Separate setup and compilation from later
 training steps when investigating steady-state throughput. Profiling adds
-overhead; measure throughput separately with `nvtx: false`.
+overhead; measure throughput separately with `nvtx: false` and the same checkpoint
+and validation overrides. These overrides disable checkpoint auto-resume, saves,
+and checkpoint-triggered validation so repeated runs execute the training steps.
 
 ## Repair Near-Zero Input Embeddings
 
