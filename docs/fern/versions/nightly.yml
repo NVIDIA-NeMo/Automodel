@@ -795,7 +795,7 @@ navigation:
             path: ../../model-coverage/diffusion/black-forest-labs/index.mdx
             contents:
               - page: "FLUX-3-Image-Klein-Base"
-                path: ../../model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx
+                path: ../../model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base.mdx
               - page: "FLUX.1-dev"
                 path: ../../model-coverage/diffusion/black-forest-labs/flux.mdx
               - page: "FLUX.2-dev"
