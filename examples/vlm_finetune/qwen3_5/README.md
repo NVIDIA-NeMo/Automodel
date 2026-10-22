@@ -44,8 +44,9 @@ Four persistent training workers prefetch two batches each. Tune these values fo
 the host's CPU and memory capacity. If setting `dataloader.num_workers: 0`, also
 set `dataloader.persistent_workers: false` and `dataloader.prefetch_factor: null`.
 
-Both recipes request FP32 resident parameters and AdamW moments, with BF16
-forward/backward compute and FP32 gradient reduction through FSDP2. See the
+Both recipes use TE FusedAdam with decoupled weight decay and FP32 Adam moments.
+The resident parameters remain FP32 and serve as master weights, so no separate
+master-weight copy is enabled. FSDP2 uses its default mixed-precision policy. See the
 [mixed-precision guide](../../../docs/guides/mixed-precision-training.mdx) before
 changing storage or optimizer precision for a throughput comparison.
 
