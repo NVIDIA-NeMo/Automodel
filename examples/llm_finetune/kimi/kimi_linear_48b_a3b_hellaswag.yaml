@@ -57,7 +57,7 @@ model:
     attn: eager
     linear: torch
     rms_norm: torch_fp32
-    experts: torch
+    experts: torch_mm
     dispatcher: torch
     gate_precision: float32
     fake_balanced_gate: false
