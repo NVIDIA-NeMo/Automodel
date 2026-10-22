@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
-#   --config examples/vlm_finetune/qwen3_5/qwen3_5_4b_neat_packing.yaml
+# automodel examples/vlm_finetune/qwen3_5/qwen3_5_4b_neat_packing.yaml --nproc-per-node 8
+# Hopper: native TE full attention + HF FA2 vision attention.
+# For single-GPU Blackwell / FA4 / 16K packing, see qwen3_5_4b_neat_packing_b300.yaml.
 
 recipe: FinetuneRecipeForVLM
 
@@ -37,9 +38,12 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.5-4B
+  # FP32 resident parameters also keep torch AdamW master weights and moments in FP32.
+  dtype: float32
+  # MTP follows the checkpoint configuration; see README.md for matched comparisons.
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
+    attn: te
     linear: torch
     rms_norm: torch
     rope_fusion: false
@@ -63,6 +67,12 @@ distributed:
   dp_replicate_size: 1
   ep_size: 1
   sequence_parallel: false
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: true
 
 freeze_config:
   freeze_vision_tower: false
@@ -78,6 +88,8 @@ dataset:
   split: train
 
 packed_sequence:
+  # Qwen3.5 keeps NEAT/BSHD inputs; TE compacts full attention internally.
+  packing_format: neat
   pretokenize: true
   max_length: 4096
   pack_size: 4096
@@ -86,7 +98,9 @@ packed_sequence:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  num_workers: 0
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
   pin_memory: true
 
 validation_dataset:
