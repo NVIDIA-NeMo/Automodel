@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 
@@ -76,7 +77,7 @@ def device_mesh(tmp_path, request):
 def _parallelize(model, compute_dtype, mesh):
     context = MeshContext(
         device_mesh=mesh,
-        strategy_config=FSDP2Config(autocast_dtype=compute_dtype),
+        strategy_config=FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=compute_dtype)),
         activation_checkpointing=False,
         reapply_trainability=None,
     )

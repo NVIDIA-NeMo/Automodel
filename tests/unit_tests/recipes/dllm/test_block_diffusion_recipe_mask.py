@@ -36,6 +36,7 @@ from pathlib import Path
 import torch
 import yaml
 
+from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.recipes.dllm.strategy import BlockDiffusionStrategy
 from nemo_automodel.recipes.dllm.train_ft import DiffusionGemmaSFTRecipe
 
@@ -62,10 +63,7 @@ def _make_recipe(block_size: int, sliding_window: int = 1024) -> DiffusionGemmaS
     recipe.canvas_length = block_size
     recipe.block_diffusion_sliding_window = sliding_window
 
-    class _DC:
-        autocast_dtype = None
-
-    recipe.distributed_config = _DC()
+    recipe.distributed_config = FSDP2Config()
     return recipe
 
 

@@ -494,10 +494,6 @@ class IDLMStrategy(DLLMStrategy):
             if is_train
             else nullcontext()
         )
-        autocast_dtype = getattr(recipe.distributed_config, "autocast_dtype", None)
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
-        )
         fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
         cp_sharder = ContextParallelSharder(None, recipe.device_mesh, {})
         train_ctx, _ = cp_sharder.shard({})
@@ -509,13 +505,13 @@ class IDLMStrategy(DLLMStrategy):
         if getattr(getattr(model, "config", None), "_attn_implementation", None) == "flex_attention":
             block_mask = create_idlm_block_mask(L, self.block_size, attn, device=device)
         else:
-            # Build the additive mask in the dtype attention runs in (autocast, else the FSDP2 mixed-precision
-            # param dtype): an fp32 mask is not cast for us when ``mp_policy.cast_forward_inputs`` is off.
+            # Match the FSDP2 compute dtype: masks are not cast when
+            # ``mp_policy.cast_forward_inputs`` is off.
             mp_policy = getattr(recipe.distributed_config, "mp_policy", None)
-            mask_dtype = autocast_dtype or getattr(mp_policy, "param_dtype", None) or torch.float32
+            mask_dtype = getattr(mp_policy, "param_dtype", None) or torch.float32
             block_mask = create_idlm_sdpa_mask(L, self.block_size, attn, device=device, dtype=mask_dtype)
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx, self._forward_context(model, noisy_input_ids):
+        with train_ctx(), sync_ctx, fp8_ctx, self._forward_context(model, noisy_input_ids):
             out = model(
                 input_ids=concat_input_ids,
                 attention_mask=block_mask,
@@ -1229,15 +1225,11 @@ class DFlashStrategy(DLLMStrategy):
             if is_train
             else nullcontext()
         )
-        autocast_dtype = getattr(recipe.distributed_config, "autocast_dtype", None)
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
-        )
         fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
         cp_sharder = ContextParallelSharder(None, recipe.device_mesh, {})
         train_ctx, _ = cp_sharder.shard({})
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+        with train_ctx(), sync_ctx, fp8_ctx:
             draft_kwargs = dict(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
