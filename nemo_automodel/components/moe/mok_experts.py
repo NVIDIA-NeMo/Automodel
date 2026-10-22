@@ -626,6 +626,8 @@ class GroupedExpertsMoK(nn.Module):
             unsupported.append("shared_expert_inter_dim must equal moe_inter_dim")
         if config.expert_activation != "swiglu" or config.shared_expert_activation != "swiglu":
             unsupported.append("routed and shared expert activations must both be swiglu")
+        if config.swiglu_clamp_after_activation:
+            unsupported.append("swiglu_clamp_after_activation=True")
         if config.expert_bias:
             unsupported.append("expert_bias=True")
         if config.shared_expert_gate:

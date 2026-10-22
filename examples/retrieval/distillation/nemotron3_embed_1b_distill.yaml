@@ -17,7 +17,7 @@ step_scheduler:
 
 model:
   _target_: nemo_automodel._transformers.retrieval.RetrieverStudentWithProjection.build
-  pretrained_model_name_or_path: <your_path>
+  pretrained_model_name_or_path: nvidia/Nemotron-3-Embed-1B-BF16
   teacher_hidden_size: 4096
   pooling: avg
   l2_normalize: false
@@ -28,7 +28,7 @@ model:
 
 teacher_model:
   _target_: nemo_automodel._transformers.retrieval.RetrieverTeacherEmbeddingEncoder.build
-  pretrained_model_name_or_path: <your_path>
+  pretrained_model_name_or_path: nvidia/Nemotron-3-Embed-8B-BF16
   pooling: avg
   l2_normalize: false
   capture_layers: []
@@ -38,7 +38,7 @@ teacher_model:
 
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: <your_path>
+  pretrained_model_name_or_path: nvidia/Nemotron-3-Embed-1B-BF16
   add_eos_token: false
   padding_side: left
   tokenizer_backend: transformers_auto
@@ -120,6 +120,9 @@ distributed:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: <your_path>
+  checkpoint_dir: checkpoints/nemotron3_embed_1b_distill
   model_save_format: safetensors
   save_consolidated: true
+
+ci:
+  cluster_tag: h100

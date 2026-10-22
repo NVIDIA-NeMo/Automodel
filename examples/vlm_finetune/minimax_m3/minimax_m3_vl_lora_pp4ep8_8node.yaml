@@ -161,6 +161,7 @@ wandb:
   dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: athitten
   nodes: 8
   # The robustness matrix (train/save, reload, resume) measured 1028s of

@@ -114,4 +114,5 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: hemildesai
