@@ -16,7 +16,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 
 def _drop_unset_architectures(config_dict: dict[str, Any]) -> dict[str, Any]:
-    """Omit a sub-config's unset ``architectures`` from its serialized form.
+    """Omit an unset ``architectures`` from a nested config's serialized dictionary.
 
     The released checkpoint lists ``architectures`` only at the top level. A
     ``null`` entry inside ``text_config`` replaces that list in loaders that
@@ -255,7 +255,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         return self.n_routed_experts
 
     def to_dict(self) -> dict[str, Any]:
-        config_dict = _drop_unset_architectures(_json_safe_value(super().to_dict()))
+        config_dict = _json_safe_value(super().to_dict())
         # Config overrides set ``layer_types`` / ``num_hidden_layers`` after construction, so the
         # serialized split is derived from the schedule the model is built from.
         if isinstance(config_dict.get("linear_attn_config"), dict):
@@ -313,7 +313,7 @@ class Glm5NextVisionConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
     def to_dict(self) -> dict[str, Any]:
-        return _drop_unset_architectures(_json_safe_value(super().to_dict()))
+        return _json_safe_value(super().to_dict())
 
 
 class Glm5NextConfig(PretrainedConfig):
@@ -363,4 +363,11 @@ class Glm5NextConfig(PretrainedConfig):
         return self.text_config
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe_value(super().to_dict())
+        config_dict = _json_safe_value(super().to_dict())
+        # Only the nested dictionaries drop an unset ``architectures``. The sub-configs' own
+        # ``to_dict`` keeps the key: Transformers' nested diff (``recursive_diff_dict``) looks up
+        # every serialized key in the sub-config's default ``to_dict``.
+        for key in self.sub_configs:
+            if isinstance(config_dict.get(key), dict):
+                _drop_unset_architectures(config_dict[key])
+        return config_dict

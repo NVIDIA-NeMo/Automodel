@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from nemo_automodel._transformers.model_init import _consume_config_overrides
+from nemo_automodel._transformers.model_init import _consume_config_overrides, get_hf_config
 from nemo_automodel._transformers.registry import (
     _CUSTOM_CONFIG_REGISTRATIONS,
     MODEL_ARCH_MAPPING,
@@ -152,6 +152,44 @@ def test_export_config_json_top_level_architectures_survive_text_config_merge():
     merged = {"architectures": exported["architectures"], **exported["text_config"]}
 
     assert merged["architectures"] == ["Glm5NextForConditionalGeneration"]
+
+
+_UNSET = object()
+
+
+@pytest.mark.parametrize("sub_config", ["text_config", "vision_config"])
+@pytest.mark.parametrize(
+    "architectures",
+    [_UNSET, None, [], ["Glm5NextForConditionalGeneration"]],
+    ids=["unset", "null", "empty", "nonempty"],
+)
+def test_nested_architectures_serialize_and_reload(tmp_path, sub_config, architectures):
+    # Transformers' nested diff looks up each serialized sub-config key in the sub-config's
+    # default ``to_dict``, so an explicit nested list must not lose that key.
+    raw = _checkpoint_style_config()
+    if architectures is not _UNSET:
+        raw[sub_config]["architectures"] = architectures
+    expected = None if architectures is _UNSET else architectures
+    config = Glm5NextConfig.from_dict(raw)
+
+    for use_diff in (False, True):
+        serialized = json.loads(config.to_json_string(use_diff=use_diff))
+        assert serialized["architectures"] == ["Glm5NextForConditionalGeneration"]
+        if expected is None:
+            assert "architectures" not in serialized[sub_config]
+        else:
+            assert serialized[sub_config]["architectures"] == expected
+
+    config.save_pretrained(tmp_path)
+    saved = json.loads((tmp_path / "config.json").read_text())
+    for reloaded in (
+        Glm5NextConfig.from_pretrained(tmp_path),
+        Glm5NextConfig.from_dict(saved),
+        get_hf_config(str(tmp_path), "sdpa"),
+    ):
+        assert isinstance(reloaded, Glm5NextConfig)
+        assert reloaded.architectures == ["Glm5NextForConditionalGeneration"]
+        assert getattr(reloaded, sub_config).architectures == expected
 
 
 @pytest.mark.parametrize(
