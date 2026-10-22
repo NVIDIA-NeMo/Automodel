@@ -32,6 +32,7 @@ from transformers.generation import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+from nemo_automodel.shared.nccl_ep import NcclEpConfig
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -450,10 +451,12 @@ class BackendConfig:
             Parameters and checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
+            "nccl_ep" uses Transformer Engine NCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
+        nccl_ep: NCCL-EP token capacity; required when selecting "nccl_ep".
         mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
-            manager instance across MoE layers.
+            manager instance across MoE layers. NCCL-EP always keeps routing state layer-local.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
             asynchronously and allocate their outputs on the communication stream.
         dispatcher_hybridep_permute_fusion: Fuse HybridEP token permutation into dispatch and
@@ -540,13 +543,14 @@ class BackendConfig:
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "nccl_ep", "mok"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
+    nccl_ep: NcclEpConfig = field(default_factory=NcclEpConfig)
     te_grouped_tensor: bool = False
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
@@ -656,6 +660,16 @@ class BackendConfig:
         elif not isinstance(self.cuda_graph, CudaGraphConfig):
             raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
 
+        if isinstance(self.nccl_ep, dict):
+            self.nccl_ep = NcclEpConfig(**self.nccl_ep)
+        elif not isinstance(self.nccl_ep, NcclEpConfig):
+            raise TypeError("nccl_ep must be an NcclEpConfig or mapping")
+        if self.dispatcher == "nccl_ep":
+            if self.nccl_ep.max_tokens_per_rank is None:
+                raise ValueError("dispatcher='nccl_ep' requires nccl_ep.max_tokens_per_rank")
+            if self.dispatcher_async_dispatch:
+                raise ValueError("dispatcher_async_dispatch is not supported by NCCL-EP")
+
         if isinstance(self.mok, dict):
             self.mok = MoKBackendConfig(**self.mok)
         elif not isinstance(self.mok, MoKBackendConfig):
@@ -695,7 +709,7 @@ class BackendConfig:
 
         # TE grouped experts require a flex dispatcher. Keep the existing standard-
         # dispatcher fallback for the deprecated gmm alias as well.
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
+        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "nccl_ep", "mok"):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
