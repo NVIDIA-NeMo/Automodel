@@ -112,7 +112,8 @@ def packed_flash_attention(
         raise ValueError("Kimi Linear FA4 requires attention_dropout=0; use eager for attention dropout")
     kernel = _load_fa4_varlen()
     if layout.indices.numel() == 0:
-        return torch.zeros_like(value) + (query.sum() + key.sum() + value.sum()) * 0
+        zero = query[..., :0].sum() + key[..., :0].sum() + value[..., :0].sum()
+        return torch.zeros_like(value) + zero
     batch, heads, sequence, value_dim = value.shape
     gathered = []
     for tensor in (query, key, value):

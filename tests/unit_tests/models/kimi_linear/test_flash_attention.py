@@ -121,6 +121,21 @@ def test_outputs_and_all_qkv_gradients_match_dense_reference(fake_flash, ids, qk
         torch.testing.assert_close(left, right, atol=1e-6, rtol=1e-5)
 
 
+def test_all_padding_fp16_outputs_and_qkv_gradients_are_finite_zeros(fake_flash) -> None:
+    q, k, v = (torch.ones(1, 1, 1024, 64, dtype=torch.float16, requires_grad=True) for _ in range(3))
+    layout = flash.build_flash_layout(torch.zeros(1, 1024, dtype=torch.int32))
+
+    actual = flash.packed_flash_attention(q, k, v, layout=layout, scale=64**-0.5)
+
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual) == 0
+    actual.backward(torch.randn_like(actual))
+    for tensor in (q, k, v):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+        assert torch.count_nonzero(tensor.grad) == 0
+
+
 @pytest.mark.parametrize("mask_kind", ["indexed", "binary", "padding_only", "none"])
 def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash, monkeypatch, mask_kind) -> None:
     torch.manual_seed(9)
