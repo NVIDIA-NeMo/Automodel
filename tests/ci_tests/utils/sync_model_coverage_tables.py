@@ -482,7 +482,9 @@ def _load_model_doc_catalog(
     model_coverage_root = docs_root / "model-coverage"
     for directory, model_type in directory_types.items():
         for path in sorted((model_coverage_root / directory).glob("*/*.mdx")):
-            if path.name == "index.mdx" or path.relative_to(docs_root.parent).as_posix() in MODEL_CARD_PATH_ALIASES:
+            canonical = MODEL_CARD_PATH_ALIASES.get(path.relative_to(docs_root.parent).as_posix())
+            # Trusted tooling can run against a PR that predates the canonical copy.
+            if path.name == "index.mdx" or (canonical is not None and (docs_root.parent / canonical).is_file()):
                 continue
             document = path.read_text(encoding="utf-8")
             slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
