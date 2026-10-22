@@ -379,7 +379,7 @@ class KimiMLAAttention(nn.Module):
 
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
-        if self.config.mla_attn_implementation == "flash_attention_2":
+        if self.config.mla_attn_implementation == "fa4":
             if attention_mask is not None:
                 raise ValueError("Flash MLA consumes document metadata, not an additive attention_mask")
             if flash_layout is None:
@@ -1126,7 +1126,7 @@ class KimiLinear48BModel(nn.Module):
             or attn_kwargs.get("packed_token_indices") is not None
             or attn_kwargs.get("cu_seqlens") is not None
         )
-        use_flash = self.config.mla_attn_implementation == "flash_attention_2"
+        use_flash = self.config.mla_attn_implementation == "fa4"
         if use_flash and attention_mask is not None and attention_mask.shape != inputs_embeds.shape[:2]:
             raise ValueError("Flash MLA requires a binary/document attention_mask [batch, sequence]")
         physical_boundaries = attn_kwargs.get("cu_seqlens_padded") if use_flash else None

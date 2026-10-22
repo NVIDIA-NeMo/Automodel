@@ -28,7 +28,10 @@ from nemo_automodel.components.models.kimi_linear.model import (
     KimiMLAAttention,
 )
 from nemo_automodel.shared.import_utils import UnavailableError
-from tests.unit_tests.models.kimi_linear.test_model import _backend_config, _tiny_kimi_config
+from tests.unit_tests.models.kimi_linear.test_model import (
+    _backend_config,
+    _tiny_kimi_config,
+)
 
 
 def _reference(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, *, ids: torch.Tensor) -> torch.Tensor:
@@ -52,47 +55,44 @@ def _fake_varlen(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
-    max_q: int,
-    max_k: int,
     *,
-    dropout_p: float,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
     softmax_scale: float,
     causal: bool,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, None]:
     """CPU replacement for only the external CUDA kernel.
 
     Args:
-        query: Tensor of shape [valid_tokens, heads, padded_dim].
-        key: Tensor of shape [valid_tokens, heads, padded_dim].
-        value: Tensor of shape [valid_tokens, heads, padded_dim].
-        cu_q: Integer tensor of shape [documents + 1].
-        cu_k: Integer tensor of shape [documents + 1].
-        max_q: Maximum document length.
-        max_k: Maximum document length.
-        dropout_p: Must be zero for this deterministic arithmetic check.
-        softmax_scale: Original QK scale, independent of padded_dim.
+        query: Tensor of shape [valid_tokens, heads, head_dim].
+        key: Tensor of shape [valid_tokens, heads, head_dim].
+        value: Tensor of shape [valid_tokens, heads, head_dim].
+        cu_seqlens_q: Integer tensor of shape [documents + 1].
+        cu_seqlens_k: Integer tensor of shape [documents + 1].
+        max_seqlen_q: Maximum document length.
+        max_seqlen_k: Maximum document length.
+        softmax_scale: Original QK scale, independent of head_dim.
         causal: Must be true.
 
     Returns:
-        Tensor of shape [valid_tokens, heads, padded_dim].
+        Pair of output tensor [valid_tokens, heads, value_dim] and unused LSE (None).
     """
-    assert causal and dropout_p == 0
-    assert torch.equal(cu_q, cu_k) and max_q == max_k
+    assert causal
+    assert torch.equal(cu_seqlens_q, cu_seqlens_k) and max_seqlen_q == max_seqlen_k
     outputs = []
-    for start, end in zip(cu_q[:-1].tolist(), cu_q[1:].tolist()):
+    for start, end in zip(cu_seqlens_q[:-1].tolist(), cu_seqlens_q[1:].tolist()):
         q, k, v = (tensor[start:end].transpose(0, 1) for tensor in (query, key, value))
         scores = (q @ k.transpose(-1, -2)) * softmax_scale
         future = torch.ones((end - start, end - start), dtype=torch.bool).triu(1)
         outputs.append((scores.masked_fill(future, -torch.inf).softmax(-1) @ v).transpose(0, 1))
-    return torch.cat(outputs)
+    return torch.cat(outputs), None
 
 
 @pytest.fixture
 def fake_flash(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(flash, "_FLASH_OK", True)
-    monkeypatch.setattr(flash, "flash_attn_varlen_func", _fake_varlen)
+    monkeypatch.setattr(flash, "_load_fa4_varlen", lambda: _fake_varlen)
 
 
 @pytest.mark.parametrize("qk_dim,value_dim", [(16, 8), (8, 16), (192, 128)])
@@ -127,7 +127,7 @@ def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash,
     config = _tiny_kimi_config()
     eager = KimiLinear48BForCausalLM(config, backend=_backend_config())
     eager.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
-    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
     fast = KimiLinear48BForCausalLM(fast_config, backend=_backend_config())
     fast.load_state_dict(eager.state_dict(), strict=True)
     ids = torch.tensor([[1, 1, 2, 2, 0], [0, 1, 1, 1, 0]], dtype=torch.int32)
@@ -139,7 +139,10 @@ def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash,
     expected = eager(input_ids=tokens, attention_mask=ids).logits
 
     def reject_dense_mask(
-        inputs_embeds: torch.Tensor, packed_context: KimiPackedContext | None, *, dtype: torch.dtype
+        inputs_embeds: torch.Tensor,
+        packed_context: KimiPackedContext | None,
+        *,
+        dtype: torch.dtype,
     ) -> None:
         """Reject dense-mask construction.
 
@@ -150,7 +153,10 @@ def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash,
         """
         raise AssertionError("Flash MLA must not allocate a sequence-square mask")
 
-    monkeypatch.setattr("nemo_automodel.components.models.kimi_linear.model._make_causal_mask", reject_dense_mask)
+    monkeypatch.setattr(
+        "nemo_automodel.components.models.kimi_linear.model._make_causal_mask",
+        reject_dense_mask,
+    )
     options = (
         {"padding_mask": ids == 0}
         if mask_kind == "padding_only"
@@ -169,7 +175,7 @@ def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash,
 
 def test_cp_keeps_its_existing_attention_path(fake_flash, monkeypatch) -> None:
     config = _tiny_kimi_config()
-    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
     layer = KimiMLAAttention(config, 0)
     context = KimiPackedContext(torch.ones(1, 4, dtype=torch.int32), cp_size=2)
     calls = []
@@ -194,21 +200,25 @@ def test_cp_keeps_its_existing_attention_path(fake_flash, monkeypatch) -> None:
 
 
 def test_missing_optional_dependency_and_explicit_dense_mask(monkeypatch) -> None:
-    monkeypatch.setattr(flash, "_FLASH_OK", False)
+    flash._load_fa4_varlen.cache_clear()
+    monkeypatch.setattr(flash, "safe_import_from", lambda *args, **kwargs: (False, None))
     q = torch.randn(1, 1, 2, 8)
     layout = flash.build_flash_layout(torch.ones(1, 2, dtype=torch.int32))
-    with pytest.raises(UnavailableError, match="flash-attn"):
+    with pytest.raises(UnavailableError, match="flash_attn.cute"):
         flash.packed_flash_attention(q, q, q, layout=layout, scale=8**-0.5)
     config = _tiny_kimi_config()
-    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
     layer = KimiMLAAttention(config, 0)
     with pytest.raises(ValueError, match="additive attention_mask"):
-        layer(torch.randn(1, 2, config.hidden_size), attention_mask=torch.zeros(1, 1, 2, 2))
+        layer(
+            torch.randn(1, 2, config.hidden_size),
+            attention_mask=torch.zeros(1, 1, 2, 2),
+        )
 
 
 def test_config_roundtrip_and_invalid_backend() -> None:
-    config = KimiLinear48BConfig(mla_attn_implementation="flash_attention_2")
-    assert KimiLinear48BConfig.from_dict(config.to_dict()).mla_attn_implementation == "flash_attention_2"
+    config = KimiLinear48BConfig(mla_attn_implementation="fa4")
+    assert KimiLinear48BConfig.from_dict(config.to_dict()).mla_attn_implementation == "fa4"
     assert KimiLinear48BConfig().mla_attn_implementation == "eager"
     with pytest.raises(ValueError, match="mla_attn_implementation"):
         KimiLinear48BConfig(mla_attn_implementation="invalid")
@@ -219,7 +229,7 @@ def test_thd_document_spans_respect_physical_padding(fake_flash) -> None:
     config = _tiny_kimi_config()
     reference = KimiLinear48BForCausalLM(config, backend=_backend_config())
     reference.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
-    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
     fast = KimiLinear48BForCausalLM(fast_config, backend=_backend_config())
     fast.load_state_dict(reference.state_dict(), strict=True)
     tokens = torch.tensor([[3, 4, 0, 5, 0, 0]])
@@ -245,7 +255,14 @@ def test_thd_document_spans_respect_physical_padding(fake_flash) -> None:
 
 def test_backbone_rejects_dense_mask_in_flash_mode() -> None:
     config = _tiny_kimi_config()
-    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
     model = KimiLinear48BForCausalLM(config, backend=_backend_config())
     with pytest.raises(ValueError, match="binary/document attention_mask"):
         model(input_ids=torch.tensor([[3, 4]]), attention_mask=torch.zeros(1, 1, 2, 2))
+
+
+def test_fa4_rejects_attention_dropout(fake_flash) -> None:
+    q = torch.randn(1, 1, 2, 8)
+    layout = flash.build_flash_layout(torch.ones(1, 2, dtype=torch.int32))
+    with pytest.raises(ValueError, match="attention_dropout=0"):
+        flash.packed_flash_attention(q, q, q, layout=layout, scale=8**-0.5, dropout_p=0.1)

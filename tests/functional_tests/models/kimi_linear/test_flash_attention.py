@@ -28,7 +28,10 @@ from nemo_automodel.components.models.kimi_linear.flash_attention import (
 )
 from nemo_automodel.components.models.kimi_linear.model import KimiMLAAttention
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA FlashAttention forward/backward")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="requires CUDA FlashAttention forward/backward",
+)
 
 
 def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, tolerance: float) -> None:
@@ -49,10 +52,13 @@ def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, tolerance: floa
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("qk_dim,value_dim", [(192, 128), (48, 64)])
 def test_real_kernel_matches_dense_outputs_and_qkv_backward(dtype, qk_dim, value_dim) -> None:
-    pytest.importorskip("flash_attn", reason="requires the optional flash-attn CUDA extension")
+    pytest.importorskip("flash_attn.cute", reason="requires the optional FlashAttention-4 CUDA kernel")
     torch.manual_seed(74)
     ids = torch.tensor(
-        [[1, 1, 1, 0, 2, 2, 2, 2, 0, 3, 3, 3, 3], [0, 1, 0, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0]],
+        [
+            [1, 1, 1, 0, 2, 2, 2, 2, 0, 3, 3, 3, 3],
+            [0, 1, 0, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0],
+        ],
         device="cuda",
         dtype=torch.int32,
     )
@@ -74,7 +80,7 @@ def test_real_kernel_matches_dense_outputs_and_qkv_backward(dtype, qk_dim, value
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mla_projection_parameter_and_input_gradients(dtype) -> None:
-    pytest.importorskip("flash_attn", reason="requires the optional flash-attn CUDA extension")
+    pytest.importorskip("flash_attn.cute", reason="requires the optional FlashAttention-4 CUDA kernel")
     torch.manual_seed(19)
     config = KimiLinear48BConfig(
         hidden_size=64,
@@ -88,17 +94,21 @@ def test_mla_projection_parameter_and_input_gradients(dtype) -> None:
         torch_dtype=dtype,
     )
     eager = KimiMLAAttention(config, 0).cuda()
-    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "flash_attention_2"})
+    fast_config = KimiLinear48BConfig.from_dict({**config.to_dict(), "mla_attn_implementation": "fa4"})
     fast = KimiMLAAttention(fast_config, 0).cuda()
     fast.load_state_dict(eager.state_dict(), strict=True)
     ids = torch.tensor(
-        [[1] * 7 + [0] + [2] * 5 + [0] * 3, [0] * 3 + [1] * 5 + [2] * 8], device="cuda", dtype=torch.int32
+        [[1] * 7 + [0] + [2] * 5 + [0] * 3, [0] * 3 + [1] * 5 + [2] * 8],
+        device="cuda",
+        dtype=torch.int32,
     )
     context = KimiPackedContext(ids)
     x = torch.randn(2, 16, 64, device="cuda", dtype=dtype, requires_grad=True)
     y = x.detach().clone().requires_grad_()
     reference = eager(
-        x, attention_mask=build_document_causal_mask(ids, ids, q_global_start=0, dtype=dtype), packed_context=context
+        x,
+        attention_mask=build_document_causal_mask(ids, ids, q_global_start=0, dtype=dtype),
+        packed_context=context,
     )
     actual = fast(y, packed_context=context, flash_layout=build_flash_layout(ids))
     valid = ids > 0

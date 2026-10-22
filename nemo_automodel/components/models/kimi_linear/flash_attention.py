@@ -12,17 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Packed FlashAttention-2 for Kimi Linear's unequal QK and value widths."""
+"""Packed FlashAttention-4 for Kimi Linear's unequal QK and value widths."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cache
 
 import torch
 import torch.nn.functional as F
 
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
 
-_FLASH_MSG = "Kimi Linear flash_attention_2 requires flash-attn. Install with `uv sync --extra fa`."
-_FLASH_OK, flash_attn_varlen_func = safe_import_from("flash_attn", "flash_attn_varlen_func", msg=_FLASH_MSG)
+_FLASH_MSG = "Kimi Linear fa4 requires flash_attn.cute. Use a container built with INSTALL_FA4=true."
+
+
+@cache
+def _load_fa4_varlen() -> Callable:
+    """Load the optional FA4 kernel only when the fast path is selected."""
+    available, kernel = safe_import_from("flash_attn.cute", "flash_attn_varlen_func", msg=_FLASH_MSG)
+    if not available:
+        raise UnavailableError(_FLASH_MSG)
+    return kernel
 
 
 @dataclass(frozen=True)
@@ -79,9 +89,9 @@ def packed_flash_attention(
 ) -> torch.Tensor:
     """Apply causal attention per document without dense sequence-square masks.
 
-    FlashAttention-2 requires equal head widths. Pad Q/K/V to their largest
-    width (aligned to eight), keep the original QK softmax scale, and slice V's
-    output back to its original width. Padding query outputs are zero.
+    FlashAttention-4 consumes the native, unequal QK/value widths and uses the
+    original QK softmax scale. Padding query outputs are zero. Attention dropout
+    is unsupported; use the eager implementation when dropout is required.
 
     Args:
         query: CUDA fp16/bf16 tensor of shape [batch, heads, sequence, qk_dim].
@@ -90,36 +100,31 @@ def packed_flash_attention(
         layout: Document-major indices and cumulative lengths for this batch;
             its tensor fields reside on the input device (see MLAFlashLayout).
         scale: Softmax scale based on the original, unpadded QK width.
-        dropout_p: Attention dropout probability; callers pass zero for eval.
+        dropout_p: Must be zero; FA4 does not implement attention dropout.
 
     Returns:
         Tensor of shape [batch, heads, sequence, value_dim], independent of the inputs,
         with zero output for padding tokens and gradients through valid tokens.
     """
-    if not _FLASH_OK:
-        raise UnavailableError(_FLASH_MSG)
+    if dropout_p != 0.0:
+        raise ValueError("Kimi Linear FA4 requires attention_dropout=0; use eager for attention dropout")
+    kernel = _load_fa4_varlen()
     if layout.indices.numel() == 0:
         return torch.zeros_like(value) + (query.sum() + key.sum() + value.sum()) * 0
     batch, heads, sequence, value_dim = value.shape
-    width = ((max(query.shape[-1], value_dim) + 7) // 8) * 8
-    if width > 256:
-        raise ValueError("Kimi Linear FlashAttention-2 requires padded head width <= 256")
     gathered = []
     for tensor in (query, key, value):
         tokens = tensor.transpose(1, 2).reshape(batch * sequence, heads, tensor.shape[-1])
         tokens = tokens.index_select(0, layout.indices)
-        if tokens.shape[-1] != width:
-            tokens = F.pad(tokens, (0, width - tokens.shape[-1]))
         gathered.append(tokens)
-    attended = flash_attn_varlen_func(
+    attended, _lse = kernel(
         *gathered,
-        layout.cu_seqlens,
-        layout.cu_seqlens,
-        layout.max_seqlen,
-        layout.max_seqlen,
-        dropout_p=dropout_p,
+        cu_seqlens_q=layout.cu_seqlens,
+        cu_seqlens_k=layout.cu_seqlens,
+        max_seqlen_q=layout.max_seqlen,
+        max_seqlen_k=layout.max_seqlen,
         softmax_scale=scale,
         causal=True,
-    )[..., :value_dim]
+    )
     padded = attended.new_zeros((batch * sequence, heads, value_dim)).index_copy(0, layout.indices, attended)
     return padded.reshape(batch, sequence, heads, value_dim).transpose(1, 2)

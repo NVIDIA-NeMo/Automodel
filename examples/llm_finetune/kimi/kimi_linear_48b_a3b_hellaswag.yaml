@@ -46,10 +46,11 @@ model:
     _target_: nemo_automodel.components.models.kimi_linear.config.KimiLinear48BConfig.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
     name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
-    # Packed non-CP MLA requires CUDA fp16/bf16 and `uv sync --extra fa`.
+    # Packed non-CP MLA requires CUDA fp16/bf16 and a container built with INSTALL_FA4=true.
     # Document boundaries/padding use the THD metadata; dense additive masks are unsupported.
-    # Set eager for dense attention. CP retains compressed-KV gather and FlexAttention.
-    mla_attn_implementation: flash_attention_2
+    # FA4 requires attention_dropout=0; use eager for attention dropout.
+    # CP retains compressed-KV gather and FlexAttention.
+    mla_attn_implementation: fa4
     kda_mode: chunk
     kda_unpad_inputs: false
     kda_use_fused_gate: true
