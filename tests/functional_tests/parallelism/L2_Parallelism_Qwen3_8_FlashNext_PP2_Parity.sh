@@ -15,10 +15,10 @@
 #!/bin/bash
 # Pipeline-parallel parity for Qwen3.8-Flash-Next.
 #
-# The decoder carries four HyperConnection streams between layers and
-# alternates GatedDeltaNet with QSA, so a stage boundary exchanges a
-# ``[batch, sequence, hc_count * hidden]`` state between two layer types. The
-# generic PP tests run a dense, single-stream model and do not cover that.
+# The decoder carries four HyperConnection streams between layers, so a stage
+# boundary exchanges a ``[batch, sequence, hc_count * hidden]`` state and the
+# last stage owns the final HyperConnection read. The generic PP tests run a
+# dense, single-stream model and do not cover that.
 #
 # The proxy generates its own synthetic token sequences, so this test stages no
 # tokenizer or dataset.

@@ -15,10 +15,11 @@
 # Small randomly-initialized Qwen3.8-Flash-Next for parallelism parity runs,
 # shrunk from `examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml`.
 #
-# The layer pattern keeps the released 3:1 GatedDeltaNet:QSA interleave so a
-# pipeline stage boundary lands between the two layer types, and every layer
-# keeps the four HyperConnection streams that the stages exchange. The expert
-# count is not scaled down below what EP shards.
+# Every layer keeps the four HyperConnection streams that the stages exchange
+# and the QSA sparse-attention path. All layers are full attention: the
+# GatedDeltaNet layers keep SSM parameters in fp32, and at `ep_size: 1` the
+# pipeline legs run through the dense FSDP path, which has no separate fp32
+# FSDP group for them. The expert count is not scaled down below what EP shards.
 #
 # The PLE (Engram) layer is disabled: its owner-sharded table is bound to the
 # per-stage FSDP group and is exercised by the dedicated Engram tests.
@@ -54,6 +55,7 @@ model:
       hidden_size: 256
       num_hidden_layers: 8
       full_attention_interval: 4
+      layer_types: [full_attention, full_attention, full_attention, full_attention, full_attention, full_attention, full_attention, full_attention]
       num_attention_heads: 8
       num_key_value_heads: 2
       head_dim: 64
