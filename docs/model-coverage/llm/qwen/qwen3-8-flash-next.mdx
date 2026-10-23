@@ -49,7 +49,7 @@ straight-through gradient.
 | Expert parallelism | EP64 baseline; EP128 for the CP1/CP8 comparison |
 | Engram ownership | Global `Shard(0)` DTensor over the FSDP (data/context shard) mesh of the pipeline stage that holds decoder layer 2; 64 or 128 contiguous local row shards without PP |
 | Context parallelism | CP1 and CP8 at world size 128; CP was disabled in the EP64 baseline run below |
-| Pipeline parallelism | PP2 with EP32 at world size 64, compared against EP64 without PP (see below) |
+| Pipeline parallelism | PP2 with EP32 at world size 64, compared against EP64 without PP over 10 optimizer steps |
 | Tensor parallelism | Disabled |
 | Workload | Non-packed right-tail-padded HellaSwag; packed (THD) Tulu-3 full-token SFT |
 | Scale | 8 nodes / 64 H100 baseline; 16 nodes / 128 H100 CP comparison |
@@ -114,6 +114,18 @@ similarity was 0.999999925, mean absolute difference 0.00024, and maximum
 absolute difference 0.00069; final losses were 0.56053 for CP1 and 0.56011
 for CP8. A world-64 single-forward probe also matched CP8 against CP1 with exact
 per-row routing IDs and passing Engram/GDN/QSA activation gates.
+
+Pipeline parallelism was compared at world size 64 from the released
+checkpoint: EP64 without PP against EP32 with PP2 (1F1B, micro-batch 1), both
+with global batch 64 of 128-token padded HellaSwag samples, gradient clipping
+at 1.0, and identical batches for 10 optimizer steps. The Engram table was
+owned by all 64 ranks in the first run and by the 32 first-stage ranks in the
+second. Step-0 losses were 2.8140 and 2.8183 with gradient norms 41.92 and
+42.00; over the 10 steps the maximum absolute loss difference was 0.012 and
+the maximum relative gradient-norm difference 0.032, and the validation losses
+after step 9 were 2.2131 and 2.2058. Rank-0 peak memory was 39.7 GiB without
+PP and 63.5 GiB on the first pipeline stage, which holds the 32-way Engram
+shard and twice the local batch.
 
 ## Example Recipe
 
