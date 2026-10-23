@@ -124,9 +124,12 @@ def test_lora_patch_applies_to_selected_module_with_str_dtype(model):
 
 def test_peft_config_memory_efficient_lora_round_trip():
     """PeftConfig should default memory-efficient LoRA on and preserve explicit overrides."""
+    from nemo_automodel.components._peft.config import PeftConfig as ConfigPeftConfig
+
+    assert PeftConfig is ConfigPeftConfig
     assert PeftConfig().use_memory_efficient_lora is True
 
-    cfg = PeftConfig.from_dict({"use_memory_efficient_lora": False})
+    cfg = PeftConfig(use_memory_efficient_lora=False)
     assert cfg.use_memory_efficient_lora is False
     assert cfg.to_dict()["use_memory_efficient_lora"] is False
 

@@ -16,7 +16,7 @@ import logging
 import math
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TypedDict, overload
 
 import torch
@@ -26,6 +26,7 @@ from torch.autograd.function import BackwardCFunction
 from torch.distributed.tensor import DTensor
 from transformers import BitsAndBytesConfig
 
+from nemo_automodel.components._peft.config import PeftConfig as PeftConfig
 from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsDeepEPLoRA,
     GroupedExpertsLoRA,
@@ -62,82 +63,6 @@ class _ExpertAdapterArgs(TypedDict):
     alpha: int
     lora_A_init_method: str
     lora_dtype: torch.dtype | str | None
-
-
-class _PeftConfigDict(TypedDict, total=False):
-    target_modules: list[str] | str | None
-    exclude_modules: list[str] | str | None
-    match_all_linear: bool
-    dim: int
-    alpha: int
-    use_dora: bool
-    dropout: float
-    dropout_position: Literal["pre", "post"]
-    lora_A_init: str
-    lora_dtype: torch.dtype | str | None
-    use_memory_efficient_lora: bool
-    use_triton: bool
-    moe_rank_scaling: bool
-    expert_weight_format: Literal["unquantized", "mxfp4"]
-
-
-@dataclass
-class PeftConfig:
-    target_modules: list[str] | str | None = field(default_factory=list)
-    exclude_modules: list[str] | str | None = field(default_factory=list)
-    match_all_linear: bool = False
-    dim: int = 8
-    alpha: int = 32
-    # Note: we currently support DoRA for nn.Linear only.
-    use_dora: bool = False
-    dropout: float = 0.0
-    dropout_position: Literal["pre", "post"] = "post"
-    lora_A_init: str = "xavier"
-    lora_dtype: torch.dtype | str | None = None
-    use_memory_efficient_lora: bool = True
-    use_triton: bool = False
-    moe_rank_scaling: bool = False
-    # Storage mode, not a torch dtype: "unquantized" uses the ordinary floating-point
-    # experts with the model's configured precision (including FP32). "mxfp4"
-    # stores frozen expert bases as fp4-e2m1 + e8m0 scales and requires torch_mm.
-    expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized"
-
-    def to_dict(self) -> _PeftConfigDict:
-        return {
-            "target_modules": self.target_modules,
-            "exclude_modules": self.exclude_modules,
-            "match_all_linear": self.match_all_linear,
-            "dim": self.dim,
-            "alpha": self.alpha,
-            "use_dora": self.use_dora,
-            "dropout": self.dropout,
-            "dropout_position": self.dropout_position,
-            "lora_A_init": self.lora_A_init,
-            "lora_dtype": self.lora_dtype,
-            "use_memory_efficient_lora": self.use_memory_efficient_lora,
-            "use_triton": self.use_triton,
-            "moe_rank_scaling": self.moe_rank_scaling,
-            "expert_weight_format": self.expert_weight_format,
-        }
-
-    @classmethod
-    def from_dict(cls, d: _PeftConfigDict) -> "PeftConfig":
-        return cls(
-            target_modules=d.get("target_modules", []),
-            exclude_modules=d.get("exclude_modules", []),
-            match_all_linear=d.get("match_all_linear", False),
-            dim=d.get("dim", 8),
-            alpha=d.get("alpha", 32),
-            use_dora=d.get("use_dora", False),
-            dropout=d.get("dropout", 0.0),
-            dropout_position=d.get("dropout_position", "post"),
-            lora_A_init=d.get("lora_A_init", "xavier"),
-            lora_dtype=d.get("lora_dtype", None),
-            use_memory_efficient_lora=d.get("use_memory_efficient_lora", True),
-            use_triton=d.get("use_triton", False),
-            moe_rank_scaling=d.get("moe_rank_scaling", False),
-            expert_weight_format=d.get("expert_weight_format", "unquantized"),
-        )
 
 
 def _extract_base_dtype(

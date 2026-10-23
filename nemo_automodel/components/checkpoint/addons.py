@@ -16,12 +16,14 @@ import glob
 import json
 import os
 import shutil
+from dataclasses import fields
 from typing import TYPE_CHECKING, Protocol
 
 import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+from nemo_automodel.components._peft.config import PeftConfig as _AutomodelPeftConfig
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
     FQN_TO_DTYPE_MAPPING_FILENAME,
     FQN_TO_FILE_INDEX_MAPPING_FILENAME,
@@ -413,13 +415,16 @@ def load_automodel_peft_config_dict(model_path: str) -> dict:
         model_path: The checkpoint's ``model/`` directory.
 
     Returns:
-        A dict for ``PeftConfig.from_dict``.
+        Constructor kwargs for ``PeftConfig``, excluding checkpoint-only metadata
+        such as the expert ParamWrapper layout stamp.
     """
     with open(os.path.join(model_path, "automodel_peft_config.json")) as f:
-        fields = json.load(f)
+        metadata = json.load(f)
     with open(os.path.join(model_path, "adapter_config.json")) as f:
         hf_config = json.load(f)
-    return {**fields, "dim": hf_config["r"], "alpha": hf_config["lora_alpha"]}
+    config_fields = {field.name for field in fields(_AutomodelPeftConfig)}
+    config = {key: value for key, value in metadata.items() if key in config_fields}
+    return {**config, "dim": hf_config["r"], "alpha": hf_config["lora_alpha"]}
 
 
 def _has_trainable_moe_lora_parameters(
