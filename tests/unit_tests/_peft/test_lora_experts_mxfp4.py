@@ -144,7 +144,8 @@ def test_mxfp4_module_packs_base_weights(moe_config, device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_mxfp4_forward_backward_matches_bf16(moe_config, device):
+@pytest.mark.parametrize("with_callback", [False, True])
+def test_mxfp4_forward_backward_matches_bf16(moe_config: MoEConfig, device: torch.device, with_callback: bool) -> None:
     """With fp4-representable base weights, the packed module must match the bf16 module."""
     orig = GroupedExperts(moe_config).to(device)
     orig.use_torch_mm = True
@@ -161,8 +162,9 @@ def test_mxfp4_forward_backward_matches_bf16(moe_config, device):
     x_ref, token_mask, weights, indices = _routing_inputs(moe_config, 32, device, torch.bfloat16)
     x_mx = x_ref.detach().clone().requires_grad_(True)
 
-    y_ref = ref(x_ref, token_mask, weights, indices)
-    y_mx = mx(x_mx, token_mask, weights, indices)
+    callback = torch.tanh if with_callback else None
+    y_ref = ref(x_ref, token_mask, weights, indices, post_expert_output=callback)
+    y_mx = mx(x_mx, token_mask, weights, indices, post_expert_output=callback)
     torch.testing.assert_close(y_mx, y_ref, atol=1e-6, rtol=1e-6)
 
     y_ref.float().pow(2).sum().backward()

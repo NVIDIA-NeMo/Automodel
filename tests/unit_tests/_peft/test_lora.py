@@ -803,3 +803,33 @@ def test_memory_efficient_lora_declines_triton_on_mixed_dtype(x_dtype, lora_dtyp
             apply_memory_efficient_lora(x, lora_A, lora_B, 1.5, True)
 
     assert triton_forward.called is expect_triton
+
+
+@pytest.mark.parametrize("use_triton", [False, True])
+def test_patched_lora_preserves_identity_and_linear_input_keyword(use_triton: bool) -> None:
+    base = nn.Linear(4, 3)
+    weight, bias = base.weight, base.bias
+    adapter = patch_linear_module(base, dim=2, use_triton=use_triton)
+    assert adapter is base
+    assert adapter.weight is weight
+    assert adapter.bias is bias
+    x = torch.randn(2, 4)
+    with patch(
+        "nemo_automodel.components._peft.lora.apply_memory_efficient_lora",
+        side_effect=lambda x, a, b, scale, *args: F.linear(F.linear(x, a) * scale, b),
+    ):
+        expected = adapter(x)
+        torch.testing.assert_close(adapter(x=x), expected)
+        torch.testing.assert_close(adapter(input=x), expected)
+    with pytest.raises(TypeError, match="either x or input"):
+        adapter(x=x, input=x)
+    with pytest.raises(TypeError, match="requires an input tensor"):
+        adapter()
+
+
+def test_patched_lora_restores_original_class_when_initialization_fails() -> None:
+    base = nn.Linear(4, 3)
+    original_class = type(base)
+    with pytest.raises(ZeroDivisionError):
+        patch_linear_module(base, dim=0)
+    assert type(base) is original_class
