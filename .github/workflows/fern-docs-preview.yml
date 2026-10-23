@@ -122,7 +122,7 @@ jobs:
         run: |
           set -euo pipefail
           test -z "$(find pr-source/docs -type l -print -quit)"
-          for VERSION in v0.4 v0.5; do
+          for VERSION in v0.4 v0.5 v0.7; do
             ROOT="docs/fern/versions/$VERSION/pages"
             test -d "archived-source/$ROOT"
             rm -rf "pr-source/$ROOT"
@@ -152,26 +152,144 @@ jobs:
             test -z "$(find "pr-source/$ROOT" -type l -print -quit)"
             mkdir -p "$RUNNER_TEMP/fern-preview/$(dirname "$ROOT")"
             cp -R "trusted-source/$ROOT" "$RUNNER_TEMP/fern-preview/$ROOT"
-            # Keep newer main pages as fallbacks, but honor explicit PR deletions.
-            BASE=$(git -C pr-source merge-base HEAD refs/remotes/origin/main)
-            git -C pr-source diff --no-renames --diff-filter=D --name-only -z \
-              "$BASE" HEAD -- "$ROOT/" > "$RUNNER_TEMP/fern-deleted-paths"
-            while IFS= read -r -d '' path; do
-              case "$path" in
-                */.*|*/components/*) continue ;;
-              esac
-              case "$path" in
-                *.md|*.mdx|*.png|*.jpg|*.jpeg|*.gif|*.svg|*.webp|*.ico|*.pdf)
-                  rm -f -- "$RUNNER_TEMP/fern-preview/$path" ;;
-              esac
-            done < "$RUNNER_TEMP/fern-deleted-paths"
-            # Navigation, components and tooling stay on the trusted branch.
+            # Retain pages and assets that archived navigation or retained pages
+            # still reference when the PR moves or deletes content. Site config,
+            # components and tooling stay on main; nightly navigation is validated
+            # separately before it replaces the trusted navigation.
             (cd pr-source && find "$ROOT" -regextype posix-extended -type f \
               -regex "$CONTENT" ! -path '*/.*' ! -path '*/components/*' \
               -exec cp --parents -- '{}' "$RUNNER_TEMP/fern-preview/" \;)
           done
           printf '%s\n' '{"organization":"nvidia","version":"5.139.0"}' \
             > "$RUNNER_TEMP/fern-preview/docs/fern/fern.config.json"
+
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.8.22
+
+      - name: Use validated PR nightly navigation
+        run: |
+          uv run --no-project --isolated --python 3.12 --with pyyaml==6.0.3 python -I - <<'PY'
+          import base64
+          import binascii
+          import os
+          import re
+          from pathlib import Path
+
+          import yaml
+
+          docs = (Path(os.environ["RUNNER_TEMP"]) / "fern-preview/docs").resolve()
+          destination = docs / "fern/versions/nightly.yml"
+          trusted = yaml.safe_load(destination.read_text())
+          proposed = yaml.safe_load(Path("pr-source/docs/fern/versions/nightly.yml").read_text())
+
+          def entries(items):
+              for item in items:
+                  yield item
+                  yield from entries(item.get("contents", []))
+
+          trusted_folders = {item["folder"] for item in entries(trusted["navigation"]) if "folder" in item}
+          trusted_icons = {item["icon"] for item in entries(trusted["navigation"]) if "icon" in item}
+          # New providers use the generator's fixed SVG wrapper around raster data.
+          # Never allow arbitrary PR SVG markup, attributes, paths or remote URLs.
+          provider_icon = re.compile(
+              r'<svg xmlns="http://www\.w3\.org/2000/svg" viewBox="0 0 20 20">'
+              r'<image width="20" height="20" href="data:image/webp;base64,([A-Za-z0-9+/=]+)"/></svg>'
+          )
+
+          def valid_icon(icon: object) -> bool:
+              if not isinstance(icon, str):
+                  return False
+              if icon in trusted_icons:
+                  return True
+              if len(icon) > 16 * 1024:
+                  return False
+              match = provider_icon.fullmatch(icon)
+              if match is None:
+                  return False
+              try:
+                  image = base64.b64decode(match[1], validate=True)
+              except binascii.Error:
+                  return False
+              return (
+                  base64.b64encode(image).decode("ascii") == match[1]
+                  and image[:4] == b"RIFF"
+                  and image[8:12] == b"WEBP"
+                  and image[12:16] in {b"VP8 ", b"VP8L", b"VP8X"}
+                  and int.from_bytes(image[4:8], "little") == len(image) - 8
+              )
+
+          allowed_keys = {
+              "page": {"page", "path", "slug"},
+              "section": {"section", "path", "contents", "slug", "skip-slug", "icon"},
+              "folder": {"folder"},
+          }
+
+          published_pages = set()
+
+          def validate(items, depth=0):
+              if not isinstance(items, list) or depth > 20:
+                  raise ValueError("Navigation must be a finite list of pages and sections")
+              for item in items:
+                  if not isinstance(item, dict):
+                      raise ValueError("Navigation entries must be mappings")
+                  kinds = item.keys() & allowed_keys.keys()
+                  if len(kinds) != 1:
+                      raise ValueError("Only page, section, and trusted folder entries are supported")
+                  kind = next(iter(kinds))
+                  if item.keys() - allowed_keys[kind] or not isinstance(item[kind], str):
+                      raise ValueError("Unsupported navigation fields")
+                  if "slug" in item and not isinstance(item["slug"], str):
+                      raise ValueError("Navigation slugs must be strings")
+                  if "skip-slug" in item and not isinstance(item["skip-slug"], bool):
+                      raise ValueError("skip-slug must be a boolean")
+                  if "icon" in item and not valid_icon(item["icon"]):
+                      raise ValueError("Preview icons must be trusted or compact embedded WebP provider logos")
+                  if kind == "folder" and item["folder"] not in trusted_folders:
+                      raise ValueError("Generated folders must come from trusted navigation")
+                  if kind == "page" and "path" not in item:
+                      raise ValueError("Pages must reference a documentation file")
+                  if "path" in item:
+                      path = item["path"]
+                      if not isinstance(path, str) or Path(path).is_absolute() or ":" in path or "\\" in path:
+                          raise ValueError("Page paths must be relative documentation paths")
+                      target = (destination.parent / path).resolve()
+                      if (
+                          not target.is_relative_to(docs)
+                          or target == docs
+                          or target.relative_to(docs).parts[0] == "fern"
+                      ):
+                          raise ValueError("Nightly pages must stay in the documentation content tree")
+                      if target.suffix not in {".md", ".mdx"} or not target.is_file():
+                          raise ValueError("Navigation paths must reference existing Markdown pages")
+                      header = re.match(r"\A---\r?\n(.*?)\r?\n---(?:\r?\n|$)", target.read_text(), re.DOTALL)
+                      if header:
+                          metadata = yaml.safe_load(header[1])
+                          slug = metadata.get("slug") if isinstance(metadata, dict) else None
+                          if isinstance(slug, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", slug):
+                              published_pages.update(
+                                  f"{prefix}/{slug}".casefold()
+                                  for prefix in ("/nemo/automodel", "/nemo/automodel/nightly")
+                              )
+                  if kind == "section":
+                      validate(item.get("contents", []), depth + 1)
+
+          if not isinstance(proposed, dict) or set(proposed) != {"navigation"}:
+              raise ValueError("Only the nightly navigation may be overridden")
+          validate(proposed["navigation"])
+          # A newly canonical PR page must not be hidden by a legacy main redirect.
+          # Only remove trusted redirects to declared pages; never load PR site settings.
+          site_path = docs / "fern/docs.yml"
+          site = yaml.safe_load(site_path.read_text())
+          if isinstance(site, dict) and isinstance(site.get("redirects"), list):
+              redirects = site["redirects"]
+              remaining = [item for item in redirects if item["source"].casefold() not in published_pages]
+              if len(remaining) != len(redirects):
+                  site["redirects"] = remaining
+                  site_path.write_text(yaml.safe_dump(site, sort_keys=False, allow_unicode=True))
+          destination.write_text(yaml.safe_dump(proposed, sort_keys=False, allow_unicode=True))
+          PY
 
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

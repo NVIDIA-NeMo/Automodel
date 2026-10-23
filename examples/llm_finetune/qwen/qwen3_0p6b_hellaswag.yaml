@@ -41,7 +41,7 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-0.6B
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
   save_consolidated: false
@@ -97,4 +97,5 @@ optimizer:
 #   dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi

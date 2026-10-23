@@ -109,6 +109,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  cluster_tag: h100
   time: "00:25:00"
   checkpoint_robustness:
     distributed.tp_size: 2

@@ -1,0 +1,201 @@
+---
+title: "flint"
+description: "Use RecursiveSI flint with NeMo AutoModel for native text-model training, checkpoint loading, SFT and LoRA recipes, numerical measurements, and long-context workflows."
+slug: model-coverage/large-language-models/recursivesi/flint
+---
+
+Flint is a text-only mixture-of-experts causal language model from
+RecursiveSI, registered as `FlintForCausalLM` (`model_type: flint`). The BF16
+checkpoint is [RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint).
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| Architecture | `FlintForCausalLM` |
+| Model type | `flint` |
+| Layers | 49 |
+| Parameters | 39.8B total, about 2.5B active per token |
+| Checkpoint | [RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint) |
+
+The checkpoint has 49 layers, hidden size 2,048, vocabulary size 150,144,
+32 query heads, four key/value heads, and head dimension 128. Layers 0 and 1
+use dense MLPs. The remaining layers use 256 routed experts, top-six routing,
+and an ungated shared expert. Routing weights apply after the expert down
+projection.
+
+Fourteen layers (0, 1, 5, 9, ..., 45, and 48) use full attention without
+positional encoding; the other 35 use sliding-window attention with NeoX RoPE.
+The sliding window includes the current token and 512 preceding tokens.
+Query/key normalization precedes RoPE. Every attention head has a trainable denominator sink with zero value; the sink is not an
+extra input token. The output head is untied. Sinks and head computation
+remain FP32, including under BF16 bulk computation. The EOS/padding embedding
+row remains trainable: positional masks distinguish padding from real EOS
+tokens.
+
+Set `model.config.router_aux_loss_coef: 0.0` explicitly for CE-only training.
+The checkpoint's nonzero auxiliary coefficient (`0.0005`) does not specify its
+original training objective, so these recipes do not reconstruct that objective.
+
+## Numerical comparison
+
+The released-weight comparison uses the first four layers of the 49-layer
+schedule, a seeded 4,096-token input, and every vocabulary entry at every
+position. Native loading validates the complete source index and all selected
+tensor values. The reference loads literal checkpoint keys separately and
+evaluates FP32 PyTorch SDPA without importing native model math.
+
+<Note>
+The checkpoint does not provide a Hugging Face modeling implementation. The
+reference is an independent test implementation, not an official HF model or
+the SGLang serving kit shipped with the checkpoint. Four-layer measurements do not describe
+full 49-layer serving numerics.
+</Note>
+
+Download `RecursiveSI/flint` to a local directory, then run inside an existing
+GPU allocation from the repository root:
+
+```bash
+python -m tests.functional_tests.models.flint.run_four_layer_logits \
+  --checkpoint /path/to/flint --output /path/to/output/fp32-sdpa \
+  --device cuda:0 --attn sdpa --candidate-dtype float32 \
+  --load-method from_pretrained
+```
+
+Use a separate output directory for the BF16 TE candidate:
+
+```bash
+python -m tests.functional_tests.models.flint.run_four_layer_logits \
+  --checkpoint /path/to/flint --output /path/to/output/bf16-te \
+  --device cuda:0 --attn te --candidate-dtype bfloat16 \
+  --residual-dtype fp32 \
+  --load-method from_pretrained
+```
+
+For the FP32-body/FP16-TE-attention candidate, use:
+
+```bash
+python -m tests.functional_tests.models.flint.run_four_layer_logits \
+  --checkpoint /path/to/flint --output /path/to/output/fp32-te-fp16-attention \
+  --device cuda:0 --attn te --candidate-dtype float32 \
+  --residual-dtype fp32 --attention-compute-dtype fp16 \
+  --load-method from_pretrained
+```
+
+This selects `model.config.attention_compute_dtype: fp16`. It casts normalized,
+rotated Q/K/V at the TE boundary and restores FP32 before the output
+projection; projection computation stays FP32. The default `null` policy
+leaves BF16 computation unchanged. Tiny-gradient GPU tests observe FP16
+underflow without explicit loss scaling, so this option is for comparison and
+inference; the training recipes use BF16.
+
+The tool reports mean `KL(reference || candidate)` computed with FP32
+log-softmax over the full vocabulary, per-position KL percentiles and maximum,
+Jensen-Shannon divergence, cosine, absolute logit error, top-one agreement, and
+per-layer hidden-state differences, together with a manifest of seeds, input
+hashes, source hashes, package versions, dtype, and backend.
+
+Measured first-four-layer results (GB200, Torch 2.13.0a0, TE 2.14.1,
+cuDNN 9.23, Transformers 5.18.0; all 1,589 selected source tensors load
+bit-identical):
+
+| Candidate | Mean KL | Top-one agreement |
+| --- | --- | --- |
+| FP32 SDPA | `-1.37e-9` (FP32 roundoff) | 100% |
+| BF16 TE, FP32 residual | `2.83e-3` | 97.974% |
+| BF16 SDPA, FP32 residual | `2.91e-3` | 98.169% |
+| FP32 body, FP16 TE attention | `2.79e-5` | 99.976% |
+
+For the FP32-body/FP16-TE-attention candidate, the maximum absolute logit
+error is `4.8910178` and the mean absolute logit error is `0.0071718`.
+
+## Training recipes
+
+| Workflow | Recipe | Configuration |
+| --- | --- | --- |
+| Full-parameter text SFT | [flint_tulu3_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_sft.yaml) | 100 steps, 4K chat data, TE attention, EP2, FP32 master parameters |
+| Attention and expert LoRA | [flint_tulu3_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_lora.yaml) | 100 steps, 4K chat data, TE attention, EP2, frozen base weights |
+| Packed long-context training | [flint_tulu3_packed128k_te.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_packed128k_te.yaml) | 50 steps, 128K packed data, TE attention, CP4/EP4 |
+| Packed long-context training, H100 | [flint_tulu3_packed128k_magi_h100.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/flint/flint_tulu3_packed128k_magi_h100.yaml) | 100 steps, 128K on-the-fly packed data, MagiAttention, CP8/EP8 on one node |
+
+All recipes use BF16 computation with FP32 sinks and output head, and keep
+`checkpoint.cpu_offload: false`; that flag changes only where checkpoint
+tensors are staged, not training precision.
+
+### SFT and LoRA measurements
+
+Measured on four GB200 GPUs at PP1/CP1/EP2 with a repeated 128-row chat
+subset. Each run trains updates 0-49, saves a checkpoint, and resumes from it
+for updates 50-99.
+
+| Workflow | Updates | Final logged CE | Max logged rank-zero allocation |
+| --- | --- | --- | --- |
+| Full-parameter SFT | 100 | `0.3066` | `151.51 GiB` |
+| Attention and expert LoRA | 100 | `0.2297` | `54.43 GiB` |
+
+These losses are on the training subset, not held-out quality measurements.
+
+The consolidated SFT HF export contains 36,734 BF16 tensors; all
+39,785,287,456 values equal the native FP32 tensors cast to BF16.
+
+Comparison of the saved state at update 52 between the uninterrupted run and
+the resumed run:
+
+| Saved-state component | SFT | LoRA |
+| --- | --- | --- |
+| Model payload | 0 of `39,785,287,456` elements differ | 0 of `746,070,016` serialized adapter elements differ |
+| Optimizer payload | `1,403` elements / `1,422` bytes differ | 0 records differ |
+| Scheduler and loaders | 0 differences | 0 differences |
+| CPU RNG | Four rank-local `torch_rng_state` fields differ by 8 bytes total | Four rank-local `torch_rng_state` fields differ by 8 bytes total |
+
+The LoRA serialized count includes the duplicated shared gate/up-A storage;
+the unique trainable count is `548,937,728`.
+
+## Parallelism and backends
+
+Packed examples retain document boundaries, reset position IDs, ignore
+padding labels, and shift next-token labels exactly once. Controlled CP
+comparisons must reuse the same physical packs, document ordering, real token
+count, loss normalization, and expert topology; a topology change must not
+silently repack the dataset. THD pipeline execution requires one physical
+packed row per microbatch. The source maximum position count is 262,144.
+
+TE context parallelism uses all-to-all communication for the learned sinks.
+Both query and key/value head counts must divide evenly across the CP group,
+so the four key/value heads permit CP2 or CP4. The sink-only FSDP unit
+corrects TE's replicated sink adjoint before gradient clipping.
+
+MagiAttention is the long-context backend for H100 (SM90). It shards the
+sequence rather than the attention heads, so its CP size is not bound by the
+key/value head count. The H100 recipe trains full 49-layer 128K packs at
+TP1/PP1/CP8/EP8 on one 8-GPU node using about 59 GiB per GPU. The Magi path
+requires one packed row per microbatch: without PP, set the dataloader
+`batch_size` to 1 and use gradient accumulation for larger global batches.
+
+<Warning>
+Magi training with learned sinks is not supported on GB200. The pinned Magi
+FFA backend requires SM90 hardware, while its FA4 backend
+[rejects learned sinks in backward](https://github.com/SandAI-org/MagiAttention/blob/d7ea8afd44c790b65fab68a04a6a0fdd5adbf182/magi_attention/functional/fa4.py#L240).
+Use the TE long-context recipe on GB200.
+</Warning>
+
+### Parallel-layout measurements
+
+| Comparison | Measured differences |
+| --- | --- |
+| CP1/DP2 vs CP2/DP1, EP1, released weights, 8K packs, three AdamW updates | Initial logits bit-identical; mean KL `1.8923e-3` and `2.1031e-3` on the two packs after the updates |
+| Same, with CP2 gradients replaced by recorded CP1 gradients after backward | Logits and optimizer updates bit-identical for all three steps |
+| PP2/CP2/EP2 (four stages) vs reference, released first four layers, Torch dispatcher | Mean KL `2.3665e-3`; gradient relative L2 `0.01929` |
+| PP2/CP2/EP2 (four stages) vs reference, released first four layers, DeepEP | Mean KL `2.3771e-3`; gradient relative L2 `0.01853` |
+| Tiny DP2 TE checkpoint restore and continuation | Model, optimizer, master remainder, scheduler, RNG, batch and loss bit-identical; auxiliary norm log differs by about `1.08e-12` |
+| PP2/CP2/EP2 native-safetensors restore, two continued updates | Restore boundary bit-identical on all four ranks; after continuing, rank 0 layer-2 sink differs by `9.3132e-10` and rank 2 layer-3 sink by `5.8208e-11`; ranks 1 and 3 bit-identical |
+
+A full-depth TE/DeepEP PP2/CP2/EP2 run on a 113,669-token book prefix inside
+each 131,072-token pack supervises 227,336 targets per update, with a
+highest logged rank-zero allocation of 118.85 GiB.
+
+KV caching, TP, and vocabulary resizing are outside this implementation's
+scope. Flint has no vision, video, or audio towers or media processor.

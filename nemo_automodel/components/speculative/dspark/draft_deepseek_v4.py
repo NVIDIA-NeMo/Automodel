@@ -40,6 +40,7 @@ from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,
     DSparkForwardOutput,
     build_eval_mask,
+    context_doc_ids,
     create_noise_embed,
     create_position_ids,
     sample_anchor_positions,
@@ -199,6 +200,8 @@ class DeepseekV4DSparkModel(nn.Module):
     """DSpark draft model with a DeepSeek V4 attention backbone (dense, non-causal)."""
 
     _no_split_modules = ["DeepseekV4DSparkDecoderLayer"]
+    # forward accepts position_ids / seq_lens / doc_remaining for packed rows.
+    supports_sequence_packing = True
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -419,15 +422,45 @@ class DeepseekV4DSparkModel(nn.Module):
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> DSparkForwardOutput:
+        """Run one DSpark training forward.
+
+        Packing keeps every block inside its anchor's document: the anchor's first
+        target is in the document, the block sees only that document's context, its
+        RoPE uses document-local positions, and supervision stops at the document end.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence] with target tokens.
+            target_hidden_states: Tensor of shape [batch, sequence, target_layers * hidden]
+                with the concatenated target features.
+            loss_mask: Tensor of shape [batch, sequence] selecting supervised tokens.
+            target_last_hidden_states: Optional tensor of shape [batch, sequence, hidden]
+                with the target's final normalized states.
+            position_ids: Optional tensor of shape [batch, sequence] with document-local
+                positions of packed rows.
+            seq_lens: Optional tensor of shape [batch, documents] with packed document
+                lengths; zero entries pad the document axis.
+            doc_remaining: Optional tensor of shape [batch, sequence] with the tokens left
+                in each position's packed document.
+
+        Returns:
+            DSpark loss inputs. Draft logits have shape [batch, num_anchors, block_size,
+            vocab]; token, mask, and confidence tensors have shape [batch, num_anchors,
+            block_size].
+        """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+        packed = seq_lens is not None
 
         anchor_positions, block_keep_mask = sample_anchor_positions(
             seq_len=seq_len,
             loss_mask=loss_mask,
             num_anchors=self.num_anchors,
             device=device,
+            doc_remaining=doc_remaining if packed else None,
         )
         noise_embedding = create_noise_embed(
             self.embed_tokens,
@@ -437,14 +470,30 @@ class DeepseekV4DSparkModel(nn.Module):
             mask_token_id=self.mask_token_id,
             block_size=self.block_size,
         )
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        draft_position_ids = create_position_ids(anchor_positions, self.block_size)
+        if packed:
+            context_position_ids = position_ids
+            ctx_doc_id = context_doc_ids(seq_lens, seq_len, device)
+            anchor_doc_id = torch.gather(ctx_doc_id, 1, anchor_positions)
+        else:
+            context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            ctx_doc_id = None
+            anchor_doc_id = None
+        draft_position_ids = create_position_ids(
+            anchor_positions, self.block_size, context_position_ids if packed else None
+        )
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
         # The draft attention is always dense eager-with-sink, so it always uses the
         # DFlash dense additive (SDPA) mask; there is no flex/eager kernel axis here
         # (a flex BlockMask cannot feed eager_attention_with_sink).
         dspark_attn_mask = create_dflash_sdpa_mask(
-            anchor_positions, block_keep_mask, seq_len, self.block_size, device, noise_embedding.dtype
+            anchor_positions,
+            block_keep_mask,
+            seq_len,
+            self.block_size,
+            device,
+            noise_embedding.dtype,
+            ctx_doc_id=ctx_doc_id,
+            anchor_doc_id=anchor_doc_id,
         )
         output_hidden = self._forward_backbone(
             position_ids=full_position_ids,
@@ -494,6 +543,8 @@ class DeepseekV4DSparkModel(nn.Module):
             label_indices=label_indices,
             safe_label_indices=safe_label_indices,
             block_keep_mask=block_keep_mask,
+            doc_remaining=doc_remaining if packed else None,
+            anchor_positions=anchor_positions if packed else None,
         )
         anchor_token_ids = torch.gather(
             input_ids,
