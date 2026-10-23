@@ -28,7 +28,6 @@ from torch.nn.attention.flex_attention import BlockMask
 from torch.utils._python_dispatch import _disable_current_modes
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
-from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 from nemo_automodel.components.models.step5.configuration import Step5Config
@@ -44,6 +43,7 @@ from nemo_automodel.components.models.step5.sparse import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 
 
 def _rms_norm_with_rstd(

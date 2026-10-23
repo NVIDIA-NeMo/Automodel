@@ -81,6 +81,9 @@ class MockNemotronV3Config:
         self.norm_topk_prob = False
         self.moe_shared_expert_intermediate_size = 128
 
+        self.num_nextn_predict_layers = 0
+        self.mtp_hybrid_override_pattern = "*"
+
         # Apply overrides
         for key, value in overrides.items():
             setattr(self, key, value)
@@ -1432,3 +1435,141 @@ class TestNemotronV3ModelWithMoE:
         # Shared experts should not have gate_proj (relu2 is non-gated)
         assert shared_experts.gate_proj is None
         assert shared_experts.up_proj is not None
+
+
+def test_response_only_hidden_states_match_dense_logits_and_keep_mtp():
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+    config = MockNemotronV3Config(torch_dtype="float32", num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*")
+    backend = BackendConfig(
+        linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
+    )
+    model = NemotronHForCausalLM(config, backend=backend).float()
+    model.train()
+    ids = torch.tensor([[1, 2, 3, 4]])
+    native_keys = set(model.state_dict())
+    dense = model(ids, compute_mtp=False, output_hidden_states=True)
+    native = model(ids, compute_logits=False, compute_mtp=False, output_hidden_states=True)
+    assert native.logits.shape == (1, 4, 0)
+    assert native.mtp_per_depth_h is None
+    assert model.mtp is not None
+    assert set(model.state_dict()) == native_keys
+    torch.testing.assert_close(model.lm_head(native.hidden_states[-1]), dense.logits)
+    native.hidden_states[-1].sum().backward()
+    assert any(parameter.grad is not None for parameter in model.model.parameters())
+    assert all(parameter.grad is None for parameter in model.mtp.parameters())
+
+
+def test_parameter_freezing_survives_materialization_with_intrinsic_fp32(tmp_path):
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+    backend = BackendConfig(
+        linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
+    )
+    with torch.device("meta"):
+        model = NemotronHForCausalLM(
+            MockNemotronV3Config(torch_dtype="float32", layers_block_type=["mamba", "moe"]), backend=backend
+        )
+    before_buffers = {name: b.dtype for name, b in model.named_buffers()}
+    from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+    from nemo_automodel.components.utils.model_utils import FreezeConfig, apply_parameter_freezing
+
+    apply_parameter_freezing(model, FreezeConfig(freeze_parameters=("model.layers.0.mixer.in_proj.weight",)))
+    prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+    before = {name: p.dtype for name, p in model.named_parameters()}
+    Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+    assert {name: p.dtype for name, p in model.named_parameters()} == before
+    assert all(not p.is_meta for p in model.parameters())
+    assert dict(model.named_parameters())["model.layers.0.mixer._fp32_params.A_log"].dtype == torch.float32
+    assert {name: b.dtype for name, b in model.named_buffers()} == before_buffers
+    bias_name = next(name for name in before_buffers if name.endswith("e_score_correction_bias"))
+    assert before_buffers[bias_name] == torch.float32
+    intrinsic = "model.layers.0.mixer._fp32_params.A_log"
+    values = torch.full_like(dict(model.named_parameters())[intrinsic], 0.1234567)
+    bias_values = torch.full_like(dict(model.named_buffers())[bias_name], 0.2345678)
+    from torch.distributed.checkpoint import load, save
+
+    save({intrinsic: values, bias_name: bias_values}, checkpoint_id=tmp_path / "weights")
+    targets = {intrinsic: dict(model.named_parameters())[intrinsic], bias_name: dict(model.named_buffers())[bias_name]}
+    load(targets, checkpoint_id=tmp_path / "weights")
+    torch.testing.assert_close(targets[intrinsic], values, rtol=0, atol=0)
+    torch.testing.assert_close(targets[bias_name], bias_values, rtol=0, atol=0)
+    assert targets[bias_name].dtype == torch.float32
+
+
+@skip_if_no_gpu
+def test_factory_freezes_only_explicit_parameters_on_one_rank(tmp_path):
+    """Unlisted parameters retain FP32 storage and trainability when FSDP is skipped."""
+    from transformers import PretrainedConfig
+
+    from nemo_automodel import NeMoAutoModelForCausalLM
+    from nemo_automodel.components.utils.model_utils import FreezeConfig
+
+    config = PretrainedConfig(**MockNemotronV3Config().to_dict())
+    config.architectures = ["NemotronHForCausalLM"]
+    model = NeMoAutoModelForCausalLM.from_config(
+        config,
+        backend=BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch"),
+        dtype=torch.float32,
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+        attn_implementation="sdpa",
+        freeze_config=FreezeConfig(freeze_parameters=("model.layers.0.norm.weight",)),
+    )
+    assert {name for name, p in model.named_parameters() if not p.requires_grad} == {"model.layers.0.norm.weight"}
+    assert all(p.dtype == torch.float32 for p in model.parameters())
+    ids = torch.tensor([[1, 2, 3]], device="cuda")
+    output = model(ids)
+    assert torch.isfinite(output.logits).all()
+    output.logits.square().mean().backward()
+    assert model.model.layers["0"].norm.weight.grad is None
+    assert model.model.layers["1"].norm.weight.grad is not None
+
+
+@skip_if_no_gpu
+def test_factory_preserves_intrinsic_fp32_without_a_trainable_surface(tmp_path):
+    from safetensors.torch import save_file
+    from transformers import PretrainedConfig
+
+    from nemo_automodel import NeMoAutoModelForCausalLM
+    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+    config = PretrainedConfig(**MockNemotronV3Config(layers_block_type=["mamba", "moe"]).to_dict())
+    config.architectures = ["NemotronHForCausalLM"]
+    config.name_or_path = str(tmp_path)
+    backend = BackendConfig(
+        linear="torch", attn="sdpa", rms_norm="torch", dispatcher="torch", enable_hf_state_dict_adapter=False
+    )
+    from nemo_automodel._transformers.model_init import local_torch_dtype
+
+    with local_torch_dtype(torch.bfloat16, "NemotronHForCausalLM"):
+        seed = NemotronHForCausalLM(config, backend=backend)
+    seed.initialize_weights(dtype=torch.bfloat16)
+    weights = {name: value.detach().clone() for name, value in seed.state_dict().items()}
+    intrinsic = "model.layers.0.mixer._fp32_params.A_log"
+    assert weights[intrinsic].dtype == torch.float32
+    weights[intrinsic].fill_(0.1234567)
+    bias_name = next(name for name in weights if name.endswith("e_score_correction_bias"))
+    assert weights[bias_name].dtype == torch.float32
+    assert weights["model.layers.0.norm.weight"].dtype == torch.bfloat16
+    weights[bias_name].fill_(0.2345678)
+    assert not torch.equal(weights[bias_name], weights[bias_name].bfloat16().float())
+    save_file(weights, tmp_path / "model.safetensors")
+    model = NeMoAutoModelForCausalLM.from_config(
+        config,
+        backend=backend,
+        torch_dtype=torch.bfloat16,
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+        attn_implementation="sdpa",
+        load_base_model=True,
+    )
+    parameters = dict(model.named_parameters())
+    assert parameters[intrinsic].dtype == torch.float32
+    torch.testing.assert_close(parameters[intrinsic].detach().cpu(), weights[intrinsic], rtol=0, atol=0)
+    bias = dict(model.named_buffers())[bias_name]
+    assert bias.dtype == torch.float32
+    torch.testing.assert_close(bias.detach().cpu(), weights[bias_name], rtol=0, atol=0)
+    assert parameters["model.layers.0.norm.weight"].dtype == torch.bfloat16
+    assert all(p.requires_grad for p in parameters.values())

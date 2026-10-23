@@ -37,7 +37,7 @@ maintainers = [
     { name = "Huiying Li", email = "huiyingl@nvidia.com" },
     { name = "NVIDIA", email = "nemo-toolkit@nvidia.com" },
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     # How mature is this project? Common values are
     #  1 - Planning
@@ -64,7 +64,6 @@ classifiers = [
     'License :: OSI Approved :: Apache Software License',
     # Supported python versions
     'Programming Language :: Python :: 3',
-    'Programming Language :: Python :: 3.10',
     'Programming Language :: Python :: 3.11',
     'Programming Language :: Python :: 3.12',
     # Additional Setting
@@ -265,7 +264,7 @@ linting = [
     "pre-commit>=4.2.0",
     "ruff~=0.12.0",
     "import-linter~=2.4",
-    "ty>=0.0.20",
+    "ty>=0.0.91",
 ]
 test = [
     "coverage",
@@ -293,6 +292,12 @@ magi = [
 
 [tool.uv]
 managed = true
+# Preserve the Linux x86_64 partition consumed by the CUDA wheelhouse selector.
+# Windows reports AMD64; a platform-independent x86_64 split requests nonexistent Windows wheels.
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform != 'linux' or platform_machine != 'x86_64'",
+]
 default-groups = ["build", "docs", "test"]
 no-build-isolation-package = [
     "bitsandbytes",
@@ -357,6 +362,8 @@ constraint-dependencies = [
     "apache-tvm-ffi<=0.1.11",
 ]
 override-dependencies = [
+    # Override Trackio's Pillow<13 cap to enforce the security update.
+    "pillow==13.0.0",
     # leptonai (via nemo-run) caps anyio<=4.9.0; override to keep the security floor
     "anyio>=4.14.2",
     # TE native grouped GEMM with current-scaling FP8 requires cuBLASLt 13.5+ on Hopper.
@@ -495,7 +502,7 @@ omit = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 exclude = [
    "tests/",
 ]
@@ -661,7 +668,7 @@ allow_indirect_imports = true
 # To advance to the next phase, move module paths from the "Phase 2" comment
 # into the active overrides list and fix any new errors.
 [tool.ty.environment]
-python-version = "3.10"
+python-version = "3.11"
 
 [tool.ty.src]
 include = ["nemo_automodel", "examples"]
