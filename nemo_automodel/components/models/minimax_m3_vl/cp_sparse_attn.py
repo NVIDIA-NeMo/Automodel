@@ -449,8 +449,8 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
             q_positions: Global token slots [sequence] for the local sequence.
 
         Returns:
-            Boolean selected blocks [batch, index_heads, sequence, key_blocks],
-            where key_blocks is ceil(sequence / block_size). A replay aliases
+            Uint8 selected blocks [batch, index_heads, sequence, ceil(key_blocks/8)],
+            with one bit per key block. A replay aliases
             the original selection, which callers must treat as read-only.
         """
         replay = sparse_route_replay.current()
@@ -470,6 +470,7 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
                 local_blocks=self.indexer.local_blocks,
                 score_type=self.indexer.score_type,
                 q_positions=q_positions,
+                packed=True,
             )
         if replay is not None and replay[1] == "record":
             replay[0].record(block_sel)
@@ -564,7 +565,8 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
                 local_blocks=idxer.local_blocks,
                 score_type=idxer.score_type,
                 q_positions=q_slots,
-            )  # [B, H_idx, T_local, num_blocks]
+                packed=True,
+            )  # uint8 [B, H_idx, T_local, ceil(num_blocks / 8)]
 
         # 4. FlexAttention over the block-sparse mask (local queries x global K/V).
         out = self._flex_sparse_attention(
@@ -629,6 +631,10 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         # _block_sel_flat_offset.
         sel_heads, sel_queries, sel_blocks = block_sel.shape[1], block_sel.shape[2], block_sel.shape[3]
         block_sel_flat = block_sel.reshape(-1)
+        use_flash = self.backend.attn == "fa4" and not rescue_pad_queries
+        # CuTe's TensorSSA in supported FA4 versions has no tensor right-shift
+        # overload. A tiny lookup supplies the exact integer bit for FLASH.
+        bit_values = (1 << torch.arange(8, device=q.device, dtype=torch.int32)) if use_flash else None
 
         def cp_sparse_mask(b, h, q_idx, kv_idx):
             # Mask construction visits padded tile boundaries too. Read metadata
@@ -643,9 +649,16 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
             else:
                 h_idx = h // rep
             sel_offset = _block_sel_flat_offset(
-                b, h_idx, q_idx, kv_idx // block_size, sel_heads, sel_queries, sel_blocks
+                b, h_idx, q_idx, kv_idx // block_size // 8, sel_heads, sel_queries, sel_blocks
             )
-            keep = (kv_idx <= q_positions[q_idx]) & block_sel_flat[sel_offset]
+            if use_flash:
+                # Flex's CuTe lowering currently materializes scalar indices
+                # as Int32. The host-side extent check below makes this exact.
+                sel_offset = sel_offset.to(torch.int32)
+                selected = (block_sel_flat[sel_offset].to(torch.int32) & bit_values[(kv_idx // block_size) % 8]) != 0
+            else:
+                selected = ((block_sel_flat[sel_offset].to(torch.int32) >> ((kv_idx // block_size) % 8)) & 1) != 0
+            keep = (kv_idx <= q_positions[q_idx]) & selected
             if key_valid is not None:
                 keep = keep & key_valid[b, kv_idx]
             if doc_global is not None:
@@ -676,7 +689,8 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         # Selection still uses 128-token key blocks. FLASH on SM100/110
         # pipelines two 128-row query tiles, so its execution mask needs a
         # 256-row query block independently of the model's key-block size.
-        use_flash = self.backend.attn == "fa4" and not rescue_pad_queries
+        if use_flash and block_sel.numel() >= 2**31:
+            raise ValueError("MiniMax FA4 packed selection exceeds the backend's int32 indexing limit")
         mask_block_size = (block_size, block_size)
         if use_flash and torch.cuda.get_device_capability(q.device)[0] in (10, 11):
             mask_block_size = (256, block_size)
