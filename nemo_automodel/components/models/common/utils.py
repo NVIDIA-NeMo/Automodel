@@ -467,6 +467,13 @@ class BackendConfig:
             blocks. ``None`` preserves HybridEP's default.
         dispatcher_hybridep_num_blocks_unpermute: Optional number of combine
             unpermutation blocks. ``None`` preserves HybridEP's default.
+        dispatcher_hybridep_max_tokens_per_rank: HybridEP only. Allocate the process-global
+            HybridEP buffer for this many tokens per rank on the first dispatch instead of the
+            first micro-batch's token count. HybridEP grows the buffer when a later micro-batch
+            is larger; in multi-node mode that reallocation re-creates the RDMA queue pairs, is
+            slow and has been seen to abort (``Failed to create ... QP``). Set it to the largest
+            micro-batch token count (e.g. the dynamic-batching token cap). The buffer is resident
+            GPU memory for the whole run, so do not pad it. ``None`` keeps the lazy behaviour.
         dispatcher_capacity_factor: HybridEP only, dynamic routing. Run HybridEP dispatch in its
             non-blocking mode with output buffers sized to the first microbatch's permuted row
             count times this factor (EP-group max, 4-token aligned) instead of letting every
@@ -571,6 +578,7 @@ class BackendConfig:
     dispatcher_hybridep_num_sms_preprocessing: int | None = None
     dispatcher_hybridep_num_blocks_permute: int | None = None
     dispatcher_hybridep_num_blocks_unpermute: int | None = None
+    dispatcher_hybridep_max_tokens_per_rank: int | None = None
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):

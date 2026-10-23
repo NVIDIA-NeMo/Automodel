@@ -1519,6 +1519,9 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
         )
+        self.dispatcher_hybridep_max_tokens_per_rank = (
+            backend.dispatcher_hybridep_max_tokens_per_rank if backend is not None else None
+        )
         # HybridEP capacity mode (BackendConfig.dispatcher_capacity_factor): the dispatcher returns
         # device-side tokens_per_expert and buffers of a fixed capacity, so the per-microbatch
         # count_nonzero host read in forward is skipped as well (rows are never empty).
@@ -1582,6 +1585,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_max_tokens_per_rank=self.dispatcher_hybridep_max_tokens_per_rank,
             moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
             moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
             moe_benchmark_static_routing=self.static_routing,
@@ -1908,6 +1912,9 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
         )
+        self.dispatcher_hybridep_max_tokens_per_rank = (
+            backend.dispatcher_hybridep_max_tokens_per_rank if backend is not None else None
+        )
 
         self._init_grouped_layers(self.num_local_experts)
         self.expert_activation = get_expert_activation_for_deepep(config)
@@ -2210,6 +2217,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_max_tokens_per_rank=self.dispatcher_hybridep_max_tokens_per_rank,
             moe_benchmark_static_routing=self.static_routing,
         )
 

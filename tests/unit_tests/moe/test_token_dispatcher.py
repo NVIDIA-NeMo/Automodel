@@ -1098,3 +1098,40 @@ class TestDispatchStateRelease:
         graph_connected = [name for name, value in leftovers.items() if value.grad_fn is not None]
         assert graph_connected == [], graph_connected
         assert activation_ptrs[1] not in self._saved_data_ptrs(leftovers.values())
+
+
+class TestHybridEPMaxTokensPerRank:
+    def test_manager_forwards_max_tokens_per_rank_to_dispatch(self, monkeypatch):
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            manager = _HybridEPManager(
+                group=None, num_local_experts=2, num_experts=8, router_topk=2, moe_hybridep_max_tokens_per_rank=3072
+            )
+        seen = []
+
+        def fake_dispatch(x, routing_map, probs, num_permuted_tokens=None, **kwargs):
+            seen.append(kwargs.get("max_tokens_per_rank"))
+            token_rows = routing_map.nonzero(as_tuple=False)[:, 0]
+            return x[token_rows], probs[routing_map], None, routing_map.sum(dim=0), "runtime-handle"
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        monkeypatch.setattr(
+            td, "hybrid_ep_combine", lambda x, **kwargs: x.reshape(5, manager.router_topk, 4).sum(dim=1)
+        )
+        manager.initialize_runtime(num_tokens=5, hidden_dim=4, dtype=torch.float32, device=torch.device("cpu"))
+
+        assert seen == [3072]
+
+    def test_default_is_none_and_non_positive_is_rejected(self):
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            manager = _HybridEPManager(group=None, num_local_experts=2, num_experts=8, router_topk=2)
+            assert manager.moe_hybridep_max_tokens_per_rank is None
+            with pytest.raises(ValueError, match="must be positive"):
+                _HybridEPManager(
+                    group=None, num_local_experts=2, num_experts=8, router_topk=2, moe_hybridep_max_tokens_per_rank=0
+                )
