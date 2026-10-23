@@ -3782,3 +3782,37 @@ def test_apply_cp_mixed_full_and_linear_attention(monkeypatch):
     te_attn.set_context_parallel_group.assert_called_once()
     # linear_attention block: cp_mesh attached
     assert linear_attn._cp_mesh is cp_mesh
+
+
+def test_parallelize_model_binds_model_owned_dtensors_without_fsdp(monkeypatch):
+    """A one-rank shard mesh skips FSDP but still hands the mesh to model-owned sharded parameters."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+
+    world_mesh = FakeWorldMesh({"dp": 1, ("dp",): 1, "tp": 1, "cp": 1}, mesh_dim_names=["dp", "tp", "cp"])
+    prepare_mock = MagicMock(return_value=set())
+
+    class Inner:
+        def __init__(self):
+            self.moe_config = type("MC", (), {"n_routed_experts": 4})()
+
+    class Outer:
+        def __init__(self):
+            self.model = Inner()
+            self._nemo_prepare_model_owned_dtensors = prepare_mock
+
+    P.parallelize_model(
+        model=Outer(),
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp",),
+        cp_axis_name=None,
+        tp_axis_name=None,
+        ep_axis_name=None,
+        activation_checkpointing=False,
+    )
+
+    apply_fsdp_mock.assert_not_called()
+    prepare_mock.assert_called_once()
+    assert prepare_mock.call_args.args[0].size() == 1
