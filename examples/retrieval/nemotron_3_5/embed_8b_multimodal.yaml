@@ -77,7 +77,7 @@ optimizer:
   master_weights: true
 
 lr_scheduler:
-  lr_warmup_steps: 0
+  lr_warmup_steps: 100
   lr_decay_style: linear
 
 distributed:

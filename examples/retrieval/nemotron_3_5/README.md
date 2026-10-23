@@ -53,12 +53,15 @@ one positive and three negatives, repeating negatives when necessary.
 The setting `use_text_in_document: true` retains accompanying text.
 Include image documents to train the embedding models' vision components.
 Provide at least 128 queries for embedding training or 256 for reranker training.
-The reranker uses 200 warmup steps, so the run must exceed 200 optimizer steps.
-For a smaller dataset, add `--lr_scheduler.lr_warmup_steps 0` to the launch command.
+Embedding training uses 100 warmup steps, and reranker training uses 200. Each run
+must include more optimizer steps than warmup steps. For a short validation run, add
+`--lr_scheduler.lr_warmup_steps 0` to the launch command.
 
-The training configurations resize images with a longest-edge setting of 1,284
-pixels and limit document sequences to 4,096 tokens. These training settings differ
-from the released processors' 1,120-pixel inference default.
+The embedding configuration uses an image longest-edge setting of 1,284 pixels
+and limits document sequences to 4,096 tokens. To reduce peak memory, the reranker
+uses 1,120 pixels, 3,072 tokens per query-document pair, and one query per GPU per
+micro-batch. Each query has four document candidates. Gradient accumulation
+preserves the reranker's global batch of 256 queries.
 
 ## Run Training
 

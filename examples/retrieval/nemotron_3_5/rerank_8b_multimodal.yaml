@@ -46,11 +46,11 @@ freeze_config:
 tokenizer:
   _target_: nemo_automodel.components.models.ministral_bidirectional.processor.Mistral3BiEncoderProcessor.from_pretrained
   pretrained_model_name_or_path: *model_id
-  rerank_max_length: 4096
+  rerank_max_length: 3072
   use_prompt_template: true
   export_as_stock_processor: false
   pad_to_multiple_of: 8
-  image_longest_edge: 1284
+  image_longest_edge: 1120
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
@@ -69,7 +69,7 @@ dataloader:
 
 step_scheduler:
   global_batch_size: 256
-  local_batch_size: 4
+  local_batch_size: 1
   num_epochs: 1
   ckpt_every_steps: 400
 
