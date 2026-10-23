@@ -460,6 +460,8 @@ navigation:
                 path: ../../model-coverage/llm/tiiuae/falcon-h1-1-5b-deep-instruct.mdx
               - page: "Falcon-H1-34B-Instruct"
                 path: ../../model-coverage/llm/tiiuae/falcon-h1-34b-instruct.mdx
+              - page: "Falcon-H1-7B-Instruct"
+                path: ../../model-coverage/llm/tiiuae/falcon-h1-7b-instruct.mdx
               - page: "Falcon3-7B-Instruct"
                 path: ../../model-coverage/llm/tiiuae/falcon3-7b-instruct.mdx
           - section: "Upstage"

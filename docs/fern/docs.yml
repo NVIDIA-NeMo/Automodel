@@ -72,6 +72,10 @@ versions:
     availability: stable
 
 redirects:
+  - source: "/nemo/automodel/model-coverage/large-language-models/nvidia/Llama-3-3-Nemotron-Super-49B-v1"
+    destination: "/nemo/automodel/model-coverage/large-language-models/nvidia/Llama-3_3-Nemotron-Super-49B-v1"
+  - source: "/nemo/automodel/nightly/model-coverage/large-language-models/nvidia/Llama-3-3-Nemotron-Super-49B-v1"
+    destination: "/nemo/automodel/nightly/model-coverage/large-language-models/nvidia/Llama-3_3-Nemotron-Super-49B-v1"
   # Preserve the former MiniMax provider and checkpoint URLs.
   - source: "/nemo/automodel/model-coverage/large-language-models/minimax"
     destination: "/nemo/automodel/model-coverage/large-language-models/MiniMaxAI"
@@ -184,8 +188,6 @@ redirects:
     destination: "/nemo/automodel/model-coverage/large-language-models/qwen/Qwen3-30B-A3B"
   - source: "/nemo/automodel/model-coverage/large-language-models/thudm/GLM-4.7-Flash"
     destination: "/nemo/automodel/model-coverage/large-language-models/thudm/GLM-4.7"
-  - source: "/nemo/automodel/model-coverage/large-language-models/tiiuae/Falcon-H1-7B-Instruct"
-    destination: "/nemo/automodel/model-coverage/large-language-models/tiiuae/falcon-7b"
   - source: "/nemo/automodel/model-coverage/large-language-models/xiaomimimo/MiMo-V2.6-Flash-RL"
     destination: "/nemo/automodel/model-coverage/large-language-models/xiaomimimo/MiMo-V2-Flash"
   - source: "/nemo/automodel/model-coverage/large-language-models/xiaomimimo/mimo-v2-5-pro"
@@ -236,8 +238,6 @@ redirects:
     destination: "/nemo/automodel/nightly/model-coverage/large-language-models/qwen/Qwen3-30B-A3B"
   - source: "/nemo/automodel/nightly/model-coverage/large-language-models/thudm/GLM-4.7-Flash"
     destination: "/nemo/automodel/nightly/model-coverage/large-language-models/thudm/GLM-4.7"
-  - source: "/nemo/automodel/nightly/model-coverage/large-language-models/tiiuae/Falcon-H1-7B-Instruct"
-    destination: "/nemo/automodel/nightly/model-coverage/large-language-models/tiiuae/falcon-7b"
   - source: "/nemo/automodel/nightly/model-coverage/large-language-models/xiaomimimo/MiMo-V2.6-Flash-RL"
     destination: "/nemo/automodel/nightly/model-coverage/large-language-models/xiaomimimo/MiMo-V2-Flash"
   - source: "/nemo/automodel/nightly/model-coverage/large-language-models/xiaomimimo/mimo-v2-5-pro"
