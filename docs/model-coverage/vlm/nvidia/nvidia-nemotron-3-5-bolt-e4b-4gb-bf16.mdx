@@ -55,12 +55,15 @@ exposes the same controls as the model card: `enable_thinking` switches reasonin
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Developer | NVIDIA Corporation |
 | Base model | [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) |
+| Architecture type | Gemma 4 |
+| Network architecture | Gemma-4-E4B |
+| Hugging Face architecture | `Gemma4ForConditionalGeneration` |
 | Total parameters | 8B (4B effective) |
 | Precision | BF16 |
 | Context length | Input up to 64K tokens; output up to 64K tokens |
@@ -70,14 +73,6 @@ exposes the same controls as the model card: `enable_thinking` switches reasonin
 | Recommended sampling | Temperature 1.0, top_p 0.95 in both thinking modes |
 | Best for | Local voice and device assistants, interactive personas, and embedded interfaces |
 | License | [OpenMDW-1.1](https://github.com/OpenMDW/OpenMDW/blob/main/1.1/LICENSE.OpenMDW-1.1) |
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Architecture type | Gemma 4 |
-| Network architecture | Gemma-4-E4B |
-| Hugging Face architecture | `Gemma4ForConditionalGeneration` |
 | Checkpoint | [`nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16) |
 
 ### Training Methodology
