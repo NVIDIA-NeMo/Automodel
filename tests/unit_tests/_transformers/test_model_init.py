@@ -1075,7 +1075,15 @@ class TestRemoteCodeConfigOverridesReachModel:
         hf_calls = []
 
         def fake_hf_from_pretrained(
-            cls_arg, path, *args, config=None, dtype=None, attn_implementation=None, trust_remote_code=None, **kwargs
+            cls_arg,
+            path,
+            *args,
+            config=None,
+            dtype=None,
+            attn_implementation=None,
+            trust_remote_code=None,
+            revision=None,
+            **kwargs,
         ):
             hf_calls.append((config, dict(kwargs)))
             if config is None:
@@ -1090,6 +1098,8 @@ class TestRemoteCodeConfigOverridesReachModel:
 
         with (
             patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=self._disk_config(auto_map)),
+            # "fake/remote" is not a local path, so revision resolution would reach the Hub.
+            patch("nemo_automodel._transformers.model_init.AutoConfig.resolve_revision", return_value="a" * 40),
             patch("nemo_automodel._transformers.model_init._try_get_remote_code_model_cls", return_value=model_cls),
             patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class", side_effect=lambda c: c),
             # The auto_map alias retry re-reads config.json when kwargs carries no config.
