@@ -42,8 +42,8 @@ def _rope_frequencies(
     pos_h = torch.arange(1, grid_h + 1, dtype=torch.float32, device=device)
     pos_w = torch.arange(1, grid_w + 1, dtype=torch.float32, device=device)
     mesh_h, mesh_w = torch.meshgrid(pos_h, pos_w, indexing="ij")
-    freq_h = torch.einsum("hw,d->hwd", mesh_h, inverse)
-    freq_w = torch.einsum("hw,d->hwd", mesh_w, inverse)
+    freq_h = mesh_h.unsqueeze(-1) * inverse
+    freq_w = mesh_w.unsqueeze(-1) * inverse
     angles = torch.cat((freq_w, freq_h), dim=-1)
     return torch.stack((angles.cos(), angles.sin()), dim=-1).reshape(grid_h * grid_w, head_dim // 2, 2)
 

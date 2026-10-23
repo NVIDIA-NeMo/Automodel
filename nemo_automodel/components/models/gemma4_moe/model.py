@@ -245,6 +245,18 @@ class Gemma4Gate(nn.Module):
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
     def forward(self, x, token_mask=None, cp_mesh=None):
+        """Select experts using FP32 router arithmetic.
+
+        Args:
+            x: Tensor of shape [..., hidden] with arbitrary leading dimensions.
+            token_mask: Optional boolean tensor matching x's leading dimensions;
+                unused by this router.
+            cp_mesh: Optional context-parallel mesh; unused by this router.
+
+        Returns:
+            Weights in the input dtype and integer expert indices, each shaped
+            [..., topk], followed by None for auxiliary loss.
+        """
         # Router math runs in fp32 regardless of parameter/activation storage
         # dtype. With bf16 storage (e.g. bf16 weights + fp32 master weights via
         # TE FusedAdam), bf16 logits can flip top-k expert selection, so keep
@@ -259,7 +271,8 @@ class Gemma4Gate(nn.Module):
         x_norm = self.norm(x).to(torch.float32)
         x_norm = x_norm * self.scale.to(torch.float32) * self.scalar_root_size
 
-        expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
 
         weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)

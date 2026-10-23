@@ -70,11 +70,23 @@ class Ernie4_5RotaryEmbedding(nn.Module):
         position_ids: torch.Tensor,
         qkv_format: str = "bshd",
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build FP32 interleaved rotary coefficients for local positions.
+
+        Args:
+            x: Tensor of shape [batch, sequence, heads, head_dim] or packed
+                [tokens, heads, head_dim]; used to select the device.
+            position_ids: Integer tensor [batch, sequence] or packed [tokens].
+            qkv_format: BSHD or packed THD tensor layout.
+
+        Returns:
+            FP32 cosine and sine tensors [batch, sequence, head_dim] or
+            [tokens, head_dim], with interleaved rotary pairs.
+        """
         if position_ids.ndim == 1:
             position_ids = position_ids.unsqueeze(0)
 
         inv_freq = self.inv_freq.to(device=x.device, dtype=torch.float32)
-        angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), inv_freq)
+        angles = position_ids.to(dtype=torch.float32).unsqueeze(-1) * inv_freq
         cos = angles.cos().repeat_interleave(2, dim=-1) * self.attention_scaling
         sin = angles.sin().repeat_interleave(2, dim=-1) * self.attention_scaling
 
