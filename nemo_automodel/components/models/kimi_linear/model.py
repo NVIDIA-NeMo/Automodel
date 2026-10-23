@@ -906,9 +906,10 @@ class KimiDecoderLayer(nn.Module):
         token_mask = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
         weights, indices, _ = moe.gate(x, token_mask, moe.cp_mesh)
 
-        counts = indices.new_zeros((indices.shape[0], experts.n_routed_experts))
-        counts.scatter_(1, indices, 1)
-        tokens_per_expert = counts.sum(dim=0).cpu().tolist()
+        # Store each expert's token mask contiguously for the reduction (see PR #4365).
+        counts = indices.new_zeros((experts.n_routed_experts, indices.shape[0]))
+        counts.scatter_(0, indices.T, 1)
+        tokens_per_expert = counts.sum(dim=1).cpu().tolist()
         sorted_ids = indices.reshape(-1).argsort()
         sorted_tokens = x[sorted_ids // indices.shape[1]]
 
