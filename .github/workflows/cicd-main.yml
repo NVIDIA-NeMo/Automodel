@@ -71,6 +71,8 @@ jobs:
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -125,6 +127,8 @@ jobs:
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -167,6 +171,8 @@ jobs:
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
