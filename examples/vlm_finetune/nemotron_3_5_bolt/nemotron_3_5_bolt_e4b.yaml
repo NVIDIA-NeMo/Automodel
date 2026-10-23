@@ -110,3 +110,5 @@ freeze_config:
 ci:
   cluster_tag: h100
   recipe_owner: huiyingl
+  nodes: 1
+  time: "00:20:00"
