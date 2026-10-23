@@ -735,6 +735,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         compute_logits: bool = True,
+        compute_mtp: bool = True,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass with optional loss computation.
@@ -788,6 +789,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 ``NemotronHCausalLMOutputWithPast`` off-PP).
             compute_logits: Whether to materialize logits. Fused-linear loss callers
                 may disable this off-PP when they consume final hidden states directly.
+            compute_mtp: Whether to run the auxiliary MTP head. Disabling it
+                keeps its parameters and checkpoint topology intact for RL.
+                Only supported off-PP; defaults to True.
             **kwargs: Additional arguments forwarded to the base model
                 (e.g. ``qkv_format``, ``cu_seqlens``, ``cu_seqlens_padded``,
                 ``max_seqlen``, ``seq_idx``, ``cp_rank``, ``cp_size``,
@@ -815,6 +819,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 have shape [batch, sequence, vocab].
         """
         is_pp_stage = self._is_pipeline_parallel_stage()
+        if is_pp_stage and not compute_mtp:
+            raise ValueError("compute_mtp=False is only supported off-PP")
         is_first_stage = getattr(self.model, "embed_tokens", None) is not None
         has_lm_head = self.lm_head is not None
         mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
@@ -822,7 +828,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # CP shards are not contiguous sequence slices. MTP therefore cannot
         # derive future-token embeddings or positions by rolling rank-local
         # tensors; callers must provide both globally shifted tensors.
-        mtp_active = self.mtp is not None and (self.training or (self.compute_mtp_in_eval and not use_cache))
+        mtp_active = (
+            compute_mtp and self.mtp is not None and (self.training or (self.compute_mtp_in_eval and not use_cache))
+        )
         cp_size = int(kwargs.get("cp_size", 1) or 1)
         if cp_size > 1 and mtp_active:
             precomputed_token_sources = int(bool(mtp_embed_inputs)) + int(mtp_per_depth_input_ids is not None)
@@ -1214,9 +1222,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         Args:
             buffer_device: Device to use for buffer initialization
-            dtype: Target dtype for model weights
+            dtype: Target dtype for model weights; prepared per-parameter storage is preserved.
         """
-        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        buffer_device = buffer_device or next(self.parameters()).device
         with buffer_device:
             self.model.initialize_weights(buffer_device=buffer_device)
             if self.lm_head is not None:
