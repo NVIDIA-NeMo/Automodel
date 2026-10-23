@@ -566,8 +566,12 @@ def test_load_automodel_peft_config_dict_round_trips_the_saved_metadata(tmp_path
 
     from nemo_automodel.components._peft.lora import PeftConfig
 
-    peft = PeftConfig(target_modules=["*.qkv_proj"], dim=16, alpha=8, lora_dtype=torch.bfloat16)
+    peft = PeftConfig(
+        target_modules=["*.qkv_proj"], dim=16, alpha=8, lora_dtype=torch.bfloat16, use_memory_efficient_lora=False
+    )
     metadata = _get_automodel_peft_metadata(peft)
+    assert "dim" not in metadata and "alpha" not in metadata
+    assert metadata["use_memory_efficient_lora"] is False
     metadata.update({"paramwrapper_layout": "peft-0.19.1+", "future_checkpoint_field": True})
     if legacy_defaults:
         metadata.pop("use_memory_efficient_lora")
@@ -578,4 +582,4 @@ def test_load_automodel_peft_config_dict_round_trips_the_saved_metadata(tmp_path
     loaded = PeftConfig(**kwargs)
     assert loaded.target_modules == ["*.qkv_proj"] and (loaded.dim, loaded.alpha) == (16, 8)
     assert loaded.lora_dtype == "torch.bfloat16"
-    assert loaded.use_memory_efficient_lora is True
+    assert loaded.use_memory_efficient_lora is legacy_defaults

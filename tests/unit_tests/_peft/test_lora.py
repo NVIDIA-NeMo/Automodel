@@ -122,8 +122,8 @@ def test_lora_patch_applies_to_selected_module_with_str_dtype(model):
     assert not isinstance(model.linear2, LinearLoRA)
 
 
-def test_peft_config_memory_efficient_lora_round_trip():
-    """PeftConfig should default memory-efficient LoRA on and preserve explicit overrides."""
+def test_peft_config_defaults_and_import_compatibility():
+    """The existing import exposes the dataclass with its defaults and explicit overrides."""
     from nemo_automodel.components._peft.config import PeftConfig as ConfigPeftConfig
 
     assert PeftConfig is ConfigPeftConfig
@@ -131,7 +131,6 @@ def test_peft_config_memory_efficient_lora_round_trip():
 
     cfg = PeftConfig(use_memory_efficient_lora=False)
     assert cfg.use_memory_efficient_lora is False
-    assert cfg.to_dict()["use_memory_efficient_lora"] is False
 
 
 def test_forward_output_consistency(dummy_input):

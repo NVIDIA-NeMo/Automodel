@@ -383,7 +383,7 @@ def _get_paramwrapper_layout_stamp(adapter, v4_compatible: bool, legacy_paramwra
     return _PARAMWRAPPER_LAYOUT_LEGACY if legacy_paramwrapper_layout else _PARAMWRAPPER_LAYOUT_MODERN
 
 
-def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
+def _get_automodel_peft_metadata(peft_config: _AutomodelPeftConfig) -> dict:
     """
     Get the PEFT metadata in the format expected by Automodel.
 
@@ -396,12 +396,13 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     """
     PEFT_KEYS = {"dim", "alpha"}
     result = {}
-    for k, v in peft_config.to_dict().items():
-        if k in PEFT_KEYS:
+    for config_field in fields(peft_config):
+        if config_field.name in PEFT_KEYS:
             continue
+        v = getattr(peft_config, config_field.name)
         if isinstance(v, torch.dtype):
             v = str(v)
-        result[k] = v
+        result[config_field.name] = v
     return result
 
 
