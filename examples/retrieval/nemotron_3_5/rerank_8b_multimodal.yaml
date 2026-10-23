@@ -51,6 +51,7 @@ tokenizer:
   export_as_stock_processor: false
   pad_to_multiple_of: 8
   image_longest_edge: 1120
+  do_pad: true
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig

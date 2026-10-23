@@ -46,6 +46,7 @@ tokenizer:
   passage_prefix: "passage:"
   pad_to_multiple_of: 8
   image_longest_edge: 1284
+  do_pad: true
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
