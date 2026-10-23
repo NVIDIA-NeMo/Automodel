@@ -424,35 +424,6 @@ class TestCustomModelGenerationConfig:
         assert model.config.eos_token_id is None
         assert model.generation_config.eos_token_id is None
 
-    @patch("nemo_automodel._transformers.model_init._download_model_weights")
-    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
-    def test_config_object_override_provenance_survives_legacy_fallback(
-        self, mock_resolve_cls, _mock_download, tmp_path
-    ):
-        """A public from_config override must win over eos_token_id in a legacy config.json."""
-        import json
-
-        (tmp_path / "config.json").write_text(
-            json.dumps({"model_type": "llama", "architectures": ["SomeModel"], "eos_token_id": 2})
-        )
-        mock_resolve_cls.return_value = self._FakeModel
-        config = PretrainedConfig(architectures=["SomeModel"], eos_token_id=None)
-        config.name_or_path = str(tmp_path)
-
-        _, model = _init_model(
-            cls=MagicMock(),
-            pretrained_model_name_or_path_or_config=config,
-            attn_implementation="sdpa",
-            torch_dtype=torch.float32,
-            quantization_config=None,
-            force_hf=False,
-            _load_base_model=True,
-            _config_overrides={"eos_token_id"},
-        )
-
-        assert model.config.eos_token_id is None
-        assert model.generation_config.eos_token_id is None
-
     @patch("nemo_automodel._transformers.model_init.get_hf_config")
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
@@ -577,39 +548,6 @@ class TestCustomModelGenerationConfig:
 
         assert is_custom is True
         assert model.generation_config.eos_token_id is None
-
-    @patch("nemo_automodel._transformers.model_init._download_model_weights")
-    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
-    def test_config_build_restores_generation_config_when_loading_base_model(
-        self, mock_resolve_cls, _mock_download, tmp_path
-    ):
-        GenerationConfig(
-            eos_token_id=[2, 11],
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.95,
-            top_k=20,
-        ).save_pretrained(tmp_path)
-        mock_resolve_cls.return_value = self._FakeModel
-        config = self._make_config()
-        config.name_or_path = str(tmp_path)
-
-        is_custom, model = _init_model(
-            cls=MagicMock(),
-            pretrained_model_name_or_path_or_config=config,
-            attn_implementation="sdpa",
-            torch_dtype=torch.float32,
-            quantization_config=None,
-            force_hf=False,
-            _load_base_model=True,
-        )
-
-        assert is_custom is True
-        assert model.generation_config.eos_token_id == [2, 11]
-        assert model.generation_config.do_sample is True
-        assert model.generation_config.temperature == 0.7
-        assert model.generation_config.top_p == 0.95
-        assert model.generation_config.top_k == 20
 
 
 class TestBackendDictCoercion:

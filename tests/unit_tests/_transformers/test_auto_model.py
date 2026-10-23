@@ -203,60 +203,6 @@ class TestResolveMeshContext:
         assert context.strategy_config.multimodal.frozen_sharding == "replicate"
 
 
-class TestFromConfigLoadsBaseModel:
-    def test_from_config_forwards_base_load_and_override_provenance(self):
-        from transformers import PretrainedConfig
-
-        config = PretrainedConfig()
-        config.name_or_path = "test/checkpoint"
-        config.eos_token_id = 2
-        sentinel_model = object()
-
-        with (
-            patch(
-                "nemo_automodel._transformers.auto_model.AutoConfig.resolve_revision",
-                return_value=None,
-            ) as mock_resolve_revision,
-            patch("nemo_automodel._transformers.auto_model.resolve_trust_remote_code", return_value=False),
-            patch("nemo_automodel._transformers.auto_model.get_is_hf_model", return_value=True),
-            patch("nemo_automodel._transformers.auto_model.resolve_sdpa_method", return_value=None),
-            patch(
-                "nemo_automodel._transformers.auto_model._apply_preload_overrides",
-                return_value=("eager", False),
-            ),
-            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
-            patch("torch.cuda.current_device", return_value=0),
-            patch(
-                "nemo_automodel._transformers.auto_model.apply_model_runtime_patches",
-                side_effect=lambda model, mesh: model,
-            ),
-            patch(
-                "nemo_automodel._transformers.auto_model._init_model",
-                return_value=(True, sentinel_model),
-            ) as mock_init,
-            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
-            patch(
-                "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
-                return_value=sentinel_model,
-            ) as mock_infrastructure,
-            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
-        ):
-            result = NeMoAutoModelForCausalLM.from_config(
-                config,
-                load_base_model=True,
-                eos_token_id=None,
-                use_liger_kernel=False,
-                use_sdpa_patching=False,
-            )
-
-        assert result is sentinel_model
-        mock_resolve_revision.assert_called_once()
-        assert mock_init.call_args.kwargs["_load_base_model"] is True
-        assert mock_init.call_args.kwargs["_config_overrides"] == {"eos_token_id"}
-        assert config.eos_token_id is None
-        assert mock_infrastructure.call_args.kwargs["load_base_model"] is True
-
-
 @pytest.mark.usefixtures("mock_hub_revision")
 class TestFromPretrainedDeviceMesh:
     def test_from_pretrained_accepts_device_mesh_as_topology_shortcut(self):

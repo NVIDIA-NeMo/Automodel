@@ -546,7 +546,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     force_hf,
                     *model_args,
                     _process_group=process_group,
-                    _load_base_model=load_base_model,
                     **kwargs,
                 )
         except (NotImplementedError, RuntimeError) as e:
@@ -577,7 +576,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                         force_hf,
                         *model_args,
                         _process_group=process_group,
-                        _load_base_model=load_base_model,
                         **kwargs,
                     )
             else:
@@ -921,7 +919,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     config = get_hf_config(config, attn_implementation, **kwargs)
                 else:
                     raise
-        config_overrides = _consume_config_overrides(config, kwargs)
+        _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
 
         sdpa_method = resolve_sdpa_method(sdpa_method, mesh.device_mesh, activation_checkpointing)
@@ -947,7 +945,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             fp8_config=fp8_config,
             compile_config=compile_config,
             load_base_model=kwargs.pop("load_base_model", False),
-            _config_overrides=config_overrides,
             **kwargs,
         )
 

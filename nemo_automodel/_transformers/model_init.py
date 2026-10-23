@@ -1215,8 +1215,6 @@ def __init_model(
     # it. Pop here so the flag never reaches HF's ``from_pretrained``.
     restore_loaded_dtype = kwargs.pop("_restore_loaded_dtype", True)
     process_group = kwargs.pop("_process_group", None)
-    load_base_model = kwargs.pop("_load_base_model", False)
-    inherited_config_overrides = set(kwargs.pop("_config_overrides", ()))
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
     if is_pretrained_init:
@@ -1374,7 +1372,7 @@ def __init_model(
                     kwargs.pop(key, None)
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
-            config_overrides = inherited_config_overrides | dict_config_overrides | _consume_config_overrides(
+            config_overrides = dict_config_overrides | _consume_config_overrides(
                 hf_config, kwargs, init_param_names=init_param_names
             )
             # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
@@ -1393,11 +1391,12 @@ def __init_model(
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             with local_torch_dtype(torch_dtype, model_cls.__name__):
                 model = model_cls(hf_config, *model_args, **kwargs)
-            if is_pretrained_init or (load_base_model and pretrained_model_name_or_path):
+            if is_pretrained_init:
                 # Custom constructors only see the config. Restore the checkpoint's
-                # generation settings both for from_pretrained and from_config builds
-                # that explicitly load base weights. A plain from_config build must
-                # not read checkpoint metadata just because config.name_or_path is set.
+                # generation settings the way PreTrainedModel.from_pretrained does:
+                # generation_config.json carries stop tokens and sampling defaults that
+                # the config lacks, and the consolidated export writes
+                # model.generation_config back out.
                 restore_pretrained_generation_config(
                     model, pretrained_model_name_or_path, config_overrides=config_overrides, **loading_kwargs
                 )

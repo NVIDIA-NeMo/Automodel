@@ -98,10 +98,8 @@ def _tiny_moe_config(config: Qwen3_8_FlashNextTextConfig) -> MoEConfig:
     )
 
 
-def test_pretrained_backed_config_build_preserves_generation_config_in_export(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The published from_config(load_base_model=True) path must round-trip checkpoint generation metadata."""
+def test_pretrained_build_preserves_generation_config_in_export(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A from_pretrained build must round-trip the checkpoint's generation metadata into the export."""
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
@@ -120,8 +118,7 @@ def test_pretrained_backed_config_build_preserves_generation_config_in_export(
         top_k=20,
     ).save_pretrained(checkpoint_dir)
 
-    config = _tiny_config()
-    config.name_or_path = str(checkpoint_dir)
+    _tiny_config().save_pretrained(checkpoint_dir)
     backend = BackendConfig(
         linear="torch",
         attn="sdpa",
@@ -137,12 +134,11 @@ def test_pretrained_backed_config_build_preserves_generation_config_in_export(
 
     is_custom, model = model_init._init_model(
         cls=MagicMock(),
-        pretrained_model_name_or_path_or_config=config,
+        pretrained_model_name_or_path_or_config=str(checkpoint_dir),
         attn_implementation="sdpa",
         torch_dtype=torch.float32,
         quantization_config=None,
         force_hf=False,
-        _load_base_model=True,
         backend=backend,
     )
     assert is_custom is True
@@ -164,6 +160,7 @@ def test_pretrained_backed_config_build_preserves_generation_config_in_export(
     assert exported.temperature == 0.7
     assert exported.top_p == 0.95
     assert exported.top_k == 20
+
 
 def test_model_class_alias_selects_qwen3_8_flash_next_conditional_generation() -> None:
     assert ModelClass is Qwen3_8_FlashNextForConditionalGeneration
@@ -429,4 +426,3 @@ def test_from_pretrained_restores_checkpoint_generation_config(monkeypatch: pyte
     assert len(restored) == 1
     assert restored[0][0] is model
     assert restored[0][1] == "/tmp/qwen-checkpoint"
-
