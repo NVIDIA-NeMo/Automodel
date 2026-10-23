@@ -277,17 +277,17 @@ class LinearLoRA(nn.Linear):
 
     def _should_use_memory_efficient_lora(self, x: torch.Tensor) -> bool:
         """Return whether this LoRA branch can use the custom autograd path."""
-        if not getattr(self, "use_memory_efficient_lora", False):
+        if not self.use_memory_efficient_lora:
             return False
         if isinstance(x, DTensor):
             return False
-        if isinstance(getattr(self.lora_A, "weight", None), DTensor):
+        if isinstance(self.lora_A.weight, DTensor):
             return False
-        if isinstance(getattr(self.lora_B, "weight", None), DTensor):
+        if isinstance(self.lora_B.weight, DTensor):
             return False
         if torch.compiler.is_compiling():
             return False
-        if HAS_TE and isinstance(getattr(self, "lora_A", None), transformer_engine.pytorch.Linear):
+        if HAS_TE and isinstance(self.lora_A, transformer_engine.pytorch.Linear):
             return False
         return True
 
@@ -756,13 +756,7 @@ def apply_lora_to_linear_modules(
                     expert_weight_format=peft_config.expert_weight_format,
                 )
 
-                # Find parent and replace
-                if "." not in name:
-                    setattr(model, name, new_module)
-                else:
-                    parent_name, child_name = name.rsplit(".", 1)
-                    parent = model.get_submodule(parent_name)
-                    setattr(parent, child_name, new_module)
+                model.set_submodule(name, new_module)
         else:
             # Standard Linear patching
             linear_types = [nn.Linear] + ([transformer_engine.pytorch.Linear] if HAS_TE else [])
@@ -782,12 +776,12 @@ def apply_lora_to_linear_modules(
                     dropout_position=peft_config.dropout_position,
                     lora_A_init_method=peft_config.lora_A_init,
                     lora_dtype=lora_dtype,
-                    use_memory_efficient_lora=getattr(peft_config, "use_memory_efficient_lora", True),
+                    use_memory_efficient_lora=peft_config.use_memory_efficient_lora,
                     use_triton=peft_config.use_triton,
                     layer_name=name,
                 )
 
-    if getattr(peft_config, "use_memory_efficient_lora", True):
+    if peft_config.use_memory_efficient_lora:
         # Fuse SwiGLU/ReLU² MLPs whose projections were just LoRA-patched into one memory-efficient
         # autograd op (recompute the activation in backward); falls back per-MLP under
         # sharding (DTensor) / DoRA / active dropout.

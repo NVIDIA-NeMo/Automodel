@@ -326,15 +326,12 @@ def _fusible(module: torch.nn.Module | torch.Tensor) -> TypeGuard[LinearLoRA]:
     """A LoRA linear is fusible when it is a plain materialized adapter."""
     if not isinstance(module, LinearLoRA):
         return False
-    lora_A = getattr(module, "lora_A", None)
-    lora_B = getattr(module, "lora_B", None)
-    if lora_A is None or lora_B is None:
+    lora_A, lora_B = module.lora_A, module.lora_B
+    if not module.use_memory_efficient_lora:
         return False
-    if not getattr(module, "use_memory_efficient_lora", False):
+    if module.use_dora:
         return False
-    if getattr(module, "use_dora", False):
-        return False
-    if getattr(module, "dropout_p", 0.0) and module.training:
+    if module.dropout_p and module.training:
         return False
     # A per-token gate (``lora_token_gate``) is applied only by the per-linear path. Only ``LinearLoRA`` carries
     # ``lora_A``/``lora_B``, so the class default ``_lora_token_gate = None`` is always present here.
@@ -343,7 +340,7 @@ def _fusible(module: torch.nn.Module | torch.Tensor) -> TypeGuard[LinearLoRA]:
     # The fused forward calls ``F.linear(x, base_weight)`` with no bias term, so a biased base
     # projection would train on silently wrong math. Models plumb this from the HF config
     # (``nn.Linear(..., bias=config.mlp_bias)``), so decline and let the per-linear path add it.
-    if getattr(module, "bias", None) is not None:
+    if module.bias is not None:
         return False
     # QLoRA / quantized base weights are stored as packed buffers (e.g. bitsandbytes 4-bit
     # carries a ``quant_state`` and a flattened weight shaped like ``(1, out*in/2)`` rather than
@@ -353,9 +350,7 @@ def _fusible(module: torch.nn.Module | torch.Tensor) -> TypeGuard[LinearLoRA]:
     base_w = module.weight
     if getattr(base_w, "quant_state", None) is not None or getattr(module, "quant_state", None) is not None:
         return False
-    out_features = getattr(module, "out_features", None)
-    in_features = getattr(module, "in_features", None)
-    if out_features is not None and in_features is not None and tuple(base_w.shape) != (out_features, in_features):
+    if tuple(base_w.shape) != (module.out_features, module.in_features):
         return False
     for w in (base_w, lora_A.weight, lora_B.weight):
         if isinstance(w, DTensor):
