@@ -119,3 +119,6 @@ loss:
   num_samples: 8
   kl_coef: 0.05
   anchor_weight: 0.1
+
+ci:
+  cluster_tag: h100
