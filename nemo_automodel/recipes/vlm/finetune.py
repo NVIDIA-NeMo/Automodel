@@ -635,6 +635,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        if self.cfg.get("nvtx", False):
+            import nemo_automodel.autonvtx as autonvtx
+
+            for i, part in enumerate(self.model_parts):
+                name = f"PipelineStage_{i}" if self.pp is not None else type(part).__name__
+                # Backward module hooks introduce views that conflict with VLM
+                # in-place operations. Annotate forward and recomputation only.
+                autonvtx.patch(part, name=name, add_backward_hooks=False)
+
         # Loss-function capability check
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
 
