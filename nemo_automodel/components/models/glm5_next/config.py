@@ -15,6 +15,25 @@ from typing import Any
 from transformers.configuration_utils import PretrainedConfig
 
 
+def _drop_unset_architectures(config_dict: dict[str, Any]) -> dict[str, Any]:
+    """Omit an unset ``architectures`` from a nested config's serialized dictionary.
+
+    The released checkpoint lists ``architectures`` only at the top level. A
+    ``null`` entry inside ``text_config`` replaces that list in loaders that
+    merge top-level keys into the text config.
+    """
+    if config_dict.get("architectures") is None:
+        config_dict.pop("architectures", None)
+    return config_dict
+
+
+def _layer_split(layer_types: list[str]) -> tuple[list[int], list[int]]:
+    """Return the 0-based ``kda_layers`` / ``full_attn_layers`` of a layer schedule."""
+    kda_layers = [idx for idx, layer_type in enumerate(layer_types) if layer_type == "linear_attention"]
+    full_attn_layers = [idx for idx, layer_type in enumerate(layer_types) if layer_type != "linear_attention"]
+    return kda_layers, full_attn_layers
+
+
 def _json_safe_value(value: Any) -> Any:
     """Return a JSON-serializable representation of a config value."""
     if value.__class__.__module__ == "torch" and value.__class__.__name__ == "dtype":
@@ -171,12 +190,25 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.linear_num_heads = linear_num_heads
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
         self.linear_lower_bound = linear_lower_bound
+        # The released config also lists the layer split as ``kda_layers`` / ``full_attn_layers``
+        # (0-based), which SGLang and Miles read. Keep both lists and derive them from ``layer_types``.
+        # Indices at or past ``num_hidden_layers`` are ignored in the check, so a config truncated to its
+        # first layers (``num_hidden_layers`` and ``layer_types`` shortened, the lists left as released) loads.
+        kda_layers, full_attn_layers = _layer_split(self.layer_types)
+        for key, layers in (("kda_layers", kda_layers), ("full_attn_layers", full_attn_layers)):
+            if linear_attn_config is not None and key in linear_attn_config:
+                provided = sorted(idx for idx in linear_attn_config[key] if idx < num_hidden_layers)
+                if provided != layers:
+                    raise ValueError(f"linear_attn_config.{key} does not match layer_types")
         self.linear_attn_config = {
+            **(linear_attn_config or {}),
             "head_dim": linear_head_dim,
             "num_heads": linear_num_heads,
             "short_conv_kernel_size": linear_conv_kernel_dim,
             "gate_lower_bound": linear_lower_bound,
             "safe_gate": linear_lower_bound is not None,
+            "kda_layers": kda_layers,
+            "full_attn_layers": full_attn_layers,
         }
 
         self.hc_mult = hc_mult
@@ -223,7 +255,14 @@ class Glm5NextTextConfig(PretrainedConfig):
         return self.n_routed_experts
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe_value(super().to_dict())
+        config_dict = _json_safe_value(super().to_dict())
+        # Config overrides set ``layer_types`` / ``num_hidden_layers`` after construction, so the
+        # serialized split is derived from the schedule the model is built from.
+        if isinstance(config_dict.get("linear_attn_config"), dict):
+            kda_layers, full_attn_layers = _layer_split(self.layer_types[: self.num_hidden_layers])
+            config_dict["linear_attn_config"]["kda_layers"] = kda_layers
+            config_dict["linear_attn_config"]["full_attn_layers"] = full_attn_layers
+        return config_dict
 
 
 class Glm5NextVisionConfig(PretrainedConfig):
@@ -324,4 +363,11 @@ class Glm5NextConfig(PretrainedConfig):
         return self.text_config
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe_value(super().to_dict())
+        config_dict = _json_safe_value(super().to_dict())
+        # Only the nested dictionaries drop an unset ``architectures``. The sub-configs' own
+        # ``to_dict`` keeps the key: Transformers' nested diff (``recursive_diff_dict``) looks up
+        # every serialized key in the sub-config's default ``to_dict``.
+        for key in self.sub_configs:
+            if isinstance(config_dict.get(key), dict):
+                _drop_unset_architectures(config_dict[key])
+        return config_dict
