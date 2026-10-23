@@ -31,8 +31,9 @@ from typing import Any
 import torch
 
 _RW_CHUNK_ROWS = 8192
-# Engage the chunked path only for large dispatch tensors, where the memory
-# saving matters; below this the backward recompute is a net compute tax.
+# Engage the eager chunked path only for large dispatch tensors, where the memory
+# saving matters; below this the backward recompute is a net compute tax. The
+# compiled cores have no such tax and serve every size.
 _RW_CHUNK_THRESHOLD = 12288
 
 
@@ -186,7 +187,10 @@ def _apply_router_weight_fp32(
 
     Large 2-D row-aligned inputs go through the chunked custom Function so
     autograd does not retain full-size fp32 intermediates; every other shape
-    keeps the plain eager multiply (bitwise-identical result).
+    keeps the plain eager multiply (bitwise-identical result). Once
+    ``compile_router_weight`` has compiled the cores, row-aligned inputs of any
+    size take the Function, since its fused kernels have no chunk loop to
+    amortize and replace several eager fp32 kernels per pass.
 
     Args:
         output2: Expert down-projection outputs of shape [tokens, hidden].
@@ -203,7 +207,7 @@ def _apply_router_weight_fp32(
         and permuted_probs.dim() == 2
         and permuted_probs.shape[0] == output2.shape[0]
         and permuted_probs.shape[1] == 1
-        and output2.shape[0] > _RW_CHUNK_THRESHOLD
+        and output2.shape[0] > (0 if _RW_CORES_COMPILED else _RW_CHUNK_THRESHOLD)
     ):
         return _RouterWeightMulFunction.apply(output2, permuted_probs, compute_dtype, permuted_probs.requires_grad)
     return (output2.float() * permuted_probs.float()).to(compute_dtype)

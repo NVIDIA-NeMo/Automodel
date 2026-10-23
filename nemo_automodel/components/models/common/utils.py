@@ -517,8 +517,9 @@ class BackendConfig:
             communication of the routed path; numerics unchanged. Default False.
         compile_router_weight: torch.compile the fp32 router-weight multiply applied to
             expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP``, all MoE models),
-            so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
-            cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
+            so each pass is one fused kernel instead of the eager fp32 cast/multiply/cast
+            kernels (per chunk on large dispatches), at every dispatch size. Same lazy
+            once-per-process pattern as ``compile_situ``;
             numerics are allclose to eager but not bitwise-identical.
         benchmark_static_routing: Benchmark-only. Requires ``fake_balanced_gate=True``
             with ``fake_gate_noise=0.0``, where routing metadata (tokens per expert,
