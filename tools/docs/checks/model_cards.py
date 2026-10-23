@@ -77,9 +77,13 @@ def _validate_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
         if title != hf_ids[0].split("/", 1)[1]:
             raise ValueError(f"{card}: title must match the primary HF checkpoint")
         recipe_ids = {hf_ids[0]}
-    filename = re.sub("[^a-z0-9]+", "-", title.casefold()).strip("-") + ".mdx"
-    if card.name != filename:
-        raise ValueError(f"{card}: filename must be {filename!r} for checkpoint {title!r}")
+    # Published source paths stay stable when the checkpoint's release name changes.
+    # Navigation validation checks the explicit slug against the checkpoint identity.
+    slug = metadata.get("slug")
+    if not isinstance(slug, str) or not slug.strip().strip("/"):
+        raise ValueError(
+            f"{card}: add an explicit frontmatter slug for checkpoint {title!r}; keep the existing MDX filename"
+        )
     matching_ids = {model_id for model_id in recipe_ids if model_id.split("/", 1)[1] == title}
     if not any((f"https://huggingface.co/{model_id}" in document for model_id in matching_ids)):
         raise ValueError(f"{card}: link the exact Hugging Face checkpoint from the recipe")

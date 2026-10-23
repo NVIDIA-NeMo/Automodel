@@ -100,6 +100,14 @@ Group validators in `checks/`, rendering helpers in `build/`, and asset tools
 in `assets/`. Keep shared metadata in `catalog.py` and mirror tests under
 `tests/unit_tests/tools/docs/`. See `tools/docs/README.md` for the file map.
 
+Keep published model-card filenames and source paths stable. When a checkpoint's
+released repository name differs from an existing MDX filename, update the card's
+`title`, `description`, explicit frontmatter `slug`, and Hugging Face links. Update the sidebar
+label and provider index to the released name while keeping navigation `path`
+pointing to the existing file. Do not rename, move, or duplicate the MDX just to
+match the repository name. If the published docs-site URL changes, add redirects
+from the old URL in `docs/fern/docs.yml`. Preserve existing compatibility copies.
+
 ---
 
 ## Git & PR conventions

@@ -95,7 +95,26 @@ docs/fern/versions/v0.4/pages/get-started/installation.mdx     /latest/get-start
 2. **Content only** — edit the single MDX file at `docs/<...>.mdx`.
 3. **Title change** — update the frontmatter `title:` and update the `- page:` entry's display label in `docs/fern/versions/nightly.yml`.
 4. **Section move** — `git mv` the file within `docs/`, update `path:` in `nightly.yml`, fix incoming links.
-5. **Slug change** — change `slug:` in the YAML (or rename the file and let the default slug update). Add a `redirects:` entry in `docs/fern/docs.yml` so the old URL keeps working.
+5. **Slug change** — set an explicit `slug:` while keeping the source filename stable. For model cards, set the full route in MDX frontmatter; keep the navigation `path:` pointing to that file. Add a `redirects:` entry in `docs/fern/docs.yml` so the old published URL keeps working.
+
+### Model repository name becomes public
+
+Keep the existing model-card filename and directory when the released checkpoint
+name differs from the original MDX name. Update its frontmatter `title`, `description`, and
+explicit `slug`, Hugging Face links, and linked recipe checkpoint IDs to the
+released identity. Update the sidebar label and provider-index link, leaving the
+navigation `path` pointed at the original MDX file. For example, an existing
+`preview-name.mdx` can use:
+
+```yaml
+title: "Released-Model-7B"
+slug: model-coverage/large-language-models/org/Released-Model-7B
+```
+
+The source filename does not determine the public model name or route. Do not
+rename, move, or duplicate the card to match the release name. Add redirects for
+previously published docs-site routes, and preserve existing compatibility copies.
+Run the shared docs check to validate the metadata, navigation, and recipe identity.
 
 ### Redirect quirks
 

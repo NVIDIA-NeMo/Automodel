@@ -22,6 +22,13 @@ uses the same command with `--keep-generated` to retain validated tables.
 | `build/code_styles.py` | Rendering styles and their cleanup. |
 | `assets/provider_icons.py` | Provider logo maintenance. |
 
+Model-card source filenames stay stable across checkpoint releases. Use an
+explicit frontmatter `slug` and the released checkpoint `title` to name the public
+page; keep navigation `path` pointing to the existing MDX. Update descriptions, checkpoint links,
+sidebar labels, and provider indexes together, adding redirects for old published
+site URLs. Filename differences are allowed; checkpoint and route mismatches are
+still rejected.
+
 Regression tests mirror this layout under `tests/unit_tests/tools/docs/`.
 Rules belong in the tools; tests exercise valid inputs, invalid inputs, and
 failure/cleanup behavior. CI collects the entire test directory separately

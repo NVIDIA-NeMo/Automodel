@@ -46,21 +46,20 @@ def test_changed_model_cards_match_linked_recipe_identity():
 
 
 @pytest.mark.parametrize(
-    ("title", "filename", "message"),
+    ("title", "checkpoint", "message"),
     [
-        ("Step-5-Preview", "step-5-preview.mdx", "title .* must match a linked recipe model ID"),
-        ("Step-5-Preview-BF16", "step-5-preview.mdx", "filename must be 'step-5-preview-bf16.mdx'"),
+        ("Step-5-Preview", "Step-5-Preview-BF16", "title .* must match a linked recipe model ID"),
+        ("Step-5-Preview-BF16", "Step-5-Preview", "link the exact Hugging Face checkpoint"),
     ],
 )
-def test_model_card_identity_rejects_recipe_mismatch(tmp_path: Path, title: str, filename: str, message: str):
+def test_model_card_identity_rejects_recipe_mismatch(tmp_path: Path, title: str, checkpoint: str, message: str):
     recipe = tmp_path / "examples/llm_finetune/step5.yaml"
     recipe.parent.mkdir(parents=True)
     recipe.write_text("model:\n  pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16\n")
-    card = tmp_path / filename
+    card = tmp_path / "step-5-preview.mdx"
     card.write_text(
-        f'---\ntitle: "{title}"\n---\n'
-        "[Old checkpoint](https://huggingface.co/stepfun-ai/Step-5-Preview)\n"
-        "[BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)\n"
+        f'---\ntitle: "{title}"\nslug: model-coverage/large-language-models/stepfun-ai/{title}\n---\n'
+        f"[Checkpoint](https://huggingface.co/stepfun-ai/{checkpoint})\n"
         "[SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/step5.yaml)\n"
     )
     with pytest.raises(ValueError, match=message):
@@ -71,7 +70,7 @@ def test_model_card_identity_rejects_recipe_mismatch(tmp_path: Path, title: str,
 def test_reference_card_identifies_fp8_checkpoint_without_bf16_recipe(tmp_path: Path, title: str, valid: bool):
     card = tmp_path / "step-5-preview.mdx"
     card.write_text(
-        f'---\ntitle: "{title}"\n---\n'
+        f'---\ntitle: "{title}"\nslug: model-coverage/large-language-models/stepfun-ai/{title}\n---\n'
         "[FP8](https://huggingface.co/stepfun-ai/Step-5-Preview)\n"
         "[BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)\n"
     )
@@ -80,6 +79,44 @@ def test_reference_card_identifies_fp8_checkpoint_without_bf16_recipe(tmp_path: 
     else:
         with pytest.raises(ValueError, match="primary HF checkpoint"):
             _validate_model_card_recipe_identity(tmp_path, card)
+
+
+@pytest.mark.parametrize("recipe_backed", [True, False])
+def test_released_checkpoint_identity_accepts_a_stable_preview_filename(tmp_path: Path, recipe_backed: bool):
+    card = tmp_path / "docs/model-coverage/llm/org/preview-name.mdx"
+    card.parent.mkdir(parents=True)
+    document = (
+        '---\ntitle: "Released-Model-7B"\n'
+        "slug: model-coverage/large-language-models/org/Released-Model-7B\n---\n"
+        "[Checkpoint](https://huggingface.co/org/Released-Model-7B)\n"
+    )
+    if recipe_backed:
+        recipe = tmp_path / "examples/model.yaml"
+        recipe.parent.mkdir()
+        recipe.write_text("model:\n  pretrained_model_name_or_path: org/Released-Model-7B\n")
+        document += "[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/model.yaml)\n"
+    card.write_text(document)
+
+    _validate_model_card_recipe_identity(tmp_path, card)
+
+    assert card.read_text() == document
+    assert not card.with_name("released-model-7b.mdx").exists()
+
+
+@pytest.mark.parametrize("slug", [None, "", " ", "/", 123, False])
+def test_stable_model_card_filename_requires_an_explicit_slug(tmp_path: Path, slug):
+    import yaml
+
+    card = tmp_path / "preview-name.mdx"
+    metadata = {"title": "Released-Model-7B"}
+    if slug is not None:
+        metadata["slug"] = slug
+    card.write_text(
+        "---\n" + yaml.safe_dump(metadata) + "---\n[Checkpoint](https://huggingface.co/org/Released-Model-7B)\n"
+    )
+
+    with pytest.raises(ValueError, match="add an explicit frontmatter slug.*keep the existing MDX filename"):
+        _validate_model_card_recipe_identity(tmp_path, card)
 
 
 def test_model_card_descriptions_meet_seo_contract():
