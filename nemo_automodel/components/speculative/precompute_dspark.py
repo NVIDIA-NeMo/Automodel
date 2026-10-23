@@ -39,7 +39,7 @@ import sys
 from typing import Any
 
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -92,10 +92,18 @@ _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES = (
     _DEEPSEEK_V4_MODEL_TYPE,
     _DEEPSEEK_V41_MODEL_TYPE,
     _GLM_5_2_MODEL_TYPE,
-    # Not "kimi_linear": published Kimi-Linear-48B checkpoints use that model_type too.
     "kimi_k3",
     *_MINIMAX_M3_MODEL_TYPES,
 )
+
+
+def _is_kimi_k3_text_export(target_path: str, trust_remote_code: bool) -> bool:
+    """Tell a Kimi K3 text-only export from Kimi-Linear-48B; both write ``model_type: kimi_linear``.
+
+    Only K3 writes ``attn_res_block_size`` to its config, and no published Kimi-Linear-48B config has it.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
+    return "attn_res_block_size" in config_dict
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -151,7 +159,9 @@ def _run(args: argparse.Namespace) -> int:
     compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     model_type = _read_target_model_type(args.target_model, args.trust_remote_code)
-    if model_type in _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES:
+    if model_type in _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES or (
+        model_type == "kimi_linear" and _is_kimi_k3_text_export(args.target_model, args.trust_remote_code)
+    ):
         raise ValueError(
             "precompute_dspark supports HF-loadable single-process targets only. "
             f"model_type={model_type!r}: DeepSeek V4/V4.1, GLM-5.2, and Kimi K3 targets use the distributed "
