@@ -1,0 +1,124 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Post-train Cloudflare Clef (27B Qwen3.5 backbone + joint schema head) on the SOC alert-triage dataset.
+# LoRA on the backbone's language model + full training of the joint schema head, FSDP2 over 8 GPUs.
+#
+#   # before: evaluate the released model
+#   automodel examples/decision/clef_soc_triage_lora.yaml --nproc-per-node 8 --mode eval --output_dir runs/clef/base
+#   # SFT
+#   automodel examples/decision/clef_soc_triage_lora.yaml --nproc-per-node 8 --mode train --loss.mode sft \
+#       --output_dir runs/clef/sft
+#   # RL from the SFT stage
+#   automodel examples/decision/clef_soc_triage_lora.yaml --nproc-per-node 8 --mode train --loss.mode rl \
+#       --init_from runs/clef/sft/LOWEST_VAL --train.epochs 1 --optimizer.lr 2.0e-5 --head_optimizer.lr 1.0e-5 \
+#       --train.eval_metric reward --output_dir runs/clef/rl
+
+recipe: nemo_automodel.recipes.decision.train_clef.TrainClefDecisionRecipe
+
+mode: train            # eval | train
+seed: 1234
+output_dir: runs/clef/sft
+init_from: null        # a published native stage (weights only; fresh optimizer/schedule), e.g. runs/clef/sft/LOWEST_VAL
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Cloudflare/clef
+  revision: ed3eed331870db2eff4b0db01237128ede8a00ce
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+head:
+  path: null           # null -> joint head shipped with the model repo
+  dropout: 0.1
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false   # all linear layers except the excluded ones
+  exclude_modules:
+    - "*visual*"
+    - "*vision*"
+    - "*lm_head*"
+  dim: 32
+  alpha: 64
+  dropout: 0.05
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+head_optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-5
+  weight_decay: 0.0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0  # integer optimizer steps; increase for longer runs
+
+checkpoint:
+  enabled: true
+  save_consolidated: false  # publisher export is a separate operation
+
+
+data:
+  train: data/soc_triage/train.jsonl
+  validation: data/soc_triage/validation.jsonl
+  test: data/soc_triage/test.jsonl
+  max_length: 4096
+  slice_keys: [evidence, verdict, family]
+
+train:
+  epochs: 2
+  local_batch_size: 2
+  global_batch_size: 32
+  max_grad_norm: 1.0
+  val_every_steps: 25
+  eval_metric: accuracy   # accuracy | exact_match | reward
+
+eval:
+  batch_size: 4
+
+loss:
+  _target_: nemo_automodel.components.loss.decision.DecisionLossConfig
+  mode: sft               # sft | rl
+  label_smoothing: 0.05
+  brier_weight: 1.0
+  ordinal_weight: 0.5
+  rl_objective: expected_reward
+  num_samples: 8
+  kl_coef: 0.05
+  anchor_weight: 0.1
+
+ci:
+  cluster_tag: h100
