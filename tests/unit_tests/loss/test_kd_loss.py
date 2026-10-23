@@ -117,6 +117,7 @@ def test_kd_loss_basic_no_labels(dtype, chunk_size):
 
     loss = KDLoss(chunk_size=chunk_size)(student_logits, teacher_logits, labels)
     assert loss == 0.0
+    assert loss.dtype == torch.float32
     loss.backward()
     torch.testing.assert_close(student_logits.grad, torch.zeros_like(student_logits))
 
@@ -782,3 +783,40 @@ def _run_two_process_tp_kd_gradient(rank: int, init_file: str) -> None:
 )
 def test_kd_loss_tp_two_process_matches_full_vocab_gradient(tmp_path):
     mp.spawn(_run_two_process_tp_kd_gradient, args=(str(tmp_path / "tp_kd_gradient"),), nprocs=2, join=True)
+
+
+def _run_two_process_empty_shard_kd_loss(rank: int, init_file: str) -> None:
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        torch.manual_seed(29)
+        student_logits = torch.randn(2, 8).to(torch.bfloat16)
+        teacher_logits = torch.randn(2, 8).to(torch.bfloat16)
+        # Rank 0 keeps only ignored positions, as a context-parallel rank can for a partly masked sequence.
+        labels = torch.tensor([-100, -100]) if rank == 0 else torch.tensor([1, 2])
+
+        local_loss = KDLoss()(student_logits, teacher_logits, labels, num_batch_labels=2)
+        assert local_loss.dtype == torch.float32
+
+        reduced = torch.stack([local_loss.detach()]).sum()
+        torch.distributed.all_reduce(reduced)
+
+        expected = _reference_kd_loss(
+            student_logits.float(), teacher_logits.float(), torch.tensor([1, 2]), num_batch_labels=2
+        )
+        if rank == 1:
+            torch.testing.assert_close(local_loss, expected)
+        torch.testing.assert_close(reduced, expected)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="the CPU Gloo backend does not support multi-process tests on Windows"
+)
+def test_kd_loss_empty_shard_two_process_reduces_with_supervised_shard(tmp_path):
+    mp.spawn(_run_two_process_empty_shard_kd_loss, args=(str(tmp_path / "empty_shard"),), nprocs=2, join=True)
