@@ -28,6 +28,33 @@ _MODEL_OWNED_GRAD_DIVISOR_ATTR = "_nemo_model_owned_grad_divisor"
 _MAX_FLAT_BUFFER_BYTES = 256 * 1024 * 1024
 
 
+def model_owned_grad_divisor(parameter: torch.Tensor) -> float | None:
+    """Return the owner-sharding gradient divisor stamped on a parameter.
+
+    Model-owned sharded parameters (for example an Engram table whose rows are
+    spread over an owner group by the model's own All-to-All) carry the divisor
+    that averages their accumulated gradient over the owner group. The marker
+    lives in the parameter's ``__dict__``.
+
+    Args:
+        parameter: Parameter or DTensor parameter of arbitrary shape.
+
+    Returns:
+        The divisor, or ``None`` for a parameter without an owner-sharding contract.
+    """
+    return getattr(parameter, _MODEL_OWNED_GRAD_DIVISOR_ATTR, None)
+
+
+def stamp_model_owned_grad_divisor(parameter: torch.Tensor, divisor: float) -> None:
+    """Stamp the owner-sharding gradient divisor on a parameter.
+
+    Args:
+        parameter: Parameter whose gradient the model accumulates over its owner group.
+        divisor: Owner-group size that averages the accumulated gradient.
+    """
+    setattr(parameter, _MODEL_OWNED_GRAD_DIVISOR_ATTR, float(divisor))
+
+
 def mark_tp_replica_gradient_reduction(
     module: torch.nn.Module,
     reduction: Literal["mean", "sum"],
