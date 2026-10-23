@@ -15,11 +15,25 @@ Follow the [installation instructions](/get-started/installation), then run the 
 automodel examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml --nproc-per-node 8
 ```
 
+## Train on Long Sequences with Context Parallelism
+
+Gemma-4-12B supports context parallelism (`distributed.cp_size > 1`). Each rank keeps a contiguous slice
+of the sequence, and the sliding-window and full-attention layers exchange keys and values over a p2p ring:
+
+```bash
+automodel examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp2.yaml --nproc-per-node 8
+```
+
+Context parallelism needs `attn_implementation: sdpa`, which the ring attention replaces. It covers text
+and image inputs; video and audio inputs are rejected under CP. Image tokens marked by `mm_token_type_ids`
+attend bidirectionally on the sliding-window layers only, with and without CP.
+
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
 | Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml). |
+| Train on long sequences with context parallelism | Use the [CP recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp2.yaml). |
 | Prepare your environment | Follow the [installation instructions](/get-started/installation). |
 
 ### Configuration
