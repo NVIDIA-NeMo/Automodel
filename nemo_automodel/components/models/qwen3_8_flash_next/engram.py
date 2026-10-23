@@ -531,8 +531,8 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
 
         DTensor conversion can discard custom attributes even when PyTorch
         preserves the Parameter identity. Ordinary module conversions restore
-        the marker through ``_apply``. Custom parameter-only materialization
-        bypasses that method, so model initialization stamps it afterwards.
+        the marker through ``_apply``; the checkpoint materialization helper
+        carries it over itself, and model initialization stamps it as well.
         The single-rank reference table needs no contract.
         """
         if isinstance(self.weight, DTensor):
