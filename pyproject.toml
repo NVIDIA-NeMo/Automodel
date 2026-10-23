@@ -264,7 +264,7 @@ linting = [
     "pre-commit>=4.2.0",
     "ruff~=0.12.0",
     "import-linter~=2.4",
-    "ty>=0.0.20",
+    "ty>=0.0.91",
 ]
 test = [
     "coverage",
