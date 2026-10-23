@@ -282,9 +282,19 @@ def test_compiled_cores_take_inputs_below_chunk_threshold(restore_rw_cores):
     """Small dispatches use the fused cores once compiled instead of the eager fp32 multiply."""
     calls: list[str] = []
 
-    def _fwd(*args):
+    def _fwd(x: torch.Tensor, probs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        """Record the call and run the forward core.
+
+        Args:
+            x: Expert outputs of shape [tokens, hidden].
+            probs: Routing probabilities of shape [tokens, 1].
+            out_dtype: Output dtype.
+
+        Returns:
+            Tensor of shape [tokens, hidden] and dtype ``out_dtype``.
+        """
         calls.append("fwd")
-        return _rw_fwd_core(*args)
+        return _rw_fwd_core(x, probs, out_dtype)
 
     experts_mod._rw_fwd_dispatch = _fwd
     experts_mod._rw_bwd_x_dispatch = _rw_bwd_x_core
