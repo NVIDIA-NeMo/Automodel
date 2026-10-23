@@ -531,6 +531,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
         self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
         self.dispatch_rows_never_empty = orig_module.dispatch_rows_never_empty
+        # The combine cache (BackendConfig.dispatcher_recompute_cache) is read by the shared dispatcher's config as
+        # well: the replacement must carry it, or the requested mode silently reverts to "none" (review of #4395).
+        self.dispatcher_recompute_cache = orig_module.dispatcher_recompute_cache
 
         self.gate_and_up_projs = orig_module.gate_and_up_projs
         self.down_projs = orig_module.down_projs
