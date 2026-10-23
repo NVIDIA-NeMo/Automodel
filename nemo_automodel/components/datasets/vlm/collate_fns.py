@@ -2008,8 +2008,26 @@ def nemotron_omni_collate_fn(
 
     padded_input_ids = []
     padded_attention_masks = []
-    for input_ids, attn_mask in zip(all_input_ids, all_attention_masks):
+    for i, (input_ids, attn_mask) in enumerate(zip(all_input_ids, all_attention_masks)):
         seq_len = input_ids.shape[0]
+        # The final position is dropped by the label shift below, so any image
+        # token at or after ``target_len - 1`` loses its placeholder.
+        if seq_len >= target_len and (i in sample_pixel_values or i in sample_pixel_values_videos):
+            image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+            if bool((input_ids[target_len - 1 :] == image_token_id).any()):
+                # The model scatters the batch's concatenated image features into
+                # the image tokens in order, so a partially kept image would shift
+                # this row's leftover features into the next row. Drop this row's
+                # media and its remaining image tokens instead.
+                logger.warning(
+                    "max_length=%d cuts into the image tokens of sample %d (%d tokens); dropping its images.",
+                    target_len,
+                    i,
+                    seq_len,
+                )
+                sample_pixel_values.pop(i, None)
+                sample_pixel_values_videos.pop(i, None)
+                input_ids = input_ids.masked_fill(input_ids == image_token_id, pad_token_id)
         if seq_len < target_len:
             pad_len = target_len - seq_len
             input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=input_ids.dtype)])
