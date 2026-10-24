@@ -110,8 +110,79 @@ def _zeros_like_optimizer_param(param: torch.Tensor) -> torch.Tensor:
         return torch.zeros_like(param)
 
 
+def _is_te_fused_adam(optimizer: torch.optim.Optimizer) -> bool:
+    """Return True if ``optimizer`` is Transformer Engine's FusedAdam (optional dependency)."""
+    try:
+        from transformer_engine.pytorch.optimizers import FusedAdam as TEFusedAdam
+    except Exception:  # pragma: no cover - TE is optional
+        return False
+    return isinstance(optimizer, TEFusedAdam)
+
+
+def _materialize_missing_te_fused_adam_state(optimizer: torch.optim.Optimizer) -> None:
+    """Create the native state Transformer Engine's FusedAdam only allocates lazily.
+
+    FusedAdam keeps ``step`` on the param group (created on the first ``step()``) and allocates the
+    per-parameter ``exp_avg`` / ``exp_avg_sq`` / ``master_param`` buffers on first use. A fresh optimizer
+    therefore produces an ``optimizer.state_dict()`` with an empty ``state`` and no ``step``; used as the
+    DCP load template that means nothing is read from the checkpoint and the resumed run silently continues
+    with fresh Adam moments. Pre-create both so the template matches what ``save_optimizer`` wrote.
+    """
+    for group in optimizer.param_groups:
+        if "step" not in group:
+            group["step"] = 0
+        for param in group["params"]:
+            if not optimizer.state.get(param):
+                optimizer.initialize_state(param, getattr(optimizer, "store_param_remainders", False))
+
+
+def _as_int(value: Any) -> int:
+    return int(value.item()) if hasattr(value, "item") else int(value)
+
+
+def _local_tensor(t: torch.Tensor) -> torch.Tensor:
+    return t._local_tensor if hasattr(t, "_local_tensor") else t
+
+
+def _verify_native_optimizer_state_restored(optimizer: torch.optim.Optimizer, loaded: dict[str, Any]) -> None:
+    """Fail loudly if a native optimizer load was a no-op.
+
+    DCP only reads the keys present in the load template, so a template that lacks ``state`` entries or the
+    group ``step`` leaves the optimizer fresh without any error. Compare what the checkpoint carried against
+    what the optimizer holds after ``load_state_dict``; both checks are skipped when the checkpoint itself had
+    nothing to restore (e.g. saved before the first step, or an optimizer without Adam moments).
+    """
+    saved_groups = loaded.get("param_groups") or []
+    saved_steps = [_as_int(g["step"]) for g in saved_groups if isinstance(g, dict) and g.get("step") is not None]
+    live_steps = [_as_int(g["step"]) for g in optimizer.param_groups if g.get("step") is not None]
+    if saved_steps and max(saved_steps) > 0 and (not live_steps or max(live_steps) != max(saved_steps)):
+        raise RuntimeError(
+            "Optimizer step counter was not restored from the checkpoint "
+            f"(checkpoint {saved_steps}, optimizer {live_steps}); the resume would continue with fresh optimizer state."
+        )
+    saved_state = loaded.get("state") or {}
+    saved_sq = [
+        v["exp_avg_sq"] for v in saved_state.values() if isinstance(v, dict) and v.get("exp_avg_sq") is not None
+    ]
+    if not saved_sq:
+        return
+    saved_total = sum(float((_local_tensor(t).detach().float() ** 2).sum()) for t in saved_sq)
+    live_sq = [
+        st["exp_avg_sq"] for st in optimizer.state.values() if isinstance(st, dict) and st.get("exp_avg_sq") is not None
+    ]
+    live_total = sum(float((_local_tensor(t).detach().float() ** 2).sum()) for t in live_sq)
+    if saved_total > 0.0 and (not live_sq or live_total == 0.0):
+        raise RuntimeError(
+            "Optimizer second moments were not restored from the checkpoint "
+            f"({len(saved_sq)} saved states, {len(live_sq)} live states); the resume would continue with fresh Adam moments."
+        )
+
+
 def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
     """Create zero-valued Adam state for parameters that do not have state yet."""
+    if _is_te_fused_adam(optimizer):
+        _materialize_missing_te_fused_adam_state(optimizer)
+        return
     if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
         return
 
@@ -697,6 +768,7 @@ class OptimizerState:
                         f"when loading {len(self.optimizer)} local optimizer parts."
                     )
                 self.optimizer[0].load_state_dict(optimizer_state_dict)
+                _verify_native_optimizer_state_restored(self.optimizer[0], optimizer_state_dict)
             else:
                 optimizer_parts = optimizer_state_dict.get(_OPTIMIZER_PARTS_KEY)
                 if not isinstance(optimizer_parts, dict):
