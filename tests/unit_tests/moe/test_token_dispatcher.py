@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -137,6 +138,41 @@ class TestHybridEPRuntimeInitialization:
         assert hybrid_ep_manager.handle is old_handle
         assert torch.equal(parameter.grad, torch.tensor([7.0]))
         assert torch.equal(actual_rng, expected_rng)
+
+    @pytest.mark.parametrize("calibrated", [None, 8])
+    def test_runtime_warmup_leaves_capacity_mode_uncalibrated(self, monkeypatch, caplog, calibrated):
+        """The synthetic warmup dispatch must neither become nor use capacity mode's calibration.
+
+        ``calibrated=8`` is the growth path: a re-warmup after real batches already calibrated the
+        capacity must not run the synthetic dispatch non-blocking at that capacity, nor recalibrate it.
+        """
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            manager = _HybridEPManager(
+                group=None, num_local_experts=2, num_experts=8, router_topk=2, moe_hybridep_capacity_factor=1.5
+            )
+        manager._hybridep_capacity = calibrated
+        passed = []
+
+        def fake_dispatch(x, routing_map, probs, num_permuted_tokens=None, **kwargs):
+            passed.append(num_permuted_tokens)
+            token_rows = routing_map.nonzero(as_tuple=False)[:, 0]
+            return x[token_rows], probs[routing_map], None, routing_map.sum(dim=0), "runtime-handle"
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        monkeypatch.setattr(
+            td, "hybrid_ep_combine", lambda x, **kwargs: x.reshape(5, manager.router_topk, 4).sum(dim=1)
+        )
+        with caplog.at_level(logging.INFO, logger=td.__name__):
+            manager.initialize_runtime(num_tokens=5, hidden_dim=4, dtype=torch.float32, device=torch.device("cpu"))
+
+        assert passed == [None], "warmup dispatch ran on the blocking path (no capacity passed)"
+        assert manager._hybridep_capacity == calibrated, "calibration neither taken from nor changed by the warmup"
+        assert manager.hybridep_capacity_factor == 1.5, "knob restored after the warmup"
+        assert "HybridEP capacity mode: calibrated" not in caplog.text
 
     def test_runtime_capacity_matches_hybridep_floor_rounding_and_group_max(self, hybrid_ep_manager, monkeypatch):
         initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 16, torch.bfloat16)
@@ -380,6 +416,9 @@ def test_hybridep_preprocess_records_cuda_graph_sample(hybrid_ep_manager, monkey
         ("moe_hybridep_num_sms_preprocessing", 12),
         ("moe_hybridep_num_blocks_permute", 16),
         ("moe_hybridep_num_blocks_unpermute", 16),
+        ("moe_hybridep_capacity_factor", 1.5),
+        ("moe_hybridep_equal_token_counts", True),
+        ("moe_hybridep_recompute_cache", "combine"),
     ],
 )
 def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, setting, value):
@@ -394,7 +433,7 @@ def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, sett
     assert first._comm_manager is second._comm_manager
 
     monkeypatch.setattr(config, setting, value)
-    with pytest.raises(ValueError, match="identical routing, fusion, and kernel tuning"):
+    with pytest.raises(ValueError, match="identical routing, fusion, kernel tuning, and sync-free"):
         MoEFlexTokenDispatcher(2, [0, 1], config, group)
 
 
@@ -732,3 +771,331 @@ class TestHybridEPStaticRoutingPadPin:
         assert calls == [4] and sizes == [12, 12]
         calls2, sizes2 = self._dispatch_n(m, monkeypatch, [16], group_max=16, pin=True)
         assert calls2 == [16] and sizes2 == [16] and m._static_target_tokens == 16
+
+
+class TestHybridEPCapacityMode:
+    """BackendConfig.dispatcher_capacity_factor: one blocking calibration dispatch, then every dispatch passes
+    the calibrated capacity as num_permuted_tokens (non-blocking) and guards HybridEP's overflow flag."""
+
+    def _run(self, monkeypatch, factor, num_tokens_seq, tpe_rows, overflow=0, static=False):
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            m = _HybridEPManager(
+                group=None,
+                num_local_experts=2,
+                num_experts=8,
+                router_topk=2,
+                benchmark_static_routing=static,
+                moe_hybridep_capacity_factor=factor,
+            )
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        passed, asserts = [], []
+
+        def fake_dispatch(x, routing_map, probs, num_permuted_tokens=None, **kwargs):
+            passed.append(num_permuted_tokens)
+            # blocking mode returns host-side counts; non-blocking returns device-side (cpu stands in) counts
+            tpe = torch.tensor(tpe_rows, dtype=torch.int64)
+            # DeepEP 10d4dd7 layout: slot 10 is num_of_valid_tokens (a Python int), the overflow flag is last
+            handle = tuple([None] * 10 + [int(tpe.sum()), torch.tensor(overflow)])
+            rows = int(tpe.sum()) if num_permuted_tokens is None else int(num_permuted_tokens)
+            return x.new_zeros(rows, x.shape[1]), probs, None, tpe, handle
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        monkeypatch.setattr(torch, "_assert_async", lambda cond, msg="": asserts.append((bool(cond), msg)))
+        for n in num_tokens_seq:
+            m.routing_map = torch.ones(n, 8, dtype=torch.bool)
+            m.token_probs = torch.full((n, 8), 0.125)
+            m.dispatch(torch.randn(n, 4))
+        return m, passed, asserts
+
+    def test_first_dispatch_calibrates_then_passes_the_capacity(self, monkeypatch):
+        m, passed, asserts = self._run(monkeypatch, 1.5, [8, 8, 8], tpe_rows=[5, 5])  # 10 rows x 1.5 = 15 -> aligned 16
+        assert passed == [None, 16, 16]
+        assert m._hybridep_capacity == 16 and m.num_permuted_tokens == 16
+        assert asserts and all(ok for ok, _ in asserts), "overflow guard checked on every capacity dispatch"
+
+    def test_calibration_dispatch_keeps_the_exact_count_for_its_combine(self, monkeypatch):
+        m, passed, _ = self._run(monkeypatch, 2.0, [8], tpe_rows=[5, 5])
+        assert passed == [None] and m.num_permuted_tokens == 10 and m._hybridep_capacity == 20
+
+    def test_overflow_flag_trips_the_guard(self, monkeypatch):
+        _, _, asserts = self._run(monkeypatch, 1.5, [8, 8], tpe_rows=[5, 5], overflow=1)
+        assert asserts and asserts[-1][0] is False and "capacity" in asserts[-1][1]
+
+    def test_static_routing_with_the_factor_is_rejected(self, monkeypatch):
+        """BackendConfig refuses the pairing; the manager refuses it too when built directly."""
+        with pytest.raises(ValueError, match="cannot be combined with benchmark_static_routing"):
+            self._run(monkeypatch, 1.5, [8, 8], tpe_rows=[5, 5], static=True)
+
+    def test_capacity_rounds_up_not_down(self, monkeypatch):
+        """10 rows x 1.25 = 12.5 -> ceil 13 -> aligned 16; floor would give 12 and no alignment step."""
+        m, passed, _ = self._run(monkeypatch, 1.25, [8, 8], tpe_rows=[5, 5])
+        assert m._hybridep_capacity == 16 and passed == [None, 16]
+
+    def test_capacity_is_the_ep_group_maximum(self, monkeypatch):
+        """Every rank must allocate the same buffers: the local capacity goes through an EP-group MAX."""
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            m = _HybridEPManager(
+                group=None, num_local_experts=2, num_experts=8, router_topk=2, moe_hybridep_capacity_factor=1.5
+            )
+        reduced = []
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            reduced.append((int(tensor), op))
+            tensor.fill_(40)  # another rank calibrated a larger capacity
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        m._calibrate_hybridep_capacity(torch.tensor([5, 5]), torch.device("cpu"))
+        assert reduced == [(16, torch.distributed.ReduceOp.MAX)]
+        assert m._hybridep_capacity == 40 and m.num_permuted_tokens == 10
+
+    def test_overflow_guard_refuses_an_unexpected_handle_layout(self):
+        """A handle that does not end with the overflow_flag tensor is an error, never a silent no-op."""
+        from nemo_automodel.components.moe.megatron.token_dispatcher import _assert_no_hybridep_overflow
+
+        with pytest.raises(RuntimeError, match="does not end with the overflow_flag tensor"):
+            _assert_no_hybridep_overflow(("layout", 12), capacity=16)
+        with pytest.raises(RuntimeError, match="does not end with the overflow_flag tensor"):
+            _assert_no_hybridep_overflow(None, capacity=16)
+
+    def test_no_factor_keeps_the_blocking_path(self, monkeypatch):
+        m, passed, asserts = self._run(monkeypatch, None, [8, 8], tpe_rows=[5, 5])
+        assert passed == [None, None] and asserts == []
+
+
+class TestHybridEPEqualTokenCounts:
+    """BackendConfig.dispatcher_equal_token_counts: the pad size is the aligned local row count, with no
+    EP-group all-reduce and no host sync; unset keeps the per-dispatch MAX all-reduce."""
+
+    def _run(self, monkeypatch, equal, num_tokens_seq, group_max):
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            m = _HybridEPManager(
+                group=None,
+                num_local_experts=2,
+                num_experts=8,
+                router_topk=2,
+                benchmark_static_routing=False,
+                moe_hybridep_equal_token_counts=equal,
+            )
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+        calls, sizes = [], []
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            calls.append(int(tensor))
+            tensor.fill_(group_max)
+
+        def fake_dispatch(x, routing_map, probs, **kwargs):
+            sizes.append(x.shape[0])
+            return x, probs, None, routing_map.sum(dim=0), "handle"
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        for n in num_tokens_seq:
+            m.routing_map = torch.ones(n, 8, dtype=torch.bool)
+            m.token_probs = torch.full((n, 8), 0.125)
+            m.dispatch(torch.randn(n, 4))
+        return calls, sizes
+
+    def test_equal_counts_skip_the_collective_and_only_align(self, monkeypatch):
+        calls, sizes = self._run(monkeypatch, True, [6, 8, 9], group_max=99)
+        assert calls == [] and sizes == [8, 8, 12]
+
+    def test_default_keeps_the_per_dispatch_all_reduce(self, monkeypatch):
+        calls, sizes = self._run(monkeypatch, False, [6, 6], group_max=6)
+        assert calls == [6, 6] and sizes == [8, 8]
+
+
+class TestDispatchStateRelease:
+    """combine() must drop the dispatch's tensors so nothing outlives the step (issue #4401)."""
+
+    HIDDEN = 4
+    TOKENS = 6
+
+    @staticmethod
+    def _fake_hybridep_kernels(monkeypatch):
+        """Install autograd-connected stand-ins for the HybridEP dispatch/combine kernels.
+
+        The fake dispatch keeps every row in place and returns probabilities with shape
+        [tokens * router_topk] derived from the dense [tokens, experts] probabilities, so the
+        returned ``dispatched_probs`` carries a ``grad_fn`` exactly like the real kernel's.
+        """
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        def fake_dispatch(x, topk_idx, routing_map, probs, **kwargs):
+            topk = int(routing_map[0].sum())
+            dispatched_probs = probs[routing_map]
+            return x.repeat_interleave(topk, dim=0), dispatched_probs, None, routing_map.sum(dim=0), "handle"
+
+        def fake_combine(x, **kwargs):
+            return x.reshape(-1, 2, x.shape[-1]).sum(dim=1)
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        monkeypatch.setattr(td, "hybrid_ep_combine", fake_combine)
+
+    @staticmethod
+    def _deepep_manager():
+        """Build a _DeepepManager whose fused kernels keep tokens in place and track gradients."""
+
+        def fake_dispatch(x, token_indices, token_probs, num_experts, group, **kwargs):
+            tokens_per_expert = torch.bincount(token_indices.reshape(-1), minlength=num_experts)
+            return x * 2, token_indices, token_probs, tokens_per_expert, "handle"
+
+        return _DeepepManager(
+            group=None,
+            router_topk=2,
+            num_experts=4,
+            num_local_experts=4,
+            _dispatch_fn=fake_dispatch,
+            _combine_fn=lambda x, group, handle, **kwargs: (x * 3, None),
+        )
+
+    def _probs(self, num_experts, requires_grad=True):
+        """Return dense routing probabilities [TOKENS, num_experts] with two experts per token."""
+        probs = torch.zeros(self.TOKENS, num_experts)
+        probs[:, 0] = 0.75
+        probs[:, 1] = 0.25
+        return probs.requires_grad_(requires_grad)
+
+    def test_hybridep_combine_releases_dispatch_state_and_keeps_persistent_tuning(self, hybrid_ep_manager, monkeypatch):
+        self._fake_hybridep_kernels(monkeypatch)
+        hybrid_ep_manager.pad_multiple = 16
+        hybrid_ep_manager._hybridep_capacity = 32
+        hybrid_ep_manager._static_target_tokens = 64
+        hidden = torch.randn(self.TOKENS, self.HIDDEN, requires_grad=True)
+
+        hybrid_ep_manager.setup_metadata(self._probs(8) > 0, self._probs(8))
+        dispatched = hybrid_ep_manager.dispatch(hidden)
+        assert hybrid_ep_manager.token_probs is None, "dispatch() consumed the routing probabilities"
+        assert hybrid_ep_manager.routing_map is None
+        _, dispatched_probs = hybrid_ep_manager.get_permuted_hidden_states_by_experts(dispatched)
+        assert dispatched_probs.grad_fn is not None
+        assert hybrid_ep_manager.dispatched_probs is None, "the probabilities were handed to the experts"
+        combined = hybrid_ep_manager.combine(dispatched * dispatched_probs[:, None])
+
+        torch.testing.assert_close(combined, hidden)
+        for name in ("handle", "num_permuted_tokens", "num_unpadded_tokens", "token_probs", "token_indices"):
+            assert getattr(hybrid_ep_manager, name) is None, name
+        for name in ("routing_map", "tokens_per_expert", "dispatched_probs"):
+            assert getattr(hybrid_ep_manager, name) is None, name
+        assert hybrid_ep_manager.pad_multiple == 16
+        assert hybrid_ep_manager._hybridep_capacity == 32
+        assert hybrid_ep_manager._static_target_tokens == 64
+
+    def test_deepep_combine_releases_dispatch_state(self):
+        manager = self._deepep_manager()
+        hidden = torch.randn(self.TOKENS, self.HIDDEN, requires_grad=True)
+
+        manager.setup_metadata(self.TOKENS, self._probs(4))
+        dispatched = manager.dispatch(hidden)
+        assert manager.token_probs is None and manager.token_indices is None
+        assert manager.dispatched_probs.grad_fn is not None
+        permuted, permuted_probs = manager.get_permuted_hidden_states_by_experts(dispatched)
+        assert permuted_probs.grad_fn is not None
+        assert manager.dispatched_probs is None and manager.dispatched_indices is None
+        assert manager.reversed_mapping_for_combine is not None
+        restored = manager.get_restored_hidden_states_by_experts(permuted)
+        combined = manager.combine(restored)
+
+        assert combined.shape == hidden.shape
+        for name in (
+            "handle",
+            "token_indices",
+            "token_probs",
+            "tokens_per_expert",
+            "dispatched_indices",
+            "dispatched_probs",
+            "dispatched_routing_map",
+            "reversed_mapping_for_combine",
+            "hidden_shape_before_permute",
+        ):
+            assert getattr(manager, name) is None, name
+        # Released state does not break the next dispatch.
+        manager.setup_metadata(self.TOKENS, self._probs(4))
+        permuted, permuted_probs = manager.get_permuted_hidden_states_by_experts(manager.dispatch(hidden))
+        assert permuted.shape == (self.TOKENS * manager.router_topk, self.HIDDEN)
+        assert permuted_probs.grad_fn is not None
+
+    @staticmethod
+    def _saved_data_ptrs(tensors) -> set[int]:
+        """Return the data pointers of every tensor saved by the autograd graphs behind ``tensors``.
+
+        Args:
+            tensors: Iterable of tensors (``None`` entries are skipped) whose ``grad_fn`` graphs are walked.
+
+        Returns:
+            Set of ``data_ptr()`` values of the saved tensors reachable from those graphs.
+        """
+        pointers: set[int] = set()
+        seen: set[int] = set()
+        stack = [tensor.grad_fn for tensor in tensors if torch.is_tensor(tensor) and tensor.grad_fn is not None]
+        while stack:
+            node = stack.pop()
+            if node is None or id(node) in seen:
+                continue
+            seen.add(id(node))
+            for name in dir(node):
+                if name.startswith("_saved_"):
+                    value = getattr(node, name)
+                    if torch.is_tensor(value):
+                        pointers.add(value.data_ptr())
+            stack.extend(next_node for next_node, _ in node.next_functions)
+        return pointers
+
+    @pytest.mark.parametrize("backend", ["hybridep", "deepep"])
+    def test_combine_leaves_no_reference_into_the_checkpoint_recompute(self, hybrid_ep_manager, monkeypatch, backend):
+        """After backward under non-reentrant checkpointing the manager must not reach recomputed activations."""
+        from torch.utils.checkpoint import checkpoint
+
+        if backend == "hybridep":
+            self._fake_hybridep_kernels(monkeypatch)
+            manager = hybrid_ep_manager
+            num_experts = 8
+        else:
+            manager = self._deepep_manager()
+            num_experts = 4
+        router = torch.nn.Linear(self.HIDDEN, num_experts)
+        weight = torch.nn.Parameter(torch.randn(self.HIDDEN, self.HIDDEN))
+        activation_ptrs: list[int] = []
+
+        def moe_block(x: torch.Tensor) -> torch.Tensor:
+            """Route ``x`` [TOKENS, HIDDEN] through the fake kernels and return [TOKENS, HIDDEN]."""
+            pre = torch.relu(x @ weight)  # saved for backward, so recomputed under checkpointing
+            activation_ptrs.append(pre.data_ptr())
+            probs = torch.softmax(router(pre), dim=-1)
+            if backend == "hybridep":
+                routing_map = torch.zeros_like(probs, dtype=torch.bool)
+                routing_map[:, :2] = True
+                manager.setup_metadata(routing_map, probs * routing_map)
+                dispatched, dispatched_probs = manager.get_permuted_hidden_states_by_experts(manager.dispatch(pre))
+                return manager.combine(dispatched * dispatched_probs[:, None])
+            manager.setup_metadata(self.TOKENS, probs)
+            permuted, permuted_probs = manager.get_permuted_hidden_states_by_experts(manager.dispatch(pre))
+            return manager.combine(manager.get_restored_hidden_states_by_experts(permuted * permuted_probs[:, None]))
+
+        x = torch.randn(self.TOKENS, self.HIDDEN, requires_grad=True)
+        out = checkpoint(moe_block, x, use_reentrant=False)
+        out.sum().backward()
+        del out
+
+        assert len(activation_ptrs) == 2, "forward and recompute should each run the block once"
+        assert router.weight.grad is not None and x.grad is not None
+        # Early-stopped recompute may legitimately leave non-autograd bookkeeping (counts, handle)
+        # behind, but nothing may still point into the recompute graph.
+        leftovers = {name: value for name, value in vars(manager).items() if torch.is_tensor(value)}
+        graph_connected = [name for name, value in leftovers.items() if value.grad_fn is not None]
+        assert graph_connected == [], graph_connected
+        assert activation_ptrs[1] not in self._saved_data_ptrs(leftovers.values())

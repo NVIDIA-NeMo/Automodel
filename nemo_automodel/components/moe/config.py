@@ -52,6 +52,8 @@ class MoEConfig:
     # DeepSeek V4's official ``Expert.forward`` with ``swiglu_limit``.
     # Default 0.0 preserves the existing ``weighted_bias_swiglu_impl`` path.
     swiglu_limit: float = 0.0
+    # Step-5 clamps silu(gate); DeepSeek V4 clamps gate before SiLU.
+    swiglu_clamp_after_activation: bool = False
     softmax_before_topk: bool = False
     router_weights_fp32: bool = False
     router_weight_uses_score_correction_bias: bool = False

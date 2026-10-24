@@ -14,7 +14,7 @@
 
 from itertools import product
 from math import ceil
-from typing import Literal, TypedDict, Union
+from typing import Any, Literal, TypedDict, Union
 
 import numpy as np
 import torch
@@ -339,21 +339,6 @@ class Step3VLProcessor(ProcessorMixin):
         image_repl, image_repl_ids = self._get_image_repl(num_images)
         return patch_repl + image_repl, patch_repl_ids + image_repl_ids
 
-    def replace_placeholder(self, text: str, placeholder: str, repls: list[str]) -> str:
-        parts = text.split(placeholder)
-
-        if len(parts) - 1 != len(repls):
-            raise ValueError(
-                "The number of placeholders does not match the number of replacements."  # noqa: E501
-            )
-
-        result = [parts[0]]
-        for i, repl in enumerate(repls):
-            result.append(repl)
-            result.append(parts[i + 1])
-
-        return "".join(result)
-
     def _normalize_batched_images(
         self,
         images,
@@ -407,6 +392,9 @@ class Step3VLProcessor(ProcessorMixin):
         # ProcessorMixin.apply_chat_template may pass return_dict through to
         # processor.__call__; tokenizers do not accept it.
         kwargs.pop("return_dict", None)
+        # apply_chat_template requests placeholder offsets to align {% generation %}
+        # spans with the expanded image tokens.
+        return_text_replacement_offsets = kwargs.pop("return_text_replacement_offsets", False)
 
         if images is not None:
             images = self.image_preprocessor.fetch_images(images)
@@ -416,6 +404,7 @@ class Step3VLProcessor(ProcessorMixin):
             text = [text]
         images_per_text = self._normalize_batched_images(images, len(text))
 
+        text_replacement_offsets: list[list[dict[str, Any]]] = [[] for _ in text]
         if not any(images_per_text):
             image_inputs = {}
             text_inputs = self.tokenizer(text, **tokenizer_kwargs)
@@ -424,10 +413,9 @@ class Step3VLProcessor(ProcessorMixin):
             patch_pixel_values_lst = []
             patch_newline_mask_lst = []
             num_patches = []
-            replaced_text = []
+            image_replacements = []
             for sample_text, sample_images in zip(text, images_per_text):
                 if not sample_images:
-                    replaced_text.append(sample_text)
                     continue
 
                 image_repl_str_lst = []
@@ -445,7 +433,9 @@ class Step3VLProcessor(ProcessorMixin):
                     if patch_newline_mask is not None:
                         patch_newline_mask_lst.extend(patch_newline_mask)
 
-                replaced_text.append(self.replace_placeholder(sample_text, self.image_token, image_repl_str_lst))
+                if sample_text.count(self.image_token) != len(image_repl_str_lst):
+                    raise ValueError("The number of placeholders does not match the number of replacements.")
+                image_replacements.extend(image_repl_str_lst)
 
             image_inputs = {
                 "pixel_values": torch.cat(pixel_values_lst),
@@ -456,14 +446,18 @@ class Step3VLProcessor(ProcessorMixin):
             if patch_newline_mask_lst:
                 image_inputs["patch_newline_mask"] = torch.tensor(patch_newline_mask_lst, dtype=torch.bool)
 
-            text_inputs = self.tokenizer(replaced_text, **tokenizer_kwargs)
+            text, text_replacement_offsets = self.get_text_with_replacements(list(text), image_replacements)
+            text_inputs = self.tokenizer(text, **tokenizer_kwargs)
 
+        if return_text_replacement_offsets:
+            text_inputs["text_replacement_offsets"] = text_replacement_offsets
         return BatchFeature(
             {
                 **text_inputs,
                 **image_inputs,
             },
             tensor_type=return_tensors,
+            skip_tensor_conversion=self.skip_tensor_conversion,
         )
 
     # Copied from transformers.models.clip.processing_clip.CLIPProcessor.batch_decode with CLIP->Gemma

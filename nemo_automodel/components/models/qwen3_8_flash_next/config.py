@@ -120,7 +120,13 @@ class Qwen3_8_FlashNextTextConfig(PretrainedConfig):
         if rope_parameters is None:
             rope_parameters = dict(rope_scaling)
 
-        if layer_types is not None:
+        if layer_types is None:
+            # Transformers' GatedDeltaNet reads layer_types directly during construction.
+            layer_types = [
+                "full_attention" if (layer_idx + 1) % full_attention_interval == 0 else "linear_attention"
+                for layer_idx in range(num_hidden_layers)
+            ]
+        else:
             layer_types = list(layer_types)
 
         if ple_layer_ids is None:

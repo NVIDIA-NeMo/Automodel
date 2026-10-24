@@ -71,3 +71,6 @@ checkpoint:
 #   project: dflash
 #   entity: my-team
 #   name: qwen3-8b-dflash
+
+ci:
+  cluster_tag: h100

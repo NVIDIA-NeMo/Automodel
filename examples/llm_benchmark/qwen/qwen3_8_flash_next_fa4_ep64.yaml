@@ -216,6 +216,7 @@ wandb:
   dir: wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: huiyingl
   nodes: 8
   time: "00:35:00"

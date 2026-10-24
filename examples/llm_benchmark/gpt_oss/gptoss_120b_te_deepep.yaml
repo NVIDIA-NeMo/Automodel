@@ -111,6 +111,7 @@ optimizer:
 
 
 ci:
+  cluster_tag: h100
   time: "00:30:00"
   nodes: 8
   ep_size: 64

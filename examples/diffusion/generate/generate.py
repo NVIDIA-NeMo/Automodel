@@ -147,7 +147,9 @@ def load_pipeline(cfg, dist_info):
         model_id,
         torch_dtype=torch_dtype,
         mesh_context=mesh_context,
-        components_to_load=["transformer"],
+        # Inference needs every component on device, but only the transformer
+        # supports the requested model/context parallelism.
+        components_to_parallelize=["transformer"],
         move_to_device=not cpu_offload,
     )
 
@@ -732,6 +734,7 @@ def run_inference(pipe, cfg, is_rank0):
             prompt for image-conditioned pipelines.
         is_rank0: Whether this is the main process (for saving outputs).
     """
+    from diffusers import ModularPipeline
     from diffusers.utils import export_to_video, load_image
 
     output_type = detect_output_type(pipe)
@@ -771,10 +774,20 @@ def run_inference(pipe, cfg, is_rank0):
     if extra_kwargs is not None:
         pipe_kwargs.update(extra_kwargs.to_dict())
 
+    if isinstance(pipe, ModularPipeline) and "guidance_scale" in pipe_kwargs:
+        guidance_scale = pipe_kwargs.pop("guidance_scale")
+        pipe.update_components(guider=pipe.guider.new(guidance_scale=guidance_scale))
+        logger.info("Configured modular pipeline guidance_scale=%s", guidance_scale)
+
     if input_images is not None:
         if "image" in pipe_kwargs:
             raise ValueError("Set source images with inference.input_images, not inference.pipeline_kwargs.image")
-        if "image" not in inspect.signature(pipe.__call__).parameters:
+        input_names = (
+            pipe.blocks.input_names
+            if isinstance(pipe, ModularPipeline)
+            else inspect.signature(pipe.__call__).parameters
+        )
+        if "image" not in input_names:
             raise ValueError(
                 f"{type(pipe).__name__} does not accept image inputs, but inference.input_images is configured"
             )

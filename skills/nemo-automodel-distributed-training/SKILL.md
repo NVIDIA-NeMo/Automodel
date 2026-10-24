@@ -1,7 +1,6 @@
 ---
 name: nemo-automodel-distributed-training
-description: Guide for selecting and configuring distributed training strategies in NeMo AutoModel, including FSDP2, Megatron FSDP, DDP, and parallelism settings.
-when_to_use: Adding or modifying distributed training strategies (FSDP2, HSDP, DDP), debugging multi-GPU or multi-node failures, configuring context or tensor parallelism, or tuning sharding settings.
+description: Guide for selecting and configuring distributed training strategies in NeMo AutoModel, including FSDP2, Megatron FSDP, DDP, and parallelism settings. Use when adding or modifying distributed training strategies (FSDP2, HSDP, DDP), debugging multi-GPU or multi-node failures, configuring context or tensor parallelism, or tuning sharding settings.
 license: Apache-2.0
 metadata:
   author: NVIDIA
@@ -391,6 +390,11 @@ distributed:
     ignore_router_for_ac: false
     wrap_outer_model: true
 ```
+
+`activation_checkpointing: moe` (expert-parallel FSDP2 only, needs
+`ignore_router_for_ac: true`) checkpoints just each decoder block's MoE
+sub-block and keeps attention / linear-attention / residual-mixing
+activations: less recompute for more activation memory.
 
 The `moe` sub-section maps to `MoEParallelizerConfig` and is only
 instantiated when `ep_size > 1`.
