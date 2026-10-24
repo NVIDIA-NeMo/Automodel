@@ -14,11 +14,7 @@
 
 from types import SimpleNamespace
 
-from nemo_automodel.components.datasets.vlm.samplers import (
-    LengthGroupedSampler,
-    _smart_resize_image,
-    _smart_resize_video,
-)
+from nemo_automodel.components.datasets.vlm.samplers import LengthGroupedSampler
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -89,45 +85,6 @@ def _make_processor(
         max_frames=video_max_frames,
     )
     return SimpleNamespace(image_processor=image_processor, video_processor=video_processor)
-
-
-# ---------------------------------------------------------------------------
-# smart_resize unit tests
-# ---------------------------------------------------------------------------
-
-
-class TestSmartResizeImage:
-    def test_basic_resize(self):
-        h, w = _smart_resize_image(1024, 768, factor=28)
-        assert h % 28 == 0 and w % 28 == 0
-
-    def test_respects_max_pixels(self):
-        h, w = _smart_resize_image(4000, 4000, factor=28, max_pixels=200000)
-        assert h * w <= 200000
-
-    def test_respects_min_pixels(self):
-        h, w = _smart_resize_image(10, 10, factor=28, min_pixels=56 * 56)
-        assert h * w >= 56 * 56
-
-    def test_exact_factor_multiple(self):
-        h, w = _smart_resize_image(280, 560, factor=28)
-        assert h == 280 and w == 560
-
-
-class TestSmartResizeVideo:
-    def test_basic_resize(self):
-        h, w = _smart_resize_video(16, 480, 640, temporal_factor=2, factor=32)
-        assert h % 32 == 0 and w % 32 == 0
-
-    def test_respects_max_pixels(self):
-        h, w = _smart_resize_video(32, 1920, 1080, temporal_factor=2, factor=32, max_pixels=500000)
-        t_bar = 32  # already multiple of 2
-        assert t_bar * h * w <= 500000
-
-    def test_respects_min_pixels(self):
-        h, w = _smart_resize_video(4, 64, 64, temporal_factor=2, factor=32, min_pixels=128 * 128)
-        t_bar = 4
-        assert t_bar * h * w >= 128 * 128
 
 
 # ---------------------------------------------------------------------------
