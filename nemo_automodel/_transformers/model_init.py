@@ -1437,7 +1437,12 @@ def __init_model(
         )
         if remote_model_cls is not None:
             init_param_names = _get_init_param_names(remote_model_cls)
-            _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
+            config_overrides = _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
+            # Without a config, HF re-reads config.json (so does the auto_map alias retry) and
+            # the overrides are lost. from_config already passes hf_config positionally.
+            if config_overrides and is_pretrained_init:
+                _absorb_config_attr_kwargs(hf_config, kwargs, init_param_names=init_param_names)
+                kwargs["config"] = hf_config
     if is_pretrained_init:
         with skip_random_init():
             model = cls._from_pretrained_parent_class(
@@ -1704,6 +1709,22 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
                     continue
             setattr(config, k, val)
     return applied
+
+
+def _absorb_config_attr_kwargs(config, kwargs: dict, *, init_param_names: set[str]) -> None:
+    """
+    Move kwargs that name an attribute of ``config`` onto it, before ``config=`` is forwarded.
+
+    Without ``config``, HF's ``from_pretrained`` applies every kwarg the loaded config has an
+    attribute for (``PretrainedConfig.from_dict``), including properties such as ``num_labels``
+    that ``to_dict()`` omits. With ``config``, HF passes all leftover kwargs to the model
+    ``__init__`` instead. ``quantization_config`` and ``_commit_hash`` are loader arguments that
+    HF takes before the config is loaded, so they stay.
+    """
+    for k in list(kwargs):
+        if k in init_param_names or k in ("quantization_config", "_commit_hash") or not hasattr(config, k):
+            continue
+        setattr(config, k, kwargs.pop(k))
 
 
 def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:
