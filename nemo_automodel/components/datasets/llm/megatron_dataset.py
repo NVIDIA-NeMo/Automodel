@@ -18,7 +18,7 @@ import glob
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Dict, List, Union
 
@@ -50,7 +50,16 @@ class MegatronPretrainingConfig:
     seq_length: int = 2048
     """Sequence length."""
     create_attention_mask: bool = False
-    """Whether to generate attention masks (not supported with fused/flash attention)."""
+    """Whether to generate dense attention masks (not supported with fused/flash attention).
+
+    Position-only resets supply a binary validity mask independently of this flag.
+    """
+    reset_position_ids: bool = field(default=False, kw_only=True)
+    """Whether to reset position IDs at document boundaries (EOD tokens)."""
+    reset_attention_mask: bool = field(default=False, kw_only=True)
+    """Whether to reset the attention mask at document boundaries (EOD tokens)."""
+    eod_mask_loss: bool = field(default=False, kw_only=True)
+    """Whether to mask the loss on EOD tokens."""
     seed: int = 1234
     """Seed for generating the GPT dataset."""
     split: str = "900,50,50"
@@ -102,6 +111,9 @@ class MegatronPretrainingConfig:
             micro_batch_size=training_schedule.local_batch_size,
             global_batch_size=training_schedule.global_batch_size,
             create_attention_mask=self.create_attention_mask,
+            reset_position_ids=self.reset_position_ids,
+            reset_attention_mask=self.reset_attention_mask,
+            eod_mask_loss=self.eod_mask_loss,
             seed=self.seed,
             split=self.split,
             index_mapping_dir=self.index_mapping_dir,
@@ -148,6 +160,10 @@ class MegatronPretraining:
         mmap_bin_files: bool = True,
         splits_to_build: Union[str, List[str]] | None = None,
         object_storage_config: Union[Dict, "ObjectStorageConfig"] | None = None,
+        *,
+        reset_position_ids: bool = False,
+        reset_attention_mask: bool = False,
+        eod_mask_loss: bool = False,
     ) -> None:
         """Pretraining dataset class for Megatron-LM datasets.
         Args:
@@ -186,8 +202,14 @@ class MegatronPretraining:
             tokenizer (Optional[PreTrainedTokenizerBase]): An instance of a PreTrainedTokenizerBase object.
             micro_batch_size (int): Batch size per GPU.
             global_batch_size (int): Global batch size.
-            create_attention_mask (bool): Option to enable the attention masks generation.
+            create_attention_mask (bool): Option to generate dense attention masks.
+                Position-only resets still supply a binary validity mask.
                 Not supported with fused and flash attention.
+            reset_position_ids (bool): Option to reset position IDs at document boundaries
+                (EOD tokens).
+            reset_attention_mask (bool): Option to reset the attention mask at document
+                boundaries (EOD tokens).
+            eod_mask_loss (bool): Option to mask the loss on EOD tokens.
             seed (int): Seed for generating the GPT dataset.
             split (str): A string of 3 comma-separated integers denoting how much of the distribution
                 to allocate to train, validation, and test sets, respectively. Unused if ``paths`` is a dict.
@@ -252,6 +274,9 @@ class MegatronPretraining:
         self.global_batch_size = global_batch_size
         self.tokenizer = tokenizer
         self.create_attention_mask = create_attention_mask
+        self.reset_position_ids = reset_position_ids
+        self.reset_attention_mask = reset_attention_mask
+        self.eod_mask_loss = eod_mask_loss
         self.seed = seed
         self.split = split
         self.index_mapping_dir = index_mapping_dir
@@ -360,10 +385,10 @@ class MegatronPretraining:
             sequence_length=self.seq_length,
             tokenizer=self.tokenizer,
             path_to_cache=self.index_mapping_dir,
-            reset_position_ids=False,
+            reset_position_ids=self.reset_position_ids,
             create_attention_mask=self.create_attention_mask,
-            reset_attention_mask=False,
-            eod_mask_loss=False,
+            reset_attention_mask=self.reset_attention_mask,
+            eod_mask_loss=self.eod_mask_loss,
             num_dataset_builder_threads=self.num_dataset_builder_threads,
             object_storage_config=self.object_storage_config,
             **self.build_kwargs,
