@@ -983,16 +983,21 @@ class MoESplitExpertsStateDictMixin:
                 the last dimension.
 
         Returns:
-            One contiguous grouped tensor in ``self.dtype``.
+            One contiguous grouped tensor in the source dtype. Installation casts it to the destination
+            parameter, so FP32 checkpoint values survive into FP32-selected experts.
         """
         if not expert_parts or not expert_parts[0]:
             raise ValueError("At least one expert projection tensor is required")
 
         first_expert = expert_parts[0]
+        source_dtype = first_expert[0].dtype
+        for parts in expert_parts:
+            for part in parts:
+                source_dtype = torch.promote_types(source_dtype, part.dtype)
         leading_shape = first_expert[0].shape[:-1]
         grouped = torch.empty(
             (len(expert_parts), *leading_shape, sum(part.shape[-1] for part in first_expert)),
-            dtype=self.dtype,
+            dtype=source_dtype,
             device=first_expert[0].device,
         )
         if len(first_expert) == 1:

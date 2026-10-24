@@ -28,6 +28,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.moe import swiglu_triton
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.megatron.fused_a2a import hybridep_combine_output_cached
 from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_geglu_impl,
     weighted_bias_swiglu_impl,
@@ -1525,6 +1526,18 @@ class GroupedExpertsDeepEP(nn.Module):
         # count_nonzero host read in forward is skipped as well (rows are never empty).
         self.dispatcher_capacity_factor = backend.dispatcher_capacity_factor if backend is not None else None
         self.dispatcher_equal_token_counts = backend.dispatcher_equal_token_counts if backend is not None else False
+        # BackendConfig.dispatcher_recompute_cache (validated there: HybridEP only): under block activation
+        # checkpointing the combine output of the checkpoint forward is served in the recompute ("combine");
+        # "moe_tail" also skips the down projection's GEMM there (_DownProjGroupedMM), which is only sound when
+        # nothing reads that output: the router weight must be applied inside the activation.
+        self.dispatcher_recompute_cache = (
+            str(getattr(backend, "dispatcher_recompute_cache", "none")) if backend is not None else "none"
+        )
+        if self.dispatcher_recompute_cache == "moe_tail" and config.apply_router_weight_after_down:
+            raise ValueError(
+                "dispatcher_recompute_cache='moe_tail' requires apply_router_weight_after_down=False: the deferred "
+                "down projection's output is never materialised in the recompute"
+            )
         # One flag for the four expert classes' forward: with static routing (forced balance, no noise)
         # every expert receives tokens by construction, and capacity mode never dispatches an empty
         # buffer, so the count_nonzero device-to-host read (one per microbatch, and again per
@@ -1585,6 +1598,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
             moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
             moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
+            moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -1772,6 +1786,10 @@ class GroupedExpertsDeepEP(nn.Module):
                     activation_probs,
                     self.expert_activation,
                     use_mxfp8=self.use_mxfp8,
+                    # moe_tail skips the down projection's GEMM in a recompute whose combine is cached — sound
+                    # only while nothing reads that output. A post-expert callback does, and would save an
+                    # uninitialised tensor for its own backward, so it keeps the GEMM (review of #4395).
+                    defer_down_proj=self.dispatcher_recompute_cache == "moe_tail" and post_expert_output is None,
                 )
         else:
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
@@ -1795,6 +1813,38 @@ class GroupedExpertsDeepEP(nn.Module):
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
 
 
+class _DownProjGroupedMM(torch.autograd.Function):
+    """``torch._grouped_mm`` for the expert down projection whose forward is skipped in a checkpoint recompute.
+
+    Under ``BackendConfig.dispatcher_recompute_cache="moe_tail"`` the HybridEP combine that consumes this output
+    is served from the forward's cache during the backward recompute, so no op reads the recomputed
+    down-projection values: the forward then only allocates the output and records the node. The backward is
+    the grouped-GEMM derivative PyTorch applies itself (dgrad = grad x W^T, wgrad = X^T x grad, both grouped by
+    ``offs``), so the gradients match the plain path bit for bit, and the saved tensors are the same three as
+    the native node, which keeps the checkpoint's saved-tensor stream identical in forward and recompute.
+    ``torch._grouped_mm`` has no autocast rule, and neither has this node: dtypes are used as given and a mix is
+    rejected by the op, under autocast or not. The recompute-only allocation is kept out of selective
+    checkpointing's op-stream accounting (``apply_ac`` registers ``aten.new_empty.default`` in
+    ``SAC_IGNORED_OPS`` when the cache is in use); the caller keeps the GEMM when a post-expert callback reads
+    the output.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(x, w, offs)
+        if hybridep_combine_output_cached():
+            return x.new_empty((x.shape[0], w.shape[-1]))
+        return torch._grouped_mm(x, w, offs)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
+        x, w, offs = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_x = torch._grouped_mm(grad_output, w.transpose(-2, -1), offs) if ctx.needs_input_grad[0] else None
+        grad_w = torch._grouped_mm(x.t(), grad_output, offs) if ctx.needs_input_grad[1] else None
+        return grad_x, grad_w, None
+
+
 def _torch_mm_experts_fwd(
     hidden_states,
     gate_and_up_projs,
@@ -1803,6 +1853,7 @@ def _torch_mm_experts_fwd(
     permuted_probs,
     activation_fn,
     use_mxfp8=False,
+    defer_down_proj=False,
 ):
     # torchao's MXFP8 quantizer (mx_tensor.to_mx) strictly asserts is_contiguous() on each
     # operand it quantizes, unlike torch._grouped_mm. select_grouped_mm returns a wrapper
@@ -1812,7 +1863,11 @@ def _torch_mm_experts_fwd(
     grouped_mm = select_grouped_mm(use_mxfp8)
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
     output1 = activation_fn(output1, permuted_probs)
-    output2 = grouped_mm(output1, down_projs, offs)
+    if defer_down_proj and not use_mxfp8:
+        # dispatcher_recompute_cache="moe_tail": the GEMM is skipped in a recompute whose combine is cached.
+        output2 = _DownProjGroupedMM.apply(output1, down_projs, offs)
+    else:
+        output2 = grouped_mm(output1, down_projs, offs)
     return output2
 
 
@@ -1900,6 +1955,13 @@ class GroupedExpertsTE(nn.Module):
         )
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
+        )
+
+        # BackendConfig.dispatcher_recompute_cache: the HybridEP combine output of a checkpoint forward is served
+        # in the recompute ("combine"); "moe_tail" is refused by BackendConfig for this backend (no deferred GEMM
+        # here). The dispatcher config below carries it, so the requested mode survives this constructor.
+        self.dispatcher_recompute_cache = (
+            str(getattr(backend, "dispatcher_recompute_cache", "none")) if backend is not None else "none"
         )
 
         self._init_grouped_layers(self.num_local_experts)
@@ -2203,6 +2265,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
             moe_benchmark_static_routing=self.static_routing,
         )
 
