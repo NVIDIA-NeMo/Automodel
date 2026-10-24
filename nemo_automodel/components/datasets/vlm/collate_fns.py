@@ -912,8 +912,7 @@ def kimi_k25_vl_collate_fn(
             "text": text,
             "return_tensors": "pt",
         }
-        if medias:
-            processor_kwargs["medias"] = medias
+        processor_kwargs["medias"] = medias
         if max_length is not None and not drop_overlong:
             processor_kwargs["truncation"] = True
             processor_kwargs["max_length"] = max_length
@@ -2335,6 +2334,7 @@ COLLATE_FNS = {
     "Qwen3OmniMoeProcessor": qwen3_omni_collate_fn,
     "KimiVLProcessor": kimi_vl_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,
+    "KimiK3Processor": kimi_k25_vl_collate_fn,
     "NemotronParseProcessor": nemotron_parse_collate_fn,
     "NemotronH_Nano_Omni_Reasoning_V3Processor": nemotron_omni_collate_fn,
     "LlavaOneVisionProcessor": llava_onevision_collate_fn,

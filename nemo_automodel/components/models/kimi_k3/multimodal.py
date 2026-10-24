@@ -14,19 +14,27 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.kimi_k3.config import KimiK3Config
+from nemo_automodel.components.models.kimi_k3.cp import KimiVlmBatch, shard_batch_for_kimi_vlm_cp
 from nemo_automodel.components.models.kimi_k3.model import KimiK3ForCausalLM
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from nemo_automodel.components.models.kimi_k3.vision import (
     MLP,
     IdentityMap,
+    Learnable2DInterpPosEmbDivided_fixed,
     MoonViT3dPretrainedModel,
     PatchMergerMLP,
     PatchMergerMLPV2,
+    Rope2DPosEmbRepeated,
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -52,6 +60,24 @@ def _projector_config(config: KimiK3Config) -> SimpleNamespace:
         projector_hidden_act=vision_config.projector_hidden_act,
         projector_ln_eps=vision_config.projector_ln_eps,
     )
+
+
+def _positions_within_documents(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Return zero-based positions within each non-padding document run.
+
+    Args:
+        attention_mask: Binary or indexed document mask [batch, sequence].
+
+    Returns:
+        Positions [batch, sequence], with padding positions set to one.
+    """
+    indices = torch.arange(attention_mask.shape[1], device=attention_mask.device).expand_as(attention_mask)
+    starts = torch.cat(
+        (torch.ones_like(attention_mask[:, :1], dtype=torch.bool), attention_mask[:, 1:] != attention_mask[:, :-1]),
+        dim=-1,
+    )
+    offsets = indices.masked_fill(~starts, 0).cummax(dim=-1).values
+    return (indices - offsets).masked_fill(attention_mask == 0, 1)
 
 
 class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
@@ -95,6 +121,7 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
             backend=backend,
             **kwargs,
         )
+        self.cp_mesh: DeviceMesh | None = None
         self.config = top_config
         self.vision_tower = MoonViT3dPretrainedModel(_vision_tower_config(top_config))
 
@@ -121,6 +148,57 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                 dtype=model_dtype,
             )
 
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Describe global media token inputs and local CP stage activations.
+
+        Args:
+            is_first: Whether this is the first pipeline stage.
+            microbatch_size: Number of sequences per pipeline microbatch.
+            seq_len: Global input token count before CP padding and slicing.
+            dtype: Floating point dtype of pipeline activations.
+
+        Returns:
+            Input and output meta tensors. Only first-stage token IDs retain
+            the global sequence; hidden states and residuals use local length.
+        """
+        cp_size = 1 if self.cp_mesh is None else self.cp_mesh.size()
+        local_seq_len = (seq_len + cp_size - 1) // cp_size
+        inputs, outputs = super().get_pipeline_stage_metas(
+            is_first=is_first, microbatch_size=microbatch_size, seq_len=local_seq_len, dtype=dtype
+        )
+        if is_first:
+            inputs = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        return inputs, outputs
+
+    def prepare_model_inputs_for_cp(
+        self, batch: KimiVlmBatch, *, num_chunks: int = 1
+    ) -> dict[str, ContextParallelSharder]:
+        """Configure native KDA/MLA CP and defer token sharding until after vision.
+
+        Args:
+            batch: Global VLM batch with token tensors [batch, sequence], image
+                patches [patches, channels, patch_height, patch_width], and grids
+                [images, 3], following shard_batch_for_kimi_vlm_cp.
+            num_chunks: Number of pipeline microbatches.
+
+        Returns:
+            Native CP sharder preserving global image ownership until embedding.
+        """
+        super().prepare_model_inputs_for_cp(batch, num_chunks=num_chunks)
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_for_kimi_vlm_cp,
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
+
     def _merge_input_ids_with_image_features(
         self,
         image_features: list[torch.Tensor],
@@ -129,7 +207,22 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         attention_mask: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
-        """Expand image placeholders in ``[batch, sequence]`` text tensors."""
+        """Merge compact HF placeholders or pre-expanded training image tokens.
+
+        Args:
+            image_features: Per-image tensors of shape [image_tokens, hidden], in
+                batch order. Each image_tokens count follows spatial patch merging.
+            inputs_embeds: Tensor of shape [batch, sequence, hidden].
+            input_ids: Tensor of shape [batch, sequence], with either one media
+                placeholder per image or one per projected image token.
+            attention_mask: Binary or indexed document mask of shape [batch, sequence].
+            labels: Optional unshifted targets of shape [batch, sequence].
+
+        Returns:
+            Embeddings [batch, expanded_sequence, hidden], binary or indexed document mask,
+            optional labels, and position IDs [batch, expanded_sequence]. Already
+            expanded inputs retain their sequence length. Inputs are not mutated.
+        """
         _, embed_dim = image_features[0].shape
         feature_lengths = torch.tensor(
             [features.shape[0] for features in image_features],
@@ -141,6 +234,33 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         pad_token_id = self.config.pad_token_id
 
         placeholder_mask = input_ids == image_token_id
+        if bool((placeholder_mask & (attention_mask <= 0)).any()):
+            raise ValueError("A K3 image token span crosses padding.")
+        if int(placeholder_mask.sum()) == image_features_tensor.shape[0]:
+            # A matching total count alone does not prove image ownership: one
+            # image must never straddle rows, documents, padding, or text gaps.
+            locations = placeholder_mask.nonzero()
+            offset = 0
+            for features in image_features:
+                span = locations[offset : offset + features.shape[0]]
+                owner = attention_mask[span[:, 0], span[:, 1]]
+                if (
+                    not bool((span[:, 0] == span[0, 0]).all())
+                    or not bool((owner == owner[0]).all())
+                    or not bool((owner > 0).all())
+                    or not bool((span[1:, 1] - span[:-1, 1] == 1).all())
+                ):
+                    raise ValueError("A K3 image token span crosses a document, row, padding, or text boundary.")
+                offset += features.shape[0]
+            final_embeddings = inputs_embeds.masked_scatter(
+                placeholder_mask.unsqueeze(-1),
+                image_features_tensor.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype),
+            )
+            final_labels = (
+                labels.masked_fill(placeholder_mask, self.config.ignore_index) if labels is not None else None
+            )
+            position_ids = _positions_within_documents(attention_mask)
+            return final_embeddings, attention_mask, final_labels, position_ids
         if int(placeholder_mask.sum()) != len(feature_lengths):
             raise ValueError(
                 f"Received {int(placeholder_mask.sum())} image placeholders for "
@@ -151,7 +271,7 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         max_length = int(occupation.sum(-1).max().item())
         batch_indices, text_indices = torch.where(~placeholder_mask)
         positions = occupation.cumsum(-1) - 1
-        left_padding = bool(torch.any(input_ids[:, -1] != pad_token_id))
+        left_padding = not bool(torch.any(attention_mask[:, -1] == 0))
         left_pad = max_length - 1 - positions[:, -1]
         if left_padding:
             positions = positions + left_pad[:, None]
@@ -176,15 +296,21 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
             device=input_ids.device,
         )
         image_positions[batch_indices, text_positions] = False
-        image_positions &= image_positions.cumsum(-1) - 1 >= left_pad[:, None]
+        token_positions = torch.arange(max_length, device=input_ids.device)[None, :]
+        if left_padding:
+            image_positions &= token_positions >= left_pad[:, None]
+        else:
+            image_positions &= token_positions < occupation.sum(-1, keepdim=True)
         if int(image_positions.sum()) != image_features_tensor.shape[0]:
             raise ValueError(
                 f"Expanded placeholders contain {int(image_positions.sum())} positions, "
                 f"but the vision tower returned {image_features_tensor.shape[0]} tokens."
             )
         final_embeddings[image_positions] = image_features_tensor.reshape(-1, embed_dim).to(final_embeddings.device)
-        final_attention_mask |= image_positions
-        position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill(final_attention_mask == 0, 1)
+        final_attention_mask[image_positions] = torch.repeat_interleave(
+            attention_mask[placeholder_mask], feature_lengths
+        )
+        position_ids = _positions_within_documents(final_attention_mask)
 
         pad_batch, pad_indices = torch.where(input_ids == pad_token_id)
         final_embeddings[pad_batch, positions[pad_batch, pad_indices]] = 0
@@ -206,22 +332,50 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         *,
         pixel_values: torch.Tensor | None = None,
         grid_thws: torch.Tensor | None = None,
+        image_grid_hws: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
+        kimi_vlm_full_input: bool = False,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast | torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Run text-only or multimodal K3 inputs."""
+        """Run text-only or multimodal K3 inputs.
+
+        Args:
+            input_ids: Token IDs [batch, sequence], or PP activations
+                [batch, sequence, hidden] after the first pipeline stage.
+            block_residual: PP residual starts [batch * sequence, blocks, hidden].
+            pixel_values: Flattened image patches [patches, channels, patch_h, patch_w].
+            grid_thws: Image geometry [images, 3], ordered time, height, width.
+            image_grid_thw: Canonical packed image geometry [images, 3].
+            image_grid_hws: Image geometry [images, 2] from the native VLM collator;
+                a [images, 3] time-height-width grid is also accepted.
+            attention_mask: Binary or indexed document mask [batch, sequence].
+            position_ids: Optional positions [batch, sequence].
+            inputs_embeds: Optional embeddings [batch, sequence, hidden].
+            labels: Optional unshifted targets [batch, sequence], with ignore_index
+                at unsupervised positions. Native recipes compute loss externally.
+            logits_to_keep: Trailing logit count or sequence indices [selected_tokens].
+            output_hidden_states: Whether to return final hidden states.
+            kimi_vlm_full_input: Whether CP left the primary token stream intact
+                for image embedding before contiguous sequence sharding.
+            **kwargs: Text-backbone metadata, following KimiK3ForCausalLM.forward.
+
+        Returns:
+            Causal LM output with logits [batch, expanded_sequence, vocab] and
+            optional scalar loss and hidden states [batch, expanded_sequence, hidden].
+            Intermediate PP stages return activations and residual starts.
+        """
         chunks = getattr(self, "_vlm_pixel_values_chunks", None)
         if (
             pixel_values is None
             and input_ids is not None
             and not torch.is_floating_point(input_ids)
             and chunks is not None
-            and (input_ids == self.config.media_placeholder_token_id).any()
         ):
             chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
             if chunk_idx < len(chunks):
@@ -238,6 +392,21 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                 else:
                     grid_thws = image_grid_hws
                 self._vlm_chunk_idx = chunk_idx + 1
+                if pixel_values.numel() == 0:
+                    pixel_values = None
+
+        if grid_thws is None and image_grid_thw is not None:
+            grid_thws = image_grid_thw
+
+        if grid_thws is None and image_grid_hws is not None:
+            if image_grid_hws.shape[-1] == 2:
+                grid_thws = torch.cat((torch.ones_like(image_grid_hws[:, :1]), image_grid_hws), dim=-1)
+            else:
+                grid_thws = image_grid_hws
+
+        full_primary = kimi_vlm_full_input and input_ids is not None and not input_ids.is_floating_point()
+        if full_primary:
+            attention_mask = kwargs["kimi_packed_doc_ids"][:, : input_ids.shape[1]]
 
         if pixel_values is not None:
             if self.vision_tower is None or self.mm_projector is None:
@@ -251,14 +420,32 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
             if attention_mask is None:
                 attention_mask = torch.ones_like(input_ids)
             image_features = self._extract_image_features(pixel_values, grid_thws)
-            inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+            inputs_embeds, attention_mask, labels, merged_positions = self._merge_input_ids_with_image_features(
                 image_features,
                 inputs_embeds.to(image_features[0].dtype),
                 input_ids,
                 attention_mask,
                 labels,
             )
+            if position_ids is None:
+                position_ids = merged_positions
+            elif not full_primary and position_ids.shape != merged_positions.shape:
+                raise ValueError("Explicit position_ids must match the expanded image token sequence.")
+            if full_primary and inputs_embeds.shape[1] != input_ids.shape[1]:
+                raise ValueError("K3 vision CP requires pre-expanded image placeholders from the VLM collator.")
             input_ids = None
+
+        if full_primary:
+            if inputs_embeds is None:
+                inputs_embeds = self.get_input_embeddings()(input_ids)
+            global_length = kwargs["kimi_packed_doc_ids"].shape[1]
+            inputs_embeds = F.pad(inputs_embeds, (0, 0, 0, global_length - inputs_embeds.shape[1]))
+            local_length = global_length // kwargs["kimi_packed_cp_size"]
+            inputs_embeds = inputs_embeds[
+                :, kwargs["kimi_packed_seq_start"] : kwargs["kimi_packed_seq_start"] + local_length
+            ].contiguous()
+            input_ids = None
+            attention_mask = None
 
         output = super().forward(
             input_ids,
@@ -289,6 +476,31 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
             logits=output.logits,
             hidden_states=output.hidden_states,
         )
+
+    @torch.no_grad()
+    def initialize_weights(
+        self,
+        buffer_device: torch.device | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """Initialize text and vision after distributed materialization."""
+        super().initialize_weights(buffer_device=buffer_device, dtype=dtype)
+        for component in (self.vision_tower, self.mm_projector):
+            if component is None:
+                continue
+            for module in component.modules():
+                if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                    torch.nn.init.trunc_normal_(module.weight, std=self.config.text_config.initializer_range)
+                    if module.bias is not None:
+                        torch.nn.init.zeros_(module.bias)
+                elif isinstance(module, (torch.nn.LayerNorm, torch.nn.RMSNorm)):
+                    torch.nn.init.ones_(module.weight)
+                    if isinstance(module, torch.nn.LayerNorm) and module.bias is not None:
+                        torch.nn.init.zeros_(module.bias)
+                elif isinstance(module, Learnable2DInterpPosEmbDivided_fixed):
+                    module.reset_parameters()
+                elif isinstance(module, Rope2DPosEmbRepeated):
+                    module.reset_parameters()
 
 
 ModelClass = KimiK3ForConditionalGeneration

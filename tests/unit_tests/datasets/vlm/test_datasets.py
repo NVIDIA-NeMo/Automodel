@@ -2001,6 +2001,26 @@ class TestPreTokenizedDatasetWrapperInjectFakeImages:
         assert inject_calls == [], "injection must be skipped when inject_fake_images=False"
         assert mask_calls == [], "no masking when nothing was injected"
 
+    def test_model_tokenize_hook_bypasses_default_processor(self, monkeypatch):
+        import torch
+
+        self._patch_pipeline(monkeypatch)
+        calls = []
+
+        def tokenize(conversation, processor):
+            calls.append(conversation)
+            return {"input_ids": torch.tensor([[8, 9, 10]]), "attention_mask": torch.ones(1, 3, dtype=torch.long)}
+
+        processor = _FakeProcessor()
+        monkeypatch.setattr(
+            processor, "apply_chat_template", lambda *args, **kwargs: pytest.fail("Default path called")
+        )
+        wrapper = ds.PreTokenizedDatasetWrapperConfig(inject_fake_images=False, tokenize_hook=tokenize).build(
+            dataset=self._make_dataset(), processor=processor
+        )
+        assert wrapper[0]["input_ids"].tolist() == [8, 9, 10]
+        assert len(calls) == 1
+
     def test_config_forwards_inject_fake_images(self):
         wrapper = ds.PreTokenizedDatasetWrapperConfig(inject_fake_images=False).build(
             dataset=self._make_dataset(),

@@ -37,14 +37,20 @@ sequences work with and without CP.
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
+
+if TYPE_CHECKING:
+    from fla.ops.cp import FLACPContext
+    from torch.nn.attention.flex_attention import BlockMask
 
 _PAD_DOC_ID = 0
 
@@ -55,7 +61,8 @@ class KimiPackedContext:
 
     Attributes:
         doc_ids: Global document ids of shape [batch, sequence] covering the full
-            (unsharded) sequence, where 0 marks padding.
+            (unsharded) sequence, where 0 marks padding. In indexed packed masks,
+            each positive document ID must occupy one contiguous run per row.
         seq_start: Global sequence offset of the local shard; 0 without CP.
         cp_size: Number of context-parallel shards the global sequence was split into.
     """
@@ -65,8 +72,25 @@ class KimiPackedContext:
     cp_size: int = 1
 
     def __post_init__(self) -> None:
+        for row in self.doc_ids:
+            if bool((row > 1).any()):
+                runs = torch.unique_consecutive(row)
+                documents = runs[runs > 0]
+                if documents.unique().numel() != documents.numel():
+                    raise ValueError("Indexed packed document IDs must occupy one contiguous run per row.")
         self._cu_seqlens: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._has_multiple_documents: bool | None = None
+        self._fla_contexts: dict[tuple[int, dist.ProcessGroup, int], FLACPContext] = {}
+        self._mla_block_mask: BlockMask | None = None
+
+    @property
+    def mla_block_mask(self) -> BlockMask:
+        """Return the document-causal mask retained through this microbatch's backward."""
+        if self._mla_block_mask is None:
+            self._mla_block_mask = _document_causal_block_mask(
+                self.local_doc_ids, self.doc_ids, q_global_start=self.seq_start
+            )
+        return self._mla_block_mask
 
     @property
     def cp_enabled(self) -> bool:
@@ -199,9 +223,9 @@ def segment_cu_seqlens(doc_ids_row: torch.Tensor) -> torch.Tensor:
 def build_fla_cp_context(
     packed_context: KimiPackedContext,
     row: int,
-    cp_group: Any,
+    cp_group: dist.ProcessGroup,
     conv_kernel_size: int,
-):
+) -> FLACPContext:
     """Build FLA's per-row context-parallel context for a KDA layer.
 
     Args:
@@ -216,13 +240,19 @@ def build_fla_cp_context(
     """
     from fla.ops.cp import build_cp_context
 
+    key = (row, cp_group, conv_kernel_size)
+    cached = packed_context._fla_contexts.get(key)
+    if cached is not None:
+        return cached
     cu_seqlens, cu_seqlens_cpu = packed_context.row_cu_seqlens(row)
-    return build_cp_context(
+    result = build_cp_context(
         cu_seqlens=cu_seqlens,
         group=cp_group,
         conv1d_kernel_size=conv_kernel_size,
         cu_seqlens_cpu=cu_seqlens_cpu,
     )
+    packed_context._fla_contexts[key] = result
+    return result
 
 
 class _AllGatherSequence(torch.autograd.Function):
@@ -295,43 +325,36 @@ def build_document_causal_mask(
     return torch.zeros(allowed.shape, dtype=dtype, device=device).masked_fill_(~allowed, min_value).unsqueeze(1)
 
 
-_BLOCK_MASK_CACHE: dict[tuple, Any] = {}
-_BLOCK_MASK_GENERATION: list[Any] = [None, None]
-
-
-def _block_mask_cache_generation(doc_ids: torch.Tensor) -> None:
-    """Drop cached block masks when a new batch (new document map) arrives."""
-    pointer = doc_ids.data_ptr()
-    if pointer != _BLOCK_MASK_GENERATION[0]:
-        _BLOCK_MASK_CACHE.clear()
-        _BLOCK_MASK_GENERATION[0] = pointer
-        # Hold the tensor so the allocator cannot recycle the address mid-step.
-        _BLOCK_MASK_GENERATION[1] = doc_ids
-
-
 def _document_causal_block_mask(
     q_doc_ids: torch.Tensor,
     kv_doc_ids: torch.Tensor,
     *,
     q_global_start: int,
-):
-    """Build (and cache for the step) the FlexAttention document-causal block mask."""
+) -> BlockMask:
+    """Build the FlexAttention mask owned by one microbatch's packed context.
+
+    Args:
+        q_doc_ids: Local query document IDs of shape [batch, local_sequence].
+        kv_doc_ids: Global key document IDs of shape [batch, global_sequence].
+        q_global_start: Offset of the contiguous local query shard.
+
+    Returns:
+        BlockMask for local queries against global keys, causal within documents.
+    """
     from torch.nn.attention.flex_attention import create_block_mask
 
-    _block_mask_cache_generation(q_doc_ids)
-    key = (
-        int(q_global_start),
-        int(q_doc_ids.shape[0]),
-        int(q_doc_ids.shape[1]),
-        int(kv_doc_ids.shape[1]),
-        q_doc_ids.device.type,
-        q_doc_ids.device.index,
-    )
-    cached = _BLOCK_MASK_CACHE.get(key)
-    if cached is not None:
-        return cached
-
     def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+        """Evaluate scalar tensor indices for batch, head, query, and key.
+
+        Args:
+            batch_idx: Scalar tensor indexing the batch axis.
+            head_idx: Scalar tensor indexing the head axis (mask is head independent).
+            q_idx: Scalar tensor indexing the local query axis.
+            kv_idx: Scalar tensor indexing the global key axis.
+
+        Returns:
+            Scalar boolean tensor indicating a valid same-document causal pair.
+        """
         q_doc = q_doc_ids[batch_idx, q_idx]
         kv_doc = kv_doc_ids[batch_idx, kv_idx]
         allowed = (kv_idx <= q_idx + q_global_start) & (q_doc == kv_doc) & (kv_doc > _PAD_DOC_ID)
@@ -345,9 +368,6 @@ def _document_causal_block_mask(
         KV_LEN=kv_doc_ids.shape[1],
         device=q_doc_ids.device,
     )
-    if len(_BLOCK_MASK_CACHE) >= 64:
-        _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
-    _BLOCK_MASK_CACHE[key] = block_mask
     return block_mask
 
 
@@ -368,8 +388,7 @@ def document_causal_flex_attention(
     value: torch.Tensor,
     *,
     q_doc_ids: torch.Tensor,
-    kv_doc_ids: torch.Tensor,
-    q_global_start: int,
+    block_mask: BlockMask,
     scale: float,
 ) -> torch.Tensor:
     """Run causal, per-document attention of local queries against global keys.
@@ -379,15 +398,12 @@ def document_causal_flex_attention(
         key: Tensor of shape [batch, heads, key_sequence, qk_head_dim].
         value: Tensor of shape [batch, heads, key_sequence, v_head_dim].
         q_doc_ids: Tensor of shape [batch, query_sequence] with 1-based document ids.
-        kv_doc_ids: Tensor of shape [batch, key_sequence] with 1-based document ids.
-        q_global_start: Global sequence offset of the first query token.
+        block_mask: Document-causal mask prepared outside checkpointed decoder layers.
         scale: Softmax scale applied to the query-key product.
 
     Returns:
         Tensor of shape [batch, heads, query_sequence, v_head_dim].
     """
-    block_mask = _document_causal_block_mask(q_doc_ids, kv_doc_ids, q_global_start=q_global_start)
-
     qk_head_dim = query.shape[-1]
     v_head_dim = value.shape[-1]
     # FlexAttention kernels require power-of-two head dims; MLA's 192/128 split
@@ -556,3 +572,44 @@ def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, pa
 
     layout = ShardLayout(original_seq_len=original_seq_len, padded_seq_len=seq_len)
     return contextlib.nullcontext, batch, layout
+
+
+KimiVlmBatch = dict[str, torch.Tensor | bool | int | str | None]
+
+
+def shard_batch_for_kimi_vlm_cp(
+    cp_mesh: DeviceMesh | None,
+    tp_mesh: DeviceMesh | None,
+    batch: KimiVlmBatch,
+    *,
+    loss_mask: torch.Tensor | None = None,
+    padding_token_id: int = 0,
+) -> tuple[Callable[[], contextlib.AbstractContextManager[None]], KimiVlmBatch, ShardLayout]:
+    """Keep complete media token streams until embedding inside the VLM forward.
+
+    Labels, positions, masks, and global document metadata use the text model's
+    contiguous CP layout. The full primary stream is batch-chunkable for PP.
+
+    Args:
+        cp_mesh: Context-parallel mesh, or None for a single context rank.
+        tp_mesh: Tensor-parallel mesh passed to the native text sharder.
+        batch: Mutable VLM batch. input_ids, labels, position_ids and document
+            masks have shape [batch, global_sequence]; pixel_values has shape
+            [patches, channels, patch_height, patch_width] and image grids have
+            shape [images, 3]. Media tensors remain replicated over CP.
+        loss_mask: Optional tensor of shape [batch, global_sequence].
+        padding_token_id: Token ID used for sequence alignment.
+
+    Returns:
+        Context factory, mutated batch, and original/padded sequence lengths.
+        Token IDs retain shape [batch, global_sequence]; labels, positions and
+        masks use [batch, padded_sequence / cp_size]. Global document metadata
+        has shape [batch, padded_sequence].
+    """
+    full_input_ids = batch["input_ids"]
+    context, batch, layout = shard_batch_for_kimi_cp(
+        cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
+    )
+    batch["input_ids"] = full_input_ids
+    batch["kimi_vlm_full_input"] = True
+    return context, batch, layout

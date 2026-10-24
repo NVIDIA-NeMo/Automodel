@@ -842,3 +842,21 @@ def test_build_source_forwards_bare_tokenizer_unchanged():
     config._build_source(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, dataset_build_context=None)
 
     assert ds_cfg.received_tokenizer is bare_tokenizer
+
+
+def test_recipe_config_resolves_model_tokenize_hook() -> None:
+    from nemo_automodel.components.models.kimi_k3.processing import tokenize_conversation
+
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "dataset": {"_target_": "nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset"},
+                "packed_sequence": {
+                    "pack_size": 128,
+                    "tokenize_hook_fn": "nemo_automodel.components.models.kimi_k3.processing.tokenize_conversation",
+                },
+                "dataloader": {"num_workers": 1},
+            }
+        )
+    ).vlm_dataloader
+    assert config.pretokenization.tokenize_hook is tokenize_conversation

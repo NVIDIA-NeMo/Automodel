@@ -1,0 +1,13 @@
+--- a/fla/ops/kda/chunk_intra.py
++++ b/fla/ops/kda/chunk_intra.py
+@@ -1,0 +2,2 @@
++
++import os
+@@ -13,4 +15,3 @@
+-if IS_TF32_SUPPORTED:
+-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
+-else:
+-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr('ieee')
++FLA_TRIL_PRECISION = os.environ.get('FLA_TRIL_PRECISION', 'tf32' if IS_TF32_SUPPORTED else 'ieee')
++assert FLA_TRIL_PRECISION in ('ieee', 'tf32', 'tf32x3'), FLA_TRIL_PRECISION
++SOLVE_TRIL_DOT_PRECISION = tl.constexpr(FLA_TRIL_PRECISION)

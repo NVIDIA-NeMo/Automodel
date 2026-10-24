@@ -16,7 +16,11 @@ import torch
 from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
-from nemo_automodel.components.models.kimi_k3.cp import shard_batch_for_kimi_cp
+from nemo_automodel.components.models.kimi_k3.cp import (
+    KimiPackedContext,
+    _document_causal_block_mask,
+    shard_batch_for_kimi_cp,
+)
 from nemo_automodel.components.models.kimi_k3.model import (
     KimiDeltaAttention,
     KimiK3ForCausalLM,
@@ -123,3 +127,59 @@ def test_pipeline_microbatches_chunk_kimi_document_map():
     assert [microbatch["kimi_packed_doc_ids"].shape for microbatch in microbatches] == [(1, 8), (1, 8)]
     assert microbatches[0]["kimi_packed_doc_ids"].tolist() == [[1, 1, 1, 1, 1, 1, 0, 0]]
     assert microbatches[1]["kimi_packed_doc_ids"].tolist() == [[1, 1, 1, 1, 0, 0, 0, 0]]
+
+
+def test_mla_masks_remain_owned_by_their_microbatch():
+    """Interleaving document layouts must retain each microbatch's original mask."""
+    first = KimiPackedContext(torch.tensor([[1, 1, 1, 1, 1, 2, 2, 0]]), seq_start=4, cp_size=2)
+    second = KimiPackedContext(torch.tensor([[1, 1, 2, 2, 2, 2, 0, 0]]), seq_start=4, cp_size=2)
+    first_mask = first.mla_block_mask
+    second_mask = second.mla_block_mask
+    assert first.mla_block_mask is first_mask
+    assert second_mask is not first_mask
+    q = torch.arange(4)[:, None]
+    k = torch.arange(8)[None, :]
+    for context, mask in ((first, first_mask), (second, second_mask)):
+        query_docs = context.doc_ids[0, 4:, None]
+        key_docs = context.doc_ids[0, None, :]
+        expected = (k <= q + 4) & (query_docs == key_docs) & (key_docs > 0)
+        expected = torch.where(query_docs == 0, k == 0, expected)
+        actual = mask.mask_mod(torch.tensor(0), torch.tensor(0), q, k)
+        torch.testing.assert_close(actual, expected)
+
+
+def test_interleaved_mla_masks_preserve_selective_checkpoint_operations():
+    """A second microbatch must not add metadata operations during recomputation."""
+    from functools import partial
+
+    from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
+
+    first = torch.tensor([[1, 1, 1, 1, 1, 2, 2, 0]])
+    second = torch.tensor([[1, 1, 2, 2, 2, 2, 0, 0]])
+    q = torch.arange(4)[:, None]
+    k = torch.arange(8)[None, :]
+    zero = torch.tensor(0)
+
+    def build(documents):
+        return _document_causal_block_mask(documents[:, 4:], documents, q_global_start=4)
+
+    def policy(context, operation, *args, **kwargs):
+        if operation in (torch.ops.aten.arange.default, torch.ops.aten.arange.start, torch.ops.aten.arange.start_step):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    def region(value):
+        mask = build(first)
+        weights = mask.mask_mod(zero, zero, q, k).float().sum(-1)
+        return (value.sin() * weights).sum()
+
+    build(first)
+    value = torch.linspace(-0.7, 0.9, 4, requires_grad=True)
+    loss = checkpoint(
+        region, value, use_reentrant=False, context_fn=partial(create_selective_checkpoint_contexts, policy)
+    )
+    build(second)
+    loss.backward()
+    # Local positions 4,5,6,7 can read respectively 5,1,2,1 keys.
+    expected = value.detach().cos() * torch.tensor([5.0, 1.0, 2.0, 1.0])
+    torch.testing.assert_close(value.grad, expected)
