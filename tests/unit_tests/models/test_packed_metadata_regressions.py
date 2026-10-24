@@ -31,6 +31,8 @@ def test_kimi_packed_forward_preserves_padding_for_every_layer(family, class_nam
     cls = getattr(module, class_name)
     model = cls.__new__(cls)
     nn.Module.__init__(model)
+    if family == "kimi_linear":
+        model.backend = module.BackendConfig(attn="eager")
     model.norm = nn.Identity()
     model.use_attn_residuals = False
 
@@ -109,6 +111,8 @@ def test_kimi_explicit_metadata_reaches_kda_without_private_document_ids(family,
     cls = getattr(module, class_name)
     model = cls.__new__(cls)
     nn.Module.__init__(model)
+    if family == "kimi_linear":
+        model.backend = module.BackendConfig(attn="eager")
     model.norm = nn.Identity()
     model.use_attn_residuals = False
     kda = module.KimiDeltaAttention.__new__(module.KimiDeltaAttention)

@@ -54,6 +54,11 @@ from nemo_automodel.components.models.kimi_linear.cp import (
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
 )
+from nemo_automodel.components.models.kimi_linear.flash_attention import (
+    MLAFlashLayout,
+    build_flash_layout,
+    packed_flash_attention,
+)
 from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinear48BStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts
@@ -277,9 +282,17 @@ class KimiRMSNorm(nn.Module):
 class KimiMLAAttention(nn.Module):
     """Kimi MLA full-attention layer copied from the HF reference math."""
 
-    def __init__(self, config: KimiLinear48BConfig, layer_idx: int) -> None:
+    def __init__(self, config: KimiLinear48BConfig, layer_idx: int, *, backend: BackendConfig | None = None) -> None:
+        """Initialize MLA projections and the runtime attention backend.
+
+        Args:
+            config: Model architecture and projection dimensions.
+            layer_idx: Decoder layer index.
+            backend: Runtime backend selection; defaults to eager attention.
+        """
         super().__init__()
         self.config = config
+        self.backend = backend if backend is not None else BackendConfig(attn="eager")
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -331,6 +344,8 @@ class KimiMLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         packed_context: "KimiPackedContext | None" = None,
+        *,
+        flash_layout: MLAFlashLayout | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Run MLA full attention.
@@ -338,9 +353,12 @@ class KimiMLAAttention(nn.Module):
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden]; the sequence axis
                 holds this rank's contiguous shard under context parallelism.
-            attention_mask: Optional additive attention mask of shape [batch, 1, sequence, sequence].
+            attention_mask: Optional additive tensor of shape [batch, 1, sequence, sequence]
+                for eager attention. Must be None for FA4, which consumes flash_layout.
             packed_context: Optional document layout of the batch, required under
                 context parallelism.
+            flash_layout: Document-major metadata required by non-CP FA4 and prepared
+                outside checkpointed layers; tensor layouts are documented by MLAFlashLayout.
             **kwargs: Extra attention options accepted for HF compatibility.
 
         Returns:
@@ -370,12 +388,28 @@ class KimiMLAAttention(nn.Module):
 
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        if self.backend.attn == "fa4":
+            if attention_mask is not None:
+                raise ValueError("backend.attn='fa4' consumes document metadata, not an additive attention_mask")
+            if flash_layout is None:
+                raise ValueError(
+                    "backend.attn='fa4' requires flash_layout prepared by the backbone or build_flash_layout"
+                )
+            attn_output = packed_flash_attention(
+                query_states,
+                key_states,
+                value_states,
+                layout=flash_layout,
+                scale=self.scaling,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+            )
+        else:
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_length, -1)
         return self.o_proj(attn_output)
 
@@ -801,7 +835,9 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % getattr(config, "moe_layer_freq", 1) == 0
         )
         self.self_attn = (
-            KimiDeltaAttention(config, layer_idx) if self.is_linear_attn else KimiMLAAttention(config, layer_idx)
+            KimiDeltaAttention(config, layer_idx)
+            if self.is_linear_attn
+            else KimiMLAAttention(config, layer_idx, backend=backend)
         )
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
@@ -828,7 +864,8 @@ class KimiDecoderLayer(nn.Module):
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden].
             attention_mask: KDA layers receive a binary mask [batch, sequence]; MLA layers receive an additive
-                causal mask [batch, 1, sequence, sequence].
+                causal mask [batch, 1, sequence, sequence], or None with a prepared
+                flash_layout for FA4.
             padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
             **attn_kwargs: Extra attention kwargs forwarded to KDA/MLA.
 
@@ -1068,7 +1105,8 @@ class KimiLinear48BModel(nn.Module):
             inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
             attention_mask: Optional binary or indexed packing mask of shape [batch, sequence].
             position_ids: Optional positions of shape [batch, sequence]; accepted for HF compatibility.
-            padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
+            padding_mask: Optional boolean tensor of shape [batch, sequence], where true
+                excludes tokens from MoE routing. FA4 also excludes them as MLA queries and keys.
             cache_position: Optional position vector of shape [sequence].
             kimi_packed_context: Optional document layout attached by
                 :func:`~nemo_automodel.components.models.kimi_linear.cp.shard_batch_for_kimi_cp`;
@@ -1079,7 +1117,16 @@ class KimiLinear48BModel(nn.Module):
                 positions and -1 padding, or [tokens] indexing flattened batch
                 and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
                 with row-local boundaries and -1 padding, or [documents + 1] for
-                flattened/THD inputs. ``max_seqlen`` is an integer document length.
+                flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
+                or [documents + 1] for THD inputs and gives physical boundaries
+                including per-document padding, rather than logical token counts.
+                Physical boundaries apply to FA4 MLA; when they differ from logical
+                boundaries, an explicit boolean ``padding_mask`` is required.
+                Hybrid models require logical ``cu_seqlens`` whenever physical
+                boundaries are supplied. With internal padding, also provide flat
+                ``packed_token_indices`` selecting valid tokens in physical order,
+                so KDA can gather its unpadded recurrent stream.
+                ``max_seqlen`` is an integer document length.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
@@ -1098,19 +1145,56 @@ class KimiLinear48BModel(nn.Module):
             or attn_kwargs.get("packed_token_indices") is not None
             or attn_kwargs.get("cu_seqlens") is not None
         )
+        use_flash = self.backend.attn == "fa4"
+        if use_flash and attention_mask is not None and attention_mask.shape != inputs_embeds.shape[:2]:
+            raise ValueError(
+                f"backend.attn='fa4' requires a binary/document attention_mask [batch, sequence]; "
+                f"got {tuple(attention_mask.shape)}"
+            )
+        physical_boundaries = attn_kwargs.get("cu_seqlens_padded") if use_flash else None
         packed_context = kimi_packed_context or _packed_context_from_inputs(
             inputs_embeds,
             attention_mask=packed_seq_ids if packed_seq_ids is not None else attention_mask,
-            cu_seqlens=attn_kwargs.get("cu_seqlens"),
+            cu_seqlens=physical_boundaries if physical_boundaries is not None else attn_kwargs.get("cu_seqlens"),
         )
+        if physical_boundaries is not None and not (packed_context is not None and packed_context.cp_enabled):
+            logical_boundaries = attn_kwargs.get("cu_seqlens")
+            has_internal_padding = logical_boundaries is not None and not torch.equal(
+                physical_boundaries.reshape(-1), logical_boundaries.reshape(-1)
+            )
+            if has_internal_padding and padding_mask is None:
+                raise ValueError("Kimi Linear FA4 physical THD padding requires an explicit padding_mask")
+            if any(layer.is_linear_attn for layer in self.layers.values()) and (
+                logical_boundaries is None or (has_internal_padding and attn_kwargs.get("packed_token_indices") is None)
+            ):
+                raise ValueError(
+                    "Kimi Linear physical THD padding with KDA requires logical cu_seqlens "
+                    "and packed_token_indices for the unpadded tokens"
+                )
+        if use_flash and packed_context is None and padding_mask is not None:
+            packed_context = KimiPackedContext(doc_ids=(~padding_mask).to(torch.int32))
         # Packed attention consumes document metadata, but MoE routing still
         # needs a separate mask for padding tokens, including in full-attention layers.
         if padding_mask is None and packed_context is not None:
             padding_mask = packed_context.local_doc_ids == 0
         linear_attn_mask = None if has_packed_inputs else self._update_linear_attn_mask(attention_mask, cache_position)
+        flash_layout = None
+        if use_flash and not (packed_context is not None and packed_context.cp_enabled):
+            if packed_context is not None:
+                doc_ids = packed_context.doc_ids
+            else:
+                doc_ids = torch.ones(inputs_embeds.shape[:2], dtype=torch.int32, device=inputs_embeds.device)
+            if doc_ids.shape != inputs_embeds.shape[:2]:
+                raise ValueError(
+                    f"Kimi Linear FA4 document map must match [batch, sequence] {tuple(inputs_embeds.shape[:2])}; "
+                    f"got {tuple(doc_ids.shape)}"
+                )
+            if padding_mask is not None:
+                doc_ids = doc_ids.masked_fill(padding_mask, 0)
+            flash_layout = build_flash_layout(doc_ids)
         causal_mask = (
             None
-            if packed_context is not None and packed_context.cp_enabled
+            if use_flash or (packed_context is not None and packed_context.cp_enabled)
             else _make_causal_mask(inputs_embeds, packed_context, dtype=inputs_embeds.dtype)
         )
         hidden_states = inputs_embeds
@@ -1125,6 +1209,7 @@ class KimiLinear48BModel(nn.Module):
                 attention_mask=layer_mask,
                 padding_mask=layer_padding_mask,
                 packed_context=packed_context,
+                flash_layout=flash_layout,
                 **attn_kwargs,
             )
 
@@ -1256,10 +1341,11 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
 
         Args:
             input_ids: Optional token ids of shape [batch, sequence].
-            attention_mask: Optional binary padding mask of shape [batch, sequence].
+            attention_mask: Optional binary or indexed document mask of shape [batch, sequence].
             position_ids: Optional positions of shape [batch, sequence].
             inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
-            padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
+            padding_mask: Optional boolean tensor of shape [batch, sequence], where true
+                excludes tokens from MoE routing. FA4 also excludes them as MLA queries and keys.
             logits_to_keep: Number of trailing sequence logits to compute, or tensor indices.
             output_hidden_states: Whether to include hidden states in the output.
             **attn_kwargs: Packed or THD metadata: ``_packed_seq_ids`` has shape
@@ -1268,7 +1354,14 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
                 positions and -1 padding, or [tokens] indexing flattened batch
                 and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
                 with row-local boundaries and -1 padding, or [documents + 1] for
-                flattened/THD inputs. ``max_seqlen`` is an integer document length.
+                flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
+                or [documents + 1] and describes physical THD boundaries for FA4 MLA.
+                An explicit boolean ``padding_mask`` is required when physical and
+                logical boundaries differ.
+                Hybrid models require logical ``cu_seqlens`` whenever physical
+                boundaries are supplied. With internal padding, also provide flat
+                ``packed_token_indices`` selecting valid physical positions
+                for KDA's unpadded stream. ``max_seqlen`` is an integer document length.
 
         Returns:
             Causal LM output whose logits have shape [batch, sequence, vocab] unless ``logits_to_keep`` trims sequence.
