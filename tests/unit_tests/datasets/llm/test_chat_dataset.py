@@ -649,6 +649,7 @@ def test_getitem_auto_converts_conversations(monkeypatch):
     ds.mask_history = False
     ds.unshifted = False
     ds.mask_generation_prompt = False
+    ds.chat_template_kwargs = {}
 
     out = ds[0]
     assert out == {"input_ids": [1], "labels": [1]}
@@ -701,4 +702,8 @@ def test_chat_dataset_config_positional_layout_is_unchanged():
     assert cfg.unshifted is True
     assert cfg.skip_invalid_samples is True
     assert cfg.mask_generation_prompt is False
-    assert [f.name for f in dataclasses.fields(tcd.ChatDatasetConfig)][-1] == "mask_generation_prompt"
+    assert cfg.chat_template_kwargs is None
+    assert [f.name for f in dataclasses.fields(tcd.ChatDatasetConfig)][-2:] == [
+        "mask_generation_prompt",
+        "chat_template_kwargs",
+    ]
