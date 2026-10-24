@@ -578,7 +578,7 @@ navigation:
               - page: "Muse-Glimmer-30B"
                 path: ../../model-coverage/vlm/meta-models/muse_glimmer.mdx
               - page: "Muse-Spark-open-816B-A42B"
-                path: ../../model-coverage/vlm/meta-models/muse_spark_open.mdx
+                path: ../../model-coverage/vlm/meta-models/muse-spark-open-816b-a42b.mdx
           - section: "MiniMax AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRtwCAABXRUJQVlA4TNACAAAvE8AEAAEFbdswSvfHn/E0DhH9nwBFdyv0wx40UNQ2khMUW66GP7Z7HxYlkSQ5DQ++f1kRn4JHERJI2vj17/z+xwMwPhKUYSKhKA0ZzIdqdWp+EGJ3Zv/PpJClbZNpO39V9ep1bNs+J/YAsu9iOwM4g8hMNAXrKpe2bRsLvSqYRD1PILWRJEhyZN/z+FM8FDclt7ZtVcvWPp9kuGQUQAuWWkYdtEFKU/Ti7vxyvrt35NDfJYXLElyimrM0fEhNG+7FZdKSZZGGsDwcawD/oMDf+/rRN5Uf+/l+X2SwcDEOCRHAIAawgBg7drpxR2G95o62deYOFh5czAwHYEaVqF91axul9rq23bqN0g577Og5fy0rCQ4zBB04iNLJ3kLGA9dPu6+19Ljrp598Ti7hYiQQAIcGpZBrse/3akG8RdzcmxUlNvcSTtuP2avKT0GgIAAdRB/+v/qWTOqbOEm1BqCRoqNEqxdqfPULLCAkLYT1P/ufVT4XVZaAf6Dv/CUpADO6MH6lZdNKfFWONBmDABgRk4OZmU6mOITLq5NH1aJBSBAmCOPHAegXFTOzguJ0f9qP7CH09aiMU/yhOPlZLXqpPk4at6h8FABwIGnE1IC8JGXVZk9XpTeNUdb0lNkjnDl+Pv0UUoAh6IJDQzRt1F1Pv8nZsvf+Txo3X47c9Mn5ddBMBDEAh66QALch/usc1hV1VWNRvrLxaVWV3cRDAYAgAIRQIJ3rNDdQl9WUP89VT8z4RsQFyxUpAIRElGO2SVX+aETn5OWH1D5asqTq844lXFZdLf7fy/wjAHTRxFQDhm8Svu762U6XN1WFRZHfu12yowO7WN25LwmIQLqCuHS4PNzNCru5/vBe++Zg8bRFvszf/vvd1Fv/1vN7qiAFxEAhnRvxKvSXsx/a/6hFPLuX0B/JvuLl0oMPBYADME8yR8z5v6tF8+AlEhlcZPHQBBg="/></svg>'
             slug: MiniMaxAI
