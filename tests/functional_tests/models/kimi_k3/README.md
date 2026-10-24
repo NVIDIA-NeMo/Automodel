@@ -99,10 +99,62 @@ and export comparison data; they do not load or repair model weights.
 - Native 13-layer PP2 EP8 CP2 packed and PP2 EP8 CP1 nonpacked training ran with
   an actual 12+1 decoder split. The first 12 decoder layers and token embeddings
   were frozen; vision, layer 12, and the output head were trainable.
-- Four-layer EP2 PP2 versus EP4 PP1 uses an explicit 2+2 decoder split with the
-  checkpoint's original residual-block size 12. Results are recorded separately
-  after both native runs finish.
+- Four-layer EP2 PP2 versus EP4 PP1 passes the declared BF16 gates on eight
+  GB200 GPUs with CP1, an explicit 2+2 split, original residual-block size 12,
+  and identical FLA autotune selections on every rank. Both use the first eight
+  frozen image packs: 5,399 valid tokens and 911 supervised tokens. All
+  94,441,250,976 parameters are trainable. Logits are bit-exact and both
+  token-averaged losses are 13.003018149347087. Gradient relative L2 error is
+  0.004537 globally (vision 0.008246, language 0.004422), below the unchanged
+  3% global and per-modality gates. Updated-parameter maximum error is 7.45e-9.
+  All 472 intermediate tensors and 16 PP activation/residual handoffs are
+  exact; a swapped-microbatch negative control is detected. All eight ranks
+  complete native loading, backward, clipping, and SGD in both configurations.
+- Four-layer EP2 PP2 versus EP4 PP1 passes the declared BF16 gates on 16 GB200
+  GPUs with CP1, an explicit 2+2 decoder split, and the original residual-block size
+  12. Both configurations train all 94,441,250,976 parameters using the same
+  first 16 frozen image packs, 11,227 valid tokens, and 1,610 supervised tokens.
+  Native loading, backward, clipping, and one SGD step complete on every rank.
+  All logits and the recomputed token-averaged loss (13.07560563390613) are
+  exact; all-gradient relative L2 error is 0.004134 (vision 0.006269, language
+  0.004066), and updated-parameter maximum error is 7.45e-9. All 368 recorded
+  intermediate tensors and 32 PP activation/residual handoffs are exact.
+  Gradients pass the predeclared 3% global and per-modality BF16 gates; they
+  are not claimed to pass strict FP32 per-parameter gates. Parameters with
+  absent gradients must agree between runs. Swapped-microbatch and corrupted
+  shard negative controls are detected.
+- These BF16 PP comparisons load the same prepared, native-exported
+  dequantized four-layer checkpoint through the production checkpointer.
+  Direct raw-INT4 loading with BF16 parameter storage failed a reader shape
+  check and is not certified by this result. FP32 EP2 PP2 exceeded memory on
+  eight GPUs; native CPU-offload attempts failed CPU collectives. The passing
+  BF16 comparison is GPU-resident and does not bypass either failure.
 - The full 93-layer model run was canceled by the user and was never submitted.
+
+To reproduce bit-exact BF16 PP forward parity, hold FLA autotune selections fixed
+across all ranks.
+An eight-GPU run with two alternating node cache profiles completed its native
+optimizer step but failed forward parity (maximum logit/KL errors 2.078125 /
+0.08925). The first divergence was inside KDA: identical loaded weights,
+projections, convolutions, and decay gates produced a 3.05e-5 kernel-output
+difference. On the same GPU, recompiling current source while retaining only
+each profile's autotune decisions reproduced the two native outputs exactly.
+For the first pack, this changed two expert sets in decoder layer 2 and 36 in
+layer 3. This is preserved as a failing comparison with different kernel
+selections, not silently absorbed into a larger tolerance. The controlled
+comparison uses the same immutable cache profile on every rank; it does not
+replace weights, activations, or router decisions. See
+kda_cache_causal_diagnosis.json and autotune_seed_choice_differences.json.
+
+Four-layer PP artifacts: native4_w8_uniformcache_bf16_ep2pp2_vs_ep4_parity.json,
+native4_w8_uniformcache_pp_boundary_audit.json,
+native4_w8_uniformcache_autotune_audit.json,
+native4_w16_bf16_ep2pp2_vs_ep4_parity.json, native4_w16_pp_boundary_audit.json,
+and the paired native4_w8_*uniformcache / native4_w16_* YAML files and per-rank
+native audit directories. The uniform-cache audit checks all 26 observed kernel
+keys across all 16 rank snapshots from the eight-GPU pair: no differing choices.
+The source revision tested was 77749a10a; the subsequent documentation update
+does not change runtime code.
 
 Runtime: PyTorch 2.14.0a0+4fdf77b940.nv26.08 / CUDA 13.4; native Transformers
 5.18.0; HF comparison Transformers 4.56.2. HF source revision:
