@@ -274,6 +274,27 @@ prek run --all-files
 
 After installing the git hooks, `git commit` will automatically run incremental checks.
 
+## Recipe checks
+
+Before pushing example recipe or recipe CI changes, run:
+
+```bash
+git fetch origin main
+uv run --script tools/recipes/check_recipes.py
+```
+
+This is the same entry point used by recipe CI. It checks example YAMLs,
+nightly recipe references, every CI folder/scope combination, and required
+`ci:` metadata on added recipes. It installs only PyYAML and ruamel.yaml in an
+isolated Python 3.12 environment; no training stack or GPUs are needed.
+
+By default, added recipes are detected against the merge base of `origin/main`
+and `HEAD`, including staged, unstaged, and untracked additions. Use
+`--base-ref <ref>` for a different base. For a committed PR range, pass
+`--base-ref <base-sha> --head-ref <head-sha>`; this excludes uncommitted additions
+from the new-recipe metadata check. Both refs and their history must be available
+locally. Every validator reads files from the current checkout.
+
 ## Adding Documentation
 
 Before pushing documentation changes, run the same check used by CI from the
