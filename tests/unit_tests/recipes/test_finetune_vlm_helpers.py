@@ -3690,7 +3690,7 @@ def _patches_for_packing(neat_pack_side_effect):
                 "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
                 side_effect=neat_pack_side_effect,
             ),
-            patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", stateful_dataloader),
+            patch("nemo_automodel.components.datasets.vlm.loader._VlmStatefulDataloader", stateful_dataloader),
             patch(
                 "nemo_automodel.components.models.common.packing.configure_packing",
                 return_value=packing_contract,
