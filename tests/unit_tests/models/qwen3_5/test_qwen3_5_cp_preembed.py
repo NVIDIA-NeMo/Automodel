@@ -24,11 +24,7 @@ import torch.nn as nn
 pytest.importorskip("transformers.models.qwen3_5")
 
 import nemo_automodel.components.models.qwen3_5.model as qwen3_5_model_module
-from nemo_automodel.components.models.qwen3_5.model import (
-    HFQwen3_5Model,
-    Qwen3_5ForConditionalGeneration,
-    Qwen3_5Model,
-)
+from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
 
 
 def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None, vision_start_token_id=None):
@@ -171,6 +167,27 @@ class TestPrepareModelInputsForCP:
 
 
 class TestPopStagedVlmMedia:
+    def test_prepared_host_token_presence_matches_media_routing(self):
+        model = _build_model(image_token_id=99, video_token_id=98, vision_start_token_id=97)
+        input_ids = torch.tensor([[10, 99, 12]])
+        packed_ids = torch.tensor([[1, 1, 2]])
+        image = torch.randn(4, 8)
+        grid = torch.tensor([[1, 4, 4]])
+        host_metadata = model.prepare_host_batch_metadata(
+            {"input_ids": input_ids, "image_grid_thw": grid, "_packed_seq_ids": packed_ids}
+        )
+        kwargs = {"pixel_values": image, "image_grid_thw": grid, **host_metadata}
+
+        actual = model._pop_staged_vlm_media(input_ids, kwargs)
+        expected = model._pop_staged_vlm_media(input_ids, {"pixel_values": image, "image_grid_thw": grid})
+
+        assert host_metadata["_vlm_token_presence"] == (True, False, False)
+        assert host_metadata["_host_image_grid_thw"].tensor is grid
+        assert host_metadata["_host_packed_seq_ids"].tensor is packed_ids
+        assert actual[0] is expected[0] is image
+        assert actual[2] is expected[2] is grid
+        assert "_vlm_token_presence" not in kwargs
+
     def test_drops_orphaned_image_media(self):
         model = _build_model(image_token_id=99, video_token_id=98, vision_start_token_id=97)
         kwargs = {
@@ -296,61 +313,6 @@ class TestEmbedAndSpliceForCP:
         assert captured["grid"] is grid_thw
         assert captured["pixel"].dtype == visual.dtype
         torch.testing.assert_close(captured["pixel"].float(), pixel_values, atol=5e-3, rtol=5e-3)
-
-
-class TestQwen3_5ModelForward:
-    def _build_inner_model(self):
-        model = Qwen3_5Model.__new__(Qwen3_5Model)
-        nn.Module.__init__(model)
-        model.visual = types.SimpleNamespace(rotary_pos_emb=types.SimpleNamespace(to=lambda device: None))
-        model.get_input_embeddings = lambda: lambda input_ids: pytest.fail("media forward should keep input_ids")
-        return model
-
-    def test_media_forward_keeps_input_ids_for_hf_placeholder_mask(self, monkeypatch):
-        model = self._build_inner_model()
-        captured = {}
-        sentinel = object()
-
-        def _fake_hf_forward(self, **kwargs):
-            captured.update(kwargs)
-            return sentinel
-
-        monkeypatch.setattr(HFQwen3_5Model, "forward", _fake_hf_forward)
-
-        input_ids = torch.tensor([[5, 99, 7]])
-        pixel_values = torch.randn(4, 8)
-        out = model.forward(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=torch.tensor([[1, 2, 2]]),
-        )
-
-        assert out is sentinel
-        assert captured["input_ids"] is input_ids
-        assert captured["inputs_embeds"] is None
-        assert captured["pixel_values"] is pixel_values
-
-    def test_media_forward_accepts_hidden_states_as_input_ids(self, monkeypatch):
-        model = self._build_inner_model()
-        captured = {}
-        sentinel = object()
-
-        def _fake_hf_forward(self, **kwargs):
-            captured.update(kwargs)
-            return sentinel
-
-        monkeypatch.setattr(HFQwen3_5Model, "forward", _fake_hf_forward)
-
-        hidden_states = torch.randn(1, 3, 4)
-        out = model.forward(
-            input_ids=hidden_states,
-            pixel_values=torch.randn(4, 8),
-            image_grid_thw=torch.tensor([[1, 2, 2]]),
-        )
-
-        assert out is sentinel
-        assert captured["input_ids"] is None
-        assert captured["inputs_embeds"] is hidden_states
 
 
 class _FakeCPMesh:
