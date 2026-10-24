@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention
 
-from nemo_automodel.components.attention.flex_attention import FlexAttention
+from nemo_automodel.components.attention.flex_attention import FlexAttention, _flex_kernel_options
 
 # Over the default 5s budget on purpose: CUDA FlexAttention compilation takes longer on a cold worker.
 # Reduce cold compiler startup before lowering this further.
@@ -127,3 +128,47 @@ def test_flex_attention_matches_sdpa():
         rtol = 1e-2 if dtype == torch.bfloat16 else 5e-4
         max_err = (ref - out).abs().max().item()
         assert torch.allclose(ref, out, rtol=rtol, atol=atol), f"Mismatch (window={window}); max_err={max_err:.4e}"
+
+
+# ---------------------------------------------------------------------------
+# _flex_kernel_options: low-shared-memory GPUs (sm_89 / sm_120) need smaller
+# flex-attention backward tiles once head_dim > 128, or the compiled backward
+# OOMs on shared memory instead of raising a clear error.
+# ---------------------------------------------------------------------------
+
+
+def test_flex_kernel_options_is_none_on_cpu():
+    assert _flex_kernel_options(torch.device("cpu"), head_dim=256) is None
+
+
+def test_flex_kernel_options_is_none_at_or_below_the_default_tile_head_dim():
+    device = torch.device("cuda", 0)
+    assert _flex_kernel_options(device, head_dim=128) is None
+
+
+def test_flex_kernel_options_is_none_on_rocm(monkeypatch: pytest.MonkeyPatch):
+    """ROCm reports device.type == 'cuda' but has no shared_memory_per_block_optin to probe."""
+    monkeypatch.setattr(torch.version, "hip", "6.0")
+    assert _flex_kernel_options(torch.device("cuda", 0), head_dim=256) is None
+
+
+def test_flex_kernel_options_returns_small_tiles_on_low_shared_memory_gpus(monkeypatch: pytest.MonkeyPatch):
+    """sm_89 (RTX 4090 / L40S) and sm_120 (RTX 5090 / RTX PRO 6000) report ~99 KB."""
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda device: SimpleNamespace(shared_memory_per_block_optin=99 * 1024)
+    )
+
+    options = _flex_kernel_options(torch.device("cuda", 0), head_dim=256)
+
+    assert options == {"BLOCK_M1": 32, "BLOCK_N1": 32, "BLOCK_M2": 32, "BLOCK_N2": 32, "num_stages": 1}
+
+
+def test_flex_kernel_options_is_none_on_high_shared_memory_gpus(monkeypatch: pytest.MonkeyPatch):
+    """A100/H100/B200-class GPUs keep inductor's defaults."""
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda device: SimpleNamespace(shared_memory_per_block_optin=164 * 1024)
+    )
+
+    assert _flex_kernel_options(torch.device("cuda", 0), head_dim=256) is None

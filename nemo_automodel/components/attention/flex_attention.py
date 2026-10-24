@@ -17,6 +17,7 @@ from typing import Any, Callable, ClassVar
 import torch
 from torch.nn.attention.flex_attention import (
     BlockMask,
+    FlexKernelOptions,
     _mask_mod_signature,
     create_block_mask,
     flex_attention,
@@ -25,6 +26,39 @@ from torch.nn.attention.flex_attention import (
 # Cache masks by window, tensor geometry, and device so a BlockMask is reused only
 # for compatible attention inputs.
 FLEX_ATTN_MASK_T = tuple[int, int, int, int, int, torch.device]
+
+# ~99 KB of shared memory per block on sm_89 (RTX 4090 / L40S) and sm_120 (RTX 5090 /
+# RTX PRO 6000 Blackwell); inductor's default flex-attention backward tiles need
+# ~112 KB once head_dim > 128, so the compiled backward OOMs on shared memory there.
+_LOW_SHARED_MEMORY_BYTES = 128 * 1024
+_MAX_DEFAULT_TILE_HEAD_DIM = 128
+_LOW_SHARED_MEMORY_KERNEL_OPTIONS: FlexKernelOptions = {
+    "BLOCK_M1": 32,
+    "BLOCK_N1": 32,
+    "BLOCK_M2": 32,
+    "BLOCK_N2": 32,
+    "num_stages": 1,
+}
+
+
+def _flex_kernel_options(device: torch.device, head_dim: int) -> FlexKernelOptions | None:
+    """Smaller flex-attention backward tiles for low-shared-memory GPUs, else ``None``.
+
+    ``None`` keeps inductor's defaults (A100/H100/B200 have enough shared memory
+    at any head_dim). Resolved per call from the tensor's device and head_dim --
+    cheap (one device-property lookup) and keeps this module free of any process-
+    global CUDA device assumption.
+    """
+    if device.type != "cuda" or head_dim <= _MAX_DEFAULT_TILE_HEAD_DIM:
+        return None
+    if torch.version.hip is not None:
+        # ROCm reports device.type == "cuda", but torch only binds
+        # shared_memory_per_block_optin on CUDA builds; nothing to probe here.
+        return None
+    optin = getattr(torch.cuda.get_device_properties(device), "shared_memory_per_block_optin", None)
+    if optin is not None and optin < _LOW_SHARED_MEMORY_BYTES:
+        return dict(_LOW_SHARED_MEMORY_KERNEL_OPTIONS)
+    return None
 
 
 # Adapted from https://github.com/pytorch/torchtitan/pull/1559
@@ -81,8 +115,9 @@ class FlexAttention(torch.nn.Module):
         Returns:
             Attention output with shape ``[B, Hq, Sq, Dv]`` on the same device and with the same dtype as ``q``.
         """
-        batch_size, num_q_heads, q_len, _ = q.shape
+        batch_size, num_q_heads, q_len, head_dim = q.shape
         kv_len = k.shape[2]
+        kernel_options = _flex_kernel_options(q.device, head_dim)
 
         mask_key = (sliding_window, batch_size, num_q_heads, q_len, kv_len, q.device)
         if mask_key not in FlexAttention.block_masks:
@@ -105,7 +140,7 @@ class FlexAttention(torch.nn.Module):
 
         if sink_weights is None:
             result: torch.Tensor = FlexAttention.flex_attn(
-                q, k, v, block_mask=block_mask, scale=scale, enable_gqa=enable_gqa
+                q, k, v, block_mask=block_mask, scale=scale, enable_gqa=enable_gqa, kernel_options=kernel_options
             )
             return result
 
@@ -117,6 +152,7 @@ class FlexAttention(torch.nn.Module):
             block_mask=block_mask,
             enable_gqa=enable_gqa,
             return_lse=True,
+            kernel_options=kernel_options,
         )
 
         # rescale by sigma(lse - w[h]) and broadcast over D
