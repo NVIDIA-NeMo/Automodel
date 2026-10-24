@@ -586,6 +586,8 @@ navigation:
             contents:
               - page: "MiniMax-M3"
                 path: ../../model-coverage/vlm/MiniMaxAI/minimax-m3.mdx
+              - page: "MiniMax-M3.1-Flash"
+                path: ../../model-coverage/vlm/MiniMaxAI/minimax-m3-1-flash.mdx
           - section: "Mistral AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRp4CAABXRUJQVlA4TJECAAAvE8AEED/lNpJkV5m9Jz9aWbjknxi+hvc2DbeR7NbNAhRSh+4/dz2uw+GXBGBFki0ryr73PbZ/lOBfAjpWBzBzG25t26qqhbu7QwU0QSH0QxEMMgahQ0wFRO4u312uBMMABjAawAASdB1KAW/w9uENDoSbABsTRvAwXBySZqftGShAIIdvAQ0jQIMyT+Yc4RlWSofJu0M8aIqvGJ+DxmLUyjVc62v8t2BhUhyTl2PNstSR1zApcJkmUiWoHKPI8cxqNINMwiJbYIkQ8+9XYcXR17G27u+EUhnwH8tcuyMZy7fH8Y7hti+VPOMp/H3lHC/H9Z2ACgwYD2IKSgDGANDCIBCgTBT69jeg+ZxfMwRxNV99xAaCIDINQU0IvmqENyenxOC2mun5oFItnvSm9IUcDV8Zu+tztgpjYRRMXhp+YS/kMk/wkvhLAIaAR0eIt6t+kfGGCPBNK2t+TbDyEzhEwaTeWMd2/b4N+9vP7k5CMDBaZgWEvcLxVT/Dy9CgOyUMRi31vd3qetwVTxoQbds23cSq21i1bVuxjdq2bdt293++lzHyCRH9nwAEndXBCtDRESiozJPHO7L78wc6gYXTg+frzTWAsXnzdHgGJuH26PUKpJcvxxdkG/vbU7PzKtXczPTW3jo6CD0ry6s7k8DE7urS4gJZ93D/6MCYyTg+ONI31EvW2eawtts9bnu7zWI1B/C7XV630+nxuF0+kj9aUX2NxqCvrdYZtFV1xTQ1APyWVjahtay8GS0VJV0AkPqTkVeY853V2JD9lVuQn/mTAiRywsWCSG4sEMeOEIrCOAlAEk8pk8hD09Xq+BCFVKbkJQNR7598Pv8jGohJ++TzP9/fEGQK9Z9IASj/RCoFwQUA"/></svg>'
             slug: mistralai
@@ -621,6 +623,8 @@ navigation:
             contents:
               - page: "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16"
                 path: ../../model-coverage/vlm/nvidia/nvidia-nemotron-3-5-bolt-74b-a9b-bf16.mdx
+              - page: "NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16"
+                path: ../../model-coverage/vlm/nvidia/nvidia-nemotron-3-5-bolt-e4b-4gb-bf16.mdx
               - page: "NVIDIA-Nemotron-Parse-v1.1"
                 path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
           - section: "OpenGVLab"
@@ -795,7 +799,7 @@ navigation:
             path: ../../model-coverage/diffusion/black-forest-labs/index.mdx
             contents:
               - page: "FLUX-3-Image-Klein-Base"
-                path: ../../model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx
+                path: ../../model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base.mdx
               - page: "FLUX.1-dev"
                 path: ../../model-coverage/diffusion/black-forest-labs/flux.mdx
               - page: "FLUX.2-dev"
