@@ -28,6 +28,7 @@ try:
         version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available()
     ):
         raise ImportError("Installed Triton version is unsupported on this device")
+    # Python launchers validate availability; JIT kernels must not read this runtime bool.
     HAVE_TRITON = True
 except ImportError:
     HAVE_TRITON = False
@@ -70,9 +71,6 @@ def get_pid_coords(
     """
     Converts one-dimensional triton pids into two dimensions.
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     pid = tl.program_id(axis=0)
 
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -110,9 +108,6 @@ def inner_kernel(
     A is an M x K matrix and B is an N x K matrix.
     The result is returned to be stored by the calling method.
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -158,9 +153,6 @@ def block_vector_mul(
 
     N is assumed to be smaller than BLOCK_SIZE_N.
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_l = tl.arange(0, BLOCK_SIZE_L)
     offs_dm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -220,9 +212,6 @@ def lora_forward_kernel(
     A has shape (M, K), B has shape (K, N), C has shape (N, L), and D has shape (M, L)
     N, the LoRA dimension must be less than or equal to than BLOCK_SIZE_N.
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     pid_m, pid_n = get_pid_coords(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
 
     ab_result = inner_kernel(
@@ -388,9 +377,6 @@ def lora_da_dx_kernel(
     N, the LoRA dimension must be less than or equal to than BLOCK_SIZE_N.
     The result returned by this kernel is reduced in the wrapper.
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     pid_m, pid_n = get_pid_coords(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
     dyb = inner_kernel(
         pid_m,
@@ -553,9 +539,6 @@ def lora_db_kernel(
 
     A has shape (M, K), X has shape (N, K).
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     pid_m, pid_n = get_pid_coords(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
     ab = inner_kernel(
         pid_m,

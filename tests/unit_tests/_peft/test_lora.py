@@ -835,3 +835,19 @@ def test_patched_lora_restores_original_class_when_initialization_fails() -> Non
     with pytest.raises(ZeroDivisionError):
         patch_linear_module(base, dim=0)
     assert type(base) is original_class
+
+
+def test_lora_kernel_launchers_report_missing_triton(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Python launchers must reject unavailable Triton before entering a JIT kernel."""
+    from nemo_automodel.components._peft import lora_kernel
+
+    monkeypatch.setattr(lora_kernel, "HAVE_TRITON", False)
+    value = torch.empty(1, 1)
+    launches = (
+        (lora_kernel.lora_forward_wrapper, (value, value, value, None, 1.0)),
+        (lora_kernel.lora_da_dx_update_wrapper, (value, value, value, value, 1.0)),
+        (lora_kernel.lora_db_update_wrapper, (value, value, value, 1.0)),
+    )
+    for launch, args in launches:
+        with pytest.raises(ImportError, match="triton is not installed"):
+            launch(*args)
