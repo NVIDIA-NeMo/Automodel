@@ -110,6 +110,49 @@ def test_load_pipeline_loads_diffusers_checkpoint_and_lora(monkeypatch):
     assert events == ["/local/org/model", ("checkpoint", pipe, cfg), ("lora", pipe, cfg)]
 
 
+def test_load_lora_weights_filters_hf_metadata_before_constructing_config(tmp_path, monkeypatch):
+    """HF metadata must not become constructor kwargs or hide the recorded LoRA settings."""
+    from safetensors.torch import load_file, save_file
+
+    from nemo_automodel.components._peft.lora import LinearLoRA
+
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "r": 2,
+                "lora_alpha": 4,
+                "lora_dropout": 0.1,
+                "target_modules": ["proj"],
+                "base_model_name_or_path": "test/base",
+            }
+        )
+    )
+    expected_a, expected_b = torch.randn(2, 4), torch.randn(3, 2)
+    save_file(
+        {
+            "base_model.model.proj.lora_A.weight": expected_a,
+            "base_model.model.proj.lora_B.weight": expected_b,
+        },
+        tmp_path / "adapter_model.safetensors",
+    )
+    monkeypatch.setattr("safetensors.torch.load_file", lambda path, device: load_file(path, device="cpu"))
+    transformer = torch.nn.Module()
+    transformer.proj = torch.nn.Linear(4, 3, bias=False)
+    original_weight = transformer.proj.weight
+    pipe = SimpleNamespace(transformer=transformer)
+    cfg = SimpleNamespace(model=SimpleNamespace(lora_weights=str(tmp_path)))
+
+    gen.load_lora_weights_into_pipeline(pipe, cfg)
+
+    assert isinstance(transformer.proj, LinearLoRA)
+    assert transformer.proj.weight is original_weight
+    assert transformer.proj.dim == 2 and transformer.proj.scale == 2
+    assert transformer.proj.dropout_p == 0.1
+    torch.testing.assert_close(transformer.proj.lora_A.weight, expected_a)
+    torch.testing.assert_close(transformer.proj.lora_B.weight, expected_b)
+
+
 class _Transformer:
     config = SimpleNamespace(architectures=["HunyuanImage3ForCausalMM"])
 

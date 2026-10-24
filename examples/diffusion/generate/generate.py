@@ -237,7 +237,7 @@ def _load_custom_model_pipeline(cfg, model_id, mesh_context, torch_dtype):
     checkpoint = getattr(cfg.model, "checkpoint", None)
     lora_weights = getattr(cfg.model, "lora_weights", None)
     # LoRA is injected before sharding, as in training, so the adapter loads into sharded LoRA weights.
-    peft_cfg = PeftConfig.from_dict(load_automodel_peft_config_dict(lora_weights)) if lora_weights else None
+    peft_cfg = PeftConfig(**load_automodel_peft_config_dict(lora_weights)) if lora_weights else None
     pipe = NeMoAutoDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
@@ -424,6 +424,7 @@ def load_lora_weights_into_pipeline(pipe, cfg):
         return
 
     import json
+    from dataclasses import fields
 
     from safetensors.torch import load_file
 
@@ -442,7 +443,8 @@ def load_lora_weights_into_pipeline(pipe, cfg):
     if "dropout" not in peft_config_dict and "lora_dropout" in peft_config_dict:
         peft_config_dict["dropout"] = peft_config_dict["lora_dropout"]
 
-    peft_config = PeftConfig.from_dict(peft_config_dict)
+    config_fields = {field.name for field in fields(PeftConfig)}
+    peft_config = PeftConfig(**{key: value for key, value in peft_config_dict.items() if key in config_fields})
     num_lora_modules = apply_lora_to_linear_modules(pipe.transformer, peft_config, skip_freeze=True)
     if num_lora_modules == 0:
         raise RuntimeError(f"No transformer modules matched LoRA config from {lora_path / 'adapter_config.json'}")

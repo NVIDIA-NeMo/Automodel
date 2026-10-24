@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import math
 from collections.abc import Callable
 
 import torch
-import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed import ProcessGroup, ReduceOp
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.moe.experts import (
@@ -32,18 +34,18 @@ from nemo_automodel.components.moe.experts import (
 from nemo_automodel.shared.utils import dtype_from_str
 
 
-def _to_local(proj):
-    """Convert DTensor to local tensor, or return as-is."""
+def _to_local(proj: torch.Tensor) -> torch.Tensor:
+    """Return the local shard of a projection or bias shaped [experts, ...]."""
     return proj.to_local() if isinstance(proj, DTensor) else proj
 
 
-def _to_grouped_mm_operand(proj, dtype: torch.dtype):
-    """Convert a projection tensor to the dtype/layout expected by grouped MM."""
+def _to_grouped_mm_operand(proj: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Make a projection [local_experts, in_dim, out_dim] contiguous in ``dtype``."""
     return _to_local(proj).to(dtype).contiguous()
 
 
 def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pad LoRA rank tensors so grouped-mm strides are 16-byte aligned."""
+    """Pad A [experts, in_dim, rank] and B [experts, rank, out_dim] for aligned grouped MM."""
     rank = lora_A.size(-1)
     alignment = max(1, 16 // lora_A.element_size())
     padding = (-rank) % alignment
@@ -94,7 +96,21 @@ class GroupedExpertsLoRA(GroupedExperts):
         lora_down_B (nn.Parameter): LoRA B matrix for down projection.
     """
 
-    def __init__(self, orig_module: GroupedExperts, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+    lora_dim: int
+    scale: float
+    lora_gate_and_up_A: nn.Parameter
+    lora_gate_and_up_B: nn.Parameter
+    lora_down_A: nn.Parameter
+    lora_down_B: nn.Parameter
+
+    def __init__(
+        self,
+        orig_module: GroupedExperts,
+        lora_dim: int = 8,
+        alpha: int = 32,
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = None,
+    ) -> None:
         # Build the wrapper without allocating another full set of expert weights.
         with torch.device("meta"):
             super().__init__(orig_module.config)
@@ -118,7 +134,13 @@ class GroupedExpertsLoRA(GroupedExperts):
         )
 
     @staticmethod
-    def _init_adapter(obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+    def _init_adapter(
+        obj: GroupedExpertsLoRA,
+        lora_dim: int = 8,
+        alpha: int = 32,
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = None,
+    ) -> None:
         obj.lora_dim = lora_dim
         obj.scale = alpha / lora_dim
 
@@ -126,6 +148,8 @@ class GroupedExpertsLoRA(GroupedExperts):
         obj.gate_and_up_projs.requires_grad = False
         obj.down_projs.requires_grad = False
         if obj.expert_bias:
+            assert obj.gate_up_proj_bias is not None
+            assert obj.down_proj_bias is not None
             obj.gate_up_proj_bias.requires_grad = False
             obj.down_proj_bias.requires_grad = False
 
@@ -157,7 +181,7 @@ class GroupedExpertsLoRA(GroupedExperts):
         GroupedExpertsLoRA.init_lora_weights(obj, lora_A_init_method)
 
     @torch.no_grad
-    def init_lora_weights(self, init_method):
+    def init_lora_weights(self, init_method: str) -> None:
         """Initialize LoRA weights.
 
         IMPORTANT: This method is called by the PEFT framework's `_init_peft_adapters`
@@ -226,6 +250,9 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         assert self.n_routed_experts % ep_size == 0
 
+        ep_group: ProcessGroup | None = None
+        gathered_lens: list[int] = []
+
         compute_dtype = x.dtype
         gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
         down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
@@ -236,6 +263,7 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         local_num_tokens = x.size(0)
         if ep_size > 1:
+            assert ep_mesh is not None
             ep_group = ep_mesh.get_group()
             x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
                 x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
@@ -250,7 +278,7 @@ class GroupedExpertsLoRA(GroupedExperts):
                 lora_gate_and_up_A, lora_gate_and_up_B
             )
             lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
-            y = self._forward_grouped_mm(
+            y = self._forward_grouped_mm_lora(
                 x,
                 token_mask,
                 weights,
@@ -266,7 +294,7 @@ class GroupedExpertsLoRA(GroupedExperts):
                 post_expert_output,
             )
         else:
-            y = self._forward_loop(
+            y = self._forward_loop_lora(
                 x,
                 weights,
                 indices,
@@ -287,7 +315,8 @@ class GroupedExpertsLoRA(GroupedExperts):
             # Ragged-aware combine, mirroring GroupedExperts.forward:
             # redistribute(Shard(0)) would split the gathered output into equal chunks.
             y.add_(x.sum(dtype=torch.float32) * 0.0)  # keep the differentiable gather attached
-            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
+            assert ep_group is not None
+            y = dist_nn_f.all_reduce(y, op=ReduceOp.SUM, group=ep_group)
             start = sum(gathered_lens[:ep_rank])
             y = y.narrow(0, start, local_num_tokens).contiguous()
 
@@ -295,24 +324,30 @@ class GroupedExpertsLoRA(GroupedExperts):
             y = y.sum(dim=1)
         return y.to(input_dtype)
 
-    def _forward_loop(
+    def _forward_loop_lora(
         self,
-        x,
-        weights,
-        indices,
-        token_mask,
-        gate_and_up_projs,
-        down_projs,
-        lora_gate_and_up_A,
-        lora_gate_and_up_B,
-        lora_down_A,
-        lora_down_B,
-        n_local_experts,
-        experts_start_idx,
-        experts_end_idx,
-        post_expert_output,
-    ):
-        """Per-expert loop forward path with LoRA injection."""
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        token_mask: torch.Tensor,
+        gate_and_up_projs: torch.Tensor,
+        down_projs: torch.Tensor,
+        lora_gate_and_up_A: torch.Tensor,
+        lora_gate_and_up_B: torch.Tensor,
+        lora_down_A: torch.Tensor,
+        lora_down_B: torch.Tensor,
+        n_local_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
+        post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """Apply local expert weights and LoRA to routed tokens.
+
+        ``x`` is [tokens, hidden], ``weights`` and ``indices`` are [tokens, topk],
+        and ``token_mask`` is [tokens]. Base projections are [experts, in_dim,
+        out_dim]; adapter A/B tensors are [experts, in_dim, rank] and
+        [experts, rank, out_dim]. The optional callback preserves [tokens, hidden].
+        """
         output_shape = (
             (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
         )
@@ -338,6 +373,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             )
 
             if self.expert_bias:
+                assert self.gate_up_proj_bias is not None
                 gate_and_up_out = gate_and_up_out + self.gate_up_proj_bias[local_idx]
 
             w = weights[idx, top, None]
@@ -349,6 +385,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             expert_out = expert_out + (activated @ lora_down_A[local_idx] @ lora_down_B[local_idx]) * self.scale
 
             if self.expert_bias:
+                assert self.down_proj_bias is not None
                 expert_out = expert_out + (
                     self.down_proj_bias[local_idx]
                     if self.config.apply_router_weight_after_down
@@ -391,23 +428,29 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         return y
 
-    def _forward_grouped_mm(
+    def _forward_grouped_mm_lora(
         self,
-        x,
-        token_mask,
-        weights,
-        indices,
-        gate_and_up_projs,
-        down_projs,
-        lora_gate_and_up_A,
-        lora_gate_and_up_B,
-        lora_down_A,
-        lora_down_B,
-        n_local_experts,
-        experts_start_idx,
-        post_expert_output,
-    ):
-        """Grouped GEMM forward path with LoRA injection using torch._grouped_mm."""
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        gate_and_up_projs: torch.Tensor,
+        down_projs: torch.Tensor,
+        lora_gate_and_up_A: torch.Tensor,
+        lora_gate_and_up_B: torch.Tensor,
+        lora_down_A: torch.Tensor,
+        lora_down_B: torch.Tensor,
+        n_local_experts: int,
+        experts_start_idx: int,
+        post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """Apply grouped expert weights and LoRA to routed tokens.
+
+        ``x`` is [tokens, hidden], ``weights`` and ``indices`` are [tokens, topk],
+        and ``token_mask`` is [tokens]. Base projections are [experts, in_dim,
+        out_dim]; adapter A/B tensors are [experts, in_dim, rank] and
+        [experts, rank, out_dim]. The optional callback preserves [routed_tokens, hidden].
+        """
         sorted_token_ids, sorted_slot_ids, sorted_weights, tokens_per_expert, offs = _permute_tokens_for_grouped_mm(
             indices,
             weights,
@@ -429,7 +472,11 @@ class GroupedExpertsLoRA(GroupedExperts):
                 torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
             )
 
+            gate_up_proj_bias: torch.Tensor | None = None
+            down_proj_bias: torch.Tensor | None = None
             if self.expert_bias:
+                assert self.gate_up_proj_bias is not None
+                assert self.down_proj_bias is not None
                 gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
                 down_proj_bias = _to_local(self.down_proj_bias)
 
@@ -440,6 +487,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             output1 = output1 + lora_out1 * self.scale
 
             if self.expert_bias:
+                assert gate_up_proj_bias is not None
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
             output1 = self.expert_activation_grouped(output1, activation_probs)
@@ -451,6 +499,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             output2 = output2 + lora_out2 * self.scale
 
             if self.expert_bias:
+                assert down_proj_bias is not None
                 output2 = _apply_bias(
                     output2,
                     down_proj_bias,
@@ -509,9 +558,21 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_B (nn.Parameter): LoRA B matrix for down projection.
     """
 
+    lora_dim: int
+    scale: float
+    lora_gate_and_up_A: nn.Parameter
+    lora_gate_and_up_B: nn.Parameter
+    lora_down_A: nn.Parameter
+    lora_down_B: nn.Parameter
+
     def __init__(
-        self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
-    ):
+        self,
+        orig_module: GroupedExpertsDeepEP,
+        lora_dim: int = 8,
+        alpha: int = 32,
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = None,
+    ) -> None:
         # Preserve the existing base storage, including its dtype and device.
         with torch.device("meta"):
             super().__init__(
@@ -558,13 +619,21 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         )
 
     @staticmethod
-    def _init_adapter(obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+    def _init_adapter(
+        obj: GroupedExpertsDeepEPLoRA,
+        lora_dim: int = 8,
+        alpha: int = 32,
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = None,
+    ) -> None:
         obj.lora_dim = lora_dim
         obj.scale = alpha / lora_dim
 
         obj.gate_and_up_projs.requires_grad = False
         obj.down_projs.requires_grad = False
         if obj.expert_bias:
+            assert obj.gate_up_proj_bias is not None
+            assert obj.down_proj_bias is not None
             obj.gate_up_proj_bias.requires_grad = False
             obj.down_proj_bias.requires_grad = False
 
@@ -594,7 +663,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         GroupedExpertsDeepEPLoRA.init_lora_weights(obj, lora_A_init_method)
 
     @torch.no_grad
-    def init_lora_weights(self, init_method):
+    def init_lora_weights(self, init_method: str) -> None:
         """Initialize LoRA weights.
 
         IMPORTANT: This method is called by the PEFT framework's `_init_peft_adapters`
@@ -668,6 +737,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             output1 = output1 + lora_out1 * self.scale
 
             if self.expert_bias:
+                assert self.gate_up_proj_bias is not None
                 gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
@@ -680,6 +750,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             output2 = output2 + lora_out2 * self.scale
 
             if self.expert_bias:
+                assert self.down_proj_bias is not None
                 down_bias = _to_local(self.down_proj_bias)
                 output2 = _apply_bias(
                     output2,
@@ -702,5 +773,6 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             output2 = post_expert_output(output2)
         if self.config.apply_router_weight_after_down:
             output2 = _apply_router_weight_fp32(output2, permuted_probs, compute_dtype)
+        assert self.token_dispatcher is not None
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
