@@ -39,7 +39,7 @@ import sys
 from typing import Any
 
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -68,6 +68,9 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
     DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V41_MODEL_TYPE as _DEEPSEEK_V41_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
     GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
@@ -87,9 +90,20 @@ logger = logging.getLogger(__name__)
 
 _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES = (
     _DEEPSEEK_V4_MODEL_TYPE,
+    _DEEPSEEK_V41_MODEL_TYPE,
     _GLM_5_2_MODEL_TYPE,
+    "kimi_k3",
     *_MINIMAX_M3_MODEL_TYPES,
 )
+
+
+def _is_kimi_k3_text_export(target_path: str, trust_remote_code: bool) -> bool:
+    """Tell a Kimi K3 text-only export from Kimi-Linear-48B; both write ``model_type: kimi_linear``.
+
+    Only K3 writes ``attn_res_block_size`` to its config, and no published Kimi-Linear-48B config has it.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
+    return "attn_res_block_size" in config_dict
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -145,12 +159,14 @@ def _run(args: argparse.Namespace) -> int:
     compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     model_type = _read_target_model_type(args.target_model, args.trust_remote_code)
-    if model_type in _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES:
+    if model_type in _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES or (
+        model_type == "kimi_linear" and _is_kimi_k3_text_export(args.target_model, args.trust_remote_code)
+    ):
         raise ValueError(
             "precompute_dspark supports HF-loadable single-process targets only. "
-            f"model_type={model_type!r}: DeepSeek V4 / GLM-5.2 targets use the distributed offline precompute "
-            "(python -m nemo_automodel.recipes.llm.precompute_dspark_dist); MiniMax M3 is multimodal and the "
-            "DSpark cache schema is text-only, so it needs the online training path."
+            f"model_type={model_type!r}: DeepSeek V4/V4.1, GLM-5.2, and Kimi K3 targets use the distributed "
+            "offline precompute (python -m nemo_automodel.recipes.llm.precompute_dspark_dist); MiniMax M3 is "
+            "multimodal and the DSpark cache schema is text-only, so it needs the online training path."
         )
 
     target_config = AutoConfig.from_pretrained(args.target_model, trust_remote_code=args.trust_remote_code)
