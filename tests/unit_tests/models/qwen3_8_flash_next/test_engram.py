@@ -29,6 +29,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
+from nemo_automodel.components.distributed.tp_replicas import model_owned_grad_divisor
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
     QWEN3_8_FLASH_NEXT_LAYER_MULTIPLIERS,
@@ -436,11 +437,13 @@ def _engram_meta_dtensor_lifecycle_worker(rank: int, world_size: int, store_path
         assert table.weight.to_local().device.type == "cpu"
         assert tuple(table.weight.shape) == (12, 3)
         assert tuple(table.weight.placements) == (Shard(0),)
-        assert not hasattr(table.weight, "_nemo_model_owned_grad_divisor")
+        # Materialization rebuilds the parameter storage but carries over the
+        # owner-group gradient divisor; a pipeline stage that loads pretrained
+        # weights never re-runs the model initialization that also stamps it.
+        assert model_owned_grad_divisor(table.weight) == float(world_size)
         table.reset_parameters()
-        table.mark_sharding_contract()
         assert torch.isfinite(table.weight.to_local()).all()
-        assert hasattr(table.weight, "_nemo_model_owned_grad_divisor")
+        assert model_owned_grad_divisor(table.weight) == float(world_size)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

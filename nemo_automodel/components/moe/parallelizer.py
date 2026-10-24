@@ -1365,6 +1365,13 @@ def parallelize_model(
     else:
         fsdp_mesh = get_submesh(world_mesh, axis_names) if axis_names else None
     fsdp_enabled = fsdp_mesh is not None and fsdp_mesh.size() > 1
+    if not fsdp_enabled and fsdp_mesh is not None:
+        # A one-rank shard mesh (for example one pipeline stage per rank) wraps
+        # nothing in FSDP, but model-owned sharded parameters still bind their
+        # owner group to this mesh so every stage reaches the same final state.
+        prepare_model_owned_dtensors = getattr(model, "_nemo_prepare_model_owned_dtensors", None)
+        if prepare_model_owned_dtensors is not None:
+            prepare_model_owned_dtensors(fsdp_mesh)
     if fsdp_enabled:
         apply_fsdp(
             model,
