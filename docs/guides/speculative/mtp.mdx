@@ -1,0 +1,71 @@
+---
+title: "Finetune a Model's Native MTP Head for Speculative Decoding"
+description: "Finetune an existing Multi-Token Prediction (MTP) head for self-speculative decoding with NeMo AutoModel, and read its accept-length metric."
+---
+
+This guide shows you how to finetune a model's existing **Multi-Token
+Prediction (MTP)** head to improve its self-speculative accept length on a
+target domain, using [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel).
+
+## What is MTP finetuning?
+
+Several model families ship a native MTP head: extra decoder depths that each
+predict one additional future token beyond the main head, trained jointly with
+the main next-token loss. At inference, an engine can use those depths to
+propose several tokens per verification step, the same way a separate draft
+model does for EAGLE or DFlash.
+
+MTP finetuning is **not** a separate draft model or recipe. It reuses the
+standard `TrainFinetuneRecipeForNextTokenPrediction` recipe, which already
+computes the MTP auxiliary loss whenever the loaded model's MTP head is
+enabled. Finetuning just the MTP head for a new domain is a matter of freezing
+everything else and continuing training.
+
+## Supported Models
+
+Any model whose `NeMoAuto*` class reports `model.supports.mtp_enabled`,
+including the Qwen3.5 (dense and MoE), nemotron_v3, step3p7, minimax_m3_vl,
+deepseek_v4, GLM-5.2, and nemotron_omni families.
+
+## Freeze Everything but MTP
+
+Add a `freeze_config` block that freezes every module, then unfreezes the MTP
+block:
+
+```yaml
+freeze_config:
+  freeze_modules:
+  - glob: "*"
+  unfreeze_modules:
+  - glob: "*mtp*"
+```
+
+`unfreeze_modules` wins over `freeze_modules` on overlap, so only the MTP
+submodule's parameters remain trainable. Combine this with any dataset and
+optimizer configuration you would use for a normal finetune.
+
+## Accept-Length Metric
+
+Validation reports `val_mtp_tau_sim`: the expected self-speculative accept
+length under teacher-forced decoding, computed from the MTP depths' own
+argmax predictions against ground-truth labels. This is the same `tau_sim`
+convention the EAGLE-3 recipe already reports for its draft, adapted here to
+score the MTP head directly, with no extra model forward pass.
+
+- A value near `1.0` means the MTP head contributes little beyond the main
+  head's own next-token prediction.
+- A value approaching `1 + num_mtp_layers` means every MTP depth is being
+  accepted on the validation set.
+
+`val_mtp_tau_sim` only appears once a `validation_dataset`/`validation_dataloader`
+is configured and the model's MTP head is enabled; it is a pure diagnostic and
+does not affect training.
+
+## Example Config
+
+See [`examples/llm_finetune/mtp_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/mtp_finetune)
+for a runnable single-GPU example:
+
+```bash
+automodel examples/llm_finetune/mtp_finetune/nemotron_nano_v3_mtp_finetune.yaml --nproc-per-node 1
+```

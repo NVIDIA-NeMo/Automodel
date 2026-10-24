@@ -94,6 +94,7 @@ from nemo_automodel.components.loss.utils import (
 )
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, simulated_accept_length
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -1438,6 +1439,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )
+                if not is_train and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None):
+                    # Eval-only: reuses the per-depth outputs calculate_mtp_loss just consumed, no extra forward.
+                    self._mtp_accept_metrics.append(
+                        compute_mtp_prefix_hits(
+                            model,
+                            mtp_per_depth_h=mtp_per_depth_h,
+                            mtp_per_depth_logits=mtp_per_depth_logits,
+                            mtp_per_depth_targets=mtp_per_depth_targets,
+                            labels=labels,
+                            ignore_index=ignore_index,
+                            seq_idx=mtp_seq_idx,
+                        )
+                    )
                 # Autograd retains tensors needed by the losses. Release the
                 # output container and auxiliary aliases before backward so
                 # unused full-vocabulary logits do not overlap its allocations.
@@ -1657,6 +1671,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
+            self._mtp_accept_metrics: list = []
 
             for batch in val_dataloader:
                 loss_buffer = []
@@ -1699,6 +1714,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "num_label_tokens": total_num_label_tokens,
             "mem": torch.cuda.max_memory_allocated() / 1024**3,
         }
+
+        # tau_sim: same metric/naming convention as the EAGLE-3 recipe's train/val tau_sim.
+        if self._mtp_accept_metrics:
+            mtp_prefix_hits = torch.stack([m.prefix_hits for m in self._mtp_accept_metrics]).sum(dim=0)
+            mtp_valid = torch.stack([m.valid for m in self._mtp_accept_metrics]).sum(dim=0)
+            mtp_prefix_hits = self._dp_allreduce(mtp_prefix_hits.to(self.dist_env.device), include_cp=True)
+            mtp_valid = self._dp_allreduce(mtp_valid.to(self.dist_env.device), include_cp=True)
+            if mtp_valid.sum().item() > 0:
+                metrics["val_mtp_tau_sim"] = simulated_accept_length(mtp_prefix_hits, mtp_valid).item()
 
         # Tool-call accuracy is the only signal that catches "loss going
         # down because format was learned but the model picks wrong tools".

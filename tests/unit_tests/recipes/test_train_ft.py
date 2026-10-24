@@ -3014,6 +3014,42 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     assert torch.isfinite(model.lin.weight.grad).all()
 
 
+def _run_validation_epoch_cpu(recipe, monkeypatch, val_dataloader):
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: 0)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
+    return recipe._run_validation_epoch(val_dataloader)
+
+
+def test_run_validation_epoch_reports_mtp_tau_sim_when_present(monkeypatch):
+    """``_run_validation_epoch`` reduces accumulated MTP acceptance counts into val_mtp_tau_sim."""
+    from nemo_automodel.components.distributed.config import FSDP2Config
+    from nemo_automodel.components.speculative.mtp import MTPAcceptanceMetrics
+
+    recipe = _make_eval_recipe(FSDP2Config(), evaluator=None)
+
+    def fake_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
+        del idx, batch, num_label_tokens, num_batches, is_train
+        loss_buffer.append(torch.tensor(0.0))
+        recipe._mtp_accept_metrics.append(
+            MTPAcceptanceMetrics(prefix_hits=torch.tensor([4, 3]), valid=torch.tensor([4, 3]))
+        )
+
+    monkeypatch.setattr(recipe, "_forward_backward_step", fake_forward_backward_step)
+    result = _run_validation_epoch_cpu(recipe, monkeypatch, [{"labels": torch.tensor([[1, 2, 3]])}])
+
+    assert result.metrics["val_mtp_tau_sim"] == pytest.approx(3.0)
+
+
+def test_run_validation_epoch_omits_mtp_tau_sim_when_absent(monkeypatch):
+    """No MTP metrics accumulated -> val_mtp_tau_sim is absent, not zero."""
+    from nemo_automodel.components.distributed.config import FSDP2Config
+
+    recipe = _make_eval_recipe(FSDP2Config(), evaluator=None)
+    result = _run_validation_epoch_cpu(recipe, monkeypatch, [])
+
+    assert "val_mtp_tau_sim" not in result.metrics
+
+
 def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch):
     """The recipe consumes raw packed lengths, shifts globally, then reuses the CP layout."""
     from nemo_automodel.components.models.common.mtp import (
