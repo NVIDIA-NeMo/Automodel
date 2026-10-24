@@ -22,7 +22,7 @@ from torch import nn
 from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, PretrainedConfig
 
 from nemo_automodel import export_merged_peft_checkpoint
-from nemo_automodel._transformers.peft_export import _merge_and_get_hf_state_dict
+from nemo_automodel._transformers.peft_export import _merge_and_get_hf_state_dict, _to_host_preserving_sharing
 from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
@@ -37,6 +37,96 @@ _ACTIVATED_EXPERTS = 2
 _EXPERT_RANK = _REQUESTED_RANK // _ACTIVATED_EXPERTS
 _HIDDEN = 8
 _INTERMEDIATE = 6
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"))],
+)
+def test_host_transfer_preserves_shared_views(device):
+    base = torch.arange(24, dtype=torch.float32, device=device).reshape(4, 6)
+    state_dict = {
+        "weight": base,
+        "tied_weight": base,
+        "transpose": base.T,
+        "slice": base[1:, 1::2],
+        "byte_view": base.view(torch.uint8),
+        "empty": torch.empty(0, device=device),
+        "scalar": torch.tensor(3, device=device),
+    }
+
+    host = _to_host_preserving_sharing(state_dict)
+
+    assert host.keys() == state_dict.keys()
+    for key, tensor in state_dict.items():
+        assert host[key].device.type == "cpu"
+        assert host[key].dtype == tensor.dtype
+        assert host[key].stride() == tensor.stride()
+        assert host[key].storage_offset() == tensor.storage_offset()
+        torch.testing.assert_close(host[key], tensor.cpu(), rtol=0, atol=0)
+    for key in ("tied_weight", "transpose", "slice", "byte_view"):
+        assert host[key].untyped_storage().data_ptr() == host["weight"].untyped_storage().data_ptr()
+    if device == "cuda":
+        host["slice"].fill_(-1)
+        torch.testing.assert_close(base, torch.arange(24, dtype=torch.float32, device=device).reshape(4, 6))
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"))],
+)
+def test_export_tied_embeddings_omits_duplicate_lm_head(tmp_path, device):
+    """Export keeps tied embedding storage shared when moving CUDA weights to CPU."""
+    torch.manual_seed(1234)
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        tie_word_embeddings=True,
+    )
+    model = LlamaForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+    projection = LinearLoRA(
+        model.model.layers[0].self_attn.q_proj,
+        dim=2,
+        alpha=4,
+        use_memory_efficient_lora=False,
+    ).to(device=device, dtype=torch.bfloat16)
+    model.model.layers[0].self_attn.q_proj = projection
+    with torch.no_grad():
+        projection.lora_A.weight.normal_()
+        projection.lora_B.weight.normal_()
+    expected_projection = projection.materialize_effective_weight().detach().cpu().clone()
+    expected_embedding = model.model.embed_tokens.weight.detach().cpu().clone()
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    adapter_state = {key: tensor.cpu() for key, tensor in ModelState(model, is_peft=True).state_dict().items()}
+    save_file(adapter_state, adapter_dir / "adapter_model.safetensors")
+    (adapter_dir / "automodel_peft_config.json").write_text("{}", encoding="utf-8")
+    with torch.no_grad():
+        projection.lora_A.weight.zero_()
+        projection.lora_B.weight.zero_()
+
+    output_dir = export_merged_peft_checkpoint(
+        model, adapter_path=adapter_dir, output_dir=tmp_path / "merged", max_shard_size=300
+    )
+
+    exported = _load_sharded_state_dict(output_dir)
+    assert "lm_head.weight" not in exported
+    assert not any("lora_" in key for key in exported)
+    torch.testing.assert_close(exported["model.embed_tokens.weight"], expected_embedding, rtol=0, atol=0)
+    torch.testing.assert_close(exported["model.layers.0.self_attn.q_proj.weight"], expected_projection, rtol=0, atol=0)
+    reloaded, loading_info = AutoModelForCausalLM.from_pretrained(
+        output_dir, dtype=torch.bfloat16, local_files_only=True, output_loading_info=True
+    )
+    assert not loading_info["missing_keys"]
+    assert not loading_info["unexpected_keys"]
+    assert reloaded.lm_head.weight is reloaded.model.embed_tokens.weight
+    torch.testing.assert_close(reloaded.lm_head.weight, expected_embedding, rtol=0, atol=0)
 
 
 def _moe_config() -> MoEConfig:
