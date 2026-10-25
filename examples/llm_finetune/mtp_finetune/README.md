@@ -25,16 +25,24 @@ supports it — the only two pieces this directory adds are:
 2. **`val_mtp_tau_sim`**, a validation-only metric (see
    `nemo_automodel/components/speculative/mtp/core.py`) reporting the expected
    self-speculative accept length under teacher-forced decoding — the same
-   `tau_sim` convention the EAGLE-3 recipe already logs, computed here from the
-   MTP depths' own argmax against ground truth. It appears automatically in
-   `_run_validation_epoch`'s metrics whenever the model's MTP head is enabled;
-   no config is needed to turn it on.
+   `tau_sim` convention the EAGLE-3 recipe already logs. Acceptance is judged
+   against the model's **own main-head greedy prediction** (the actual
+   verifier in self-speculative decoding), not the dataset label, since those
+   two can disagree whenever the main head is imperfect.
 
-`nemotron_nano_v3_mtp_finetune.yaml` runs this on a single GPU against
-`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`:
+Only models that opt back into computing MTP outputs during `model.eval()`
+report this metric — today that's the `nemotron_v3` family, via
+`model.compute_mtp_in_eval` (the recipe toggles it on for validation and
+restores it afterward). Other MTP-capable families currently gate MTP on
+`self.training` unconditionally, so `val_mtp_tau_sim` stays absent for them
+until they add the same hook.
+
+`nemotron_nano_v3_5_lightning_mtp_finetune.yaml` runs this on a single GPU
+against `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`, which ships a
+real pretrained MTP layer (`mtp.*` weights in its safetensors index):
 
 ```bash
-automodel examples/llm_finetune/mtp_finetune/nemotron_nano_v3_mtp_finetune.yaml --nproc-per-node 1
+automodel examples/llm_finetune/mtp_finetune/nemotron_nano_v3_5_lightning_mtp_finetune.yaml --nproc-per-node 1
 ```
 
 Watch `val_mtp_tau_sim` across validation runs: it should trend upward as the

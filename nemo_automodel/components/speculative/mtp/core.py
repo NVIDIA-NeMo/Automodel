@@ -20,11 +20,18 @@ reports scalar per-depth CE -- it says nothing about how many tokens the MTP
 head would actually get accepted under self-speculative decoding. This module
 computes that acceptance-length proxy from the same per-depth outputs the loss
 already consumes, without an extra model forward pass.
+
+Acceptance is checked against the model's own main-head greedy prediction (the
+actual verifier in self-speculative decoding), not against the dataset label:
+a draft is "accepted" when it agrees with what the model itself would have
+produced, which can diverge from the ground-truth label whenever the main head
+is imperfect. The dataset label only decides which positions are supervised
+(masking ignored/padded/cross-document positions), the same role it plays in
+``calculate_mtp_loss``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -52,26 +59,30 @@ class MTPAcceptanceMetrics:
     valid: torch.Tensor
 
 
-def _mtp_depth_targets(
-    labels: torch.Tensor,
+def _roll_per_depth(
+    base: torch.Tensor,
     num_depths: int,
-    ignore_index: int,
+    fill_value: int,
     seq_idx: torch.Tensor | None,
 ) -> list[torch.Tensor]:
-    """Teacher-forced per-depth targets, mirroring ``calculate_mtp_loss``'s label roll."""
-    cur_labels = labels
-    targets = []
+    """Cumulative per-depth left-roll of ``base``, mirroring ``calculate_mtp_loss``'s label roll.
+
+    ``fill_value`` only matters at trailing/cross-sub-sequence positions, which
+    the caller always excludes from both the hit and valid counts.
+    """
+    cur = base
+    rolled = []
     for k in range(num_depths):
-        cur_labels = roll_tensor(cur_labels, shifts=-1, dim=-1)
-        masked = cur_labels.clone()
+        cur = roll_tensor(cur, shifts=-1, dim=-1)
+        masked = cur.clone()
         n_invalid = min(k + 1, masked.shape[-1])
-        masked[..., -n_invalid:] = ignore_index
+        masked[..., -n_invalid:] = fill_value
         if seq_idx is not None:
             rolled_seq_idx = roll_tensor(seq_idx, shifts=-(k + 1), dim=-1)
             cross_seq = rolled_seq_idx != seq_idx
-            masked = torch.where(cross_seq, torch.full_like(masked, ignore_index), masked)
-        targets.append(masked)
-    return targets
+            masked = torch.where(cross_seq, torch.full_like(masked, fill_value), masked)
+        rolled.append(masked)
+    return rolled
 
 
 @torch.no_grad()
@@ -80,17 +91,12 @@ def compute_mtp_prefix_hits(
     *,
     mtp_per_depth_h: list[torch.Tensor] | None = None,
     mtp_per_depth_logits: list[torch.Tensor] | None = None,
-    mtp_per_depth_targets: Sequence[torch.Tensor] | None = None,
+    verifier_logits: torch.Tensor,
     labels: torch.Tensor,
     ignore_index: int,
     seq_idx: torch.Tensor | None = None,
 ) -> MTPAcceptanceMetrics:
-    """Score a model's MTP depths against teacher-forced ground truth.
-
-    Takes the same per-depth outputs already computed for
-    ``calculate_mtp_loss`` (no extra model forward) and argmaxes each depth's
-    logits against the depth's target, under the same label-roll and
-    cross-sub-sequence masking the loss applies.
+    """Score a model's MTP depths against its own main-head greedy prediction.
 
     Args:
         model: The wrapped model; used to fetch the shared LM head when
@@ -99,16 +105,15 @@ def compute_mtp_prefix_hits(
             ``[batch, sequence, hidden]``.
         mtp_per_depth_logits: Per-depth logit tensors of shape
             ``[batch, sequence, vocab]``.
-        mtp_per_depth_targets: Optional precomputed target tensors, one per
-            MTP depth, already shifted and boundary-masked (e.g. the
-            context-parallel path). When omitted, targets are derived from
-            ``labels`` the same way ``calculate_mtp_loss`` derives them.
-        labels: Original unshifted label tensor of shape ``[batch, sequence]``.
-            Ignored when ``mtp_per_depth_targets`` is supplied.
+        verifier_logits: The model's own main-head logits, ``[batch, sequence,
+            vocab]``, from the same forward pass. Its argmax is the acceptance
+            reference -- not ``labels``, which can disagree with what the
+            model itself would produce.
+        labels: Original unshifted label tensor of shape ``[batch, sequence]``,
+            used only to mask ignored/padded positions out of the counts.
         ignore_index: Label value excluded from both the hit and valid counts.
-        seq_idx: Optional per-token sub-sequence index used to mask label
-            rolls whose source position crosses a packed-sequence boundary.
-            Ignored when ``mtp_per_depth_targets`` is supplied.
+        seq_idx: Optional per-token sub-sequence index used to mask rolls
+            whose source position crosses a packed-sequence boundary.
 
     Returns:
         :class:`MTPAcceptanceMetrics` with one raw sum per depth.
@@ -129,25 +134,20 @@ def compute_mtp_prefix_hits(
     num_depths = len(mtp_outputs)
     if labels.dim() == 1:
         mtp_outputs = [h.squeeze(0) if (h.dim() == 3 and h.shape[0] == 1) else h for h in mtp_outputs]
+        if verifier_logits.dim() == 3 and verifier_logits.shape[0] == 1:
+            verifier_logits = verifier_logits.squeeze(0)
 
-    if mtp_per_depth_targets is not None:
-        if len(mtp_per_depth_targets) != num_depths:
-            raise ValueError(
-                f"Expected {num_depths} mtp_per_depth_targets for {num_depths} MTP outputs, "
-                f"got {len(mtp_per_depth_targets)}"
-            )
-        targets = list(mtp_per_depth_targets)
-    else:
-        targets = _mtp_depth_targets(labels, num_depths, ignore_index, seq_idx)
+    label_targets = _roll_per_depth(labels, num_depths, ignore_index, seq_idx)
+    verifier_targets = _roll_per_depth(verifier_logits.argmax(dim=-1), num_depths, ignore_index, seq_idx)
 
     prefix_correct: torch.Tensor | None = None
     prefix_valid: torch.Tensor | None = None
     hits = []
     valids = []
-    for depth_targets, mtp_output in zip(targets, mtp_outputs):
+    for lt, vt, mtp_output in zip(label_targets, verifier_targets, mtp_outputs):
         logits = mtp_output if mtp_per_depth_logits is not None else lm_head(mtp_output)
-        valid_mask = depth_targets != ignore_index
-        correct = (logits.argmax(dim=-1) == depth_targets) & valid_mask
+        valid_mask = lt != ignore_index
+        correct = (logits.argmax(dim=-1) == vt) & valid_mask
 
         prefix_correct = correct if prefix_correct is None else prefix_correct & correct
         prefix_valid = valid_mask if prefix_valid is None else prefix_valid & valid_mask

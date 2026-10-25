@@ -3050,6 +3050,96 @@ def test_run_validation_epoch_omits_mtp_tau_sim_when_absent(monkeypatch):
     assert "val_mtp_tau_sim" not in result.metrics
 
 
+def test_run_validation_epoch_toggles_compute_mtp_in_eval(monkeypatch):
+    """Native MTP forwards gate on self.training; validation must opt back in and restore after."""
+    from nemo_automodel.components.distributed.config import FSDP2Config
+
+    model = nn.Module()
+    model.compute_mtp_in_eval = False
+    recipe = _make_eval_recipe(FSDP2Config(), evaluator=None)
+    recipe.model_parts = [model]
+
+    seen = []
+
+    def fake_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
+        del idx, batch, num_label_tokens, num_batches, is_train
+        seen.append(model.compute_mtp_in_eval)
+        loss_buffer.append(torch.tensor(0.0))
+
+    monkeypatch.setattr(recipe, "_forward_backward_step", fake_forward_backward_step)
+    _run_validation_epoch_cpu(recipe, monkeypatch, [{"labels": torch.tensor([[1, 2, 3]])}])
+
+    assert seen == [True]
+    assert model.compute_mtp_in_eval is False
+
+
+def test_forward_backward_step_eval_scores_mtp_against_verifier_not_label(monkeypatch):
+    """End-to-end (real _forward_backward_step, is_train=False): the native model's MTP
+    outputs, produced because compute_mtp_in_eval is set, get scored against its own
+    verifier logits rather than the dataset label (the bug a fabricated-metrics test would miss)."""
+    vocab = 6
+
+    class _EvalMTPModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.compute_mtp_in_eval = True
+            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+
+        def forward(self, input_ids, **kwargs):
+            del kwargs
+            verifier_logits = torch.zeros(*input_ids.shape, vocab)
+            verifier_logits[..., 2] = 10.0  # verifier's own greedy pick: class 2
+            draft_logits = verifier_logits.clone()  # draft agrees with the verifier
+            return SimpleNamespace(
+                logits=verifier_logits,
+                mtp_per_depth_h=None,
+                mtp_per_depth_logits=[draft_logits] if self.training or self.compute_mtp_in_eval else None,
+                mtp_loss_scaling_factor=1.0,
+            )
+
+    model = _EvalMTPModel()
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    object.__setattr__(recipe, "cfg", SimpleNamespace(mtp=SimpleNamespace(ignore_index=-100, scaling_factor=1.0)))
+    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu")))
+    object.__setattr__(recipe, "device_mesh", object())
+    object.__setattr__(recipe, "pp_enabled", False)
+    object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
+    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "model_parts", [model])
+    object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
+    object.__setattr__(recipe, "loss_fn", object())
+    object.__setattr__(recipe, "_get_cp_group_size", lambda: 1)
+    object.__setattr__(recipe, "_get_dp_group_size", lambda include_cp=False: 1)
+    recipe._mtp_accept_metrics = []
+
+    class _IdentitySharder:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def shard(self, batch):
+            return nullcontext, batch
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ContextParallelSharder", _IdentitySharder)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.calculate_loss", lambda loss_fn, *, logits, **kw: logits.sum() * 0.0
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.calculate_mtp_loss",
+        lambda loss_fn, *, mtp_per_depth_logits, **kw: sum(t.sum() for t in mtp_per_depth_logits) * 0.0,
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)
+
+    # Labels deliberately disagree with the verifier's class-2 pick, to prove the metric
+    # tracks the verifier, not the label.
+    batch = {"input_ids": torch.tensor([[10, 11, 12]]), "labels": torch.tensor([[1, 1, 1]])}
+    recipe._forward_backward_step(idx=0, batch=batch, loss_buffer=[], num_label_tokens=3, num_batches=1, is_train=False)
+
+    assert len(recipe._mtp_accept_metrics) == 1
+    metrics = recipe._mtp_accept_metrics[0]
+    torch.testing.assert_close(metrics.valid, torch.tensor([2]))
+    torch.testing.assert_close(metrics.prefix_hits, torch.tensor([2]))
+
+
 def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch):
     """The recipe consumes raw packed lengths, shifts globally, then reuses the CP layout."""
     from nemo_automodel.components.models.common.mtp import (

@@ -1,11 +1,12 @@
-# Single-GPU MTP-only finetune for NVIDIA-Nemotron-3-Nano-30B-A3B (bf16).
+# Single-GPU MTP-only finetune for NVIDIA Nemotron 3.5 Lightning 30B-A3B.
 #
-# Freezes every parameter except the model's native MTP block, so training
-# only improves the self-speculative accept length (val_mtp_tau_sim, logged
+# This checkpoint ships a real pretrained MTP layer (mtp.* weights in its
+# safetensors index). Freezes every other parameter, so training only
+# improves the self-speculative accept length (val_mtp_tau_sim, logged
 # during validation) without touching the base model's main-head quality.
 #
 # Run (single GPU):
-#   automodel examples/llm_finetune/mtp_finetune/nemotron_nano_v3_mtp_finetune.yaml --nproc-per-node 1
+#   automodel examples/llm_finetune/mtp_finetune/nemotron_nano_v3_5_lightning_mtp_finetune.yaml --nproc-per-node 1
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -27,11 +28,17 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  # Reuse the checkpoint's single physical MTP layer for two prediction steps.
+  num_nextn_predict_layers: 2
+  mtp_use_repeated_layer: true
+  mtp_loss_scaling_factor: 0.1
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    rms_norm: torch_fp32
+    attn: te
     linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
     dispatcher: torch
 
 compile:
@@ -69,7 +76,7 @@ packed_sequence:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: True
+  shuffle: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -82,15 +89,15 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
-  _target_: torch.optim.Adam
-  betas: [0.9, 0.999]
-  eps: 1e-8
-  lr: 1.0e-5
-  weight_decay: 0
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-4
+  weight_decay: 0.1
 
 ci:
-  cluster_tag: h100
-  time: "00:15:00"
+  cluster_tag: gb10
+  time: "00:20:00"
   nproc_per_node: 1
   env_vars:
     OMP_NUM_THREADS: 8

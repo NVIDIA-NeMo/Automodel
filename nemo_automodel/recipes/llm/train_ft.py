@@ -1439,14 +1439,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )
-                if not is_train and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None):
+                verifier_logits = getattr(out, "logits", None)
+                if (
+                    not is_train
+                    and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None)
+                    and mtp_per_depth_targets is None  # CP-sharded verifier targets not supported yet
+                    and isinstance(verifier_logits, torch.Tensor)
+                    and verifier_logits.shape[-1] > 0  # non-empty: not the FusedLinearCrossEntropy placeholder
+                ):
                     # Eval-only: reuses the per-depth outputs calculate_mtp_loss just consumed, no extra forward.
                     self._mtp_accept_metrics.append(
                         compute_mtp_prefix_hits(
                             model,
                             mtp_per_depth_h=mtp_per_depth_h,
                             mtp_per_depth_logits=mtp_per_depth_logits,
-                            mtp_per_depth_targets=mtp_per_depth_targets,
+                            verifier_logits=verifier_logits,
                             labels=labels,
                             ignore_index=ignore_index,
                             seq_idx=mtp_seq_idx,
@@ -1668,6 +1675,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
+            # Native MTP forwards gate on self.training; models that expose compute_mtp_in_eval
+            # (today: nemotron_v3) opt eval back in so mtp_per_depth_h/_logits are actually produced.
+            mtp_eval_flags = [
+                (mp, mp.compute_mtp_in_eval) for mp in self.model_parts if hasattr(mp, "compute_mtp_in_eval")
+            ]
+            for mp, _ in mtp_eval_flags:
+                mp.compute_mtp_in_eval = True
 
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
@@ -1689,6 +1703,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
+
+            for mp, prev in mtp_eval_flags:
+                mp.compute_mtp_in_eval = prev
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
         total_num_label_tokens = self._dp_allreduce(
