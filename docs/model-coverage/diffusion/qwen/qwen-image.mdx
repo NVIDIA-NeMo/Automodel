@@ -4,7 +4,7 @@ description: "Train Qwen-Image text-to-image and image-editing checkpoints with 
 slug: model-coverage/diffusion/qwen/Qwen-Image
 ---
 
-[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's flow-matching image model. NeMo AutoModel supports Qwen-Image text-to-image training and cached, full-parameter training of [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511).
+[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's flow-matching image model. NeMo AutoModel supports Qwen-Image text-to-image training and cached full-parameter and LoRA training of [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511).
 
 ## Model Reference
 
@@ -21,15 +21,18 @@ slug: model-coverage/diffusion/qwen/Qwen-Image
 | Model | HF ID | Training Scope |
 |---|---|---|
 | Qwen-Image | [`Qwen/Qwen-Image`](https://huggingface.co/Qwen/Qwen-Image) | Text-to-image training and fine-tuning |
-| Qwen-Image-Edit-2511 | [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Cached, full-parameter, single-node training |
+| Qwen-Image-Edit-2511 | [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Cached full-parameter training on one node; cached LoRA training on one GPU |
 
-Qwen-Image-Edit-2511 training is intentionally limited to cached target latents, cached context latents, and cached Qwen2.5-VL prompt conditioning. Raw-image online encoding, LoRA, older Qwen image-edit checkpoints, and multi-node tuning are not supported by the training recipe. Image-edit inference is supported by the generic generation script.
+Qwen-Image-Edit-2511 training uses cached target latents, cached context latents, and cached Qwen2.5-VL prompt conditioning. Raw-image online encoding, older Qwen image-edit checkpoints, and multi-node tuning are outside the validated recipe scope. Image-edit inference is supported by the generic generation script.
+
+For the single-GPU LoRA workflow, including its 256p cache, checkpoint restore, and adapter generation commands, see [Qwen-Image-Edit-2511](/model-coverage/diffusion/qwen/Qwen-Image-Edit-2511). The preparation and training commands below describe the full-parameter workflow.
 
 ## Recipes
 
 | Recipe | Description |
 |---|---|
 | [qwen_image_edit_2511_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) | 8-GPU BF16 FSDP2 baseline for full-parameter Qwen-Image-Edit-2511 training |
+| [qwen_image_edit_2511_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow_lora.yaml) | Single-GPU BF16 LoRA starting configuration with a 256p cache and no FSDP |
 | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune Qwen-Image with flow matching |
 | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain Qwen-Image with flow matching |
 
@@ -161,7 +164,7 @@ uv run python examples/diffusion/generate/generate.py \
   --inference.prompts '["Add mountains in the background"]'
 ```
 
-The checkpoint directory must contain the consolidated Diffusers-compatible safetensors written by training with `checkpoint.save_consolidated: final`. Omit `--model.checkpoint` to run with the base `Qwen/Qwen-Image-Edit-2511` weights.
+For this full-parameter workflow, the checkpoint directory must contain the consolidated Diffusers-compatible safetensors written by training with `checkpoint.save_consolidated: final`. Omit `--model.checkpoint` to run with the base `Qwen/Qwen-Image-Edit-2511` weights. For LoRA, use `--model.lora_weights` with the checkpoint's `model/` subdirectory as shown in the [LoRA guide](/model-coverage/diffusion/qwen/Qwen-Image-Edit-2511).
 
 ## Install
 

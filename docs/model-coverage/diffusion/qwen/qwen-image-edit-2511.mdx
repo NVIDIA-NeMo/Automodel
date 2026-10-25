@@ -1,15 +1,154 @@
 ---
 title: "Qwen-Image-Edit-2511"
-description: "Use NeMo AutoModel to fine-tune Qwen-Image-Edit-2511 for Diffusion workflows with checked-in image to image recipes and documented distributed settings."
+description: "Fine-tune Qwen-Image-Edit-2511 with cached image-edit data using full-parameter or single-GPU LoRA recipes."
 slug: model-coverage/diffusion/qwen/Qwen-Image-Edit-2511
 ---
 
-[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) has a checked-in NeMo AutoModel recipe for image to image.
+[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) supports instruction-based image editing. NeMo AutoModel provides full-parameter and LoRA recipes that train from cached target latents, source-image latents, and Qwen2.5-VL prompt conditioning.
 
-## Fine-Tune Qwen-Image-Edit-2511
+## Choose a Workflow
 
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
+| Goal | Start Here |
+| --- | --- |
+| Train all transformer parameters on one node | Use the [8-GPU FSDP2 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) and the [full-parameter guide](/model-coverage/diffusion/qwen/Qwen-Image). |
+| Train LoRA adapters on one GPU | Use the [single-GPU LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow_lora.yaml) and the steps below. |
+| Edit an image with base or trained weights | Use the [generation configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml). |
+
+## Single-GPU LoRA
+
+The LoRA recipe is a low-resolution starting configuration. It uses BF16 parameters and compute, rank 8 and alpha 8, attention projections only, AdamW with a learning rate of `1e-5`, batch size 1, and transformer-block activation checkpointing. The `ddp` configuration runs with one process and does not use FSDP. W&B is disabled by default with `wandb: null`.
+
+Real-model validation used one GPU with 48 GiB of memory. Peak PyTorch allocated memory was approximately 43.5 GiB for this 256p training setup. This is an observed allocation, not a minimum hardware specification; it excludes memory outside the PyTorch allocator. The recipe has not been validated on a standard 24 GiB RTX 4090. Its settings are not tuned for image quality.
+
+### Install and Download the Model
+
+Follow the [installation instructions](/get-started/installation). Run the following commands from a source checkout:
+
+```bash
+uv sync --locked --all-groups --extra all --extra diffusion-media
+
+export MODEL_DIR=/data/model/Qwen-Image-Edit-2511
+export CACHE_DIR=/data/cache/magicbrush-qie2511-256p
+export RUN_DIR=/data/checkpoints/qie2511-lora-run-01
+export OUTPUT_DIR=/data/outputs/qie2511-lora-run-01
+
+uvx --from huggingface_hub hf download Qwen/Qwen-Image-Edit-2511 \
+  --local-dir "${MODEL_DIR}"
+```
+
+The download keeps the complete official repository, including its safetensors shards and index files. File sharding in the downloaded model is independent of FSDP; do not merge or remove the official files. To use the model revision from the real-model validation, add `--revision 6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9` to the download command. Use the same model directory for preprocessing, training, and generation.
+
+### Prepare a Small MagicBrush Cache
+
+This example caches 16 training samples from [MagicBrush](https://huggingface.co/datasets/osunlp/MagicBrush). The `256p` preset resizes and center-crops the source and target images to 256x256 pixels before VAE encoding. The condition image supplies the Qwen2.5-VL prompt conditioning. Preprocessing loads the text encoder and VAE; training then uses the cached tensors.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python \
+  -m tools.diffusion.preprocessing_multiprocess image-edit \
+  --dataset_name osunlp/MagicBrush \
+  --dataset_split train \
+  --dataset_streaming \
+  --dataset_media_mapping target=target_img \
+  --dataset_media_mapping context=source_img \
+  --dataset_media_mapping condition=source_img \
+  --dataset_caption_column instruction \
+  --max_items 16 \
+  --resolution_preset 256p \
+  --max_sequence_length 512 \
+  --processor qwen_image_edit \
+  --model_name "${MODEL_DIR}" \
+  --num_gpus 1 \
+  --verify \
+  --output_dir "${CACHE_DIR}"
+```
+
+Keep the cache resolution and the recipe's `data.dataloader.base_resolution: [256, 256]` aligned. A different cache or resolution needs a separate run and memory check. Raw-image encoding during training is outside this workflow.
+
+### Run 20 Training Steps
+
+Choose a new `RUN_DIR` for each fresh run. The checkpointer can automatically restore a checkpoint from that directory even when `checkpoint.restore_from` is `null`.
+
+```bash
+test ! -e "${RUN_DIR}" || { echo "Choose a new RUN_DIR"; exit 1; }
+
+CUDA_VISIBLE_DEVICES=0 uv run torchrun --standalone --nproc-per-node=1 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/qwen_image_edit_2511_flow_lora.yaml \
+  --model.pretrained_model_name_or_path "${MODEL_DIR}" \
+  --data.dataloader.cache_dir "${CACHE_DIR}" \
+  --checkpoint.checkpoint_dir "${RUN_DIR}" \
+  --step_scheduler.max_steps 20 \
+  --step_scheduler.ckpt_every_steps 10
+```
+
+The checked-in recipe defaults to 1,000 steps and saves every 100 steps. These overrides make a short execution check. They do not establish convergence or image quality. The recipe saves native LoRA safetensors with `checkpoint.save_consolidated: false`; it does not export a merged full model.
+
+### Restore a Training Checkpoint
+
+For a run that stopped after a completed checkpoint and before step 20, repeat the same training settings and add `checkpoint.restore_from: LATEST`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run torchrun --standalone --nproc-per-node=1 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/qwen_image_edit_2511_flow_lora.yaml \
+  --model.pretrained_model_name_or_path "${MODEL_DIR}" \
+  --data.dataloader.cache_dir "${CACHE_DIR}" \
+  --checkpoint.checkpoint_dir "${RUN_DIR}" \
+  --checkpoint.restore_from LATEST \
+  --step_scheduler.max_steps 20 \
+  --step_scheduler.ckpt_every_steps 10
+```
+
+`LATEST` searches `RUN_DIR`; it starts fresh if no checkpoint exists. Check the log for the selected restore path. To choose a specific checkpoint, pass its `epoch_*_step_*` directory to `--checkpoint.restore_from`. This directory contains the adapter and the optimizer, scheduler, dataloader, RNG, and step state required for a training restore. The `model/` subdirectory alone is not a training checkpoint.
+
+Keep the original scheduler horizon, data, and seed when comparing a resumed run with an uninterrupted run. The validation uses a controlled stop after checkpoint saving at an optimizer-step boundary. It does not test a process crash during a checkpoint write. Exact numerical comparisons also require deterministic execution; setting a seed alone does not provide that guarantee.
+
+### Generate with the Adapter
+
+Select a saved step directory from the training log. The example below uses the final directory for the 16-sample, 20-step run; use the actual saved name if the data or step settings differ. Set `SOURCE_IMAGE` to the image to edit.
+
+```bash
+export STEP_DIR="${RUN_DIR}/epoch_1_step_19"
+export SOURCE_IMAGE=/data/source.png
+
+CUDA_VISIBLE_DEVICES=0 uv run python examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_qwen_image_edit.yaml \
+  --model.pretrained_model_name_or_path "${MODEL_DIR}" \
+  --model.lora_weights "${STEP_DIR}/model" \
+  --inference.input_images "[\"${SOURCE_IMAGE}\"]" \
+  --inference.prompts '["Add mountains in the background"]' \
+  --inference.height 512 \
+  --inference.width 512 \
+  --vae.enable_cpu_offload true \
+  --output.output_dir "${OUTPUT_DIR}"
+```
+
+`model.lora_weights` must point to the directory containing `adapter_model.safetensors` and `adapter_config.json`. The generator loads the base model and then the adapter. Leave `model.checkpoint` unset for this workflow; that option is for a full-model checkpoint. To compare with the base model, omit `--model.lora_weights`, keep the source image, prompt, seed, and inference settings unchanged, and use a separate output directory.
+
+The generation configuration enables model CPU offload. These overrides request a 512x512 output. The stock Qwen edit pipeline processes reference-image latents at approximately 1024x1024 pixel area, so its reference-image processing differs from the 256p training cache. A successful PNG confirms that inference ran; it does not establish that the adapter improved the edit.
+
+### Run the CUDA Integration Test
+
+The [functional test](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/diffusion/test_qwen_image_edit_lora.py) uses a small local Qwen transformer and synthetic cached tensors. It requires CUDA and diffusion dependencies but downloads no model weights. It exercises the shipped recipe, native checkpoint saving, fresh-process adapter loading, and deterministic checkpoint restore. It checks that base weights stay fixed, LoRA weights update, values stay finite, reload predictions match, and resumed state matches uninterrupted training.
+
+Use a new artifact directory. Pytest can remove the directory supplied to `--basetemp` when it starts.
+
+```bash
+export TEST_ARTIFACT_DIR=/data/artifacts/qie2511-lora-e2e-01
+test ! -e "${TEST_ARTIFACT_DIR}" || { echo "Choose a new TEST_ARTIFACT_DIR"; exit 1; }
+mkdir -p "${TEST_ARTIFACT_DIR}"
+
+CUDA_VISIBLE_DEVICES=0 uv run pytest -q -s \
+  tests/functional_tests/diffusion/test_qwen_image_edit_lora.py \
+  --basetemp "${TEST_ARTIFACT_DIR}/tmp" \
+  --junitxml "${TEST_ARTIFACT_DIR}/junit.xml"
+```
+
+The test prints `QIE_LORA_REPORT` with the path to `report.json`. Its temporary directory retains per-phase logs, checkpoints, and state snapshots. Check the pytest result as well as the report: a skipped test is not a pass. This small-model test verifies the training and checkpoint path. Full-model memory use and generated-image behavior require the real-model workflow above.
+
+## Full-Parameter Training
+
+The full-parameter recipe uses eight FSDP2 ranks on one node. Prepare its cache and set the data and checkpoint paths as described in the [Qwen-Image guide](/model-coverage/diffusion/qwen/Qwen-Image), then launch:
 
 ```bash
 uv run torchrun --nproc-per-node=8 \
@@ -17,40 +156,15 @@ uv run torchrun --nproc-per-node=8 \
   -c examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml
 ```
 
-## Choose a Workflow
-
-| Goal | Start Here |
-| --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml). |
-| Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml). |
-
-### Configuration
-
-| Setting | Configuration |
-| --- | --- |
-| Hardware | - |
-| Strategy | - |
-| Nodes | 1 |
-| Features | Checkpointing (enabled=true) |
-| Advanced | bfloat16 |
-
-### More Recipes for This Model
-
-- [`generate_qwen_image_edit.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml)
-
 ## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
-| Task | Image to image |
-| Architecture | - |
-
-### Available Models
-
-- [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
+| Task | Instruction-based image editing |
+| Architecture | Diffusion transformer with flow matching |
+| Model | [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) |
 
 ## Related Resources
 
+- [Qwen-Image and full-parameter training](/model-coverage/diffusion/qwen/Qwen-Image)
 - [Diffusion fine-tuning guide](/recipes-e2e-examples/diffusion-fine-tuning)
