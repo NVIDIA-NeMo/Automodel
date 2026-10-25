@@ -23,8 +23,9 @@ from PIL import Image
 from tokenizers import AddedToken
 from transformers import AutoProcessor
 
-from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn
+from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn, pad_collate_fn
 from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
+from nemo_automodel.components.datasets.vlm.fake_image import inject_fake_image_into_conversation
 from nemo_automodel.components.models.kimi_k3.processing import KimiK3ImageProcessor, KimiK3Processor
 from nemo_automodel.components.models.kimi_k3.tokenization import TikTokenTokenizer
 
@@ -127,6 +128,163 @@ def test_standard_images_text_interface_and_image_truncation(processor):
         processor(text=text, images=[])
     with pytest.raises(ValueError, match="video"):
         processor(text=text, videos=[image])
+
+
+def _fake_and_real_batch(processor, path: str, fake_color: str) -> dict[str, torch.Tensor]:
+    """Collate an injected-fake text sample and a real-image sample through a native path.
+
+    Args:
+        processor: Local K3 processor.
+        path: "pretokenized" (wrapper -> pad_collate_fn) or "default_collate".
+        fake_color: Fill color of the injected fake image, to perturb its pixels.
+
+    Returns:
+        Batch with input_ids/attention_mask [2, sequence], pixel_values
+        [patches, 3, 14, 14] and image_grid_thw [2, 3]; row 0 owns the fake image.
+    """
+    from nemo_automodel.components.datasets.vlm import fake_image
+
+    real = _chat(Image.new("RGB", (56, 28), "red"))
+    original = fake_image._FAKE_IMAGE
+    fake_image._FAKE_IMAGE = Image.new("RGB", (56, 56), fake_color)
+    try:
+        if path == "pretokenized":
+            # inject_fake_images keeps its default (True), as in native recipes.
+            wrapper = PreTokenizedDatasetWrapper(
+                [{"conversation": _chat()}, {"conversation": real}], processor, max_retries=1
+            )
+            return pad_collate_fn([wrapper[0], wrapper[1]], processor)
+        examples = [
+            {"conversation": inject_fake_image_into_conversation(_chat()), "_injected_fake": True},
+            {"conversation": real},
+        ]
+        return default_collate_fn(examples, processor)
+    finally:
+        fake_image._FAKE_IMAGE = original
+
+
+@pytest.mark.parametrize("path", ["pretokenized", "default_collate"])
+def test_injected_fake_images_stay_masked_through_model_training(processor, path):
+    """Default fake-image injection must train; the masked fake media must not leak into text."""
+    from tests.unit_tests.models.kimi_k3.test_multimodal import _tiny_vlm
+
+    torch.manual_seed(26)
+    model = _tiny_vlm(
+        vocab_size=272,
+        media_placeholder_token_id=processor.image_token_id,
+        pad_token_id=processor.tokenizer.pad_token_id,
+        patch_size=14,
+    )
+
+    def run(batch):
+        """Return logits [2, sequence, vocab] for a collated fake/real batch."""
+        return model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            pixel_values=batch["pixel_values"],
+            image_grid_thw=batch["image_grid_thw"],
+        ).logits
+
+    batch = _fake_and_real_batch(processor, path, "white")
+    image_tokens = batch["input_ids"] == processor.image_token_id
+    assert batch["image_grid_thw"].tolist() == [[1, 4, 4], [1, 2, 4]]
+    assert image_tokens.sum(-1).tolist() == [4, 2]
+    # The data contract under test: fake image tokens are masked, real ones are not.
+    assert bool((batch["attention_mask"][0][image_tokens[0]] == 0).all())
+    assert bool((batch["attention_mask"][1][image_tokens[1]] == 1).all())
+
+    logits = run(batch)
+    valid = batch["labels"] != -100
+    assert valid[0].any() and valid[1].any()
+    loss = torch.nn.functional.cross_entropy(logits[valid], batch["labels"][valid])
+    loss.backward()
+    assert torch.isfinite(loss)
+    vision_grads = [p.grad for name, p in model.named_parameters() if name.startswith("vision_tower.")]
+    assert all(grad is not None and torch.isfinite(grad).all() for grad in vision_grads)
+    assert any(grad.abs().sum() > 0 for grad in vision_grads)
+
+    with torch.no_grad():
+        other_fake = _fake_and_real_batch(processor, path, "black")
+        torch.testing.assert_close(other_fake["input_ids"], batch["input_ids"], rtol=0, atol=0)
+        assert not torch.equal(other_fake["pixel_values"], batch["pixel_values"])
+        perturbed = run(other_fake)
+        text = batch["attention_mask"][0] > 0
+        # Masked fake media cannot influence any unmasked token of its sample.
+        torch.testing.assert_close(perturbed[0][text], logits[0][text].detach(), rtol=0, atol=0)
+        torch.testing.assert_close(perturbed[1], logits[1].detach(), rtol=0, atol=0)
+        # Control: the same comparison detects a change to the real image.
+        real_changed = dict(batch)
+        fake_patches = int(batch["image_grid_thw"][0].prod())
+        real_changed["pixel_values"] = batch["pixel_values"].clone()
+        real_changed["pixel_values"][fake_patches:] = -batch["pixel_values"][fake_patches:]
+        assert not torch.allclose(run(real_changed)[1], logits[1].detach())
+
+
+def test_tool_call_only_assistant_message_matches_native_tokenizer(processor):
+    chat = [
+        {"role": "user", "content": "Inspect."},
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "1", "type": "function", "function": {"name": "inspect", "arguments": {}}}],
+        },
+        {"role": "tool", "tool_call_id": "1", "content": "ok"},
+        {"role": "assistant", "content": "Done."},
+    ]
+    expected = processor.tokenizer.apply_chat_template(chat, tokenize=True)
+    output = processor.apply_chat_template(chat, tokenize=True, return_dict=True, return_tensors="pt")
+    assert output["input_ids"][0].tolist() == expected
+    assert "pixel_values" not in output or output["pixel_values"].numel() == 0
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_chat_truncation_honors_truncation_side(processor, side):
+    chat = _chat()
+    full = processor.tokenizer.apply_chat_template(
+        chat, tokenize=True, return_dict=True, return_assistant_tokens_mask=True
+    )
+    ids, mask = list(full["input_ids"]), list(full["assistant_masks"])
+    processor.tokenizer.truncation_side = side
+    try:
+        for limit in (0, 10, len(ids), len(ids) + 3):
+            cut = processor.tokenizer.apply_chat_template(
+                chat,
+                tokenize=True,
+                return_dict=True,
+                return_assistant_tokens_mask=True,
+                truncation=True,
+                max_length=limit,
+            )
+            kept = slice(max(0, len(ids) - limit), None) if side == "left" else slice(0, limit)
+            assert list(cut["input_ids"]) == ids[kept]
+            assert list(cut["assistant_masks"]) == mask[kept]
+        untruncated = processor.tokenizer.apply_chat_template(chat, tokenize=True, truncation=False, max_length=10)
+        assert untruncated == ids
+        processed = processor.apply_chat_template(chat, tokenize=True, truncation=True, max_length=10)
+        assert processed == (ids[-10:] if side == "left" else ids[:10])
+    finally:
+        processor.tokenizer.truncation_side = "right"
+
+
+def test_left_chat_truncation_keeps_or_rejects_whole_image_spans(processor):
+    image = Image.new("RGB", (56, 28), "red")
+    chat = _chat(image)
+    full = processor.apply_chat_template(chat, tokenize=True, return_dict=True, return_tensors="pt")
+    ids = full["input_ids"][0].tolist()
+    begin = ids.index(processor.tokenizer.convert_tokens_to_ids("<|media_begin|>"))
+    processor.tokenizer.truncation_side = "left"
+    try:
+        # Cutting through <|media_begin|> drops part of the image span.
+        with pytest.raises(ValueError, match="image token count"):
+            processor.apply_chat_template(chat, tokenize=True, truncation=True, max_length=len(ids) - begin - 1)
+        # A cut confined to the text before the span keeps the whole image.
+        kept = processor.apply_chat_template(
+            chat, tokenize=True, return_dict=True, return_tensors="pt", truncation=True, max_length=len(ids) - begin
+        )
+        assert kept["input_ids"][0].tolist() == ids[begin:]
+        torch.testing.assert_close(kept["pixel_values"], full["pixel_values"], rtol=0, atol=0)
+        assert kept["image_grid_thw"].tolist() == full["image_grid_thw"].tolist()
+    finally:
+        processor.tokenizer.truncation_side = "right"
 
 
 @pytest.mark.parametrize("stage", ["before_resize", "after_resize"])

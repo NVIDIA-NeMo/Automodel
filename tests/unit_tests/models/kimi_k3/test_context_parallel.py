@@ -161,6 +161,15 @@ def test_interleaved_mla_masks_preserve_selective_checkpoint_operations():
     zero = torch.tensor(0)
 
     def build(documents):
+        """Build this test's trailing-shard attention mask.
+
+        Args:
+            documents: Tensor of shape [batch, global_sequence], with global_sequence=8.
+
+        Returns:
+            BlockMask for [batch, local_sequence=4] queries against
+            [batch, global_sequence=8] keys.
+        """
         return _document_causal_block_mask(documents[:, 4:], documents, q_global_start=4)
 
     def policy(context, operation, *args, **kwargs):
@@ -169,6 +178,14 @@ def test_interleaved_mla_masks_preserve_selective_checkpoint_operations():
         return CheckpointPolicy.PREFER_RECOMPUTE
 
     def region(value):
+        """Reduce the checkpointed query values.
+
+        Args:
+            value: Tensor of shape [local_sequence], with local_sequence=4.
+
+        Returns:
+            Scalar tensor of shape [] containing the weighted sine reduction.
+        """
         mask = build(first)
         weights = mask.mask_mod(zero, zero, q, k).float().sum(-1)
         return (value.sin() * weights).sum()

@@ -17,14 +17,10 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
-    ContextParallelSharder,
-    contiguous_local_indices,
-)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.kimi_k3.config import KimiK3Config
-from nemo_automodel.components.models.kimi_k3.cp import KimiVlmBatch, shard_batch_for_kimi_vlm_cp
+from nemo_automodel.components.models.kimi_k3.cp import shard_batch_for_kimi_vlm_cp
 from nemo_automodel.components.models.kimi_k3.model import KimiK3ForCausalLM
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from nemo_automodel.components.models.kimi_k3.vision import (
@@ -63,21 +59,27 @@ def _projector_config(config: KimiK3Config) -> SimpleNamespace:
 
 
 def _positions_within_documents(attention_mask: torch.Tensor) -> torch.Tensor:
-    """Return zero-based positions within each non-padding document run.
+    """Return zero-based positions within each document, skipping masked tokens.
+
+    Masked tokens inside a document, such as deliberately masked fake-image
+    spans, do not advance positions or start a new document.
 
     Args:
         attention_mask: Binary or indexed document mask [batch, sequence].
 
     Returns:
-        Positions [batch, sequence], with padding positions set to one.
+        Positions [batch, sequence], with masked positions set to one.
     """
+    valid = attention_mask > 0
     indices = torch.arange(attention_mask.shape[1], device=attention_mask.device).expand_as(attention_mask)
-    starts = torch.cat(
-        (torch.ones_like(attention_mask[:, :1], dtype=torch.bool), attention_mask[:, 1:] != attention_mask[:, :-1]),
-        dim=-1,
-    )
-    offsets = indices.masked_fill(~starts, 0).cummax(dim=-1).values
-    return (indices - offsets).masked_fill(attention_mask == 0, 1)
+    # Index of the closest valid token strictly before each position, or -1.
+    last_valid = indices.masked_fill(~valid, -1).cummax(dim=-1).values
+    previous_valid = F.pad(last_valid[:, :-1], (1, 0), value=-1)
+    previous_document = attention_mask.gather(1, previous_valid.clamp(min=0)).masked_fill(previous_valid < 0, 0)
+    starts = valid & (attention_mask != previous_document)
+    counts = valid.long().cumsum(dim=-1)
+    offsets = ((counts - 1) * starts).cummax(dim=-1).values
+    return (counts - 1 - offsets).masked_fill(~valid, 1)
 
 
 class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
@@ -86,6 +88,8 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
     # The multimodal wrapper uses the same Kimi Linear execution path as its
     # language backbone, including its model-owned CP and pipeline staging.
     ModelCapabilities = KimiK3ForCausalLM.ModelCapabilities
+    # Keep complete media token streams until image embedding inside forward.
+    _cp_batch_sharder = staticmethod(shard_batch_for_kimi_vlm_cp)
 
     @classmethod
     def from_config(
@@ -177,28 +181,6 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
             inputs = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         return inputs, outputs
 
-    def prepare_model_inputs_for_cp(
-        self, batch: KimiVlmBatch, *, num_chunks: int = 1
-    ) -> dict[str, ContextParallelSharder]:
-        """Configure native KDA/MLA CP and defer token sharding until after vision.
-
-        Args:
-            batch: Global VLM batch with token tensors [batch, sequence], image
-                patches [patches, channels, patch_height, patch_width], and grids
-                [images, 3], following shard_batch_for_kimi_vlm_cp.
-            num_chunks: Number of pipeline microbatches.
-
-        Returns:
-            Native CP sharder preserving global image ownership until embedding.
-        """
-        super().prepare_model_inputs_for_cp(batch, num_chunks=num_chunks)
-        return {
-            "cp_sharder": ContextParallelSharder(
-                shard_batch=shard_batch_for_kimi_vlm_cp,
-                local_token_global_indices=contiguous_local_indices,
-            )
-        }
-
     def _merge_input_ids_with_image_features(
         self,
         image_features: list[torch.Tensor],
@@ -234,11 +216,11 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         pad_token_id = self.config.pad_token_id
 
         placeholder_mask = input_ids == image_token_id
-        if bool((placeholder_mask & (attention_mask <= 0)).any()):
-            raise ValueError("A K3 image token span crosses padding.")
         if int(placeholder_mask.sum()) == image_features_tensor.shape[0]:
             # A matching total count alone does not prove image ownership: one
             # image must never straddle rows, documents, padding, or text gaps.
+            # A wholly masked span is valid: fake-image injection embeds the
+            # image for FSDP but masks its tokens from attention and positions.
             locations = placeholder_mask.nonzero()
             offset = 0
             for features in image_features:
@@ -247,7 +229,6 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                 if (
                     not bool((span[:, 0] == span[0, 0]).all())
                     or not bool((owner == owner[0]).all())
-                    or not bool((owner > 0).all())
                     or not bool((span[1:, 1] - span[:-1, 1] == 1).all())
                 ):
                     raise ValueError("A K3 image token span crosses a document, row, padding, or text boundary.")

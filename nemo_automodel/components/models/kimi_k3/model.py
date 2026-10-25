@@ -1933,6 +1933,9 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # (contiguous slices, as FLA's CP kernels require) and each layer type carries
     # its own transport, so CP does not depend on the attention backend.
     requires_packed_sequence_metadata = True
+    # Batch callback of the CP sharder built by prepare_model_inputs_for_cp; the
+    # VLM overrides it to keep media token streams whole until embedding.
+    _cp_batch_sharder = staticmethod(shard_batch_for_kimi_cp)
     packed_mask_type = "document_ids"
     _owns_cp_attention = True
     # Packed documents are masked by the model itself: MLA gets a document-blocked
@@ -2257,7 +2260,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         del batch, num_chunks
         return {
             "cp_sharder": ContextParallelSharder(
-                shard_batch=shard_batch_for_kimi_cp,
+                shard_batch=self._cp_batch_sharder,
                 local_token_global_indices=contiguous_local_indices,
             )
         }

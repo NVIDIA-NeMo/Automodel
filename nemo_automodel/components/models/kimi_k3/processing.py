@@ -417,7 +417,9 @@ class KimiK3Processor(ProcessorMixin):
         for messages in conversations:
             sources = []
             for message in messages:
-                content = message["content"]
+                # Tool-call-only assistant turns carry no content; the native
+                # encoder renders their tool calls separately.
+                content = message.get("content")
                 if isinstance(content, list):
                     for item in content:
                         if item["type"] == "image":

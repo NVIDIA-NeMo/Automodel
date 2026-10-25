@@ -235,11 +235,15 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Restore learned positions and the configuration-derived temporal buffer."""
+        """Restore learned positions and the configuration-derived temporal buffer.
+
+        The temporal buffer follows the learned positions' device and dtype, so a
+        BF16 tower keeps BF16 patch states after re-initialization.
+        """
         nn.init.normal_(self.weight)
         self.time_weight = (
             torch.from_numpy(get_1d_sincos_pos_embed(self.dim, self.num_frames))
-            .to(device=self.weight.device, dtype=torch.float32)
+            .to(device=self.weight.device, dtype=self.weight.dtype)
             .unsqueeze(1)
         )
 

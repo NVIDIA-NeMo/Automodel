@@ -17,12 +17,27 @@ import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig, KimiK3VisionConfig
-from nemo_automodel.components.models.kimi_k3.multimodal import KimiK3ForConditionalGeneration
+from nemo_automodel.components.models.kimi_k3.cp import shard_batch_for_kimi_vlm_cp
+from nemo_automodel.components.models.kimi_k3.multimodal import (
+    KimiK3ForConditionalGeneration,
+    _positions_within_documents,
+)
+from nemo_automodel.components.models.kimi_k3.vision import (
+    Learnable2DInterpPosEmbDivided_fixed,
+    get_1d_sincos_pos_embed,
+)
 
 
-def _tiny_vlm() -> KimiK3ForConditionalGeneration:
+def _tiny_vlm(
+    *,
+    vocab_size: int = 64,
+    media_placeholder_token_id: int = 63,
+    pad_token_id: int = 0,
+    patch_size: int = 2,
+    init_pos_emb_time: int = 1,
+) -> KimiK3ForConditionalGeneration:
     text_config = KimiK3TextConfig(
-        vocab_size=64,
+        vocab_size=vocab_size,
         hidden_size=32,
         head_dim=8,
         intermediate_size=64,
@@ -53,10 +68,10 @@ def _tiny_vlm() -> KimiK3ForConditionalGeneration:
         attn_res_block_size=None,
     )
     vision_config = KimiK3VisionConfig(
-        patch_size=2,
+        patch_size=patch_size,
         init_pos_emb_height=4,
         init_pos_emb_width=2,
-        init_pos_emb_time=1,
+        init_pos_emb_time=init_pos_emb_time,
         vt_num_attention_heads=2,
         vt_num_hidden_layers=1,
         vt_hidden_size=16,
@@ -72,8 +87,8 @@ def _tiny_vlm() -> KimiK3ForConditionalGeneration:
     config = KimiK3Config(
         text_config=text_config,
         vision_config=vision_config,
-        media_placeholder_token_id=63,
-        pad_token_id=0,
+        media_placeholder_token_id=media_placeholder_token_id,
+        pad_token_id=pad_token_id,
     )
     backend = BackendConfig(
         attn="eager",
@@ -196,6 +211,43 @@ def test_vision_initialization_after_meta_materialization():
     assert torch.isfinite(output).all()
 
 
+def _independent_sincos(dim: int, frames: int) -> torch.Tensor:
+    """Return the configuration-derived temporal table [frames, 1, dim] in FP64."""
+    omega = 1.0 / 10000 ** (torch.arange(dim // 2, dtype=torch.float64) / (dim / 2))
+    angles = torch.arange(frames, dtype=torch.float64)[:, None] * omega[None, :]
+    return torch.cat((angles.sin(), angles.cos()), dim=-1).unsqueeze(1)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_two_frame_temporal_positions_follow_tower_dtype_after_initialization(dtype: torch.dtype) -> None:
+    torch.manual_seed(25)
+    model = _tiny_vlm(init_pos_emb_time=2)
+    model.to_empty(device="cpu")
+    model.initialize_weights(torch.device("cpu"), dtype=dtype)
+    (pos_emb,) = [module for module in model.modules() if isinstance(module, Learnable2DInterpPosEmbDivided_fixed)]
+    assert pos_emb.time_weight.dtype == pos_emb.weight.dtype == dtype
+    assert pos_emb.time_weight.device == pos_emb.weight.device
+    expected = _independent_sincos(pos_emb.dim, 2)
+    if dtype == torch.float32:
+        torch.testing.assert_close(pos_emb.time_weight.double(), expected, atol=1e-7, rtol=0)
+    else:
+        torch.testing.assert_close(pos_emb.time_weight, expected.to(dtype), atol=0, rtol=0)
+    # The production table also matches the independently derived one.
+    torch.testing.assert_close(
+        torch.from_numpy(get_1d_sincos_pos_embed(pos_emb.dim, 2)).double().unsqueeze(1), expected, atol=1e-7, rtol=0
+    )
+    pixels = torch.randn(16, 3, 2, 2, dtype=dtype, requires_grad=True)
+    output = model(
+        input_ids=torch.tensor([[1, 63, 2]]),
+        pixel_values=pixels,
+        grid_thws=torch.tensor([[2, 4, 2]]),
+    ).logits
+    assert output.dtype == dtype
+    output.float().square().mean().backward()
+    assert torch.isfinite(output).all()
+    assert pixels.grad is not None and torch.isfinite(pixels.grad).all() and pixels.grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize("left_padding", [False, True])
 def test_compact_ragged_images_keep_text_and_padding_order(left_padding):
     model = _tiny_vlm()
@@ -275,6 +327,7 @@ def test_vlm_cp_keeps_full_image_stream_and_shards_auxiliary_tokens():
     batch["labels"] = batch["input_ids"].clone()
     original_ids = batch["input_ids"].clone()
     sharder = model.prepare_model_inputs_for_cp(batch)["cp_sharder"]
+    assert sharder.shard_batch is shard_batch_for_kimi_vlm_cp
     _, local, layout = sharder.shard_batch(model.cp_mesh, None, batch)
     assert local["input_ids"].shape == (1, 16)
     torch.testing.assert_close(local["input_ids"], original_ids)
@@ -348,13 +401,33 @@ def test_vlm_pipeline_metadata_retains_full_input_and_shards_outputs(is_first: b
     assert outputs[0].shape == (1, 144, 64)
 
 
-def test_compact_image_placeholder_in_padding_is_rejected() -> None:
+@pytest.mark.parametrize("expanded", [False, True])
+def test_masked_fake_image_span_stays_masked_and_skips_positions(expanded: bool) -> None:
+    """Fake-image injection masks whole image spans; they must stay masked holes."""
     model = _tiny_vlm()
-    ids = torch.tensor([[5, model.config.media_placeholder_token_id, 7]])
-    embeddings = model.get_input_embeddings()(ids)
-    features = [torch.randn(2, embeddings.shape[-1])]
-    with pytest.raises(ValueError, match="padding"):
-        model._merge_input_ids_with_image_features(features, embeddings, ids, torch.tensor([[1, 0, 0]]))
+    image_tokens = [63, 63] if expanded else [63]
+    ids = torch.tensor([[5, *image_tokens, 7, 8, 0]])
+    mask = torch.tensor([[1, *[0] * len(image_tokens), 1, 1, 0]])
+    labels = torch.tensor([[-100, *[-100] * len(image_tokens), 7, 8, -100]])
+    features = [torch.randn(2, 32)]
+    embeddings, merged_mask, merged_labels, positions = model._merge_input_ids_with_image_features(
+        features, model.get_input_embeddings()(ids), ids, mask, labels
+    )
+    assert merged_mask.tolist() == [[1, 0, 0, 1, 1, 0]]
+    assert merged_labels is not None
+    assert merged_labels.tolist() == [[-100, -100, -100, 7, 8, -100]]
+    # Masked image tokens neither advance positions nor start a new document.
+    assert positions.tolist() == [[0, 1, 1, 1, 2, 1]]
+    torch.testing.assert_close(embeddings[0, 1:3], features[0])
+
+
+def test_positions_skip_masked_holes_within_documents() -> None:
+    mask = torch.tensor([[1, 1, 0, 0, 1, 1, 0], [0, 0, 1, 2, 0, 2, 2], [1, 2, 2, 0, 3, 3, 0]])
+    assert _positions_within_documents(mask).tolist() == [
+        [0, 1, 1, 1, 2, 3, 1],
+        [1, 1, 0, 0, 1, 1, 2],
+        [0, 0, 1, 1, 0, 1, 1],
+    ]
 
 
 def test_packed_document_ids_cannot_reappear_after_another_document() -> None:
