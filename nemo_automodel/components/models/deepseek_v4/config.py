@@ -81,6 +81,10 @@ class DeepseekV4Config(PretrainedConfig):
         index_head_dim: int = 128,
         index_n_heads: int = 64,
         index_topk: int = 512,
+        reuse_sparse_selection_on_recompute: bool = False,
+        group_fp32_fsdp_units: bool = False,
+        group_compressor_fsdp_units: bool = False,
+        fuse_qnorm_rope: bool = False,
         # Optional DeepSeek-V4-Flash-Vision-Exp tower and image-token bridge.
         vision_n_layers: int = 0,
         vision_dim: int = 1024,
@@ -146,6 +150,10 @@ class DeepseekV4Config(PretrainedConfig):
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
         self.index_topk = index_topk
+        self.reuse_sparse_selection_on_recompute = reuse_sparse_selection_on_recompute
+        self.group_fp32_fsdp_units = group_fp32_fsdp_units
+        self.group_compressor_fsdp_units = group_compressor_fsdp_units
+        self.fuse_qnorm_rope = fuse_qnorm_rope
         self.vision_n_layers = vision_n_layers
         self.vision_dim = vision_dim
         self.vision_n_heads = vision_n_heads

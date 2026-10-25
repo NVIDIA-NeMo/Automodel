@@ -232,7 +232,7 @@ def _attach_hca_param_sync_group(module: nn.Module, mesh) -> None:
             setter(process_group)
 
 
-def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=None, **fsdp_kwargs):
+def fully_shard_deepseek_v4(module: nn.Module | list[nn.Module], mesh, mp_policy, offload_policy=None, **fsdp_kwargs):
     """Apply FSDP2 to DeepSeek-V4 without mixing fp32 and bf16 params in one unit.
 
     This is intentionally model-specific.  DeepSeek-V4 keeps a small set of
@@ -245,6 +245,18 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
     the explicitly listed reference-sensitive islands and let the parent block
     use the caller's bf16 policy.
     """
+    if isinstance(module, list):
+        # Cross-block groups arrive with the helper's explicit FP32 policy.
+        # All members must preserve their natural output dtype, including the
+        # raw sink parameters that are consumed after their holder returns.
+        return fully_shard(
+            module,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            **fsdp_kwargs,
+        )
+
     is_dsv4 = _is_deepseek_v4_module(module)
     if is_dsv4:
         _attach_hca_param_sync_group(module, mesh)
