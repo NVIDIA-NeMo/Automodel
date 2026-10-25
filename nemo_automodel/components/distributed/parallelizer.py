@@ -759,7 +759,9 @@ def apply_fsdp2_sharding_recursively(
         if should_prefetch:
             fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
             parallelizer_utils.configure_fsdp_prefetch(
-                fsdp_units, fsdp2_forward_prefetch_depth, fsdp2_backward_prefetch_depth
+                fsdp_units,
+                forward_depth=fsdp2_forward_prefetch_depth,
+                backward_depth=fsdp2_backward_prefetch_depth,
             )
     else:
         for name, sub_module in module.named_children():

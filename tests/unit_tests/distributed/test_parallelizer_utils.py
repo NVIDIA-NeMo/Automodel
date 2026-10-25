@@ -14,7 +14,7 @@
 
 from types import SimpleNamespace
 from typing import List, Tuple
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -22,6 +22,7 @@ import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
+from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_uniform_reduce_dtype,
     patch_fsdp_unused_param_reduction,
@@ -32,6 +33,7 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _group_params_by_dtype,
     _make_compute_dtype_fn,
     _mp_policy_with_param_dtype,
+    configure_fsdp_prefetch,
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     get_internal_fsdp_mp_policy,
@@ -1170,3 +1172,112 @@ def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
     assert compute_dtype_of(attention.sinks_param.weight) == torch.float32
     assert compute_dtype_of(attention.sinks_param.scale) == torch.float32
     assert compute_dtype_of(attention.proj.weight) == torch.bfloat16
+
+
+class _RecordingFSDPUnit(nn.Module):
+    """FSDP-unit double that records the prefetch setters."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.set_modules_to_forward_prefetch = MagicMock()
+        self.set_modules_to_backward_prefetch = MagicMock()
+
+
+def _prefetch_units(monkeypatch: pytest.MonkeyPatch, count: int) -> list[_RecordingFSDPUnit]:
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", _RecordingFSDPUnit)
+    return [_RecordingFSDPUnit() for _ in range(count)]
+
+
+def test_configure_fsdp_prefetch_installs_ordered_targets(monkeypatch):
+    a, b, c, d = _prefetch_units(monkeypatch, 4)
+
+    configure_fsdp_prefetch([a, b, c, d], forward_depth=2, backward_depth=2)
+
+    a.set_modules_to_forward_prefetch.assert_called_once_with([b, c])
+    b.set_modules_to_forward_prefetch.assert_called_once_with([c, d])
+    c.set_modules_to_forward_prefetch.assert_called_once_with([d])
+    d.set_modules_to_forward_prefetch.assert_not_called()
+    a.set_modules_to_backward_prefetch.assert_not_called()
+    b.set_modules_to_backward_prefetch.assert_called_once_with([a])
+    c.set_modules_to_backward_prefetch.assert_called_once_with([b, a])
+    d.set_modules_to_backward_prefetch.assert_called_once_with([c, b])
+
+
+def test_configure_fsdp_prefetch_forward_only(monkeypatch):
+    a, b, c = _prefetch_units(monkeypatch, 3)
+
+    configure_fsdp_prefetch([a, b, c], forward_depth=2, backward_depth=0)
+
+    a.set_modules_to_forward_prefetch.assert_called_once_with([b, c])
+    b.set_modules_to_forward_prefetch.assert_called_once_with([c])
+    c.set_modules_to_forward_prefetch.assert_not_called()
+    for unit in (a, b, c):
+        unit.set_modules_to_backward_prefetch.assert_not_called()
+
+
+def test_configure_fsdp_prefetch_backward_only_with_depth_beyond_count(monkeypatch):
+    a, b, c = _prefetch_units(monkeypatch, 3)
+
+    configure_fsdp_prefetch([a, b, c], forward_depth=0, backward_depth=3)
+
+    a.set_modules_to_backward_prefetch.assert_not_called()
+    b.set_modules_to_backward_prefetch.assert_called_once_with([a])
+    c.set_modules_to_backward_prefetch.assert_called_once_with([b, a])
+    for unit in (a, b, c):
+        unit.set_modules_to_forward_prefetch.assert_not_called()
+
+
+def test_configure_fsdp_prefetch_forward_depth_beyond_count(monkeypatch):
+    a, b = _prefetch_units(monkeypatch, 2)
+
+    configure_fsdp_prefetch([a, b], forward_depth=5, backward_depth=0)
+
+    a.set_modules_to_forward_prefetch.assert_called_once_with([b])
+    b.set_modules_to_forward_prefetch.assert_not_called()
+
+
+def test_configure_fsdp_prefetch_zero_depths_keep_native_scheduling(monkeypatch):
+    units = _prefetch_units(monkeypatch, 3)
+
+    configure_fsdp_prefetch(units, forward_depth=0, backward_depth=0)
+
+    for unit in units:
+        unit.set_modules_to_forward_prefetch.assert_not_called()
+        unit.set_modules_to_backward_prefetch.assert_not_called()
+
+
+@pytest.mark.parametrize("count", [0, 1])
+def test_configure_fsdp_prefetch_empty_or_single_unit_sets_nothing(monkeypatch, count):
+    units = _prefetch_units(monkeypatch, count)
+
+    configure_fsdp_prefetch(units, forward_depth=2, backward_depth=2)
+
+    for unit in units:
+        unit.set_modules_to_forward_prefetch.assert_not_called()
+        unit.set_modules_to_backward_prefetch.assert_not_called()
+
+
+def test_configure_fsdp_prefetch_skips_non_fsdp_modules(monkeypatch):
+    a, b, c = _prefetch_units(monkeypatch, 3)
+    plain = nn.Linear(2, 2)
+
+    configure_fsdp_prefetch([a, plain, b, c], forward_depth=1, backward_depth=1)
+
+    a.set_modules_to_forward_prefetch.assert_called_once_with([b])
+    b.set_modules_to_forward_prefetch.assert_called_once_with([c])
+    c.set_modules_to_forward_prefetch.assert_not_called()
+    a.set_modules_to_backward_prefetch.assert_not_called()
+    b.set_modules_to_backward_prefetch.assert_called_once_with([a])
+    c.set_modules_to_backward_prefetch.assert_called_once_with([b])
+
+
+@pytest.mark.parametrize("forward_depth, backward_depth", [(-1, 0), (0, -1)])
+def test_configure_fsdp_prefetch_rejects_negative_depth(monkeypatch, forward_depth, backward_depth):
+    units = _prefetch_units(monkeypatch, 3)
+
+    with pytest.raises(ValueError, match="nonnegative"):
+        configure_fsdp_prefetch(units, forward_depth=forward_depth, backward_depth=backward_depth)
+
+    for unit in units:
+        unit.set_modules_to_forward_prefetch.assert_not_called()
+        unit.set_modules_to_backward_prefetch.assert_not_called()

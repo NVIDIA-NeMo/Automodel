@@ -48,3 +48,15 @@ def test_parallelize_moe_forwards_the_moe_checkpointing_mode() -> None:
     assert kwargs["fsdp2_forward_prefetch_depth"] == 2
     assert kwargs["fsdp2_backward_prefetch_depth"] == 3
     assert "checkpoint_moe_only" not in kwargs
+
+
+def test_moe_parallelizer_config_keeps_positional_slots() -> None:
+    """The prefetch depths are keyword-only, so older positional calls bind as before."""
+    moe = MoEParallelizerConfig(True, False, "float32", False)
+
+    assert moe.ignore_router_for_ac is True
+    assert moe.reshard_after_forward is False
+    assert moe.lm_head_precision == "float32"
+    assert moe.wrap_outer_model is False
+    assert moe.fsdp2_forward_prefetch_depth == 0
+    assert moe.fsdp2_backward_prefetch_depth == 0

@@ -197,8 +197,9 @@ class MoEParallelizerConfig:
     ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
     # Explicit MoE block prefetch is opt-in; dense FSDP settings stay independent.
-    fsdp2_forward_prefetch_depth: int = 0
-    fsdp2_backward_prefetch_depth: int = 0
+    # Keyword-only so the existing positional fields keep their slots.
+    fsdp2_forward_prefetch_depth: int = field(default=0, kw_only=True)
+    fsdp2_backward_prefetch_depth: int = field(default=0, kw_only=True)
     lm_head_precision: Union[str, torch.dtype] | None = None
     wrap_outer_model: bool = True
     mp_policy: MixedPrecisionPolicy | None = None

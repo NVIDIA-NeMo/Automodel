@@ -362,6 +362,7 @@ def _make_compute_dtype_fn(
 
 def configure_fsdp_prefetch(
     modules: Sequence[nn.Module],
+    *,
     forward_depth: int,
     backward_depth: int,
 ) -> None:

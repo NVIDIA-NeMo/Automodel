@@ -867,12 +867,13 @@ def apply_fsdp(
     mp_policy: MixedPrecisionPolicy | None = None,
     offload_policy: OffloadPolicy | None = None,
     reshard_after_forward: bool = False,
-    fsdp2_forward_prefetch_depth: int = 0,
-    fsdp2_backward_prefetch_depth: int = 0,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     model_parallelizer: "ModelParallelizer | None" = None,
+    *,
+    fsdp2_forward_prefetch_depth: int = 0,
+    fsdp2_backward_prefetch_depth: int = 0,
 ) -> None:
     """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
@@ -1067,8 +1068,8 @@ def apply_fsdp(
 
     parallelizer_utils.configure_fsdp_prefetch(
         list(_iter_moe_blocks(model, _model)),
-        fsdp2_forward_prefetch_depth,
-        fsdp2_backward_prefetch_depth,
+        forward_depth=fsdp2_forward_prefetch_depth,
+        backward_depth=fsdp2_backward_prefetch_depth,
     )
     if fsdp2_forward_prefetch_depth or fsdp2_backward_prefetch_depth:
         logger.info(
