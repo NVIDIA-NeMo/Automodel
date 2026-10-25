@@ -457,6 +457,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     parallelizer_utils_stub.fully_shard_across_blocks = lambda blocks, module_names, **kwargs: set()
     parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
+    parallelizer_utils_stub.configure_fsdp_prefetch = MagicMock()
 
     monkeypatch.setitem(
         sys.modules,
