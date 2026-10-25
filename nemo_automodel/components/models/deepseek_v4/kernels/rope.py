@@ -58,7 +58,9 @@ if _HAVE_TRITON and _HAVE_LANGUAGE:
             out: Output storage of shape [batch, sequence, heads, channels].
             count: Number of channel pairs in x.
         """
-        pair = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        # Widen before any index arithmetic: H64/D512 activations exceed
+        # 2**31 elements at long sequence lengths.
+        pair = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         valid = pair < count
         channel = (pair % (DIM // 2)) * 2
         row = pair // (DIM // 2)

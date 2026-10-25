@@ -323,6 +323,15 @@ class DeepseekV4Block(nn.Module):
             padding_mask = attention_mask.bool().logical_not()
 
         def attention_site(hidden_streams: torch.Tensor) -> torch.Tensor:
+            """Collapse HC streams, attend, and mix the result back into the streams.
+
+            Args:
+                hidden_streams: Tensor of shape [batch, sequence, streams, hidden],
+                    where streams is ``hc_mult``.
+
+            Returns:
+                Tensor of shape [batch, sequence, streams, hidden].
+            """
             pre, post, comb = self.attn_hc(hidden_streams)
             collapsed = self.attn_hc.collapse(hidden_streams, pre)
             attn_out, _ = self.self_attn(
@@ -338,6 +347,17 @@ class DeepseekV4Block(nn.Module):
             return self.attn_hc.expand(attn_out, hidden_streams, post, comb)
 
         def ffn_prepare(hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Collapse HC streams for the FFN and return the mixing coefficients.
+
+            Args:
+                hidden_streams: Tensor of shape [batch, sequence, streams, hidden].
+
+            Returns:
+                Collapsed input of shape [batch, sequence, hidden] in the
+                activation dtype, FP32 post coefficients of shape
+                [batch, sequence, streams], and FP32 combination coefficients of
+                shape [batch, sequence, input_streams, output_streams].
+            """
             pre, post, comb = self.ffn_hc(hidden_streams)
             collapsed = self.ffn_hc.collapse(hidden_streams, pre)
             return collapsed, post, comb
@@ -1139,6 +1159,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _pp_return_hidden_states_supported: bool = True
     _pp_return_hidden_states: bool = False
+    # The FP32 head casts logits back to the hidden dtype; the PP linear loss
+    # must reproduce that rounding when it owns the projection.
+    pp_logits_follow_hidden_dtype: bool = True
     _keep_in_fp32_modules_strict = [
         "attn_hc.fn",
         "attn_hc.base",
@@ -1257,6 +1280,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         self.mtp_config = build_mtp_config_from_hf(config, loss_scaling_factor=mtp_loss_scaling_factor)
+        # PipelineCausalLMLoss rejects linear-loss MTP tuples, so only advertise
+        # hidden-state output when the final stage returns bare hidden states.
+        self._pp_return_hidden_states_supported = not self.mtp_config.enabled
         if self.mtp_config.enabled:
             self.mtp = build_deepseek_v4_mtp(
                 config=config,

@@ -142,3 +142,79 @@ def test_fused_qnorm_rope_preserves_bf16_rounding_and_gradients(
         error = value.float() - reference.float()
         assert error.norm() / reference.float().norm() < 2e-4
         assert error.abs().max() <= 0.0625
+
+
+# Each shape holds just over 2**31 elements: the first exceeds int32 element
+# offsets through the sequence, the second through its batch stride.
+_LARGE_SHAPES = [(2, 32769), (1, 65537)]
+
+
+def _large_rope_inputs(batch: int, length: int) -> tuple[torch.Tensor, ...]:
+    """Build token-major BF16 Q activations whose element count exceeds 2**31.
+
+    Args:
+        batch: Batch size.
+        length: Sequence length per sample.
+
+    Returns:
+        Tuple of x and upstream gradient, both [batch, 64, length, 512] views of
+        [batch, length, 64, 512] storage, followed by FP32 cosine and sine
+        tables of shape [batch, length, 64].
+    """
+    # x, upstream, output and input gradient: four ~4.3 GB tensors plus allocator slack.
+    if torch.cuda.mem_get_info()[0] < 24 * 2**30:
+        pytest.skip("requires 24 GiB of free CUDA memory")
+    torch.manual_seed(31)
+    x = torch.randn(batch, length, 64, 512, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    upstream = torch.randn(batch, length, 64, 512, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    assert x.numel() > 2**31
+    angles = torch.randn(batch, length, 32, device="cuda")
+    return x.requires_grad_(), upstream, angles.cos().repeat(1, 1, 2), angles.sin().repeat(1, 1, 2)
+
+
+def _sample_positions(length: int) -> torch.Tensor:
+    """Select first, middle and final sequence positions.
+
+    Args:
+        length: Sequence length per sample.
+
+    Returns:
+        CUDA int64 tensor of shape [5]. The final positions of the last sample
+        lie beyond 2**31 elements in the large test tensors.
+    """
+    return torch.tensor([0, 1, length // 2, length - 2, length - 1], device="cuda")
+
+
+@pytest.mark.parametrize(("batch", "length"), _LARGE_SHAPES)
+def test_triton_rope_addresses_tensors_beyond_int32_offsets(batch: int, length: int) -> None:
+    x, upstream, cos, sin = _large_rope_inputs(batch, length)
+    actual = _apply_partial_rope(x, cos, sin, 64, backend="triton")
+    actual_grad = torch.autograd.grad(actual, x, upstream)[0]
+    positions = _sample_positions(length)
+    # Eager RoPE is position-local, so sampled positions form an exact oracle.
+    sampled = x.detach()[:, :, positions].requires_grad_()
+    expected = _apply_partial_rope(sampled, cos[:, positions], sin[:, positions], 64)
+    expected_grad = torch.autograd.grad(expected, sampled, upstream[:, :, positions])[0]
+    torch.testing.assert_close(actual[:, :, positions], expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_grad[:, :, positions], expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("batch", "length"), _LARGE_SHAPES)
+def test_fused_qnorm_rope_addresses_tensors_beyond_int32_offsets(batch: int, length: int) -> None:
+    import torch.nn.functional as F
+
+    from nemo_automodel.components.models.deepseek_v4.kernels.qnorm_rope import qnorm_rope_triton
+
+    x, upstream, cos, sin = _large_rope_inputs(batch, length)
+    actual = qnorm_rope_triton(x, cos, sin, 64, 1e-6)
+    actual_grad = torch.autograd.grad(actual, x, upstream)[0]
+    positions = _sample_positions(length)
+    sampled = x.detach()[:, :, positions].requires_grad_()
+    expected = _apply_partial_rope(F.rms_norm(sampled, (512,), eps=1e-6), cos[:, positions], sin[:, positions], 64)
+    expected_grad = torch.autograd.grad(expected, sampled, upstream[:, :, positions])[0]
+    # Same BF16 rounding-boundary bounds as the 4K/8K parity test above.
+    for value, reference in ((actual[:, :, positions], expected), (actual_grad[:, :, positions], expected_grad)):
+        error = value.float() - reference.float()
+        assert torch.isfinite(value).all()
+        assert error.norm() / reference.float().norm() < 2e-4
+        assert error.abs().max() <= 0.0625

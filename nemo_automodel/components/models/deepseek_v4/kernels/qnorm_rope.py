@@ -55,9 +55,23 @@ if _HAVE_TRITON and _HAVE_LANGUAGE:
         M: tl.constexpr,
         K: tl.constexpr,
     ):
-        row = tl.program_id(0) * M + tl.arange(0, M)
-        pair = tl.arange(0, K)
-        channel = pair * 2
+        """Normalize and rotate M query rows per program into token-major storage.
+
+        Args:
+            x: Input with logical shape [batch, heads, sequence, channels] and
+                strides (XB, XH, XS, XD); D is channels and R rotary_channels.
+            cos: Cosines of shape [batch, sequence, rotary_channels] with strides
+                (CB, CS, CD); the first half holds the unique pair frequencies.
+            sin: Sines with cos's layout and strides (SB, SS, SD).
+            out: Contiguous output storage of shape [batch, sequence, heads, channels].
+            rstd: FP32 inverse RMS of shape [batch * sequence * heads], one per
+                row in the output's token-major order.
+            rows: batch * sequence * heads.
+        """
+        # Widen before any index arithmetic: H64/D512 activations exceed
+        # 2**31 elements at long sequence lengths.
+        row = tl.program_id(0).to(tl.int64) * M + tl.arange(0, M)
+        channel = tl.arange(0, K).to(tl.int64) * 2
         token = row // H
         batch, position, head = token // S, token % S, row % H
         offset = (batch * XB + head * XH + position * XS)[:, None] + channel[None, :] * XD
@@ -110,8 +124,20 @@ if _HAVE_TRITON and _HAVE_LANGUAGE:
         M: tl.constexpr,
         K: tl.constexpr,
     ):
-        row = tl.program_id(0) * M + tl.arange(0, M)
-        channel = tl.arange(0, K) * 2
+        """Rotate the upstream gradient back, then apply the RMSNorm input gradient.
+
+        Args:
+            x: Saved forward input with logical shape [batch, heads, sequence,
+                channels] and strides (XB, XH, XS, XD).
+            grad: Upstream gradient with x's logical shape and strides (GB, GH, GS, GD).
+            cos: Cosines of shape [batch, sequence, rotary_channels] with strides (CB, CS, CD).
+            sin: Sines with cos's layout and strides (SB, SS, SD).
+            rstd: FP32 inverse RMS of shape [batch * sequence * heads] from the forward.
+            out: Contiguous input-gradient storage of shape [batch, sequence, heads, channels].
+            rows: batch * sequence * heads.
+        """
+        row = tl.program_id(0).to(tl.int64) * M + tl.arange(0, M)
+        channel = tl.arange(0, K).to(tl.int64) * 2
         token = row // H
         batch, position, head = token // S, token % S, row % H
         mask = (row[:, None] < rows) & (channel[None, :] < D)
@@ -154,14 +180,18 @@ class _QNormRoPE(torch.autograd.Function):
 
         Args:
             ctx: Autograd context.
-            x: Input Q tensor.
-            cos: Fixed FP32 cosine table.
-            sin: Fixed FP32 sine table.
+            x: Query tensor of shape [batch, heads, sequence, channels], any strides.
+            cos: Fixed FP32 cosines of shape [batch, sequence, rotary_channels];
+                the first half holds the unique pair frequencies.
+            sin: Fixed FP32 sines with cos's shape and frequency order.
             rotary: Number of trailing channels to rotate.
             eps: Normalization epsilon.
 
         Returns:
-            Tensor with x's logical shape and token-major storage.
+            Tensor of shape [batch, heads, sequence, channels] in x's dtype, backed
+            by [batch, sequence, heads, channels] storage so transpose(1, 2) is
+            contiguous. Saves x, the tables, and FP32 inverse RMS of shape
+            [batch * sequence * heads] in token-major row order.
         """
         batch, heads, sequence, dim = x.shape
         output = x.new_empty((batch, sequence, heads, dim))
@@ -200,10 +230,13 @@ class _QNormRoPE(torch.autograd.Function):
 
         Args:
             ctx: Saved input, frequencies, and inverse RMS.
-            grad_output: Upstream gradient with the output's logical shape.
+            grad_output: Upstream gradient of shape [batch, heads, sequence,
+                channels], any strides.
 
         Returns:
-            Input gradient and None for the fixed non-input arguments.
+            Input gradient of shape [batch, heads, sequence, channels] in x's dtype
+            with [batch, sequence, heads, channels] storage, then None for the
+            fixed cosine, sine, rotary and epsilon arguments.
         """
         x, cos, sin, inv = ctx.saved_tensors
         batch, heads, sequence, dim = x.shape

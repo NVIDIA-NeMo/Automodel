@@ -406,6 +406,7 @@ class PipelineCausalLMLoss(nn.Module):
         """
         seq_idx_mb, output = self._extract_seq_idx_tail(output)
 
+        logits_dtype = None
         if isinstance(output, tuple):
             if isinstance(self.loss_fn, LinearCrossEntropy):
                 raise ValueError(f"{type(self.loss_fn).__name__} is not supported with MTP under pipeline parallelism")
@@ -426,6 +427,10 @@ class PipelineCausalLMLoss(nn.Module):
             if isinstance(self.loss_fn, LinearCrossEntropy) and isinstance(output, torch.Tensor):
                 logits = None
                 hidden_states = output
+                # Models whose own head casts FP32-projected logits back to the
+                # activation dtype keep that rounding when the loss projects.
+                if getattr(self.model, "pp_logits_follow_hidden_dtype", False):
+                    logits_dtype = output.dtype
             else:
                 logits = getattr(output, "logits", output)
                 hidden_states = _get_final_hidden_states(output)
@@ -448,6 +453,7 @@ class PipelineCausalLMLoss(nn.Module):
             model=self.model,
             hidden_states=hidden_states,
             lm_weight=shared_lm_weight,
+            logits_dtype=logits_dtype,
             grad_reduce_group=self.grad_reduce_group,
         )
         if (mtp_per_depth_h is not None or mtp_per_depth_logits is not None) and self.model.training:

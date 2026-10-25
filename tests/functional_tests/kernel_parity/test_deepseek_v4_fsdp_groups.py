@@ -42,6 +42,14 @@ class _Block(torch.nn.Module):
         self.self_attn.sinks_param = DeepseekV4FP32Parameter(torch.randn(4))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mix four residual streams through both HC sites and add the sinks.
+
+        Args:
+            x: Tensor of shape [batch, sequence, streams, hidden] with four streams.
+
+        Returns:
+            Tensor of shape [batch, sequence, streams, hidden].
+        """
         for site in (self.attn_hc, self.ffn_hc):
             pre, post, comb = site(x)
             x = site.expand(site.collapse(x, pre), x, post, comb)
@@ -55,6 +63,14 @@ class _Model(torch.nn.Module):
         self.layers = torch.nn.ModuleList([checkpoint_wrapper(b) for b in blocks] if checkpointed else blocks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply both blocks.
+
+        Args:
+            x: Tensor of shape [batch, sequence, streams, hidden] with four streams.
+
+        Returns:
+            Tensor of shape [batch, sequence, streams, hidden].
+        """
         for block in self.layers:
             x = block(x)
         return x

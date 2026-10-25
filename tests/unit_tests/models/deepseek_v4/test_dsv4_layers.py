@@ -1856,6 +1856,14 @@ def test_frozen_indexer_replay_preserves_attention_and_interleaved_microbatch_gr
         context_fn = dsv4_layers.dsv4_indexer_replay.checkpoint_context_fn(inner)
 
         def forward(x):
+            """Run the attention layer under checkpointing.
+
+            Args:
+                x: Tensor of shape [batch, sequence, hidden].
+
+            Returns:
+                Attention output of shape [batch, sequence, hidden].
+            """
             return module(
                 x,
                 position_embeddings=rotary_main,

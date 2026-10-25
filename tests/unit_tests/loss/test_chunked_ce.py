@@ -335,3 +335,43 @@ def test_transformed_head_rejected_before_training():
         _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), model, False)
     torch.testing.assert_close(model.lm_head.weight, original_weight)
     assert model.lm_head.weight.grad is None
+
+
+@pytest.mark.parametrize("follow_hidden_dtype", [False, True])
+def test_pipeline_loss_keeps_model_owned_logit_rounding(follow_hidden_dtype):
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    model = torch.nn.Module()
+    model.lm_head = torch.nn.Linear(1, 2, bias=False)
+    model.pp_logits_follow_hidden_dtype = follow_hidden_dtype
+    with torch.no_grad():
+        # 1.00390625 is FP32-exact but rounds to 1.0 in BF16.
+        model.lm_head.weight.copy_(torch.tensor([[1.00390625], [0.0]]))
+    hidden = torch.ones(1, 1, 1, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.zeros(1, 1, dtype=torch.long)
+    loss = PipelineCausalLMLoss(ChunkedCrossEntropy(compile=False), model)(hidden, labels)
+    rounded = F.cross_entropy(torch.tensor([[1.0, 0.0]]), labels.flatten(), reduction="sum")
+    unrounded = F.cross_entropy(torch.tensor([[1.00390625, 0.0]]), labels.flatten(), reduction="sum")
+    assert rounded != unrounded
+    torch.testing.assert_close(loss, rounded if follow_hidden_dtype else unrounded, rtol=0, atol=0)
+
+
+def test_pipeline_loss_rounded_logits_match_model_projection_gradients():
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+    from nemo_automodel.components.models.common.utils import compute_lm_head_logits
+
+    torch.manual_seed(71)
+    model = torch.nn.Module()
+    model.lm_head = torch.nn.Linear(19, 37, bias=False)
+    model.pp_logits_follow_hidden_dtype = True
+    hidden = torch.randn(2, 9, 19, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(37, (2, 9))
+    loss = PipelineCausalLMLoss(ChunkedCrossEntropy(4, compile=False), model)(hidden, labels)
+    logits = compute_lm_head_logits(model.lm_head, hidden, fp32_lm_head=True).logits
+    assert logits.dtype == torch.bfloat16
+    expected = F.cross_entropy(logits.float().flatten(0, 1), labels.flatten(), reduction="sum")
+    torch.testing.assert_close(loss, expected)
+    actual_grads = torch.autograd.grad(loss, (hidden, model.lm_head.weight), retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (hidden, model.lm_head.weight))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)

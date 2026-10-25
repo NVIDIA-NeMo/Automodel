@@ -937,6 +937,16 @@ def test_unpadded_sparse_mask_fastpath_requires_canonical_unmasked_inputs(case):
 
     class RecordLayer(torch.nn.Module):
         def forward(self, x, attention_mask, **kwargs):
+            """Record the mask decision and pass the HC streams through.
+
+            Args:
+                x: Tensor of shape [batch, sequence, streams, hidden].
+                attention_mask: Additive mask of shape [batch, 1, sequence, sequence], or None.
+                **kwargs: Remaining block inputs, including the nonempty-query flag.
+
+            Returns:
+                x unchanged.
+            """
             observed.append((attention_mask, kwargs["_dsv4_all_queries_nonempty"]))
             return x
 
@@ -975,6 +985,15 @@ def test_grouped_compressor_guard_rejects_inputs_with_optional_parameter_partici
 
     class RecordLayer(torch.nn.Module):
         def forward(self, x, **kwargs):
+            """Record the complete-window flag and pass the HC streams through.
+
+            Args:
+                x: Tensor of shape [batch, sequence, streams, hidden].
+                **kwargs: Remaining block inputs, including the complete-window flag.
+
+            Returns:
+                x unchanged.
+            """
             called.append(kwargs["_dsv4_complete_compressor_windows"])
             return x
 

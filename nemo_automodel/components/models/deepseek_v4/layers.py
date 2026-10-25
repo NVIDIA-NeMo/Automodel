@@ -447,6 +447,25 @@ def _apply_partial_rope(
     Llama-style helper produces wrong activations on the released checkpoint
     (verified empirically: kv_post_rope cosine drops from 0.9999 to 0.866
     after one block under Llama-style; matches at >0.999 under interleaved).
+
+    Args:
+        x: Tensor of shape [..., sequence, channels] rotated on its last
+            ``rope_head_dim`` channels. The eager path accepts any leading
+            dimensions broadcastable with the tables, for example
+            [batch, heads, sequence, channels] or [batch, 1, sequence, channels];
+            the Triton path requires exactly [batch, heads, sequence, channels].
+        cos: Tensor of shape [batch, sequence, rope_head_dim]; the first half
+            holds the unique adjacent-pair frequencies.
+        sin: Tensor with cos's shape and frequency order; negate it for the
+            inverse rotation.
+        rope_head_dim: Even number of trailing channels to rotate.
+        backend: ``"triton"`` uses the fused CUDA kernel when x is on CUDA and
+            the tables do not require gradients; otherwise the eager path runs.
+
+    Returns:
+        Tensor with x's shape and dtype. The leading ``channels - rope_head_dim``
+        channels are unchanged. The Triton result has
+        [batch, sequence, heads, channels] storage, so transpose(1, 2) is contiguous.
     """
     if backend == "triton" and x.is_cuda and not (cos.requires_grad or sin.requires_grad):
         return apply_partial_rope_triton(x, cos, sin, rope_head_dim)
@@ -843,19 +862,29 @@ class DeepseekV4Indexer(nn.Module):
         existing path; each checkpoint invocation owns an independent record.
 
         Args:
-            hidden_states: Input tokens, [batch, sequence, hidden].
-            q_residual: Query latent, [batch, sequence, q_lora_rank].
+            hidden_states: Tensor of shape [batch, local_sequence, hidden], where
+                local_sequence is this rank's query shard under CP.
+            q_residual: Tensor of shape [batch, local_sequence, q_lora_rank].
             rotary: Rotary module for compressed keys.
-            position_embeddings: Query cosine and sine tables.
+            position_embeddings: Query cosine and sine, each of shape
+                [batch, local_sequence, rotary_channels] with rotary_channels
+                equal to ``qk_rope_head_dim``.
             cache: Per-attention-call scratch cache.
             layer_idx: Index of the current transformer layer.
             start_pos: First query position.
-            position_ids: Optional explicit token positions.
-            packed_seq_ids: Optional per-token document identities.
+            position_ids: Optional tensor of shape [batch, local_sequence] with
+                each token's position inside its document.
+            packed_seq_ids: Optional tensor of shape [batch, local_sequence] with
+                positive document identities; zero marks padding.
             cp_group: Optional context-parallel process group.
 
         Returns:
-            Compressed-key indices of shape [batch, sequence, selected_keys].
+            Int64 tensor of shape [batch, local_sequence, selected_keys], with
+            selected_keys = min(index_topk, compressed_keys). Indices address
+            the compressed pool, concatenated across CP ranks when CP is active.
+            Packed inputs mark selections outside the query's document or causal
+            range with -1. Unpacked selections are raw top-k positions whose
+            causal filtering the compressor applies.
         """
         args = (
             hidden_states,
@@ -895,8 +924,28 @@ class DeepseekV4Indexer(nn.Module):
         start_pos: int,
         position_ids: torch.Tensor | None = None,
         packed_seq_ids: torch.Tensor | None = None,
-        cp_group=None,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> torch.LongTensor:
+        """Score the compressed pool and select keys; see :meth:`forward` for the contract.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden].
+            q_residual: Tensor of shape [batch, local_sequence, q_lora_rank].
+            rotary: Rotary module for compressed keys.
+            position_embeddings: Query cosine and sine, each of shape
+                [batch, local_sequence, rotary_channels].
+            cache: Per-attention-call scratch cache.
+            layer_idx: Index of the current transformer layer.
+            start_pos: First query position.
+            position_ids: Optional tensor of shape [batch, local_sequence].
+            packed_seq_ids: Optional tensor of shape [batch, local_sequence].
+            cp_group: Optional context-parallel process group.
+
+        Returns:
+            Int64 tensor of shape [batch, local_sequence, selected_keys]
+            indexing the (CP-global) compressed pool, with -1 for packed
+            selections outside the query's document.
+        """
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
         cp_active = dsv4_cp_enabled(cp_group)
@@ -1504,7 +1553,22 @@ class DeepseekV4Attention(nn.Module):
         self._cp_group = cp_mesh.get_group()
 
     def _project_query(self, q_residual: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """Expand the low-rank query, normalize each head, and apply partial RoPE."""
+        """Expand, normalize, and partially rotate the low-rank query.
+
+        Args:
+            q_residual: Tensor of shape [batch, sequence, q_lora_rank].
+            cos: Tensor of shape [batch, sequence, rotary_channels], where
+                rotary_channels is ``qk_rope_head_dim`` and the first half
+                contains the unique adjacent-pair frequencies.
+            sin: Tensor of shape [batch, sequence, rotary_channels] with cos's
+                frequency order.
+
+        Returns:
+            Tensor of shape [batch, heads, sequence, channels], where channels
+            is ``head_dim``. The Triton paths use [batch, sequence, heads,
+            channels] storage, so transpose(1, 2) is contiguous. Fused
+            QNorm/RoPE requires CUDA and fixed frequency tables.
+        """
         batch, seq_len = q_residual.shape[:2]
         q = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         if self.config.fuse_qnorm_rope:
@@ -1527,6 +1591,34 @@ class DeepseekV4Attention(nn.Module):
         position_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run sliding-window, compressed, and sparse attention for one layer.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden], where
+                local_sequence is this rank's contiguous query shard under CP.
+            position_embeddings: Main-rope cosine and sine, each of shape
+                [batch, local_sequence, rotary_channels].
+            attention_mask: Optional additive mask of shape [batch, 1,
+                local_sequence, keys] over local queries and CP-global keys.
+                None on the canonical unmasked sparse path.
+            position_embeddings_compress: Optional compress-rope cosine and
+                sine with the main tables' shapes; compressed layers use them
+                for queries and keys.
+            rotary_compress: Rotary module for compressed keys.
+            start_pos: First query position.
+            position_ids: Optional tensor of shape [batch, local_sequence] with
+                each token's position inside its document.
+            **kwargs: Optional ``packed_seq_ids`` and ``vision_token_types``
+                tensors of shape [batch, local_sequence], ``_dsv4_cp_group``,
+                and the model-validated flags ``_dsv4_all_queries_nonempty``
+                (every query sees its diagonal key, so sparse kernels may skip
+                empty-row filtering) and ``_dsv4_complete_compressor_windows``.
+
+        Returns:
+            Output of shape [batch, local_sequence, hidden], and eager attention
+            probabilities of shape [batch, heads, local_sequence, keys] or None
+            on the sparse kernel paths.
+        """
         cp_group = kwargs.get("_dsv4_cp_group") or getattr(self, "_cp_group", None)
         cp_active = dsv4_cp_enabled(cp_group)
         packed_seq_ids = kwargs.get("packed_seq_ids")

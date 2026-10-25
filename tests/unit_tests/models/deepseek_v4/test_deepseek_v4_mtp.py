@@ -395,6 +395,22 @@ class TestPipelineHooks:
         assert final_outputs[1].shape == (2, 16, cfg.hidden_size)
         assert final_outputs[2].shape == (2, 16, cfg.hidden_size)
 
+    @pytest.mark.parametrize("num_nextn_predict_layers", [0, 1])
+    def test_pp_chunked_ce_requires_mtp_disabled(self, num_nextn_predict_layers):
+        from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+        from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+        model = _make_model(_tiny_config(num_nextn_predict_layers=num_nextn_predict_layers))
+        loss_fn = ChunkedCrossEntropy(compile=False)
+        if num_nextn_predict_layers:
+            # The final stage would return an MTP tuple, which the PP linear loss rejects.
+            with pytest.raises(ValueError, match="pipeline stages that can return hidden states"):
+                _maybe_downgrade_loss_fn(loss_fn, model, True)
+        else:
+            assert _maybe_downgrade_loss_fn(loss_fn, model, True) is loss_fn
+            # PP linear CE must then reproduce the FP32 head's BF16 logit cast.
+            assert model.pp_logits_follow_hidden_dtype
+
 
 if __name__ == "__main__":
     import sys

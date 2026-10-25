@@ -14,9 +14,18 @@
 
 from __future__ import annotations
 
+from typing import TypeAlias
+
+import torch
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.models.deepseek_v4.flops import model_flops
+
+# Values forwarded to PretrainedConfig: parsed config.json entries plus HF
+# loader options such as ``dtype``.
+HFConfigValue: TypeAlias = (
+    str | int | float | bool | torch.dtype | list["HFConfigValue"] | dict[str, "HFConfigValue"] | None
+)
 
 
 class DeepseekV4Config(PretrainedConfig):
@@ -110,8 +119,8 @@ class DeepseekV4Config(PretrainedConfig):
         tie_word_embeddings: bool = False,
         initializer_range: float = 0.02,
         torch_dtype: str | None = None,
-        **kwargs,
-    ):
+        **kwargs: HFConfigValue,
+    ) -> None:
         dtype = kwargs.pop("dtype", None)
         resolved_dtype = dtype if dtype is not None else torch_dtype
         if resolved_dtype is None:
