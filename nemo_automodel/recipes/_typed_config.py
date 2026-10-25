@@ -418,9 +418,6 @@ class RecipeConfig:
 
         pretokenization = None
         if pretokenize:
-            tokenize_hook = packing_node.get("tokenize_hook_fn", None) if packing_node else None
-            if tokenize_hook is not None and not callable(tokenize_hook):
-                raise TypeError("packed_sequence.tokenize_hook_fn must resolve to a callable")
             post_tokenize_hook = packing_node.get("post_tokenize_hook_fn", None) if packing_node else None
             if post_tokenize_hook is not None and not callable(post_tokenize_hook):
                 raise TypeError("packed_sequence.post_tokenize_hook_fn must resolve to a callable")
@@ -429,7 +426,6 @@ class RecipeConfig:
                 truncate=truncate,
                 inject_fake_images=inject_fake_images,
                 post_tokenize_hook=post_tokenize_hook,
-                tokenize_hook=tokenize_hook,
             )
 
         packing = None
@@ -447,7 +443,6 @@ class RecipeConfig:
                 "pretokenize",
                 "max_length",
                 "post_tokenize_hook_fn",
-                "tokenize_hook_fn",
             }
             unknown = sorted(set(packing_node) - packing_fields)
             if unknown:

@@ -1504,9 +1504,7 @@ class PreTokenizedDatasetWrapperConfig:
     """If ``True``, truncate overlong samples instead of replacing them."""
     inject_fake_images: bool = True
     """If ``True``, inject a fake image into text-only samples for sharded training."""
-    tokenize_hook: Callable[[list[dict[str, object]], ProcessorMixin], dict[str, torch.Tensor]] | None = None
-    """Optional model-owned tokenizer returning unshifted [1, sequence] token tensors and media tensors."""
-    post_tokenize_hook: Callable[[dict[str, object], ProcessorMixin], dict[str, object]] | None = None
+    post_tokenize_hook: Callable[[dict[str, object]], dict[str, object]] | None = None
     """Optional declarative callback applied to each tokenizer result."""
 
     def build(
@@ -1529,7 +1527,6 @@ class PreTokenizedDatasetWrapperConfig:
             truncate=self.truncate,
             post_tokenize_hook=self.post_tokenize_hook,
             inject_fake_images=self.inject_fake_images,
-            tokenize_hook=self.tokenize_hook,
         )
 
 
@@ -1558,22 +1555,19 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        dataset: torch.utils.data.Dataset | Sequence[dict[str, object]],
-        processor: ProcessorMixin,
-        max_length: int | None = None,
-        max_retries: int = 10,
-        truncate: bool = False,
-        post_tokenize_hook: Callable[[dict[str, object], ProcessorMixin], dict[str, object]] | None = None,
-        inject_fake_images: bool = True,
-        *,
-        tokenize_hook: Callable[[list[dict[str, object]], ProcessorMixin], dict[str, torch.Tensor]] | None = None,
-    ) -> None:
+        dataset,
+        processor,
+        max_length=None,
+        max_retries=10,
+        truncate=False,
+        post_tokenize_hook=None,
+        inject_fake_images=True,
+    ):
         self.dataset = dataset
         self.processor = processor
         self.max_length = max_length
         self.truncate = truncate
         self.max_retries = max_retries
-        self.tokenize_hook = tokenize_hook
         self.post_tokenize_hook = post_tokenize_hook
         self.inject_fake_images = inject_fake_images
         # Compatibility attributes expected by build_dataloader
@@ -1625,31 +1619,27 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 if video_metadata:
                     processor_kwargs["video_metadata"] = [video_metadata]
 
-                if self.tokenize_hook is not None:
-                    template_has_generation_kwd = False
-                    result = self.tokenize_hook(conversation, self.processor)
+                chat_template = self.processor.chat_template if isinstance(self.processor, ProcessorMixin) else None
+                if isinstance(chat_template, dict):
+                    chat_template = chat_template.get("default")
+                template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
+                if template_has_generation_kwd:
+                    result = self.processor.apply_chat_template(
+                        [conversation],
+                        tokenize=True,
+                        return_dict=True,
+                        return_tensors="pt",
+                        return_assistant_tokens_mask=True,
+                        processor_kwargs=processor_kwargs,
+                    )
                 else:
-                    chat_template = self.processor.chat_template if isinstance(self.processor, ProcessorMixin) else None
-                    if isinstance(chat_template, dict):
-                        chat_template = chat_template.get("default")
-                    template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
-                    if template_has_generation_kwd:
-                        result = self.processor.apply_chat_template(
-                            [conversation],
-                            tokenize=True,
-                            return_dict=True,
-                            return_tensors="pt",
-                            return_assistant_tokens_mask=True,
-                            processor_kwargs=processor_kwargs,
-                        )
-                    else:
-                        text = self.processor.apply_chat_template([conversation], tokenize=False)
-                        if isinstance(text, list):
-                            text = text[0]
-                        images, videos = _extract_media_from_conversations([conversation])
-                        result = self.processor(
-                            text=[text], images=images, videos=videos, return_tensors="pt", **processor_kwargs
-                        )
+                    text = self.processor.apply_chat_template([conversation], tokenize=False)
+                    if isinstance(text, list):
+                        text = text[0]
+                    images, videos = _extract_media_from_conversations([conversation])
+                    result = self.processor(
+                        text=[text], images=images, videos=videos, return_tensors="pt", **processor_kwargs
+                    )
                 if self.post_tokenize_hook is not None:
                     result = self.post_tokenize_hook(result, self.processor)
 
