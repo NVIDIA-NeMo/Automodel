@@ -68,6 +68,23 @@ def _worker(rank: int, init_file: str, dtype: torch.dtype) -> None:
         torch.testing.assert_close(weight, expected, rtol=0, atol=0)
         torch.testing.assert_close(gate.e_score_correction_bias, torch.zeros(256, device="cuda"))
         assert gate.e_score_correction_bias.dtype == torch.float32
+
+        # The initialized gate must route and backpropagate on its first use.
+        # A nonconstant upstream gradient avoids the constant-sum loss of
+        # normalized routing weights.
+        inputs = torch.randn(4, config.dim, device=weight.device, dtype=dtype, requires_grad=True)
+        token_mask = torch.ones(4, device=weight.device, dtype=torch.bool)
+        routing_weights, selected, _ = gate(inputs, token_mask, cp_mesh=None)
+        assert torch.isfinite(routing_weights).all()
+        assert ((selected >= 0) & (selected < config.n_routed_experts)).all()
+        assert (selected.sort(dim=-1).values.diff(dim=-1) > 0).all()
+        routing_weights.backward(torch.randn_like(routing_weights))
+        assert inputs.grad is not None
+        assert torch.isfinite(inputs.grad).all()
+        assert inputs.grad.abs().sum() > 0
+        assert gate.weight.grad is not None
+        assert torch.isfinite(gate.weight.grad.to_local()).all()
+        assert gate.weight.grad.full_tensor().abs().sum() > 0
     finally:
         dist.destroy_process_group()
 
