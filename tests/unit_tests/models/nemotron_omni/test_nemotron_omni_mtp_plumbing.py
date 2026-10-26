@@ -54,3 +54,23 @@ def test_mtp_config_absent_when_language_model_has_none():
 
 def test_declares_mtp_cp_support():
     assert NemotronOmniForConditionalGeneration.ModelCapabilities().supports_mtp_cp is True
+
+
+def test_compute_mtp_in_eval_delegates_to_language_model():
+    """The validation-eval toggle in train_ft.py reads/writes this on model_parts entries;
+    without delegation the inner LM's flag never flips and omni silently never reports
+    val_mtp_tau_sim even though the docs list it as supported."""
+    lm = SimpleNamespace(compute_mtp_in_eval=False)
+    model = _bare_omni_with_lm(lm)
+
+    assert model.compute_mtp_in_eval is False
+    model.compute_mtp_in_eval = True
+    assert lm.compute_mtp_in_eval is True
+    assert model.compute_mtp_in_eval is True
+    model.compute_mtp_in_eval = False
+    assert lm.compute_mtp_in_eval is False
+
+
+def test_compute_mtp_in_eval_absent_when_language_model_has_none():
+    model = _bare_omni_with_lm(SimpleNamespace())
+    assert model.compute_mtp_in_eval is False

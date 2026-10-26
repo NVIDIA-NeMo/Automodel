@@ -91,6 +91,42 @@ def test_draft_matching_the_label_is_rejected_against_a_disagreeing_verifier(lab
     torch.testing.assert_close(simulated_accept_length(metrics.prefix_hits, metrics.valid), torch.tensor(1.0))
 
 
+def test_cu_seqlens_masks_cross_document_positions():
+    """``cu_seqlens`` (THD layout) must exclude a document's last token from the
+    acceptance count, the same packed-sequence boundary ``calculate_mtp_loss``
+    enforces -- not just the global trailing position every depth already masks.
+    """
+    labels = torch.ones(1, 8, dtype=torch.long)
+    verifier_logits = _constant_class_logits(labels.shape, cls=2)
+    draft_logits = [_constant_class_logits(labels.shape, cls=2)]
+    cu_seqlens = torch.tensor([0, 4, 8])  # two 4-token documents
+
+    with_boundary = compute_mtp_prefix_hits(
+        model=nn.Identity(),
+        mtp_per_depth_logits=draft_logits,
+        verifier_logits=verifier_logits,
+        labels=labels,
+        ignore_index=IGNORE_INDEX,
+        cu_seqlens=cu_seqlens,
+    )
+    # Position 7 is the global trailing position (masked regardless of boundaries);
+    # position 3 is the first document's last token, whose depth-1 target rolls
+    # into the second document and must also be excluded.
+    torch.testing.assert_close(with_boundary.valid, torch.tensor([6]))
+    torch.testing.assert_close(with_boundary.prefix_hits, torch.tensor([6]))
+
+    without_boundary = compute_mtp_prefix_hits(
+        model=nn.Identity(),
+        mtp_per_depth_logits=draft_logits,
+        verifier_logits=verifier_logits,
+        labels=labels,
+        ignore_index=IGNORE_INDEX,
+    )
+    # Without cu_seqlens only the global trailing position is excluded, proving
+    # the boundary argument is what fixes the cross-document contamination.
+    torch.testing.assert_close(without_boundary.valid, torch.tensor([7]))
+
+
 def test_second_depth_wrong_breaks_the_chain():
     """Depth 2 disagreeing with the verifier zeroes the joint prefix, not just depth 2's own count."""
     labels = torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.long)

@@ -15,9 +15,9 @@
 """MTP (multi-token prediction) acceptance-length evaluation.
 
 Scores a model's existing native MTP head (``nemo_automodel.components.models.common.mtp``)
-against teacher-forced ground truth to report the self-speculative accept
-length a finetuned MTP head would achieve, without adding a separate draft
-model or recipe.
+against its own main-head greedy prediction under teacher forcing, to report
+the self-speculative accept length a finetuned MTP head would achieve, without
+adding a separate draft model or recipe.
 """
 
 from nemo_automodel.components.speculative.mtp.core import (

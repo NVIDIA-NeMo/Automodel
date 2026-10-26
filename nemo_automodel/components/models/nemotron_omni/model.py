@@ -959,6 +959,15 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         """MTP head configuration of the wrapped NemotronV3 LM (drives ``supports.mtp_enabled``)."""
         return getattr(self.language_model, "mtp_config", None)
 
+    @property
+    def compute_mtp_in_eval(self) -> bool:
+        """Whether the wrapped NemotronV3 LM computes MTP outputs during ``model.eval()``."""
+        return getattr(self.language_model, "compute_mtp_in_eval", False)
+
+    @compute_mtp_in_eval.setter
+    def compute_mtp_in_eval(self, value: bool) -> None:
+        self.language_model.compute_mtp_in_eval = value
+
     def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100):
         """Globally ordered MTP future-token inputs/targets, prepared before CP sharding.
 

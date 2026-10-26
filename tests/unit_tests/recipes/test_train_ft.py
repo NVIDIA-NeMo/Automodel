@@ -3073,31 +3073,15 @@ def test_run_validation_epoch_toggles_compute_mtp_in_eval(monkeypatch):
     assert model.compute_mtp_in_eval is False
 
 
-def test_forward_backward_step_eval_scores_mtp_against_verifier_not_label(monkeypatch):
-    """End-to-end (real _forward_backward_step, is_train=False): the native model's MTP
-    outputs, produced because compute_mtp_in_eval is set, get scored against its own
-    verifier logits rather than the dataset label (the bug a fabricated-metrics test would miss)."""
-    vocab = 6
+def _make_mtp_forward_backward_recipe(model, monkeypatch, *, calculate_mtp_loss=None):
+    """Build a minimal real ``_forward_backward_step`` harness around ``model``.
 
-    class _EvalMTPModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.compute_mtp_in_eval = True
-            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
-
-        def forward(self, input_ids, **kwargs):
-            del kwargs
-            verifier_logits = torch.zeros(*input_ids.shape, vocab)
-            verifier_logits[..., 2] = 10.0  # verifier's own greedy pick: class 2
-            draft_logits = verifier_logits.clone()  # draft agrees with the verifier
-            return SimpleNamespace(
-                logits=verifier_logits,
-                mtp_per_depth_h=None,
-                mtp_per_depth_logits=[draft_logits] if self.training or self.compute_mtp_in_eval else None,
-                mtp_loss_scaling_factor=1.0,
-            )
-
-    model = _EvalMTPModel()
+    Patches just enough of the recipe's collaborators (CP sharder, main-loss,
+    hidden-state extraction) to run the actual non-PP branch end to end, so
+    tests exercise the real MTP wiring instead of asserting against fabricated
+    counts. ``calculate_mtp_loss`` defaults to a zero stub; pass a spy to
+    assert whether/how it was called.
+    """
     recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
     object.__setattr__(recipe, "cfg", SimpleNamespace(mtp=SimpleNamespace(ignore_index=-100, scaling_factor=1.0)))
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu")))
@@ -3125,9 +3109,39 @@ def test_forward_backward_step_eval_scores_mtp_against_verifier_not_label(monkey
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.calculate_mtp_loss",
-        lambda loss_fn, *, mtp_per_depth_logits, **kw: sum(t.sum() for t in mtp_per_depth_logits) * 0.0,
+        calculate_mtp_loss
+        or (lambda loss_fn, *, mtp_per_depth_logits, **kw: sum(t.sum() for t in mtp_per_depth_logits) * 0.0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)
+    return recipe
+
+
+def test_forward_backward_step_eval_scores_mtp_against_verifier_not_label(monkeypatch):
+    """End-to-end (real _forward_backward_step, is_train=False): the native model's MTP
+    outputs, produced because compute_mtp_in_eval is set, get scored against its own
+    verifier logits rather than the dataset label (the bug a fabricated-metrics test would miss)."""
+    vocab = 6
+
+    class _EvalMTPModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.compute_mtp_in_eval = True
+            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+
+        def forward(self, input_ids, **kwargs):
+            del kwargs
+            verifier_logits = torch.zeros(*input_ids.shape, vocab)
+            verifier_logits[..., 2] = 10.0  # verifier's own greedy pick: class 2
+            draft_logits = verifier_logits.clone()  # draft agrees with the verifier
+            return SimpleNamespace(
+                logits=verifier_logits,
+                mtp_per_depth_h=None,
+                mtp_per_depth_logits=[draft_logits] if self.training or self.compute_mtp_in_eval else None,
+                mtp_loss_scaling_factor=1.0,
+            )
+
+    model = _EvalMTPModel()
+    recipe = _make_mtp_forward_backward_recipe(model, monkeypatch)
 
     # Labels deliberately disagree with the verifier's class-2 pick, to prove the metric
     # tracks the verifier, not the label.
@@ -3138,6 +3152,83 @@ def test_forward_backward_step_eval_scores_mtp_against_verifier_not_label(monkey
     metrics = recipe._mtp_accept_metrics[0]
     torch.testing.assert_close(metrics.valid, torch.tensor([2]))
     torch.testing.assert_close(metrics.prefix_hits, torch.tensor([2]))
+
+
+def test_forward_backward_step_eval_skips_metric_for_logits_to_keep_one_verifier(monkeypatch):
+    """A LinearCrossEntropy-style forward that only materializes the last-token logits
+    (``logits_to_keep=1``, shape ``[B, 1, V]``) must not be scored as a full-sequence
+    verifier: its argmax would broadcast across every MTP position and silently report
+    tau == 1 regardless of actual agreement."""
+    vocab = 6
+
+    class _OneTokenVerifierModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.compute_mtp_in_eval = True
+            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+
+        def forward(self, input_ids, **kwargs):
+            del kwargs
+            one_token_logits = torch.zeros(input_ids.shape[0], 1, vocab)
+            one_token_logits[..., 2] = 10.0
+            draft_logits = [torch.zeros(*input_ids.shape, vocab)]
+            draft_logits[0][..., 2] = 10.0
+            return SimpleNamespace(
+                logits=one_token_logits,
+                mtp_per_depth_h=None,
+                mtp_per_depth_logits=draft_logits,
+                mtp_loss_scaling_factor=1.0,
+            )
+
+    model = _OneTokenVerifierModel()
+    recipe = _make_mtp_forward_backward_recipe(model, monkeypatch)
+
+    batch = {"input_ids": torch.tensor([[10, 11, 12]]), "labels": torch.tensor([[1, 1, 1]])}
+    recipe._forward_backward_step(idx=0, batch=batch, loss_buffer=[], num_label_tokens=3, num_batches=1, is_train=False)
+
+    assert recipe._mtp_accept_metrics == []
+
+
+def test_forward_backward_step_eval_excludes_mtp_loss_from_val_loss(monkeypatch):
+    """Forcing MTP outputs on during eval (via compute_mtp_in_eval) must not change
+    val_loss: calculate_mtp_loss is a training-loss term and must stay gated on
+    is_train, even though the metric itself still gets computed."""
+    vocab = 6
+
+    class _EvalMTPModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.compute_mtp_in_eval = True
+            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+
+        def forward(self, input_ids, **kwargs):
+            del kwargs
+            verifier_logits = torch.zeros(*input_ids.shape, vocab)
+            verifier_logits[..., 2] = 10.0
+            return SimpleNamespace(
+                logits=verifier_logits,
+                mtp_per_depth_h=None,
+                mtp_per_depth_logits=[verifier_logits.clone()],
+                mtp_loss_scaling_factor=1.0,
+            )
+
+    calls = []
+
+    def _spy_calculate_mtp_loss(loss_fn, *, mtp_per_depth_logits, **kw):
+        calls.append(kw)
+        return sum(t.sum() for t in mtp_per_depth_logits) * 0.0
+
+    model = _EvalMTPModel()
+    recipe = _make_mtp_forward_backward_recipe(model, monkeypatch, calculate_mtp_loss=_spy_calculate_mtp_loss)
+
+    batch = {"input_ids": torch.tensor([[10, 11, 12]]), "labels": torch.tensor([[1, 1, 1]])}
+    loss_buffer = []
+    recipe._forward_backward_step(
+        idx=0, batch=batch, loss_buffer=loss_buffer, num_label_tokens=3, num_batches=1, is_train=False
+    )
+
+    assert calls == []  # the MTP loss term is never added during eval
+    assert len(recipe._mtp_accept_metrics) == 1  # but the acceptance metric still is
 
 
 def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch):

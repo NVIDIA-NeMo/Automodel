@@ -37,7 +37,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common.mtp import roll_tensor
+from nemo_automodel.components.models.common.mtp import resolve_mtp_seq_idx, roll_tensor
 from nemo_automodel.components.speculative.eagle.core import simulated_accept_length
 from nemo_automodel.components.utils.model_utils import get_lm_head_module
 
@@ -95,6 +95,7 @@ def compute_mtp_prefix_hits(
     labels: torch.Tensor,
     ignore_index: int,
     seq_idx: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> MTPAcceptanceMetrics:
     """Score a model's MTP depths against its own main-head greedy prediction.
 
@@ -113,11 +114,16 @@ def compute_mtp_prefix_hits(
             used only to mask ignored/padded positions out of the counts.
         ignore_index: Label value excluded from both the hit and valid counts.
         seq_idx: Optional per-token sub-sequence index used to mask rolls
-            whose source position crosses a packed-sequence boundary.
+            whose source position crosses a packed-sequence boundary. Takes
+            precedence over ``cu_seqlens``.
+        cu_seqlens: Optional cumulative sequence lengths ``[num_seqs+1]``
+            (THD-pack layout) used to derive ``seq_idx`` when it is not given,
+            the same boundary ``calculate_mtp_loss`` uses for this batch.
 
     Returns:
         :class:`MTPAcceptanceMetrics` with one raw sum per depth.
     """
+    seq_idx = resolve_mtp_seq_idx(labels, seq_idx, cu_seqlens)
     if mtp_per_depth_logits is not None:
         if mtp_per_depth_h is not None:
             raise ValueError("Provide exactly one of mtp_per_depth_h or mtp_per_depth_logits")

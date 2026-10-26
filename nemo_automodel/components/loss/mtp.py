@@ -28,7 +28,7 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
-from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor, roll_tensor
+from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor, resolve_mtp_seq_idx, roll_tensor
 
 
 @dataclass(frozen=True)
@@ -242,33 +242,7 @@ def calculate_mtp_loss(
             grad_reduce_group=grad_reduce_group,
         )
 
-    if seq_idx is None and cu_seqlens is not None:
-        cs = cu_seqlens
-        if cs.dim() == 2 and cs.shape[0] == 1:
-            cs = cs.squeeze(0)
-        if cs.dim() == 1:
-            # Span the full (padded) token axis; cu_seqlens[-1] excludes tail pad.
-            # Matches the model's mamba seq_idx build (nemotron_v3/layers.py).
-            total_len = labels.shape[-1]
-            positions = torch.arange(total_len, device=labels.device)
-            # ``right=True`` so a position equal to a boundary (the first token
-            # of sub-seq k, position == cu_seqlens[k]) maps to k, not k-1.
-            seq_idx = torch.searchsorted(cs[1:].contiguous(), positions, right=True)
-            if labels.dim() == 2:
-                seq_idx = seq_idx.unsqueeze(0).expand(labels.shape[0], -1)
-    elif seq_idx is not None:
-        if seq_idx.dim() == 1 and labels.dim() == 2:
-            seq_idx = seq_idx.unsqueeze(0).expand(labels.shape[0], -1)
-        elif seq_idx.dim() == 2 and labels.dim() == 1 and seq_idx.shape[0] == 1:
-            seq_idx = seq_idx.squeeze(0)
-        # Under PP the caller must chunk seq_idx to per-microbatch shape; a
-        # mismatch is a wiring bug, not a runtime condition to swallow.
-        if seq_idx.shape != labels.shape:
-            raise ValueError(
-                f"calculate_mtp_loss: seq_idx.shape={tuple(seq_idx.shape)} does not "
-                f"match labels.shape={tuple(labels.shape)}; under PP, chunk seq_idx "
-                f"into per-microbatch pieces before passing it in."
-            )
+    seq_idx = resolve_mtp_seq_idx(labels, seq_idx, cu_seqlens)
 
     for k, mtp_output in enumerate(mtp_outputs):
         if mtp_per_depth_targets is None:

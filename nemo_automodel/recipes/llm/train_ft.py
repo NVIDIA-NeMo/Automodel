@@ -1405,7 +1405,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
-                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                if is_train and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None):
                     if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
                         # CP targets or NEAT document IDs already define the boundaries.
                         mtp_cu_seqlens = None
@@ -1439,26 +1439,33 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )
-                verifier_logits = getattr(out, "logits", None)
-                if (
-                    not is_train
-                    and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None)
-                    and mtp_per_depth_targets is None  # CP-sharded verifier targets not supported yet
-                    and isinstance(verifier_logits, torch.Tensor)
-                    and verifier_logits.shape[-1] > 0  # non-empty: not the FusedLinearCrossEntropy placeholder
-                ):
-                    # Eval-only: reuses the per-depth outputs calculate_mtp_loss just consumed, no extra forward.
-                    self._mtp_accept_metrics.append(
-                        compute_mtp_prefix_hits(
-                            model,
-                            mtp_per_depth_h=mtp_per_depth_h,
-                            mtp_per_depth_logits=mtp_per_depth_logits,
-                            verifier_logits=verifier_logits,
-                            labels=labels,
-                            ignore_index=ignore_index,
-                            seq_idx=mtp_seq_idx,
+                elif not is_train and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None):
+                    # Eval-only: score against the verifier, no loss term added, so val_loss
+                    # stays main-head CE only (matches pre-metric behavior).
+                    verifier_logits = getattr(out, "logits", None)
+                    if (
+                        mtp_per_depth_targets is None  # CP-sharded verifier targets not supported yet
+                        and isinstance(verifier_logits, torch.Tensor)
+                        # Full-sequence logits, not a LinearCrossEntropy logits_to_keep=1 slice.
+                        and verifier_logits.dim() >= 2
+                        and verifier_logits.shape[-2] == labels.shape[-1]
+                    ):
+                        self._mtp_accept_metrics.append(
+                            compute_mtp_prefix_hits(
+                                model,
+                                mtp_per_depth_h=mtp_per_depth_h,
+                                mtp_per_depth_logits=mtp_per_depth_logits,
+                                verifier_logits=verifier_logits,
+                                labels=labels,
+                                ignore_index=ignore_index,
+                                seq_idx=mtp_seq_idx,
+                                cu_seqlens=mtp_cu_seqlens,
+                            )
                         )
-                    )
+                    # Drop the alias explicitly: unlike `out`, it isn't in the del
+                    # list below, so it would otherwise keep full-vocab logits
+                    # alive past this point.
+                    del verifier_logits
                 # Autograd retains tensors needed by the losses. Release the
                 # output container and auxiliary aliases before backward so
                 # unused full-vocabulary logits do not overlap its allocations.

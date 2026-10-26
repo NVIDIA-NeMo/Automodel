@@ -31,11 +31,11 @@ supports it — the only two pieces this directory adds are:
    two can disagree whenever the main head is imperfect.
 
 Only models that opt back into computing MTP outputs during `model.eval()`
-report this metric — today that's the `nemotron_v3` family, via
-`model.compute_mtp_in_eval` (the recipe toggles it on for validation and
-restores it afterward). Other MTP-capable families currently gate MTP on
-`self.training` unconditionally, so `val_mtp_tau_sim` stays absent for them
-until they add the same hook.
+report this metric — today that's `nemotron_v3` (and `nemotron_omni`, which
+delegates to it) via `model.compute_mtp_in_eval` (the recipe toggles it on for
+validation and restores it afterward). Other MTP-capable families currently
+gate MTP on `self.training` unconditionally, so `val_mtp_tau_sim` stays absent
+for them until they add the same hook.
 
 `nemotron_nano_v3_5_lightning_mtp_finetune.yaml` runs this on a single GPU
 against `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`, which ships a
