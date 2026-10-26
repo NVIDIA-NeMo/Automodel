@@ -2,9 +2,240 @@
 title: "Release Notes"
 description: ""
 ---
-## Unreleased
 
-### Native FlashAttention-4
+## 0.7.0 · 26.10 (2026-10-21) · [PyPI](https://pypi.org/project/nemo-automodel/0.7.0/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.7.0) · [NGC Docker](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.10.00)
+
+### Highlights
+
+- **Expanded model coverage.** New training paths for DeepSeek-V4.1-Flash,
+  GLM-5.3-Flash, Qwen3.8-Flash-Next, MiMo-V2.5-Pro and MiMo-V2.6, and additional
+  vision-language models.
+- **More MoE training options.** Mixture-of-Kittens (MoK) BF16 and MXFP8 experts,
+  compact HybridEP routing, and MXFP4-resident DeepSeek-V4-Flash experts for LoRA.
+- **Speculative and discrete-diffusion training.** DFlash 2, additional Kimi K3
+  and DeepSeek-V4.1 draft-training paths, streaming EAGLE-3 feature components,
+  I-DLM training, and SCDD training and sampling.
+- **Text-to-image fine-tuning.** HunyuanImage-3.0 with expert parallelism and
+  Qwen-Image-2.1 with full-parameter and LoRA recipes.
+- **Training and integration improvements.** Native FlashAttention-4, explicit
+  packing contracts, weighted domain mixtures, lower-memory checkpoint loading,
+  and public registration of custom model architectures.
+
+### New and Expanded Model Support
+
+#### LLM and MoE
+
+- **DeepSeek-V4.1-Flash:** Native model and checkpoint conversion, attention and
+  expert LoRA, packed SFT and context parallelism, H100-80GB recipes, and MedPix
+  vision SFT. The release includes the CP8 gradient-synchronization fix.
+  ([model guide](https://github.com/NVIDIA-NeMo/Automodel/blob/d5af786161ba6d2d3cb348558ff26d8cea299af4/docs/model-coverage/vlm/deepseek-ai/deepseek-v4-1-flash.mdx),
+  [#3855](https://github.com/NVIDIA-NeMo/Automodel/pull/3855),
+  [#3872](https://github.com/NVIDIA-NeMo/Automodel/pull/3872),
+  [#3879](https://github.com/NVIDIA-NeMo/Automodel/pull/3879),
+  [#3962](https://github.com/NVIDIA-NeMo/Automodel/pull/3962),
+  [#4221](https://github.com/NVIDIA-NeMo/Automodel/pull/4221))
+- **GLM-5.3-Flash:** Native hybrid KDA/DSA model, vision processing, distributed
+  checkpoint loading, and packed context-parallel training. The MedPix recipe
+  uses EP72/CP2 on 72 H100 GPUs; sparse attention combines FlashMLA forward with
+  cuDNN backward. TP, PP, video training, and full-model single-GPU loading are
+  outside this model's supported path. GLM-5.2 and GLM-5.3 also gain cuDNN DSA
+  training backends.
+  ([model guide](https://github.com/NVIDIA-NeMo/Automodel/blob/d5af786161ba6d2d3cb348558ff26d8cea299af4/docs/model-coverage/vlm/thudm/glm-5-3-flash.mdx),
+  [#3699](https://github.com/NVIDIA-NeMo/Automodel/pull/3699),
+  [#3127](https://github.com/NVIDIA-NeMo/Automodel/pull/3127),
+  [#3747](https://github.com/NVIDIA-NeMo/Automodel/pull/3747))
+- **Qwen3.8:** Adds 27B fine-tuning recipes and native Flash-Next language-only
+  training with a sharded Engram embedding table, sparse QSA attention, packed
+  sequences, and contiguous context parallelism. Flash-Next's QSA indexers remain
+  frozen; its checkpoint MTP head is not loaded. TP and PP are disabled in the
+  documented Flash-Next configurations.
+  ([model guide](https://github.com/NVIDIA-NeMo/Automodel/blob/d5af786161ba6d2d3cb348558ff26d8cea299af4/docs/model-coverage/llm/qwen/qwen3-8-flash-next.mdx),
+  [#3560](https://github.com/NVIDIA-NeMo/Automodel/pull/3560),
+  [#3690](https://github.com/NVIDIA-NeMo/Automodel/pull/3690))
+- **MiMo:** Adds MiMo-V2.5-Pro, MiMo-V2.6, and MiMo-V2.6-Pro support. The
+  MiMo-V2.6-Pro-RL recipes cover packed 64K Tulu3 text, MedPix full fine-tuning,
+  and MedPix LoRA on GB200. Keep expert-parallel groups within an NVLink domain.
+  ([recipe guide](https://github.com/NVIDIA-NeMo/Automodel/blob/d5af786161ba6d2d3cb348558ff26d8cea299af4/docs/model-coverage/llm/xiaomimimo/mimo-v2-6-pro-rl.mdx),
+  [#2514](https://github.com/NVIDIA-NeMo/Automodel/pull/2514),
+  [#3992](https://github.com/NVIDIA-NeMo/Automodel/pull/3992),
+  [#4054](https://github.com/NVIDIA-NeMo/Automodel/pull/4054))
+- **Additional architectures:** Dense Nemotron-H Nano 4B, a Laguna XS 2.1
+  training recipe, and encoder-decoder fine-tuning through
+  `NeMoAutoModelForSeq2SeqLM`, including a T5-small SQuAD example. The seq2seq
+  path does not wire up CP, TP, PP, or sequence packing.
+  ([#2670](https://github.com/NVIDIA-NeMo/Automodel/pull/2670),
+  [#3639](https://github.com/NVIDIA-NeMo/Automodel/pull/3639),
+  [#2860](https://github.com/NVIDIA-NeMo/Automodel/pull/2860))
+
+#### Vision-Language Models
+
+- **DeepSeek-V4-Flash Vision and Muse Glimmer:** Adds the DeepSeek-V4 vision
+  path and native Muse Glimmer training, checkpoint conversion, and distributed
+  model support.
+  ([#3772](https://github.com/NVIDIA-NeMo/Automodel/pull/3772),
+  [#3476](https://github.com/NVIDIA-NeMo/Automodel/pull/3476))
+- **Cohere North Micro Vision:** Adds Shopify product-catalogue and RDR LoRA
+  recipes, including checkpoint resume. This preview model uses remote-code
+  dependencies and is excluded from automatic release-scope CI discovery.
+  ([#3518](https://github.com/NVIDIA-NeMo/Automodel/pull/3518),
+  [#3400](https://github.com/NVIDIA-NeMo/Automodel/pull/3400))
+- **Existing VLM improvements:** Gemma 4 gains D512 FFPA attention on SM100 and
+  sliding-window communication improvements. MiniMax-M3 gains SM100 sparse
+  attention with a custom backward pass. Qwen3.5 gains packed vision training
+  with Transformer Engine and MTP with VLM context parallelism.
+  ([#3742](https://github.com/NVIDIA-NeMo/Automodel/pull/3742),
+  [#2984](https://github.com/NVIDIA-NeMo/Automodel/pull/2984),
+  [#3809](https://github.com/NVIDIA-NeMo/Automodel/pull/3809),
+  [#4303](https://github.com/NVIDIA-NeMo/Automodel/pull/4303),
+  [#3990](https://github.com/NVIDIA-NeMo/Automodel/pull/3990))
+
+### Speculative Decoding and Discrete-Diffusion LLMs
+
+- **DFlash 2:** Draft model, trainer, Qwen3 and Qwen3.8-27B recipes, dynamic
+  convolution, and candidate-path selection. Sampling supports top-p and top-k.
+  ([#3605](https://github.com/NVIDIA-NeMo/Automodel/pull/3605),
+  [#3627](https://github.com/NVIDIA-NeMo/Automodel/pull/3627))
+- **Additional draft targets and parallelism:** Kimi K3 DSpark, EAGLE-3, and
+  DFlash training; DeepSeek-V4.1 DSpark training; and Ulysses context parallelism
+  for the EAGLE-3 draft.
+  ([#3263](https://github.com/NVIDIA-NeMo/Automodel/pull/3263),
+  [#3286](https://github.com/NVIDIA-NeMo/Automodel/pull/3286),
+  [#3287](https://github.com/NVIDIA-NeMo/Automodel/pull/3287),
+  [#3875](https://github.com/NVIDIA-NeMo/Automodel/pull/3875),
+  [#3356](https://github.com/NVIDIA-NeMo/Automodel/pull/3356))
+- **Streaming supervision components:** EAGLE-3 feature production and loading,
+  an asynchronous producer, and a safetensors-backed shared-directory feature
+  store with backpressure.
+  ([#3085](https://github.com/NVIDIA-NeMo/Automodel/pull/3085),
+  [#3094](https://github.com/NVIDIA-NeMo/Automodel/pull/3094))
+- **I-DLM and SCDD:** I-DLM all-masked training uses `dllm.mode: idlm`; SCDD
+  adds mixed mask/uniform corruption, training, and sampling with
+  `dllm.mode: scdd`. Neither new mode supports context parallelism. SCDD does
+  not currently maintain the reference method's EMA weights.
+  ([#2437](https://github.com/NVIDIA-NeMo/Automodel/pull/2437),
+  [#3354](https://github.com/NVIDIA-NeMo/Automodel/pull/3354))
+
+### Diffusion
+
+- **HunyuanImage-3.0:** Native MoE text-to-image implementation with FSDP2,
+  expert parallelism, LoRA, full fine-tuning, preprocessing, and generation.
+  Recipes cover single-node LoRA and four-node full fine-tuning. TP, PP, CP,
+  image-to-image conditioning, and text-generation training are unsupported.
+  ([model and recipe guide](https://github.com/NVIDIA-NeMo/Automodel/blob/d5af786161ba6d2d3cb348558ff26d8cea299af4/docs/model-coverage/diffusion/tencent/hunyuan-image-3.mdx),
+  [#4113](https://github.com/NVIDIA-NeMo/Automodel/pull/4113),
+  [#4129](https://github.com/NVIDIA-NeMo/Automodel/pull/4129))
+- **Qwen-Image-2.1:** Full-parameter and LoRA text-to-image fine-tuning, a
+  dedicated latent/prompt preprocessing path, and generation recipes. Requires
+  a Diffusers build providing `QwenImage21Pipeline`.
+  ([model and recipe guide](https://github.com/NVIDIA-NeMo/Automodel/blob/d5af786161ba6d2d3cb348558ff26d8cea299af4/docs/model-coverage/diffusion/qwen/qwen-image-2-1.mdx),
+  [#4027](https://github.com/NVIDIA-NeMo/Automodel/pull/4027))
+- **Validation:** Periodic diffusion validation loss, retention of validation
+  tail batches, and sample-weighted validation loss.
+  ([#3579](https://github.com/NVIDIA-NeMo/Automodel/pull/3579),
+  [#4291](https://github.com/NVIDIA-NeMo/Automodel/pull/4291))
+
+### Retrieval and Embeddings
+
+- **Context-aware reranking:** Train rerankers with query-context pairs and
+  configurable prompt augmentation.
+  ([#3786](https://github.com/NVIDIA-NeMo/Automodel/pull/3786))
+- **Mistral3 vision-language retrieval:** Embedding training, reranking, and
+  multimodal hard-negative mining for text, images, and image-plus-text
+  documents. Exports preserve retrieval prompts, pooling, normalization,
+  attention policy, and scoring temperature; release backports fix portable
+  reranker exports and Pixtral image-attention boundaries.
+  ([#3915](https://github.com/NVIDIA-NeMo/Automodel/pull/3915),
+  [#4197](https://github.com/NVIDIA-NeMo/Automodel/pull/4197),
+  [#4267](https://github.com/NVIDIA-NeMo/Automodel/pull/4267))
+
+### Training, Parallelism, and Performance
+
+- **MoK experts:** Optional `dispatcher: mok` integration for fused dispatch
+  and expert computation, plus MXFP8 experts. Supported shapes, precision,
+  topology, and adapter combinations are checked explicitly.
+  ([#3422](https://github.com/NVIDIA-NeMo/Automodel/pull/3422),
+  [#3606](https://github.com/NVIDIA-NeMo/Automodel/pull/3606))
+- **Lower-memory DeepSeek-V4-Flash LoRA:** MXFP4-resident frozen experts avoid
+  keeping a full BF16 expert copy. This path requires expert parallelism and
+  `torch_mm` experts with the torch dispatcher; DeepEP experts are unsupported.
+  ([#2548](https://github.com/NVIDIA-NeMo/Automodel/pull/2548))
+- **MoE and Kimi K3 efficiency:** Compact HybridEP routing, reuse of DeepEP
+  dispatch layouts during activation-checkpoint recomputation, fused gradient
+  norm reduction, pipeline receive-buffer reuse, and opt-in Kimi K3 kernels.
+  ([#3404](https://github.com/NVIDIA-NeMo/Automodel/pull/3404),
+  [#3684](https://github.com/NVIDIA-NeMo/Automodel/pull/3684),
+  [#3685](https://github.com/NVIDIA-NeMo/Automodel/pull/3685),
+  [#3780](https://github.com/NVIDIA-NeMo/Automodel/pull/3780),
+  [#3954](https://github.com/NVIDIA-NeMo/Automodel/pull/3954))
+- **Kimi Linear:** Adds packed sequences and context parallelism.
+  ([#3243](https://github.com/NVIDIA-NeMo/Automodel/pull/3243))
+- **Weighted domain mixtures:** Configure sampling frequency separately from
+  each domain's objective weight for Megatron continual pretraining, with
+  per-domain token metrics and weighted validation. This initial path rejects
+  packing, PP, CP, JSON blends, and other unvalidated combinations.
+  ([#3303](https://github.com/NVIDIA-NeMo/Automodel/pull/3303))
+- **Correctness fixes:** Expert-parallel gradient clipping, TP replica
+  synchronization, TP knowledge-distillation gradient reduction, per-token
+  parallel cross-entropy gradients, and preservation of model input/output
+  dtypes through FSDP.
+  ([#3817](https://github.com/NVIDIA-NeMo/Automodel/pull/3817),
+  [#3822](https://github.com/NVIDIA-NeMo/Automodel/pull/3822),
+  [#3777](https://github.com/NVIDIA-NeMo/Automodel/pull/3777),
+  [#3853](https://github.com/NVIDIA-NeMo/Automodel/pull/3853),
+  [#4150](https://github.com/NVIDIA-NeMo/Automodel/pull/4150))
+
+### Data, Checkpointing, and Extensibility
+
+- **Data paths:** SynthTraces agent SFT, Shopify product-catalogue VLM data,
+  typed Datum records and collate-time THD packing, and `mask_generation_prompt`
+  to exclude generation-prompt tokens from loss.
+  ([#3371](https://github.com/NVIDIA-NeMo/Automodel/pull/3371),
+  [#3400](https://github.com/NVIDIA-NeMo/Automodel/pull/3400),
+  [#3514](https://github.com/NVIDIA-NeMo/Automodel/pull/3514),
+  [#3739](https://github.com/NVIDIA-NeMo/Automodel/pull/3739))
+- **Checkpoint loading:** DCP loading of standard Hugging Face safetensors,
+  broader low-memory MoE loading, and bounded quantized/GPT-OSS MXFP4 loading.
+  ([#3616](https://github.com/NVIDIA-NeMo/Automodel/pull/3616),
+  [#3610](https://github.com/NVIDIA-NeMo/Automodel/pull/3610),
+  [#3619](https://github.com/NVIDIA-NeMo/Automodel/pull/3619),
+  [#3623](https://github.com/NVIDIA-NeMo/Automodel/pull/3623))
+- **PEFT export and resume:** Fixes for grouped-expert merged exports,
+  DeepSeek-V4 LoRA reload/resume, Nemotron adapter namespaces and generation
+  configuration, and processor artifacts in merged VLM adapters.
+  ([#3834](https://github.com/NVIDIA-NeMo/Automodel/pull/3834),
+  [#4072](https://github.com/NVIDIA-NeMo/Automodel/pull/4072),
+  [#3866](https://github.com/NVIDIA-NeMo/Automodel/pull/3866),
+  [#3891](https://github.com/NVIDIA-NeMo/Automodel/pull/3891),
+  [#3270](https://github.com/NVIDIA-NeMo/Automodel/pull/3270))
+- **Custom architectures:** Register an architecture through the public
+  `nemo_automodel.register_architecture()` API or the
+  `nemo_automodel.architectures` entry-point group.
+  ([#3645](https://github.com/NVIDIA-NeMo/Automodel/pull/3645))
+- **Freezing:** `freeze_config.freeze_modules` and `unfreeze_modules` accept
+  module selectors and glob patterns.
+  ([#3681](https://github.com/NVIDIA-NeMo/Automodel/pull/3681))
+
+### Compatibility and Upgrade Notes
+
+- **Dependency baseline:** The release branch pins `transformers==5.18.0`
+  and requires `torchao>=0.16.0`. The optional PyTorch base stage uses NVIDIA
+  PyTorch `26.08-py3`. Use the release branch's dependency files when building an
+  environment; individual model guides may still mention older intermediate
+  Transformers pins.
+  ([package dependencies](https://github.com/NVIDIA-NeMo/Automodel/blob/d5af786161ba6d2d3cb348558ff26d8cea299af4/pyproject.toml),
+  [container definition](https://github.com/NVIDIA-NeMo/Automodel/blob/d5af786161ba6d2d3cb348558ff26d8cea299af4/docker/Dockerfile))
+- **Optional experiment tracking:** MLflow and Weights & Biases are optional
+  extras. Install `nemo-automodel[mlflow]` for the tracking client,
+  `nemo-automodel[mlflow-full]` for the full MLflow stack, or
+  `nemo-automodel[wandb]` for W&B.
+  ([#3785](https://github.com/NVIDIA-NeMo/Automodel/pull/3785),
+  [extra definitions](https://github.com/NVIDIA-NeMo/Automodel/blob/d5af786161ba6d2d3cb348558ff26d8cea299af4/pyproject.toml))
+- **Custom retrieval loaders:** Pass backbone options such as
+  `attn_implementation="sdpa"` by keyword; positional arguments after the
+  checkpoint path are forwarded to the backbone constructor.
+  ([#3915](https://github.com/NVIDIA-NeMo/Automodel/pull/3915))
+
+#### Native FlashAttention-4
 
 - Select the native CuTe backend with `model.backend.attn: fa4` in an
   `INSTALL_FA4=true` image. On models declaring native FA4 support,
@@ -20,7 +251,7 @@ description: ""
   not support local attention with 256-wide query/key and value heads; select
   `model.backend.attn: sdpa` for that combination.
 
-### NEAT packing API migration
+#### NEAT packing API migration
 
 - Packing now follows the built model's attention dispatch. The legacy YAML
   selector `packed_sequence.attn_implementation` is ignored with a warning.
@@ -45,6 +276,693 @@ description: ""
 - Qwen3.5 packing with load-balanced context parallelism now raises instead of
   silently losing document isolation. Use `cp_size: 1`, or the supported SDPA
   block-diagonal CP path for Qwen3.5-MoE.
+
+### External Contributors
+
+Thank you to the following community contributors for the code, documentation,
+tests, and fixes included in 26.10, and to everyone who reported issues,
+reviewed changes, and helped validate the release.
+
+- **[@akx](https://github.com/akx)** — expert-parallel collective deadlock fixes, Kimi-K2.5 checkpoint and quantization fixes, lint updates, and distributed-filesystem checkpoint handling. ([#3631](https://github.com/NVIDIA-NeMo/Automodel/pull/3631), [#3632](https://github.com/NVIDIA-NeMo/Automodel/pull/3632), [#3633](https://github.com/NVIDIA-NeMo/Automodel/pull/3633), [#3686](https://github.com/NVIDIA-NeMo/Automodel/pull/3686))
+- **[@Anai-Guo](https://github.com/Anai-Guo)** — removing a shadowed Kimi-K2.5-VL forward-test class. ([#3873](https://github.com/NVIDIA-NeMo/Automodel/pull/3873))
+- **[@andrewwhitecdw](https://github.com/andrewwhitecdw)** — removing an unused CI summary environment variable. ([#3536](https://github.com/NVIDIA-NeMo/Automodel/pull/3536))
+- **[@beccohov](https://github.com/beccohov)** — typed packing metadata in place of the global Hugging Face monkeypatch, and periodic diffusion validation loss. ([#3577](https://github.com/NVIDIA-NeMo/Automodel/pull/3577), [#3579](https://github.com/NVIDIA-NeMo/Automodel/pull/3579))
+- **[@Butterfingrz](https://github.com/Butterfingrz)** — Gemma 4 D512 FFPA attention on SM100 and MiniMax-M3 SM100 sparse attention with a custom backward pass. ([#3742](https://github.com/NVIDIA-NeMo/Automodel/pull/3742), [#3809](https://github.com/NVIDIA-NeMo/Automodel/pull/3809))
+- **[@coderaBruce](https://github.com/coderaBruce)** — preserving fused losses through MiniMax-M3-VL's `logits_to_keep` contract. ([#3511](https://github.com/NVIDIA-NeMo/Automodel/pull/3511))
+- **[@coding-famer](https://github.com/coding-famer)** — saving processor artifacts when merging VLM LoRA adapters. ([#3270](https://github.com/NVIDIA-NeMo/Automodel/pull/3270))
+- **[@dundysm](https://github.com/dundysm)** — accepting the singular embedding-key alias in Nemotron V3 Hugging Face checkpoints. ([#3999](https://github.com/NVIDIA-NeMo/Automodel/pull/3999))
+- **[@edjson](https://github.com/edjson)** — preserving FP32 routing weights in DeepSeek and Ling models. ([#3746](https://github.com/NVIDIA-NeMo/Automodel/pull/3746), [#3861](https://github.com/NVIDIA-NeMo/Automodel/pull/3861))
+- **Daniel Shen ([@excepshenal](https://github.com/excepshenal), [@dshen-crusoe](https://github.com/dshen-crusoe))** — MXFP4-resident MoE experts for DeepSeek-V4-Flash LoRA. ([#2548](https://github.com/NVIDIA-NeMo/Automodel/pull/2548))
+- **[@Faisal-Alsrheed](https://github.com/Faisal-Alsrheed)** — correcting the training dataloader annotation and modernizing optional types. ([#3534](https://github.com/NVIDIA-NeMo/Automodel/pull/3534))
+- **[@haowen-han](https://github.com/haowen-han)** — preserving FP32 rotary frequencies in the Qwen3.5 vision tower. ([#3856](https://github.com/NVIDIA-NeMo/Automodel/pull/3856))
+- **[@HuayiJin](https://github.com/HuayiJin)** — keeping Qwen3.8 Flash Next flex-QSA membership lookup in int64. ([#3802](https://github.com/NVIDIA-NeMo/Automodel/pull/3802))
+- **[@kabirvashisht4-glitch](https://github.com/kabirvashisht4-glitch)** — documentation corrections and fixes to dataset logging and collation, checkpoint sizing, sequence-classification loss, InfoNCE validation, scheduler resume, launcher overrides, and the torchao dependency floor. ([#3762](https://github.com/NVIDIA-NeMo/Automodel/pull/3762), [#3830](https://github.com/NVIDIA-NeMo/Automodel/pull/3830), [#3883](https://github.com/NVIDIA-NeMo/Automodel/pull/3883), [#4131](https://github.com/NVIDIA-NeMo/Automodel/pull/4131))
+- **[@kashif](https://github.com/kashif)** — I-DLM and SCDD training, streaming EAGLE-3 features, DFlash 2 training and sampling, DeepSeek-V4.1 DSpark support, and DiffusionGemma documentation. ([#2437](https://github.com/NVIDIA-NeMo/Automodel/pull/2437), [#3094](https://github.com/NVIDIA-NeMo/Automodel/pull/3094), [#3354](https://github.com/NVIDIA-NeMo/Automodel/pull/3354), [#3605](https://github.com/NVIDIA-NeMo/Automodel/pull/3605), [#3875](https://github.com/NVIDIA-NeMo/Automodel/pull/3875))
+- **[@khazic](https://github.com/khazic)** — speculative-decoding training, correctness fixes and documentation; Kimi Linear packing and context parallelism; SynthTraces data support; DeepSeek-V4.1-Flash training; and HunyuanImage-3.0 fine-tuning with expert parallelism. ([#3243](https://github.com/NVIDIA-NeMo/Automodel/pull/3243), [#3286](https://github.com/NVIDIA-NeMo/Automodel/pull/3286), [#3356](https://github.com/NVIDIA-NeMo/Automodel/pull/3356), [#3855](https://github.com/NVIDIA-NeMo/Automodel/pull/3855), [#4129](https://github.com/NVIDIA-NeMo/Automodel/pull/4129))
+- **[@linmuchuiyang](https://github.com/linmuchuiyang)** — selective activation-checkpoint replay fixes, DeepSeek-V4.1 H100 recipes and data preparation, and the CP8 gradient-synchronization fix backported into this release. ([#3961](https://github.com/NVIDIA-NeMo/Automodel/pull/3961), [#3962](https://github.com/NVIDIA-NeMo/Automodel/pull/3962), [#4203](https://github.com/NVIDIA-NeMo/Automodel/pull/4203), [#4221](https://github.com/NVIDIA-NeMo/Automodel/pull/4221))
+- **[@mikemikimike](https://github.com/mikemikimike)** — preventing tensor-parallel knowledge-distillation gradient over-reduction. ([#3777](https://github.com/NVIDIA-NeMo/Automodel/pull/3777))
+- **[@MohammedAlkindi](https://github.com/MohammedAlkindi)** — documentation and coverage-link repairs, UTF-8 configuration loading, multi-node SkyPilot rendezvous, SQuAD handling, PEFT compatibility and wildcard fixes, validation-loss reduction, and optimizer-group scheduling. ([#3769](https://github.com/NVIDIA-NeMo/Automodel/pull/3769), [#4037](https://github.com/NVIDIA-NeMo/Automodel/pull/4037), [#4043](https://github.com/NVIDIA-NeMo/Automodel/pull/4043), [#4045](https://github.com/NVIDIA-NeMo/Automodel/pull/4045), [#4050](https://github.com/NVIDIA-NeMo/Automodel/pull/4050))
+- **[@MrCapricornLiu](https://github.com/MrCapricornLiu)** — Mistral tokenizers in the distillation collator, InfoNCE masking order, and per-token gradients in parallel cross-entropy. ([#3849](https://github.com/NVIDIA-NeMo/Automodel/pull/3849), [#3850](https://github.com/NVIDIA-NeMo/Automodel/pull/3850), [#3853](https://github.com/NVIDIA-NeMo/Automodel/pull/3853))
+- **[@nathan-az](https://github.com/nathan-az)** — Gemma 4 sliding-window attention communication and FlashAttention improvements. ([#2984](https://github.com/NVIDIA-NeMo/Automodel/pull/2984))
+- **[@piyushumate](https://github.com/piyushumate)** — making MLflow and Weights & Biases optional dependencies. ([#3785](https://github.com/NVIDIA-NeMo/Automodel/pull/3785))
+- **[@ralovets](https://github.com/ralovets)** — base-weight loading with DDP and Megatron FSDP, RTX PRO 6000 MFU recognition, and multi-source dataset blending fixes. ([#3597](https://github.com/NVIDIA-NeMo/Automodel/pull/3597), [#3598](https://github.com/NVIDIA-NeMo/Automodel/pull/3598), [#3919](https://github.com/NVIDIA-NeMo/Automodel/pull/3919))
+- **[@rouchenzi](https://github.com/rouchenzi)** — keeping Qwen3.8 Flash Next PLE hashing and convolution within packed document boundaries. ([#4132](https://github.com/NVIDIA-NeMo/Automodel/pull/4132))
+- **[@sahel-sh](https://github.com/sahel-sh)** — configurable metric buffering, retaining retrieval metrics on preemption or error, and context-aware reranker training. ([#3541](https://github.com/NVIDIA-NeMo/Automodel/pull/3541), [#3583](https://github.com/NVIDIA-NeMo/Automodel/pull/3583), [#3786](https://github.com/NVIDIA-NeMo/Automodel/pull/3786))
+- **[@Simar-malhotra09](https://github.com/Simar-malhotra09)** and credited co-author **Matilda-Coder** — MiMo-V2.5-Pro model support. ([#2514](https://github.com/NVIDIA-NeMo/Automodel/pull/2514))
+- **[@stanley1208](https://github.com/stanley1208)** — FP8 loading checks, dense Nemotron-H and encoder-decoder support, PEFT checkpoint naming and export fixes, expert-parallel gradient clipping, generation-config export, and shared PEFT reload tests. ([#2350](https://github.com/NVIDIA-NeMo/Automodel/pull/2350), [#2670](https://github.com/NVIDIA-NeMo/Automodel/pull/2670), [#2860](https://github.com/NVIDIA-NeMo/Automodel/pull/2860), [#3817](https://github.com/NVIDIA-NeMo/Automodel/pull/3817), [#3945](https://github.com/NVIDIA-NeMo/Automodel/pull/3945))
+- **[@taran-dev4u](https://github.com/taran-dev4u)** — VLM processor serialization tests and Nemotron Omni PEFT save/reload key conversion. ([#3379](https://github.com/NVIDIA-NeMo/Automodel/pull/3379), [#3986](https://github.com/NVIDIA-NeMo/Automodel/pull/3986))
+- **[@waynel96](https://github.com/waynel96)** — GLM-5.3-Flash installation and parity documentation, KDA execution fixes, and the GLM5 Next training chat template. ([#3939](https://github.com/NVIDIA-NeMo/Automodel/pull/3939), [#4077](https://github.com/NVIDIA-NeMo/Automodel/pull/4077), [#4110](https://github.com/NVIDIA-NeMo/Automodel/pull/4110), [#4165](https://github.com/NVIDIA-NeMo/Automodel/pull/4165))
+- **[@yh0903](https://github.com/yh0903)** — avoiding retained routed inputs in chunked MoE checkpoints. ([#4103](https://github.com/NVIDIA-NeMo/Automodel/pull/4103))
+- **[@yuvalnissan](https://github.com/yuvalnissan)** — honoring the checkpoint's GLM indexer rotary layout. ([#4142](https://github.com/NVIDIA-NeMo/Automodel/pull/4142))
+- **[@ZenAlexa](https://github.com/ZenAlexa)** — advancing the DeepSeek-V4 pipeline media cursor for text-only microbatches. ([#3821](https://github.com/NVIDIA-NeMo/Automodel/pull/3821))
+- **[@zeryx](https://github.com/zeryx)** — the Shopify product-catalogue VLM dataset and Cohere Micro Vision model support. ([#3400](https://github.com/NVIDIA-NeMo/Automodel/pull/3400), [#3518](https://github.com/NVIDIA-NeMo/Automodel/pull/3518))
+
+## 0.6.0 · 26.08 (2026-08-26) · [PyPI](https://pypi.org/project/nemo-automodel/0.6.0/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.6.0) · [NGC Docker](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.08.00)
+
+### Highlights
+
+- **Frontier-scale MoE and multimodal models.** Train Moonshot AI's Kimi K3 (2.8T/104B active),
+  Thinking Machines Lab's Inkling (975B/41B active), MiniMax AI's MiniMax-M3 VL (428B/22B active),
+  Poolside's Laguna, and Zhipu AI's GLM-5.2.
+
+- **Long-context training.** Shard packed multi-document sequences with block-diagonal
+  variable-length context parallelism, and shard vision towers by frame to remove the redundant
+  vision compute of a CP fold; recipes reach 128K tokens at EP8/CP32.
+
+- **New attention and kernel backends.** Select FlashAttention 3 and 4, MagiAttention, FFPA for
+  headdim=512 layers, QuACK linear/RMSNorm/RoPE kernels, and scoped partial CUDA graphs for MoE.
+
+- **Resilient checkpointing.** Checkpoint on preemption signals, write to `msc://` cloud
+  directories, consolidate async saves in the background, bound checkpoint retention, and resume
+  past an interrupted save.
+
+- **Diffusion.** Fine-tune and generate with LTX-2.3 joint video+audio and Qwen-Image-Edit-2511, and
+  run context parallelism through the diffusers `ContextParallelConfig` API.
+
+### New Hardware and Precision Support
+
+- **FP8 draft training.** Extends the SFT recipes' top-level `fp8:` block to every speculative
+  recipe, swapping the draft's `nn.Linear` layers to torchao `Float8Linear` on SM89 and newer, with
+  `emulate: true` for older GPUs. ([#2963](https://github.com/NVIDIA-NeMo/Automodel/pull/2963))
+
+- **Quantized checkpoint ingestion.** Dequantizes MXFP4 dequantization for Kimi K3 and MXFP8
+  dequantization for MiniMax-M3 for BF16 training, keeps Kimi-K2.5-VL LoRA keys out of INT4
+  quantization on save, and fixes a TileLang `boolx8` backward codegen failure on the DeepSeek-V4
+  path. ([#3259](https://github.com/NVIDIA-NeMo/Automodel/pull/3259),
+  [#3295](https://github.com/NVIDIA-NeMo/Automodel/pull/3295),
+  [#3467](https://github.com/NVIDIA-NeMo/Automodel/pull/3467))
+
+### New and Expanded Model Support
+
+#### LLM and MoE
+
+- **Moonshot AI: Kimi K3** (2.8T / 104B-active MoE) — text-only [HellaSwag full
+  SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_finetune/kimi/k3_hellaswag.yaml)
+  at EP32/PP8 on 256 GB200 GPUs.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/model-coverage/llm/moonshotai/kimi-k3.mdx),
+  [#3259](https://github.com/NVIDIA-NeMo/Automodel/pull/3259),
+  [#3283](https://github.com/NVIDIA-NeMo/Automodel/pull/3283))
+
+- **Zhipu AI: GLM-5.2** (MoE with IndexShare DSA) —
+  [HellaSwag](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml)
+  and [Tulu-3
+  4K](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml)
+  at EP64/PP4, [Tulu-3
+  32K](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml)
+  at CP8/EP64/PP4,
+  [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_finetune/glm/glm_5.2_lora.yaml)
+  at EP128; selectable TileLang DSA kernels.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/model-coverage/llm/thudm/glm5-moe-dsa.mdx),
+  [#2633](https://github.com/NVIDIA-NeMo/Automodel/pull/2633),
+  [#2691](https://github.com/NVIDIA-NeMo/Automodel/pull/2691),
+  [#2695](https://github.com/NVIDIA-NeMo/Automodel/pull/2695),
+  [#3222](https://github.com/NVIDIA-NeMo/Automodel/pull/3222))
+
+- **Poolside: Laguna S 2.1** (118B / ~8B-active MoE) — [HellaSwag full
+  SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml)
+  at EP16.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/model-coverage/llm/poolside/laguna.mdx),
+  [#3148](https://github.com/NVIDIA-NeMo/Automodel/pull/3148))
+
+- **DeepSeek: DeepSeek-V4 Flash** (MoE) — [Tulu-3
+  SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_cp_tulu3.yaml)
+  at CP8/PP4/EP32 and
+  [pretraining](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_pretrain/deepseek_v4/deepseek_v4_flash_pretrain.yaml)
+  at PP4/EP32; packed THD under context parallelism.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/llm/dsv4-flash.mdx),
+  [#2590](https://github.com/NVIDIA-NeMo/Automodel/pull/2590),
+  [#2731](https://github.com/NVIDIA-NeMo/Automodel/pull/2731),
+  [#3227](https://github.com/NVIDIA-NeMo/Automodel/pull/3227),
+  [#3231](https://github.com/NVIDIA-NeMo/Automodel/pull/3231))
+
+#### VLM
+
+- **MiniMax AI: MiniMax-M3 VL** (428B / 22B-active MoE) — [MedPix full
+  SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml)
+  at EP32/PP4 on 16 nodes, [MedPix
+  LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml)
+  at PP4/EP8, a [CP2 comparison
+  recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp2_medpix_2k.yaml),
+  and [16K packed Tulu-3 text
+  SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml)
+  at CP8.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/vlm/minimax-m3.mdx),
+  [#2538](https://github.com/NVIDIA-NeMo/Automodel/pull/2538),
+  [#2551](https://github.com/NVIDIA-NeMo/Automodel/pull/2551))
+
+- **Thinking Machines Lab: Inkling** (975B / 41B-active MoE; text, image, video, audio) — [MedPix
+  SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/inkling/inkling_medpix.yaml)
+  at PP8/EP32 on 32 nodes.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/model-coverage/vlm/thinkingmachines/inkling.mdx),
+  [#3095](https://github.com/NVIDIA-NeMo/Automodel/pull/3095),
+  [#3281](https://github.com/NVIDIA-NeMo/Automodel/pull/3281),
+  [#3358](https://github.com/NVIDIA-NeMo/Automodel/pull/3358))
+
+- **Alibaba: Qwen3.5 and Qwen3.6 VLM** (122B-A10B MoE, 27B dense) — [128K packed
+  sequences](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml)
+  at EP8/CP32 on 16 nodes with a trainable vision tower, dense context parallelism, and matched
+  [CP1](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/qwen3_5/qwen3_6_27b_medpix_cp1_2k_2node_100steps.yaml)/[CP2](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/qwen3_5/qwen3_6_27b_medpix_cp2_2k_2node_100steps.yaml)
+  27B MedPix recipes.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/vlm/qwen3-5.mdx),
+  [#2505](https://github.com/NVIDIA-NeMo/Automodel/pull/2505),
+  [#3186](https://github.com/NVIDIA-NeMo/Automodel/pull/3186),
+  [#3209](https://github.com/NVIDIA-NeMo/Automodel/pull/3209))
+
+- **Google: Gemma 4** (31B and E2B/E4B dense, 26B-A4B MoE) — context parallelism with [16K Tulu-3 at
+  CP8](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/gemma4/gemma4_31b_tulu3_text_cp8_16k.yaml),
+  [64K Tulu-3 at
+  CP16](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_cp16_64k.yaml),
+  and [4K MedPix at
+  EP8/CP2](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_medpix_ep8cp2_4k.yaml);
+  plus fp32 SDPA to avoid NaNs on Hopper and an exact fp32 reference router for MoE parity.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/vlm/gemma4.mdx),
+  [#1914](https://github.com/NVIDIA-NeMo/Automodel/pull/1914),
+  [#2592](https://github.com/NVIDIA-NeMo/Automodel/pull/2592),
+  [#2621](https://github.com/NVIDIA-NeMo/Automodel/pull/2621),
+  [#3141](https://github.com/NVIDIA-NeMo/Automodel/pull/3141))
+
+- **Moonshot AI: Kimi-K2.5 VL** (MoE) — LoRA tensors kept out of INT4 expert quantization on save,
+  so adapters reload on resume. ([#3295](https://github.com/NVIDIA-NeMo/Automodel/pull/3295),
+  [#3431](https://github.com/NVIDIA-NeMo/Automodel/pull/3431))
+
+- **NVIDIA: Nemotron-Parse** — corrected preprocessing stopping the RADIO encoder from normalizing
+  already-normalized images a second time.
+  ([#3331](https://github.com/NVIDIA-NeMo/Automodel/pull/3331))
+
+- **MTP on multimodal inputs.** Pre-rolls pre-fused `inputs_embeds` per depth so audio and vision
+  positions keep their continuous embedding instead of being re-embedded from a padding token id.
+  ([#2510](https://github.com/NVIDIA-NeMo/Automodel/pull/2510))
+
+- **Pre-extracted video frames.** Loads a `video` field holding a list of image paths directly as a
+  frame sequence with no decoder, padded to the processor's `temporal_patch_size`.
+  ([#3211](https://github.com/NVIDIA-NeMo/Automodel/pull/3211))
+
+#### Diffusion
+
+- **Lightricks: LTX-2.3** (video + audio) —
+  [full-finetuning](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml),
+  [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml),
+  and
+  [generation](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/diffusion/generate/configs/generate_ltx2.yaml)
+  recipes that train video and audio jointly and mux the generated waveform into the output mp4;
+  `--processor ltx2` preprocessing requires an `8n+1` frame count.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/model-coverage/diffusion/lightricks/ltx-2-3.mdx),
+  [#3165](https://github.com/NVIDIA-NeMo/Automodel/pull/3165),
+  [#3372](https://github.com/NVIDIA-NeMo/Automodel/pull/3372))
+
+- **Alibaba: Qwen-Image-Edit-2511** — cached, full-parameter instruction-based editing with an
+  offline latent and prompt cache encoder, an [eight-GPU BF16
+  recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml),
+  and an `image-edit` preprocessing subcommand.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/model-coverage/diffusion/qwen/qwen-image.mdx),
+  [#3217](https://github.com/NVIDIA-NeMo/Automodel/pull/3217))
+
+- **Diffusion context parallelism.** Drives the diffusers `ContextParallelConfig` API from
+  `fsdp.cp_size`, reusing the `cp` axis of the existing FSDP2 mesh; only pure Ulysses sharding is
+  accepted. ([#3157](https://github.com/NVIDIA-NeMo/Automodel/pull/3157))
+
+#### dLLM
+
+- **Google: DiffusionGemma 26B-A4B** (block-diffusion MoE) — a native implementation with GSM8K
+  [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/dllm_sft/diffusion_gemma_sft.yaml)
+  and
+  [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/dllm_sft/diffusion_gemma_lora.yaml)
+  recipes at `ep_size: 8`.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/dllm/diffusiongemma.mdx),
+  [#2506](https://github.com/NVIDIA-NeMo/Automodel/pull/2506))
+
+- **Generation and LoRA.** Exposes `--sampler` presets `llada`, `llada2`, `nemotron`, and `gemma`,
+  an `--adapter` merge path, and `llada_lora`, `llada2_lora`, and `nemotron_labs_diffusion_lora`
+  recipes. ([#3092](https://github.com/NVIDIA-NeMo/Automodel/pull/3092),
+  [#3161](https://github.com/NVIDIA-NeMo/Automodel/pull/3161),
+  [#3163](https://github.com/NVIDIA-NeMo/Automodel/pull/3163))
+
+- **Reproducible corruption.** Seeds corruption noise per sample from that example's global index in
+  the shuffled stream, so noise is independent of parallel topology and resume reproduces exactly.
+  ([#3162](https://github.com/NVIDIA-NeMo/Automodel/pull/3162))
+
+### Speculative Decoding
+
+- **DSpark.** Introduces a semi-autoregressive draft in which a parallel backbone proposes a whole
+  block, a serial Markov head adds intra-block dependency, and a confidence head predicts
+  acceptance, with configs for Qwen3, Gemma 4, GLM-5.2, MiniMax-M3, and DeepSeek-V4-Flash.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/speculative/dspark.mdx),
+  [#2810](https://github.com/NVIDIA-NeMo/Automodel/pull/2810),
+  [#2866](https://github.com/NVIDIA-NeMo/Automodel/pull/2866),
+  [#2885](https://github.com/NVIDIA-NeMo/Automodel/pull/2885),
+  [#2909](https://github.com/NVIDIA-NeMo/Automodel/pull/2909))
+
+- **Domino, JetSpec, and ViSpec.** Adds a GRU correction head on the DFlash backbone
+  ([Domino](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/speculative/dflash/qwen3_domino.yaml)),
+  causal in-block attention distilled with a temperature-scaled forward KL
+  ([JetSpec](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/speculative/jetspec/qwen3_jetspec.yaml)),
+  and two-stage VLM draft training
+  ([ViSpec](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/speculative/vispec/qwen2_5_vl_vispec.yaml)).
+  ([#2819](https://github.com/NVIDIA-NeMo/Automodel/pull/2819),
+  [#2867](https://github.com/NVIDIA-NeMo/Automodel/pull/2867),
+  [#3173](https://github.com/NVIDIA-NeMo/Automodel/pull/3173))
+
+- **New EAGLE-3 targets.** Registers a DeepSeek-V3 MLA draft class reusing the target's low-rank
+  q/kv projections, and registers Gemma 4 as a target with E2B, E4B, 31B, and 26B-A4B configs.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/speculative/eagle.mdx),
+  [#2849](https://github.com/NVIDIA-NeMo/Automodel/pull/2849),
+  [#3071](https://github.com/NVIDIA-NeMo/Automodel/pull/3071),
+  [#3077](https://github.com/NVIDIA-NeMo/Automodel/pull/3077),
+  [#3079](https://github.com/NVIDIA-NeMo/Automodel/pull/3079))
+
+- **Sequence packing, TP, and CP.** Enables block-causal packed training for every draft family,
+  target tensor parallelism for EAGLE-1/2/3 and DFlash, and context parallelism for both target and
+  draft through a differentiable ring attention.
+  ([#2827](https://github.com/NVIDIA-NeMo/Automodel/pull/2827),
+  [#2918](https://github.com/NVIDIA-NeMo/Automodel/pull/2918),
+  [#3002](https://github.com/NVIDIA-NeMo/Automodel/pull/3002),
+  [#3005](https://github.com/NVIDIA-NeMo/Automodel/pull/3005))
+
+- **fp8, compile, LoRA, and new objectives.** Exposes a `compile:` block, EAGLE-3 adapter-only
+  training through `peft:`, DFlash `loss_type: variable_prefix`, and EAGLE-3 `lk_loss_type:
+  alpha`/`lambda`. ([#2963](https://github.com/NVIDIA-NeMo/Automodel/pull/2963),
+  [#3032](https://github.com/NVIDIA-NeMo/Automodel/pull/3032),
+  [#3081](https://github.com/NVIDIA-NeMo/Automodel/pull/3081))
+
+- **Feature-noise augmentation.** Perturbs the target features fed to the EAGLE-1/2 draft with
+  uniform noise on the target features fed to the EAGLE-1/2 draft through
+  `recipe_args.feature_noise`, defaulting to the paper value `0.1`.
+  ([#2470](https://github.com/NVIDIA-NeMo/Automodel/pull/2470))
+
+- **On-policy regeneration.** Interleaves EAGLE-3 training with online target regeneration through a
+  `recipe_args.regen` block that interleaves EAGLE-3 training with online target regeneration on a
+  reserved GPU, hot-swapping the dataloader across all ranks in lockstep.
+  ([#3042](https://github.com/NVIDIA-NeMo/Automodel/pull/3042))
+
+- **Serving, benchmarking, and caches.** Covers `sglang` and `vllm` target backends for training
+  supervision, `serve_vllm` for trained EAGLE-3, P-EAGLE, and DFlash-family drafts,
+  `bench_vllm`/`bench_sweep` acceptance and speedup benchmarks, and distributed DSpark offline
+  precompute for targets too large for one node.
+  ([#2798](https://github.com/NVIDIA-NeMo/Automodel/pull/2798),
+  [#2841](https://github.com/NVIDIA-NeMo/Automodel/pull/2841),
+  [#2912](https://github.com/NVIDIA-NeMo/Automodel/pull/2912),
+  [#2953](https://github.com/NVIDIA-NeMo/Automodel/pull/2953))
+
+- **Metrics and resume.** Reports simulated accept length, per-position `accept_rate@k`, and
+  periodic real accept length through `decode_eval`, and rejects a mismatched `mask_token_id`, a
+  stale draft-vocab mapping, and mixed precompute shards on resume.
+  ([#2959](https://github.com/NVIDIA-NeMo/Automodel/pull/2959),
+  [#3037](https://github.com/NVIDIA-NeMo/Automodel/pull/3037),
+  [#3237](https://github.com/NVIDIA-NeMo/Automodel/pull/3237),
+  [#3238](https://github.com/NVIDIA-NeMo/Automodel/pull/3238))
+
+### Training, Parallelism, and Performance
+
+- **Block-diagonal variable-length context parallelism.** Introduces a `blockdiag_cp` implementation
+  that shards packed multi-document sequences while keeping masking block-causal per document,
+  driving varlen kernels from precomputed `cu_seqlens` with a fused K/V all-gather.
+  ([#2989](https://github.com/NVIDIA-NeMo/Automodel/pull/2989),
+  [#3223](https://github.com/NVIDIA-NeMo/Automodel/pull/3223))
+
+- **Unified context-parallel input preparation.** Returns a `ContextParallelSharder` from a single
+  `prepare_model_inputs_for_cp` hook and replaces `cp_utils` with
+  `components.distributed.context_parallel`.
+  ([#2937](https://github.com/NVIDIA-NeMo/Automodel/pull/2937))
+
+- **Frame-level vision-tower sharding.** Partitions frame units across the CP group through
+  `distributed.multimodal.vision.frame_sharding` and reassembles embeddings with a differentiable
+  variable-length all-gather.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/cp-vision-frame-sharding.mdx),
+  [#2990](https://github.com/NVIDIA-NeMo/Automodel/pull/2990),
+  [#3186](https://github.com/NVIDIA-NeMo/Automodel/pull/3186))
+
+- **Attention backends.** Selects `flash_attention_3` and `flash_attention_4` with a `fa4 → fa3 →
+  fa2 → sdpa → eager` fallback ladder, MagiAttention as both a kernel and a context-parallel backend
+  with
+  [CP1](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_finetune/qwen/qwen3_moe_30b_magi_packed_sequence.yaml)/[CP2](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_finetune/qwen/qwen3_moe_30b_magi_packed_sequence_cp2.yaml)
+  Qwen3-MoE-30B packed recipes, and a CuTeDSL FFPA backend for Gemma 4's head_dim=512 layers
+  ([8K](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/gemma4/gemma4_31b_ffpa_mock_8k.yaml),
+  [packed CP8
+  16K](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_finetune/gemma4/gemma4_31b_ffpa_mock_packing_cp8_16k.yaml)).
+  ([#2384](https://github.com/NVIDIA-NeMo/Automodel/pull/2384),
+  [#2929](https://github.com/NVIDIA-NeMo/Automodel/pull/2929),
+  [#3070](https://github.com/NVIDIA-NeMo/Automodel/pull/3070))
+
+- **QuACK kernels and partial CUDA graphs.** Exposes `quack` options for `backend.linear`,
+  `backend.rms_norm`, and `backend.rope`, and `backend.cuda_graph.modules` capture of `attn`,
+  `moe_router`, and `moe_preprocess` while dispatch, expert compute, and combine stay eager.
+  ([#2917](https://github.com/NVIDIA-NeMo/Automodel/pull/2917),
+  [#3115](https://github.com/NVIDIA-NeMo/Automodel/pull/3115))
+
+- **Activation checkpointing.** Accepts `activation_checkpointing: selective` for DDP and an
+  `activation_checkpointing_scope` selecting which layer groups are wrapped, and saves the MoE
+  router and its top-k output so recompute preserves expert assignments.
+  ([#2786](https://github.com/NVIDIA-NeMo/Automodel/pull/2786),
+  [#2840](https://github.com/NVIDIA-NeMo/Automodel/pull/2840),
+  [#3140](https://github.com/NVIDIA-NeMo/Automodel/pull/3140),
+  [#3247](https://github.com/NVIDIA-NeMo/Automodel/pull/3247))
+
+- **Cross-entropy memory.** Supports `FusedLinearCrossEntropy` under pipeline parallelism and bounds
+  `ChunkedCrossEntropy` memory with a kernel that saves only original-dtype logits and recomputes
+  each softmax chunk in backward. ([#2927](https://github.com/NVIDIA-NeMo/Automodel/pull/2927),
+  [#2996](https://github.com/NVIDIA-NeMo/Automodel/pull/2996))
+
+- **FSDP2** Wraps HF transformer layers with PyTorch's non-reentrant `checkpoint_wrapper` to remove
+  duplicate prefetch all-gathers, and adds `distributed.multimodal.frozen_sharding` for fully frozen
+  towers. ([#3328](https://github.com/NVIDIA-NeMo/Automodel/pull/3328),
+  [#3411](https://github.com/NVIDIA-NeMo/Automodel/pull/3411),
+  [#3513](https://github.com/NVIDIA-NeMo/Automodel/pull/3513))
+
+- **Gradient correctness.** Normalizes the MoE auxiliary loss by the gradient-accumulation and
+  pipeline-microbatch count, all-reduces grad-norm accumulators on the mesh device, and preserves
+  HSDP replica gradient synchronization for MoE.
+  ([#3135](https://github.com/NVIDIA-NeMo/Automodel/pull/3135),
+  [#3359](https://github.com/NVIDIA-NeMo/Automodel/pull/3359),
+  [#3461](https://github.com/NVIDIA-NeMo/Automodel/pull/3461))
+
+- **Damaged-embedding repair.** Replaces, through an optional `embedding_row_repair:` section,
+  input-embedding rows whose L2 norm is non-finite or below `min_norm` with the scaled
+  output-embedding direction; it is rejected under pipeline parallelism.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/model-coverage/troubleshooting.mdx#enable-the-repair),
+  [#3136](https://github.com/NVIDIA-NeMo/Automodel/pull/3136))
+
+- **Setup-time prewarms and mesh timeouts.** Initializes lazily created resources through an opt-in
+  `prewarm:` section covering `cublas_backward`, `fla_gdn_autotune`, `mamba_ssd_autotune`, and
+  `comm_groups`, and applies `dist_env.timeout_minutes` to flattened and expert-parallel meshes.
+  ([#2846](https://github.com/NVIDIA-NeMo/Automodel/pull/2846),
+  [#2992](https://github.com/NVIDIA-NeMo/Automodel/pull/2992),
+  [#3296](https://github.com/NVIDIA-NeMo/Automodel/pull/3296))
+
+- **Rollout Routing Replay.** Reuses the rollout's discrete top-k expert selection in the training
+  forward through `MoEConfig.enable_routing_replay`, which reuses the rollout's discrete top-k
+  expert selection in the training forward to remove the rollout/training routing mismatch in
+  on-policy RL. ([#2797](https://github.com/NVIDIA-NeMo/Automodel/pull/2797))
+
+- **Optimizer parameter groups and throughput.** Adds `optimizer.param_group_overrides` with
+  `lr_mult` and `wd_mult` multipliers, removes Python overhead from Transformer Engine attention and
+  MoE expert hot paths, and shapes `TPLinear`/`LinearLoRA` graphs so async-TP fusion fires.
+  ([#2987](https://github.com/NVIDIA-NeMo/Automodel/pull/2987),
+  [#3046](https://github.com/NVIDIA-NeMo/Automodel/pull/3046),
+  [#3374](https://github.com/NVIDIA-NeMo/Automodel/pull/3374))
+
+- **PEFT under pipeline and expert parallelism.** Gathers adapter weights across pipeline stages
+  before writing and saves optimizer state for every PEFT model part namespaced by stage.
+  ([#3096](https://github.com/NVIDIA-NeMo/Automodel/pull/3096),
+  [#3250](https://github.com/NVIDIA-NeMo/Automodel/pull/3250),
+  [#3316](https://github.com/NVIDIA-NeMo/Automodel/pull/3316))
+
+- **PEFT v5 expert adapters.** Exports MoE expert LoRA through an opt-in PEFT v0.18+ ParamWrapper
+  export for MoE expert LoRA with fused `target_parameters`, validated on Qwen3-MoE, MiniMax-M2, and
+  Nemotron v3. ([#3439](https://github.com/NVIDIA-NeMo/Automodel/pull/3439),
+  [#3458](https://github.com/NVIDIA-NeMo/Automodel/pull/3458))
+
+- **LoRA correctness.** Makes `use_memory_efficient_lora: false` also suppress the fused
+  SwiGLU/ReLU² LoRA MLP, restores adapters through DDP wrappers, and reaches the absorbed GLM MLA KV
+  weight through a new `materialize_effective_weight()`.
+  ([#3126](https://github.com/NVIDIA-NeMo/Automodel/pull/3126),
+  [#3150](https://github.com/NVIDIA-NeMo/Automodel/pull/3150),
+  [#3176](https://github.com/NVIDIA-NeMo/Automodel/pull/3176),
+  [#3470](https://github.com/NVIDIA-NeMo/Automodel/pull/3470))
+
+### Checkpointing
+
+- **Preemption checkpointing.** Introduces `step_scheduler.preemption_signal`, which watches one or
+  more signals (default `SIGTERM`), gathers the flag across ranks, and saves at the next step
+  boundary before exiting cleanly.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/checkpointing.mdx),
+  [#3007](https://github.com/NVIDIA-NeMo/Automodel/pull/3007))
+
+- **Cloud checkpoint directories.** Accepts `msc://` paths for sharded DCP state; cloud roots
+  require `save_consolidated: false`, reject `max_recent_checkpoints`, and keep RNG, dataloader, and
+  pointer files local. ([#1709](https://github.com/NVIDIA-NeMo/Automodel/pull/1709))
+
+- **Retention and interrupted saves.** Prunes older directories through `max_recent_checkpoints`,
+  and marks in-progress directories until every component is published so resume falls back instead
+  of hanging all ranks. ([#2416](https://github.com/NVIDIA-NeMo/Automodel/pull/2416),
+  [#3261](https://github.com/NVIDIA-NeMo/Automodel/pull/3261))
+
+- **Async consolidation and new knobs.** Runs consolidated safetensors export through the same
+  all-rank consolidation as synchronous mode on a background thread, and adds `cpu_offload`,
+  `wait_for_staging`, and `consolidation_timeout_minutes`.
+  ([#3108](https://github.com/NVIDIA-NeMo/Automodel/pull/3108),
+  [#3125](https://github.com/NVIDIA-NeMo/Automodel/pull/3125),
+  [#3130](https://github.com/NVIDIA-NeMo/Automodel/pull/3130),
+  [#3131](https://github.com/NVIDIA-NeMo/Automodel/pull/3131))
+
+- **torchsave export to Hugging Face.** Adds `scripts/export_llm_dcp_to_hf.py`, which rebuilds the
+  original topology from the checkpoint's recorded `config.yaml` and dispatches the LLM or VLM
+  recipe named there, so a VLM checkpoint keeps its vision tower.
+  ([#2487](https://github.com/NVIDIA-NeMo/Automodel/pull/2487))
+
+- **Export fidelity and safety.** Keeps fp32 parameters fp32 even under an explicit `cast_dtype`,
+  writes safetensors without append, retains later-stage keys in pipeline-parallel consolidation,
+  and loads auxiliary `torch.save` state with `weights_only=True`.
+  ([#2627](https://github.com/NVIDIA-NeMo/Automodel/pull/2627),
+  [#3193](https://github.com/NVIDIA-NeMo/Automodel/pull/3193),
+  [#3240](https://github.com/NVIDIA-NeMo/Automodel/pull/3240),
+  [#3248](https://github.com/NVIDIA-NeMo/Automodel/pull/3248))
+
+- **Per-global-rank RNG state.** Saves and restores RNG state per global rank rather than per
+  data-parallel rank, so tensor- and pipeline-parallel peers keep distinct streams across a resume.
+  ([#3437](https://github.com/NVIDIA-NeMo/Automodel/pull/3437))
+
+- **Tied-embedding guards.** Declares a `TieSupport` policy per model class and rejects an
+  unsupported `tie_word_embeddings` value.
+  ([#2805](https://github.com/NVIDIA-NeMo/Automodel/pull/2805),
+  [#2896](https://github.com/NVIDIA-NeMo/Automodel/pull/2896),
+  [#2998](https://github.com/NVIDIA-NeMo/Automodel/pull/2998))
+
+### Data
+
+- **Typed dataset configs.** Gives every shipped dataset a typed `*Config` with a `build` method and
+  resolves `dataset:` and `dataloader:` into a single `DataloaderConfig`; legacy `_target_` values
+  still resolve through a compatibility registry.
+  ([#2390](https://github.com/NVIDIA-NeMo/Automodel/pull/2390))
+
+- **Prefix-tree attention for rollouts.** Folds, through `prefix_tree_collate_fn`, one shared prompt
+  and its completions into a single deduplicated sequence with a block-sparse mask so the prompt is
+  encoded once. ([#2564](https://github.com/NVIDIA-NeMo/Automodel/pull/2564))
+
+- **Long-context agent-SFT data pipeline.** Tokenizes CoderForge trajectories once in a dedicated
+  stage and drops over-length ones rather than truncating, with a paired [Gemma-4-31B
+  recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml)
+  at `seq_length: 65536` and `cp_size: 8`.
+  ([#3151](https://github.com/NVIDIA-NeMo/Automodel/pull/3151),
+  [#3446](https://github.com/NVIDIA-NeMo/Automodel/pull/3446))
+
+- **Chat-template masking and pre-tokenization.** Validates prefix-built answer-only masks against
+  the full-conversation render, keeps `system` turns in the ShareGPT converter, and adds
+  `packed_sequence.num_proc` for parallel pre-tokenization before packing.
+  ([#3024](https://github.com/NVIDIA-NeMo/Automodel/pull/3024),
+  [#3045](https://github.com/NVIDIA-NeMo/Automodel/pull/3045),
+  [#3144](https://github.com/NVIDIA-NeMo/Automodel/pull/3144))
+
+### Embedding and Re-ranker
+
+- **Normalized Arrow retrieval datasets.** Reads, through `NormalizedRetrievalDatasetConfig`, a
+  portable Arrow bundle that stores each referenced document or image once, with a CPU-side
+  preparation script and Slurm wrappers.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/llm/retrieval-dataset.mdx),
+  [#2596](https://github.com/NVIDIA-NeMo/Automodel/pull/2596))
+
+- **NVIDIA: Nemotron VL 1B.** Adds a native `llama_nemotron_vl` model and processor for
+  `nvidia/llama-nemotron-embed-vl-1b-v2`, trained as a vision bi-encoder with a [bi-encoder
+  recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml)
+  and a ColPali conversion notebook.
+  ([docs](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/docs/guides/llm/retrieval-finetune.mdx),
+  [#2354](https://github.com/NVIDIA-NeMo/Automodel/pull/2354))
+
+- **Cross-encoder re-ranking.** `use_text_in_document` applies to the
+  [cross-encoder](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/retrieval/cross_encoder/llama3_2_1b.yaml)
+  transform as well as the bi-encoder, so a re-ranker can score an image document together with its
+  text. ([#3189](https://github.com/NVIDIA-NeMo/Automodel/pull/3189))
+
+- **Embedding distillation.** Distills a teacher embedding model into a student with
+  `EmbeddingDistillRecipe` and an [8-GPU
+  example](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/retrieval/distillation/nemotron3_embed_1b_distill.yaml),
+  mixing cosine, MSE, and listwise InfoNCE terms with support for intermediate-layer distillation
+  and cross-tokenizer cached teachers. ([#3058](https://github.com/NVIDIA-NeMo/Automodel/pull/3058))
+
+- **Ministral 3 recipes.** Loads the stock bidirectional Ministral backbone instead of a bespoke
+  extraction, repairs the [bi-encoder
+  recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml),
+  and guards the optional Weights & Biases import so the retrieval recipes import without it.
+  ([#3103](https://github.com/NVIDIA-NeMo/Automodel/pull/3103),
+  [#3380](https://github.com/NVIDIA-NeMo/Automodel/pull/3380),
+  [#3441](https://github.com/NVIDIA-NeMo/Automodel/pull/3441))
+
+- **Sentence Transformers metadata.** Writes `modules.json`, `1_Pooling/config.json`, and
+  `config_sentence_transformers.json` alongside consolidated bi-encoder exports, which the
+  hard-negative miner reads back for pooling and normalization.
+  ([#3464](https://github.com/NVIDIA-NeMo/Automodel/pull/3464))
+
+### Distillation
+
+- **Distillation on separate meshes.** Places the teacher on its own ranks through `separate_meshes:
+  true` and a `teacher_distributed:` block, with [Llama-3.2
+  1B/3B](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_tp2.yaml)
+  and [Qwen3.5
+  4B/9B](https://github.com/NVIDIA-NeMo/Automodel/blob/v0.6.0/examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_tp2.yaml)
+  examples under TP2, CP2, PP2, or DP2 teacher meshes.
+  ([#2954](https://github.com/NVIDIA-NeMo/Automodel/pull/2954),
+  [#3280](https://github.com/NVIDIA-NeMo/Automodel/pull/3280))
+
+- **Distillation correctness.** Resolves fp32 master weights for the student, runs gradient clipping
+  on the recipe's own mesh with the expert TP replication factor, and passes tensor-valued hidden
+  states through unchanged. ([#3019](https://github.com/NVIDIA-NeMo/Automodel/pull/3019),
+  [#3302](https://github.com/NVIDIA-NeMo/Automodel/pull/3302),
+  [#3324](https://github.com/NVIDIA-NeMo/Automodel/pull/3324))
+
+### Packaging and Dependencies
+
+- **Framework pins.** Moves `transformers` from 5.8.1 to 5.12.1 and `megatron-fsdp` from 0.2.3 to a
+  pinned 0.5.0 resolved from a Megatron-LM fork commit; both force an environment rebuild.
+  ([#2873](https://github.com/NVIDIA-NeMo/Automodel/pull/2873))
+
+- **QuACK is a default dependency.** Promotes `quack-kernels==0.6.1` to the base dependencies on
+  Linux, which pulls `nvidia-cutlass-dsl`, `apache-tvm-ffi`, and `torch-c-dlpack-ext` into every
+  Linux install. ([#3115](https://github.com/NVIDIA-NeMo/Automodel/pull/3115))
+
+- **New optional dependency sets.** Adds an `ffpa` extra with `ffpa-attn` and `nvidia-cutlass-dsl`,
+  and ships MagiAttention as a uv dependency group installed with `uv sync --group magi`; neither is
+  part of `[all]`. ([#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436),
+  [#3070](https://github.com/NVIDIA-NeMo/Automodel/pull/3070),
+  [#3225](https://github.com/NVIDIA-NeMo/Automodel/pull/3225))
+
+- **Container.** Builds FlashAttention 3 from source on x86 by default and leaves FlashAttention 4
+  opt-in behind `INSTALL_FA4=true`, moves the optional PyTorch base stage to `pytorch:26.06-py3`,
+  and moves the deploy image to `vllm:26.04-py3`.
+  ([#2929](https://github.com/NVIDIA-NeMo/Automodel/pull/2929),
+  [#2983](https://github.com/NVIDIA-NeMo/Automodel/pull/2983),
+  [#3061](https://github.com/NVIDIA-NeMo/Automodel/pull/3061),
+  [#3329](https://github.com/NVIDIA-NeMo/Automodel/pull/3329))
+
+- **Security constraints.** Advances `aiohttp`, `cryptography`, `gitpython`, `pillow`, `starlette`,
+  `mlflow`, and `thrift`, and adds `pyarrow` and `ray` constraints.
+  ([#3346](https://github.com/NVIDIA-NeMo/Automodel/pull/3346),
+  [#3398](https://github.com/NVIDIA-NeMo/Automodel/pull/3398),
+  [#3482](https://github.com/NVIDIA-NeMo/Automodel/pull/3482),
+  [#3523](https://github.com/NVIDIA-NeMo/Automodel/pull/3523))
+
+### Media dependencies
+
+Media packages remain opt-in. The `vlm-media` extra adds `albumentations` for the Nemotron-Parse processor and `diffusion-media` adds PyAV for LTX-2 audio decoding; the `diffusion` extra now requires `diffusers>=0.39.0`:
+
+```shell
+uv pip install 'nemo-automodel[media]==0.6.0'
+```
+
+Use `nemo-automodel[vlm-media]` or `nemo-automodel[diffusion-media]` when only one of those media stacks is required.
+
+### Breaking Changes
+
+- `tie_word_embeddings` is validated per model family and raises instead of leaving a randomly
+  initialized `lm_head`. ([#2805](https://github.com/NVIDIA-NeMo/Automodel/pull/2805),
+  [#2896](https://github.com/NVIDIA-NeMo/Automodel/pull/2896),
+  [#2998](https://github.com/NVIDIA-NeMo/Automodel/pull/2998))
+
+- Tokenizer BOS/EOS insertion is opt-in; set `add_bos_token` / `add_eos_token` to keep the previous
+  tokenization. ([#3337](https://github.com/NVIDIA-NeMo/Automodel/pull/3337))
+
+- Multi-turn masking raises on chat templates that rewrite earlier turns; affected templates must
+  carry `{% generation %}` blocks. ([#3024](https://github.com/NVIDIA-NeMo/Automodel/pull/3024),
+  [#3051](https://github.com/NVIDIA-NeMo/Automodel/pull/3051))
+
+- Unrecognized keys under `dataloader:` or on a typed dataset config now raise instead of being
+  silently forwarded. ([#2390](https://github.com/NVIDIA-NeMo/Automodel/pull/2390))
+
+- DFlash requires an explicit `mask_token_id`, and `loss_decay_gamma` defaults to 7.0.
+  ([#2461](https://github.com/NVIDIA-NeMo/Automodel/pull/2461),
+  [#2908](https://github.com/NVIDIA-NeMo/Automodel/pull/2908))
+
+- `BaichuanForCausalLM`, `Qwen2ForCausalLM`, and `KimiVLForConditionalGeneration` are deprecated and
+  scheduled for removal in 26.10. ([#2807](https://github.com/NVIDIA-NeMo/Automodel/pull/2807),
+  [#2884](https://github.com/NVIDIA-NeMo/Automodel/pull/2884))
+
+### External Contributors
+
+This release includes work from the following contributors outside the NVIDIA-NeMo organization. Thank you.
+
+- **[@khazic](https://github.com/khazic)** — most of the speculative-decoding stack in this release:
+  the DSpark, Domino, and JetSpec drafts, ViSpec VLM draft training, sequence packing and target
+  tensor/context parallelism across every draft family, the vLLM and SGLang target backends, serving
+  and acceptance benchmarks, and Gemma 4 ring context parallelism (94 PRs).
+  ([#2449](https://github.com/NVIDIA-NeMo/Automodel/pull/2449),
+  [#2810](https://github.com/NVIDIA-NeMo/Automodel/pull/2810),
+  [#2819](https://github.com/NVIDIA-NeMo/Automodel/pull/2819),
+  [#2867](https://github.com/NVIDIA-NeMo/Automodel/pull/2867),
+  [#3173](https://github.com/NVIDIA-NeMo/Automodel/pull/3173))
+
+- **[@Achyuthan-S](https://github.com/Achyuthan-S)** — the `TieSupport` policy and
+  `tie_word_embeddings` guards across the registered model families.
+  ([#2732](https://github.com/NVIDIA-NeMo/Automodel/pull/2732),
+  [#2805](https://github.com/NVIDIA-NeMo/Automodel/pull/2805),
+  [#2896](https://github.com/NVIDIA-NeMo/Automodel/pull/2896),
+  [#2998](https://github.com/NVIDIA-NeMo/Automodel/pull/2998))
+
+- **[@kashif](https://github.com/kashif)** — the DSpark draft model and training objective, context
+  parallelism for draft training, and DSpark acceptance and confidence metrics.
+  ([#2810](https://github.com/NVIDIA-NeMo/Automodel/pull/2810),
+  [#2918](https://github.com/NVIDIA-NeMo/Automodel/pull/2918),
+  [#2957](https://github.com/NVIDIA-NeMo/Automodel/pull/2957))
+
+- **[@edjson](https://github.com/edjson)** — MSC cloud-storage support for DCP checkpoints and
+  preemption checkpointing. ([#1709](https://github.com/NVIDIA-NeMo/Automodel/pull/1709),
+  [#3007](https://github.com/NVIDIA-NeMo/Automodel/pull/3007))
+
+- **[@Butterfingrz](https://github.com/Butterfingrz)** — the FFPA headdim=512 attention backend for
+  Gemma 4. ([#2436](https://github.com/NVIDIA-NeMo/Automodel/pull/2436))
+
+- **[@beccohov](https://github.com/beccohov)** — `FusedLinearCrossEntropy` support under pipeline
+  parallelism. ([#2927](https://github.com/NVIDIA-NeMo/Automodel/pull/2927))
+
+- **[@fkuner](https://github.com/fkuner)** — the DSpark offline target-cache path.
+  ([#2924](https://github.com/NVIDIA-NeMo/Automodel/pull/2924))
+
+- **[@GITsologun](https://github.com/GITsologun)** — pre-extracted video frame sequences in the VLM
+  data path. ([#3211](https://github.com/NVIDIA-NeMo/Automodel/pull/3211))
+
+- **[@hyfine](https://github.com/hyfine)** — gathering PEFT adapters across pipeline stages before
+  save. ([#3096](https://github.com/NVIDIA-NeMo/Automodel/pull/3096))
+
+- **[@wangzhxg](https://github.com/wangzhxg)** — preserving HSDP replica gradient synchronization
+  for MoE models. ([#3135](https://github.com/NVIDIA-NeMo/Automodel/pull/3135))
+
+- **[@shahafwa](https://github.com/shahafwa)** — applying LoRA to the TileLang MLA KV projection.
+  ([#3176](https://github.com/NVIDIA-NeMo/Automodel/pull/3176))
+
+- **[@amolkhanna](https://github.com/amolkhanna)** — activation checkpointing for Qwen3-Next
+  linear-attention layers. ([#3192](https://github.com/NVIDIA-NeMo/Automodel/pull/3192))
+
+- **[@aminehd](https://github.com/aminehd)** — running Gemma 4 SDPA in fp32 to avoid NaNs on Hopper.
+  ([#3141](https://github.com/NVIDIA-NeMo/Automodel/pull/3141))
+
+- **[@huahuajhu](https://github.com/huahuajhu)** — writing consolidated safetensors without append.
+  ([#2627](https://github.com/NVIDIA-NeMo/Automodel/pull/2627))
+
+- **[@zhiqi-li](https://github.com/zhiqi-li)** — omitting the unset FSDP reshard argument.
+  ([#2926](https://github.com/NVIDIA-NeMo/Automodel/pull/2926))
+
+- **[@DOGEUNNKIM](https://github.com/DOGEUNNKIM)** — casting Gemma 4 dense parameters without
+  casting buffers. ([#2359](https://github.com/NVIDIA-NeMo/Automodel/pull/2359))
+
+- **[@grgkovac](https://github.com/grgkovac)** — per-validation-dataset logging in Weights & Biases.
+  ([#2526](https://github.com/NVIDIA-NeMo/Automodel/pull/2526))
+
+### Known Issues
+
+- Transformer Engine fused RoPE is force-disabled globally and overrides an explicit `rope_fusion:
+  true`. ([#3028](https://github.com/NVIDIA-NeMo/Automodel/pull/3028))
+
+- Inter-node DeepEP dispatch still faults and `deepep` remains the default whenever DeepEP is
+  importable; use HybridEP for inter-node EP.
+
+- FlashAttention 4 and the TileLang backend cannot coexist in one image; an `INSTALL_FA4=true` build
+  loses the TileLang backend used by DeepSeek-V4 and GLM MoE DSA.
+  ([#2929](https://github.com/NVIDIA-NeMo/Automodel/pull/2929))
+
+- P-EAGLE rejects a remote target backend, a cached target path, and packed sequences.
+  ([#2466](https://github.com/NVIDIA-NeMo/Automodel/pull/2466))
+
+- Qwen-Image-Edit-2511 training is limited to cached latents on a single node, and diffusion context
+  parallelism accepts only pure Ulysses sharding.
+  ([#3157](https://github.com/NVIDIA-NeMo/Automodel/pull/3157),
+  [#3217](https://github.com/NVIDIA-NeMo/Automodel/pull/3217))
 
 ## 0.5.0 · 26.06 · [PyPI](https://pypi.org/project/nemo-automodel/0.5.0/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.5.0) · [NGC Docker](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.06.00)
 

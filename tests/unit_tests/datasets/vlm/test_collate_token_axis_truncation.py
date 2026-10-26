@@ -77,3 +77,13 @@ def test_no_truncation_when_already_short():
 
     assert batch["input_ids"].shape == (1, 32)
     assert batch["pixel_values"].shape == (1, 64, 8)
+
+
+def test_assistant_masks_follow_the_token_axis():
+    """Generation-template masks are token-aligned and must be sliced with input_ids."""
+    batch = _batch(seq=100, patches=64, media_span=slice(0, 10))
+    batch["assistant_masks"] = torch.ones(1, 100, dtype=torch.long)
+
+    _truncate_token_axis(batch, max_length=50)
+
+    assert batch["assistant_masks"].shape == (1, 50)

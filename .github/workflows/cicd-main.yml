@@ -66,11 +66,13 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Set up UV
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -120,11 +122,13 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Set up UV
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -162,11 +166,13 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Set up UV
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true

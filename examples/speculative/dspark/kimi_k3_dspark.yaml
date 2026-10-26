@@ -82,3 +82,6 @@ checkpoint:
   model_save_format: safetensors
   save_consolidated: final
   dequantize_base_checkpoint: true
+
+ci:
+  cluster_tag: h100

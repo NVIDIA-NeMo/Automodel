@@ -130,5 +130,6 @@ optimizer:
 #   dir: /tmp/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: hemildesai
   node_multiplier: true

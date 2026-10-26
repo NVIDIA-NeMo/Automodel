@@ -512,12 +512,17 @@ class DummyNemotronOmniProcessor:
 
     image_token = "<image>"
     video_token = "<video>"
+    IMAGE_TOKEN_ID = 9
 
     def __init__(self):
         self.tokenizer = self  # collate uses getattr(processor, "tokenizer", processor)
         self.pad_token_id = 0
         self.sample_lens = [3, 5]
         self._call_idx = 0
+
+    def convert_tokens_to_ids(self, token):
+        assert token == self.image_token
+        return self.IMAGE_TOKEN_ID
 
     def apply_chat_template(self, text_conversation, *, tokenize=False, **kwargs):
         assert tokenize is False
@@ -617,6 +622,96 @@ def test_nemotron_omni_collate_extracts_images(collate_mod, monkeypatch):
     assert "pixel_values" in batch
     assert batch["pixel_values"].dtype == torch.bfloat16  # collate casts to bf16
     assert "image_flags" in batch and batch["image_flags"].shape == (1, 1)
+
+
+class DummyNemotronOmniTruncationProcessor(DummyNemotronOmniProcessor):
+    """Variant returning fixed per-sample token ids where ``9`` is the image token.
+
+    Each sample carries one image whose ``(3, H, W)`` tile has a distinct height,
+    so the collate emits a ragged ``pixel_values`` list.
+    """
+
+    def __init__(self, sample_ids):
+        super().__init__()
+        self.sample_ids = sample_ids
+
+    def __call__(self, *, text, return_tensors, **kwargs):
+        assert return_tensors == "pt"
+        idx = self._call_idx
+        self._call_idx += 1
+        ids = torch.tensor([self.sample_ids[idx]], dtype=torch.long)
+        out = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+        if "images" in kwargs:
+            out["pixel_values"] = [torch.full((3, 4 + idx, 4), float(idx + 1))]
+        return out
+
+
+def _nemotron_omni_image_examples(n):
+    from PIL import Image as PILImage
+
+    return [
+        {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": PILImage.new("RGB", (4, 4))},
+                        {"type": "text", "text": "what is this?"},
+                    ],
+                },
+                {"role": "assistant", "content": "an image"},
+            ]
+        }
+        for _ in range(n)
+    ]
+
+
+@pytest.mark.parametrize(
+    "first_sample_ids",
+    [
+        # max_length cuts inside the first sample's image tokens.
+        [1, 7, 9, 9, 9, 9, 8, 2],
+        # The last kept image token is removed by the label shift.
+        [1, 7, 9, 9, 9, 8, 2],
+    ],
+)
+def test_nemotron_omni_collate_drops_images_cut_by_truncation(collate_mod, monkeypatch, first_sample_ids):
+    """A row whose image tokens are cut must not keep its image features.
+
+    The model scatters the concatenated features of the whole batch into the
+    image tokens in order, so leftover features of a truncated row would land
+    on the next row's image tokens.
+    """
+    second_sample_ids = [1, 7, 9, 9, 8, 2]
+    processor = DummyNemotronOmniTruncationProcessor([first_sample_ids, second_sample_ids])
+    monkeypatch.setattr(collate_mod, "build_labels", lambda ids, conv, p: torch.zeros_like(ids), raising=True)
+
+    batch = collate_mod.nemotron_omni_collate_fn(_nemotron_omni_image_examples(2), processor=processor, max_length=5)
+
+    image_token_id = DummyNemotronOmniTruncationProcessor.IMAGE_TOKEN_ID
+    assert not bool((batch["input_ids"][0] == image_token_id).any())
+    # Only the second sample's image survives, and its features cover exactly
+    # the image tokens left in the batch.
+    assert isinstance(batch["pixel_values"], torch.Tensor)
+    assert batch["pixel_values"].shape == (1, 3, 5, 4)
+    assert torch.all(batch["pixel_values"] == 2)
+    assert batch["image_flags"].shape == (1, 1)
+    assert batch["input_ids"].tolist() == [[1, 7, 0, 0], second_sample_ids[:4]]
+
+
+def test_nemotron_omni_collate_keeps_images_when_truncation_spares_them(collate_mod, monkeypatch):
+    """Truncating only text after the image keeps every image and image token."""
+    first_sample_ids = [1, 7, 9, 9, 8, 2, 3, 4]
+    second_sample_ids = [1, 7, 9, 9, 8, 2]
+    processor = DummyNemotronOmniTruncationProcessor([first_sample_ids, second_sample_ids])
+    monkeypatch.setattr(collate_mod, "build_labels", lambda ids, conv, p: torch.zeros_like(ids), raising=True)
+
+    batch = collate_mod.nemotron_omni_collate_fn(_nemotron_omni_image_examples(2), processor=processor, max_length=6)
+
+    assert batch["input_ids"].tolist() == [first_sample_ids[:5], second_sample_ids[:5]]
+    assert isinstance(batch["pixel_values"], list)
+    assert [tuple(pv.shape) for pv in batch["pixel_values"]] == [(3, 4, 4), (3, 5, 4)]
+    assert batch["image_flags"].shape == (2, 1)
 
 
 def test_qwen25_collate_shapes(collate_mod, monkeypatch):

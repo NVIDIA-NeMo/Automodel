@@ -49,32 +49,21 @@ def _flatten_media_groups(media: Any, batch_size: int) -> tuple[list[Any], list[
     return [value for group in groups for value in group], [len(group) for group in groups]
 
 
-def _replace_grouped_placeholders(
+def _validate_grouped_placeholders(
     texts: list[str],
     placeholder: str,
-    replacements: list[str],
     counts: list[int],
-) -> list[str]:
-    """Replace each sample's placeholders with its media expansions."""
-    if sum(counts) != len(replacements):
+    num_replacements: int,
+) -> None:
+    """Check that every sample has exactly one placeholder per media value."""
+    if sum(counts) != num_replacements:
         raise ValueError("Muse Spark Open media counts do not match replacement count")
-    cursor = 0
-    output = list(texts)
     for sample_idx, count in enumerate(counts):
-        if output[sample_idx].count(placeholder) != count:
+        if texts[sample_idx].count(placeholder) != count:
             raise ValueError(
-                f"Muse Spark Open sample {sample_idx} has {output[sample_idx].count(placeholder)} "
+                f"Muse Spark Open sample {sample_idx} has {texts[sample_idx].count(placeholder)} "
                 f"{placeholder!r} placeholders for {count} media values"
             )
-        # v2 uses the patch token as both placeholder and expanded token.
-        # Split once so a later image never expands an earlier image's output.
-        pieces = output[sample_idx].split(placeholder)
-        expanded = [pieces[0]]
-        for replacement, tail in zip(replacements[cursor : cursor + count], pieces[1:]):
-            expanded.extend((replacement, tail))
-        output[sample_idx] = "".join(expanded)
-        cursor += count
-    return output
 
 
 class MuseSparkProcessor(ProcessorMixin):
@@ -131,7 +120,12 @@ class MuseSparkProcessor(ProcessorMixin):
         audio: Any | None = None,
         **kwargs: Any,
     ) -> BatchFeature:
-        """Tokenize prompts after expanding image/video/audio placeholders."""
+        """Tokenize prompts after expanding image/video/audio placeholders.
+
+        Expansion goes through ``ProcessorMixin.get_text_with_replacements`` so the
+        processor can return ``text_replacement_offsets``; ``apply_chat_template``
+        needs them to keep ``{% generation %}`` spans aligned with expanded media.
+        """
         if images is None and text is None and videos is None and audio is None:
             raise ValueError("MuseSparkProcessor requires text or media")
         texts = [text] if isinstance(text, str) else list(text or [])
@@ -142,22 +136,25 @@ class MuseSparkProcessor(ProcessorMixin):
             tokenizer_init_kwargs=getattr(self.tokenizer, "init_kwargs", {}),
             **kwargs,
         )
+        text_kwargs = dict(merged["text_kwargs"])
+        return_text_replacement_offsets = text_kwargs.pop("return_text_replacement_offsets", False)
 
         flat_images, image_counts = _flatten_media_groups(images, len(texts))
         image_inputs: dict[str, Any] = {}
+        image_replacements: list[str] = []
         if flat_images:
             image_inputs = dict(self.image_processor(flat_images, **merged["images_kwargs"]))
             token_counts = image_inputs.pop("image_token_counts").tolist()
-            replacements = [
+            image_replacements = [
                 self.image_start_token + self.patch_token * int(count) + self.image_end_token for count in token_counts
             ]
-            texts = _replace_grouped_placeholders(texts, self.image_token, replacements, image_counts)
+            _validate_grouped_placeholders(texts, self.image_token, image_counts, len(image_replacements))
 
         flat_videos, video_counts = _flatten_media_groups(videos, len(texts))
         video_inputs: dict[str, Any] = {}
+        video_replacements: list[str] = []
         if flat_videos:
             features = [self.image_processor.preprocess_video(video) for video in flat_videos]
-            replacements = []
             for feature in features:
                 pieces = [self.video_start_token]
                 for clip_idx, timestamp in enumerate(feature.timestamps):
@@ -166,8 +163,8 @@ class MuseSparkProcessor(ProcessorMixin):
                     pieces.append(self.timestamp_format.format(s=timestamp))
                     pieces.append(self.video_patch_token * feature.tokens_per_clip)
                 pieces.append(self.video_end_token)
-                replacements.append("".join(pieces))
-            texts = _replace_grouped_placeholders(texts, self.video_token, replacements, video_counts)
+                video_replacements.append("".join(pieces))
+            _validate_grouped_placeholders(texts, self.video_token, video_counts, len(video_replacements))
             video_inputs = {
                 "pixel_values_videos": torch.cat([feature.patches for feature in features]),
                 "video_grid_thw": torch.tensor([feature.grid_thw for feature in features], dtype=torch.long),
@@ -175,9 +172,9 @@ class MuseSparkProcessor(ProcessorMixin):
 
         flat_audio, audio_counts = _flatten_media_groups(audio, len(texts))
         audio_inputs: dict[str, Any] = {}
+        audio_replacements: list[str] = []
         if flat_audio:
             waveforms = []
-            replacements = []
             for waveform in flat_audio:
                 value = torch.as_tensor(np.asarray(waveform), dtype=torch.float32)
                 if value.ndim > 1:
@@ -185,16 +182,21 @@ class MuseSparkProcessor(ProcessorMixin):
                 value = value.flatten()
                 waveforms.append(value)
                 token_count = math.ceil(value.numel() / _AUDIO_SAMPLES_PER_TOKEN)
-                replacements.append(
+                audio_replacements.append(
                     self.audio_start_token + self.audio_patch_token * token_count + self.audio_end_token
                 )
-            texts = _replace_grouped_placeholders(texts, self.audio_token, replacements, audio_counts)
+            _validate_grouped_placeholders(texts, self.audio_token, audio_counts, len(audio_replacements))
             audio_inputs = {"audio_values": waveforms}
 
-        text_inputs = self.tokenizer(texts, **merged["text_kwargs"])
+        texts, text_replacement_offsets = self.get_text_with_replacements(
+            texts, image_replacements, video_replacements, audio_replacements
+        )
+        text_inputs = self.tokenizer(texts, **text_kwargs)
+        if return_text_replacement_offsets:
+            text_inputs["text_replacement_offsets"] = text_replacement_offsets
         data = {**text_inputs, **image_inputs, **video_inputs, **audio_inputs}
-        return_tensors = merged["text_kwargs"].get("return_tensors")
-        return BatchFeature(data=data, tensor_type=return_tensors)
+        return_tensors = text_kwargs.get("return_tensors")
+        return BatchFeature(data=data, tensor_type=return_tensors, skip_tensor_conversion=self.skip_tensor_conversion)
 
     @property
     def model_input_names(self) -> list[str]:

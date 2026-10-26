@@ -18,7 +18,9 @@ from unittest.mock import MagicMock
 
 import torch
 from PIL import Image as PILImage
+from transformers.processing_utils import ProcessorMixin
 
+from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
     PackedSequenceContract,
@@ -1319,12 +1321,18 @@ def default_collate_fn(
         processing_kwargs["padding"] = "max_length"
         if drop_overlong:
             processing_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
+    chat_template = processor.chat_template if isinstance(processor, ProcessorMixin) else None
+    if isinstance(chat_template, dict):
+        chat_template = chat_template.get("default")
+    template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
+    template_kwargs = {"return_assistant_tokens_mask": True} if template_has_generation_kwd else {}
     batch = processor.apply_chat_template(
         conversations,
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
         processor_kwargs=processing_kwargs,
+        **template_kwargs,
     )
 
     if _post_tokenize_hook is not None:
@@ -1354,11 +1362,10 @@ def default_collate_fn(
                 value.to(torch.bfloat16) if isinstance(value, torch.Tensor) else value for value in pixel_values_videos
             ]
 
-    labels = build_labels_from_template(
-        batch["input_ids"],
-        conversations,
-        processor,
-    )
+    if template_has_generation_kwd:
+        labels = batch["input_ids"].masked_fill(batch.pop("assistant_masks") == 0, -100)
+    else:
+        labels = build_labels_from_template(batch["input_ids"], conversations, processor)
     batch["labels"] = labels[:, 1:]
 
     input_shape = batch["input_ids"].shape
@@ -2001,8 +2008,26 @@ def nemotron_omni_collate_fn(
 
     padded_input_ids = []
     padded_attention_masks = []
-    for input_ids, attn_mask in zip(all_input_ids, all_attention_masks):
+    for i, (input_ids, attn_mask) in enumerate(zip(all_input_ids, all_attention_masks)):
         seq_len = input_ids.shape[0]
+        # The final position is dropped by the label shift below, so any image
+        # token at or after ``target_len - 1`` loses its placeholder.
+        if seq_len >= target_len and (i in sample_pixel_values or i in sample_pixel_values_videos):
+            image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+            if bool((input_ids[target_len - 1 :] == image_token_id).any()):
+                # The model scatters the batch's concatenated image features into
+                # the image tokens in order, so a partially kept image would shift
+                # this row's leftover features into the next row. Drop this row's
+                # media and its remaining image tokens instead.
+                logger.warning(
+                    "max_length=%d cuts into the image tokens of sample %d (%d tokens); dropping its images.",
+                    target_len,
+                    i,
+                    seq_len,
+                )
+                sample_pixel_values.pop(i, None)
+                sample_pixel_values_videos.pop(i, None)
+                input_ids = input_ids.masked_fill(input_ids == image_token_id, pad_token_id)
         if seq_len < target_len:
             pad_len = target_len - seq_len
             input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=input_ids.dtype)])
@@ -2125,6 +2150,12 @@ def _inject_thinking_prefix_tokens(
         seq_keys.append("mm_token_type_ids")
         fill_defaults["mm_token_type_ids"] = 0
         inject_defaults["mm_token_type_ids"] = 0
+    if "assistant_masks" in batch:
+        # Generation-template masks are read after this hook; injected prefix
+        # tokens and padding are never supervised.
+        seq_keys.append("assistant_masks")
+        fill_defaults["assistant_masks"] = 0
+        inject_defaults["assistant_masks"] = 0
 
     B = batch["input_ids"].size(0)
     new_seqs: Dict[str, List[torch.Tensor]] = {k: [] for k in seq_keys}
@@ -2201,6 +2232,7 @@ _TOKEN_AXIS_KEYS: tuple[str, ...] = (
     "labels",
     "token_type_ids",
     "mm_token_type_ids",
+    "assistant_masks",
 )
 
 
