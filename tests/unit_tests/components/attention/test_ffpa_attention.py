@@ -393,9 +393,17 @@ def test_dense_bwd_requests_fp32_kv_storage_only_on_sm80(sm80):
     ):
         assert ffpa_mod._ffpa_dense_bwd(grad_out, q, k, v, out, lse, scale=0.0625, causal=True) == ("dq", "dk", "dv")
     dispatch.assert_called_once_with(q.device, 512, 512)
-    fake_bwd.assert_called_once_with(
-        grad_out, q, k, v, out, lse, 0.0625, True, grad_kv_storage_dtype=torch.float32 if sm80 else None
-    )
+    storage = {"grad_kv_storage_dtype": torch.float32} if sm80 else {}
+    fake_bwd.assert_called_once_with(grad_out, q, k, v, out, lse, 0.0625, True, **storage)
+
+
+def test_sm80_split_d_backward_keeps_defaults_when_dispatch_is_unimportable(caplog):
+    caplog.set_level(logging.WARNING, logger=ffpa_mod.__name__)
+    with _fake_ffpa_cute():  # no private dispatch names exported
+        assert ffpa_mod._ffpa_sm80_split_d_backward(torch.device("cpu"), 512, 512) is False
+        ffpa_mod._ffpa_sm80_split_d_backward.cache_clear()
+        assert ffpa_mod._ffpa_sm80_split_d_backward(torch.device("cpu"), 256, 256) is False
+    assert len(_warns(caplog, "cannot inspect the ffpa-attn backward dispatch")) == 1
 
 
 def test_varlen_bwd_sm80_runs_dense_backward_per_document():

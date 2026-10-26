@@ -192,10 +192,18 @@ def _ffpa_sm80_split_d_backward(device: torch.device, head_dim: int, head_dim_v:
     (measured on the SM80 path, head_dim 512: ~4e-3 relative L2 at 256 tokens, ~1e-2 at 2K, ~1.5e-2 at 4K,
     three to four times the Flex ring). Its ``grad_kv_storage_dtype`` option widens that buffer
     to fp32; the SM90/SM100 kernels accumulate in registers/TMEM and reject the option. Mirrors
-    the library's own dispatch so the two cannot disagree.
+    the library's own dispatch so the two cannot disagree; if that dispatch cannot be imported,
+    the backward keeps the library defaults and says so once.
     """
-    from ffpa_attn.cute import _backward_impl_for_device, _ffpa_attn_backward_sm80
-
+    try:
+        from ffpa_attn.cute import _backward_impl_for_device, _ffpa_attn_backward_sm80
+    except ImportError as exc:
+        _warn_once(
+            "ffpa_backward_dispatch",
+            f"cannot inspect the ffpa-attn backward dispatch ({exc}); dK/dV keep the activation-dtype storage",
+            target="ffpa-attn defaults",
+        )
+        return False
     return _backward_impl_for_device(device, head_dim, head_dim_v) is _ffpa_attn_backward_sm80
 
 
@@ -389,10 +397,12 @@ def _ffpa_dense_bwd(
     """
     from ffpa_attn.cute import _ffpa_attn_backward_cute
 
-    storage = torch.float32 if _ffpa_sm80_split_d_backward(q.device, q.shape[-1], v.shape[-1]) else None
-    return _ffpa_attn_backward_cute(
-        grad_out, q, k, v, out, lse, float(scale), bool(causal), grad_kv_storage_dtype=storage
+    storage = (
+        {"grad_kv_storage_dtype": torch.float32}
+        if _ffpa_sm80_split_d_backward(q.device, q.shape[-1], v.shape[-1])
+        else {}
     )
+    return _ffpa_attn_backward_cute(grad_out, q, k, v, out, lse, float(scale), bool(causal), **storage)
 
 
 def _get_ffpa_high_level() -> tuple[Callable, Any] | None:
