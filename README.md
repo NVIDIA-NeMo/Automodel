@@ -418,6 +418,26 @@ NeMo AutoModel achieves great training performance on NVIDIA GPUs. Below are hig
 
 For complete benchmark results including configuration details, see the [Performance Summary](docs/performance-summary.mdx).
 
+### Compile startup for small helpers
+
+For `Float32RMSNorm`, we prefer `@torch.compiler.disable` on the
+`torch.autograd.Function.forward` and `backward` methods to reduce startup cost in
+short training and parity runs. A `torch.library.custom_op` with `register_fake`
+keeps its forward implementation opaque, but the fake kernel supplies metadata
+for graph capture; it does not disable compilation. The operator call and its
+registered backward can still participate in compiled graphs. Our previous
+compiled wrapper therefore incurred Dynamo tracing and guards, plus
+AOTAutograd/Inductor startup, despite the opaque forward. The disabled autograd
+methods keep both passes in eager PyTorch and avoid RMSNorm-specific compilation.
+
+This choice prioritizes startup latency over compiler fusion. With
+`fullgraph=False`, compilation can resume after the eager graph break;
+`fullgraph=True` cannot cross it. Custom operators with fake kernels remain appropriate when an
+opaque kernel must be captured for compilation or export. Measure cold-start and
+post-warmup costs separately before applying this pattern to other helpers. See
+PyTorch's [compilation-disable API](https://docs.pytorch.org/docs/stable/generated/torch.compiler.disable.html)
+and [custom-operator guidance](https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html).
+
 <!--
 ## Mesh‑Aware Checkpointing
 
