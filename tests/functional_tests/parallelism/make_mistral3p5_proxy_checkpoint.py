@@ -38,8 +38,8 @@ VOCAB_SIZE = 131072
 IMAGE_TOKEN_INDEX = 10
 SPATIAL_MERGE_SIZE = 2
 # Shrunk, except the vision patch size, which has to match the processor.
-TEXT_HIDDEN = 256
-VISION_HIDDEN = 128
+TEXT_HIDDEN = 128
+VISION_HIDDEN = 64
 
 
 def build_config():
@@ -56,7 +56,7 @@ def build_config():
         "model_type": "ministral3",
         "vocab_size": VOCAB_SIZE,
         "hidden_size": TEXT_HIDDEN,
-        "intermediate_size": 512,
+        "intermediate_size": 256,
         "num_hidden_layers": 4,
         "num_attention_heads": 8,
         "num_key_value_heads": 2,
@@ -91,10 +91,10 @@ def build_config():
     vision_config = {
         "model_type": "pixtral",
         "hidden_size": VISION_HIDDEN,
-        "intermediate_size": 256,
+        "intermediate_size": 128,
         "num_hidden_layers": 2,
         "num_attention_heads": 4,
-        "head_dim": 32,
+        "head_dim": VISION_HIDDEN // 4,
         "image_size": 1024,
         # Must match the processor: PixtralImageProcessor uses patch_size 14,
         # and a mismatch makes the image-token count disagree with the number
