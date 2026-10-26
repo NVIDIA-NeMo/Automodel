@@ -46,9 +46,10 @@ PEFT configuration, and joint-head architecture consistent. Use `head_optimizer.
 `optimizer.lr` for the backbone adapters, and `lr_scheduler.lr_warmup_steps` for integer optimizer-step warmup.
 Publisher-layout merged export remains the explicit `examples/decision/export_clef_release.py` operation.
 
-D1 examples are experimental. Tiny configuration tests exercise causal/readout/gradient contracts; released-size
-GPU acceptance remains required for D1-3B. A prior released-size D1-3B baseline comparison exceeded the declared probability
-tolerance, and no successful fresh full-size rerun has been collected for this contribution. The contributed NeMo
+D1 examples are experimental. Tiny configuration tests exercise causal/readout/gradient contracts. The
+[D1 acceptance notes](../../tests/functional_tests/decision_models/d1/README.md) record released-size D1-3B BF16
+and Omni FP32 checks on a small fictional fixture, with their numerical tolerances and remaining limitations.
+These checks do not establish adaptation quality or Omni FP16 acceptance. The contributed NeMo
 implementation follows this repository's Apache 2.0 license. Downloaded publisher code and model artifacts retain
 their own license terms:
 [model](https://huggingface.co/LiquidAI/d1-3B) and [Omni](https://huggingface.co/LiquidAI/d1-omni-600M).

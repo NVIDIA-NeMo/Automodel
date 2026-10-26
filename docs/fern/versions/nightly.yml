@@ -713,6 +713,11 @@ navigation:
             contents:
               - page: "BAGEL-7B-MoT"
                 path: ../../model-coverage/multimodal/bytedance-seed/bagel.mdx
+          - section: "LiquidAI"
+            slug: liquidai
+            contents:
+              - page: "D1 Decision Models"
+                path: ../../model-coverage/multimodal/liquidai/d1.mdx
       - section: "Omni"
         slug: omni
         contents:

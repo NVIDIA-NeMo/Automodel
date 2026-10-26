@@ -363,7 +363,7 @@ def collect_clm_texts(records: Sequence[dict[str, Any]]) -> list[str]:
 class EmbeddingTable:
     """Text -> row lookup into a table of L2-normalised encoder embeddings."""
 
-    def __init__(self, texts: Sequence[str], embeddings: torch.Tensor):
+    def __init__(self, texts: Sequence[str], embeddings: torch.Tensor) -> None:
         """Create the table.
 
         Args:
@@ -394,7 +394,9 @@ class EmbeddingTable:
         return [t for t in texts if t not in self.index]
 
 
-def clm_batch(records: Sequence[dict[str, Any]], table: EmbeddingTable, device: torch.device | str | None = None):
+def clm_batch(
+    records: Sequence[dict[str, Any]], table: EmbeddingTable, device: torch.device | str | None = None
+) -> tuple[torch.Tensor, torch.Tensor, list[int], list[dict[str, list[str]]]]:
     """Gather encoder embeddings for a batch of records.
 
     Returns:

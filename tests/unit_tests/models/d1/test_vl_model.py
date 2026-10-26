@@ -14,9 +14,12 @@
 
 """D1-3B tied readout and causal image/text gradient contracts."""
 
+import inspect
+
 import pytest
 import torch
 from transformers import Lfm2VlConfig
+from transformers.models.lfm2 import modeling_lfm2
 from transformers.models.lfm2.modeling_lfm2 import Lfm2RotaryEmbedding
 from transformers.models.lfm2_vl.modeling_lfm2_vl import (
     Lfm2VlForConditionalGeneration as HFLfm2VlForConditionalGeneration,
@@ -219,10 +222,17 @@ def test_causal_text_readout_preserves_full_model_alias_scores_and_head_gradient
 @pytest.mark.parametrize("tied", [False, True])
 @pytest.mark.parametrize("use_cache", [False, True])
 @pytest.mark.parametrize("with_image", [False, True])
-def test_selected_model_generates_like_hf_for_ordinary_lfm2_vl(tied, use_cache, with_image):
+def test_selected_model_generates_like_hf_for_ordinary_lfm2_vl(
+    tied: bool, use_cache: bool, with_image: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The actual default loader preserves text/image generation and cache behavior."""
     torch.manual_seed(731)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cpu":
+        # The installed CUDA extension can override HF's CPU-capable reference
+        # functions. Select HF's own PyTorch implementations for this CPU case.
+        for name in ("causal_conv1d_fn", "causal_conv1d_update"):
+            monkeypatch.setattr(modeling_lfm2, name, inspect.unwrap(getattr(modeling_lfm2, name)))
     config = tiny_config()
     config.tie_word_embeddings = tied
     is_custom, model = _init_model(

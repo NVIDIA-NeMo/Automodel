@@ -22,6 +22,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
+from nemo_automodel.shared.decision_records import QuestionTarget
+
 
 class DecisionEvaluator:
     """Accumulates per-question predictions and summarises them.
@@ -29,7 +31,7 @@ class DecisionEvaluator:
     Call :meth:`add` once per (record, question) with the model's probabilities in the model's option order.
     """
 
-    def __init__(self, slice_keys: Sequence[str] = (), num_bins: int = 10):
+    def __init__(self, slice_keys: Sequence[str] = (), num_bins: int = 10) -> None:
         self.slice_keys = tuple(slice_keys)
         self.num_bins = num_bins
         self.rows: list[dict[str, Any]] = []
@@ -59,7 +61,12 @@ class DecisionEvaluator:
             }
         )
 
-    def add_batch(self, records: Sequence[dict], targets_per_record: Sequence[Sequence[Any]], probs_per_record) -> None:
+    def add_batch(
+        self,
+        records: Sequence[dict[str, Any]],
+        targets_per_record: Sequence[Sequence[QuestionTarget]],
+        probs_per_record: Sequence[Sequence[Sequence[float]]],
+    ) -> None:
         """Add a batch: ``targets_per_record[i]`` are :class:`QuestionTarget`, ``probs_per_record[i][j]`` a 1-D list."""
         for record, targets, probs in zip(records, targets_per_record, probs_per_record):
             for target, p in zip(targets, probs):
