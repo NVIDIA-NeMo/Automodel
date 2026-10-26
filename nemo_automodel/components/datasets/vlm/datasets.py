@@ -1616,7 +1616,12 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
 
                     if self.max_length is not None and seq_len > self.max_length:
                         if not self.truncate:
-                            idx = random.randint(0, len(self.dataset) - 1)
+                            # Reuse the per-index replacement RNG (created at the
+                            # top of __getitem__) so the same logical index maps
+                            # to the same replacement document across ranks and
+                            # global seeds — context parallelism requires
+                            # rank-identical inputs.
+                            idx = rng.randint(0, len(self.dataset) - 1)
                             continue
                         for key, value in list(output.items()):
                             if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[-1] == seq_len:
