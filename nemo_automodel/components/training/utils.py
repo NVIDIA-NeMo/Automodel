@@ -316,22 +316,6 @@ def _clip_grad_norm_impl(
     if target_device is None:
         target_device = torch.device("cpu")
 
-    def _all_reduce_scalar(tensor, *, op, group):
-        # FSDP2 CPUOffloadPolicy leaves gradients and their norm scalars on
-        # CPU, while the mesh process groups use NCCL and cannot reduce CPU
-        # tensors. Shuttle only the scalar through the current CUDA device;
-        # keep the returned value on the original device for CPU clipping.
-        backend = str(torch.distributed.get_backend(group)).lower()
-        if tensor.device.type == "cpu" and "nccl" in backend:
-            reduce_tensor = tensor.to(
-                device=torch.device("cuda", torch.cuda.current_device()),
-                non_blocking=True,
-            )
-            torch.distributed.all_reduce(reduce_tensor, op=op, group=group)
-            return reduce_tensor.to(device=tensor.device)
-        torch.distributed.all_reduce(tensor, op=op, group=group)
-        return tensor
-
     # Compute norm for each sharding group using a scalar-first reduction:
     # sum(|g_local|^p) locally → single-scalar allreduce per Shard mesh dim.
     # Going through torch.nn.utils.get_total_norm on DTensor grads would stack
