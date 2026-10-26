@@ -11,7 +11,8 @@ uses the same command with `--keep-generated` to retain validated tables.
 
 | Location | Responsibility |
 | --- | --- |
-| `catalog.py` | Shared architecture aliases, card aliases, provider mappings, and generation markers. Keep aliases literal so trusted preview tooling can read PR metadata without executing PR code. |
+| `catalog.py` | Shared architecture aliases, provider mappings, and generation markers. Keep aliases literal so trusted preview tooling can read PR metadata without executing PR code. |
+| `cards.py` | Model-card discovery by slug and canonical-file selection from nightly navigation. |
 | `checks/sources.py` | Coordinates source contracts before generation. |
 | `checks/model_cards.py` | Card identity, descriptions, commands, and compatibility copies. |
 | `checks/navigation.py` | Navigation, provider hierarchy, routes, redirects, and links. |
@@ -28,6 +29,25 @@ page; keep navigation `path` pointing to the existing MDX. Update descriptions, 
 sidebar labels, and provider indexes together, adding redirects for old published
 site URLs. Filename differences are allowed; checkpoint and route mismatches are
 still rejected.
+
+A card may stay in its original source directory, including a different provider
+or category directory or another location under `docs/`. Its full frontmatter
+slug determines the public model category, provider, and checkpoint route. Place
+its navigation entry under that category and provider, with `path` pointing to
+the original file. This preserves previously shared GitHub source URLs without
+requiring a move or a new copy. For example:
+
+```yaml
+# docs/guides/preview-announcement.mdx frontmatter
+title: "Released-Model-7B"
+slug: model-coverage/vision-language-models/org/Released-Model-7B
+```
+
+Existing compatibility copies are discovered by their shared slug. Exactly one
+file for that slug must appear in nightly navigation; that file is canonical for
+generated tables. Other copies stay on disk and must remain byte-identical.
+Missing or ambiguous canonical selection and divergent copies fail validation.
+No per-file alias registration in `catalog.py` is needed.
 
 Regression tests mirror this layout under `tests/unit_tests/tools/docs/`.
 Rules belong in the tools; tests exercise valid inputs, invalid inputs, and

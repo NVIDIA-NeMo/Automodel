@@ -22,35 +22,9 @@ import yaml
 
 from tools.docs.build.coverage_tables import (
     _iter_pretrained_model_ids,
-    _load_model_doc_catalog,
     _read_documented_recipe,
 )
-from tools.docs.catalog import (
-    MODEL_CARD_PATH_ALIASES,
-)
-
-
-def _frontmatter_slug(path: Path) -> str | None:
-    document = path.read_text(encoding="utf-8")
-    if not document.startswith("---\n"):
-        return None
-    closing = document.find("\n---\n", 4)
-    if closing == -1:
-        return None
-    frontmatter = yaml.safe_load(document[4:closing]) or {}
-    slug = frontmatter.get("slug")
-    return str(slug).strip("/") if slug else None
-
-
-def _model_card_paths(repo_root: Path) -> list[Path]:
-    coverage_root = repo_root / "docs" / "model-coverage"
-    return sorted(
-        (
-            path
-            for path in coverage_root.rglob("*.mdx")
-            if path.name != "index.mdx" and len(path.relative_to(coverage_root).parts) == 3
-        )
-    )
+from tools.docs.cards import _model_card_aliases, _model_card_paths
 
 
 def _validate_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
@@ -151,43 +125,27 @@ def _model_card_command_violations(repo_root: Path) -> list[str]:
 
 
 def _validate_card_aliases(repo_root: Path) -> None:
-    (_, _, catalog) = _load_model_doc_catalog(repo_root / "docs")
-    source_paths = [model.source_path for model in catalog]
-    for alias, canonical in MODEL_CARD_PATH_ALIASES.items():
-        if not (repo_root / alias).is_file():
-            raise ValueError(f"Published source URL must remain available: {alias}")
-        if not (repo_root / canonical).is_file():
-            raise ValueError(f"Published source URL must remain available: {canonical}")
-        if (repo_root / alias).read_bytes() != (repo_root / canonical).read_bytes():
+    for alias, canonical in _model_card_aliases(repo_root).items():
+        if alias.read_bytes() != canonical.read_bytes():
             raise ValueError(f"Compatibility card must stay synchronized with {canonical}: {alias}")
-        if _frontmatter_slug(repo_root / alias) != _frontmatter_slug(repo_root / canonical):
-            raise ValueError(f"Compatibility card {alias} must use the same slug as {canonical}")
-        if alias in source_paths:
-            raise ValueError(f"Compatibility card must be excluded from the model catalog: {alias}")
-        if source_paths.count(canonical) != 1:
-            raise ValueError(f"Canonical card must appear exactly once in the model catalog: {canonical}")
 
 
 def _validate_changed_card_identity(repo_root: Path) -> None:
     base = subprocess.check_output(["git", "merge-base", "HEAD", "origin/main"], cwd=repo_root, text=True).strip()
     changed = subprocess.check_output(
-        ["git", "diff", "--name-only", "--diff-filter=ACMR", base, "--", "docs/model-coverage"],
+        ["git", "diff", "--name-only", "--diff-filter=ACMR", base, "--", "docs"],
         cwd=repo_root,
         text=True,
     ).splitlines()
     changed += subprocess.check_output(
-        ["git", "ls-files", "--others", "--exclude-standard", "--", "docs/model-coverage"], cwd=repo_root, text=True
+        ["git", "ls-files", "--others", "--exclude-standard", "--", "docs"], cwd=repo_root, text=True
     ).splitlines()
     changed += [f"docs/model-coverage/{kind}/stepfun-ai/step-5-preview-bf16.mdx" for kind in ("llm", "vlm")]
-    canonical_paths = {MODEL_CARD_PATH_ALIASES.get(relative, relative) for relative in changed}
-    for relative in sorted(canonical_paths):
-        card = repo_root / relative
-        if (
-            len(card.relative_to(repo_root / "docs/model-coverage").parts) == 3
-            and card.is_file()
-            and (card.suffix == ".mdx")
-            and (card.name != "index.mdx")
-        ):
+    cards = set(_model_card_paths(repo_root))
+    aliases = _model_card_aliases(repo_root)
+    canonical_paths = {aliases.get(repo_root / relative, repo_root / relative) for relative in changed}
+    for card in sorted(canonical_paths):
+        if card in cards:
             _validate_model_card_recipe_identity(repo_root, card)
 
 

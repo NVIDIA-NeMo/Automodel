@@ -22,6 +22,7 @@ from pathlib import Path
 from tools.docs.build.coverage_tables import (
     _parse_registry_entries,
 )
+from tools.docs.cards import _model_card_paths
 from tools.docs.catalog import (
     _DOC_ARCH_ALIASES,
 )
@@ -29,17 +30,7 @@ from tools.docs.catalog import (
 
 def _model_card_documents(repo_root: Path) -> list[tuple[Path, str]]:
     """Return rendered model-card documents, excluding section landing pages."""
-    docs_dir = repo_root / "docs" / "model-coverage"
-    excluded_names = {"index.mdx", "latest-models.mdx", "overview.mdx"}
-    documents = []
-    for path in sorted(docs_dir.rglob("*.mdx")):
-        if path.name in excluded_names:
-            continue
-        content = path.read_text(encoding="utf-8")
-        frontmatter = content.split("---", maxsplit=2)
-        if len(frontmatter) == 3 and "slug: model-coverage/" in frontmatter[1]:
-            documents.append((path, content))
-    return documents
+    return [(path, path.read_text(encoding="utf-8")) for path in _model_card_paths(repo_root)]
 
 
 def _without_generated_registry_table(content: str) -> str:
@@ -108,7 +99,9 @@ def validate_registered_architectures(repo_root: Path) -> None:
     docs_dir = repo_root / "docs" / "model-coverage"
     if not docs_dir.is_dir():
         raise ValueError(f"docs/model-coverage/ not found at {docs_dir}")
-    md_contents = [_without_generated_registry_table(p.read_text(encoding="utf-8")) for p in docs_dir.rglob("*.mdx")]
+    md_contents = [
+        _without_generated_registry_table(p.read_text(encoding="utf-8")) for p in _model_card_paths(repo_root)
+    ]
     if not md_contents:
         raise ValueError("No .mdx files found under docs/model-coverage/")
     missing = []
@@ -137,8 +130,9 @@ def validate_architecture_aliases(repo_root: Path) -> None:
     Raises:
         ValueError: An alias target is absent from the model cards.
     """
-    docs_dir = repo_root / "docs" / "model-coverage"
-    md_contents = [_without_generated_registry_table(p.read_text(encoding="utf-8")) for p in docs_dir.rglob("*.mdx")]
+    md_contents = [
+        _without_generated_registry_table(p.read_text(encoding="utf-8")) for p in _model_card_paths(repo_root)
+    ]
     bad = []
     for arch, needle in _DOC_ARCH_ALIASES.items():
         if not any((needle in content for content in md_contents)):

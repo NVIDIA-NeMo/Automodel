@@ -49,18 +49,21 @@ def test_hf_org_to_doc_slug_targets_exist():
 
 
 @pytest.mark.parametrize("publisher", ["example", "wrong-publisher"])
-def test_recipe_publisher_validator_checks_the_card_directory(tmp_path: Path, publisher: str):
+def test_recipe_publisher_validator_checks_the_card_slug(tmp_path: Path, publisher: str):
     recipe = tmp_path / "examples/model.yaml"
     recipe.parent.mkdir()
     recipe.write_text("model:\n  pretrained_model_name_or_path: Example/Model-1B\n")
-    card = tmp_path / f"docs/model-coverage/llm/{publisher}/model.mdx"
+    card = tmp_path / "docs/model-coverage/llm/old-provider/model.mdx"
     card.parent.mkdir(parents=True)
-    card.write_text("https://huggingface.co/Example/Model-1B\n")
+    card.write_text(
+        f"---\nslug: model-coverage/large-language-models/{publisher}/Model-1B\n---\n"
+        "https://huggingface.co/Example/Model-1B\n"
+    )
 
     if publisher == "example":
         recipe_coverage.validate_recipe_publishers(tmp_path)
     else:
-        with pytest.raises(ValueError, match="documented outside the org directory"):
+        with pytest.raises(ValueError, match="documented outside their publisher routes"):
             recipe_coverage.validate_recipe_publishers(tmp_path)
 
 

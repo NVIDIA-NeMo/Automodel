@@ -49,7 +49,6 @@ from tools.docs.catalog import (
     DATED_SUPPORT_TABLE_HEADER,
     HOMEPAGE_END_MARKER,
     HOMEPAGE_START_MARKER,
-    MODEL_CARD_PATH_ALIASES,
     MODEL_TYPE_OVERVIEW_PATHS,
     REGISTRY_END_MARKER,
     REGISTRY_START_MARKER,
@@ -373,7 +372,7 @@ def test_committed_generated_tables_are_rejected(tmp_path):
 @pytest.mark.parametrize("canonical_exists", [False, True])
 def test_trusted_catalog_resolves_cards_in_checkouts_before_and_after_a_rename(tmp_path, canonical_exists):
     alias = "docs/model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx"
-    canonical = MODEL_CARD_PATH_ALIASES[alias]
+    canonical = "docs/model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base.mdx"
     document = (
         '---\ntitle: "flux-3-image-klein-base"\n'
         "slug: model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base\n---\n"
@@ -387,6 +386,11 @@ def test_trusted_catalog_resolves_cards_in_checkouts_before_and_after_a_rename(t
     config_path = tmp_path / "docs/fern/docs.yml"
     config_path.parent.mkdir(parents=True)
     config_path.write_text("redirects: []\n", encoding="utf-8")
+
+    navigation = config_path.parent / "versions/nightly.yml"
+    navigation.parent.mkdir()
+    selected = canonical if canonical_exists else alias
+    navigation.write_text(f"navigation:\n  - page: Model\n    path: ../../{selected.removeprefix('docs/')}\n")
 
     model_docs, _, catalog = _load_model_doc_catalog(tmp_path / "docs")
     release = _ModelRelease(

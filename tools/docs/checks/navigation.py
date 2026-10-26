@@ -27,13 +27,10 @@ from tools.docs.build.coverage_tables import (
     _load_model_releases,
     _resolve_model_card_routes,
 )
+from tools.docs.cards import _frontmatter_slug, _model_card_aliases, _model_card_paths
 from tools.docs.catalog import (
     MAX_TOTAL_ENCODED_BYTES,
-    MODEL_CARD_PATH_ALIASES,
     PROVIDER_ORGS,
-)
-from tools.docs.checks.model_cards import (
-    _frontmatter_slug,
 )
 
 _NavigationItem = TypedDict(
@@ -204,9 +201,6 @@ def _validate_provider_sections(repo_root: Path) -> None:
                     continue
                 model_path = (config_path.parent / path).resolve()
                 navigated_model_pages.append(model_path)
-                relative_parts = model_path.relative_to(repo_root / "docs" / "model-coverage").parts
-                if relative_parts[:2] != (category_directory, provider_slug):
-                    offenders.append(f"{path}: nested under the wrong provider section")
                 frontmatter_slug = _frontmatter_slug(model_path)
                 if frontmatter_slug is None or not frontmatter_slug.startswith(expected_provider_route + "/"):
                     offenders.append(f"{path}: invalid model route {frontmatter_slug!r}")
@@ -245,12 +239,8 @@ def _validate_provider_sections(repo_root: Path) -> None:
             offenders.append(f"{category_slug}/meta-models: Muse-Glimmer-30B is not grouped under Meta Models")
         if (category_slug, "muse") in provider_models:
             offenders.append(f"{category_slug}: Muse remains a standalone provider")
-    expected_model_pages = {
-        path.resolve()
-        for category_directory in category_directories.values()
-        for path in (repo_root / "docs" / "model-coverage" / category_directory).glob("*/*.mdx")
-        if path.name != "index.mdx" and path.relative_to(repo_root).as_posix() not in MODEL_CARD_PATH_ALIASES
-    }
+    aliases = _model_card_aliases(repo_root)
+    expected_model_pages = {path.resolve() for path in _model_card_paths(repo_root) if path not in aliases}
     if set(navigated_model_pages) != expected_model_pages:
         offenders.append("nightly navigation does not contain every model card exactly once")
     if len(navigated_model_pages) != len(set(navigated_model_pages)):
@@ -386,7 +376,8 @@ def _validate_internal_links(repo_root: Path) -> None:
     navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
     routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
     broken_links: list[tuple[Path, str]] = []
-    for page in (repo_root / "docs" / "model-coverage").rglob("*.mdx"):
+    pages = set((repo_root / "docs" / "model-coverage").rglob("*.mdx")) | set(_model_card_paths(repo_root))
+    for page in sorted(pages):
         document = page.read_text(encoding="utf-8")
         for link in re.findall("\\]\\((/[^)#?]+)", document):
             if link == "/model-coverage/llms.txt":

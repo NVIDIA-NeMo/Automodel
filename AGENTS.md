@@ -125,6 +125,11 @@ label and provider index to the released name while keeping navigation `path`
 pointing to the existing file. Do not rename, move, or duplicate the MDX just to
 match the repository name. If the published docs-site URL changes, add redirects
 from the old URL in `docs/fern/docs.yml`. Preserve existing compatibility copies.
+The full MDX slug determines the model category and provider independently of
+the source directory. A previously shared file may stay anywhere under `docs/`
+while navigation places it in the correct section. Existing files sharing a slug
+are compatibility copies: select exactly one in nightly navigation and keep all
+copies byte-identical; no path alias entry in `catalog.py` is required.
 
 ---
 

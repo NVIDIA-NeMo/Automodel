@@ -330,6 +330,16 @@ modules. They run separately in CI to test the tools and their failure cases.
 The checker itself needs only PyYAML; Pillow is used by the asset tool and
 its regression tests.
 
+Keep previously shared model-card source paths stable, even if the file is in
+the wrong directory. The explicit MDX `slug` determines its public category,
+provider, and checkpoint route. Put its sidebar entry under the correct section
+in `docs/fern/versions/nightly.yml`, with `path` pointing to the original file.
+Update its title, description, checkpoint links, and provider-index link to match;
+add redirects in `docs/fern/docs.yml` when changing a published docs-site URL.
+Existing files sharing a slug are compatibility copies: navigation must select
+exactly one canonical source, and all copies must stay byte-identical. No
+per-file alias registration in `tools/docs/catalog.py` is needed.
+
 If your contribution involves documentation changes, please refer to the [Fern docs maintenance guide](.agents/contributor-skills/fern-docs/SKILL.md) guide for detailed instructions on building and serving the documentation.
 
 ## Signing Your Work

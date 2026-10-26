@@ -23,6 +23,7 @@ import pathlib
 
 import yaml
 
+from tools.docs.cards import _frontmatter_slug, _model_card_paths
 from tools.docs.catalog import (
     _DOC_ARCH_ALIASES,
 )
@@ -149,7 +150,7 @@ def validate_recipe_architectures(repo_root: pathlib.Path) -> None:
     if not model_ids:
         raise ValueError("No pretrained_model_name_or_path values found in examples/*.yaml")
 
-    md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.mdx")]
+    md_contents = [p.read_text(encoding="utf-8") for p in _model_card_paths(root)]
 
     resolved: dict[str, list[str]] = {}
     unresolved: list[str] = []
@@ -192,7 +193,7 @@ def validate_recipe_publishers(repo_root: pathlib.Path) -> None:
     """Validate that documented recipe checkpoints have cards under their publishers.
 
     Publisher aliases allow rebrands and shared family pages. Cross-references
-    elsewhere are allowed when at least one card uses the expected directory.
+    elsewhere are allowed when at least one card uses the expected provider slug.
     This check only reads checked-in files and makes no network requests.
 
     Args:
@@ -210,14 +211,8 @@ def validate_recipe_publishers(repo_root: pathlib.Path) -> None:
     if not recipe_model_ids:
         raise ValueError("YAML scanner returned no HF model IDs")
 
-    # Only consider model-card files at depth <modality>/<org>/<name>.mdx.
-    # Navigation pages (top-level ``latest-models.mdx``, per-modality
-    # ``index.mdx``, etc.) legitimately cross-reference HF IDs from many orgs.
-    md_texts: list[tuple[pathlib.Path, str]] = []
-    for md in docs_dir.rglob("*.mdx"):
-        if len(md.relative_to(docs_dir).parts) != 3 or md.name == "index.mdx":
-            continue
-        md_texts.append((md, md.read_text(encoding="utf-8")))
+    # Slugs identify publishers even when shared source URLs use another directory.
+    md_texts = [(md, md.read_text(encoding="utf-8")) for md in _model_card_paths(root)]
 
     offenders: list[tuple[str, str, str]] = []
     for mid in sorted(recipe_model_ids):
@@ -231,32 +226,28 @@ def validate_recipe_publishers(repo_root: pathlib.Path) -> None:
             # Undocumented; surfaced by optional architecture resolution.
             continue
 
-        # Pass if AT LEAST ONE mention is under the expected org slug —
-        # cross-references on sibling pages (e.g., Moonlight on deepseek-v3.mdx
-        # for shared-arch context) are fine as long as a properly-placed
-        # primary card exists.
-        if any(md.parent.name == expected_slug for md in mentioning):
+        # Cross-references are allowed when a primary card has the expected publisher route.
+        if any(
+            (slug := _frontmatter_slug(md)) is not None
+            and len(slug.split("/")) == 4
+            and slug.split("/")[2] == expected_slug
+            for md in mentioning
+        ):
             continue
 
-        wrong_paths = ", ".join(str(p.relative_to(docs_dir)) for p in mentioning)
+        wrong_paths = ", ".join(str(p.relative_to(root)) for p in mentioning)
         offenders.append((mid, expected_slug, wrong_paths))
 
     if offenders:
         details = "\n".join(
-            f"  - {mid}  (belongs under docs/model-coverage/*/{slug}/ — currently mentioned in: {paths})"
+            f"  - {mid}  (expected provider slug {slug!r}; currently mentioned in: {paths})"
             for mid, slug, paths in offenders
         )
         raise ValueError(
-            "The following recipe HF model IDs are documented outside the "
-            "org directory that matches their HF publisher:\n"
+            "The following recipe HF model IDs are documented outside their publisher routes:\n"
             f"{details}\n\n"
-            "Fix by either:\n"
-            "  1. Moving the model card to "
-            "docs/model-coverage/<modality>/<org_slug>/<model>.mdx (preferred), "
-            "or\n"
-            "  2. Adding a ``<HF_ORG>: <doc_slug>`` entry to "
-            "_HF_ORG_TO_DOC_SLUG with a comment explaining the rebrand / "
-            "shared-page case."
+            "Update the card's frontmatter slug and navigation provider section, keeping its source path stable. "
+            "For a rebrand or shared-page case, add a documented publisher alias to _HF_ORG_TO_DOC_SLUG."
         )
 
 

@@ -85,3 +85,38 @@ def test_retired_model_routes_redirect_to_provider_indexes():
 
 def test_internal_links_from_model_coverage_resolve_to_nightly_routes():
     _validate_internal_links(Path(__file__).resolve().parents[5])
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "docs/model-coverage/llm/wrong-provider/deep/preview.mdx",
+        "docs/guides/shared-announcement.mdx",
+    ],
+)
+def test_navigation_accepts_a_card_at_a_previously_shared_source_location(tmp_path: Path, source: str):
+    repo_root = Path(__file__).resolve().parents[5]
+    shutil.copytree(repo_root / "docs/model-coverage", tmp_path / "docs/model-coverage")
+    for relative in ("docs/fern/docs.yml", "docs/fern/versions/nightly.yml"):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(repo_root / relative, target)
+    current = "docs/model-coverage/diffusion/black-forest-labs/flux.mdx"
+    card = tmp_path / current
+    document = card.read_bytes()
+    shared = tmp_path / source
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    card.rename(shared)
+    config = tmp_path / "docs/fern/versions/nightly.yml"
+    config.write_text(
+        config.read_text().replace("../../" + current.removeprefix("docs/"), "../../" + source.removeprefix("docs/"))
+    )
+
+    _validate_provider_sections(tmp_path)
+    _, _, catalog = _load_model_doc_catalog(tmp_path / "docs")
+
+    model = next(model for model in catalog if model.source_path == source)
+    assert model.model_type == "Diffusion"
+    assert model.docs_page == "/model-coverage/diffusion/black-forest-labs/FLUX.1-dev"
+    assert shared.read_bytes() == document
+    assert not card.exists()

@@ -42,6 +42,7 @@ def docs_checkout(tmp_path: Path) -> Path:
     generator = root / "tools/docs/build/coverage_tables.py"
     generator.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source / "tools/docs/catalog.py", root / "tools/docs/catalog.py")
+    shutil.copyfile(source / "tools/docs/cards.py", root / "tools/docs/cards.py")
     generator.write_text(
         "import os, runpy, sys\n"
         "from pathlib import Path\n"

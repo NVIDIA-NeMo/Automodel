@@ -20,9 +20,6 @@ from pathlib import Path
 
 import pytest
 
-from tools.docs.catalog import (
-    MODEL_CARD_PATH_ALIASES,
-)
 from tools.docs.checks import model_cards as checks
 from tools.docs.checks.model_cards import (
     _is_local_checkpoint_override,
@@ -147,7 +144,7 @@ def test_recipe_link_errors_include_every_link_card_and_compatibility_copy(tmp_p
 
     models = []
     source_paths = ["docs/model-coverage/llm/first.mdx", "docs/model-coverage/llm/second.mdx"]
-    alias = next(iter(MODEL_CARD_PATH_ALIASES))
+    alias = "docs/model-coverage/legacy/old-name.mdx"
     expected = []
     for index, source_path in enumerate([*source_paths, alias]):
         path = tmp_path / source_path
@@ -160,7 +157,7 @@ def test_recipe_link_errors_include_every_link_card_and_compatibility_copy(tmp_p
             recipe.write_text("model: {}\n")
             links.append(f"[Recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/{'a' * 40}/{recipe_path})")
             expected.append(recipe_path)
-        path.write_text("\n".join(links))
+        path.write_text("---\nslug: model-coverage/large-language-models/org/Model\n---\n" + "\n".join(links))
         if source_path in source_paths:
             models.append(coverage._ModelDoc("LLM", f"/models/{index}", (), "Model", source_path))
 
@@ -197,10 +194,9 @@ def test_command_validation_collects_link_and_yaml_errors_across_cards(tmp_path)
 
 
 @pytest.mark.parametrize("synchronized", [True, False])
-def test_flux_compatibility_copy_must_match_its_canonical_card(tmp_path: Path, monkeypatch, synchronized: bool):
+def test_flux_compatibility_copy_must_match_its_canonical_card(tmp_path: Path, synchronized: bool):
     alias = "docs/model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx"
     canonical = "docs/model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base.mdx"
-    monkeypatch.setattr(checks, "MODEL_CARD_PATH_ALIASES", {alias: canonical})
     content = (
         '---\ntitle: "flux-3-image-klein-base"\n'
         "slug: model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base\n---\nBody\n"
@@ -208,6 +204,10 @@ def test_flux_compatibility_copy_must_match_its_canonical_card(tmp_path: Path, m
     (tmp_path / canonical).parent.mkdir(parents=True)
     (tmp_path / canonical).write_text(content)
     (tmp_path / alias).write_text(content if synchronized else content + "Compatibility-only edit\n")
+
+    navigation = tmp_path / "docs/fern/versions/nightly.yml"
+    navigation.parent.mkdir(parents=True)
+    navigation.write_text(f"navigation:\n  - page: Model\n    path: ../../{canonical.removeprefix('docs/')}\n")
 
     if synchronized:
         checks._validate_card_aliases(tmp_path)
