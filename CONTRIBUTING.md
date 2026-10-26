@@ -2,12 +2,9 @@
 
 ## Coding guidelines
 
-Read the [draft coding guidelines](CODING_GUIDELINES.md) for development
-expectations shared by human contributors and coding agents, including API design,
-component ownership, tensor contracts, and validation. The guidelines are open for
-discussion; existing repository policies and tool configuration remain authoritative
-while the draft is reviewed. Coding agents must also follow [AGENTS.md](AGENTS.md)
-and applicable contributor skills.
+Read the [draft coding guidelines](CODING_GUIDELINES.md) for humans and coding
+agents. Existing repository policies remain authoritative. Agents must also follow
+[AGENTS.md](AGENTS.md) and applicable contributor skills.
 
 ## Environment setup for Automodel
 
