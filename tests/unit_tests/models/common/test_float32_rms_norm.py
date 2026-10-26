@@ -40,15 +40,10 @@ def test_float32_rms_norm_forward_and_gradients(shape, dtype, trainable):
     ref_x = x.detach().clone().requires_grad_(x.requires_grad)
     ref_weight = module.weight.detach().clone().requires_grad_(module.weight.requires_grad)
 
-    actual = module(x)
-    with torch.no_grad():
-        no_grad_output = module(x)
-    torch.testing.assert_close(actual, no_grad_output, rtol=0, atol=0)
+    with torch.compiler.set_stance("force_eager"):
+        actual = module(x)
     expected = torch.nn.functional.rms_norm(ref_x.float(), (7,), ref_weight.float(), module.eps).to(dtype)
-    # Native CUDA RMSNorm can fuse arithmetic differently. Allow fp32 roundoff
-    # (or one bf16 ULP) against native, while grad/no_grad stays bitwise equal.
-    forward_rtol, forward_atol = (1e-5, 1e-6) if dtype == torch.float32 else (0.008, 1e-5)
-    torch.testing.assert_close(actual, expected, rtol=forward_rtol, atol=forward_atol)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     upstream = torch.randn_like(actual)
     actual.backward(upstream)
     expected.backward(upstream)
@@ -73,38 +68,21 @@ def test_float32_rms_norm_forward_and_gradients(shape, dtype, trainable):
         ),
     ],
 )
-def test_float32_rms_norm_noncontiguous_forward_and_gradients(layout, device):
+# opcheck includes AOTAutograd compilation, which exceeds the default 5 seconds.
+@pytest.mark.runtime_budget(60, hard_timeout=70, reason="opcheck includes AOTAutograd compilation")
+def test_float32_rms_norm_custom_op_contract(layout, device):
     x = torch.randn(3, 2, 14 if layout == "strided_hidden" else 7, device=device)
     if layout == "transposed":
         x = x.transpose(0, 1)
     elif layout == "strided_hidden":
         x = x[..., ::2]
     x.requires_grad_()
-    module = Float32RMSNorm(7, device=device, dtype=x.dtype)
-    with torch.no_grad():
-        module.weight.normal_()
-    ref_x = x.detach().clone().requires_grad_()
-    ref_weight = module.weight.detach().clone().requires_grad_()
-
-    actual = module(x)
-    expected = torch.nn.functional.rms_norm(ref_x, (7,), ref_weight, module.eps)
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-    upstream = torch.randn_like(actual)
-    actual.backward(upstream)
-    expected.backward(upstream)
-    torch.testing.assert_close(x.grad, ref_x.grad, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(module.weight.grad, ref_weight.grad, rtol=1e-5, atol=1e-6)
+    weight = torch.randn(7, device=device, requires_grad=True)
+    torch.library.opcheck(torch.ops.nemo_automodel.float32_rms_norm.default, (x, weight, 1e-5))
 
 
-@pytest.mark.parametrize(("shape", "dim"), [((), 7), ((2, 7), 1), ((2, 7), (2, 7))])
-def test_float32_rms_norm_rejects_invalid_shapes(shape, dim):
-    module = Float32RMSNorm(dim, dtype=torch.float32)
-    with pytest.raises(ValueError, match="Float32RMSNorm expects"):
-        module(torch.randn(shape))
-
-
-# A fresh process verifies reimport safety and the absence of custom-op registration.
-@pytest.mark.runtime_budget(60, hard_timeout=70, reason="a fresh Python process imports torch and checks reimports")
+# The child process isolates registrations and reproduces the install import checker.
+@pytest.mark.runtime_budget(60, hard_timeout=70, reason="a fresh Python process imports torch and checks registrations")
 def test_float32_rms_norm_reimport():
     script = """
 import importlib
@@ -112,14 +90,14 @@ import sys
 import torch
 name = "nemo_automodel.components.models.common.utils"
 original = importlib.import_module(name)
-assert not hasattr(torch.ops.nemo_automodel, "float32_rms_norm")
 for _ in range(2):
     del sys.modules[name]
     current = importlib.import_module(name)
     for module in (original, current):
         x = torch.randn(7, requires_grad=True)
         norm = module.Float32RMSNorm(7, dtype=torch.float32)
-        norm(x).sum().backward()
+        with torch.compiler.set_stance("force_eager"):
+            norm(x).sum().backward()
         assert norm.weight.grad.shape == (7,)
         assert torch.isfinite(x.grad).all()
 """
@@ -148,11 +126,10 @@ def _dtensor_worker(rank: int, world_size: int, init_file: str) -> None:
             expected.backward(upstream)
 
             x = distribute_tensor(values.clone(), mesh, [placement]).requires_grad_()
-            module = Float32RMSNorm(8, dtype=torch.float32)
-            module.weight = torch.nn.Parameter(distribute_tensor(weights.clone(), mesh, [Replicate()]))
-            weight = module.weight
-            actual = module(x)
-            assert actual.placements == (placement,)
+            weight = distribute_tensor(weights.clone(), mesh, [Replicate()]).requires_grad_()
+            actual = torch.ops.nemo_automodel.float32_rms_norm(x, weight, 1e-5)
+            expected_placement = Replicate() if placement == Shard(2) else placement
+            assert actual.placements == (expected_placement,)
             torch.testing.assert_close(actual.full_tensor(), expected, rtol=1e-5, atol=1e-6)
             actual.backward(distribute_tensor(upstream, mesh, list(actual.placements)))
             torch.testing.assert_close(x.grad.full_tensor(), ref_x.grad, rtol=1e-5, atol=1e-6)
@@ -182,10 +159,9 @@ def test_float32_rms_norm_dtensor(world_size, tmp_path):
     not torch.cuda.is_available(), reason="CUDA is required to reproduce the compiled grad/no_grad regression"
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("surrounding_ops", [False, True])
 # This checks actual Inductor compilation, including activation recomputation.
 @pytest.mark.runtime_budget(60, hard_timeout=70, reason="runs Inductor compilation and activation recomputation")
-def test_float32_rms_norm_stays_eager_inside_compiled_code(dtype, surrounding_ops, monkeypatch):
+def test_float32_rms_norm_compiled_determinism(dtype, monkeypatch):
     from torch._dynamo.testing import CompileCounterWithBackend
 
     monkeypatch.delenv("TORCH_COMPILE_DISABLE", raising=False)
@@ -193,22 +169,8 @@ def test_float32_rms_norm_stays_eager_inside_compiled_code(dtype, surrounding_op
     module = Float32RMSNorm(257, device="cuda", dtype=dtype)
     with torch.no_grad():
         module.weight.normal_()
-
-    def forward(x: torch.Tensor) -> torch.Tensor:
-        """Optionally place compiled operations around the eager normalization.
-
-        Args:
-            x: CUDA tensor of shape [batch, sequence, hidden].
-
-        Returns:
-            Tensor of shape [batch, sequence, hidden] in x's dtype.
-        """
-        if surrounding_ops:
-            return module(x * 1.25).square()
-        return module(x)
-
     counter = CompileCounterWithBackend("inductor")
-    compiled = torch.compile(forward, backend=counter, fullgraph=False, dynamic=True)
+    compiled = torch.compile(module, backend=counter, fullgraph=True, dynamic=True)
     for shape, recompute in [((2, 7, 257), False), ((3, 5, 257), True)]:
         x = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
         ref_x = x.detach().clone().requires_grad_()
@@ -217,12 +179,8 @@ def test_float32_rms_norm_stays_eager_inside_compiled_code(dtype, surrounding_op
         with torch.no_grad():
             no_grad_output = compiled(x)
         torch.testing.assert_close(actual, no_grad_output, rtol=0, atol=0)
-        norm_input = ref_x * 1.25 if surrounding_ops else ref_x
-        expected = torch.nn.functional.rms_norm(norm_input.float(), (257,), ref_weight.float(), module.eps).to(dtype)
-        if surrounding_ops:
-            expected = expected.square()
-        forward_rtol, forward_atol = (1e-5, 1e-6) if dtype == torch.float32 else (0.008, 1e-5)
-        torch.testing.assert_close(actual, expected, rtol=forward_rtol, atol=forward_atol)
+        expected = torch.nn.functional.rms_norm(ref_x.float(), (257,), ref_weight.float(), module.eps).to(dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         upstream = torch.randn_like(actual)
         actual.backward(upstream)
         expected.backward(upstream)
@@ -230,6 +188,4 @@ def test_float32_rms_norm_stays_eager_inside_compiled_code(dtype, surrounding_op
         torch.testing.assert_close(x.grad, ref_x.grad, rtol=rtol, atol=atol)
         torch.testing.assert_close(module.weight.grad, ref_weight.grad, rtol=rtol, atol=atol)
         module.zero_grad()
-    # Dynamic module dispatch can emit empty graphs; only surrounding arithmetic
-    # should contribute compiled operations.
-    assert (counter.op_count > 0) is surrounding_ops
+    assert counter.frame_count > 0

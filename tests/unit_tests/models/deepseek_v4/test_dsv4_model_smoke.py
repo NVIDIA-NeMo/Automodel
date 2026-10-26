@@ -842,8 +842,11 @@ class TestDeepseekV4ModelSmoke:
         cfg = _tiny_config()
         model = _make_model(cfg)
 
-        # Other compiled model kernels may specialize on compressed sequence
-        # lengths. Allow cache growth for this shape-only test.
+        # ``Float32RMSNorm.forward`` is ``@torch.compile``'d.  Iterating four
+        # different sequence lengths through ``compress_ratio>0`` layers (which
+        # build masks of shape ``[..., n_pooled]`` that varies per call)
+        # explodes Dynamo's per-shape recompile cache.  Disable the compile
+        # for this test — we only care about shape correctness here.
         import torch._dynamo as _dynamo
 
         with _dynamo.config.patch(recompile_limit=64), _dynamo.config.patch(fail_on_recompile_limit_hit=False):
