@@ -128,5 +128,6 @@ optimizer:
 #   name: <your_wandb_name>
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "00:15:00"

@@ -23,7 +23,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5DecoderLayer,
@@ -38,6 +38,11 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model as HFQwen3_5Model,
 )
 from transformers.utils import torch_compilable_check
+from transformers.vision_utils import (
+    get_vision_cu_seqlens,
+    get_vision_interpolation_indices_and_weights,
+    get_vision_position_ids,
+)
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -58,7 +63,11 @@ from nemo_automodel.components.models.common.mtp import (
     prepare_mtp_context_parallel_inputs,
     roll_tensor,
 )
-from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
+from nemo_automodel.components.models.common.packing import (
+    PackedMaskType,
+    flatten_packed_sequence_metadata,
+    is_indexed_packed_mask,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -66,6 +75,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
+    HostTensor,
     prepare_gated_delta_packed_metadata,
 )
 from nemo_automodel.components.models.qwen3_5.parallelization import PARALLELIZER
@@ -438,8 +448,8 @@ class Qwen3_5DenseBlock(Block):
 
         Args:
             x: Hidden states of shape [batch, sequence, hidden].
-            freqs_cis: Rotary frequencies of shape [axes, batch, sequence,
-                head_dim].
+            freqs_cis: Rotary cosine/sine values of shape [batch, sequence,
+                rotary_dim].
             attention_mask: Optional validity, indexed document, or backend mask
                 of shape [batch, sequence] or [batch, 1, sequence, sequence].
             padding_mask: Optional padding mask of shape [batch, sequence].
@@ -447,7 +457,13 @@ class Qwen3_5DenseBlock(Block):
                 [axes, batch, sequence].
             packed_gdn_metadata: Optional model-forward-owned packing metadata;
                 tensor layouts are documented by :class:`GatedDeltaPackedMetadata`.
-            **attn_kwargs: Backend-specific attention arguments.
+            **attn_kwargs: Packed or THD metadata: ``_packed_seq_ids`` has shape
+                [batch, sequence] with 1-based document IDs and zero padding.
+                ``packed_token_indices`` has shape [batch, sequence] with row-local
+                positions and -1 padding, or [tokens] indexing flattened batch
+                and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
+                with row-local boundaries and -1 padding, or [documents + 1] for
+                flattened/THD inputs. ``max_seqlen`` is an integer document length.
 
         Returns:
             Hidden states of shape [batch, sequence, hidden].
@@ -455,7 +471,17 @@ class Qwen3_5DenseBlock(Block):
         if self.layer_type != "linear_attention":
             attn_kwargs = dict(attn_kwargs)
             attn_kwargs.pop("seq_index", None)
-            return super().forward(
+            padded_x = None
+            indices = attn_kwargs.get("packed_token_indices")
+            if self.self_attn.backend.attn == "te" and indices is not None:
+                # NEAT batches stay BSHD between blocks, but TE consumes the
+                # unpadded THD stream with one causal segment per document.
+                padded_x = x
+                x = x.flatten(0, 1)[indices]
+                freqs_cis = freqs_cis.flatten(0, 1)[indices]
+                attention_mask = None
+                padding_mask = None
+            output = super().forward(
                 x,
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
@@ -463,6 +489,9 @@ class Qwen3_5DenseBlock(Block):
                 position_ids=position_ids,
                 **attn_kwargs,
             )
+            if padded_x is not None:
+                output = padded_x.flatten(0, 1).index_copy(0, indices, output).view_as(padded_x)
+            return output
 
         linear_attn_mask = attention_mask
         from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
@@ -474,6 +503,9 @@ class Qwen3_5DenseBlock(Block):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                compute_device=x.device,
+                packed_token_indices=attn_kwargs.get("packed_token_indices"),
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
 
         if packed_gdn_metadata is not None:
@@ -574,13 +606,23 @@ class Qwen3_5DenseTextBackbone(nn.Module):
             output_hidden_states: Accepted for Hugging Face compatibility and
                 ignored.
             **attn_kwargs: Backend-specific attention arguments, including optional
-                ``_packed_seq_ids`` of shape [batch, sequence].
+                ``_packed_seq_ids`` of shape [batch, sequence], ``packed_token_indices``
+                of shape [batch, sequence] or [tokens], ``cu_seqlens`` of shape
+                [batch, max_documents + 1] or [documents + 1], and integer
+                ``max_seqlen``. Batch-major metadata uses -1 padding. Explicit
+                token metadata is supported without context parallelism.
+                The multimodal wrapper temporarily prefixes ``cu_seqlens`` and
+                ``max_seqlen`` with ``_text_`` while crossing the HF vision path;
+                their layouts and values are unchanged.
 
         Returns:
             Model output whose ``last_hidden_state`` has shape [batch, sequence,
             hidden].
         """
         del output_hidden_states  # accepted for HF-forward compatibility; ignored
+        for key in ("cu_seqlens", "max_seqlen"):
+            if f"_text_{key}" in attn_kwargs:
+                attn_kwargs[key] = attn_kwargs.pop(f"_text_{key}")
         if past_key_values is not None or use_cache:
             raise NotImplementedError("KV cache is not supported for the Qwen3.5 dense backend implementation.")
         if inputs_embeds is None:
@@ -597,6 +639,11 @@ class Qwen3_5DenseTextBackbone(nn.Module):
             position_ids = position_ids[1:]
 
         if getattr(self, "_cp_enabled", False):
+            if attn_kwargs.get("packed_token_indices") is not None or attn_kwargs.get("cu_seqlens") is not None:
+                raise ValueError(
+                    "Qwen3.5 packed sequence metadata is unsupported with load-balanced context parallelism. "
+                    "Disable packing or use the supported SDPA block-diagonal CP path for Qwen3.5-MoE."
+                )
             attention_mask = None
             padding_mask = None
 
@@ -607,14 +654,32 @@ class Qwen3_5DenseTextBackbone(nn.Module):
                 padding_mask = attention_mask[:, 0].diagonal(dim1=-2, dim2=-1).bool().logical_not()
 
         hidden_states = inputs_embeds
+        if self.backend.attn == "te" and attn_kwargs.get("packed_token_indices") is not None:
+            # Flatten after microbatch splitting and vision splicing, once for
+            # all decoder blocks. TE requires int32 cumulative lengths.
+            if not isinstance(attn_kwargs.get("cu_seqlens"), torch.Tensor):
+                raise ValueError("Packed Qwen3.5 TE attention requires cu_seqlens alongside packed_token_indices.")
+            indices, cu_seqlens = flatten_packed_sequence_metadata(
+                attn_kwargs["packed_token_indices"],
+                attn_kwargs["cu_seqlens"],
+                batch_size=hidden_states.shape[0],
+                sequence_length=hidden_states.shape[1],
+            )
+            attn_kwargs["packed_token_indices"] = indices
+            attn_kwargs["cu_seqlens"] = cu_seqlens.to(torch.int32)
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
         packed_gdn_metadata = None
         if not getattr(self, "_cp_enabled", False):
+            host_packed_seq_ids = attn_kwargs.pop("_host_packed_seq_ids", None)
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                compute_device=inputs_embeds.device,
+                host_packed_seq_ids=host_packed_seq_ids,
+                packed_token_indices=attn_kwargs.get("packed_token_indices"),
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
 
         for decoder_layer in self.layers.values():
@@ -654,7 +719,7 @@ class Qwen3_5DenseTextBackbone(nn.Module):
 class Qwen3_5Model(HFQwen3_5Model):
     """Thin VLM wrapper exposing ``language_model`` internals as properties and
     routing the forward: vision encoding and a fixed-size splice when media and
-    token IDs are present, HF fallback for embedded media, and the NeMo dense
+    token IDs are present, mask-based splicing for embedded media, and the NeMo dense
     backbone for text only."""
 
     @property
@@ -668,6 +733,122 @@ class Qwen3_5Model(HFQwen3_5Model):
     @property
     def norm(self):
         return self.language_model.norm
+
+    def get_image_features(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor | None = None,
+        host_image_grid_thw: HostTensor | None = None,
+        **kwargs: Any,
+    ) -> tuple | BaseModelOutputWithPooling:
+        """Encode image patches, keeping SDPA segment lengths on the host.
+
+        Args:
+            pixel_values: Tensor of shape [patches, patch_features], in image order.
+            image_grid_thw: Integer tensor of shape [images, 3], with temporal,
+                height, and width grid sizes in that order.
+            host_image_grid_thw: Matching CPU grid retained before the
+                distributed wrapper moves tensor inputs to CUDA.
+            **kwargs: Additional Hugging Face vision-forward arguments.
+
+        Returns:
+            Vision output whose ``last_hidden_state`` has shape [patches, hidden]
+            and whose ``pooler_output`` contains one tensor of shape
+            [image_tokens, hidden] per image, or the equivalent tuple when
+            ``return_dict=False``. The return contract matches the HF method.
+        """
+        if self.visual.config._attn_implementation == "sdpa" and image_grid_thw is not None:
+            # HF's vision helpers use host lengths for attention, interpolation,
+            # positions, and output splitting. Compute them from one host grid
+            # rather than reading CUDA scalars repeatedly in each helper/block.
+            grid_cpu = (
+                host_image_grid_thw.tensor
+                if host_image_grid_thw is not None
+                else image_grid_thw.detach().to(device="cpu")
+            )
+            kwargs["cu_seqlens"] = get_vision_cu_seqlens(grid_cpu)
+            interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+                grid_cpu,
+                num_grid_per_side=self.visual.num_grid_per_side,
+                mode=self.visual.interpolation_mode,
+                align_corners=self.visual.interpolation_align_corners,
+                spatial_merge_size=self.visual.config.spatial_merge_size,
+            )
+            position_ids = get_vision_position_ids(grid_cpu, self.visual.spatial_merge_size)
+            device = pixel_values.device
+            if pixel_values.is_cuda:
+                interp_indices = interp_indices.pin_memory()
+                interp_weights = interp_weights.pin_memory()
+                position_ids = position_ids.pin_memory()
+            kwargs["interp_indices"] = interp_indices.to(device=device, non_blocking=True)
+            kwargs["interp_weights"] = interp_weights.to(device=device, non_blocking=True)
+            kwargs["position_ids"] = position_ids.to(device=device, non_blocking=True)
+            image_grid_thw = grid_cpu
+        return super().get_image_features(pixel_values, image_grid_thw, **kwargs)
+
+    def get_placeholder_mask(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor,
+        image_features: torch.Tensor | None = None,
+        video_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return image and video masks while checking token counts on device.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or ``None`` when
+                only embeddings are available.
+            inputs_embeds: Token embeddings of shape [batch, sequence, hidden].
+            image_features: Optional image features of shape [image_tokens, hidden].
+            video_features: Optional video features of shape [video_tokens, hidden].
+
+        Returns:
+            Image and video boolean masks, each of shape [batch, sequence, 1].
+        """
+        if input_ids is None:
+            image_token = torch.full((), self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+            video_token = torch.full((), self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
+            image_mask = (inputs_embeds == self.get_input_embeddings()(image_token)).all(-1)
+            video_mask = (inputs_embeds == self.get_input_embeddings()(video_token)).all(-1)
+        else:
+            image_mask = input_ids == self.config.image_token_id
+            video_mask = input_ids == self.config.video_token_id
+
+        if image_features is not None:
+            torch._assert_async(
+                image_mask.sum() * inputs_embeds.shape[-1] == image_features.numel(),
+                "Image features and image tokens do not match",
+            )
+        if video_features is not None:
+            torch._assert_async(
+                video_mask.sum() * inputs_embeds.shape[-1] == video_features.numel(),
+                "Video features and video tokens do not match",
+            )
+        return image_mask.unsqueeze(-1).to(inputs_embeds.device), video_mask.unsqueeze(-1).to(inputs_embeds.device)
+
+    @staticmethod
+    def _scatter_media_embeddings(
+        inputs_embeds: torch.Tensor,
+        media_embeds: torch.Tensor,
+        media_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace selected token embeddings without dynamic-size backward ops.
+
+        Args:
+            inputs_embeds: Token embeddings of shape [batch, sequence, hidden].
+            media_embeds: Media embeddings of shape [media_tokens, hidden], in
+                the order of true entries in ``media_mask``.
+            media_mask: Boolean mask of shape [batch, sequence, 1].
+
+        Returns:
+            Combined token embeddings of shape [batch, sequence, hidden].
+        """
+        if media_embeds.numel() == 0:
+            return inputs_embeds
+        token_mask = media_mask.reshape(-1)
+        source_indices = (token_mask.to(torch.long).cumsum(0) - 1).clamp_min_(0)
+        selected = media_embeds.index_select(0, source_indices).reshape_as(inputs_embeds)
+        return torch.where(media_mask, selected, inputs_embeds)
 
     def forward(
         self,
@@ -683,8 +864,35 @@ class Qwen3_5Model(HFQwen3_5Model):
         cache_position=None,
         **kwargs,
     ):
-        # Media present + vision encoder: splice when token IDs are available,
-        # then call the HF forward to reach self.language_model (NeMo backbone).
+        """Route multimodal inputs without exposing text boundaries to vision.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or floating-point
+                pipeline hidden states of shape [batch, sequence, hidden].
+            attention_mask: Padding/document IDs of shape [batch, sequence] or
+                a dense mask of shape [batch, 1, sequence, sequence].
+            position_ids: Text positions of shape [batch, sequence] or mRoPE
+                coordinates of shape [3 or 4, batch, sequence].
+            past_key_values: Unsupported recurrent or KV cache.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            pixel_values: Optional image patches of shape [patches, patch_features].
+            pixel_values_videos: Optional video patches of shape [patches, patch_features].
+            image_grid_thw: Image grids of shape [images, 3] in temporal/height/width order.
+            video_grid_thw: Video grids of shape [videos, 3] in temporal/height/width order.
+            cache_position: Optional token positions of shape [sequence].
+            **kwargs: Text attention metadata, including ``cu_seqlens`` of shape
+                [batch, max_documents + 1] or [documents + 1], integer
+                ``max_seqlen``, and ``packed_token_indices`` of shape [batch,
+                sequence] or [tokens]. Image/video-prefixed metadata retains
+                the inherited HF precomputed-vision contract.
+
+        Returns:
+            Model output with ``last_hidden_state`` of shape [batch, sequence,
+            hidden] and, on the HF media path, ``rope_deltas`` of shape [batch, 1].
+        """
+        host_image_grid_thw = kwargs.pop("_host_image_grid_thw", None)
+        # Media present + vision encoder: full HF VL forward (vision encode +
+        # multimodal scatter), which then calls self.language_model (NeMo backbone).
         if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
             embed_tokens = self.get_input_embeddings()
             input_ids_for_super = input_ids
@@ -700,72 +908,76 @@ class Qwen3_5Model(HFQwen3_5Model):
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
             if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
+            # HF forwards kwargs to both vision and text. Its vision helpers
+            # consume bare cu_seqlens/max_seqlen as precomputed frame metadata,
+            # whereas these values describe packed text documents.
+            for key in ("cu_seqlens", "max_seqlen"):
+                if key in kwargs:
+                    kwargs[f"_text_{key}"] = kwargs.pop(key)
+            if inputs_embeds_for_super is None:
+                inputs_embeds_for_super = embed_tokens(input_ids_for_super)
 
-            # With token IDs available, keep the HF vision/position path but
-            # replace its dynamic masked-scatter backward with fixed-size indices.
-            # The inputs-embeds-only generation path retains the upstream fallback.
-            if input_ids_for_super is not None:
-                if inputs_embeds_for_super is None:
-                    inputs_embeds_for_super = embed_tokens(input_ids_for_super)
-                if pixel_values is not None:
-                    image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True, **kwargs)
-                    image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
-                        inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
-                    )
+            vision_kwargs = {
+                key: value for key, value in kwargs.items() if key not in {"_host_packed_seq_ids", "return_dict"}
+            }
+            if pixel_values is not None:
+                image_outputs = self.get_image_features(
+                    pixel_values,
+                    image_grid_thw,
+                    host_image_grid_thw=host_image_grid_thw,
+                    return_dict=True,
+                    **vision_kwargs,
+                )
+                image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
+                    inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
+                )
+                if input_ids_for_super is not None:
                     inputs_embeds_for_super = _splice_multimodal_features(
-                        inputs_embeds_for_super,
-                        input_ids_for_super,
-                        image_embeds,
-                        self.config.image_token_id,
-                        "Image",
+                        inputs_embeds_for_super, input_ids_for_super, image_embeds, self.config.image_token_id, "Image"
                     )
-                if pixel_values_videos is not None:
-                    video_outputs = self.get_video_features(
-                        pixel_values_videos, video_grid_thw, return_dict=True, **kwargs
+                else:
+                    image_mask, _ = self.get_placeholder_mask(None, inputs_embeds_for_super, image_embeds)
+                    inputs_embeds_for_super = self._scatter_media_embeddings(
+                        inputs_embeds_for_super, image_embeds, image_mask
                     )
-                    video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
-                        inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
-                    )
+            if pixel_values_videos is not None:
+                video_outputs = self.get_video_features(
+                    pixel_values_videos, video_grid_thw, return_dict=True, **vision_kwargs
+                )
+                video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
+                    inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
+                )
+                if input_ids_for_super is not None:
                     inputs_embeds_for_super = _splice_multimodal_features(
-                        inputs_embeds_for_super,
-                        input_ids_for_super,
-                        video_embeds,
-                        self.config.video_token_id,
-                        "Video",
+                        inputs_embeds_for_super, input_ids_for_super, video_embeds, self.config.video_token_id, "Video"
                     )
-                if position_ids is None:
-                    position_ids = self.compute_3d_position_ids(
-                        input_ids=input_ids_for_super,
-                        inputs_embeds=inputs_embeds_for_super,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        attention_mask=attention_mask,
-                        past_key_values=past_key_values,
-                        mm_token_type_ids=kwargs.get("mm_token_type_ids"),
+                else:
+                    _, video_mask = self.get_placeholder_mask(
+                        None, inputs_embeds_for_super, video_features=video_embeds
                     )
-                return super().forward(
-                    input_ids=None,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    inputs_embeds=inputs_embeds_for_super,
-                    pixel_values=None,
-                    pixel_values_videos=None,
+                    inputs_embeds_for_super = self._scatter_media_embeddings(
+                        inputs_embeds_for_super, video_embeds, video_mask
+                    )
+            if position_ids is None:
+                position_ids = self.compute_3d_position_ids(
+                    input_ids=input_ids_for_super,
                     image_grid_thw=image_grid_thw,
                     video_grid_thw=video_grid_thw,
-                    cache_position=cache_position,
-                    **kwargs,
+                    inputs_embeds=inputs_embeds_for_super,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    mm_token_type_ids=kwargs.get("mm_token_type_ids"),
                 )
             return super().forward(
-                input_ids=input_ids_for_super,
+                input_ids=None,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds_for_super,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
+                pixel_values=None,
+                pixel_values_videos=None,
+                image_grid_thw=None,
+                video_grid_thw=None,
                 cache_position=cache_position,
                 **kwargs,
             )
@@ -795,8 +1007,15 @@ class Qwen3_5Model(HFQwen3_5Model):
 class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     """Qwen3.5 dense causal LM with optional Megatron-style MTP head."""
 
+    _uses_native_fa4 = True
+    requires_packed_sequence_metadata = True
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+    @property
+    def packed_mask_type(self) -> PackedMaskType:
+        """Request compact NEAT document IDs when TE consumes packed offsets."""
+        return "document_ids" if self.backend.attn == "te" else "block_causal"
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -893,6 +1112,32 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
+        """Compute causal-LM logits and optional multi-token prediction states.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence].
+            attention_mask: Optional document/validity mask of shape [batch, sequence]
+                or block-causal mask of shape [batch, 1, sequence, sequence].
+            position_ids: Optional text positions of shape [batch, sequence] or
+                multi-axis positions of shape [3, batch, sequence] or
+                [4, batch, sequence] including a leading text-position axis.
+            past_key_values: Optional HF cache; cached generation is unsupported.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            labels: Optional targets of shape [batch, sequence], ignored here.
+            use_cache: Whether to cache states; only False or None is supported.
+            logits_to_keep: Trailing token count (zero means all), or position
+                indices of shape [selected_tokens] indexing the sequence axis.
+            **kwargs: Backbone arguments, including ``_packed_seq_ids`` of shape
+                [batch, sequence], ``packed_token_indices`` of shape [batch, sequence]
+                or [tokens], ``cu_seqlens`` of shape [batch, max_documents + 1] or
+                [documents + 1], and integer ``max_seqlen``. Batch-major metadata
+                uses -1 padding and is removed before the separate MTP sublayers.
+
+        Returns:
+            Logits of shape [batch, selected_sequence, vocab], final hidden states
+            of shape [batch, sequence, hidden], and optional per-depth MTP states
+            with the same hidden-state layout.
+        """
         del labels
         kwargs.pop("output_hidden_states", None)
         effective_use_cache = False if use_cache is None else use_cache
@@ -912,6 +1157,11 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
 
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:
+            mtp_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"packed_token_indices", "cu_seqlens", "cu_seqlens_padded", "max_seqlen"}
+            }
             source_embeds = inputs_embeds if inputs_embeds is not None else self.model.embed_tokens(input_ids)
             rotary_position_ids, text_position_ids = _split_qwen3_5_position_ids(
                 position_ids,
@@ -942,7 +1192,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
                     position_ids=rotary_position_ids,
                     attention_mask=causal_mask,
                     rotary_emb=self.model.rotary_emb,
-                    **kwargs,
+                    **mtp_kwargs,
                 )
             else:
                 mtp_per_depth_h = self.mtp(
@@ -952,7 +1202,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
                     position_ids=rotary_position_ids,
                     attention_mask=causal_mask,
                     rotary_emb=self.model.rotary_emb,
-                    **kwargs,
+                    **mtp_kwargs,
                 )
 
         return Qwen3_5CausalLMOutputWithPast(
@@ -996,12 +1246,14 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
 class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditionalGeneration):
     """Qwen3.5/Qwen3.6 dense VLM with optional Megatron-style MTP head.
 
-    The base VLM stays on the upstream HF implementation so image/video feature
-    insertion, M-RoPE position handling, and generation helpers remain intact.
+    The base VLM retains upstream image/video and M-RoPE semantics, with
+    model-owned host metadata and media insertion paths to avoid CUDA syncs.
     MTP is added as an auxiliary train-time module over the final language
     hidden states, matching the dense text-only MTP architecture.
     """
 
+    _uses_native_fa4 = True
+    requires_packed_sequence_metadata = True
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
@@ -1031,6 +1283,11 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         supports_thd: bool = False
         supports_cp_vision_frame_sharding: bool = True
         supports_mtp_cp: bool = True
+
+    @property
+    def packed_mask_type(self) -> PackedMaskType:
+        """Request compact NEAT document IDs when TE consumes packed offsets."""
+        return "document_ids" if self.backend.attn == "te" else "block_causal"
 
     @classmethod
     def from_config(
@@ -1111,11 +1368,46 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
+    def prepare_host_batch_metadata(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Retain host metadata outside distributed tensor input transfers."""
+        metadata: dict[str, Any] = {}
+        for key, host_key in (
+            ("image_grid_thw", "_host_image_grid_thw"),
+            ("_packed_seq_ids", "_host_packed_seq_ids"),
+        ):
+            value = batch.get(key)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                metadata[host_key] = HostTensor(value)
+        input_ids = batch.get("input_ids")
+        if (
+            not isinstance(input_ids, torch.Tensor)
+            or input_ids.device.type != "cpu"
+            or torch.is_floating_point(input_ids)
+        ):
+            return metadata
+        token_ids = (self.config.image_token_id, self.config.video_token_id, self.config.vision_start_token_id)
+        metadata["_vlm_token_presence"] = tuple(
+            bool((input_ids == token_id).any()) if token_id is not None else False for token_id in token_ids
+        )
+        return metadata
+
     def _pop_staged_vlm_media(
         self,
         input_ids: torch.Tensor | None,
         kwargs: dict[str, Any],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Resolve media for the current sequence and pipeline chunk.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or ``None``.
+            kwargs: Forward arguments with optional image and video patch tensors
+                of shape [patches, patch_features] and grids of shape [entries, 3].
+
+        Returns:
+            Image patches [image_patches, patch_features], video patches
+            [video_patches, patch_features], image grid [images, 3], and video
+            grid [videos, 3], each optionally ``None``.
+        """
         pixel_values = kwargs.get("pixel_values", None)
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
@@ -1124,21 +1416,19 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
-        has_image_tokens = (
-            bool((input_ids == image_token_id).any().item())
-            if input_ids is not None and image_token_id is not None
-            else False
-        )
-        has_video_tokens = (
-            bool((input_ids == video_token_id).any().item())
-            if input_ids is not None and video_token_id is not None
-            else False
-        )
-        has_vision_start_tokens = (
-            bool((input_ids == vision_start_token_id).any().item())
-            if input_ids is not None and vision_start_token_id is not None
-            else False
-        )
+        has_image_tokens = has_video_tokens = has_vision_start_tokens = False
+        token_presence = kwargs.pop("_vlm_token_presence", None)
+        if input_ids is not None and token_presence is None:
+            # The staged-media decision needs host booleans. Transfer the three
+            # results together so it has one CUDA synchronization per forward.
+            token_presence = torch.stack(
+                [
+                    (input_ids == token_id).any() if token_id is not None else input_ids.new_zeros((), dtype=torch.bool)
+                    for token_id in (image_token_id, video_token_id, vision_start_token_id)
+                ]
+            ).tolist()
+        if input_ids is not None:
+            has_image_tokens, has_video_tokens, has_vision_start_tokens = token_presence
         has_media_tokens = input_ids is not None and (has_image_tokens or has_video_tokens or has_vision_start_tokens)
         if input_ids is not None:
             if pixel_values is not None and image_token_id is not None and not has_image_tokens:
@@ -1641,8 +1931,10 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     "cache_position",
                     "cu_seqlens",
                     "cu_seqlens_padded",
+                    "packed_token_indices",
                     "max_seqlen",
                     "mm_token_type_ids",
+                    "_host_packed_seq_ids",
                     "padding_mask",
                     "qkv_format",
                 }

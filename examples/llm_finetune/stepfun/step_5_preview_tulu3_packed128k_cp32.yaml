@@ -1,0 +1,138 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Long-context full-parameter SFT of the Step 5 Preview language backbone on
+# Tulu3 packed to 131,072 tokens. 16 H100 nodes x 8 GPUs: PP4 / CP32 / EP32.
+# CP32 gives each rank a contiguous 4,096-token query shard of every pack.
+# The interleaved 1F1B schedule runs eight model parts, two per pipeline rank.
+# Step5 owns its CP attention, so NEAT packs documents with cp_size 1 and
+# the model's document-ID mask; documents keep their own positions and labels.
+#
+# To run this recipe:
+#   automodel examples/llm_finetune/stepfun/step_5_preview_tulu3_packed128k_cp32.yaml --nproc-per-node 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 42
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 4
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 5
+  max_steps: 50
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: fa4
+    linear: te
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: hybridep
+    compile_router_weight: true
+    gate_precision: float32
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/step_5_preview_tulu3_packed128k_cp32
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 32
+  pp_size: 4
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  moe:
+    wrap_outer_model: true
+    reshard_after_forward: true
+    ignore_router_for_ac: true
+    mp_policy:
+      _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+      param_dtype: bfloat16
+      reduce_dtype: float32
+      output_dtype: null
+      cast_forward_inputs: false
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    pp_seq_len: 4096
+    scale_grads_in_schedule: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 42
+  seq_length: 131072
+  truncation: true
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16
+
+packed_sequence:
+  packed_sequence_size: 131072
+  packing_strategy: neat
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: false
+  drop_last: true
+  num_workers: 2
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+lr_scheduler:
+  lr_decay_style: constant
+
+clip_grad_norm:
+  max_norm: 1.0
+
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 16
+  cluster_tag: h100
+  time: "01:00:00"

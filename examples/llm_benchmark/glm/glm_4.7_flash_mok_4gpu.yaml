@@ -145,3 +145,5 @@ ci:
   recipe_owner: HuiyingLi
   time: "00:25:00"
   nodes: 1
+  nproc_per_node: 4
+  cluster_tag: gb200

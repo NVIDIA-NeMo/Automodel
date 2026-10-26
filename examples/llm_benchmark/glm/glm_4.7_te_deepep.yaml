@@ -80,6 +80,7 @@ model:
     rope_fusion: true
     experts: torch_mm
     dispatcher: hybridep
+    compile_router_weight: true
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -111,6 +112,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  cluster_tag: h100
   time: "00:45:00"
   nodes: 32
   env_vars:

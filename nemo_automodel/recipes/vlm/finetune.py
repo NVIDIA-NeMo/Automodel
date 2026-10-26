@@ -54,6 +54,7 @@ from nemo_automodel._transformers import (
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
@@ -85,6 +86,7 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -174,6 +176,41 @@ def _validate_cp_packing_support(
     )
 
 
+def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
+    """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
+    # Probe the wrapped model's signature, head, and config; training still calls DDP.
+    if isinstance(probe_module, nn.parallel.DistributedDataParallel):
+        probe_module = probe_module.module
+    if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
+        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        return MaskedCrossEntropy(
+            ignore_index=_get_loss_ignore_index(loss_fn),
+            reduction=getattr(loss_fn, "reduction", "sum"),
+        )
+    if (
+        pp_enabled
+        and isinstance(loss_fn, LinearCrossEntropy)
+        and not getattr(probe_module, "_pp_return_hidden_states_supported", False)
+    ):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires pipeline stages that can return hidden states")
+        logger.warning(
+            "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
+            "model. Using MaskedCrossEntropy instead."
+        )
+        return MaskedCrossEntropy(
+            ignore_index=_get_loss_ignore_index(loss_fn),
+            reduction=getattr(loss_fn, "reduction", "sum"),
+        )
+    if isinstance(loss_fn, ChunkedCrossEntropy):
+        lm_head = _get_lm_head_module(probe_module)
+        if lm_head is not None or not pp_enabled:
+            loss_fn.validate_lm_head(lm_head, model_config=getattr(probe_module, "config", None))
+    return loss_fn
+
+
 def _get_model_name(cfg_model):
     if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
@@ -194,8 +231,13 @@ def build_model(
     cfg_compile=None,
     distributed_setup: DistributedSetup | None = None,
     cfg_quantization=None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
+
+    Args:
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
 
     Returns:
         The instantiated model and optimizer.
@@ -205,6 +247,7 @@ def build_model(
         kwargs = {
             "peft_config": cfg_peft,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
+            "load_metadata_with_gloo": load_metadata_with_gloo,
         }
         if distributed_setup is not None:
             kwargs["distributed_setup"] = distributed_setup
@@ -333,6 +376,7 @@ def build_dataloader(
     cfg_ps=None,
     get_rope_index=None,
     pp_n_microbatches=None,
+    model: nn.Module | None = None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -344,7 +388,7 @@ def build_dataloader(
         device_mesh: Device mesh for distributed training.
         seed: Random seed.
         local_batch_size: Local batch size.
-        cfg_model: Model configuration (used to detect attention backend).
+        cfg_model: Deprecated compatibility argument; ignored.
         cfg_ps: Packed sequence configuration (top-level ``packed_sequence:`` section).
             When provided, takes precedence over ``dataset.packing``.
         get_rope_index: Optional ``model.get_rope_index`` callable. When provided,
@@ -354,6 +398,7 @@ def build_dataloader(
             plain 1D positions.
         pp_n_microbatches: When set, wrap collate so VLM media tensors are
             pre-chunked for this many PP microbatches before entering the train loop.
+        model: Built model supplying the structural packing contract.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -381,17 +426,16 @@ def build_dataloader(
         if "cp" in getattr(device_mesh, "mesh_dim_names", ()):
             cp_size = device_mesh["cp"].size()
 
-    from nemo_automodel.components.models.common.packing import (
-        get_attn_implementation,
-        validate_flash_packing_support,
-    )
+    from nemo_automodel.components.models.common.packing import configure_packing, get_model_attn_implementation
 
-    packing_attn_implementation = config.resolve_packing_attn_implementation(
-        model_attn_implementation=get_attn_implementation(cfg_model),
-        cp_size=cp_size,
-    )
+    packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
     if config.packing is not None and config.packing.packing_format != "thd":
-        validate_flash_packing_support(attn_implementation=packing_attn_implementation)
+        if model is None:
+            raise ValueError("Packed deprecated build_dataloader calls require the built model")
+        packing_contract = configure_packing(
+            get_model_attn_implementation(model),
+            model=model,
+        )
 
     with ScopedRNG(seed=seed, ranked=True):
         result = config.build(
@@ -401,7 +445,7 @@ def build_dataloader(
             batch_size=local_batch_size,
             dataset_build_context=FirstRankPerNode(),
             get_rope_index=get_rope_index,
-            packing_attn_implementation=packing_attn_implementation,
+            packing_contract=packing_contract,
             pp_n_microbatches=pp_n_microbatches,
             cp_size=cp_size,
         )
@@ -437,6 +481,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
     def _should_setup_training_components(self) -> bool:
         """Whether this rank owns the trainable model and its components."""
         return True
+
+    def _configure_packing(self) -> PackingCapabilities:
+        """Configure local model stages before the VLM dataloader is built."""
+        from nemo_automodel.components.models.common.packing import configure_packing_for_models
+
+        return configure_packing_for_models(self.model_parts)
 
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
@@ -487,6 +537,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
             suppress_wandb_log_messages()
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
+
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=_get_model_name(self.cfg.model)
+            )
+            logging.info("Trackio experiment tracking enabled")
 
         if self.dist_env.is_main and self.cfg.mlflow is not None:
             run_config = self.cfg.to_yaml_dict(use_orig_values=True)
@@ -560,6 +617,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             distributed_setup=self.distributed_setup,
             cfg_quantization=self.cfg.get("quantization", None),
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         capability_model = model.parts[0] if isinstance(model, AutoPipeline) else model
         _validate_cp_vision_frame_sharding_support(capability_model, self.cp_vision_frame_sharding)
@@ -570,26 +628,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
             model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
-        if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
-            if isinstance(self.loss_fn, ChunkedCrossEntropy):
-                raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
-            logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-            self.loss_fn = MaskedCrossEntropy(
-                ignore_index=_get_loss_ignore_index(self.loss_fn),
-                reduction=getattr(self.loss_fn, "reduction", "sum"),
-            )
-
-        if isinstance(self.loss_fn, ChunkedCrossEntropy):
-            self.loss_fn.validate_lm_head(
-                _get_lm_head_module(capability_model), model_config=getattr(capability_model, "config", None)
-            )
-
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
         else:
             self.model_parts = [model]
             self.pp = None
+
+        if self.cfg.get("nvtx", False):
+            import nemo_automodel.autonvtx as autonvtx
+
+            for i, part in enumerate(self.model_parts):
+                name = f"PipelineStage_{i}" if self.pp is not None else type(part).__name__
+                # Backward module hooks introduce views that conflict with VLM
+                # in-place operations. Annotate forward and recomputation only.
+                autonvtx.patch(part, name=name, add_backward_hooks=False)
+
+        # Loss-function capability check
+        self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
+
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
@@ -629,17 +686,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             packing_enabled=dataloader_config.packing is not None,
             cp_size=self.mesh_context.cp_size,
         )
-        from nemo_automodel.components.models.common.packing import (
-            get_attn_implementation,
-            validate_flash_packing_support,
-        )
-
-        packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
-            model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),
-            cp_size=self.mesh_context.cp_size,
-        )
+        packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
-            validate_flash_packing_support(attn_implementation=packing_attn_implementation, model=self.model_parts[0])
+            packing_contract = self._configure_packing()
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
@@ -650,7 +699,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 dataset_build_context=dataset_build_context,
                 get_rope_index=get_rope_index,
-                packing_attn_implementation=packing_attn_implementation,
+                packing_contract=packing_contract,
                 pp_n_microbatches=pp_n_microbatches,
                 cp_size=self.mesh_context.cp_size,
             )
@@ -670,6 +719,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                     dataset_build_context=validation_build_context,
                     get_rope_index=get_rope_index,
+                    packing_contract=packing_contract,
                     cp_size=self.mesh_context.cp_size,
                 )
             self.val_dataloader = validation_build.dataloader
@@ -868,8 +918,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
+        """Run one local batch and accumulate its loss and optional gradients.
 
+        Args:
+            idx: Microbatch index in the accumulation window.
+            batch: Input mapping with token IDs, labels, and physical NEAT
+                document IDs of shape [batch, sequence]. NEAT attention metadata
+                is batch-major; legacy THD inputs are flattened by the sharder.
+                VLM media and position tensors retain the model's input layout.
+                THD MTP requires physical boundaries in cu_seqlens_padded of
+                shape [num_sequences + 1] or [1, num_sequences + 1], or
+                _packed_seq_ids [batch, sequence] supplied by the native model
+                sharder from physical seq_lens_padded [batch, num_sequences].
+            loss_buffer: List receiving the detached scalar loss.
+            num_label_tokens: Global supervised-token count for loss normalization.
+            num_batches: Number of microbatches in the accumulation window.
+            is_train: Whether to backpropagate the combined main and MTP loss.
+        """
         # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
         # a plain method call (prepare_model_inputs_for_cp): sharder-only, it
         # touches no weights and consumes nothing. Invoke it on EVERY pp stage so
@@ -884,6 +949,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
             and self.device_mesh["cp"].size() > 1
         )
+        if not _cp_active and not self.pp_enabled:
+            prepare_host_metadata = getattr(self.model_parts[0], "prepare_host_batch_metadata", None)
+            if prepare_host_metadata is not None:
+                batch = {**batch, **prepare_host_metadata(batch)}
+        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
         if _cp_active and not _is_first_or_no_pp and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
             # Non-first PP stages don't embed; drop raw multimodal inputs so their
             # forwards see only text.
@@ -946,6 +1016,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
+        # Preserve physical NEAT document IDs before model-kwarg filtering. The
+        # loss needs these even when the forward does not accept packing metadata.
+        mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
+        # Preserve packing metadata needed by the loss before model-kwarg filtering.
+        mtp_is_packed = "cu_seqlens" in batch or "cu_seqlens_padded" in batch or batch.get("qkv_format") == "thd"
+        mtp_cu_seqlens = batch.get("cu_seqlens_padded")
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -1024,6 +1100,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
+                        # CP targets or NEAT document IDs already define the boundaries.
+                        mtp_cu_seqlens = None
+                    elif mtp_is_packed and mtp_cu_seqlens is None:
+                        raise ValueError(
+                            "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
+                            "including padding; cu_seqlens alone is insufficient."
+                        )
                     if _cp_active and mtp_per_depth_targets is None:
                         raise RuntimeError("MTP with context parallelism requires globally prepared per-depth targets")
                     mtp_cfg = self.cfg.mtp
@@ -1035,6 +1119,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         mtp_per_depth_h=mtp_per_depth_h,
                         mtp_per_depth_logits=mtp_per_depth_logits,
                         mtp_per_depth_targets=mtp_per_depth_targets,
+                        seq_idx=mtp_seq_idx,
                         labels=labels,
                         model=model,
                         scaling_factor=scaling_factor,
@@ -1043,7 +1128,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         lm_weight=shared_lm_weight,
                         logits_dtype=out.logits.dtype,
                         grad_reduce_group=grad_reduce_group,
-                        cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
+                        cu_seqlens=mtp_cu_seqlens,
                     )
 
                 # Joint base + drafter co-training (Gemma4WithDrafter and
@@ -1080,6 +1165,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
+        # Linear CE consumes hidden states: flag the last stage to emit them
+        if isinstance(self.loss_fn, LinearCrossEntropy):
+            last_stage_model._pp_return_hidden_states = True
+
         self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
             self.loss_fn,
             last_stage_model,
@@ -1094,22 +1183,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        num_label_tokens = torch.tensor(
-            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
+        # Both counts are needed as Python integers. Reduce and read them in one
+        # transfer so the second count does not introduce another device sync.
+        token_counts = torch.tensor(
+            [
+                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+            ],
+            dtype=torch.long,
         )
-        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        num_label_tokens, num_tokens_in_batch = self._dp_allreduce(token_counts).tolist()
 
         num_batches = len(batches)
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer = []
-
-        # number of tokens in the batch, excluding any tail padding.
-        num_tokens_in_batch = torch.tensor(
-            sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-            dtype=torch.long,
-        )
-        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
@@ -1314,6 +1402,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         if _HAS_MLFLOW and mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
@@ -1347,6 +1438,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
             if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=self.step_scheduler.step)
 

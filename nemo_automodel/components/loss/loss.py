@@ -173,7 +173,7 @@ class KDLossConfig(LossConfig):
         fp32_upcast: Cast logits to float32 for numerical stability.
         tp_group: Tensor-parallel process group the loss reduces over (runtime
             arg; usually left as ``None`` in YAML and supplied programmatically).
-        chunk_size: Vocab chunk size for the KD loss (0 = no chunking).
+        chunk_size: Number of valid tokens per KD loss chunk (0 = no chunking).
     """
 
     ignore_index: int = -100
@@ -191,6 +191,44 @@ class KDLossConfig(LossConfig):
             fp32_upcast=self.fp32_upcast,
             tp_group=self.tp_group,
             chunk_size=self.chunk_size,
+        )
+
+
+@dataclass
+class DFlashDecayLossConfig(LossConfig):
+    """``DFlashDecayLoss`` (DFlash draft training, decay + D-PACE objectives).
+
+    Attributes:
+        loss_gamma: Position-decay parameter γ (Eq. 4). ``None`` disables decay
+            (uniform weights). Ignored by the ``dpace*`` variants.
+        use_fused_linear_ce: Use the chunked linear-CE path (``forward_fused``)
+            so the full ``[batch, blocks, k, vocab]`` logits are never
+            materialised.
+        chunk_size: Predicted positions per chunk in the fused path.
+        normalize: Denominator policy — ``"tokens"`` (global ``num_tokens``) or
+            ``"mean"`` (effective weight sum for dflash, batch size times block
+            count for D-PACE).
+        loss_type: ``"dflash"`` or a ``"dpace*"`` variant.
+        dpace_alpha: Smoothing α for the D-PACE confidence product.
+    """
+
+    loss_gamma: float | None = 7.0
+    use_fused_linear_ce: bool = False
+    chunk_size: int = 1024
+    normalize: str = "tokens"
+    loss_type: str = "dflash"
+    dpace_alpha: float = 0.5
+
+    def build(self) -> nn.Module:
+        from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+
+        return DFlashDecayLoss(
+            loss_gamma=self.loss_gamma,
+            use_fused_linear_ce=self.use_fused_linear_ce,
+            chunk_size=self.chunk_size,
+            normalize=self.normalize,
+            loss_type=self.loss_type,
+            dpace_alpha=self.dpace_alpha,
         )
 
 
@@ -227,6 +265,7 @@ LOSS_CONFIG_REGISTRY: dict[str, type[LossConfig]] = {
     "ChunkedCrossEntropy": ChunkedCEConfig,
     "TEParallelCrossEntropy": TEParallelCEConfig,
     "KDLoss": KDLossConfig,
+    "DFlashDecayLoss": DFlashDecayLossConfig,
 }
 
 
@@ -309,6 +348,7 @@ def build_loss_module(loss: LossConfig | Callable[..., nn.Module], **loss_kwargs
 
 __all__ = [
     "LOSS_CONFIG_REGISTRY",
+    "DFlashDecayLossConfig",
     "FusedLinearCEConfig",
     "KDLossConfig",
     "LossConfig",

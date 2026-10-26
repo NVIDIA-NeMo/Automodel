@@ -68,6 +68,7 @@ from nemo_automodel.components.loss.utils import (
     _normalize_kd_labels,
     calculate_loss,
 )
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
@@ -85,6 +86,7 @@ from nemo_automodel.recipes.kd_utils import (
     RUN_TEACHER,
     STOP_TEACHER,
     KDMeshBridge,
+    configure_kd_teacher_packing,
     create_kd_distributed_setups,
     materialize_teacher_logits,
 )
@@ -109,6 +111,8 @@ def _build_teacher_model(
     has_packed_sequence,
     distributed_setup: DistributedSetup | None = None,
     device=None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ):
     """Build and initialize the teacher model for knowledge distillation.
 
@@ -121,6 +125,7 @@ def _build_teacher_model(
         has_packed_sequence: Whether using packed sequences.
         distributed_setup: Resolved distributed topology and policy object.
         device: Device to place the teacher model on.
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
 
     Returns:
         The frozen teacher model ready for inference.
@@ -138,6 +143,7 @@ def _build_teacher_model(
         kwargs: Dict[str, Any] = {
             "has_packed_sequence": has_packed_sequence,
             "distributed_setup": distributed_setup,
+            "load_metadata_with_gloo": load_metadata_with_gloo,
         }
 
         teacher_model = cfg_teacher.instantiate(**kwargs)
@@ -160,6 +166,8 @@ def _build_teacher_model_with_pp(
     pipeline_config: PipelineConfig,
     distributed_setup: DistributedSetup,
     activation_checkpointing: bool,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> Any:
     """Build a frozen teacher model with the supplied distributed setup.
 
@@ -175,6 +183,7 @@ def _build_teacher_model_with_pp(
         pipeline_config: Pipeline configuration for the teacher.
         distributed_setup: Distributed setup for the teacher.
         activation_checkpointing: Whether to enable activation checkpointing.
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
 
     Returns:
         The frozen teacher AutoPipeline with a ``_teacher_logits_capture`` attribute.
@@ -240,6 +249,7 @@ def _build_teacher_model_with_pp(
             cfg_quantization=None,
             distributed_setup=teacher_distributed_setup,
             cfg_qat=None,
+            load_metadata_with_gloo=load_metadata_with_gloo,
         )
 
     # Freeze all teacher parameters.
@@ -315,6 +325,32 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             pp_microbatch_size=pp_microbatch_size,
         )
 
+    def _configure_packing(self) -> PackingCapabilities:
+        """Emit metadata for both KD consumers, including a teacher built later."""
+        return replace(super()._configure_packing(), requires_packed_sequence_metadata=True)
+
+    def _configure_teacher_packing(self) -> None:
+        """Adapt teacher stages and reject incompatible student/teacher mask layouts.
+
+        All separate-mesh ranks participate in the layout check before either
+        side starts training. Metadata is always emitted by the KD dataloader,
+        since the teacher is constructed after the student loader.
+        """
+        if (
+            self.cfg.get("packed_sequence.packed_sequence_size", 0) <= 0
+            or self.cfg.get("packed_sequence.packing_strategy", "thd") != "neat"
+        ):
+            return
+        teacher_parts = []
+        if self.teacher_model is not None:
+            teacher_parts = self.teacher_pp.parts if self.teacher_pp is not None else [self.teacher_model]
+        student_parts = self.model_parts if not self.separate_meshes or self.kd_mesh_bridge.is_student else []
+        configure_kd_teacher_packing(
+            teacher_parts,
+            student_parts,
+            control_group=self.kd_mesh_bridge.control_group if self.separate_meshes else None,
+        )
+
     def setup(self):  # noqa: C901 – same complexity as parent
         """Build student & teacher, dataloaders, optimizers, etc."""
         # Right now, we only support tokenizer compatibility for the same tokenizer.
@@ -339,6 +375,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         pipeline_config=self.pipeline_config,
                         distributed_setup=self.distributed_setup,
                         activation_checkpointing=self.activation_checkpointing,
+                        load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
                     )
                     self.teacher_pp = self.teacher_model
                 else:
@@ -348,6 +385,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
                         distributed_setup=self.distributed_setup,
                         device=self.dist_env.device,
+                        load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
                     )
                     self.teacher_pp = None
             else:
@@ -357,6 +395,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     schedule = self.pp.info.schedule
                     self._original_pp_loss_fn = getattr(schedule, "_loss_fn", None)
                     schedule._loss_fn = self._make_pp_kd_loss_wrapper()
+            self._configure_teacher_packing()
             self.kd_mesh_bridge.synchronize()
             return
 
@@ -376,6 +415,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 pipeline_config=self.pipeline_config,
                 distributed_setup=self.distributed_setup,
                 activation_checkpointing=self.activation_checkpointing,
+                load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
             )
             self.teacher_pp = self.teacher_model
         else:
@@ -385,9 +425,11 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
                 distributed_setup=self.distributed_setup,
                 device=teacher_device,
+                load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
             )
             self.teacher_pp = None
 
+        self._configure_teacher_packing()
         logger.info("Teacher Model: " + str(self.teacher_model))
 
         # KD
@@ -607,7 +649,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         separate_teacher_logits = (
             self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None
         )
-        batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+        batch = {
+            k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
         if separate_teacher_logits is not None:
             batch["teacher_logits"] = separate_teacher_logits
         labels = batch.pop("labels")
@@ -1159,6 +1204,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         if not metric_logger is None:
             metric_logger.log(log_data)
@@ -1212,6 +1260,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # JSONL training log (always log for detailed local records).
         self.metric_logger_train.log(log_data)

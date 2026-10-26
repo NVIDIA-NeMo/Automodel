@@ -216,6 +216,10 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         total_params += n
         if p.requires_grad:
             trainable_params += n
+        # Quantized parameters can store packed integer bytes. They still count
+        # above, but a norm of those bytes is neither supported nor meaningful.
+        if not (p.is_floating_point() or p.is_complex()):
+            continue
         try:
             local_sq_norm += p.detach().norm(2) ** 2
         except Exception:
@@ -387,6 +391,14 @@ class FreezeConfig:
     defaults to ``True`` only for legacy-only configurations; a configuration
     that declares ``freeze_modules`` or ``unfreeze_modules`` uses
     explicit-selector semantics and does not implicitly freeze vision modules.
+
+    ``freeze_parameters`` freezes exact canonical parameter names after module
+    selectors, including module unfreezes. Unlisted parameters retain their
+    existing trainability. Shared parameters can be frozen through any alias.
+    This option changes trainability only; model ``dtype`` owns trainable storage.
+    ``unfreeze_parameters`` enables exact parameters after module selectors and
+    before exact exclusions. Combined with a whole-model module freeze, it defines
+    a narrow update surface without unfreezing sibling weights or biases.
     """
 
     freeze_modules: list[ModuleSelector] | None = None
@@ -395,9 +407,18 @@ class FreezeConfig:
     freeze_audio_tower: bool = False
     freeze_language_model: bool = False
     freeze_video_embedder: bool = False
+    freeze_parameters: tuple[str, ...] | None = None
+    unfreeze_parameters: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate selectors and legacy compatibility options."""
+        for field_name in ("freeze_parameters", "unfreeze_parameters"):
+            names = getattr(self, field_name)
+            if names is not None:
+                if not isinstance(names, tuple) or any(not isinstance(name, str) or not name for name in names):
+                    raise ValueError(f"freeze_config.{field_name} must be a tuple of non-empty parameter names")
+                if len(set(names)) != len(names):
+                    raise ValueError(f"freeze_config.{field_name} must be unique")
         for field_name in ("freeze_modules", "unfreeze_modules"):
             selectors = getattr(self, field_name)
             if selectors is None:
@@ -419,10 +440,17 @@ class FreezeConfig:
 
     def has_generic_selectors(self) -> bool:
         """Return whether either generic selector field was explicitly declared."""
-        return self.freeze_modules is not None or self.unfreeze_modules is not None
+        return (
+            self.freeze_parameters is not None
+            or self.unfreeze_parameters is not None
+            or self.freeze_modules is not None
+            or self.unfreeze_modules is not None
+        )
 
 
 _FREEZE_CONFIG_OPTIONS = {
+    "freeze_parameters",
+    "unfreeze_parameters",
     "freeze_modules",
     "unfreeze_modules",
     "freeze_vision_tower",
@@ -510,7 +538,15 @@ def parse_freeze_config(config: FreezeConfig | Mapping[str, Any] | None) -> Free
             raise ValueError(f"freeze_config.{option} must be a boolean; got {value!r}.")
         legacy_booleans[option] = value
 
+    freeze_parameters = config.get("freeze_parameters")
+    if "freeze_parameters" in config and not isinstance(freeze_parameters, (list, tuple)):
+        raise ValueError("freeze_config.freeze_parameters must be a list or tuple of parameter names")
+    unfreeze_parameters = config.get("unfreeze_parameters")
+    if "unfreeze_parameters" in config and not isinstance(unfreeze_parameters, (list, tuple)):
+        raise ValueError("freeze_config.unfreeze_parameters must be a list or tuple of parameter names")
     return FreezeConfig(
+        freeze_parameters=tuple(freeze_parameters) if freeze_parameters is not None else None,
+        unfreeze_parameters=tuple(unfreeze_parameters) if unfreeze_parameters is not None else None,
         freeze_modules=_selectors("freeze_modules"),
         unfreeze_modules=_selectors("unfreeze_modules"),
         **legacy_booleans,
@@ -596,6 +632,29 @@ def _apply_module_selectors(
             )
 
 
+def _resolve_selected_parameters(model: nn.Module, names: tuple[str, ...], *, strict: bool) -> list[nn.Parameter]:
+    """Resolve exact canonical names before changing trainability.
+
+    Args:
+        model: Model whose registered parameters may have arbitrary shapes.
+        names: Canonical parameter names, including tied aliases.
+        strict: Whether names missing from this model or pipeline stage are errors.
+
+    Returns:
+        Original Parameter objects of arbitrary shapes; storage and aliases are retained.
+    """
+    if not names:
+        return []
+    parameters = {
+        canonical_parameter_fqn(name).replace("_orig_mod.", ""): parameter
+        for name, parameter in model.named_parameters(remove_duplicate=False)
+    }
+    missing = set(names) - parameters.keys()
+    if strict and missing:
+        raise ValueError(f"Unknown selected parameters: {sorted(missing)}")
+    return [parameters[name] for name in names if name in parameters]
+
+
 def apply_parameter_freezing(
     model: nn.Module,
     freeze_config: FreezeConfig | Mapping[str, Any],
@@ -608,6 +667,9 @@ def apply_parameter_freezing(
     then ``unfreeze_modules`` unfreezes and wins on overlap. Framework-required
     freezes (dead K/V projections, indexer parameters) are applied separately
     by the infrastructure after this function, before and after sharding.
+    Exact ``unfreeze_parameters`` are enabled after module selectors.
+    Exact ``freeze_parameters`` exclusions are applied last and do not change
+    the trainability of unlisted parameters, storage dtype, or parameter identity.
 
     Args:
         model: The model to apply freezing to.
@@ -628,6 +690,8 @@ def apply_parameter_freezing(
     if parsed_freeze_config is None:
         return
     freeze_config = parsed_freeze_config
+    frozen_parameters = _resolve_selected_parameters(model, freeze_config.freeze_parameters or (), strict=strict)
+    unfrozen_parameters = _resolve_selected_parameters(model, freeze_config.unfreeze_parameters or (), strict=strict)
 
     # Preserve the legacy attribute and substring matching independently of the
     # fnmatch semantics used by the generic selectors.
@@ -658,6 +722,11 @@ def apply_parameter_freezing(
     _apply_module_selectors(
         model, freeze_config.unfreeze_modules or [], requires_grad=True, strict=strict, field_name="unfreeze_modules"
     )
+
+    for parameter in unfrozen_parameters:
+        parameter.requires_grad_(True)
+    for parameter in frozen_parameters:
+        parameter.requires_grad_(False)
 
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
     # and disable KV cache (remote code uses legacy DynamicCache.key_cache
@@ -770,10 +839,11 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
     batch has already been converted to THD format (with batch_size=1 as a placeholder
     dimension) and that dimension needs to be removed.
 
-    The function performs three key operations:
+    The function performs four key operations:
     1. Removes the batch dimension (dim 0) from input tensors
     2. Filters out padding values from cumulative sequence length tensors
     3. Converts max_seqlen from tensor to scalar if needed
+    4. Resolves the microbatch's TE padding flag from its complete boundary arrays
 
     Args:
         input_ids (torch.Tensor or None): Input token IDs with shape [1, total_tokens]
@@ -842,6 +912,11 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
             attn_kwargs[key] = value[value != seqlens_padding_value].contiguous()
         if key == "max_seqlen" and isinstance(value, torch.Tensor):
             attn_kwargs[key] = value.item()
+
+    # Resolve chunked THD metadata once per model call, after removing sentinels.
+    # A single batch-wide flag cannot describe microbatches with different padding.
+    if attn_kwargs.get("cu_seqlens_padded") is not None and attn_kwargs.get("pad_between_seqs") is None:
+        attn_kwargs["pad_between_seqs"] = not torch.equal(attn_kwargs["cu_seqlens_padded"], attn_kwargs["cu_seqlens"])
 
     return input_ids, position_ids, padding_mask, attn_kwargs
 

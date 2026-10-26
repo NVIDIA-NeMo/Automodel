@@ -30,6 +30,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 from transformers import PreTrainedTokenizerFast
 
+import nemo_automodel.components.models.deepseek_v41.engram as v41_engram
 from nemo_automodel.components.distributed.multimodal_fsdp import ignored_params_for_root
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import (
@@ -45,7 +46,7 @@ from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_n
 
 # Over the default 5s budget on purpose: distributed owner and checkpoint tests spawn Gloo workers.
 # Shrink process startup and checkpoint round trips before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _tiny_config() -> DeepseekV41TextConfig:
@@ -156,8 +157,30 @@ def test_hash_rejects_mismatched_compressed_vocabulary() -> None:
         DeepseekV41NgramHash(config, _tokenizer())
 
 
+def _eager_engram_gate(monkeypatch) -> None:
+    """Pin the module-level gate dispatcher to eager for this test (restored by monkeypatch)."""
+    monkeypatch.setattr(v41_engram, "_engram_gate", v41_engram._engram_gate_core)
+    monkeypatch.setattr(v41_engram, "_ENGRAM_GATE_COMPILED", False)
+
+
+def test_compile_engram_is_a_config_knob_that_defaults_off(monkeypatch) -> None:
+    _eager_engram_gate(monkeypatch)
+    assert DeepseekV41TextConfig().compile_engram is False
+    assert v41_engram._engram_gate is v41_engram._engram_gate_core and not v41_engram._ENGRAM_GATE_COMPILED
+    v41_engram.compile_engram_gate()
+    assert v41_engram._ENGRAM_GATE_COMPILED and v41_engram._engram_gate is not v41_engram._engram_gate_core
+    compiled = v41_engram._engram_gate
+    v41_engram.compile_engram_gate()  # idempotent: the second hook keeps the first wrapper
+    assert v41_engram._engram_gate is compiled
+
+
+@pytest.mark.runtime_budget(30, reason="the compiled cases build the Engram gate core with torch.compile")
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 @pytest.mark.parametrize("all_masked", [False, True])
-def test_residual_and_parameter_gradients_match_reference(all_masked: bool) -> None:
+def test_residual_and_parameter_gradients_match_reference(monkeypatch, all_masked: bool, compiled: bool) -> None:
+    _eager_engram_gate(monkeypatch)
+    if compiled:
+        v41_engram.compile_engram_gate()
     torch.manual_seed(17)
     config = _tiny_config()
     model = DeepseekV41Engram(config, 1, BackendConfig(linear="torch"))
@@ -483,3 +506,49 @@ def test_engram_owner_lookup_gradients_and_checkpoint(tmp_path: Path) -> None:
         nprocs=2,
         join=True,
     )
+
+
+def _empty_requester_worker(rank: int, rendezvous: str) -> None:
+    """Rank 1 brings an empty batch: with the device-side validation path forced on both ranks, both must still meet
+    in the same collectives (review of #4394: the request-count-gated split sent the empty rank into a validity
+    all-reduce its peer never entered)."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=120)
+    )
+    table_original = Qwen3_8_FlashNextOwnerShardedEmbedding._validate_on_host
+    wrapper_original = DeepseekV41Engram._validates_on_device
+    Qwen3_8_FlashNextOwnerShardedEmbedding._validate_on_host = lambda self, tensor: False
+    DeepseekV41Engram._validates_on_device = lambda self, hash_ids: True
+    try:
+        torch.manual_seed(22)
+        config = _tiny_config()
+        reference = DeepseekV41Engram(config, 1, BackendConfig(linear="torch"))
+        model = DeepseekV41Engram(config, 1, BackendConfig(linear="torch"), process_group=dist.group.WORLD)
+        assert model.embed.capacity_mode is False  # the default: exact-count sizing follows any request size
+        mesh = DeviceMesh.from_group(dist.group.WORLD, "cpu", mesh_dim_names=("dp_shard_cp",))
+        owner_parameter = model.embed.parallelize_weight(mesh)
+        with torch.no_grad():
+            padded_weight = F.pad(reference.embed.weight, (0, 0, 0, 1))
+            owner_parameter.to_local().copy_(padded_weight[rank * 57 : (rank + 1) * 57])
+            for name in ("wkv.weight", "q_weight", "k_weight"):
+                model.get_parameter(name).copy_(reference.get_parameter(name))
+        torch.manual_seed(71)
+        hidden = torch.randn(1, 3, config.hc_mult, config.hidden_size)
+        ids = torch.tensor([[[0, 0, 1, 2, 56, 57]] * 3])
+        rows = slice(0, 1) if rank == 0 else slice(0, 0)
+        expected = reference(hidden, ids)
+        actual = model(hidden[rows], ids[rows])
+        torch.testing.assert_close(actual, expected[rows], rtol=1e-5, atol=1e-6)
+        actual.sum().backward()
+        expected[0:1].sum().backward()  # the reference sees every request made across the group: rank 0's only
+        expected_table_grad = F.pad(reference.embed.weight.grad, (0, 0, 0, 1))[rank * 57 : (rank + 1) * 57]
+        torch.testing.assert_close(owner_parameter.grad.to_local(), expected_table_grad, rtol=1e-5, atol=1e-6)
+    finally:
+        Qwen3_8_FlashNextOwnerShardedEmbedding._validate_on_host = table_original
+        DeepseekV41Engram._validates_on_device = wrapper_original
+        dist.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(30, reason="spawns two Gloo workers")
+def test_empty_requester_takes_the_peers_validation_path(tmp_path: Path) -> None:
+    mp.spawn(_empty_requester_worker, args=(str(tmp_path / "rendezvous-empty"),), nprocs=2, join=True)

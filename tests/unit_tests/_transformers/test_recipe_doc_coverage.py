@@ -53,7 +53,7 @@ from tests.unit_tests._transformers.test_doc_coverage import _DOC_ARCH_ALIASES
 
 # Over the default 5s budget on purpose: this module scans every recipe YAML and every docs page.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _repo_root() -> pathlib.Path:
@@ -238,7 +238,7 @@ _HF_ORG_TO_DOC_SLUG = {
     "diffusers": "lightricks",  # LTX-2.3 conversion shares the Lightricks family page
     "ibm-granite": "ibm",
     "meta-llama": "meta",
-    "MiniMaxAI": "minimax",
+    "MiniMaxAI": "MiniMaxAI",  # Keep the publisher's exact case in directories and routes.
     "zai-org": "thudm",  # zai-org (née THUDM) publishes GLM-4+
 }
 

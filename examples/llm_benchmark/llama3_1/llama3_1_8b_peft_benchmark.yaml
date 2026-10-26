@@ -112,4 +112,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  # Retained for reproducibility; excluded from automatic GPU CI.
+  deprecated: true
+  cluster_tag: h100
   recipe_owner: ZhiyuLi-Nvidia

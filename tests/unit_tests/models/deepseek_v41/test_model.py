@@ -32,7 +32,7 @@ from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from nemo_automodel._transformers.capabilities import _is_deepseek_v4
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_across_blocks, fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
@@ -47,10 +47,11 @@ from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCa
 from nemo_automodel.components.moe.layers import FakeBalancedGate
 from nemo_automodel.components.moe.parallelizer import _is_deepseek_v4_model, apply_ac
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 
 # Over the default 5s budget on purpose: this module runs full-model forwards and distributed FSDP checks.
 # Shrink the model fixtures and process startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _tiny_config() -> DeepseekV41Config:
@@ -102,7 +103,7 @@ def test_full_tiny_ced_model_trains_after_meta_initialization() -> None:
     assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight
     inputs = torch.randint(0, 64, (2, 12))
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.002)
-    initial = model(inputs, labels=inputs, output_hidden_states=True)
+    initial = model(inputs, labels=inputs, output_residual_streams=True)
     assert initial.logits.shape == (2, 12, 64)
     assert len(initial.hidden_states) == 6
     initial_loss = initial.loss.item()
@@ -193,7 +194,7 @@ def test_bf16_backbone_returns_unrounded_fp32_logits():
         model.lm_head.weight.copy_(
             torch.linspace(-0.04321, 0.05137, model.lm_head.weight.numel()).view_as(model.lm_head.weight)
         )
-    result = model(torch.tensor([[3, 5, 7, 9]]), return_hidden_states=True)
+    result = model(torch.tensor([[3, 5, 7, 9]]), output_hidden_states=True)
     assert result.hidden_states.dtype == torch.bfloat16
     assert result.logits.dtype == torch.float32
     expected = F.linear(result.hidden_states.float(), model.lm_head.weight)
@@ -211,9 +212,9 @@ def test_labels_match_independent_shifted_logprob_and_head_gradient():
     labels = ids.clone()
     labels[0, 2] = -100
     original = labels.clone()
-    result = model(ids, labels=labels, return_hidden_states=True)
+    result = model(ids, labels=labels, output_hidden_states=True)
     # Compare API variants under the same grad mode and before backward.
-    plain = model(ids, return_hidden_states=True)
+    plain = model(ids, output_hidden_states=True)
     assert plain.loss is None
     torch.testing.assert_close(plain.logits, result.logits, rtol=0, atol=0)
     reference = result.logits.detach().clone().requires_grad_()
@@ -268,12 +269,59 @@ def test_labels_shape_and_inputs_embeds_contract() -> None:
 def test_captured_streams_and_final_hidden_states_have_distinct_contracts() -> None:
     model = _model()
     ids = torch.tensor([[3, 4, 5, 6]])
-    final = model(ids, return_hidden_states=True)
-    captured = model(ids, output_hidden_states=True)
+    final = model(ids, output_hidden_states=True)
+    captured = model(ids, output_residual_streams=True)
     assert final.hidden_states.shape == (1, 4, 16)
     assert len(captured.hidden_states) == 1
     assert captured.hidden_states[0].shape == (1, 4, 4, 16)
     torch.testing.assert_close(final.logits, captured.logits, rtol=0, atol=0)
+    assert model(ids).hidden_states is None
+    with pytest.raises(ValueError, match="request one of them"):
+        model(ids, output_hidden_states=True, output_residual_streams=True)
+    # the model-local kwarg of #3855 is gone: the shared contract is the only way to ask for the final states
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        model(ids, return_hidden_states=True)
+
+
+def test_output_hidden_states_honours_the_recipes_fused_loss_contract(monkeypatch) -> None:
+    """The recipes call ``model(**batch, logits_to_keep=1, output_hidden_states=True)`` for a ``LinearCrossEntropy``
+    loss and project ``get_final_hidden_states(out)`` with ``lm_head.weight`` themselves: V4.1 must hand them the
+    final ``[batch, sequence, hidden]`` tensor (not a residual-stream capture) in the backbone's dtype, and the
+    fused loss projects the bf16 states in the fp32 head's dtype."""
+    torch.manual_seed(5)
+    model = _model("bfloat16")
+    ids = torch.tensor([[3, 4, 5, 6]])
+    out = model(ids, logits_to_keep=1, output_hidden_states=True)
+    hidden = get_final_hidden_states(out)
+    assert hidden is out.hidden_states and isinstance(hidden, torch.Tensor)
+    assert hidden.shape == (1, 4, model.config.text_config.hidden_size)
+    assert hidden.dtype == torch.bfloat16
+    assert model.lm_head.weight.dtype == torch.float32
+    # the kept logits are the fp32 head applied to the same positions
+    torch.testing.assert_close(F.linear(hidden[:, -1:].float(), model.lm_head.weight), out.logits, rtol=0, atol=0)
+
+    # The recipes' fused loss: cut-cross-entropy's torch_compile projection is ``e @ c.T`` with no dtype
+    # alignment, so the loss promotes the bf16 states to the fp32 weight it was handed.
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    def stand_in(e, c, targets=None, *, ignore_index=-100, reduction="sum", **_):
+        assert e.dtype == c.dtype == torch.float32
+        return F.cross_entropy(
+            (e @ c.T).view(-1, c.shape[0]), targets.view(-1), ignore_index=ignore_index, reduction=reduction
+        )
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", stand_in, raising=False)
+    labels = ids.roll(-1, dims=1)
+    loss = linear_ce_mod.FusedLinearCrossEntropy(impl="torch_compile")(hidden, labels, model.lm_head.weight)
+    expected = F.cross_entropy(
+        F.linear(hidden.float(), model.lm_head.weight).view(-1, model.config.text_config.vocab_size),
+        labels.view(-1),
+        reduction="sum",
+    )
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert model.lm_head.weight.grad is not None and model.lm_head.weight.grad.dtype == torch.float32
 
 
 def test_dspark_target_features_are_attention_input_stream_means() -> None:
@@ -427,6 +475,17 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
         policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=None, cast_forward_inputs=False
         )
+        # The attention sinks share one FSDP unit across the blocks (the production parallelizer does the same
+        # through _fsdp_shard_across_blocks); the per-block dtype units must then leave those parameters alone.
+        cross_block = fully_shard_across_blocks(
+            list(model.model.layers.values()),
+            model._fsdp_shard_across_blocks,
+            mesh=mesh,
+            mp_policy=policy,
+            offload_policy=None,
+        )
+        assert len(cross_block) == len(model.model.layers)
+        assert all(isinstance(parameter, DTensor) for parameter in cross_block)
         for module in model.model.layers.values():
             fully_shard_by_dtype(
                 module,
@@ -435,6 +494,7 @@ def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch
                 offload_policy=None,
                 fp32_compute_module_names=tuple(strict_names),
                 reshard_after_forward=True,
+                ignored_params=cross_block & set(module.parameters()),
             )
         fully_shard(model.model.embed_tokens, mesh=mesh, mp_policy=policy, reshard_after_forward=True)
         fully_shard(
@@ -482,3 +542,35 @@ def test_fsdp_initialization_preserves_local_storage_dtype_and_checkpoint_values
     tmp_path: Path, storage_dtype: torch.dtype
 ) -> None:
     mp.spawn(_fsdp_initialization_worker, args=(str(tmp_path / "rendezvous"), storage_dtype), nprocs=2, join=True)
+
+
+def test_model_validates_attention_inputs_once_before_the_layers() -> None:
+    """The model runs the host-synchronising position / mask checks once per forward and the layers skip them."""
+    model = _model()
+    input_ids = torch.randint(0, 17, (1, 4))
+    with pytest.raises(ValueError, match="zero-based"):
+        model(input_ids, position_ids=torch.tensor([[0, 1, 0, 1]]))
+    with pytest.raises(ValueError, match="right padding"):
+        model(input_ids, position_ids=torch.arange(4)[None], attention_mask=torch.tensor([[0, 1, 1, 1]]))
+    logits = model(input_ids, position_ids=torch.arange(4)[None]).logits
+    assert logits.shape == (1, 4, 17)
+
+
+def test_attention_sinks_are_declared_for_one_cross_block_fsdp_unit():
+    from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Parameter
+
+    model = _model()
+    assert model._fsdp_shard_across_blocks == ["attn.sinks_param"]
+    layers = dict(model.model.layers.items())  # ModuleDict keyed by the layer index
+    assert layers
+    # every block carries the holder under the declared name, and nothing else does
+    named = {name for name, _ in model.named_modules() if name.endswith("attn.sinks_param")}
+    assert named == {f"model.layers.{key}.attn.sinks_param" for key in layers}
+    holders = [layer.attn.sinks_param for layer in layers.values()]
+    assert all(isinstance(holder, DeepseekV4FP32Parameter) for holder in holders)
+    assert all(param.dtype == torch.float32 for holder in holders for param in holder.parameters())
+    # the holder's forward ignores its input: FSDP2 hooks post-backward on the inputs, so it would never fire
+    reference = torch.zeros(2, requires_grad=True)
+    out = holders[0](reference)
+    torch.testing.assert_close(out, holders[0].weight, rtol=0, atol=0)
+    assert torch.autograd.grad(out.sum(), reference, allow_unused=True)[0] is None

@@ -18,6 +18,15 @@ from unittest.mock import MagicMock
 
 import torch
 from PIL import Image as PILImage
+from transformers.processing_utils import ProcessorMixin
+
+from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
+from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    PackedSequenceContract,
+    build_packed_sequence_metadata,
+    resolve_packing_contract,
+)
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -96,12 +105,49 @@ def make_robust_collate(dataset, collate_fn, max_retries=10):
 
 
 def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
+    """Find the first token-pattern match in a one-dimensional sequence.
+
+    Args:
+        template: Token IDs with shape ``[sequence]``.
+        pattern: Token IDs with shape ``[pattern_tokens]`` on the same device.
+        search_start_index: Nonnegative first start offset to consider.
+        allow_first_token_mismatch: Match only ``pattern[1:]`` at each start.
+
+    Returns:
+        The first half-open ``(start, end)`` span, or ``(-1, -1)``. An empty
+        pattern matches at ``search_start_index`` when it is in range.
+    """
     template_len = len(template)
     pattern_len = len(pattern)
-    for i in range(search_start_index, template_len - pattern_len + 1):
-        match = template[i : i + pattern_len] == pattern
-        if torch.all(match) or (allow_first_token_mismatch and torch.all(match[1:])):
-            return i, i + pattern_len
+    search_stop_index = template_len - pattern_len + 1
+    if search_start_index >= search_stop_index:
+        return -1, -1
+    if pattern_len == 0:
+        return search_start_index, search_start_index
+
+    # Filter candidate starts with one token before comparing full slices.  The
+    # previous loop evaluated a tensor in a Python condition at every possible
+    # offset, producing one aten::is_nonzero/aten::item pair per comparison.
+    # On a 16K packed sample that can mean tens of thousands of scalarizations
+    # for each assistant span.
+    if allow_first_token_mismatch:
+        if pattern_len == 1:
+            return search_start_index, search_start_index + 1
+        anchor_offset = 1
+    else:
+        anchor_offset = 0
+    anchor = pattern[anchor_offset]
+    candidate_positions = torch.nonzero(
+        template[search_start_index + anchor_offset : search_stop_index + anchor_offset] == anchor,
+        as_tuple=True,
+    )[0]
+    compare_start = anchor_offset if allow_first_token_mismatch else 0
+    pattern_values = pattern[compare_start:].tolist()
+    for candidate_offset in candidate_positions.tolist():
+        start = search_start_index + candidate_offset
+        candidate_values = template[start + compare_start : start + pattern_len].tolist()
+        if candidate_values == pattern_values:
+            return start, start + pattern_len
     return -1, -1
 
 
@@ -355,6 +401,10 @@ def _build_labels_from_markers(
     stop_id:
         Single token id that closes a turn (e.g. ``<|im_end|>`` or
         ``<end_of_turn>``).
+
+    Returns:
+        Labels with shape ``(B, L)`` on the same device and with the same dtype
+        as ``input_ids_batch``.
     """
     marker_len = len(assistant_marker)
     marker_tensor = torch.tensor(assistant_marker, dtype=input_ids_batch.dtype, device=input_ids_batch.device)
@@ -367,22 +417,18 @@ def _build_labels_from_markers(
         i = 0
 
         while i <= seq_len - marker_len:
-            if torch.equal(encoded[i : i + marker_len], marker_tensor):
-                content_start = i + marker_len  # first token of assistant content
+            marker_start, content_start = _find_pattern_indices(encoded, marker_tensor, i)
+            if marker_start < 0:
+                break
 
-                # Scan forward to find the closing stop token.
-                content_end = content_start
-                while content_end < seq_len and encoded[content_end].item() != stop_id:
-                    content_end += 1
+            # Locate every possible closing token with one tensor comparison,
+            # then use the first host index.  The previous token-by-token loop
+            # called ``item()`` for every assistant token in the packed stream.
+            stop_offsets = torch.nonzero(encoded[content_start:] == stop_id, as_tuple=True)[0].tolist()
+            content_end = content_start + stop_offsets[0] + 1 if stop_offsets else seq_len
 
-                # Include the stop token in labels so the model learns to emit it.
-                if content_end < seq_len:
-                    content_end += 1
-
-                labels[content_start:content_end] = encoded[content_start:content_end]
-                i = content_end
-            else:
-                i += 1
+            labels[content_start:content_end] = encoded[content_start:content_end]
+            i = content_end
 
         labels_list.append(labels)
 
@@ -1122,14 +1168,24 @@ def nemotron_parse_collate_fn(
     return batch
 
 
-def _ensure_rgb(conversations):
-    """Convert any PIL images in conversations to RGB to handle RGBA/grayscale inputs."""
+def _ensure_rgb(conversations, preserve_alpha: bool = False):
+    """Convert any PIL images in conversations to RGB to handle RGBA/grayscale inputs.
+
+    Args:
+        conversations: Conversation samples whose image items are normalized in place.
+        preserve_alpha: When True, RGBA images are passed through unchanged so the
+            image processor can apply its own alpha handling (e.g. flattening onto
+            white). PIL's plain ``convert("RGB")`` discards the alpha channel,
+            exposing the raw RGB values of fully transparent pixels.
+    """
     for conv in conversations:
         for turn in conv:
             content = turn.get("content")
             if isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict) and isinstance(item.get("image"), PILImage.Image):
+                        if preserve_alpha and item["image"].mode == "RGBA":
+                            continue
                         item["image"] = item["image"].convert("RGB")
     return conversations
 
@@ -1255,6 +1311,7 @@ def default_collate_fn(
     processor,
     max_length: int | None = None,
     drop_overlong: bool = False,
+    preserve_alpha: bool = False,
     _post_tokenize_hook=None,
 ) -> dict[str, Any]:
     """Default collate function for multimodal VLM datasets.
@@ -1264,6 +1321,12 @@ def default_collate_fn(
         processor: Multimodal processor used to apply the chat template.
         max_length: Optional maximum token sequence length.
         drop_overlong: Whether to remove samples estimated to exceed ``max_length``.
+        preserve_alpha: When True, RGBA images keep their alpha channel until
+            the image processor runs, letting processors with alpha-aware
+            handling (e.g. flattening onto white) see the original
+            transparency. Defaults to False (alpha is dropped while converting
+            to RGB), matching the behavior of stock HuggingFace image
+            processors.
         _post_tokenize_hook: Optional callable ``(batch, processor) -> batch``
             invoked right after ``apply_chat_template`` and before
             ``build_labels``.  Used by model-specific collate wrappers
@@ -1277,7 +1340,7 @@ def default_collate_fn(
         whose tensor elements preserve their processor-defined shapes; image lists
         commonly contain tensors of shape [channels, height, width].
     """
-    conversations = _ensure_rgb([example["conversation"] for example in examples])
+    conversations = _ensure_rgb([example["conversation"] for example in examples], preserve_alpha=preserve_alpha)
 
     # Optionally drop overlong samples before processing
     if max_length is not None and drop_overlong:
@@ -1295,12 +1358,18 @@ def default_collate_fn(
         processing_kwargs["padding"] = "max_length"
         if drop_overlong:
             processing_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
+    chat_template = processor.chat_template if isinstance(processor, ProcessorMixin) else None
+    if isinstance(chat_template, dict):
+        chat_template = chat_template.get("default")
+    template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
+    template_kwargs = {"return_assistant_tokens_mask": True} if template_has_generation_kwd else {}
     batch = processor.apply_chat_template(
         conversations,
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
         processor_kwargs=processing_kwargs,
+        **template_kwargs,
     )
 
     if _post_tokenize_hook is not None:
@@ -1330,11 +1399,10 @@ def default_collate_fn(
                 value.to(torch.bfloat16) if isinstance(value, torch.Tensor) else value for value in pixel_values_videos
             ]
 
-    labels = build_labels_from_template(
-        batch["input_ids"],
-        conversations,
-        processor,
-    )
+    if template_has_generation_kwd:
+        labels = batch["input_ids"].masked_fill(batch.pop("assistant_masks") == 0, -100)
+    else:
+        labels = build_labels_from_template(batch["input_ids"], conversations, processor)
     batch["labels"] = labels[:, 1:]
 
     input_shape = batch["input_ids"].shape
@@ -1508,34 +1576,42 @@ def neat_packed_vlm_collater(
     batch: list[dict],
     padding_idx: int = 0,
     max_length: int | None = None,
-    attn_implementation: str = "sdpa",
+    attn_implementation: str | None = None,
     materialize_4d_mask: bool = True,
+    *,
+    packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
 ) -> dict:
     """Collater for neat-packed VLM sequences.
 
     Packs arrive with **variable lengths** (no pre-padding).  This collater:
 
     1. Pads all text tensors to a common length.
-    2. Converts the indexed ``attention_mask`` to the appropriate format:
-       - ``flash_attention_2``: emits typed packed-sequence metadata as
-         ``FlashAttentionKwargs`` (``cu_seq_lens_q``/``cu_seq_lens_k``/
-         ``max_length_q``/``max_length_k``) and omits ``attention_mask`` so
-         HuggingFace routes the batch through ``flash_attn_varlen_func``.
-         The indexed ``[B, S]`` document map is preserved as ``_packed_seq_ids``.
-       - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
+    2. Converts the indexed ``attention_mask`` to the representation requested
+       by ``packing``: a dense block-causal mask, compact document IDs, or
+       document IDs plus native metadata. ``flash_varlen`` emits HF varlen
+       kwargs without an attention mask.
     3. Concatenates media tensors across the batch dimension.
 
     **No autoregressive shift** — it was already applied during packing.
 
     Args:
-        batch: List of packed sample dicts from ``PackedDatasetWrapper``.
+        batch: Packed sample mappings. ``input_ids``, ``labels``, indexed
+            ``attention_mask``, and optional ``mm_token_type_ids`` have shape
+            [sequence]. ``position_ids`` has shape [sequence] or [3, sequence]
+            for multimodal RoPE. Optional media values have a leading media or
+            patch axis and processor-defined trailing axes, or are lists of
+            per-image tensors with variable spatial sizes. Grid tensors have
+            shape [media, 3], image positions [patches, position_axes], and
+            ``second_per_grid_ts`` [videos].
         padding_idx: Token ID for padding ``input_ids`` (default 0).
         max_length: If set, pad every batch to this fixed length.
             If ``None`` (default), pad to the longest pack in the batch.
             A fixed length avoids recompilation with ``torch.compile``
             and ensures uniform tensor shapes across steps.
-        attn_implementation: Attention backend (``"flash_attention_2"``,
-            ``"sdpa"``, or ``"eager"``).
+        attn_implementation: Deprecated attention-backend name retained in its
+            original positional slot for Python-call compatibility.
+        packing: Structural model contract selecting the packed mask representation.
+            Defaults to block-causal masking without packed-sequence metadata.
         materialize_4d_mask: Whether SDPA/eager packing should expand the
             indexed ``[B, S]`` document map into a dense
             ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths
@@ -1543,13 +1619,34 @@ def neat_packed_vlm_collater(
             False to avoid the quadratic allocation.
 
     Returns:
-        Dict with batched tensors ready for model forward.
+        Mapping with text IDs, labels, and token types of shape [batch, sequence];
+        positions of shape [batch, sequence] or [3, batch, sequence]; and an
+        attention mask of shape [batch, sequence] or [batch, 1, sequence, sequence].
+        For ``flash_varlen``, the attention mask is omitted; ``cu_seq_lens_q``
+        and ``cu_seq_lens_k`` have shape [segments + 1] and include physical
+        padding runs. ``max_length_q`` and ``max_length_k`` are Python ints.
+        Optional ``_packed_seq_ids`` has shape [batch, sequence]. Media values,
+        grids, image positions, and timestamps concatenate their leading axis
+        while preserving their trailing axes; variable-resolution media remain
+        a flattened list of per-image tensors. Pixel values are cast to bfloat16.
+        Optional media counts have shape [batch].
+        A contract requiring native packed-sequence metadata additionally adds
+        int64 ``packed_token_indices`` of shape [batch, sequence], containing
+        row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape
+        [batch, max_documents + 1], containing row-local cumulative lengths
+        and -1 after each row's last boundary; and a Python int ``max_seqlen``.
+        Model entry flattens these into [tokens] indices into batch * sequence
+        and [documents + 1] boundaries over the unpadded token stream. These
+        are not physical offsets for pre-packed THD buffers.
     """
+    packing = resolve_packing_contract(packing, attn_implementation)
     if not batch:
         return {}
 
     LABEL_PAD = -100
-    use_flash = attn_implementation == "flash_attention_2"
+    packed_mask_type = packing.packed_mask_type
+    if packed_mask_type not in ("block_causal", "document_ids", "flash_varlen"):
+        raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
 
     # Determine pad target: fixed max_length or batch-dynamic
     max_len = (
@@ -1579,6 +1676,15 @@ def neat_packed_vlm_collater(
 
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
+    if packed_mask_type != "block_causal" or not materialize_4d_mask:
+        # Keep the compact indexed [B, S] map for native attention or CP.
+        # The HF varlen path replaces it with explicit cumulative lengths below.
+        attention_mask_out = attention_mask
+    else:
+        from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
+
+        attention_mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
+
     # Handle position_ids: 1D [seq_len] or 3D mRoPE [3, seq_len]
     pos_sample = torch.as_tensor(batch[0]["position_ids"])
     if pos_sample.ndim == 2:
@@ -1599,42 +1705,37 @@ def neat_packed_vlm_collater(
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
+        "attention_mask": attention_mask_out,
         "mm_token_type_ids": mm_token_type_ids,
     }
-
-    if use_flash:
-        # No attention_mask: HF then takes its varlen-kwargs branch, not the binary-mask unpad path.
+    if packed_mask_type == "flash_varlen":
         from nemo_automodel.components.datasets.packed_seq import (
             packed_seq_params_from_doc_ids,
             to_flash_attention_kwargs,
         )
 
-        params = packed_seq_params_from_doc_ids(attention_mask)
-        result.update(to_flash_attention_kwargs(params))
-        # Emitted only for 2+ docs, matching the sdpa path; consumed by loss / CP.
-        if attention_mask.numel() > 0 and attention_mask.max().item() > 1:
-            result["_packed_seq_ids"] = attention_mask
-    else:
-        if not materialize_4d_mask:
-            # CP rebuilds its local mask from _packed_seq_ids; keep the compact indexed [B, S] map here.
-            result["attention_mask"] = attention_mask
-        else:
-            from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
+        # HF consumes physical offsets, including padding, without an attention
+        # mask. Native FA4's unpadded offsets below have a different contract.
+        result.pop("attention_mask")
+        result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
+    if packing.requires_packed_sequence_metadata:
+        result.update(build_packed_sequence_metadata(attention_mask))
 
-            result["attention_mask"] = _indexed_mask_to_4d_block_causal(attention_mask)
-
-        # Keep the indexed [B, S] map for loss (e.g. SqrtCrossEntropy) and CP mask rebuild.
-        has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
-        if has_multiple_docs or not materialize_4d_mask:
-            result["_packed_seq_ids"] = attention_mask
+    # Store indexed attention mask for loss functions that need per-sample
+    # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
+    # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
+    # ``attention_mask_out`` is already converted to 4D, so keep a copy.
+    has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
+    if has_multiple_docs or not materialize_4d_mask or packing.requires_packed_sequence_metadata:
+        result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)
-    for key in ("pixel_values", "pixel_values_videos"):
+    for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = _merge_media_values(tensors)
 
-    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts", "num_patches"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
@@ -1768,12 +1869,12 @@ def packed_sequence_thd_vlm_collater(
         "qkv_format": "thd",
     }
 
-    for key in ("pixel_values", "pixel_values_videos"):
+    for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = _merge_media_values(tensors)
 
-    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts", "num_patches"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
@@ -1944,8 +2045,26 @@ def nemotron_omni_collate_fn(
 
     padded_input_ids = []
     padded_attention_masks = []
-    for input_ids, attn_mask in zip(all_input_ids, all_attention_masks):
+    for i, (input_ids, attn_mask) in enumerate(zip(all_input_ids, all_attention_masks)):
         seq_len = input_ids.shape[0]
+        # The final position is dropped by the label shift below, so any image
+        # token at or after ``target_len - 1`` loses its placeholder.
+        if seq_len >= target_len and (i in sample_pixel_values or i in sample_pixel_values_videos):
+            image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+            if bool((input_ids[target_len - 1 :] == image_token_id).any()):
+                # The model scatters the batch's concatenated image features into
+                # the image tokens in order, so a partially kept image would shift
+                # this row's leftover features into the next row. Drop this row's
+                # media and its remaining image tokens instead.
+                logger.warning(
+                    "max_length=%d cuts into the image tokens of sample %d (%d tokens); dropping its images.",
+                    target_len,
+                    i,
+                    seq_len,
+                )
+                sample_pixel_values.pop(i, None)
+                sample_pixel_values_videos.pop(i, None)
+                input_ids = input_ids.masked_fill(input_ids == image_token_id, pad_token_id)
         if seq_len < target_len:
             pad_len = target_len - seq_len
             input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=input_ids.dtype)])
@@ -2068,6 +2187,12 @@ def _inject_thinking_prefix_tokens(
         seq_keys.append("mm_token_type_ids")
         fill_defaults["mm_token_type_ids"] = 0
         inject_defaults["mm_token_type_ids"] = 0
+    if "assistant_masks" in batch:
+        # Generation-template masks are read after this hook; injected prefix
+        # tokens and padding are never supervised.
+        seq_keys.append("assistant_masks")
+        fill_defaults["assistant_masks"] = 0
+        inject_defaults["assistant_masks"] = 0
 
     B = batch["input_ids"].size(0)
     new_seqs: Dict[str, List[torch.Tensor]] = {k: [] for k in seq_keys}
@@ -2144,6 +2269,7 @@ _TOKEN_AXIS_KEYS: tuple[str, ...] = (
     "labels",
     "token_type_ids",
     "mm_token_type_ids",
+    "assistant_masks",
 )
 
 

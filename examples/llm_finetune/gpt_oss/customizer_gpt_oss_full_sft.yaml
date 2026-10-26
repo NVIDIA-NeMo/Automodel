@@ -85,6 +85,7 @@ parallelizer:
   activation_checkpointing: false
 
 ci:
+  cluster_tag: h100
   time: "00:30:00"
   checkpoint_robustness:
     # Routed-MoE source parity measures 0.0064-0.0076 mean KL at 2K while

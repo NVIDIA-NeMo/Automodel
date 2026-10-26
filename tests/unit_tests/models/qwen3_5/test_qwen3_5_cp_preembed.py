@@ -172,6 +172,27 @@ class TestPrepareModelInputsForCP:
 
 
 class TestPopStagedVlmMedia:
+    def test_prepared_host_token_presence_matches_media_routing(self):
+        model = _build_model(image_token_id=99, video_token_id=98, vision_start_token_id=97)
+        input_ids = torch.tensor([[10, 99, 12]])
+        packed_ids = torch.tensor([[1, 1, 2]])
+        image = torch.randn(4, 8)
+        grid = torch.tensor([[1, 4, 4]])
+        host_metadata = model.prepare_host_batch_metadata(
+            {"input_ids": input_ids, "image_grid_thw": grid, "_packed_seq_ids": packed_ids}
+        )
+        kwargs = {"pixel_values": image, "image_grid_thw": grid, **host_metadata}
+
+        actual = model._pop_staged_vlm_media(input_ids, kwargs)
+        expected = model._pop_staged_vlm_media(input_ids, {"pixel_values": image, "image_grid_thw": grid})
+
+        assert host_metadata["_vlm_token_presence"] == (True, False, False)
+        assert host_metadata["_host_image_grid_thw"].tensor is grid
+        assert host_metadata["_host_packed_seq_ids"].tensor is packed_ids
+        assert actual[0] is expected[0] is image
+        assert actual[2] is expected[2] is grid
+        assert "_vlm_token_presence" not in kwargs
+
     def test_drops_orphaned_image_media(self):
         model = _build_model(image_token_id=99, video_token_id=98, vision_start_token_id=97)
         kwargs = {
@@ -403,6 +424,9 @@ class TestQwen3_5ModelForward:
         mm_token_type_ids = torch.tensor([[0, 1, 2, 0]])
         image_interp_indices = torch.tensor([[1]])
         video_cu_seqlens = torch.tensor([0, 4])
+        text_cu_seqlens = torch.tensor([0, 2, 4])
+        host_image_grid_thw = object()
+        host_packed_seq_ids = object()
         image_grid_thw = torch.tensor([[1, 2, 2]]) if media in ("image", "mixed") else None
         video_grid_thw = torch.tensor([[1, 2, 2]]) if media in ("video", "mixed") else None
         out = model.forward(
@@ -415,6 +439,11 @@ class TestQwen3_5ModelForward:
             video_grid_thw=video_grid_thw,
             image_interp_indices=image_interp_indices,
             video_cu_seqlens=video_cu_seqlens,
+            cu_seqlens=text_cu_seqlens,
+            max_seqlen=2,
+            _host_image_grid_thw=host_image_grid_thw,
+            _host_packed_seq_ids=host_packed_seq_ids,
+            return_dict=True,
         )
 
         assert out is sentinel
@@ -432,7 +461,17 @@ class TestQwen3_5ModelForward:
         torch.testing.assert_close(
             captured["inputs_embeds"][0, 2], video_features[0] if video_grid_thw is not None else torch.full((4,), 98.0)
         )
+        assert captured["_text_cu_seqlens"] is text_cu_seqlens
+        assert captured["_text_max_seqlen"] == 2
+        assert captured["_host_packed_seq_ids"] is host_packed_seq_ids
+        assert captured["return_dict"] is True
+        for vision_call in vision_calls.values():
+            assert "cu_seqlens" not in vision_call
+            assert "max_seqlen" not in vision_call
+            assert "_host_packed_seq_ids" not in vision_call
+            assert vision_call["return_dict"] is True
         if image_grid_thw is not None:
+            assert vision_calls["image"]["host_image_grid_thw"] is host_image_grid_thw
             assert vision_calls["image"]["image_interp_indices"] is image_interp_indices
         if video_grid_thw is not None:
             assert vision_calls["video"]["video_cu_seqlens"] is video_cu_seqlens
@@ -472,7 +511,10 @@ class TestQwen3_5ModelForward:
 
         monkeypatch.setattr(HFQwen3_5Model, "forward", _fake_hf_forward)
 
-        hidden_states = torch.randn(1, 3, 4)
+        hidden_states = torch.tensor([[[5.0] * 4, [99.0] * 4, [7.0] * 4]])
+        image_features = torch.full((1, 4), 8.0)
+        model.get_image_features = lambda *args, **kwargs: types.SimpleNamespace(pooler_output=[image_features])
+        model.compute_3d_position_ids = lambda **kwargs: torch.arange(3).view(1, 3)
         out = model.forward(
             input_ids=hidden_states,
             pixel_values=torch.randn(4, 8),
@@ -481,7 +523,9 @@ class TestQwen3_5ModelForward:
 
         assert out is sentinel
         assert captured["input_ids"] is None
-        assert captured["inputs_embeds"] is hidden_states
+        expected = hidden_states.clone()
+        expected[0, 1] = image_features[0]
+        torch.testing.assert_close(captured["inputs_embeds"], expected)
 
 
 class _FakeCPMesh:

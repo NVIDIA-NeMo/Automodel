@@ -25,6 +25,47 @@ CONVERSATION = [
 ]
 
 
+class TestFindPatternIndices:
+    @pytest.mark.parametrize(
+        ("template", "pattern", "search_start", "allow_first_mismatch", "expected"),
+        [
+            ([1, 2, 3, 2, 3], [2, 3], 0, False, (1, 3)),
+            ([1, 2, 3, 2, 3], [2, 3], 2, False, (3, 5)),
+            ([1, 9, 3, 4], [2, 3, 4], 0, True, (1, 4)),
+            ([1, 9, 3, 4], [2, 3, 4], 0, False, (-1, -1)),
+            ([1, 2], [1, 2, 3], 0, False, (-1, -1)),
+            ([1, 2], [], 0, False, (0, 0)),
+            ([1, 2], [9], 1, True, (1, 2)),
+        ],
+    )
+    def test_matches_expected_semantics(self, template, pattern, search_start, allow_first_mismatch, expected):
+        from nemo_automodel.components.datasets.vlm.collate_fns import _find_pattern_indices
+
+        actual = _find_pattern_indices(
+            torch.tensor(template),
+            torch.tensor(pattern),
+            search_start_index=search_start,
+            allow_first_token_mismatch=allow_first_mismatch,
+        )
+
+        assert actual == expected
+
+    def test_long_scan_does_not_scalarize_each_candidate(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import _find_pattern_indices
+
+        template = torch.zeros(16_384, dtype=torch.long)
+        pattern = torch.arange(1, 9, dtype=torch.long)
+        template[-len(pattern) :] = pattern
+
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            actual = _find_pattern_indices(template, pattern)
+
+        assert actual == (16_376, 16_384)
+        operator_names = {event.key for event in prof.key_averages()}
+        assert "aten::item" not in operator_names
+        assert "aten::equal" not in operator_names
+
+
 class DummyTokenizer:
     def __init__(self, pad_token_id=0):
         self.pad_token_id = pad_token_id
@@ -512,12 +553,17 @@ class DummyNemotronOmniProcessor:
 
     image_token = "<image>"
     video_token = "<video>"
+    IMAGE_TOKEN_ID = 9
 
     def __init__(self):
         self.tokenizer = self  # collate uses getattr(processor, "tokenizer", processor)
         self.pad_token_id = 0
         self.sample_lens = [3, 5]
         self._call_idx = 0
+
+    def convert_tokens_to_ids(self, token):
+        assert token == self.image_token
+        return self.IMAGE_TOKEN_ID
 
     def apply_chat_template(self, text_conversation, *, tokenize=False, **kwargs):
         assert tokenize is False
@@ -617,6 +663,96 @@ def test_nemotron_omni_collate_extracts_images(collate_mod, monkeypatch):
     assert "pixel_values" in batch
     assert batch["pixel_values"].dtype == torch.bfloat16  # collate casts to bf16
     assert "image_flags" in batch and batch["image_flags"].shape == (1, 1)
+
+
+class DummyNemotronOmniTruncationProcessor(DummyNemotronOmniProcessor):
+    """Variant returning fixed per-sample token ids where ``9`` is the image token.
+
+    Each sample carries one image whose ``(3, H, W)`` tile has a distinct height,
+    so the collate emits a ragged ``pixel_values`` list.
+    """
+
+    def __init__(self, sample_ids):
+        super().__init__()
+        self.sample_ids = sample_ids
+
+    def __call__(self, *, text, return_tensors, **kwargs):
+        assert return_tensors == "pt"
+        idx = self._call_idx
+        self._call_idx += 1
+        ids = torch.tensor([self.sample_ids[idx]], dtype=torch.long)
+        out = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+        if "images" in kwargs:
+            out["pixel_values"] = [torch.full((3, 4 + idx, 4), float(idx + 1))]
+        return out
+
+
+def _nemotron_omni_image_examples(n):
+    from PIL import Image as PILImage
+
+    return [
+        {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": PILImage.new("RGB", (4, 4))},
+                        {"type": "text", "text": "what is this?"},
+                    ],
+                },
+                {"role": "assistant", "content": "an image"},
+            ]
+        }
+        for _ in range(n)
+    ]
+
+
+@pytest.mark.parametrize(
+    "first_sample_ids",
+    [
+        # max_length cuts inside the first sample's image tokens.
+        [1, 7, 9, 9, 9, 9, 8, 2],
+        # The last kept image token is removed by the label shift.
+        [1, 7, 9, 9, 9, 8, 2],
+    ],
+)
+def test_nemotron_omni_collate_drops_images_cut_by_truncation(collate_mod, monkeypatch, first_sample_ids):
+    """A row whose image tokens are cut must not keep its image features.
+
+    The model scatters the concatenated features of the whole batch into the
+    image tokens in order, so leftover features of a truncated row would land
+    on the next row's image tokens.
+    """
+    second_sample_ids = [1, 7, 9, 9, 8, 2]
+    processor = DummyNemotronOmniTruncationProcessor([first_sample_ids, second_sample_ids])
+    monkeypatch.setattr(collate_mod, "build_labels", lambda ids, conv, p: torch.zeros_like(ids), raising=True)
+
+    batch = collate_mod.nemotron_omni_collate_fn(_nemotron_omni_image_examples(2), processor=processor, max_length=5)
+
+    image_token_id = DummyNemotronOmniTruncationProcessor.IMAGE_TOKEN_ID
+    assert not bool((batch["input_ids"][0] == image_token_id).any())
+    # Only the second sample's image survives, and its features cover exactly
+    # the image tokens left in the batch.
+    assert isinstance(batch["pixel_values"], torch.Tensor)
+    assert batch["pixel_values"].shape == (1, 3, 5, 4)
+    assert torch.all(batch["pixel_values"] == 2)
+    assert batch["image_flags"].shape == (1, 1)
+    assert batch["input_ids"].tolist() == [[1, 7, 0, 0], second_sample_ids[:4]]
+
+
+def test_nemotron_omni_collate_keeps_images_when_truncation_spares_them(collate_mod, monkeypatch):
+    """Truncating only text after the image keeps every image and image token."""
+    first_sample_ids = [1, 7, 9, 9, 8, 2, 3, 4]
+    second_sample_ids = [1, 7, 9, 9, 8, 2]
+    processor = DummyNemotronOmniTruncationProcessor([first_sample_ids, second_sample_ids])
+    monkeypatch.setattr(collate_mod, "build_labels", lambda ids, conv, p: torch.zeros_like(ids), raising=True)
+
+    batch = collate_mod.nemotron_omni_collate_fn(_nemotron_omni_image_examples(2), processor=processor, max_length=6)
+
+    assert batch["input_ids"].tolist() == [first_sample_ids[:5], second_sample_ids[:5]]
+    assert isinstance(batch["pixel_values"], list)
+    assert [tuple(pv.shape) for pv in batch["pixel_values"]] == [(3, 4, 4), (3, 5, 4)]
+    assert batch["image_flags"].shape == (2, 1)
 
 
 def test_qwen25_collate_shapes(collate_mod, monkeypatch):
@@ -2383,6 +2519,17 @@ class TestBuildLabelsFromTemplate:
         expected[0, 13] = _IM_END  # stop token
         assert torch.equal(labels, expected)
 
+    def test_assistant_turn_without_closing_token(self, collate_mod):
+        """An unfinished assistant turn labels its content through the row end."""
+        complete = _make_qwen_input_ids(("user", [10, 11, 12]), ("assistant", [20, 21]))
+        input_ids = complete[:, :-2]  # Remove the assistant <|im_end|> and newline.
+
+        labels = collate_mod.build_labels_from_template(input_ids, [[]], Qwen3VLProcessor())
+
+        expected = torch.full_like(input_ids, -100)
+        expected[0, -2:] = torch.tensor([20, 21])
+        assert torch.equal(labels, expected)
+
     def test_multi_turn(self, collate_mod):
         """Both assistant turns get labels."""
         input_ids = _make_qwen_input_ids(
@@ -2397,6 +2544,19 @@ class TestBuildLabelsFromTemplate:
         # Turn 1: content [20] + im_end
         # Turn 2: content [40, 41] + im_end
         assert len(labeled_positions) == 5  # 1+1 + 2+1
+
+    def test_long_marker_scan_does_not_scalarize_each_token(self, collate_mod):
+        prefix = torch.zeros(16_000, dtype=torch.long)
+        assistant_turn = _make_qwen_input_ids(("assistant", [20, 21]))[0]
+        input_ids = torch.cat([prefix, assistant_turn]).unsqueeze(0)
+
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            labels = collate_mod.build_labels_from_template(input_ids, [[]], Qwen3VLProcessor())
+
+        operator_names = {event.key for event in prof.key_averages()}
+        assert "aten::item" not in operator_names
+        assert "aten::is_nonzero" not in operator_names
+        assert labels[0, -4:-1].tolist() == [20, 21, _IM_END]
 
     def test_user_text_never_labeled(self, collate_mod):
         """Even if user text matches assistant text, user tokens stay -100."""
@@ -3087,11 +3247,11 @@ class TestMakeRobustCollate:
 
 
 # ---------------------------------------------------------------------------
-# neat_packed_vlm_collater — attn_implementation variants
+# neat_packed_vlm_collater — structural packing contracts
 # ---------------------------------------------------------------------------
 
 
-class TestNeatPackedVlmCollaterAttnImpl:
+class TestNeatPackedVlmCollaterPackingContract:
     def _make_packed_sample(self, seq_len=16, n_images=1):
         """Create a minimal packed sample dict."""
         input_ids = torch.randint(100, 30000, (seq_len,))
@@ -3110,6 +3270,13 @@ class TestNeatPackedVlmCollaterAttnImpl:
             sample["image_grid_thw"] = torch.tensor([[1, 2, 2]] * n_images)
         return sample
 
+    @staticmethod
+    def _packing(*, packed_mask_type="block_causal", requires_metadata=False):
+        return types.SimpleNamespace(
+            packed_mask_type=packed_mask_type,
+            requires_packed_sequence_metadata=requires_metadata,
+        )
+
     def test_flash_attention_2_emits_varlen_kwargs_instead_of_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
@@ -3120,22 +3287,43 @@ class TestNeatPackedVlmCollaterAttnImpl:
         assert "attention_mask" not in result
         assert "cu_seq_lens_q" in result
 
-    def test_sdpa_returns_4d_mask(self):
+    def test_document_ids_contract_returns_2d_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
-        result = neat_packed_vlm_collater(batch, attn_implementation="sdpa")
-        # SDPA produces 4D block-causal mask
+        result = neat_packed_vlm_collater(
+            batch,
+            packing=self._packing(packed_mask_type="document_ids"),
+        )
+
+        assert result["attention_mask"].ndim == 2
+
+    def test_deprecated_positional_attention_argument_is_translated(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(8, 0)]
+        with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
+            result = neat_packed_vlm_collater(batch, 0, None, "flash_attention_2")
+
+        assert "attention_mask" not in result
+        assert result["cu_seq_lens_q"].tolist() == [0, 8]
+
+    def test_block_causal_contract_returns_4d_mask(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
+        result = neat_packed_vlm_collater(batch, packing=self._packing())
+
         assert result["attention_mask"].ndim == 4
 
-    def test_sdpa_cp_keeps_compact_document_ids(self):
+    def test_cp_can_keep_compact_document_ids_without_changing_contract(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(16, 0)]
         result = neat_packed_vlm_collater(
             batch,
             max_length=32,
-            attn_implementation="sdpa",
+            packing=self._packing(),
             materialize_4d_mask=False,
         )
 
@@ -3150,14 +3338,18 @@ class TestNeatPackedVlmCollaterAttnImpl:
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(4, 0)]
-        result = neat_packed_vlm_collater(batch, max_length=6, attn_implementation="sdpa")
+        result = neat_packed_vlm_collater(batch, max_length=6, packing=self._packing())
         assert "_packed_seq_ids" not in result
 
     def test_fixed_max_length_pads_to_max(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(10, 0)]
-        result = neat_packed_vlm_collater(batch, max_length=32, attn_implementation="flash_attention_2")
+        result = neat_packed_vlm_collater(
+            batch,
+            max_length=32,
+            packing=self._packing(packed_mask_type="document_ids"),
+        )
         assert result["input_ids"].shape[1] == 32
 
     def test_concatenates_pixel_values(self):
@@ -3165,9 +3357,31 @@ class TestNeatPackedVlmCollaterAttnImpl:
 
         s1 = self._make_packed_sample(16, n_images=2)
         s2 = self._make_packed_sample(12, n_images=1)
-        result = neat_packed_vlm_collater([s1, s2], attn_implementation="flash_attention_2")
+        result = neat_packed_vlm_collater(
+            [s1, s2],
+            packing=self._packing(packed_mask_type="document_ids"),
+        )
         assert result["pixel_values"].shape[0] == 3  # 2 + 1
         assert result["image_grid_thw"].shape[0] == 3
+
+    def test_metadata_contract_emits_generic_varlen_fields(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        sample = self._make_packed_sample(5, 0)
+        sample["attention_mask"] = torch.tensor([1, 1, 2, 2, 2])
+        result = neat_packed_vlm_collater(
+            [sample],
+            max_length=7,
+            packing=self._packing(
+                packed_mask_type="document_ids",
+                requires_metadata=True,
+            ),
+        )
+
+        assert result["packed_token_indices"].tolist() == [[0, 1, 2, 3, 4, -1, -1]]
+        assert result["cu_seqlens"].tolist() == [[0, 2, 5]]
+        assert result["max_seqlen"] == 3
+        assert result["_packed_seq_ids"].tolist() == [[1, 1, 2, 2, 2, 0, 0]]
 
 
 # ---------------------------------------------------------------------------
