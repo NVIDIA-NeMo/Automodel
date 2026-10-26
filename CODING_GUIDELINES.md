@@ -38,6 +38,16 @@ not yet comply; use these guidelines to guide changes within your task's scope.
 - **Keep artifact versions consistent.** Resolve related external artifacts, such as configs and weights,
   to a consistent immutable revision and propagate that identity through dependent loads.
 
+## Code provenance
+
+- **Implement independently.** Make every effort to avoid copying code from external repositories.
+  Reuse compatible code already in this repository as described above.
+- **Record unavoidable external reuse.** If copying or adapting external code is necessary, include the source URL,
+  immutable revision, original file paths, and applicable licenses in the header of each affected file.
+  Complete the PR description's "Code provenance" section with those details and the affected repository files.
+- **Preserve attribution.** Retain all required license and copyright notices and attribution in affected files,
+  and state in the PR description where those notices are retained or added.
+
 ## Types and contracts
 
 - **Prefer explicit types.** Annotate public inputs and returns with concrete, meaningful types.
