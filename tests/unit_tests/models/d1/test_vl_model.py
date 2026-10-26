@@ -294,3 +294,55 @@ def test_selected_model_generates_like_hf_for_ordinary_lfm2_vl(
     torch.testing.assert_close(actual.sequences, expected.sequences, rtol=0, atol=0)
     for score, reference_score in zip(actual.scores, expected.scores, strict=True):
         torch.testing.assert_close(score, reference_score, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("with_image", [False, True])
+def test_native_d1_fp32_logits_and_every_parameter_gradient_match_hf(with_image, monkeypatch):
+    # Use HF's own CPU convolution body, rather than its installed CUDA override.
+    for name in ("causal_conv1d_fn", "causal_conv1d_update"):
+        monkeypatch.setattr(modeling_lfm2, name, inspect.unwrap(getattr(modeling_lfm2, name)))
+    torch.manual_seed(1739)
+    config = tiny_config()
+    config.auto_map = {"AutoModel": "modeling_d1.D1Model"}
+    with torch.device("cpu"):
+        reference = HFLfm2VlForConditionalGeneration._from_config(
+            config, dtype=torch.float32, attn_implementation="sdpa"
+        ).eval()
+        native = Lfm2VlForConditionalGeneration(config).float().eval()
+    with torch.no_grad():
+        for module in reference.modules():
+            if type(module).__name__.endswith("RMSNorm"):
+                module.weight.copy_(torch.linspace(0.65, 1.35, module.weight.numel()))
+    native.load_state_dict(reference.state_dict(), strict=True)
+    assert isinstance(native.model.language_model.rotary_emb, D1CausalRotaryEmbedding)
+    ids = torch.tensor([[1, 31, 31, 31, 31, 2, 3]]) if with_image else torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]])
+    valid = torch.ones_like(ids) if with_image else ids.ne(0).long()
+    image = torch.randn(1, 16, 768) if with_image else None
+    image_args = (
+        {"spatial_shapes": torch.tensor([[4, 4]]), "pixel_attention_mask": torch.ones(1, 16, dtype=torch.int32)}
+        if with_image
+        else {}
+    )
+    reference_pixels = image.clone().requires_grad_() if image is not None else None
+    native_pixels = image.clone().requires_grad_() if image is not None else None
+    expected = reference(
+        input_ids=ids, attention_mask=valid, pixel_values=reference_pixels, use_cache=False, **image_args
+    ).logits
+    actual = native(
+        input_ids=ids, attention_mask=valid, pixel_values=native_pixels, use_cache=False, **image_args
+    ).logits
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+    upstream = torch.randn_like(expected)
+    expected.backward(upstream)
+    actual.backward(upstream)
+    reference_parameters = dict(reference.named_parameters())
+    native_parameters = dict(native.named_parameters())
+    assert native_parameters.keys() == reference_parameters.keys()
+    for name, parameter in native_parameters.items():
+        gradient = reference_parameters[name].grad
+        if gradient is None:
+            assert parameter.grad is None
+        else:
+            torch.testing.assert_close(parameter.grad, gradient, atol=3e-6, rtol=3e-5, msg=name)
+    if with_image:
+        torch.testing.assert_close(native_pixels.grad, reference_pixels.grad, atol=3e-6, rtol=3e-5)
