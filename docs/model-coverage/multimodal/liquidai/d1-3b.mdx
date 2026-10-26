@@ -1,7 +1,7 @@
 ---
-title: "D1 Decision Models"
-description: "Run experimental frozen-backbone decision readout adaptation for LiquidAI D1-3B and D1 Omni with NeMo AutoModel."
-slug: model-coverage/multimodal/liquidai/d1
+title: "d1-3B"
+description: "Adapt d1-3B decision readouts with NeMo AutoModel using experimental frozen-backbone text workflows, with a related D1 Omni example and scoped acceptance notes."
+slug: model-coverage/multimodal/liquidai/d1-3B
 ---
 
 NeMo AutoModel provides experimental typed decision readouts for LiquidAI D1 models.
@@ -36,8 +36,7 @@ These artifacts initialize readout weights and do not resume optimizer or schedu
 
 | Property | Value |
 | --- | --- |
-| D1-3B registered architecture | `Lfm2VlForConditionalGeneration` |
-| D1 Omni registered architecture | `D1OmniModel` |
+| **Architecture** | `Lfm2VlForConditionalGeneration` (D1-3B); `D1OmniModel` (Omni) |
 | D1-3B checkpoint | [`LiquidAI/d1-3B`](https://huggingface.co/LiquidAI/d1-3B/tree/051bcc464b01b9f92942b364d9586b0ef5912432) |
 | D1 Omni checkpoint | [`LiquidAI/d1-omni-600M`](https://huggingface.co/LiquidAI/d1-omni-600M/tree/02b55d7076f15129e59ab3f94783f32c4b088674) |
 | Training scope | Single-device, frozen-backbone text decision readout adaptation |
