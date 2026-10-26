@@ -17,7 +17,7 @@ import json
 from types import ModuleType
 
 import pytest
-from huggingface_hub.utils._http import get_session
+from huggingface_hub.utils import get_session
 
 A, B = "a" * 40, "b" * 40
 

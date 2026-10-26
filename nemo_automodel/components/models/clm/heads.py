@@ -45,13 +45,10 @@ import torch.nn.functional as F
 
 from .prompting import clm_pairs
 
-CLM_HIDDEN = 4096
-CLM_PROJ_DIM = 512
 CLM_MAX_LOGIT_SCALE = math.log(100.0)
 CLM_HF_REPO = "Contrastive-LM/CLM-v0.1-8B"
 CLM_HF_FILE = "CLM_v0.1-8B.pt"
 CLM_HF_REVISION = "e939398d4556fcd9400c76fa8c5a513202f42b0a"
-CLM_ENCODER = "Qwen/Qwen3-8B"
 CLM_MAX_TOKENS = 2048
 
 
@@ -247,13 +244,13 @@ class CLMHeadPair(nn.Module):
         """
         states = self.project_states(state_embeddings)
         actions = self.project_actions(action_embeddings)
-        scale = self.logit_scale.clamp(max=math.log(100.0)).exp()
+        scale = self.logit_scale.clamp(max=CLM_MAX_LOGIT_SCALE).exp()
         return scale * states @ actions.transpose(0, 1)
 
     @property
     def scale(self) -> torch.Tensor:
         """Return the scalar inverse temperature, capped at the released value 100."""
-        return self.logit_scale.clamp(max=math.log(100.0)).exp()
+        return self.logit_scale.clamp(max=CLM_MAX_LOGIT_SCALE).exp()
 
     def question_logits(
         self, state_emb: torch.Tensor, option_emb: torch.Tensor, option_counts: Sequence[int]
@@ -405,10 +402,6 @@ class EmbeddingTable:
         """Load a previously published cache using restricted tensor deserialization."""
         ck = torch.load(path, map_location="cpu", weights_only=True)
         return cls(ck["texts"], ck["embeddings"])
-
-    def missing(self, texts: Sequence[str]) -> list[str]:
-        """Return requested texts absent from the cached row index."""
-        return [t for t in texts if t not in self.index]
 
 
 def clm_batch(

@@ -179,7 +179,7 @@ def test_kl_to_identical_reference_is_zero():
     assert abs(m["kl"].item()) < 1e-6
 
 
-def test_metrics_summary_and_table():
+def test_metrics_summary():
     ev = metrics.DecisionEvaluator(slice_keys=["evidence"])
     ev.add("r1", "verdict", ["a", "b"], [0.9, 0.1], 0, [1.0, -1.0], {"evidence": "clear"})
     ev.add("r1", "severity", ["0", "1"], [0.4, 0.6], 0, [1.0, 0.5], {"evidence": "clear"})
@@ -188,8 +188,6 @@ def test_metrics_summary_and_table():
     assert s["questions"]["verdict"]["accuracy"] == 1.0
     assert s["overall"]["exact_match"] == 0.5
     assert math.isclose(s["overall"]["reward"], (1.0 + 0.5 + 1.0) / 3)
-    table = metrics.format_comparison({"before": s, "after": s})
-    assert "| verdict |" in table and "overall/exact_match" in table
 
 
 # ---------------------------------------------------------------------------------------------------------------------

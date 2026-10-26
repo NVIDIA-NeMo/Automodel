@@ -159,26 +159,3 @@ def save_summary(summary: dict[str, Any], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(summary, indent=2))
-
-
-def comparison_rows(summaries: dict[str, dict[str, Any]], metric: str = "accuracy") -> list[dict[str, Any]]:
-    """Flatten ``{run_name: summary}`` into rows ``{"question": ..., run_name: value, ...}`` for a before/after table."""
-    names = list(summaries)
-    question_ids = list(next(iter(summaries.values()))["questions"])
-    rows = []
-    for qid in question_ids:
-        rows.append({"question": qid, **{n: summaries[n]["questions"][qid].get(metric) for n in names}})
-    for key in ("accuracy", "exact_match", "reward", "brier", "ece"):
-        rows.append({"question": f"overall/{key}", **{n: summaries[n]["overall"].get(key) for n in names}})
-    return rows
-
-
-def format_comparison(summaries: dict[str, dict[str, Any]], metric: str = "accuracy") -> str:
-    """Markdown table comparing runs (e.g. ``{"before": ..., "after SFT": ..., "after RL": ...}``)."""
-    rows = comparison_rows(summaries, metric)
-    names = list(summaries)
-    lines = ["| question | " + " | ".join(names) + " |", "|---|" + "---:|" * len(names)]
-    for row in rows:
-        cells = ["—" if row[n] is None else f"{row[n]:.3f}" for n in names]
-        lines.append(f"| {row['question']} | " + " | ".join(cells) + " |")
-    return "\n".join(lines)

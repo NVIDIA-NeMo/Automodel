@@ -197,21 +197,3 @@ def question_targets(record: dict[str, Any], option_orders: dict[str, Iterable[s
             )
         )
     return targets
-
-
-def answer_from_probabilities(question: dict[str, Any], option_ids: list[str], probs: list[float]) -> dict[str, Any]:
-    """Build a SystemOne answer object from per-option probabilities."""
-    dist = {str(o): float(p) for o, p in zip(option_ids, probs)}
-    if question["type"] == "noul":
-        return {"type": "noul", "noul": dist["true"]}
-    best = max(dist, key=dist.__getitem__)
-    if question["type"] == "choice":
-        return {"type": "choice", "choice": best, "confidence": dist[best], "probabilities": dist}
-    levels = [str(i) for i in range(len(question["criteria"]))]
-    return {
-        "type": "score",
-        "score": sum(i * dist[level] for i, level in enumerate(levels)),
-        "confidence": dist[best],
-        "legend": {level: c for level, c in zip(levels, question["criteria"])},
-        "probabilities": {level: dist[level] for level in levels},
-    }

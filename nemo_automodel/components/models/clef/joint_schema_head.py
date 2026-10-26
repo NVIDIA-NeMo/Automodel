@@ -535,9 +535,6 @@ class JointSchemaHead(nn.Module):
         return results
 
 
-CLEF_HF_REPO = "Cloudflare/clef"
-
-
 def load_joint_head(
     path: str | Path, dtype: torch.dtype = torch.float32, dropout: float = 0.0, *, revision: str | None = None
 ) -> JointSchemaHead:
