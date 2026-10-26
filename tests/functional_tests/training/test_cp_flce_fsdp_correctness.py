@@ -253,8 +253,8 @@ def _assert_globally_unused_param_keeps_none_grad(device: torch.device) -> None:
         for micro_index, users in enumerate(users_per_micro_batch):
             model(_inputs(window, micro_index, rank), use_conditional=rank in users).sum().backward()
 
-    # Only rank 0 runs the branch, in the second micro-batch: the first micro-batch's reduced
-    # zero is dropped and the second one's contribution survives.
+    # Only rank 0 runs the branch, in the second micro-batch: the restore after the first micro-batch
+    # must not stop the second micro-batch's contribution from arriving intact.
     _run_window(0, [(), (0,)])
     reference(_inputs(0, 1, 0), use_conditional=True).sum().div(world).backward()
     torch.testing.assert_close(

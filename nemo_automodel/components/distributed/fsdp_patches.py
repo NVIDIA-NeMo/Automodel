@@ -183,8 +183,7 @@ def _restore_unused_param_grads(param_groups: list[Any]) -> None:
     # Issue every domain's reduction before reading any back, so the backward pays one host sync.
     used_by_domain = []
     for (reduce_scatter_group, all_reduce_group, device), entries in entries_by_domain.items():
-        used = torch.tensor([used_locally for _, used_locally, _ in entries], dtype=torch.int32)
-        used = used.to(device, non_blocking=True)
+        used = torch.tensor([used_locally for _, used_locally, _ in entries], dtype=torch.int32, device=device)
         for process_group in (reduce_scatter_group, all_reduce_group):
             if process_group is not None:
                 dist.all_reduce(used, op=dist.ReduceOp.MAX, group=process_group)
@@ -198,7 +197,7 @@ def _restore_unused_param_grads(param_groups: list[Any]) -> None:
 def patch_fsdp_restore_unused_param_grads() -> None:
     """Keep ``grad is None`` for parameters that no rank of their reduction used.
 
-    The context-parallel unused-parameter fill (PyTorch's public API or
+    The unused-parameter fill (PyTorch's public API or
     :func:`patch_fsdp_unused_param_reduction`) gives a locally unused parameter a
     zero contribution so every rank issues the same reduce-scatter. When no rank
     of the parameter's reduction domain used it, that reduction turns a missing
@@ -207,13 +206,11 @@ def patch_fsdp_restore_unused_param_grads() -> None:
     weight with residual momentum. Without the fill the gradient stays ``None``
     and the optimizer skips the parameter.
 
-    Each reducing post-backward records which parameters had a local gradient;
-    the root's final backward callback reduces those flags over the parameter's
-    reduction domain and resets every sharded gradient that this reduction
-    created for a parameter no rank used. Usage comes from gradient presence,
-    never from a zero value, and a gradient from an earlier reduction of the
-    accumulation window keeps its real contribution. Install it after the fill,
-    so the probe sees gradients before the zero fill. The patch is
+    Each reducing post-backward records which parameters had a local gradient,
+    and the root's final backward callback reduces those flags over the reduction
+    domain and resets the sharded gradients this reduction created for parameters
+    no rank used. Usage comes from gradient presence, never from a zero value.
+    Install it after the fill so the probe runs before the zero fill; the patch is
     process-global and idempotent.
 
     Raises:
@@ -225,7 +222,8 @@ def patch_fsdp_restore_unused_param_grads() -> None:
         from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
     except ImportError as error:
         raise RuntimeError(
-            "Context parallelism keeps gradients of parameters no rank used as None, but this PyTorch "
+            "FSDP unused-parameter reduction keeps gradients of parameters no rank used as None, but this "
+            "PyTorch "
             "version does not provide the compatible FSDP2 implementation."
         ) from error
 
@@ -240,7 +238,7 @@ def patch_fsdp_restore_unused_param_grads() -> None:
         if zero_fills and self.reduce_grads and self._training_state != TrainingState.POST_BACKWARD:
             # An HSDP reduction whose all-reduce was deferred holds earlier micro-batches' real
             # contributions outside ``sharded_param.grad``, so this reduction does not create the gradient.
-            pending_partial_reduce = getattr(self, "_partial_reduce_output", None) is not None
+            pending_partial_reduce = self._partial_reduce_output is not None
             self._automodel_unused_param_probe = [
                 (
                     fsdp_param,

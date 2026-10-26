@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Gemma4 Unified 12B with 128K-token sequences under context parallelism (cp_size=8) on one 8-GPU node.
-# Each rank keeps a contiguous 8K-token slice; the sliding-window layers run Flex and the head_dim=512
+# Each rank keeps a contiguous 16K-token slice; the sliding-window layers run Flex and the head_dim=512
 # full-attention ring chunks run the FFPA kernel (install the `ffpa` extra: uv sync --extra ffpa).
 # The data is the built-in synthetic LLM mock (one 128K-token sample per row), so the recipe is
 # self-contained and measures memory and throughput, not convergence.

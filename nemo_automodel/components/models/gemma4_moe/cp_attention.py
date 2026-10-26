@@ -1436,6 +1436,11 @@ def apply_gemma4_cp_attention_backend_policy(model: torch.nn.Module, attention_c
         raise ValueError(f"Unsupported cp_full_attn_backend: {full_backend!r}")
     if sliding_backend not in {"flex", "fa"}:
         raise ValueError(f"Unsupported cp_sliding_attn_backend: {sliding_backend!r}")
+    if full_backend == "ffpa" and not _ffpa_varlen_ring_available():
+        logger.warning(
+            "cp_full_attn_backend='ffpa' was requested, but the ffpa-attn CuTeDSL varlen ops are unavailable; "
+            "the full-attention CP ring chunks fall back to Flex. Install the `ffpa` extra to use FFPA."
+        )
     for module in model.modules():
         if isinstance(module, attention_cls):
             attach_gemma4_cp_ring_attention(module, use_ffpa=full_backend == "ffpa", sliding_backend=sliding_backend)

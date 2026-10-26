@@ -179,18 +179,10 @@ def _reference(model, batch):
 
 
 def _cp_backward(model, batch, device_mesh):
-    """Backward of the token-mean loss through the CP sharder, the recipe path.
-
-    Args:
-        model: The model; when FSDP2-wrapped, FSDP reduces its gradients over the CP ranks.
-        batch: Full-sequence tensors of shape [batch, sequence], plus the image tensors for an image batch.
-        device_mesh: Mesh with a ``cp`` dimension.
-
-    Returns:
-        This rank's share of the loss, a scalar tensor.
-    """
+    """Backward of the token-mean loss through the CP sharder (the recipe path); returns this rank's loss."""
     from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 
+    model.zero_grad(set_to_none=True)
     batch = {k: v.clone() for k, v in batch.items()}
     num_tokens = (batch["labels"] != -100).sum()
     train_ctx, batch = ContextParallelSharder(model, device_mesh, batch).shard(batch)
@@ -202,7 +194,6 @@ def _cp_backward(model, batch, device_mesh):
 
 
 def _context_parallel(model, batch, device_mesh):
-    model.zero_grad(set_to_none=True)
     loss = _cp_backward(model, batch, device_mesh)
     group = device_mesh["cp"].get_group()
     dist.all_reduce(loss, group=group)
@@ -215,17 +206,10 @@ def _context_parallel(model, batch, device_mesh):
 
 
 def _image_then_text_updates(model, image_batch, text_batch, backward):
-    """Take an AdamW step on the image batch, then one on the text batch.
+    """Take an AdamW step on the image batch, then one on the text batch, with ``backward(model, batch)``.
 
-    Args:
-        model: The model to train, FSDP2-wrapped or not.
-        image_batch: Batch whose image runs the vision embedder.
-        text_batch: Text-only batch, which leaves the vision embedder unused.
-        backward: Callable ``(model, batch)`` that accumulates the batch's gradients.
-
-    Returns:
-        ``(vision_changed, text_changed, vision_steps)``: whether the text step changed any vision
-        embedder weight, whether it changed any other weight, and each vision weight's AdamW step count.
+    Returns ``(vision_changed, text_changed, vision_steps)``: whether the text step changed any vision embedder
+    weight, whether it changed any other weight, and each vision weight's AdamW step count.
     """
     from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtensor
 
@@ -233,7 +217,6 @@ def _image_then_text_updates(model, image_batch, text_batch, backward):
     params = dict(model.named_parameters())
 
     def _step(batch):
-        model.zero_grad(set_to_none=True)
         backward(model, batch)
         optimizer.step()
 
@@ -246,39 +229,28 @@ def _image_then_text_updates(model, image_batch, text_batch, backward):
     after = _snapshot()
     changed = {n for n in params if not torch.equal(after[n], before[n])}
     vision = {n for n in params if ".embed_vision." in n}
-    vision_steps = {n: int(optimizer.state[params[n]].get("step", 0)) for n in sorted(vision)}
+    vision_steps = {n: int(optimizer.state[params[n]].get("step", 0)) for n in vision}
     return bool(changed & vision), bool(changed - vision), vision_steps
 
 
 def _compare(reference, result, loss_tol, grad_tol):
-    """Gate one batch: CP loss and gradients against the reference.
+    """Gate one batch's CP ``(loss, grads)`` against the reference; returns ``(ok, summary)``.
 
-    Args:
-        reference: ``(loss, grads)`` without CP; ``grads`` maps parameter names to gradients of any shape.
-        result: ``(loss, grads)`` with CP, in the same layout.
-        loss_tol: Maximum absolute loss difference.
-        grad_tol: Maximum relative L2 error of any parameter gradient.
-
-    Returns:
-        ``(ok, summary)``. Any nonfinite loss or gradient fails before the worst error is reduced, so a
-        NaN cannot hide behind the ``max`` comparison.
+    A nonfinite loss or gradient fails the gate explicitly: a NaN after the first entry would never be picked
+    by the ``max`` over relative errors.
     """
     (ref_loss, ref_grads), (cp_loss, cp_grads) = reference, result
     missing = sorted(set(ref_grads) ^ set(cp_grads))
-    nonfinite = sorted(
-        {n for grads in (ref_grads, cp_grads) for n, g in grads.items() if not torch.isfinite(g).all()}
-        | {label for label, loss in (("ref_loss", ref_loss), ("cp_loss", cp_loss)) if not torch.isfinite(loss)}
+    tensors = [("ref_loss", ref_loss), ("cp_loss", cp_loss), *ref_grads.items(), *cp_grads.items()]
+    nonfinite = sorted({n for n, t in tensors if not torch.isfinite(t).all()})
+    worst_name, worst = max(
+        (
+            (n, ((cp_grads[n].float() - g.float()).norm() / g.float().norm().clamp_min(1e-12)).item())
+            for n, g in ref_grads.items()
+            if n in cp_grads
+        ),
+        key=lambda item: item[1],
     )
-    worst_name, worst = "-", float("inf")
-    if not nonfinite:
-        worst_name, worst = max(
-            (
-                (n, ((cp_grads[n].float() - g.float()).norm() / g.float().norm().clamp_min(1e-12)).item())
-                for n, g in ref_grads.items()
-                if n in cp_grads
-            ),
-            key=lambda item: item[1],
-        )
     dloss = abs(ref_loss.item() - cp_loss.item())
     ok = not missing and not nonfinite and dloss < loss_tol and worst < grad_tol
     summary = (
@@ -341,13 +313,11 @@ def main():
     # The image step stepped the vision weights once in both; the text step must step none of them.
     updates_ok = cp == cp1 and not vision_changed and text_changed and 1 in vision_steps.values()
     if rank == 0:
-        print(
-            f"[image_then_text] cp1 vision_changed={cp1[0]} text_changed={cp1[1]}  "
-            f"cp vision_changed={vision_changed} text_changed={text_changed}  "
-            f"vision steps cp1={sorted(set(cp1[2].values()))} cp={sorted(set(vision_steps.values()))}  "
-            f"{'PASS' if updates_ok else 'FAIL'}",
-            flush=True,
+        summary = "  ".join(
+            f"{label} vision_changed={vc} text_changed={tc} vision_steps={sorted(set(steps.values()))}"
+            for label, (vc, tc, steps) in (("cp1", cp1), ("cp", cp))
         )
+        print(f"[image_then_text] {summary}  {'PASS' if updates_ok else 'FAIL'}", flush=True)
     if not updates_ok:
         failed.append("image_then_text")
     if rank == 0:

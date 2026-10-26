@@ -20,6 +20,8 @@ reproduce the Hugging Face forward exactly; the ring itself is covered by the GP
 ``tests/functional_tests/context_parallel/run_gemma4_unified_cp.py``.
 """
 
+import logging
+
 import pytest
 import torch
 from transformers.cache_utils import DynamicCache
@@ -101,6 +103,20 @@ def test_cp_attention_backends_follow_the_text_config():
         _model(cp_sliding_attn_backend="sdpa")
     with pytest.raises(ValueError, match="cp_full_attn_backend"):
         _model(cp_full_attn_backend="sdpa")
+
+
+def test_cp_ffpa_backend_warns_when_the_kernel_is_unavailable(monkeypatch, caplog):
+    from nemo_automodel.components.models.gemma4_moe import cp_attention
+
+    monkeypatch.setattr(cp_attention, "_ffpa_varlen_ring_available", lambda: False)
+    with caplog.at_level(logging.WARNING, logger=cp_attention.__name__):
+        _model(cp_full_attn_backend="ffpa")
+    assert "fall back to Flex" in caplog.text
+    caplog.clear()
+    monkeypatch.setattr(cp_attention, "_ffpa_varlen_ring_available", lambda: True)
+    with caplog.at_level(logging.WARNING, logger=cp_attention.__name__):
+        _model(cp_full_attn_backend="ffpa")
+    assert "fall back to Flex" not in caplog.text
 
 
 @pytest.mark.parametrize("with_image", [False, True])
