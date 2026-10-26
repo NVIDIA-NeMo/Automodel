@@ -1,7 +1,7 @@
 {#- Training chat template for DeepSeek-V4.1-Flash (deepseek-ai/DeepSeek-V4.1-Flash,
     chat_template.jinja at revision 2cba9e42aa026125f3ed06c6d98c1db82f7ca027, itself ported from
     encoding/encoding.py in the model repo). For the same thinking_mode it renders byte-identically
-    to the released template, with two differences:
+    to the released template, with three differences:
 
     1. A generation block marks each assistant turn's supervised span: the reasoning text and
        </think> (thinking mode, on turns that keep their reasoning), the answer, any DSML tool
@@ -10,15 +10,17 @@
        inference.
     2. When neither thinking_mode nor enable_thinking is passed, it renders chat mode instead of
        the released default (thinking), and it rejects assistant turns that carry
-       reasoning_content (or thinking), which chat mode would silently drop. The recipes have
-       no option for chat template arguments, and thinking mode would train every reply
-       without reasoning as an empty reasoning block. To train on thinking-mode data, where
-       assistant turns carry reasoning_content, set default_thinking_mode to "thinking".
+       reasoning_content (or thinking), which chat mode would silently drop. Thinking mode
+       would train every reply without reasoning as an empty reasoning block, so chat is the
+       safer default. To train on thinking-mode data, where assistant turns carry
+       reasoning_content, pass thinking_mode: thinking through chat_template_kwargs.
+    3. It rejects tool calls whose function.arguments is not an object, which the released body renders as one
+       DSML parameter named "arguments". NeMoAutoTokenizer hands this model type JSON-string arguments as objects.
 
-    Extra kwargs, as in the released template: thinking_mode ("thinking" | "chat";
-    enable_thinking=true/false is accepted as an alias), drop_thinking (default true),
-    reasoning_effort (int in [1, 100] or "low"/"medium"/"high"/"max", default "high"). Assistant
-    reasoning is read from reasoning_content, or from thinking as an alias.
+    Extra kwargs, as in the released template, set through chat_template_kwargs: thinking_mode
+    ("thinking" | "chat"; enable_thinking=true/false is accepted as an alias), drop_thinking
+    (default true), reasoning_effort (int in [1, 100] or "low"/"medium"/"high"/"max", default
+    "high"). Assistant reasoning is read from reasoning_content, or from thinking as an alias.
 
     For system, user, and assistant turns in chat mode it renders the same text and supervised
     spans as tulu3_chat_template.jinja in this directory, which accepts only those three roles.
@@ -31,10 +33,15 @@
     {%- set thinking_mode = default_thinking_mode -%}
     {%- if thinking_mode == "chat" -%}
         {%- for msg in messages if msg.role == "assistant" and (msg.get("reasoning_content") or msg.get("thinking")) -%}
-            {{- raise_exception("Assistant reasoning_content would be dropped in the default chat mode; set default_thinking_mode to \"thinking\" in this template, or remove the reasoning from the data") -}}
+            {{- raise_exception("Assistant reasoning_content would be dropped in the default chat mode; pass thinking_mode \"thinking\" through chat_template_kwargs, or remove the reasoning from the data") -}}
         {%- endfor -%}
     {%- endif -%}
 {%- endif -%}
+{%- for msg in messages if msg.role == "assistant" and msg.get("tool_calls") -%}
+    {%- for tc in msg.tool_calls if tc.function.arguments is not mapping -%}
+        {{- raise_exception("Tool call arguments must be an object, or they render as one DSML parameter named \"arguments\"; load the tokenizer with NeMoAutoTokenizer (default tokenizer_backend), which parses JSON-string arguments for DeepSeek-V4.1") -}}
+    {%- endfor -%}
+{%- endfor -%}
 {#- Released template body. -#}
 {%- set IMG = "<｜deepseek_image｜>" -%}
 {%- set DSML = "｜DSML｜" -%}

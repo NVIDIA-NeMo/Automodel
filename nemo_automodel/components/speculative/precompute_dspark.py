@@ -33,13 +33,14 @@ Typical usage (single device):
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 from typing import Any
 
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -68,6 +69,9 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
     DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V41_MODEL_TYPE as _DEEPSEEK_V41_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
     GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
@@ -87,9 +91,20 @@ logger = logging.getLogger(__name__)
 
 _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES = (
     _DEEPSEEK_V4_MODEL_TYPE,
+    _DEEPSEEK_V41_MODEL_TYPE,
     _GLM_5_2_MODEL_TYPE,
+    "kimi_k3",
     *_MINIMAX_M3_MODEL_TYPES,
 )
+
+
+def _is_kimi_k3_text_export(target_path: str, trust_remote_code: bool) -> bool:
+    """Tell a Kimi K3 text-only export from Kimi-Linear-48B; both write ``model_type: kimi_linear``.
+
+    Only K3 writes ``attn_res_block_size`` to its config, and no published Kimi-Linear-48B config has it.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
+    return "attn_res_block_size" in config_dict
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -145,12 +160,14 @@ def _run(args: argparse.Namespace) -> int:
     compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     model_type = _read_target_model_type(args.target_model, args.trust_remote_code)
-    if model_type in _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES:
+    if model_type in _UNSUPPORTED_OFFLINE_TARGET_MODEL_TYPES or (
+        model_type == "kimi_linear" and _is_kimi_k3_text_export(args.target_model, args.trust_remote_code)
+    ):
         raise ValueError(
             "precompute_dspark supports HF-loadable single-process targets only. "
-            f"model_type={model_type!r}: DeepSeek V4 / GLM-5.2 targets use the distributed offline precompute "
-            "(python -m nemo_automodel.recipes.llm.precompute_dspark_dist); MiniMax M3 is multimodal and the "
-            "DSpark cache schema is text-only, so it needs the online training path."
+            f"model_type={model_type!r}: DeepSeek V4/V4.1, GLM-5.2, and Kimi K3 targets use the distributed "
+            "offline precompute (python -m nemo_automodel.recipes.llm.precompute_dspark_dist); MiniMax M3 is "
+            "multimodal and the DSpark cache schema is text-only, so it needs the online training path."
         )
 
     target_config = AutoConfig.from_pretrained(args.target_model, trust_remote_code=args.trust_remote_code)
@@ -189,11 +206,12 @@ def _run(args: argparse.Namespace) -> int:
         shuffle_seed=args.shuffle_seed,
         mask_reasoning_content=args.mask_reasoning_content,
         mask_generation_prompt=args.mask_generation_prompt,
+        chat_template_kwargs=args.chat_template_kwargs,
     )
     num_samples = len(dataloader.dataset)
 
     # The manifest guards resume for the tensor-shaping target/cache settings AND
-    # the run's input identity (dataset, split, seed, masking, chat template), so a
+    # the run's input identity (dataset, split, seed, masking, chat template and kwargs), so a
     # --resume with different inputs fails instead of mixing supervision.
     manifest = build_cache_manifest(
         target_model=args.target_model,
@@ -210,6 +228,7 @@ def _run(args: argparse.Namespace) -> int:
         mask_reasoning_content=bool(args.mask_reasoning_content),
         chat_template_sha256=tokenizer_chat_template_sha256(tokenizer),
         mask_generation_prompt=bool(args.mask_generation_prompt),
+        chat_template_kwargs=args.chat_template_kwargs,
     )
     if args.resume:
         _ensure_resume_compatible(args.output_dir, manifest, existing)
@@ -259,6 +278,17 @@ def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _json_object(value: str) -> dict[str, Any]:
+    """Parse a ``--chat-template-kwargs`` value, which must be a JSON object."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError(f"expected a JSON object, got {type(parsed).__name__}")
+    return parsed
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Precompute the DSpark offline target-supervision cache.")
     parser.add_argument("--target-model", required=True, help="Target model path or HF repo id.")
@@ -278,6 +308,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-layer-ids", type=int, nargs="+", default=None, help="Target layers to capture.")
     parser.add_argument(
         "--chat-template", default=None, help="Inline Jinja template or path to template/tokenizer config."
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=_json_object,
+        default=None,
+        help="Extra chat template variables as a JSON object, e.g. '{\"enable_thinking\": false}'.",
     )
     parser.add_argument("--mask-reasoning-content", action="store_true")
     parser.add_argument(

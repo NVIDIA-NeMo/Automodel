@@ -481,6 +481,16 @@ class BackendConfig:
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
             that derives the pad size is skipped and the count is only aligned. Default False;
             keep it False for variable-length or in-batch-packed inputs.
+        dispatcher_recompute_cache: HybridEP only; effective under full-block activation checkpointing (not
+            installed for ``checkpoint_moe_only`` regions, which end at the combine the recompute never re-runs).
+            ``"none"`` (default) recomputes the whole MoE layer in the backward. ``"combine"`` keeps
+            a clone of every MoE layer's combine output ([tokens, hidden] in the activation dtype)
+            from the checkpoint forward and returns it in the recompute instead of re-running the
+            unpermute, the EP-group barrier and the combine all-to-all. ``"moe_tail"`` additionally
+            builds the down projection's autograd node in the recompute without running its GEMM
+            (its output only fed the skipped combine; torch_mm experts without expert bias and with
+            the router weight applied inside the activation) (a post-expert callback that reads the output keeps the GEMM). Costs one [tokens, hidden] activation
+            per MoE layer per in-flight microbatch; gradients are unchanged.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -516,7 +526,7 @@ class BackendConfig:
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
             communication of the routed path; numerics unchanged. Default False.
         compile_router_weight: torch.compile the fp32 router-weight multiply applied to
-            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP``, all MoE models),
+            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP`` / ``GroupedExpertsTE``, all MoE models),
             so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
             cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
             numerics are allclose to eager but not bitwise-identical.
@@ -565,6 +575,10 @@ class BackendConfig:
     # aligned. Leave False for variable-length inputs: with genuinely unequal aligned counts the
     # HybridEP collective hangs silently (no exception; the job sits until its time limit).
     dispatcher_equal_token_counts: bool = False
+    # HybridEP only, under block activation checkpointing: "none" | "combine" (serve each MoE layer's combine
+    # output from the checkpoint forward in the recompute) | "moe_tail" (also skip the down projection's GEMM
+    # in the recompute). One [tokens, hidden] activation per MoE layer per in-flight microbatch.
+    dispatcher_recompute_cache: str = "none"
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     dispatcher_hybridep_permute_fusion: bool = False
     dispatcher_hybridep_compact_routing: bool = False
@@ -746,6 +760,21 @@ class BackendConfig:
             raise ValueError(
                 f"dispatcher_capacity_factor must be >= 1.0 (a smaller buffer overflows on the first skewed batch), "
                 f"got {self.dispatcher_capacity_factor!r}"
+            )
+        if self.dispatcher_recompute_cache not in ("none", "combine", "moe_tail"):
+            raise ValueError(
+                "dispatcher_recompute_cache must be one of 'none', 'combine', 'moe_tail', "
+                f"got {self.dispatcher_recompute_cache!r}"
+            )
+        if self.dispatcher_recompute_cache != "none" and self.dispatcher != "hybridep":
+            raise ValueError(
+                "dispatcher_recompute_cache requires dispatcher='hybridep' (the cache is served by the HybridEP "
+                f"combine), got dispatcher='{self.dispatcher}'"
+            )
+        if self.dispatcher_recompute_cache == "moe_tail" and self.experts not in ("torch_mm", "gmm"):
+            raise ValueError(
+                "dispatcher_recompute_cache='moe_tail' requires experts='torch_mm' (the deferred down projection "
+                f"is the torch grouped-GEMM path), got experts='{self.experts}'"
             )
         if self.dispatcher_capacity_factor is not None and self.benchmark_static_routing:
             # Static routing already pins the dispatched count after the first dispatch, so the capacity

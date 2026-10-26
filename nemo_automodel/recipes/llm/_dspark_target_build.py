@@ -68,6 +68,17 @@ def distributed_section_dict(cfg) -> dict:
     return section.to_dict() if hasattr(section, "to_dict") else dict(section)
 
 
+def chat_template_kwargs_from(recipe_cfg) -> dict[str, Any] | None:
+    """Return ``recipe_args.chat_template_kwargs`` as a plain dict, or ``None`` when unset.
+
+    DSpark training and the distributed precompute both read it here, so the kwargs a cache
+    records and the ones a cached run compares them with are read the same way. A value that
+    is not a mapping is returned unchanged for the dataset to reject.
+    """
+    kwargs = recipe_cfg.get("chat_template_kwargs", None)
+    return kwargs.to_dict() if hasattr(kwargs, "to_dict") else kwargs
+
+
 def unsupported_parallel_axes(sizes: dict, axes: tuple[str, ...]) -> dict[str, int]:
     """Return the entries of ``axes`` whose parallelism size is not 1.
 
