@@ -40,11 +40,11 @@ Run with::
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -150,7 +150,9 @@ class TrainClefDecisionRecipe(BaseRecipe):
             dropout=self.cfg.get("head.dropout", 0.0),
             revision=self.cfg.get("model.revision", None),
         ).to(self.device)
-        checkpoint_config = replace(self.cfg.checkpoint, checkpoint_dir=str(self.output_dir))
+        # Preserve the config's normalized enums; dataclasses.replace reruns raw-input validation.
+        checkpoint_config = copy.copy(self.cfg.checkpoint)
+        checkpoint_config.checkpoint_dir = str(self.output_dir)
         self.checkpointer = checkpoint_config.build(
             dp_rank=self._get_dp_rank(),
             tp_rank=0,

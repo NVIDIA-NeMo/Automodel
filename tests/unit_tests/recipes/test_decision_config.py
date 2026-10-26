@@ -251,3 +251,68 @@ def test_clm_setup_rejects_empty_split_before_loading_encoder(tmp_path, monkeypa
     recipe = train_clm_heads.TrainCLMHeadsRecipe(ConfigNode({"data": {"train": str(empty)}}))
     with pytest.raises(ValueError, match="data.train must contain at least one record"):
         recipe.setup()
+
+
+def test_clef_setup_preserves_normalized_checkpoint_config(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import torch
+
+    from nemo_automodel import NeMoAutoModelForImageTextToText
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.models.clef.joint_schema_head import ClefHeadConfig
+    from nemo_automodel.recipes.decision import train_clef
+
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.output = torch.nn.Embedding(8, 8).requires_grad_(False)
+
+        def get_output_embeddings(self) -> torch.nn.Embedding:
+            """Return the frozen output table with weight of shape [vocabulary, hidden]."""
+            return self.output
+
+    root = Path(train_clef.__file__).resolve().parents[3]
+    config = yaml.safe_load((root / "examples/decision/clef_soc_triage_heads.yaml").read_text())
+    config.update(mode="eval", output_dir=str(tmp_path / "run"))
+    record = {"id": "one", "state": "text", "questions": {"pick": {"type": "choice", "criteria": {"a": "A", "b": "B"}}}}
+    data = tmp_path / "data.jsonl"
+    import json
+
+    data.write_text(json.dumps(record) + "\n")
+    for split in ("train", "validation", "test"):
+        config["data"][split] = str(data)
+    monkeypatch.setattr(
+        train_clef, "initialize_distributed", lambda **kwargs: SimpleNamespace(device=torch.device("cpu"), world_size=1)
+    )
+    monkeypatch.setattr(train_clef, "create_distributed_setup_from_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        train_clef.TrainClefDecisionRecipe,
+        "_distributed_setup_attributes",
+        lambda *args: (None, SimpleNamespace(tp_size=1, cp_size=1), None, None, None, False, None, None, False),
+    )
+    monkeypatch.setattr(train_clef.TrainClefDecisionRecipe, "_get_dp_rank", lambda *args: 0)
+    monkeypatch.setattr(train_clef.TrainClefDecisionRecipe, "_dp_group", lambda *args: None)
+    monkeypatch.setattr(NeMoAutoModelForImageTextToText, "from_pretrained", lambda *args, **kwargs: Backbone())
+
+    class Tokenizer:
+        pad_token_id = 0
+
+        def __call__(self, text, **kwargs):
+            return SimpleNamespace(input_ids=[1])
+
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: Tokenizer())
+    head = ClefHeadConfig(hidden_size=8, width=8, routing_layers=1, layers=1, heads=2, feedforward=16).build()
+    monkeypatch.setattr(train_clef, "load_joint_head", lambda *args, **kwargs: head)
+    recipe = train_clef.TrainClefDecisionRecipe(ConfigNode(config))
+    try:
+        recipe.setup()
+        assert recipe.checkpointer.config is not recipe.cfg.checkpoint
+        assert recipe.checkpointer.config.checkpoint_dir == str(tmp_path / "run")
+        assert str(recipe.cfg.checkpoint.checkpoint_dir) == "checkpoints/"
+        assert recipe.checkpointer.config.model_save_format == recipe.cfg.checkpoint.model_save_format
+        assert len(recipe.splits["train"]) == 1
+        assert recipe.lexical.rows.shape == (1, 8)
+    finally:
+        if hasattr(recipe, "checkpointer"):
+            recipe.checkpointer.close()
