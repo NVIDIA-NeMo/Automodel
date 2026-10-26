@@ -164,6 +164,7 @@ def initialize_attn_module_and_func(
             common: dict[str, Any] = {
                 "softmax_scale": softmax_scale,
                 "causal": cast(bool, call_kwargs.get("causal", default_causal)),
+                "deterministic": torch.are_deterministic_algorithms_enabled(),
                 "window_size": call_kwargs.get("window_size", (None, None)),
             }
             # The pinned FA4 SM100/SM110 dedicated HD256 forward kernel has no
@@ -188,6 +189,14 @@ def initialize_attn_module_and_func(
             if cu_seqlens_q is None:
                 output, _lse = flash_attn_func(q, k, v, **common)
                 return output
+
+            if q.shape[0] == 0:
+                # Empty reductions retain all gradient paths without reading discarded
+                # FP16 values, whose full reductions could overflow before multiplying by zero.
+                zero = q[:0].sum() + k[:0].sum() + v[:0].sum()
+                empty = torch.zeros_like(v) + zero
+                padded_shape = call_kwargs.get("_fa4_padded_output_shape")
+                return empty if padded_shape is None else v.new_zeros(padded_shape) + zero
 
             cu_seqlens_kv = call_kwargs.get("cu_seqlens_kv", cu_seqlens_q)
             max_seqlen_q = call_kwargs.get("max_seqlen_q")
@@ -401,11 +410,9 @@ def preprocess_args_and_kwargs_for_attn(
             valid_tokens = attention_mask.bool()
             seqlens = valid_tokens.sum(dim=-1)
             seqlens = seqlens[seqlens > 0]
-            if seqlens.numel() == 0:
-                raise ValueError("FA4 attention_mask must contain at least one valid token")
             unpad_indices = torch.nonzero(valid_tokens.flatten(), as_tuple=False).flatten()
             cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
-            max_seqlen = int(seqlens.max().item())
+            max_seqlen = int(seqlens.max().item()) if seqlens.numel() else 0
 
         if cu_seqlens is not None and unpad_indices is not None and (cu_seqlens.ndim != 1 or unpad_indices.ndim != 1):
             raise ValueError(

@@ -32,7 +32,7 @@ from tests.unit_tests.models.kimi_linear.test_model import _backend_config, _tin
 
 
 def _assert_recipe_document_isolation(
-    *, device: str, use_kda: bool, training: bool, pack_size: int, split: str
+    *, device: str, use_kda: bool, training: bool, pack_size: int, split: str, attn: str = "eager"
 ) -> dict[str, float]:
     """Exercise the recipe's real loaders and model, returning isolation errors."""
     torch.manual_seed(0)
@@ -41,7 +41,11 @@ def _assert_recipe_document_isolation(
     model_config = _tiny_kimi_config(use_kda=use_kda)
     if use_kda:
         model_config.linear_attn_config["head_dim"] = 32
-    model = KimiLinear48BForCausalLM(model_config, backend=_backend_config())
+    if attn == "fa4":
+        model_config.qk_nope_head_dim = 128
+        model_config.qk_rope_head_dim = 64
+        model_config.v_head_dim = 128
+    model = KimiLinear48BForCausalLM(model_config, backend=replace(_backend_config(), attn=attn))
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     model.initialize_weights(buffer_device=torch.device(device), dtype=dtype)
     model.to(device=device)

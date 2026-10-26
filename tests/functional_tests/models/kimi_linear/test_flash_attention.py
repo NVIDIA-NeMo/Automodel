@@ -25,15 +25,17 @@ import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
 
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    preprocess_args_and_kwargs_for_attn,
+)
+from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.packing import flatten_packed_sequence_metadata
 from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
 from nemo_automodel.components.models.kimi_linear.cp import (
     KimiPackedContext,
     build_document_causal_mask,
-)
-from nemo_automodel.components.models.kimi_linear.flash_attention import (
-    build_flash_layout,
-    packed_flash_attention,
 )
 from nemo_automodel.components.models.kimi_linear.model import KimiLinear48BForCausalLM, KimiMLAAttention
 
@@ -49,6 +51,18 @@ def _require_fa4_gpu_architecture() -> None:
     capability = torch.cuda.get_device_capability()
     if capability < (9, 0):
         pytest.fail(f"Kimi Linear FA4 CUDA tests require SM90 or newer; got SM{capability[0]}{capability[1]}")
+
+
+def _metadata(ids: torch.Tensor) -> dict[str, torch.Tensor | int]:
+    """Build production NEAT metadata and flatten once, as at model entry."""
+    metadata = build_packed_sequence_metadata(ids)
+    indices, boundaries = flatten_packed_sequence_metadata(
+        metadata["packed_token_indices"],
+        metadata["cu_seqlens"],
+        batch_size=ids.shape[0],
+        sequence_length=ids.shape[1],
+    )
+    return {**metadata, "packed_token_indices": indices, "cu_seqlens": boundaries}
 
 
 def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, tolerance: float) -> None:
@@ -67,7 +81,7 @@ def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, tolerance: floa
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("qk_dim,value_dim", [(192, 128), (48, 64)])
+@pytest.mark.parametrize("qk_dim,value_dim", [(192, 128)])
 def test_real_kernel_matches_dense_outputs_and_qkv_backward(dtype, qk_dim, value_dim) -> None:
     torch.manual_seed(74)
     ids = torch.tensor(
@@ -84,7 +98,11 @@ def test_real_kernel_matches_dense_outputs_and_qkv_backward(dtype, qk_dim, value
     mask = build_document_causal_mask(ids, ids, q_global_start=0, dtype=dtype)
     scores = (q @ k.transpose(-1, -2)) * qk_dim**-0.5 + mask
     reference = (scores.softmax(-1, dtype=torch.float32).to(dtype) @ v) * (ids > 0)[:, None, :, None]
-    actual = packed_flash_attention(q, k, v, layout=build_flash_layout(ids), scale=qk_dim**-0.5)
+    _, attention = initialize_attn_module_and_func("fa4", 4, qk_dim, value_dim, qk_dim**-0.5)
+    packed_q, packed_k, packed_v, options = preprocess_args_and_kwargs_for_attn(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), ids, "fa4", **_metadata(ids)
+    )
+    actual = attention(packed_q, packed_k, packed_v, **options).transpose(1, 2)
     tolerance = 0.01 if dtype == torch.bfloat16 else 0.003
     _assert_parity(actual, reference, tolerance)
     grad = torch.randn_like(actual)
@@ -124,7 +142,7 @@ def test_mla_projection_parameter_and_input_gradients(dtype) -> None:
         attention_mask=build_document_causal_mask(ids, ids, q_global_start=0, dtype=dtype),
         packed_context=context,
     )
-    actual = fast(y, packed_context=context, flash_layout=build_flash_layout(ids))
+    actual = fast(y, attention_mask=ids, packed_context=context, **_metadata(ids))
     valid = ids > 0
     tolerance = 0.015 if dtype == torch.bfloat16 else 0.004
     _assert_parity(actual[valid], reference[valid], tolerance)
@@ -175,7 +193,7 @@ def test_checkpointed_backbone_logits_and_parameter_gradients() -> None:
     ids = torch.tensor([[1, 1, 0, 2, 2], [0, 1, 1, 0, 0]], device="cuda", dtype=torch.int32)
     tokens = torch.tensor([[3, 4, 0, 5, 6], [0, 7, 8, 0, 0]], device="cuda")
     expected = eager(input_ids=tokens, attention_mask=ids, padding_mask=ids == 0).logits
-    actual = fast(input_ids=tokens, attention_mask=ids, padding_mask=ids == 0).logits
+    actual = fast(input_ids=tokens, attention_mask=ids, padding_mask=ids == 0, **_metadata(ids)).logits
     valid = ids > 0
     _assert_parity(actual[valid], expected[valid], 0.015)
     grad = torch.randn_like(actual) * valid[..., None]
@@ -185,3 +203,45 @@ def test_checkpointed_backbone_logits_and_parameter_gradients() -> None:
         assert name == other
         assert parameter.grad is not None and reference.grad is not None, name
         _assert_parity(parameter.grad, reference.grad, 0.015)
+
+
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("split", ["train", "validation"])
+@pytest.mark.parametrize("pack_size", [8, 10, 4096])
+def test_recipe_neat_fa4_kda_mla_document_isolation(training: bool, split: str, pack_size: int) -> None:
+    """Exercise the shipped loader, native FA4, and real KDA recurrent boundaries."""
+    from tests.unit_tests.models.kimi_linear.test_recipe_packing import _assert_recipe_document_isolation
+
+    _assert_recipe_document_isolation(
+        device="cuda",
+        use_kda=True,
+        training=training,
+        pack_size=pack_size,
+        split=split,
+        attn="fa4",
+    )
+
+
+def test_deterministic_fa4_backward_is_repeatable() -> None:
+    """The shared native FA4 path must honor deterministic backward on real CUDA."""
+    previous = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        torch.manual_seed(12)
+        q = torch.randn(1, 16, 4, 192, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn_like(q, requires_grad=True)
+        v = torch.randn(1, 16, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        ids = torch.tensor([[1] * 7 + [2] * 9], device="cuda", dtype=torch.int32)
+        _, attention = initialize_attn_module_and_func("fa4", 4, 192, 128, 192**-0.5)
+        grad = torch.randn_like(v)
+        results = []
+        for _ in range(3):
+            pq, pk, pv, options = preprocess_args_and_kwargs_for_attn(q, k, v, ids, "fa4", **_metadata(ids))
+            output = attention(pq, pk, pv, **options)
+            results.append(torch.autograd.grad(output, (q, k, v), grad))
+        for current in results[1:]:
+            for actual, expected in zip(current, results[0]):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=warn_only)

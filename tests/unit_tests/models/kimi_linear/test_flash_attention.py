@@ -14,13 +14,19 @@
 
 """CPU arithmetic checks for packed MLA layouts, outputs and gradients."""
 
+import sys
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    preprocess_args_and_kwargs_for_attn,
+)
 from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata
-from nemo_automodel.components.models.kimi_linear import flash_attention as flash
+from nemo_automodel.components.models.common.packing import flatten_packed_sequence_metadata
 from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
 from nemo_automodel.components.models.kimi_linear.cp import (
     KimiPackedContext,
@@ -30,10 +36,8 @@ from nemo_automodel.components.models.kimi_linear.model import (
     KimiLinear48BForCausalLM,
     KimiMLAAttention,
 )
-from nemo_automodel.shared.import_utils import UnavailableError
 from tests.unit_tests.models.kimi_linear.test_model import (
     _backend_config,
-    _require_fla,
     _tiny_kimi_config,
 )
 
@@ -66,14 +70,14 @@ def _fake_varlen(
     max_seqlen_k: int,
     softmax_scale: float,
     causal: bool,
+    **kwargs,
 ) -> tuple[torch.Tensor, None]:
     """CPU replacement for only the external CUDA kernel.
 
     Args:
         query: Tensor of shape [valid_tokens, heads, qk_dim], grouped in cu_seqlens_q order.
         key: Tensor of shape [valid_tokens, heads, qk_dim].
-        value: Tensor of shape [valid_tokens, heads, value_dim], with qk_dim >= value_dim
-            after the wrapper pads narrower Q/K.
+        value: Tensor of shape [valid_tokens, heads, value_dim].
         cu_seqlens_q: Integer tensor of shape [documents + 1].
         cu_seqlens_k: Integer tensor of shape [documents + 1].
         max_seqlen_q: Maximum document length.
@@ -97,15 +101,66 @@ def _fake_varlen(
 
 @pytest.fixture
 def fake_flash(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(flash, "_load_fa4_varlen", lambda: _fake_varlen)
+    """Replace only the external CUDA kernels; keep shared preprocessing and restore."""
+
+    def dense(q, k, v, **kwargs):
+        lengths = torch.arange(0, (q.shape[0] + 1) * q.shape[1], q.shape[1], dtype=torch.int32)
+        output, _ = _fake_varlen(
+            q.flatten(0, 1),
+            k.flatten(0, 1),
+            v.flatten(0, 1),
+            cu_seqlens_q=lengths,
+            cu_seqlens_k=lengths,
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=q.shape[1],
+            **kwargs,
+        )
+        return output.reshape(*v.shape), None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_attn.cute",
+        SimpleNamespace(
+            flash_attn_func=dense,
+            flash_attn_varlen_func=_fake_varlen,
+        ),
+    )
 
 
-@pytest.mark.parametrize("qk_dim,value_dim", [(16, 8), (8, 16), (192, 128)])
+def _metadata(ids: torch.Tensor) -> dict[str, torch.Tensor | int]:
+    """Use the dataset's production metadata builder and model-entry normalization."""
+    if not ids.bool().any():
+        return {}
+    metadata = build_packed_sequence_metadata(ids)
+    indices, boundaries = flatten_packed_sequence_metadata(
+        metadata["packed_token_indices"],
+        metadata["cu_seqlens"],
+        batch_size=ids.shape[0],
+        sequence_length=ids.shape[1],
+    )
+    return {**metadata, "packed_token_indices": indices, "cu_seqlens": boundaries}
+
+
+def _shared_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """Exercise the same shared attention path as Kimi MLA."""
+    _, attention = initialize_attn_module_and_func("fa4", q.shape[1], q.shape[-1], v.shape[-1], q.shape[-1] ** -0.5)
+    q, k, v, kwargs = preprocess_args_and_kwargs_for_attn(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        ids,
+        "fa4",
+        **_metadata(ids),
+    )
+    return attention(q, k, v, **kwargs).transpose(1, 2)
+
+
+@pytest.mark.parametrize("qk_dim,value_dim", [(16, 8), (192, 128)])
 @pytest.mark.parametrize(
     "ids",
     [
         [[1, 1, 2, 2, 0], [0, 1, 1, 2, 0]],
-        [[2, 1, 2, 0, 1], [1, 0, 1, 0, 0]],
+        [[1, 1, 0, 2, 2], [1, 0, 1, 0, 0]],
         [[1, 1, 1, 1, 1], [0, 0, 0, 0, 0]],
         [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
     ],
@@ -117,7 +172,7 @@ def test_outputs_and_all_qkv_gradients_match_dense_reference(fake_flash, ids, qk
     k = torch.randn_like(q, requires_grad=True)
     v = torch.randn(2, 2, 5, value_dim, requires_grad=True)
     expected = _reference(q, k, v, ids=ids)
-    actual = flash.packed_flash_attention(q, k, v, layout=flash.build_flash_layout(ids), scale=qk_dim**-0.5)
+    actual = _shared_attention(q, k, v, ids)
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
     grad = torch.randn_like(actual)
     expected_grads = torch.autograd.grad(expected, (q, k, v), grad, retain_graph=True)
@@ -128,9 +183,7 @@ def test_outputs_and_all_qkv_gradients_match_dense_reference(fake_flash, ids, qk
 
 def test_all_padding_fp16_outputs_and_qkv_gradients_are_finite_zeros(fake_flash) -> None:
     q, k, v = (torch.ones(1, 1, 1024, 64, dtype=torch.float16, requires_grad=True) for _ in range(3))
-    layout = flash.build_flash_layout(torch.zeros(1, 1024, dtype=torch.int32))
-
-    actual = flash.packed_flash_attention(q, k, v, layout=layout, scale=64**-0.5)
+    actual = _shared_attention(q, k, v, torch.zeros(1, 1024, dtype=torch.int32))
 
     assert torch.isfinite(actual).all()
     assert torch.count_nonzero(actual) == 0
@@ -181,7 +234,7 @@ def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash,
         if mask_kind == "padding_only"
         else ({"attention_mask": ids} if mask_kind != "none" else {})
     )
-    actual = fast(input_ids=tokens, **options).logits
+    actual = fast(input_ids=tokens, **options, **(_metadata(ids) if mask_kind == "indexed" else {})).logits
     valid = ids > 0
     torch.testing.assert_close(actual[valid], expected[valid], atol=1e-6, rtol=1e-5)
     expected[valid].square().sum().backward()
@@ -191,13 +244,6 @@ def test_backbone_outputs_and_parameter_gradients_without_dense_mask(fake_flash,
         assert (left.grad is None) == (right.grad is None), name
         if left.grad is not None:
             torch.testing.assert_close(right.grad, left.grad, atol=1e-6, rtol=1e-4, msg=name)
-
-
-def test_layer_requires_a_prepared_flash_layout() -> None:
-    config = _tiny_kimi_config()
-    layer = KimiMLAAttention(config, 0, backend=replace(_backend_config(), attn="fa4"))
-    with pytest.raises(ValueError, match="requires flash_layout"):
-        layer(torch.randn(1, 4, config.hidden_size))
 
 
 def test_cp_keeps_its_existing_attention_path(fake_flash, monkeypatch) -> None:
@@ -225,23 +271,13 @@ def test_cp_keeps_its_existing_attention_path(fake_flash, monkeypatch) -> None:
     assert calls == [context]
 
 
-def test_missing_optional_dependency_and_explicit_dense_mask(monkeypatch) -> None:
-    flash._load_fa4_varlen.cache_clear()
-    monkeypatch.setattr(flash, "safe_import_from", lambda *args, **kwargs: (False, None))
-    q = torch.randn(1, 1, 2, 8)
-    layout = flash.build_flash_layout(torch.ones(1, 2, dtype=torch.int32))
-    with pytest.raises(UnavailableError, match="flash_attn.cute"):
-        flash.packed_flash_attention(q, q, q, layout=layout, scale=8**-0.5)
-    config = _tiny_kimi_config()
-    layer = KimiMLAAttention(config, 0, backend=replace(_backend_config(), attn="fa4"))
-    with pytest.raises(ValueError, match="additive attention_mask"):
-        layer(
-            torch.randn(1, 2, config.hidden_size),
-            attention_mask=torch.zeros(1, 1, 2, 2),
-        )
+def test_missing_optional_dependency(monkeypatch) -> None:
+    monkeypatch.setattr("nemo_automodel.components.attention.utils.safe_import", lambda *args, **kwargs: (False, None))
+    with pytest.raises(ImportError, match="flash_attn.cute"):
+        KimiMLAAttention(_tiny_kimi_config(), 0, backend=replace(_backend_config(), attn="fa4"))
 
 
-def test_checkpoint_config_does_not_persist_the_execution_backend(monkeypatch) -> None:
+def test_checkpoint_config_does_not_persist_the_execution_backend(fake_flash, monkeypatch) -> None:
     config = _tiny_kimi_config()
     fast = KimiLinear48BForCausalLM(config, backend=replace(_backend_config(), attn="fa4"))
     fast.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
@@ -254,67 +290,11 @@ def test_checkpoint_config_does_not_persist_the_execution_backend(monkeypatch) -
     def reject_flash():
         raise AssertionError("A restored checkpoint must run without the optional FA4 kernel")
 
-    monkeypatch.setattr(flash, "_load_fa4_varlen", reject_flash)
+    monkeypatch.setattr("nemo_automodel.components.attention.utils.safe_import", reject_flash)
     assert torch.isfinite(restored(input_ids=torch.tensor([[3, 4]])).logits).all()
 
 
-@pytest.mark.parametrize("use_kda", [False, True])
-def test_thd_document_spans_respect_physical_padding(fake_flash, monkeypatch, use_kda) -> None:
-    if use_kda:
-        _require_fla()
-    torch.manual_seed(20)
-    config = _tiny_kimi_config(use_kda=use_kda)
-    reference = KimiLinear48BForCausalLM(config, backend=_backend_config())
-    reference.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
-    fast = KimiLinear48BForCausalLM(config, backend=replace(_backend_config(), attn="fa4"))
-    fast.load_state_dict(reference.state_dict(), strict=True)
-    tokens = torch.tensor([[3, 4, 0, 5, 0, 0]])
-    ids = torch.tensor([[1, 1, 0, 2, 0, 0]], dtype=torch.int32)
-    reference_metadata = build_packed_sequence_metadata(ids) if use_kda else {}
-    if use_kda:
-        # Isolate packing/gradient behavior from the unchanged GPU-only FLA core.
-        def recurrent_reference(hidden_states: torch.Tensor, *, cu_seqlens: torch.Tensor) -> torch.Tensor:
-            """Compute segmented prefix sums as a deterministic recurrent oracle.
-
-            Args:
-                hidden_states: Tensor of shape [1, valid_tokens, hidden].
-                cu_seqlens: Logical boundaries of shape [documents + 1].
-
-            Returns:
-                Prefix sums of shape [1, valid_tokens, hidden], reset at each document.
-            """
-            assert hidden_states.shape[1] == 3
-            assert cu_seqlens.tolist() == [0, 2, 3]
-            cuts = cu_seqlens.tolist()
-            return torch.cat([hidden_states[:, start:end].cumsum(1) for start, end in zip(cuts, cuts[1:])], dim=1)
-
-        for model in (reference, fast):
-            for layer in model.model.layers.values():
-                if layer.is_linear_attn:
-                    monkeypatch.setattr(layer.self_attn, "_kda_core", recurrent_reference)
-    expected = reference(input_ids=tokens, attention_mask=ids, **reference_metadata).logits
-    physical_metadata = {"packed_token_indices": torch.tensor([0, 1, 3])} if use_kda else {}
-    actual = fast(
-        input_ids=tokens,
-        padding_mask=ids == 0,
-        qkv_format="thd",
-        position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
-        cu_seqlens=torch.tensor([[0, 2, 3]], dtype=torch.int32),
-        cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
-        **physical_metadata,
-    ).logits
-    valid = ids > 0
-    torch.testing.assert_close(actual[valid], expected[valid], atol=1e-6, rtol=1e-5)
-    expected[valid].square().sum().backward()
-    actual[valid].square().sum().backward()
-    for (name, a), (other, b) in zip(fast.named_parameters(), reference.named_parameters()):
-        assert name == other
-        assert (a.grad is None) == (b.grad is None), name
-        if b.grad is not None:
-            torch.testing.assert_close(a.grad, b.grad, atol=1e-6, rtol=1e-4, msg=name)
-
-
-def test_backbone_rejects_dense_mask_in_flash_mode() -> None:
+def test_backbone_rejects_dense_mask_in_flash_mode(fake_flash) -> None:
     config = _tiny_kimi_config()
     model = KimiLinear48BForCausalLM(config, backend=replace(_backend_config(), attn="fa4"))
     with pytest.raises(ValueError, match="binary/document attention_mask"):
@@ -322,77 +302,61 @@ def test_backbone_rejects_dense_mask_in_flash_mode() -> None:
 
 
 def test_fa4_rejects_attention_dropout(fake_flash) -> None:
-    q = torch.randn(1, 1, 2, 8)
-    layout = flash.build_flash_layout(torch.ones(1, 2, dtype=torch.int32))
+    config = _tiny_kimi_config()
+    config.attention_dropout = 0.1
+    layer = KimiMLAAttention(config, 0, backend=replace(_backend_config(), attn="fa4"))
     with pytest.raises(ValueError, match="attention_dropout=0"):
-        flash.packed_flash_attention(q, q, q, layout=layout, scale=8**-0.5, dropout_p=0.1)
+        layer(torch.randn(1, 2, config.hidden_size))
 
 
-def test_nonempty_fa4_rejects_deterministic_algorithms(fake_flash) -> None:
+@pytest.mark.parametrize("warn_only", [False, True])
+def test_shared_fa4_forwards_deterministic_mode(fake_flash, monkeypatch, warn_only) -> None:
+    seen = []
+
+    def kernel(*args, **kwargs):
+        seen.append(kwargs["deterministic"])
+        return _fake_varlen(*args, **kwargs)
+
+    monkeypatch.setattr(sys.modules["flash_attn.cute"], "flash_attn_varlen_func", kernel)
     previous = torch.are_deterministic_algorithms_enabled()
-    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    previous_warn = torch.is_deterministic_algorithms_warn_only_enabled()
     try:
-        torch.use_deterministic_algorithms(True)
-        q = torch.ones(1, 1, 2, 8, requires_grad=True)
-        layout = flash.build_flash_layout(torch.ones(1, 2, dtype=torch.int32))
-        with pytest.raises(RuntimeError, match="nondeterministic attention backward"):
-            flash.packed_flash_attention(q, q, q, layout=layout, scale=8**-0.5)
-        empty = flash.packed_flash_attention(
-            q, q, q, layout=flash.build_flash_layout(torch.zeros(1, 2, dtype=torch.int32)), scale=8**-0.5
-        )
-        assert torch.isfinite(empty).all() and torch.count_nonzero(empty) == 0
-        grad = torch.autograd.grad(empty, q, torch.randn_like(empty))[0]
-        assert torch.count_nonzero(grad) == 0
+        q = torch.randn(1, 1, 3, 16, requires_grad=True)
+        ids = torch.ones(1, 3, dtype=torch.int32)
+        for enabled in (False, True):
+            torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+            _shared_attention(q, q, q, ids).sum().backward()
+        assert seen == [False, True]
     finally:
-        torch.use_deterministic_algorithms(previous, warn_only=warn_only)
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn)
 
 
-def test_hybrid_physical_thd_padding_requires_unpadded_indices(fake_flash) -> None:
-    _require_fla()
-    model = KimiLinear48BForCausalLM(_tiny_kimi_config(use_kda=True), backend=replace(_backend_config(), attn="fa4"))
-    with pytest.raises(ValueError, match="requires logical cu_seqlens and packed_token_indices"):
-        model(
-            input_ids=torch.tensor([[3, 4, 0, 5, 0, 0]]),
-            padding_mask=torch.tensor([[False, False, True, False, True, True]]),
-            qkv_format="thd",
-            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
-            cu_seqlens=torch.tensor([[0, 2, 3]], dtype=torch.int32),
-            cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
-        )
-
-
-def test_hybrid_backbone_requires_logical_boundaries_with_physical_thd_padding(fake_flash) -> None:
-    _require_fla()
-    model = KimiLinear48BForCausalLM(_tiny_kimi_config(use_kda=True), backend=replace(_backend_config(), attn="fa4"))
-    with pytest.raises(ValueError, match="requires logical cu_seqlens and packed_token_indices"):
-        model.model(
-            input_ids=torch.tensor([[3, 4, 0, 5, 0, 0]]),
-            padding_mask=torch.tensor([[False, False, True, False, True, True]]),
-            cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
-            packed_token_indices=torch.tensor([0, 1, 3]),
-        )
-
-
-@pytest.mark.parametrize("use_kda", [False, True], ids=["mla", "hybrid"])
-def test_physical_thd_padding_requires_a_padding_mask(fake_flash, use_kda) -> None:
-    if use_kda:
-        _require_fla()
-    model = KimiLinear48BForCausalLM(_tiny_kimi_config(use_kda=use_kda), backend=replace(_backend_config(), attn="fa4"))
-    with pytest.raises(ValueError, match="requires an explicit padding_mask"):
-        model(
-            input_ids=torch.tensor([[3, 4, 0, 5, 0, 0]]),
-            qkv_format="thd",
-            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
-            cu_seqlens=torch.tensor([[0, 2, 3]], dtype=torch.int32),
-            cu_seqlens_padded=torch.tensor([[0, 3, 6]], dtype=torch.int32),
-            packed_token_indices=torch.tensor([0, 1, 3]),
-        )
-
-
-def test_flat_thd_boundaries_reject_a_mismatched_batch_layout(fake_flash) -> None:
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"qkv_format": "thd"},
+        {"cu_seqlens_padded": torch.tensor([0, 2, 4], dtype=torch.int32)},
+    ],
+)
+def test_shared_fa4_rejects_physical_thd(fake_flash, metadata) -> None:
     model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=replace(_backend_config(), attn="fa4"))
-    with pytest.raises(ValueError, match="document map must match"):
-        model(
-            input_ids=torch.tensor([[3, 4, 5, 6], [7, 8, 9, 10]]),
-            cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
-        )
+    with pytest.raises(ValueError, match="Use NEAT packing"):
+        model.model(input_ids=torch.tensor([[3, 4, 5, 6]]), **metadata)
+
+
+def test_indexed_fa4_requires_dataset_metadata(fake_flash) -> None:
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=replace(_backend_config(), attn="fa4"))
+    with pytest.raises(ValueError, match="dataset-provided"):
+        model(input_ids=torch.tensor([[3, 4, 5, 6]]), attention_mask=torch.tensor([[1, 1, 2, 2]]))
+
+
+@pytest.mark.parametrize("split", ["train", "validation"])
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("pack_size", [8, 10])
+def test_recipe_neat_shared_fa4_document_isolation(fake_flash, split: str, training: bool, pack_size: int) -> None:
+    """Exercise dataset metadata, the native model-entry hook, and the shared FA4 path."""
+    from tests.unit_tests.models.kimi_linear.test_recipe_packing import _assert_recipe_document_isolation
+
+    _assert_recipe_document_isolation(
+        device="cpu", use_kda=False, training=training, pack_size=pack_size, split=split, attn="fa4"
+    )

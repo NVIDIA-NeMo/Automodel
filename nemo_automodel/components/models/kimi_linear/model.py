@@ -27,6 +27,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    preprocess_args_and_kwargs_for_attn,
+)
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -53,11 +57,6 @@ from nemo_automodel.components.models.kimi_linear.cp import (
     doc_ids_from_cu_seqlens,
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
-)
-from nemo_automodel.components.models.kimi_linear.flash_attention import (
-    MLAFlashLayout,
-    build_flash_layout,
-    packed_flash_attention,
 )
 from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinear48BStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -304,6 +303,8 @@ class KimiMLAAttention(nn.Module):
             raise ValueError("Kimi Linear Automodel support currently expects q_lora_rank=None.")
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.kv_lora_rank = config.kv_lora_rank
+        if config.v_head_dim is None:
+            raise ValueError("Kimi MLA requires v_head_dim in its architecture config")
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -328,6 +329,14 @@ class KimiMLAAttention(nn.Module):
         )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False, dtype=dtype)
         self._cp_mesh = None
+        if self.backend.attn == "fa4":
+            self.attn_module, self.attn_func = initialize_attn_module_and_func(
+                attn_impl="fa4",
+                num_attention_heads=self.num_heads,
+                num_qk_channels=self.q_head_dim,
+                num_v_channels=self.v_head_dim,
+                softmax_scale=self.scaling,
+            )
 
     def setup_cp_attention(self, cp_mesh) -> None:
         """Attach the context-parallel mesh used to gather full-sequence keys and values.
@@ -344,8 +353,6 @@ class KimiMLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         packed_context: "KimiPackedContext | None" = None,
-        *,
-        flash_layout: MLAFlashLayout | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Run MLA full attention.
@@ -354,17 +361,15 @@ class KimiMLAAttention(nn.Module):
             hidden_states: Tensor of shape [batch, sequence, hidden]; the sequence axis
                 holds this rank's contiguous shard under context parallelism.
             attention_mask: Optional additive tensor of shape [batch, 1, sequence, sequence]
-                for eager attention. Must be None for FA4, which consumes flash_layout.
+                for eager attention; FA4 accepts a binary/document mask [batch, sequence].
             packed_context: Optional document layout of the batch, required under
                 context parallelism.
-            flash_layout: Document-major metadata required by non-CP FA4 and prepared
-                outside checkpointed layers; tensor layouts are documented by MLAFlashLayout.
-            **kwargs: Extra attention options accepted for HF compatibility.
+            **kwargs: Flattened NEAT cu_seqlens, packed_token_indices, and max_seqlen
+                for the shared native FA4 path.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
         """
-        del kwargs
         if packed_context is not None and packed_context.cp_enabled:
             return self._forward_with_cp(hidden_states, packed_context)
         batch_size, seq_length = hidden_states.shape[:-1]
@@ -389,20 +394,17 @@ class KimiMLAAttention(nn.Module):
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
         if self.backend.attn == "fa4":
-            if attention_mask is not None:
-                raise ValueError("backend.attn='fa4' consumes document metadata, not an additive attention_mask")
-            if flash_layout is None:
-                raise ValueError(
-                    "backend.attn='fa4' requires flash_layout prepared by the backbone or build_flash_layout"
-                )
-            attn_output = packed_flash_attention(
-                query_states,
-                key_states,
-                value_states,
-                layout=flash_layout,
-                scale=self.scaling,
-                dropout_p=self.attention_dropout if self.training else 0.0,
+            if self.training and self.attention_dropout != 0.0:
+                raise ValueError("Kimi Linear FA4 requires attention_dropout=0; use eager for attention dropout")
+            q, k, v, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+                query_states.transpose(1, 2),
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+                attention_mask,
+                "fa4",
+                **kwargs,
             )
+            attn_output = self.attn_func(q, k, v, **attn_kwargs).transpose(1, 2)
         else:
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
             if attention_mask is not None:
@@ -864,8 +866,8 @@ class KimiDecoderLayer(nn.Module):
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden].
             attention_mask: KDA layers receive a binary mask [batch, sequence]; MLA layers receive an additive
-                causal mask [batch, 1, sequence, sequence], or None with a prepared
-                flash_layout for FA4.
+                causal mask [batch, 1, sequence, sequence] for eager, or a binary/document
+                mask [batch, sequence] with NEAT metadata for FA4.
             padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
             **attn_kwargs: Extra attention kwargs forwarded to KDA/MLA.
 
@@ -1117,16 +1119,9 @@ class KimiLinear48BModel(nn.Module):
                 positions and -1 padding, or [tokens] indexing flattened batch
                 and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
                 with row-local boundaries and -1 padding, or [documents + 1] for
-                flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
-                or [documents + 1] for THD inputs and gives physical boundaries
-                including per-document padding, rather than logical token counts.
-                Physical boundaries apply to FA4 MLA; when they differ from logical
-                boundaries, an explicit boolean ``padding_mask`` is required.
-                Hybrid models require logical ``cu_seqlens`` whenever physical
-                boundaries are supplied. With internal padding, also provide flat
-                ``packed_token_indices`` selecting valid tokens in physical order,
-                so KDA can gather its unpadded recurrent stream.
-                ``max_seqlen`` is an integer document length.
+                flattened inputs. ``max_seqlen`` is an integer document length.
+                FA4 consumes NEAT BSHD metadata; pre-packed THD and physical
+                ``cu_seqlens_padded`` are unsupported.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
@@ -1151,52 +1146,41 @@ class KimiLinear48BModel(nn.Module):
                 f"backend.attn='fa4' requires a binary/document attention_mask [batch, sequence]; "
                 f"got {tuple(attention_mask.shape)}"
             )
-        physical_boundaries = attn_kwargs.get("cu_seqlens_padded") if use_flash else None
         packed_context = kimi_packed_context or _packed_context_from_inputs(
             inputs_embeds,
             attention_mask=packed_seq_ids if packed_seq_ids is not None else attention_mask,
-            cu_seqlens=physical_boundaries if physical_boundaries is not None else attn_kwargs.get("cu_seqlens"),
+            cu_seqlens=None if use_flash else attn_kwargs.get("cu_seqlens"),
         )
-        if physical_boundaries is not None and not (packed_context is not None and packed_context.cp_enabled):
-            logical_boundaries = attn_kwargs.get("cu_seqlens")
-            has_internal_padding = logical_boundaries is not None and not torch.equal(
-                physical_boundaries.reshape(-1), logical_boundaries.reshape(-1)
-            )
-            if has_internal_padding and padding_mask is None:
-                raise ValueError("Kimi Linear FA4 physical THD padding requires an explicit padding_mask")
-            if any(layer.is_linear_attn for layer in self.layers.values()) and (
-                logical_boundaries is None or (has_internal_padding and attn_kwargs.get("packed_token_indices") is None)
-            ):
+        if use_flash and not (packed_context is not None and packed_context.cp_enabled):
+            if attn_kwargs.get("qkv_format") == "thd" or attn_kwargs.get("cu_seqlens_padded") is not None:
                 raise ValueError(
-                    "Kimi Linear physical THD padding with KDA requires logical cu_seqlens "
-                    "and packed_token_indices for the unpadded tokens"
+                    "Kimi Linear FA4 requires BSHD inputs; pre-packed THD is unsupported. Use NEAT packing."
                 )
-        if use_flash and packed_context is None and padding_mask is not None:
-            packed_context = KimiPackedContext(doc_ids=(~padding_mask).to(torch.int32))
+            indices, boundaries = attn_kwargs.get("packed_token_indices"), attn_kwargs.get("cu_seqlens")
+            if indices is not None or boundaries is not None:
+                if indices is None or boundaries is None:
+                    raise ValueError("Packed FA4 inputs require packed_token_indices and cu_seqlens together")
+                # Configured recipes already normalize in the native FA4 entry hook.
+                # Direct model calls normalize batch-major metadata here as well.
+                if indices.ndim != 1 or boundaries.ndim != 1:
+                    indices, boundaries = flatten_packed_sequence_metadata(
+                        indices, boundaries, batch_size=inputs_embeds.shape[0], sequence_length=inputs_embeds.shape[1]
+                    )
+                attn_kwargs = {**attn_kwargs, "packed_token_indices": indices, "cu_seqlens": boundaries}
         # Packed attention consumes document metadata, but MoE routing still
         # needs a separate mask for padding tokens, including in full-attention layers.
         if padding_mask is None and packed_context is not None:
             padding_mask = packed_context.local_doc_ids == 0
         linear_attn_mask = None if has_packed_inputs else self._update_linear_attn_mask(attention_mask, cache_position)
-        flash_layout = None
-        if use_flash and not (packed_context is not None and packed_context.cp_enabled):
-            if packed_context is not None:
-                doc_ids = packed_context.doc_ids
-            else:
-                doc_ids = torch.ones(inputs_embeds.shape[:2], dtype=torch.int32, device=inputs_embeds.device)
-            if doc_ids.shape != inputs_embeds.shape[:2]:
-                raise ValueError(
-                    f"Kimi Linear FA4 document map must match [batch, sequence] {tuple(inputs_embeds.shape[:2])}; "
-                    f"got {tuple(doc_ids.shape)}"
-                )
-            if padding_mask is not None:
-                doc_ids = doc_ids.masked_fill(padding_mask, 0)
-            flash_layout = build_flash_layout(doc_ids)
         causal_mask = (
             None
             if use_flash or (packed_context is not None and packed_context.cp_enabled)
             else _make_causal_mask(inputs_embeds, packed_context, dtype=inputs_embeds.dtype)
         )
+        if use_flash:
+            causal_mask = packed_seq_ids if packed_seq_ids is not None else attention_mask
+            if causal_mask is None and padding_mask is not None:
+                causal_mask = ~padding_mask
         hidden_states = inputs_embeds
 
         for decoder_layer in self.layers.values():
@@ -1209,7 +1193,6 @@ class KimiLinear48BModel(nn.Module):
                 attention_mask=layer_mask,
                 padding_mask=layer_padding_mask,
                 packed_context=packed_context,
-                flash_layout=flash_layout,
                 **attn_kwargs,
             )
 
@@ -1245,6 +1228,7 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
     # Kimi Linear owns context parallelism end to end: it shards the batch itself
     # (contiguous slices, as FLA's CP kernels require) and each layer type carries
     # its own transport, so CP does not depend on the attention backend.
+    _uses_native_fa4 = True
     requires_packed_sequence_metadata = True
     packed_mask_type = "document_ids"
     _owns_cp_attention = True
@@ -1354,14 +1338,9 @@ class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
                 positions and -1 padding, or [tokens] indexing flattened batch
                 and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
                 with row-local boundaries and -1 padding, or [documents + 1] for
-                flattened/THD inputs. ``cu_seqlens_padded`` has shape [1, documents + 1]
-                or [documents + 1] and describes physical THD boundaries for FA4 MLA.
-                An explicit boolean ``padding_mask`` is required when physical and
-                logical boundaries differ.
-                Hybrid models require logical ``cu_seqlens`` whenever physical
-                boundaries are supplied. With internal padding, also provide flat
-                ``packed_token_indices`` selecting valid physical positions
-                for KDA's unpadded stream. ``max_seqlen`` is an integer document length.
+                flattened inputs. ``max_seqlen`` is an integer document length.
+                FA4 consumes NEAT BSHD metadata; pre-packed THD and physical
+                ``cu_seqlens_padded`` are unsupported.
 
         Returns:
             Causal LM output whose logits have shape [batch, sequence, vocab] unless ``logits_to_keep`` trims sequence.

@@ -58,8 +58,8 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     # Non-CP MLA requires CUDA fp16/bf16 and INSTALL_FA4=true in the container.
     # FA4 requires attention_dropout=0; use eager for attention dropout.
-    # This raw-THD recipe retains whole-pack causal attention at CP=1.
-    # Document-ID masks or converted THD metadata isolate documents; dense masks are unsupported.
+    # NEAT metadata isolates documents in both KDA and shared native FA4 MLA.
+    # Pre-packed THD and dense attention masks are unsupported by FA4.
     # CP retains compressed-KV gather and FlexAttention.
     attn: fa4
     linear: torch
