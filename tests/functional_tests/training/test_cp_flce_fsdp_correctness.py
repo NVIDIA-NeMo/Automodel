@@ -18,6 +18,7 @@ import argparse
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 import pytest
@@ -269,16 +270,18 @@ def _assert_globally_unused_param_keeps_none_grad(device: torch.device) -> None:
     optimizer.step()
     optimizer.zero_grad()
 
-    conditional_before = model.conditional.weight.to_local().clone()
-    output_before = model.output.weight.to_local().clone()
+    # Compare full tensors: ``output.weight`` is [1, 8], so on two ranks one local shard is empty and
+    # a local ``torch.equal`` holds vacuously there, whatever the optimizer did.
+    conditional_before = model.conditional.weight.full_tensor().clone()
+    output_before = model.output.weight.full_tensor().clone()
     conditional_step = optimizer.state[model.conditional.weight]["step"].clone()
     _run_window(2, [(), ()])
     assert model.conditional.weight.grad is None
     optimizer.step()
     optimizer.zero_grad()
-    assert torch.equal(model.conditional.weight.to_local(), conditional_before)
+    assert torch.equal(model.conditional.weight.full_tensor(), conditional_before)
     assert torch.equal(optimizer.state[model.conditional.weight]["step"], conditional_step)
-    assert not torch.equal(model.output.weight.to_local(), output_before)
+    assert not torch.equal(model.output.weight.full_tensor(), output_before)
 
 
 def _run_worker() -> None:
@@ -301,8 +304,13 @@ def _run_worker() -> None:
 
         if dist.get_rank() == 0:
             print(_RESULT_PREFIX + "PASS", flush=True)
-    finally:
-        dist.destroy_process_group()
+    except Exception:
+        # Surface the failure and exit at once: destroy_process_group would block behind the peer
+        # rank's pending collective and the parent would only ever see a timeout.
+        traceback.print_exc()
+        sys.stdout.flush()
+        os._exit(1)
+    dist.destroy_process_group()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least 2 CUDA devices")
@@ -318,19 +326,24 @@ def test_cp_flce_and_empty_rank_fsdp_two_rank_gradient_parity() -> None:
         "--worker",
     ]
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "0,1"
+    visible = env.get("CUDA_VISIBLE_DEVICES")
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(visible.split(",")[:2]) if visible else "0,1"
     repo_root = str(Path(__file__).resolve().parents[3])
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
-    completed = subprocess.run(
-        command,
-        cwd=repo_root,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=180,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=repo_root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=600,  # a cold cache compiles the fused-CE kernels first
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        output = (error.stdout or b"").decode(errors="replace")
+        pytest.fail(f"worker timed out after {error.timeout}s:\n{output}")
     print(completed.stdout)
     assert completed.returncode == 0, completed.stdout
     assert _RESULT_PREFIX + "PASS" in completed.stdout
