@@ -667,6 +667,54 @@ class TestTrailingPadAbsorption:
         assert int(result["max_seqlen"][1].item()) == 576
 
 
+def test_process_input_for_thd_preserves_label_alignment_for_masked_ce():
+    """THD flattening preserves token/label order and yields the same SFT loss."""
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    labels = torch.tensor(
+        [
+            [-100, 2, 3, -100, 5, 6, 7, -100],
+            [-100, 1, 2, 3, 4, 5, 6, 7],
+        ],
+        dtype=torch.long,
+    )
+    batch = {
+        "input_ids": torch.arange(16).view(2, 8),
+        "labels": labels.clone(),
+        "position_ids": torch.tensor(
+            [
+                [0, 1, 2, 0, 1, 2, 3, 0],
+                [0, 1, 2, 3, 4, 5, 6, 7],
+            ]
+        ),
+        "seq_lens": torch.tensor([[3, 4], [8, -1000]]),
+        "seq_lens_padded": torch.tensor([[3, 5], [8, -1000]]),
+        "qkv_format": "thd",
+    }
+
+    out = process_input_for_thd(batch)
+
+    assert out["input_ids"].shape == (16,)
+    assert out["labels"].shape == (16,)
+    assert torch.equal(out["labels"], labels.reshape(-1))
+    assert out["qkv_format"] == "thd"
+    assert int((out["labels"] != -100).sum()) == 12
+
+    torch.manual_seed(1234)
+    logits_bshd = torch.randn(2, 8, 11, requires_grad=True)
+    logits_thd = logits_bshd.detach().reshape(1, 16, 11).clone().requires_grad_(True)
+    loss_fn = MaskedCrossEntropy(reduction="sum")
+
+    reference = loss_fn(logits_bshd, labels)
+    packed = loss_fn(logits_thd, out["labels"])
+    torch.testing.assert_close(packed, reference)
+
+    reference.backward()
+    packed.backward()
+    torch.testing.assert_close(logits_thd.grad.reshape(2, 8, 11), logits_bshd.grad)
+
+
 def test_process_input_for_thd_mrope_3d_shape():
     """3D mRoPE position_ids [n_rope, batch, seq] flatten to [n_rope, 1, batch*seq]."""
     import torch
