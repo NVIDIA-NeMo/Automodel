@@ -7,8 +7,11 @@ Draft for humans and coding agents. Existing repository policies remain authorit
 - **Separate concerns.** Give each function and class one cohesive responsibility.
 - **Keep functions small.** Extract cohesive helpers when control flow becomes hard to follow.
 - **Keep argument lists short.** Pass only necessary inputs; group related settings in typed configs.
-- **Avoid function pointers.** Prefer direct calls or typed object methods over callback chains;
-  keep framework-required callbacks explicit and typed.
+- **Avoid function pointers and ad-hoc callback dispatch.** In Python, this includes
+  callback arguments such as `step_fn`, stored function references, and tables of
+  callables used to select behavior. Prefer direct calls or named methods on a typed
+  interface so behavior and ownership are easy to trace. When a framework requires
+  callbacks, give them explicit typed signatures and a clear lifecycle.
 - **Avoid globals.** Keep mutable state with its owner and pass dependencies explicitly.
 - **Keep APIs small.** Reuse existing components and avoid speculative abstractions.
 - **Respect ownership.** Keep model-specific logic in its model package and recipes as thin orchestration.
