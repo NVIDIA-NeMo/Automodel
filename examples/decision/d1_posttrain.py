@@ -30,12 +30,14 @@ import json
 import logging
 import math
 import random
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
+from transformers import __version__ as transformers_version
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from nemo_automodel import NeMoAutoModelForImageTextToText
@@ -141,6 +143,7 @@ class D1PostTraining:
             },
             "gpu": torch.cuda.get_device_name(),
             "torch": torch.__version__,
+            "transformers": transformers_version,
             "cuda": torch.version.cuda,
         }
         source_root = Path(inspect.getfile(type(self.model))).parent
@@ -159,6 +162,8 @@ class D1PostTraining:
                 "model",
                 "revision",
                 "backbone_dtype",
+                "torch",
+                "transformers",
                 "data_sha256",
                 "native_source_sha256",
                 "recipe_source_sha256",
@@ -185,7 +190,15 @@ class D1PostTraining:
             feature = self.readout.extract_features(ids, valid)
         if not torch.isfinite(feature).all():
             raise ValueError("Nonfinite frozen native features")
-        torch.save(feature.detach().cpu(), path)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as stream:
+                temporary = Path(stream.name)
+                torch.save(feature.detach().cpu(), stream)
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         return feature
 
     def logits(self, split: str, indices: list[int], head: torch.nn.Module | None = None) -> list[torch.Tensor]:
@@ -427,6 +440,8 @@ class D1PostTraining:
                 "revision",
                 "backbone_dtype",
                 "readout_dtype",
+                "torch",
+                "transformers",
                 "data_sha256",
                 "training_scope",
             ):

@@ -430,3 +430,33 @@ def test_malformed_criteria_fail_before_model_specific_encoding(kind, criteria):
     record = {"id": "invalid", "state": "text", "questions": {"pick": {"type": kind, "criteria": criteria}}}
     with pytest.raises(ValueError, match="criteria"):
         schema.validate_record(record)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"probabilities": []},
+        {"probabilities": [1.0]},
+        {"probabilities": [float("nan"), 0.5]},
+        {"probabilities": [-0.1, 1.1]},
+        {"probabilities": [0.2, 0.3]},
+        {"label": 2},
+        {"rewards": [1.0]},
+        {"rewards": [1.0, float("inf")]},
+    ],
+)
+def test_metrics_reject_misaligned_or_invalid_decisions(overrides):
+    evaluator = metrics.DecisionEvaluator()
+    inputs = dict(record_id="r", question_id="q", option_ids=["a", "b"], probabilities=[0.8, 0.2], label=0)
+    inputs.update(overrides)
+    with pytest.raises(ValueError):
+        evaluator.add(**inputs)
+    assert evaluator.predictions() == []
+
+
+def test_metrics_reject_truncated_batch():
+    with pytest.raises(ValueError):
+        metrics.DecisionEvaluator().add_batch([{"id": "r"}], [], [])
+    target = schema.QuestionTarget("q", 0, ("a", "b"), 0, None)
+    with pytest.raises(ValueError):
+        metrics.DecisionEvaluator().add_batch([{"id": "r"}], [[target]], [[]])

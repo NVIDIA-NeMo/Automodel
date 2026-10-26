@@ -33,6 +33,8 @@ class DecisionEvaluator:
 
     def __init__(self, slice_keys: Sequence[str] = (), num_bins: int = 10) -> None:
         """Set metadata slices and the number of confidence calibration bins."""
+        if num_bins < 1:
+            raise ValueError("num_bins must be positive")
         self.slice_keys = tuple(slice_keys)
         self.num_bins = num_bins
         self.rows: list[dict[str, Any]] = []
@@ -59,6 +61,14 @@ class DecisionEvaluator:
             meta: Optional record metadata used to group evaluation slices.
         """
         probs = [float(p) for p in probabilities]
+        if not probs or len(probs) != len(option_ids):
+            raise ValueError("probabilities must have one value per nonempty option_ids")
+        if label >= len(probs):
+            raise ValueError("label must be a valid option index or negative for unlabelled data")
+        if any(not math.isfinite(p) or p < 0 for p in probs) or not math.isclose(sum(probs), 1.0, abs_tol=1e-5):
+            raise ValueError("probabilities must be finite, nonnegative and sum to one")
+        if rewards is not None and (len(rewards) != len(probs) or any(not math.isfinite(r) for r in rewards)):
+            raise ValueError("rewards must have one finite value per option")
         pred = max(range(len(probs)), key=probs.__getitem__)
         self.rows.append(
             {
@@ -80,8 +90,8 @@ class DecisionEvaluator:
         probs_per_record: Sequence[Sequence[Sequence[float]]],
     ) -> None:
         """Add a batch: ``targets_per_record[i]`` are :class:`QuestionTarget`, ``probs_per_record[i][j]`` a 1-D list."""
-        for record, targets, probs in zip(records, targets_per_record, probs_per_record):
-            for target, p in zip(targets, probs):
+        for record, targets, probs in zip(records, targets_per_record, probs_per_record, strict=True):
+            for target, p in zip(targets, probs, strict=True):
                 self.add(
                     str(record.get("id")),
                     target.question_id,

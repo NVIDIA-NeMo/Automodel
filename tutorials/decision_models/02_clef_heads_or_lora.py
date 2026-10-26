@@ -138,12 +138,10 @@ if RUN_TRAINING:
 # %% [markdown]
 # ## Optional local merged export
 #
-# Native stages retain the selected head and any adapters for reload. A LoRA stage can also produce a merged Hugging Face model plus joint schema head. This is a new local artifact subject to the model license; no weights are included in this tutorial. Export does not establish publisher or cross-framework numerical equivalence.
+# Native stages retain the selected head and any adapters for reload. Both head-only and LoRA stages can produce a publisher-loadable Hugging Face model plus joint schema head; LoRA adapters are merged when present. This is a new local artifact subject to the model license; no weights are included in this tutorial. Export does not establish publisher or cross-framework numerical equivalence.
 
 # %%
 EXPORT_MODEL = False  # A full merged model may require substantial local disk/memory.
-if EXPORT_MODEL and HEAD_ONLY:
-    raise ValueError("Head-only stages already save a schema head; merged export requires a LoRA stage")
 if EXPORT_MODEL:
     launch(
         [
