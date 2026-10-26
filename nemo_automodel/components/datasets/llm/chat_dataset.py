@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 from torch.utils.data import Dataset
 
+from nemo_automodel.components.datasets.utils import default_collater
+
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
     _has_chat_template,
@@ -464,6 +466,10 @@ class ChatDataset(Dataset):
             raise ValueError("Tokenizer is required")
         chat_template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
 
+        # VLM recipes pass the runtime processor to tokenizer-aware datasets.
+        # Plain chat formatting only needs the processor's text tokenizer.
+        tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+
         # Enforce chat-template availability for tool-calling data
         if chat_template is not None:
             tokenizer.chat_template = _resolve_chat_template(chat_template)
@@ -576,3 +582,24 @@ class ChatDataset(Dataset):
             if "labels" in sample:
                 self._keep_last_supervised_run(sample["labels"], -100)
         return sample
+
+
+def vlm_chat_collater(
+    examples: List[Dict[str, List[int]]],
+    processor: Any = None,
+    pad_seq_len_divisible: int | None = None,
+):
+    """Batch pre-tokenized chat samples for the VLM training recipe.
+
+    The VLM trainer expects labels to be shifted by the collator, while
+    ``ChatDataset`` emits unshifted causal-LM labels. ``processor`` is accepted
+    because the typed VLM loader injects it into configured collators.
+    """
+    del processor
+    batch = default_collater(examples, pad_seq_len_divisible=pad_seq_len_divisible)
+    batch["labels"] = batch["labels"][:, 1:]
+    input_shape = batch["input_ids"].shape
+    for key, value in list(batch.items()):
+        if key != "labels" and getattr(value, "shape", None) == input_shape:
+            batch[key] = value[:, :-1]
+    return batch
