@@ -15,7 +15,16 @@ Draft for humans and coding agents. Existing repository policies remain authorit
 - **Avoid globals.** Keep mutable state with its owner and pass dependencies explicitly.
 - **Keep APIs small.** Reuse existing components and avoid speculative abstractions.
   Introduce shared abstractions only when existing callers share stable semantics.
-- **Respect ownership.** Keep model-specific logic in its model package and recipes as thin orchestration.
+- **Keep model-specific logic in the model directory.** Architecture, initialization, weight layouts,
+  and model-specific parallelization policy belong under `nemo_automodel/components/models/<model>/`.
+- **Keep shared components as infrastructure.** Shared components must not branch on model names, families,
+  or model-specific module paths to select behavior. Expose generic typed contracts and let model-owned
+  implementations supply the policy. Keep recipes as thin orchestration.
+- **Stop YAML at the typed-config boundary.** Parse and validate YAML into typed configs at the configuration
+  boundary. Components must consume typed configs and explicit typed runtime arguments, never YAML or `ConfigNode`
+  objects. Converting a `ConfigNode` into a plain dictionary, nested mapping, or `**kwargs` bag and passing it into
+  a component is the same boundary violation; it does not make the configuration typed. Do not reconstruct or
+  interpret the YAML schema inside components.
 - **Let configs own construction.** Use typed `build(...)` methods; keep runtime objects out of serializable configs.
   Preserve typed configs internally, serialize at shared boundaries, and do not mutate configs during construction.
 - **Keep artifact versions consistent.** Resolve related external artifacts, such as configs and weights,
