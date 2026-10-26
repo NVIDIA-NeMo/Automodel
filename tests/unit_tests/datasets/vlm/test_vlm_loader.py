@@ -45,6 +45,11 @@ from nemo_automodel.components.distributed.thd_utils import process_input_for_th
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
+@pytest.fixture(autouse=True)
+def one_visible_gpu(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+
 class DummyProcessor:
     def __init__(self):
         self.tokenizer = SimpleNamespace(pad_token_id=0)
@@ -180,17 +185,21 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
 
 
 @pytest.mark.parametrize(
-    ("affinity", "cpu_count", "expected"),
+    ("affinity", "cpu_count", "num_gpus", "expected"),
     [
-        ({4, 5}, 128, 2),
-        (OSError("unavailable"), 3, 3),
-        (AttributeError("unavailable"), 4, 4),
-        (NotImplementedError(), None, 1),
-        (set(), 2, 2),
+        ({4, 5}, 128, 1, 2),
+        (set(range(24)), 128, 2, 8),
+        (set(range(64)), 128, 8, 32),
+        (set(range(6)), 128, 2, 6),
+        (OSError("unavailable"), 64, 2, 8),
+        (AttributeError("unavailable"), 4, 2, 4),
+        (NotImplementedError(), None, 1, 1),
+        (set(), 2, 1, 2),
+        (set(range(24)), 128, 0, 0),
     ],
 )
-def test_zero_vlm_workers_uses_available_cpus_without_mutating_config(
-    monkeypatch, caplog, affinity, cpu_count, expected
+def test_zero_vlm_workers_caps_by_gpus_and_available_cpus_without_mutating_config(
+    monkeypatch, caplog, affinity, cpu_count, num_gpus, expected
 ):
     def get_affinity(_):
         if isinstance(affinity, Exception):
@@ -198,6 +207,7 @@ def test_zero_vlm_workers_uses_available_cpus_without_mutating_config(
         return affinity
 
     monkeypatch.setattr(vlm_loader, "os", SimpleNamespace(sched_getaffinity=get_affinity, cpu_count=lambda: cpu_count))
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: num_gpus)
     config = VlmDataloaderConfig(
         dataset_config=StaticDatasetConfig([]),
         processor_config=VlmProcessorConfig(factory=DummyProcessor),
@@ -210,8 +220,8 @@ def test_zero_vlm_workers_uses_available_cpus_without_mutating_config(
         for _ in range(2):
             result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1)
             assert result.dataloader.num_workers == expected
-            assert result.dataloader.persistent_workers is True
-            assert result.dataloader.prefetch_factor == 3
+            assert result.dataloader.persistent_workers is (expected > 0)
+            assert result.dataloader.prefetch_factor == (3 if expected > 0 else None)
 
     assert config.num_workers == 0
     messages = [record.getMessage() for record in caplog.records if record.name == vlm_loader.__name__]
