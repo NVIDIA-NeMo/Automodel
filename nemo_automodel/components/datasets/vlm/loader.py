@@ -279,7 +279,7 @@ class VlmDataloaderConfig:
     chat_template: str | None = None
     shuffle: bool = True
     num_workers: int = 0
-    """Worker processes per dataloader; zero selects min(4 * visible GPUs, available CPUs)."""
+    """Worker processes per dataloader; zero selects available CPUs, capped at 4 * visible GPUs when present."""
     pin_memory: bool = False
     persistent_workers: bool = False
     prefetch_factor: int | None = None
@@ -438,10 +438,11 @@ class VlmDataloaderConfig:
                 available_cpus = None
             num_cpus = available_cpus or os.cpu_count() or 1
             num_gpus = torch.cuda.device_count()
-            num_workers = min(4 * num_gpus, num_cpus)
+            num_workers = min(4 * num_gpus, num_cpus) if num_gpus > 0 else num_cpus
             logger.warning(
                 "VLM dataloader num_workers=0 selects automatic preprocessing and prefetching; "
-                "using num_workers=%d = min(4 * %d visible GPUs, %d available CPUs). "
+                "using num_workers=%d with %d visible GPUs and %d available CPUs "
+                "(capped at 4 workers per visible GPU when GPUs are available). "
                 "This count is per dataloader; set an explicit positive num_workers "
                 "to override the automatic selection.",
                 num_workers,
