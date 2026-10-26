@@ -54,6 +54,7 @@ from nemo_automodel.components.models.common.utils import (
     restore_pretrained_generation_config,
 )
 from nemo_automodel.components.models.qwen3_5_moe.model import Fp32SafeQwen3_5MoeTextRotaryEmbedding
+from nemo_automodel.components.models.qwen3_8_flash_next.parallelization import PARALLELIZER
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -106,7 +107,8 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
             row shards. When omitted in a distributed run the table binds the
             FSDP (data/context shard) mesh of the pipeline stage that holds it
             during parallelization, so the owner group is the stage's EP/FSDP
-            group rather than the world.
+            group rather than the world. Only the MoE parallelizer binds it,
+            so PLE layers require ``ep_size > 1``.
         engram_table_config: Optional tiny-table override for unit tests. The
             released checkpoint uses ``[320001536, 160]`` globally.
 
@@ -517,6 +519,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     # Pipeline stages run this forward unchanged: a later stage receives the
     # flattened HC state in place of token IDs and routes it as inputs_embeds.
     _pp_keep_self_forward: bool = True
+    parallelizer = PARALLELIZER
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -709,7 +712,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         Stages exchange the flattened HC state, so a non-first stage receives
         ``[batch, sequence, hc_count * hidden]`` rather than ``[batch, sequence,
         hidden]``. The last stage collapses it through the HC mixer and emits
-        either logits or, for the fused loss path, ``[batch, sequence, hidden]``.
+        logits.
 
         Args:
             is_first: Whether this stage holds ``embed_tokens``.
@@ -721,10 +724,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             ``(inputs_meta, outputs_meta)`` tuples of meta tensors. The first-stage
             input is int64 ``[batch, sequence]``; every other input is
             ``[batch, sequence, hc_count * hidden]``. The output is
-            ``[batch, sequence, vocab]`` when this stage owns ``lm_head`` and emits
-            logits, ``[batch, sequence, hidden]`` when it owns the HC mixer but
-            emits hidden states, and ``[batch, sequence, hc_count * hidden]``
-            otherwise.
+            ``[batch, sequence, vocab]`` on the stage that owns ``lm_head`` and
+            ``[batch, sequence, hc_count * hidden]`` otherwise.
         """
         if getattr(self, "_cp_enabled", False):
             raise NotImplementedError(
@@ -737,15 +738,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         else:
             inputs_meta = (torch.empty(microbatch_size, seq_len, hc_width, device="meta", dtype=dtype),)
 
-        has_mixer = self.model.language_model.hyper_connection_mixer is not None
-        has_lm_head = self.lm_head is not None
-        emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
-        if has_lm_head and not emits_hidden_states:
-            output_width = text_config.vocab_size
-        elif has_mixer:
-            output_width = text_config.hidden_size
-        else:
-            output_width = hc_width
+        output_width = text_config.vocab_size if self.lm_head is not None else hc_width
         outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=dtype),)
         return inputs_meta, outputs_meta
 

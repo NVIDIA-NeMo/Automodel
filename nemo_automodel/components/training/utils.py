@@ -26,6 +26,7 @@ from nemo_automodel.components.training.triton.grad_norm import (
 )
 from nemo_automodel.components.training.triton.grad_norm import multi_tensor_absmax, multi_tensor_sumsq
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
+from nemo_automodel.shared.model_owned_sharding import model_owned_grad_divisor
 
 _GradNormBackend = Literal["triton", "te"]
 
@@ -552,11 +553,7 @@ def clip_grad_norm(
     )
     if can_use_torch_clip:
         for p in parameters:
-            if (
-                isinstance(p, DTensor)
-                or isinstance(p.grad, DTensor)
-                or getattr(p, "_nemo_model_owned_grad_divisor", None) is not None
-            ):
+            if isinstance(p, DTensor) or isinstance(p.grad, DTensor) or model_owned_grad_divisor(p) is not None:
                 can_use_torch_clip = False
                 break
 
@@ -727,7 +724,7 @@ def scale_grads_and_clip_grad_norm(
             ep_ratio *= float(expert_tp_replication_factor)
 
     has_model_owned_sharded_params = any(
-        getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
+        model_owned_grad_divisor(parameter) is not None
         for model_part in model_parts
         for parameter in model_part.parameters()
     )
@@ -744,7 +741,7 @@ def scale_grads_and_clip_grad_norm(
                     continue
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
-                owner_divisor = getattr(p, "_nemo_model_owned_grad_divisor", None)
+                owner_divisor = model_owned_grad_divisor(p)
                 if owner_divisor is not None:
                     p.grad.div_(float(owner_divisor))
                 if ep_ratio is not None:

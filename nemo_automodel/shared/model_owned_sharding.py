@@ -40,7 +40,11 @@ def stamp_model_owned_grad_divisor(parameter: torch.Tensor, divisor: float) -> N
     """Stamp the owner-sharding gradient divisor on a parameter.
 
     Args:
-        parameter: Parameter whose gradient the model accumulates over its owner group.
+        parameter: Parameter or DTensor parameter of arbitrary global and
+            per-rank local shape whose gradient the model accumulates over its
+            owner group. No axis, dtype, device, or placement restriction
+            applies. Only the parameter's Python metadata is mutated; tensor
+            values, storage, and DTensor placements are unchanged.
         divisor: Owner-group size that averages the accumulated gradient.
     """
     setattr(parameter, _MODEL_OWNED_GRAD_DIVISOR_ATTR, float(divisor))

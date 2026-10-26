@@ -33,6 +33,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     qwen3_8_flash_next_cp_left_halo,
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGroupedRMSNorm
+from nemo_automodel.shared.model_owned_sharding import stamp_model_owned_grad_divisor
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 QWEN3_8_FLASH_NEXT_LAYER_MULTIPLIERS = (
@@ -536,7 +537,7 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         The single-rank reference table needs no contract.
         """
         if isinstance(self.weight, DTensor):
-            self.weight._nemo_model_owned_grad_divisor = float(self.owner_world_size)
+            stamp_model_owned_grad_divisor(self.weight, self.owner_world_size)
 
     def parallelize_weight(self, fsdp_mesh: DeviceMesh) -> nn.Parameter:
         """Represent the already-local owner shard as one global DTensor.

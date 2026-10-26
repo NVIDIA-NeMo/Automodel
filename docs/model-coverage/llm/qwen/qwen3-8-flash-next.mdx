@@ -66,8 +66,8 @@ sends IDs to owners, and a second autograd-aware All-to-All returns values.
 Each rank looks up only its contiguous local DTensor shard, and the backward
 pass reverses the value route so only the owner stores and updates each row's
 gradient. The owner group is the FSDP mesh of the pipeline stage that holds
-decoder layer 2: without pipeline parallelism that is the whole world, with
-`pp_size > 1` it is the first stage's `dp_shard_cp` group, and the group size
+decoder layer 2: without pipeline parallelism, that is the whole world; with
+`pp_size > 1`, it is the first stage's `dp_shard_cp` group, and the group size
 must divide the 128 physical checkpoint shards. Pipeline stages exchange the
 flattened `[batch, sequence, 4 * hidden]` HyperConnection state; the last stage
 owns the final HyperConnection read and the language-model head. The
@@ -113,7 +113,7 @@ path, so both runs consume byte-identical pack sequences). Loss-curve cosine
 similarity was 0.999999925, mean absolute difference 0.00024, and maximum
 absolute difference 0.00069; final losses were 0.56053 for CP1 and 0.56011
 for CP8. A world-64 single-forward probe also matched CP8 against CP1 with exact
-per-row routing IDs and passing Engram/GDN/QSA activation gates.
+per-row routing IDs and passing Engram, GDN, and QSA activation gates.
 
 Pipeline parallelism was compared at world size 64 from the released
 checkpoint: EP64 without PP against EP32 with PP2 (1F1B, micro-batch 1), both
@@ -166,16 +166,21 @@ setup.
   size changes. Checkpoints from the earlier rank-local owner format are not
   supported; resume from a native DTensor checkpoint or restart the optimizer.
 - Pipeline parallelism splits the decoder layers across stages with the
-  generic layer planner (`pipeline_parallel_layers_per_stage` or explicit
-  `module_fqns_per_model_part`); the stage that holds decoder layer 2 must be
-  the first stage because Engram hashes the raw token IDs that only the first
-  stage receives. Pipeline stages use static shape metadata, so micro-batches
+  generic layer planner (`distributed.pipeline.layers_per_stage`), which also
+  places `hyper_connection_mixer` on the last stage. An explicit
+  `module_fqns_per_model_part` is used as given, so its last stage must list
+  `model.language_model.hyper_connection_mixer` itself. The stage that holds
+  decoder layer 2 must be the first stage because Engram hashes the raw token
+  IDs that only the first stage receives. The Engram layer requires
+  `ep_size > 1`, with or without pipeline parallelism: only the MoE
+  parallelizer binds the table's owner group, so an EP1 run with PLE layers is
+  rejected on every rank before training starts. Pipeline stages use static shape metadata, so micro-batches
   need one fixed sequence length (`pad_to_max_length`, packing to a fixed
   size, or a fixed-length loader).
 - CP is limited to language-only inputs with TP=PP=1. Non-packed
   right-tail-padded batches and packed (THD) batches with `cu_seqlens` (or
   loader `seq_lens`) are both supported; the same FlexAttention path serves
-  packed CUDA training, and packing is performed topology-independently.
+  packed CUDA training, and packing is performed independently of topology.
   Left padding, interior padding, TP, CP together with PP, MTP, and vision and
   video training remain unsupported.
 

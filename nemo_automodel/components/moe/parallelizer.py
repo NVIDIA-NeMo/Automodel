@@ -58,6 +58,7 @@ from nemo_automodel.components.moe.layers import (
 )
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.model_owned_sharding import model_owned_grad_divisor
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
@@ -932,9 +933,7 @@ def apply_fsdp(
     # parameter set while preserving the normal nn.Module path.
     outer_parameters = model.parameters() if hasattr(model, "parameters") else ()
     externally_sharded_params = prepared_model_owned_dtensors | {
-        parameter
-        for parameter in outer_parameters
-        if getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
+        parameter for parameter in outer_parameters if model_owned_grad_divisor(parameter) is not None
     }
     if externally_sharded_params:
         logger.info(
@@ -1365,13 +1364,6 @@ def parallelize_model(
     else:
         fsdp_mesh = get_submesh(world_mesh, axis_names) if axis_names else None
     fsdp_enabled = fsdp_mesh is not None and fsdp_mesh.size() > 1
-    if not fsdp_enabled and fsdp_mesh is not None:
-        # A one-rank shard mesh (for example one pipeline stage per rank) wraps
-        # nothing in FSDP, but model-owned sharded parameters still bind their
-        # owner group to this mesh so every stage reaches the same final state.
-        prepare_model_owned_dtensors = getattr(model, "_nemo_prepare_model_owned_dtensors", None)
-        if prepare_model_owned_dtensors is not None:
-            prepare_model_owned_dtensors(fsdp_mesh)
     if fsdp_enabled:
         apply_fsdp(
             model,

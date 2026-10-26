@@ -17,19 +17,23 @@
 import copy
 import inspect
 from collections.abc import Callable
+from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
 )
 
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.config import (
     Qwen3_8_FlashNextConfig,
     Qwen3_8_FlashNextTextConfig,
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.model import Qwen3_8_FlashNextForConditionalGeneration
+from nemo_automodel.components.models.qwen3_8_flash_next.parallelization import PARALLELIZER
 from nemo_automodel.components.moe.layers import MoEConfig
 
 LAYERS_PREFIX = "model.language_model."
@@ -199,11 +203,6 @@ def test_stage_metas_exchange_hc_width() -> None:
     assert inputs_meta[0].shape == (2, 5, hc_width)
     assert outputs_meta[0].shape == (2, 5, text.vocab_size)
 
-    # The fused-loss path asks the last stage for collapsed hidden states.
-    last._pp_return_hidden_states = True
-    _, outputs_meta = last.get_pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=5, dtype=torch.float32)
-    assert outputs_meta[0].shape == (2, 5, text.hidden_size)
-
 
 def test_two_stage_forward_matches_single_model() -> None:
     model = _build_model()
@@ -232,3 +231,22 @@ def test_last_stage_backward_reaches_incoming_state() -> None:
 
     assert incoming.grad is not None
     assert torch.isfinite(incoming.grad).all()
+
+
+@pytest.mark.parametrize(
+    ("ple_layer_ids", "ep_size", "rejected"),
+    [([2], 1, True), ([2], 2, False), ([], 1, False)],
+)
+def test_parallelizer_rejects_ple_without_expert_parallelism(monkeypatch, ple_layer_ids, ep_size, rejected) -> None:
+    """Every stage reads the config, so a stage without the PLE layer rejects EP1 too."""
+    parallelized = object()
+    monkeypatch.setattr(ModelParallelizer, "parallelize", lambda self, model, mesh_context: parallelized)
+    stage = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(ple_layer_ids=ple_layer_ids)))
+    mesh_context = SimpleNamespace(ep_size=ep_size)
+
+    assert Qwen3_8_FlashNextForConditionalGeneration.parallelizer is PARALLELIZER
+    if rejected:
+        with pytest.raises(ValueError, match="requires distributed.ep_size > 1"):
+            PARALLELIZER.parallelize(stage, mesh_context)
+    else:
+        assert PARALLELIZER.parallelize(stage, mesh_context) is parallelized
