@@ -31,7 +31,9 @@ over `cp_size: 8` (8K tokens per rank) on synthetic data:
 automodel examples/llm_finetune/gemma/gemma_4_12b_mock_cp8_64k.yaml --nproc-per-node 8
 ```
 
-`gemma_4_12b_mock_cp8_128k.yaml` is the same recipe for 128K-token sequences (16K tokens per rank).
+`gemma_4_12b_mock_cp8_128k.yaml` is the same recipe for 128K-token sequences (16K tokens per rank). Both
+use `FusedLinearCrossEntropy`, which computes the loss from the hidden states instead of materializing
+the 262K-vocab logits for every token of the shard.
 
 Context parallelism needs `attn_implementation: sdpa`, which the ring attention replaces. The CP recipes
 set `text_config.cp_full_attn_backend: ffpa`, which runs the head_dim=512 full-attention ring chunks
