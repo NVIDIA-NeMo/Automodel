@@ -52,36 +52,24 @@ training configuration require separate memory and restoration validation.
 </Note>
 
 Place all 64 ranks in one verified NVLink domain with static rank ordering.
-The model and recipe use:
-
-- `attn: tilelang`
-- `linear: torch`
-- `rms_norm: torch_fp32`
-- `experts: torch_mm`
-- `dispatcher: hybridep`
-
+The model and recipe use `attn: tilelang`, `linear: torch`,
+`rms_norm: torch_fp32`, `experts: torch_mm`, and `dispatcher: hybridep`.
 Set `model.backend.rms_norm: te` to use Transformer Engine RMSNorm for the
 text backbone, attention projections, compressor, and indexer. This preserves
 parameter names and dtypes; the default retains eager FP32 normalization.
-
 Set `model.backend.compile_hc: true` to run the single-pass mHC
 coefficient projection, stream collapse and stream expand through
 `torch.compile` (one fused kernel each instead of four to five FP32 passes;
 the eager `expand` materializes a `[batch, sequence, streams, streams, hidden]`
-FP32 temporary).
-
-Set `model.backend.compile_norm: true` to compile the FP32 RMSNorm chain the same way.
-
-Both are opt-in: compiled numerics are allclose to eager, not bitwise-identical
-(the 12-layer mini benchmark reproduced the eager loss to four decimals). The
-cores are specialized per shape: a new sequence length (or grad mode) compiles
-them again, so keep them off for runs with many distinct packed lengths.
-
+FP32 temporary), and `model.backend.compile_norm: true` to compile the FP32
+RMSNorm chain the same way. Both are opt-in: compiled numerics are allclose to
+eager, not bitwise-identical (the 12-layer mini benchmark reproduced the eager
+loss to four decimals). The cores are specialized per shape: a new sequence
+length (or grad mode) compiles them again, so keep them off for runs with many
+distinct packed lengths.
 The Sinkhorn normalization keeps its TileKernels or torch backend. Both knobs are
 backend fields: they select kernels and are not written to `config.json`.
-
 TileLang and TileKernels are the optional dependencies also used by DeepSeek V4.
-
 HybridEP provides both token dispatch and expert-output combine. Router
 correction biases remain fixed during fine-tuning through
 `gate_bias_update_factor: 0`.
@@ -91,14 +79,9 @@ key/value, and indexer projections through a fused Triton kernel (one launch for
 the forward and one for the backward); the default `torch` keeps the eager
 complex rotation, which stays the numerical reference.
 
-FSDP mixed precision must use:
-
-- `param_dtype: bfloat16`
-- `reduce_dtype: float32`
-- `output_dtype: null`
-- `cast_forward_inputs: false`
-
-Set `lm_head_precision: float32`. These settings preserve FP32 mHC coefficients
+FSDP mixed precision must use `param_dtype: bfloat16`, `reduce_dtype: float32`,
+`output_dtype: null`, and `cast_forward_inputs: false`. Set
+`lm_head_precision: float32`. These settings preserve FP32 mHC coefficients
 across module boundaries; the language-model head returns FP32 logits.
 
 See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) and
@@ -171,15 +154,9 @@ writes the same padded and prepacked layouts to disk.
 `tulu3_chat_template.jinja` accepts only system, user, and assistant turns.
 For data with tool calls or reasoning, use
 [`deepseek_v41_flash_training_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_training_chat_template.jinja)
-from the same directory, the released `chat_template.jinja` with loss spans.
-It renders those three roles identically, and for thinking-mode data the
-dataset takes `chat_template_kwargs: {thinking_mode: thinking}`.
-Tool-call arguments render as one DSML parameter each, so the template
-rejects arguments that are not an object. `ChatDataset` stores arguments as
-JSON strings; load the dataset tokenizer with
-`nemo_automodel.NeMoAutoTokenizer.from_pretrained` (the example configs use
-`transformers.AutoTokenizer.from_pretrained`), which parses them back into
-objects for this model type. The DSpark recipes already load it that way.
+from the same directory, the released `chat_template.jinja` with loss spans
+(its header covers thinking-mode data). It renders those three roles
+identically.
 
 Three points apply to every H100 variant:
 
@@ -280,7 +257,7 @@ sample rather than broad prompt coverage.
 
 | Metric | PR `d5c8b5e4` Native-Combine Streamed-40 Result |
 |---|---:|
-| Mean KL(reference \|\| native) | 0.0034285025 |
+| Mean KL(reference || native) | 0.0034285025 |
 | P95 KL | 0.0003751850 |
 | Maximum KL | 3.8604531288 |
 | Logit cosine | 0.9939242168 |
