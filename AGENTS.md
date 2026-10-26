@@ -12,6 +12,11 @@ hand.
 Follow the shared [coding guidelines](CODING_GUIDELINES.md) alongside these
 instructions. Existing code may not yet comply as refactoring proceeds.
 
+For reuse discovery, combine repository text search with available code-graph
+tools. Verify the graph's repository, indexed revision, and freshness before
+relying on it. Empty or incomplete graph results do not establish that reusable
+code is absent; confirm candidates and callers directly in source.
+
 ---
 
 ## Skills

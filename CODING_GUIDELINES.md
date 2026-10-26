@@ -17,6 +17,12 @@ not yet comply; use these guidelines to guide changes within your task's scope.
 - **Avoid globals.** Keep mutable state with its owner and pass dependencies explicitly.
 - **Keep APIs small.** Reuse existing components and avoid speculative abstractions.
   Introduce shared abstractions only when existing callers share stable semantics.
+- **Search before implementing.** Before adding a helper, backend, or adapter, search shared components and sibling
+  models for the same capability and underlying library calls. Inspect candidate implementations and their production
+  callers. Reuse or extend compatible code; justify a separate implementation with concrete differences in semantics
+  or input contracts.
+- **Design for produced inputs.** Trace supported input forms to their production callers. Do not duplicate
+  infrastructure to support hypothetical layouts, metadata, or execution modes without a demonstrated requirement.
 - **Keep model-specific logic in the model directory.** Architecture, initialization, weight layouts,
   and model-specific parallelization policy belong under `nemo_automodel/components/models/<model>/`.
 - **Keep shared components as infrastructure.** Shared components must not branch on model names, families,
@@ -64,6 +70,9 @@ not yet comply; use these guidelines to guide changes within your task's scope.
 ## Changes and validation
 
 - Keep changes focused and preserve compatibility, or provide a migration path.
+- Review newly added implementations for overlap with existing shared and sibling code. Record the strongest reuse
+  candidate and why it was reused, extended, or unsuitable. Passing correctness or performance tests does not establish
+  that a separate implementation is necessary.
 - Test observable behavior and failure cases. Regression tests should demonstrate the original failure.
   Exercise the production entry point when helper tests cannot establish integration correctness;
   check forward and backward parity for tensor math.
