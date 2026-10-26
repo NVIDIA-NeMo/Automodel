@@ -37,9 +37,12 @@ instructions.
   types. Use `list[T]`, `dict[K, V]`, `X | Y`, and `T | None`. Model structured
   contracts with existing dataclasses, `TypedDict`, or `Protocol` where appropriate
   instead of passing untyped dictionaries or chains of `**kwargs`.
-- Keep parameters explicit. Use keyword-only arguments when booleans or several
-  arguments of the same type would make a call ambiguous. Prefer a named result
-  when callers would otherwise have to remember the meaning of tuple positions.
+- **Avoid long argument lists.** Pass only what the operation needs. Group related
+  declarative settings in a cohesive typed config, and split an operation when its
+  arguments reveal unrelated responsibilities. Do not hide argument sprawl in
+  `*args`, `**kwargs`, or an untyped parameter bag. Use keyword-only arguments when
+  booleans or several arguments of the same type would make a call ambiguous.
+  Prefer a named result when tuple positions would be hard to remember.
 - Prefer typed attributes and existing capability/config contracts to repeated
   `getattr`, `hasattr`, class-name checks, or signature inspection for dispatch.
   Keep necessary third-party compatibility checks at the integration boundary.
@@ -53,14 +56,35 @@ instructions.
   root logger, printing from library code, or logging credentials.
 - Guard optional dependencies with `safe_import()` from
   `nemo_automodel.shared.import_utils`. Missing optional packages must not break
-  unrelated module imports. Avoid import-time monkeypatching and module-global
-  mutation; pass collaborators explicitly.
+  unrelated module imports. Avoid import-time monkeypatching.
+- **Avoid globals.** Keep mutable state with the object or lifecycle that owns it,
+  and pass dependencies explicitly. Avoid the `global` statement, `globals()`,
+  module-namespace mutation, and global caches without an ownership and lifetime
+  contract. Module constants and module loggers are appropriate; follow the narrow
+  lazy-import exception documented by `tools/lint_no_globals.py` when applicable.
 
 ## Keep ownership and APIs small
 
-- Give each function one cohesive operation and each class one cohesive state,
-  policy, or lifecycle. Split responsibilities when they change independently;
-  line count alone is not a reason to extract another layer.
+- **Exercise separation of concerns.** Give each function one cohesive operation
+  and each class one cohesive state, policy, or lifecycle. Keep config parsing,
+  construction, tensor computation, persistence, and orchestration with their
+  respective owners. Split responsibilities when they change independently.
+- **Avoid large functions.** Keep control flow readable at one level of
+  abstraction. Extract cohesive private helpers when a function mixes distinct
+  operations or becomes difficult to reason about. A function approaching 150
+  lines or a signature exceeding eight parameters is a review signal, not a hard
+  limit; identify the responsibility boundary before extracting another layer.
+- **Avoid function pointers.** In Python, avoid passing or storing arbitrary
+  function references to switch behavior through ad-hoc callback chains. Prefer
+  direct calls or methods on a cohesive object with an explicit typed contract.
+  Where a framework requires callbacks, keep their signatures and lifecycle
+  explicit and typed.
+- **Use contracts where applicable.** Define component boundaries with typed
+  signatures, dataclasses, or `Protocol` interfaces that describe what callers
+  can rely on. Document preconditions, postconditions, invariants, failure modes,
+  and ownership where relevant, and validate external inputs at the boundary.
+  Test implementations against that contract. Reuse an existing contract before
+  adding an interface or relying on runtime attribute probing.
 - Add abstractions only for current callers or demonstrated variation. Prefer a
   short explicit flow to speculative wrappers, extension points, and flags.
   Share duplicated code only when its semantics and ownership are stable.
