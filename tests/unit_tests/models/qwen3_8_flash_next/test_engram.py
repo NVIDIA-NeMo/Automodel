@@ -29,7 +29,6 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.distributed.tp_replicas import model_owned_grad_divisor
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
     QWEN3_8_FLASH_NEXT_LAYER_MULTIPLIERS,
@@ -40,6 +39,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
     Qwen3_8_FlashNextOwnerShardedEmbedding,
     Qwen3_8_FlashNextPLELayer,
 )
+from nemo_automodel.shared.model_owned_sharding import model_owned_grad_divisor
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.

@@ -19,7 +19,7 @@ import torch
 from torch import nn
 
 from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
-from nemo_automodel.components.distributed.tp_replicas import (
+from nemo_automodel.shared.model_owned_sharding import (
     model_owned_grad_divisor,
     stamp_model_owned_grad_divisor,
 )

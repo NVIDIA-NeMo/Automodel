@@ -92,11 +92,11 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
-from nemo_automodel.components.distributed.tp_replicas import (
+from nemo_automodel.shared.embedding_padding import zero_embedding_row_
+from nemo_automodel.shared.model_owned_sharding import (
     model_owned_grad_divisor,
     stamp_model_owned_grad_divisor,
 )
-from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
