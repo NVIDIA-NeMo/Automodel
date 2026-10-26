@@ -30,6 +30,7 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
     build_cached_dspark_dataloader,
     compute_batch_cache,
     existing_shard_indices,
+    manifest_path,
     read_manifest,
     read_target_weight_modules,
     write_manifest,
@@ -331,6 +332,42 @@ def test_resume_compatibility_rejects_manifest_mismatch(tmp_path):
         _ensure_resume_compatible(cache_dir, manifest, existing_shards={0})
 
 
+@pytest.mark.parametrize(
+    ("recorded_kwargs", "current_kwargs"),
+    [
+        ({"enable_thinking": False}, {"enable_thinking": 0}),
+        # A template iterating ``options.items()`` renders these differently.
+        ({"options": {"b": 2, "a": 1}}, {"options": {"a": 1, "b": 2}}),
+        ({"options": [{"b": 2, "a": 1}]}, {"options": [{"a": 1, "b": 2}]}),
+    ],
+)
+def test_resume_compatibility_rejects_kwargs_that_only_python_equality_merges(
+    tmp_path, recorded_kwargs, current_kwargs
+):
+    cache_dir = str(tmp_path / "cache")
+    _write_tiny_cache(cache_dir, num_samples=2, shard_size=2, seq_len=4)
+    recorded = {**read_manifest(cache_dir), "chat_template_kwargs": recorded_kwargs}
+    write_manifest(cache_dir, recorded)
+
+    with pytest.raises(ValueError, match="chat_template_kwargs"):
+        _ensure_resume_compatible(cache_dir, {**recorded, "chat_template_kwargs": current_kwargs}, existing_shards={0})
+    _ensure_resume_compatible(cache_dir, recorded, existing_shards={0})  # same kwargs -> ok
+
+
+def test_manifest_keeps_nested_kwargs_order_on_disk(tmp_path):
+    cache_dir = str(tmp_path / "cache")
+    _write_tiny_cache(cache_dir, num_samples=2, shard_size=2, seq_len=4)
+    kwargs = {"z": 0, "options": {"b": 2, "a": 1}, "items": [{"d": 1, "c": 2}]}
+    write_manifest(cache_dir, {**read_manifest(cache_dir), "chat_template_kwargs": kwargs})
+
+    recorded = read_manifest(cache_dir)["chat_template_kwargs"]
+    assert list(recorded["options"]) == ["b", "a"]
+    assert list(recorded["items"][0]) == ["d", "c"]
+    with open(manifest_path(cache_dir)) as f:
+        top_level = list(json.load(f))
+    assert top_level == sorted(top_level)  # top-level fields stay sorted by name
+
+
 def test_precompute_resume_mismatch_does_not_overwrite_target_weights(monkeypatch, tmp_path):
     import nemo_automodel.components.speculative.precompute_dspark as precompute_dspark
 
@@ -424,6 +461,7 @@ def test_precompute_resume_mismatch_does_not_overwrite_target_weights(monkeypatc
         draft_num_hidden_layers=5,
         target_layer_ids=list(_LAYERS),
         chat_template=None,
+        chat_template_kwargs=None,
         mask_reasoning_content=False,
         mask_generation_prompt=False,
         target_attn_implementation=None,
@@ -519,7 +557,10 @@ def test_precompute_run_writes_cache(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: fake_model,
     )
     monkeypatch.setattr(precompute_dspark, "HFDSparkTargetModel", _FakeWrapper)
-    monkeypatch.setattr(precompute_dspark, "build_eagle3_dataloader", lambda **_kwargs: _FakeLoader())
+    loader_kwargs = {}
+    monkeypatch.setattr(
+        precompute_dspark, "build_eagle3_dataloader", lambda **kwargs: loader_kwargs.update(kwargs) or _FakeLoader()
+    )
 
     cache_dir = str(tmp_path / "cache")
     args = SimpleNamespace(
@@ -537,6 +578,7 @@ def test_precompute_run_writes_cache(monkeypatch, tmp_path):
         draft_num_hidden_layers=5,
         target_layer_ids=list(_LAYERS),
         chat_template=None,
+        chat_template_kwargs={"enable_thinking": False},
         mask_reasoning_content=False,
         mask_generation_prompt=False,
         target_attn_implementation=None,
@@ -550,6 +592,9 @@ def test_precompute_run_writes_cache(monkeypatch, tmp_path):
     manifest = read_manifest(cache_dir)
     assert manifest["num_samples"] == 3
     assert manifest["target_layer_ids"] == _LAYERS
+    # The template arguments reach both the dataloader and the recorded input identity.
+    assert loader_kwargs["chat_template_kwargs"] == {"enable_thinking": False}
+    assert manifest["chat_template_kwargs"] == {"enable_thinking": False}
     dataset = CachedDSparkDataset(cache_dir)
     assert len(dataset) == 3
     assert dataset[0]["target_hidden_states"].shape == (4, _HIDDEN * len(_LAYERS))
@@ -562,3 +607,18 @@ def test_parser_mask_generation_prompt_flag():
     base = ["--target-model", "tiny", "--input-data", "data.jsonl", "--output-dir", "out"]
     assert _build_parser().parse_args(base).mask_generation_prompt is False
     assert _build_parser().parse_args(base + ["--mask-generation-prompt"]).mask_generation_prompt is True
+
+
+def test_parser_chat_template_kwargs_flag():
+    base = ["--target-model", "tiny", "--input-data", "data.jsonl", "--output-dir", "out"]
+    assert _build_parser().parse_args(base).chat_template_kwargs is None
+    args = _build_parser().parse_args(base + ["--chat-template-kwargs", '{"thinking_mode": "thinking"}'])
+    assert args.chat_template_kwargs == {"thinking_mode": "thinking"}
+
+
+@pytest.mark.parametrize("value", ["not json", "[1, 2]"])
+def test_parser_chat_template_kwargs_rejects_non_objects(value, capsys):
+    base = ["--target-model", "tiny", "--input-data", "data.jsonl", "--output-dir", "out"]
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(base + ["--chat-template-kwargs", value])
+    assert "--chat-template-kwargs" in capsys.readouterr().err
