@@ -227,6 +227,7 @@ def test_frozen_mxfp4_conversion_preserves_hybridep_settings(moe_config: MoEConf
         dispatcher_hybridep_num_blocks_unpermute=20,
         dispatcher_capacity_factor=1.5,
         dispatcher_equal_token_counts=True,
+        dispatcher_recompute_cache="combine",
     )
     with torch.device(device), torch.no_grad():
         original = GroupedExpertsDeepEP(moe_config, backend, dispatcher_backend=backend.dispatcher)
@@ -249,6 +250,8 @@ def test_frozen_mxfp4_conversion_preserves_hybridep_settings(moe_config: MoEConf
     assert converted.dispatcher_capacity_factor == 1.5
     assert converted.dispatcher_equal_token_counts is True
     assert converted.dispatch_rows_never_empty is True
+    # a frozen layer next to a LoRA one must present the same cache mode to the shared dispatcher (review of #4395)
+    assert converted.dispatcher_recompute_cache == "combine"
     assert all(not param.requires_grad for param in converted.parameters())
     assert converted.gate_and_up_projs_packed.is_meta == (device == "meta")
 
