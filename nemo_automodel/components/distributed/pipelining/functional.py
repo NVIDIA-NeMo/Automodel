@@ -378,8 +378,13 @@ def _precompute_stage_shapes(
 
         # --- inputs_meta ---
         if stage.is_first:
-            # THD packed microbatches are flat [T]; padded inputs are [mb, S].
-            inputs_meta = (torch.empty(*batch_seq_shape, device="meta", dtype=torch.long),)
+            # THD packed microbatches arrive at stage0 as [1, T]: the sharder
+            # emits [num_chunks, T] and TensorChunkSpec(0) slices dim 0 before
+            # the model's own THD squeeze runs, so PipelineStage's runtime
+            # validation keeps the singleton batch axis. Padded inputs are
+            # [mb, S]. Inter-stage activations below stay flat [T, H].
+            first_input_shape = (1, seq_len) if packed_sequence else (microbatch_size, seq_len)
+            inputs_meta = (torch.empty(*first_input_shape, device="meta", dtype=torch.long),)
         else:
             inputs_meta = (torch.empty(*batch_seq_shape, hidden_size, device="meta", dtype=model_dtype),)
 

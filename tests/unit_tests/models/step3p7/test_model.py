@@ -336,7 +336,9 @@ def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
         dtype=torch.float32,
         packed_sequence=True,
     )
-    assert packed_ins[0].shape == (6,)
+    # Packed first-stage input keeps the singleton batch axis: TensorChunkSpec(0)
+    # slices [num_chunks, T] on dim 0 before the model's THD squeeze.
+    assert packed_ins[0].shape == (1, 6)
     primary_width = wrapper.config.text_config.vocab_size if wrapper.lm_head is not None else hidden
     assert packed_outs[0].shape == (6, primary_width)
     assert len(packed_outs) == 1 + mtp_depth
@@ -408,3 +410,53 @@ def test_initialize_weights_initializes_lm_head_and_casts(monkeypatch):
 
 def test_model_class_alias():
     assert step3p7_model.ModelClass is Step3p7ForConditionalGeneration
+
+
+class _MtpEmbedOracleModel:
+    """Minimal stand-in exposing only _build_mtp_embed_inputs_from_embeds."""
+
+    def __init__(self, mtp_layers):
+        self.mtp_config = SimpleNamespace(num_layers=mtp_layers)
+
+
+def test_mtp_embed_inputs_roll_along_token_axis_per_layout():
+    """Value/gradient regression for the MTP conditioning shift.
+
+    The MTP head must be conditioned on the NEXT token's embedding, so the roll
+    runs along the token axis in both layouts. Regression for the review
+    finding: flat [T, H] inputs were rolled on dim=1, shifting hidden channels
+    instead of tokens (MTP logits diverged, MTP-loss gradients failed parity).
+    """
+    torch.manual_seed(0)
+    T, H = 6, 4
+    base = torch.randn(T, H, requires_grad=True)
+
+    # Flat THD layout: [T, H], token axis is dim 0.
+    holder = _MtpEmbedOracleModel(mtp_layers=1)
+    flat = Step3p7ForConditionalGeneration._build_mtp_embed_inputs_from_embeds(holder, base)
+    expected_flat = torch.roll(base, shifts=-1, dims=0)
+    expected_flat = expected_flat.index_fill(0, torch.arange(T - 1, T), 0.0)
+    assert torch.allclose(flat[0], expected_flat), "flat layout must shift tokens, not channels"
+    # Gradient flows back through the shift.
+    flat[0].sum().backward()
+    assert base.grad is not None and base.grad.abs().sum() > 0
+    base.grad = None
+
+    # Batch-major layout: [B, S, H], token axis is dim 1 — unchanged behavior.
+    batched = torch.randn(2, T, H, requires_grad=True)
+    out_b = Step3p7ForConditionalGeneration._build_mtp_embed_inputs_from_embeds(
+        _MtpEmbedOracleModel(2), batched
+    )
+    # The builder rolls iteratively (one position per depth, chained), so depth d
+    # equals d successive single rolls — the trailing slot is re-zeroed each time.
+    oracle = batched
+    for depth in range(2):
+        oracle = torch.roll(oracle, shifts=-1, dims=1)
+        oracle = oracle.index_fill(1, torch.arange(T - 1, T), 0.0)
+        assert torch.allclose(out_b[depth], oracle), f"batch-major depth {depth} must shift tokens"
+
+    # Explicitly reject ambiguous layouts.
+    with pytest.raises(ValueError):
+        Step3p7ForConditionalGeneration._build_mtp_embed_inputs_from_embeds(
+            _MtpEmbedOracleModel(1), torch.randn(2, 3, 4, 5)
+        )

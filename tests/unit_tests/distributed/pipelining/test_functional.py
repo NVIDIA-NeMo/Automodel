@@ -873,7 +873,11 @@ class TestPrecomputeStageShapes:
             packed_sequence=True,
         )
 
-        assert stages[0].inputs_meta[0].shape == (8192,)
+        # Stage0's declared input keeps the singleton batch axis: the schedule's
+        # TensorChunkSpec(0) slices [num_chunks, T] on dim 0 before the model's
+        # own THD squeeze, so PipelineStage's runtime validation sees [1, T].
+        assert stages[0].inputs_meta[0].shape == (1, 8192)
+        # Inter-stage activations are flat [T, H].
         first_output = stages[0]._configure_outputs_meta.call_args[0][0]
         assert first_output[0].shape == (8192, 64)
         assert stages[1].inputs_meta[0].shape == (8192, 64)
