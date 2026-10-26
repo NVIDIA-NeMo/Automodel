@@ -12,31 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PEFT configuration without adapter or distributed runtime dependencies."""
+"""Compatibility import for the shared PEFT configuration."""
 
-from dataclasses import dataclass, field
-from typing import Literal
-
-import torch
-
-
-@dataclass
-class PeftConfig:
-    target_modules: list[str] | str | None = field(default_factory=list)
-    exclude_modules: list[str] | str | None = field(default_factory=list)
-    match_all_linear: bool = False
-    dim: int = 8
-    alpha: int = 32
-    # Note: we currently support DoRA for nn.Linear only.
-    use_dora: bool = False
-    dropout: float = 0.0
-    dropout_position: Literal["pre", "post"] = "post"
-    lora_A_init: str = "xavier"
-    lora_dtype: torch.dtype | str | None = None
-    use_memory_efficient_lora: bool = True
-    use_triton: bool = False
-    moe_rank_scaling: bool = False
-    # Storage mode, not a torch dtype: "unquantized" uses the ordinary floating-point
-    # experts with the model's configured precision (including FP32). "mxfp4"
-    # stores frozen expert bases as fp4-e2m1 + e8m0 scales and requires torch_mm.
-    expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized"
+from nemo_automodel.shared.peft_config import PeftConfig as PeftConfig

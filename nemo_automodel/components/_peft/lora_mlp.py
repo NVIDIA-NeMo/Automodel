@@ -249,6 +249,21 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
         (``h``, ``d_g``, ``d_e``), so the only new ``tokens x intermediate`` buffer is ``d_h``.
         Safe for single backward (no double-backward in LoRA SFT); ``grad_out`` and the LoRA
         ``A``/``B`` are never mutated.
+
+        Args:
+            ctx: Context saved by forward.
+            grad_outputs: Exactly one Tensor of shape [..., out_features], with arbitrary leading
+                dimensions matching forward's x and the forward output's dtype and device.
+
+        Returns:
+            Thirteen gradients in forward-input order:
+            (dx, None, dgA, dgB, None, None, duA, duB, None, None, ddA, ddB, None).
+            dx is None or Tensor of shape [..., in_features], restoring x's leading dimensions.
+            dgA and dgB have shapes [gate_rank, in_features] and [intermediate, gate_rank];
+            duA and duB have shapes [up_rank, in_features] and [intermediate, up_rank];
+            ddA and ddB have shapes [down_rank, intermediate] and [out_features, down_rank].
+            intermediate is the gate/up projection width; gate_rank, up_rank, and down_rank are
+            the corresponding adapter ranks. Tensor gradients match their input's dtype and device.
         """
         if len(grad_outputs) != 1:
             raise TypeError("SwiGLU backward requires exactly one output gradient")
@@ -433,7 +448,22 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: BackwardCFunction, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
-        """Recompute ReLU² + down-input, then backprop to x, up-LoRA, and down-LoRA."""
+        """Recompute ReLU² + down-input, then backprop to x, up-LoRA, and down-LoRA.
+
+        Args:
+            ctx: Context saved by forward.
+            grad_outputs: Exactly one Tensor of shape [..., out_features], with arbitrary leading
+                dimensions matching forward's x and the forward output's dtype and device.
+
+        Returns:
+            Nine gradients in forward-input order:
+            (dx, None, duA, duB, None, None, ddA, ddB, None).
+            dx is None or Tensor of shape [..., in_features], restoring x's leading dimensions.
+            duA and duB have shapes [up_rank, in_features] and [intermediate, up_rank];
+            ddA and ddB have shapes [down_rank, intermediate] and [out_features, down_rank].
+            intermediate is the up-projection width; up_rank and down_rank are the corresponding
+            adapter ranks. Tensor gradients match their input's dtype and device.
+        """
         if len(grad_outputs) != 1:
             raise TypeError("ReLU-squared backward requires exactly one output gradient")
         (grad_out,) = grad_outputs

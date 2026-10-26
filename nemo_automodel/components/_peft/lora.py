@@ -930,14 +930,18 @@ class LoRATritonFunction(torch.autograd.Function):
 
         Args:
             ctx: Autograd context containing the saved input and LoRA weights.
-            d_y: Tensor of shape ``[tokens, out_features]`` containing the output gradient in the forward compute
-                dtype.
+            grad_outputs: Exactly one Tensor of shape [tokens, out_features] in the forward compute dtype,
+                where tokens flattens the original batch and sequence axes for a 3D input.
 
         Returns:
-            Gradients for the custom autograd inputs. The input gradient has shape ``[tokens, in_features]`` or
-            ``[batch, sequence, in_features]`` and matches the original input dtype. LoRA weight gradients have
-            shapes ``[rank, in_features]`` and ``[out_features, rank]`` and match their weight dtypes. When a
-            residual input is present, its gradient matches the original residual shape.
+            Five gradients (dx, dA, dB, None, None) in forward-input order, with a sixth None when the
+            optional use_triton_kernel argument was supplied, and a seventh residual gradient when res
+            was supplied. dx is None or Tensor of shape [tokens, in_features] or
+            [batch, sequence, in_features], matching the original input. dA and dB are None or Tensors
+            of shape [rank, in_features] and [out_features, rank]. These gradients match their
+            corresponding input's dtype and device. The residual gradient is None when unrequested;
+            otherwise it has shape [tokens, out_features] or [batch, sequence, out_features], matching
+            the original residual, and retains the incoming gradient's dtype and device.
         """
         if len(grad_outputs) != 1:
             raise TypeError("LoRA backward requires exactly one output gradient")

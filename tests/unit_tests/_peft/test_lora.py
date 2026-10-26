@@ -125,8 +125,9 @@ def test_lora_patch_applies_to_selected_module_with_str_dtype(model):
 def test_peft_config_defaults_and_import_compatibility():
     """The existing import exposes the dataclass with its defaults and explicit overrides."""
     from nemo_automodel.components._peft.config import PeftConfig as ConfigPeftConfig
+    from nemo_automodel.shared.peft_config import PeftConfig as SharedPeftConfig
 
-    assert PeftConfig is ConfigPeftConfig
+    assert PeftConfig is ConfigPeftConfig is SharedPeftConfig
     assert PeftConfig().use_memory_efficient_lora is True
 
     cfg = PeftConfig(use_memory_efficient_lora=False)

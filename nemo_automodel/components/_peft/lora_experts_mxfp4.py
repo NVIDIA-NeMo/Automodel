@@ -227,7 +227,7 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
             output2 = torch.matmul(output1_, down_w0)
             output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
             if post_expert_output is not None:
-                output2 = post_expert_output(output2)
+                output2 = post_expert_output(output2) * 0
             y[0] += output2[0]
 
         return y

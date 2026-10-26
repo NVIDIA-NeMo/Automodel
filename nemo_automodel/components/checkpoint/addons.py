@@ -23,7 +23,6 @@ import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel.components._peft.config import PeftConfig as _AutomodelPeftConfig
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
     FQN_TO_DTYPE_MAPPING_FILENAME,
     FQN_TO_FILE_INDEX_MAPPING_FILENAME,
@@ -37,6 +36,7 @@ from nemo_automodel.components.moe.state_dict_mixin import (
     MoESplitExpertsStateDictMixin,
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from nemo_automodel.shared.peft_config import PeftConfig as _AutomodelPeftConfig
 
 if TYPE_CHECKING:
     from peft import PeftConfig

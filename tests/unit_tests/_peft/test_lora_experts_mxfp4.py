@@ -195,6 +195,47 @@ def test_mxfp4_no_routed_tokens(moe_config, device):
     assert x.grad is not None
 
 
+@pytest.mark.parametrize("callback", [None, torch.sigmoid], ids=["no_callback", "sigmoid"])
+def test_mxfp4_no_routed_tokens_cpu(moe_config, callback):
+    """Nonexistent routes contribute zero values and attached zero gradients."""
+    moe_config.dtype = torch.float32
+    orig = GroupedExperts(moe_config).cpu()
+    orig.use_torch_mm = True
+    with torch.no_grad():
+        orig.init_weights(buffer_device=torch.device("cpu"))
+    mx = GroupedExpertsLoRAMXFP4(orig, lora_dim=8, alpha=16)
+    # Exercise every adapter gradient, including A factors whose B defaults to zero.
+    with torch.no_grad():
+        mx.lora_gate_and_up_B.normal_()
+        mx.lora_down_B.normal_()
+    x, _, weights, indices = _routing_inputs(moe_config, 8, torch.device("cpu"), torch.float32)
+    token_mask = torch.zeros(8, dtype=torch.bool)
+
+    y = mx(x, token_mask, weights, indices, post_expert_output=callback)
+    torch.testing.assert_close(y, torch.zeros_like(x), atol=0, rtol=0)
+    y.sum().backward()
+    assert x.grad is not None
+    torch.testing.assert_close(x.grad, torch.zeros_like(x), atol=0, rtol=0)
+    for parameter in mx.parameters():
+        if parameter.requires_grad:
+            assert parameter.grad is not None
+            torch.testing.assert_close(parameter.grad, torch.zeros_like(parameter), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mxfp4_active_sigmoid_is_not_zeroed(moe_config, device):
+    """Two active zero-valued routes each contribute sigmoid(0) per feature."""
+    orig = GroupedExperts(moe_config).to(device)
+    orig.use_torch_mm = True
+    with torch.no_grad():
+        orig.gate_and_up_projs.zero_()
+        orig.down_projs.zero_()
+    mx = GroupedExpertsLoRAMXFP4(orig, lora_dim=8, alpha=16)
+    x, token_mask, weights, indices = _routing_inputs(moe_config, 8, device, torch.bfloat16)
+    y = mx(x, token_mask, weights, indices, post_expert_output=torch.sigmoid)
+    torch.testing.assert_close(y, torch.ones_like(y), atol=0, rtol=0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mxfp4_requires_torch_mm_backend(moe_config, device):
     orig = GroupedExperts(moe_config).to(device)  # default per-expert loop backend
