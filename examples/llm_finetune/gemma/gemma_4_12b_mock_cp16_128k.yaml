@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Gemma4 Unified 12B with 128K-token sequences under context parallelism (cp_size=8) on one 8-GPU node.
-# Each rank keeps a contiguous 16K-token slice; the sliding-window layers run Flex and the head_dim=512
+# Gemma4 Unified 12B with 128K-token sequences under context parallelism (cp_size=16) on two 8-GPU nodes.
+# Each rank keeps a contiguous 8K-token slice, the same shard length as the single-node 64K recipe (a 16K
+# shard per rank exceeds 80 GB per GPU); the sliding-window layers run Flex and the head_dim=512
 # full-attention ring chunks run the FFPA kernel (install the `ffpa` extra: uv sync --extra ffpa).
 # The data is the built-in synthetic LLM mock (one 128K-token sample per row), so the recipe is
 # self-contained and measures memory and throughput, not convergence.
 #
-# To run:
-#   automodel examples/llm_finetune/gemma/gemma_4_12b_mock_cp8_128k.yaml --nproc-per-node 8
+# To run, on each of the two nodes (node 0 is the rendezvous master):
+#   torchrun --nnodes 2 --node-rank <0|1> --master-addr <node-0 address> --master-port 29500 --nproc-per-node 8 \
+#     examples/llm_finetune/finetune.py --config examples/llm_finetune/gemma/gemma_4_12b_mock_cp16_128k.yaml
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -53,13 +55,13 @@ distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 1
-  cp_size: 8  # 131072 / 8 = 16384 tokens per rank
+  cp_size: 16  # 131072 / 16 = 8192 tokens per rank, over two nodes
   pp_size: 1
   sequence_parallel: false
   activation_checkpointing: true
 
-# Fused linear CE: at 16K tokens per rank the materialized 262K-vocab logits alone need 8 GiB in bf16 plus
-# 16 GiB for the fp32 upcast, which does not fit next to the activations on an 80 GB GPU.
+# Fused linear CE: at 8K tokens per rank the materialized 262K-vocab logits alone need 4 GiB in bf16 plus
+# 8 GiB for the fp32 upcast, which does not fit next to the activations on an 80 GB GPU.
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
   logit_softcapping: 30.0  # Gemma4's final_logit_softcapping
@@ -94,5 +96,6 @@ ci:
   cluster_tag: h100
   recipe_owner: khazic
   time: "00:40:00"
-  nodes: 1
+  # cp_size(16) = 16 GPUs => 2 nodes (8 GPUs/node).
+  nodes: 2
   nproc_per_node: 8
