@@ -483,6 +483,31 @@ def _global_doc_ids_from_batch(batch: dict, seq_len: int, device: torch.device) 
     return doc_ids
 
 
+def _valid_first_token_order(doc_ids: torch.Tensor) -> torch.Tensor | None:
+    """Return a stable per-row order that moves masked tokens behind valid tokens.
+
+    Without CP, KDA compacts masked tokens away, so a masked span inside a
+    document, such as an injected fake image, does not interrupt that
+    document's convolution or recurrent state. FLA's CP kernels instead start
+    a new segment at every document-id change. Moving masked tokens to the
+    row's trailing padding gives every CP rank the non-CP valid-token
+    sequence; K3 attention applies no rotary positions, so only the relative
+    order of valid tokens matters.
+
+    Args:
+        doc_ids: Document IDs of shape [batch, sequence], with zero marking
+            masked tokens.
+
+    Returns:
+        Source indices of shape [batch, sequence], or None when no masked
+        token precedes a valid token.
+    """
+    masked = doc_ids <= _PAD_DOC_ID
+    if not bool((masked[:, :-1] & ~masked[:, 1:]).any()):
+        return None
+    return torch.argsort(masked.to(torch.int8), dim=1, stable=True)
+
+
 def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, padding_token_id: int = 0):
     """Shard a batch contiguously across the context-parallel mesh for Kimi K3.
 
@@ -533,6 +558,15 @@ def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, pa
         )
     elif batch["position_ids"].ndim == 2 and batch["position_ids"].shape[0] == 1 and input_ids.shape[0] > 1:
         batch["position_ids"] = batch["position_ids"].expand(input_ids.shape[0], -1).contiguous()
+
+    token_order = _valid_first_token_order(doc_ids) if cp_size > 1 else None
+    if token_order is not None:
+        for key in ("input_ids", "labels", "position_ids", "padding_mask"):
+            if key in batch:
+                batch[key] = batch[key].gather(1, token_order)
+        doc_ids = doc_ids.gather(1, token_order)
+        if loss_mask is not None:
+            loss_mask = loss_mask.gather(1, token_order)
 
     pad_len = (-seq_len) % cp_size
     if pad_len:
@@ -602,14 +636,24 @@ def shard_batch_for_kimi_vlm_cp(
 
     Returns:
         Context factory, mutated batch, and original/padded sequence lengths.
-        Token IDs retain shape [batch, global_sequence]; labels, positions and
-        masks use [batch, padded_sequence / cp_size]. Global document metadata
-        has shape [batch, padded_sequence].
+        Token IDs retain shape [batch, global_sequence] in source order; labels,
+        positions and masks use [batch, padded_sequence / cp_size]. Global
+        document metadata has shape [batch, padded_sequence]. When masked tokens
+        precede valid ones, ``kimi_vlm_token_order`` [batch, padded_sequence]
+        holds the source index of each sharded position.
     """
     full_input_ids = batch["input_ids"]
+    seq_len = full_input_ids.shape[1]
+    cp_size = 1 if cp_mesh is None else cp_mesh.size()
+    token_order = None
+    if cp_size > 1:
+        token_order = _valid_first_token_order(_global_doc_ids_from_batch(batch, seq_len, full_input_ids.device))
     context, batch, layout = shard_batch_for_kimi_cp(
         cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
     )
     batch["input_ids"] = full_input_ids
     batch["kimi_vlm_full_input"] = True
+    if token_order is not None:
+        tail = torch.arange(seq_len, layout.padded_seq_len, device=token_order.device)
+        batch["kimi_vlm_token_order"] = torch.cat((token_order, tail.expand(token_order.shape[0], -1)), dim=1)
     return context, batch, layout

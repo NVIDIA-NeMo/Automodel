@@ -334,6 +334,7 @@ def test_vlm_cp_keeps_full_image_stream_and_shards_auxiliary_tokens():
     assert local["position_ids"].tolist() == [[1, 2, 3, 4, 5, 6, 0, 0]]
     assert local["labels"].shape == (1, 8)
     assert local["kimi_packed_doc_ids"].tolist() == [[1] * 5 + [2] * 2 + [3] * 7 + [0] * 2]
+    assert "kimi_vlm_token_order" not in local
     assert layout.padded_seq_len == 16
 
 

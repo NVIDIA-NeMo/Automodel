@@ -322,6 +322,7 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
         kimi_vlm_full_input: bool = False,
+        kimi_vlm_token_order: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast | torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run text-only or multimodal K3 inputs.
@@ -344,6 +345,9 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
             output_hidden_states: Whether to return final hidden states.
             kimi_vlm_full_input: Whether CP left the primary token stream intact
                 for image embedding before contiguous sequence sharding.
+            kimi_vlm_token_order: Optional source index of each CP sequence
+                position [batch, padded_sequence], set when CP moved masked
+                tokens behind valid ones.
             **kwargs: Text-backbone metadata, following KimiK3ForCausalLM.forward.
 
         Returns:
@@ -387,7 +391,11 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
 
         full_primary = kimi_vlm_full_input and input_ids is not None and not input_ids.is_floating_point()
         if full_primary:
-            attention_mask = kwargs["kimi_packed_doc_ids"][:, : input_ids.shape[1]]
+            doc_ids = kwargs["kimi_packed_doc_ids"]
+            if kimi_vlm_token_order is not None:
+                # Media ownership is checked in source token order.
+                doc_ids = torch.empty_like(doc_ids).scatter_(1, kimi_vlm_token_order, doc_ids)
+            attention_mask = doc_ids[:, : input_ids.shape[1]]
 
         if pixel_values is not None:
             if self.vision_tower is None or self.mm_projector is None:
@@ -421,6 +429,9 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                 inputs_embeds = self.get_input_embeddings()(input_ids)
             global_length = kwargs["kimi_packed_doc_ids"].shape[1]
             inputs_embeds = F.pad(inputs_embeds, (0, 0, 0, global_length - inputs_embeds.shape[1]))
+            if kimi_vlm_token_order is not None:
+                order = kimi_vlm_token_order.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1])
+                inputs_embeds = inputs_embeds.gather(1, order)
             local_length = global_length // kwargs["kimi_packed_cp_size"]
             inputs_embeds = inputs_embeds[
                 :, kwargs["kimi_packed_seq_start"] : kwargs["kimi_packed_seq_start"] + local_length

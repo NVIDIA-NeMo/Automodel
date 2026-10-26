@@ -84,6 +84,25 @@ def test_kimi_cp_sharder_keeps_contiguous_tokens_and_global_document_map():
     assert layout.padded_seq_len == 8
 
 
+def test_kimi_cp_sharder_moves_masked_holes_behind_valid_tokens():
+    """A masked span inside a document must not split it into separate CP segments."""
+    batch = {
+        "input_ids": torch.arange(8).unsqueeze(0),
+        "labels": torch.arange(10, 18).unsqueeze(0),
+        "attention_mask": torch.tensor([[1, 1, 0, 0, 1, 1, 1, 0]]),
+    }
+    loss_mask = torch.tensor([[1, 1, 0, 0, 1, 1, 0, 0]])
+
+    _, local_batch, _ = shard_batch_for_kimi_cp(_FakeCPMesh(), None, batch, loss_mask=loss_mask)
+
+    # Valid tokens 0, 1, 4, 5, 6 keep their order; masked tokens 2, 3, 7 trail them.
+    assert local_batch["kimi_packed_doc_ids"].tolist() == [[1, 1, 1, 1, 1, 0, 0, 0]]
+    assert local_batch["input_ids"].tolist() == [[6, 2, 3, 7]]
+    assert local_batch["labels"].tolist() == [[16, 12, 13, 17]]
+    assert local_batch["loss_mask"].tolist() == [[0, 0, 0, 0]]
+    assert local_batch["padding_mask"].tolist() == [[False, True, True, True]]
+
+
 def test_kimi_cp_sharder_consumes_dataset_packing_metadata():
     batch = {
         "input_ids": torch.arange(8).unsqueeze(0),
