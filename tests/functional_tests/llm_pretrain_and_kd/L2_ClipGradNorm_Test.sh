@@ -17,8 +17,8 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 
-# Detect available GPU count
-GPU_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader | head -1)
+# Read the first count while draining stdout to avoid SIGPIPE under pipefail.
+GPU_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader | sed -n '1p')
 echo "Detected $GPU_COUNT GPUs"
 
 # Set CUDA_VISIBLE_DEVICES based on available GPUs
