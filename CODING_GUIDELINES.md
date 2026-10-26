@@ -5,17 +5,21 @@ Draft for humans and coding agents. Existing repository policies remain authorit
 ## Design
 
 - **Separate concerns.** Give each function and class one cohesive responsibility.
-- **Keep functions small.** Extract cohesive helpers when control flow becomes hard to follow.
+- **Extract around responsibility.** Split code when responsibilities, dependencies, or lifetimes differ.
+  Keep cohesive algorithms together; do not extract helpers based on line count alone.
 - **Keep argument lists short.** Pass only necessary inputs; group related settings in typed configs.
-- **Avoid function pointers and ad-hoc callback dispatch.** In Python, this includes
-  callback arguments such as `step_fn`, stored function references, and tables of
-  callables used to select behavior. Prefer direct calls or named methods on a typed
-  interface so behavior and ownership are easy to trace. When a framework requires
-  callbacks, give them explicit typed signatures and a clear lifecycle.
+- **Use explicit contracts for variation.** Prefer typed attributes, capabilities, and existing interfaces
+  over repeated runtime introspection, ad-hoc string dispatch, or untyped parameter bags.
+  Use narrow, typed callbacks or model-owned hooks when they express a necessary operation;
+  document when they run and who owns their state.
 - **Avoid globals.** Keep mutable state with its owner and pass dependencies explicitly.
 - **Keep APIs small.** Reuse existing components and avoid speculative abstractions.
+  Introduce shared abstractions only when existing callers share stable semantics.
 - **Respect ownership.** Keep model-specific logic in its model package and recipes as thin orchestration.
 - **Let configs own construction.** Use typed `build(...)` methods; keep runtime objects out of serializable configs.
+  Preserve typed configs internally, serialize at shared boundaries, and do not mutate configs during construction.
+- **Keep artifact versions consistent.** Resolve related external artifacts, such as configs and weights,
+  to a consistent immutable revision and propagate that identity through dependent loads.
 
 ## Types and contracts
 
@@ -26,15 +30,41 @@ Draft for humans and coding agents. Existing repository policies remain authorit
 - **Use contracts where applicable.** Define interfaces with typed signatures, dataclasses, or `Protocol`;
   document assumptions, ownership, and failure modes.
 - **Document tensor contracts.** State shapes, axis order, relevant dtype/device requirements, and distributed placements.
-- **Validate boundaries.** Raise specific exceptions for invalid inputs and preserve exception causes.
+- **Preserve semantic contracts.** Transformations must preserve token/label/media alignment, document boundaries,
+  parameter identity, and distributed placements where applicable. Document these relationships alongside shapes and types.
+- **Treat precision as part of correctness.** Distinguish storage, compute, and accumulation dtypes.
+  Preserve precision-sensitive state through casts and serialization. Verify gradients and required reproducibility
+  when rewriting tensor operations or reductions.
+- **Validate boundaries.** Reject invalid inputs and unsupported combinations early at ownership and trust boundaries.
+  Raise specific exceptions and preserve exception causes. Use safe serialization defaults, preserve argument boundaries
+  when constructing commands, and localize compatibility handling to adapters.
 - **Follow repository tooling.** Use Ruff, Google-style docstrings, `uv`, and `safe_import()` for optional dependencies.
+
+## State and resource ownership
+
+- **Make ownership explicit.** Do not mutate caller-owned inputs unless the API documents it.
+  Document tensor aliasing and ownership transfer.
+- **Bound resource lifetimes.** Keep asynchronous resources alive until completion, release transient state after
+  consumption, and handle cleanup on failure or early termination, including activation-checkpoint recomputation.
+- **Keep state transitions coherent and recoverable.** Establish valid state before use and publish results only after
+  successful completion. Define behavior for partial failure, retries, and repeated initialization or restoration;
+  do not expose partially updated state as a successful result.
 
 ## Changes and validation
 
 - Keep changes focused and preserve compatibility, or provide a migration path.
-- Test observable behavior and failure cases; check forward and backward parity for tensor math.
+- Test observable behavior and failure cases. Regression tests should demonstrate the original failure.
+  Exercise the production entry point when helper tests cannot establish integration correctness;
+  check forward and backward parity for tensor math.
 - Use real multi-process tests for distributed behavior that mocks cannot exercise.
+- Support performance changes with representative measurements. Report the workload, environment, throughput,
+  and memory tradeoffs; distinguish isolated improvements from end-to-end gains.
+- When adding or changing a quality gate, verify that it covers the intended files and rejects a known violation.
+  Keep suppressions and exceptions narrow, justified, and tracked for removal when temporary.
 - Report checks run, results, and remaining gaps. Sign off commits with DCO.
 
 Details: [contributing](CONTRIBUTING.md), [agent instructions](AGENTS.md),
-[review policy](skills/pr-review/SKILL.md), and [testing](.agents/contributor-skills/testing/SKILL.md).
+[review policy](skills/pr-review/SKILL.md), [testing](.agents/contributor-skills/testing/SKILL.md),
+[parity testing](.agents/contributor-skills/parity-testing/SKILL.md),
+[distributed training](skills/nemo-automodel-distributed-training/SKILL.md),
+and [checkpointing](docs/guides/checkpointing.mdx).
