@@ -9,8 +9,8 @@ This document is the top-level reference for any AI agent working in this
 repository. Read it first, then consult the relevant skill file for the task at
 hand.
 
-Read the shared [draft coding guidelines](CODING_GUIDELINES.md) alongside these
-instructions; existing repository policies remain authoritative.
+Follow the shared [coding guidelines](CODING_GUIDELINES.md) alongside these
+instructions. Existing code may not yet comply as refactoring proceeds.
 
 ---
 

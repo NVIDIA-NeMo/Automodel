@@ -1,6 +1,8 @@
 # Coding guidelines
 
-Draft for humans and coding agents. Existing repository policies remain authoritative.
+These guidelines apply to human contributors and coding agents. Follow them when
+adding or modifying code. Existing code is being refactored incrementally and may
+not yet comply; use these guidelines to guide changes within your task's scope.
 
 ## Design
 

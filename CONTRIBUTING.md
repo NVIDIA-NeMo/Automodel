@@ -2,9 +2,9 @@
 
 ## Coding guidelines
 
-Read the [draft coding guidelines](CODING_GUIDELINES.md) for humans and coding
-agents. Existing repository policies remain authoritative. Agents must also follow
-[AGENTS.md](AGENTS.md) and applicable contributor skills.
+Follow the [coding guidelines](CODING_GUIDELINES.md) when adding or modifying code.
+Existing code is being refactored incrementally and may not yet comply. Agents
+must also follow [AGENTS.md](AGENTS.md) and applicable contributor skills.
 
 ## Environment setup for Automodel
 
