@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -253,7 +254,7 @@ def test_parser_accepts_required_args():
     assert args.dtype == "bf16"
 
 
-@pytest.mark.parametrize("model_type", ["deepseek_v4", "glm_moe_dsa", "minimax_m3_vl"])
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41", "glm_moe_dsa", "kimi_k3", "minimax_m3_vl"])
 def test_precompute_rejects_targets_that_need_specialized_online_loading(monkeypatch, tmp_path, model_type):
     import nemo_automodel.components.speculative.precompute_dspark as precompute_dspark
 
@@ -278,6 +279,45 @@ def test_precompute_rejects_targets_that_need_specialized_online_loading(monkeyp
 
     with pytest.raises(ValueError, match=f"model_type='{model_type}'"):
         _run(args)
+
+
+@pytest.mark.parametrize(
+    "extra_config, rejected",
+    [({"attn_res_block_size": 12}, True), ({"attn_res_block_size": None}, True), ({}, False)],
+)
+def test_precompute_separates_kimi_k3_text_export_from_kimi_linear_48b(monkeypatch, tmp_path, extra_config, rejected):
+    import nemo_automodel.components.speculative.precompute_dspark as precompute_dspark
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "config.json").write_text(json.dumps({"model_type": "kimi_linear", **extra_config}))
+
+    class _PastGuard(Exception):
+        pass
+
+    def _reach_config(*_args, **_kwargs):
+        raise _PastGuard
+
+    monkeypatch.setattr(precompute_dspark.AutoConfig, "from_pretrained", _reach_config)
+    args = _build_parser().parse_args(
+        [
+            "--target-model",
+            str(target),
+            "--input-data",
+            "data.jsonl",
+            "--output-dir",
+            str(tmp_path / "cache"),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    if rejected:
+        with pytest.raises(ValueError, match="model_type='kimi_linear'"):
+            _run(args)
+    else:
+        with pytest.raises(_PastGuard):
+            _run(args)
 
 
 def test_resume_compatibility_rejects_manifest_mismatch(tmp_path):

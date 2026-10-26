@@ -85,7 +85,8 @@ def _load_openai_messages(
     through to ``load_dataset`` as-is (no default override).
 
     For local files, we manually parse JSONL/JSON to avoid pyarrow type
-    inference issues (e.g., heterogeneous field types under `tools`).
+    inference issues (e.g., heterogeneous field types under `tools`).  A
+    slice in *split* is applied to the parsed rows in file order.
 
     Args:
         path_or_dataset_id: HF dataset ID or local file path(s).
@@ -184,6 +185,12 @@ def _load_openai_messages(
 
     for f in files:
         _read_file(f)
+
+    # Honor a split slice such as ``train[:1024]`` like the HF and Parquet
+    # branches do. Local rows are not shuffled, so the slice is in file order.
+    _, sl = _parse_split_slice(split)
+    if sl is not None:
+        rows = rows[sl]
 
     return rows
 
@@ -470,7 +477,9 @@ class ChatDataset(Dataset):
 
         # Ensure pad token presence for downstream padding
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
-        self.pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
+        self.pad_token_id = _add_pad_token(self.tokenizer)
+        if self.pad_token_id is None:
+            self.pad_token_id = eos_token_id
 
     def __len__(self) -> int:
         return len(self.dataset)

@@ -111,5 +111,8 @@ optimizer:
   weight_decay: 0
 
 ci:
+  # Retained for reproducibility; excluded from automatic GPU CI.
+  deprecated: true
+  cluster_tag: h100
   time: "00:30:00"
   nodes: 8

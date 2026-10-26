@@ -139,6 +139,7 @@ wandb:
   dir: logs/muse_glimmer_30b_medpix_lora/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 1
   time: "01:00:00"

@@ -119,6 +119,7 @@ wandb:
 # google/gemma-4-31B (base) ships no chat template; it is supplied via dataset.chat_template
 # (applied to the processor by the VLM loader), so no manual staging onto the model dir is needed.
 ci:
+  cluster_tag: h100
   recipe_owner: athitten
   nodes: 4
   time: "02:00:00"                     # full 1000-step train (4 nodes) + IFEval

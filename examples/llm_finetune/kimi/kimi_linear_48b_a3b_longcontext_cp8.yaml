@@ -145,6 +145,7 @@ wandb:
   dir: result/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: huiyingl
   nodes: 1
   time: "01:00:00"

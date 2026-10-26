@@ -1472,12 +1472,13 @@ class TestCalculateLoss:
         from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 
         loss_fn = FusedLinearCrossEntropy()
-        hidden_states = torch.randn(2, 10, 64, device="cuda")
+        # The cce kernel projects bf16/fp16 operands only.
+        hidden_states = torch.randn(2, 10, 64, device="cuda", dtype=torch.bfloat16)
         labels = torch.randint(0, 100, (2, 10), device="cuda")
 
         # Mock model with lm_head
         model = MagicMock()
-        lm_head = torch.nn.Linear(64, 100).cuda()
+        lm_head = torch.nn.Linear(64, 100, dtype=torch.bfloat16).cuda()
         model.get_output_embeddings.return_value = lm_head
 
         loss = calculate_loss(
@@ -1498,7 +1499,7 @@ class TestCalculateLoss:
         from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 
         loss_fn = FusedLinearCrossEntropy()
-        hidden_states = torch.randn(2, 5, 32, device="cuda")
+        hidden_states = torch.randn(2, 5, 32, device="cuda", dtype=torch.bfloat16)
         labels = torch.randint(0, 50, (2, 5), device="cuda")
 
         # Use a module that has lm_head parameters but no get_output_embeddings
@@ -1508,7 +1509,7 @@ class TestCalculateLoss:
 
             def __init__(self):
                 super().__init__()
-                self._lm_head = torch.nn.Linear(32, 50).cuda()
+                self._lm_head = torch.nn.Linear(32, 50, dtype=torch.bfloat16).cuda()
 
             def named_parameters(self, remove_duplicate=False):
                 return [("lm_head.weight", self._lm_head.weight), ("lm_head.bias", self._lm_head.bias)]
@@ -3689,7 +3690,7 @@ def _patches_for_packing(neat_pack_side_effect):
                 "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
                 side_effect=neat_pack_side_effect,
             ),
-            patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", stateful_dataloader),
+            patch("nemo_automodel.components.datasets.vlm.loader._VlmStatefulDataloader", stateful_dataloader),
             patch(
                 "nemo_automodel.components.models.common.packing.configure_packing",
                 return_value=packing_contract,
