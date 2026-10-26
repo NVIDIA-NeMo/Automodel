@@ -79,6 +79,16 @@ def test_tie_identity_and_native_registry():
     assert model.model.language_model.rotary_emb.inv_freq.dtype == torch.float32
 
 
+def test_loader_selects_native_d1_only_for_explicit_publisher_mapping() -> None:
+    ordinary = tiny_config()
+    assert ModelRegistry.resolve_custom_model_cls("Lfm2VlForConditionalGeneration", ordinary) is None
+    publisher = Lfm2VlConfig(**ordinary.to_dict(), auto_map={"AutoModel": "modeling_d1.D1Model"})
+    assert (
+        ModelRegistry.resolve_custom_model_cls("Lfm2VlForConditionalGeneration", publisher)
+        is Lfm2VlForConditionalGeneration
+    )
+
+
 @pytest.mark.parametrize("rope_type", ["linear", "yarn"])
 @pytest.mark.parametrize(
     "device",
@@ -222,8 +232,9 @@ def test_causal_text_readout_preserves_full_model_alias_scores_and_head_gradient
 @pytest.mark.parametrize("tied", [False, True])
 @pytest.mark.parametrize("use_cache", [False, True])
 @pytest.mark.parametrize("with_image", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_selected_model_generates_like_hf_for_ordinary_lfm2_vl(
-    tied: bool, use_cache: bool, with_image: bool, monkeypatch: pytest.MonkeyPatch
+    tied: bool, use_cache: bool, with_image: bool, monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype
 ) -> None:
     """The actual default loader preserves text/image generation and cache behavior."""
     torch.manual_seed(731)
@@ -239,14 +250,14 @@ def test_selected_model_generates_like_hf_for_ordinary_lfm2_vl(
         cls=NeMoAutoModelForImageTextToText,
         pretrained_model_name_or_path_or_config=config,
         attn_implementation="sdpa",
-        torch_dtype=torch.float32,
+        torch_dtype=dtype,
         quantization_config=None,
         force_hf=False,
     )
-    assert is_custom
-    assert isinstance(model, Lfm2VlForConditionalGeneration)
+    assert not is_custom
+    assert isinstance(model, HFLfm2VlForConditionalGeneration)
     assert model.can_generate()
-    reference = HFLfm2VlForConditionalGeneration(config)
+    reference = HFLfm2VlForConditionalGeneration._from_config(config, dtype=dtype, attn_implementation="sdpa")
     reference.load_state_dict(model.state_dict(), strict=True)
     model.to(device).eval()
     reference.to(device).eval()
@@ -257,7 +268,7 @@ def test_selected_model_generates_like_hf_for_ordinary_lfm2_vl(
     )
     image_args = (
         {
-            "pixel_values": torch.randn(1, 16, 768, device=device),
+            "pixel_values": torch.randn(1, 16, 768, device=device, dtype=dtype),
             "spatial_shapes": torch.tensor([[4, 4]], device=device),
             "pixel_attention_mask": torch.ones(1, 16, dtype=torch.int32, device=device),
         }

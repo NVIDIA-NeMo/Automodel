@@ -167,7 +167,7 @@ class TrainCLMHeadsRecipe(BaseRecipe):
             ),
         )
         tokenizer.padding_side = "right"
-        # vLLM's ``truncate_prompt_tokens`` keeps the *last* tokens; match it matching the input contract used by clm-serve.
+        # vLLM's ``truncate_prompt_tokens`` keeps the *last* tokens; match it the input contract used by clm-serve.
         tokenizer.truncation_side = "left"
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token

@@ -23,7 +23,8 @@ import torch
 import torch.distributed.checkpoint as dcp
 from safetensors.torch import load_file
 
-from nemo_automodel.components.models.clef.joint_schema_head import ClefHeadConfig, save_joint_head
+from nemo_automodel.components.models.clef.joint_schema_head import save_joint_head
+from nemo_automodel.components.models.clef.stage import ClefStageManifest
 
 logger = logging.getLogger(__name__)
 
@@ -73,13 +74,11 @@ def export_release(base: str | Path, *, revision: str, stage: Path, out: Path) -
 
     base = Path(base) if Path(base).is_dir() else Path(snapshot_download(base, revision=revision))
     stage, out = Path(stage), Path(out)
-    manifest = json.loads((stage / "stage.json").read_text())
-    if manifest.get("format") != "clef-native-stage-v1":
-        raise ValueError("export requires a published native CLEF stage")
+    manifest = ClefStageManifest.load(stage)
     if (stage / ".incomplete").exists():
         raise ValueError("cannot export an incomplete stage")
     adapter, scale = {}, 0.0
-    if manifest["backbone_adapter"]:
+    if manifest.backbone_adapter:
         meta = json.loads((stage / "model" / "adapter_config.json").read_text())
         if meta.get("use_dora"):
             raise ValueError("CLEF merged export currently supports ordinary LoRA, not DoRA")
@@ -95,7 +94,7 @@ def export_release(base: str | Path, *, revision: str, stage: Path, out: Path) -
     model.load_state_dict(state)
     logger.info("merged %d LoRA modules (scale %.3f)", n, scale)
     model.save_pretrained(out)
-    head = ClefHeadConfig(**manifest["head_config"]).build()
+    head = manifest.head_config.build()
     head_state = head.state_dict()
     dcp.load(head_state, checkpoint_id=str(stage / "head"))
     head.load_state_dict(head_state, strict=True)

@@ -20,7 +20,7 @@
 #
 # The implementation and tutorial follow this repository's Apache 2.0 license. Model loading uses pinned public publisher downloads; downloaded weights and remote publisher components retain their [publisher license](https://www.liquid.ai/lfm-license). No model weights, executed outputs or measured performance are bundled here.
 #
-# This notebook has CPU source/default-path checks only. Full GPU model loading, training, publisher comparisons and media paths have not been run as part of this preparation. It uses text-only fictional observations and makes no image/audio adaptation claim. Checkpoint self-reload, sampled publisher agreement and full numerical equivalence remain separate checks. Set `RUN_TRAINING=True` only in a prepared single-GPU environment.
+# Notebook source/default-path checks are CPU-only; this notebook has not been executed end-to-end. Separate released-checkpoint GPU, publisher and media acceptance is documented in the [D1 acceptance notes](../../tests/functional_tests/decision_models/d1/README.md), with its precision and fixture limitations. It uses text-only fictional observations and makes no image/audio adaptation claim. Checkpoint self-reload, sampled publisher agreement and full numerical equivalence remain separate checks. Set `RUN_TRAINING=True` only in a prepared single-GPU environment.
 
 # %%
 from __future__ import annotations

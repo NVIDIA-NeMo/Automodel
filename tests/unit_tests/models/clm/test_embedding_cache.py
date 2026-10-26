@@ -15,10 +15,39 @@
 """Feature-cache identity covers the full frozen-encoder contract."""
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
+import torch
 
-from nemo_automodel.components.models.clm.heads import CLMEmbeddingCacheConfig
+from nemo_automodel.components.models.clm.heads import CLMEmbeddingCacheConfig, EmbeddingTable
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_interrupted_cache_save_never_publishes_partial_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    path = tmp_path / "embeddings.pt"
+    table = EmbeddingTable(["state"], torch.ones(1, 8))
+    if existing:
+        table.save(path)
+    previous = path.read_bytes() if existing else None
+
+    def interrupted_save(value: object, destination: Path) -> None:
+        destination.write_bytes(b"incomplete tensor archive")
+        raise OSError("interrupted cache publication")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "save", interrupted_save)
+        with pytest.raises(OSError, match="interrupted cache publication"):
+            table.save(path)
+    assert path.exists() == existing
+    if existing:
+        assert path.read_bytes() == previous
+        torch.testing.assert_close(EmbeddingTable.load(path).lookup(["state"]), torch.ones(1, 8))
+    assert list(tmp_path.iterdir()) == ([path] if existing else [])
+    table.save(path)
+    torch.testing.assert_close(EmbeddingTable.load(path).lookup(["state"]), torch.ones(1, 8))
 
 
 def config():

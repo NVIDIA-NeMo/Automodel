@@ -20,14 +20,15 @@ import json
 import numpy as np
 import torch
 from d1_publisher_fixtures import initialize_nonunit_rmsnorm
+from PIL import Image
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
 from nemo_automodel.components.models.d1.config import D1OmniConfig
 from nemo_automodel.components.models.d1.model import (
     OMNI_REPOSITORY,
     OMNI_REVISION,
     D1OmniModel,
 )
-from PIL import Image
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 
 def main() -> None:
@@ -85,7 +86,7 @@ def main() -> None:
     released_config = released_class.config_class(**config.to_dict())
     released = released_class(released_config).eval().to(device)
     nonunit_rmsnorms = initialize_nonunit_rmsnorm(released)
-    native = D1OmniModel(config).eval().to(device)
+    native = D1OmniModel(config, trust_remote_code=True).eval().to(device)
     expected = released.state_dict()
     assert set(native.state_dict()) == set(expected)
     native.load_state_dict(expected, strict=True)

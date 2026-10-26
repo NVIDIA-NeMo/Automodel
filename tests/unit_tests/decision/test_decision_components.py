@@ -14,7 +14,9 @@
 
 """CPU unit tests for decision-model post-training utilities."""
 
+import json
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -80,6 +82,29 @@ def test_validate_and_targets_follow_model_order():
 def test_validate_rejects_unknown_answer():
     record = make_record(verdict="ransomware")
     with pytest.raises(ValueError):
+        schema.validate_record(record)
+
+
+@pytest.mark.parametrize(
+    "rewards",
+    [
+        {},
+        {"malicious": 1.0},
+        {"malicious": float("nan"), "benign_authorized": 0.0, "false_positive": 0.0},
+        {"malicious": "bad", "benign_authorized": 0.0, "false_positive": 0.0},
+    ],
+)
+def test_validate_rejects_malformed_reward_tables_before_training(rewards: dict[str, object]) -> None:
+    record = make_record()
+    record["rewards"]["verdict"] = rewards
+    with pytest.raises(ValueError, match="record 'r1', question 'verdict': rewards"):
+        schema.validate_record(record)
+
+
+def test_validate_rejects_rewards_for_an_unknown_question() -> None:
+    record = make_record()
+    record["rewards"]["unknown"] = {"option": 1.0}
+    with pytest.raises(ValueError, match="rewards for unknown question"):
         schema.validate_record(record)
 
 
@@ -168,12 +193,15 @@ def test_metrics_summary_and_table():
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-def test_clm_rendering_matches_reference_package():
-    clm_schema = pytest.importorskip("clm.schema")
-    record = make_record()
-    mine = clm_prompting.clm_pairs(record)
-    ref = clm_schema.build_pairs(record["state"], record["questions"])
-    assert mine == {k: (v[0], list(v[1]), list(v[2])) for k, v in ref.items()}
+def _clm_reference() -> dict:
+    path = Path(__file__).resolve().parents[1] / "models/clm/fixtures/reference.json"
+    return json.loads(path.read_text())
+
+
+def test_clm_rendering_matches_pinned_reference() -> None:
+    fixture = _clm_reference()
+    assert fixture["provenance"]["revision"] == "d5f9ef0fd9bde185df0ceaad4f4ecc6cfe8c34f6"
+    assert clm_prompting.clm_pairs(fixture["record"]) == {k: tuple(v) for k, v in fixture["rendered_pairs"].items()}
 
 
 def test_clm_heads_roundtrip_and_logits(tmp_path):
@@ -199,22 +227,33 @@ def test_clm_heads_roundtrip_and_logits(tmp_path):
     assert all(x.abs().max() <= heads.scale + 1e-4 for x in a)
 
 
-def test_clm_heads_match_reference_package(tmp_path):
-    clm_heads = pytest.importorskip("clm.heads")
-    import numpy as np
-
+def test_clm_heads_match_pinned_reference_forward_and_backward() -> None:
+    fixture = _clm_reference()
+    cfg = fixture["config"]
     heads = clm.CLMHeadConfig(
-        hidden_size=32, width=64, depth=3, projection_dim=16, activation="gelu", layer_norm=True, residual=False
-    ).build(initial_temperature=math.exp(-2.0))
-    path = tmp_path / "heads.pt"
-    clm.save_clm_heads(heads, path)
-    pair = clm_heads.HeadPair("t", str(path), device="cpu").ensure()
-    states = np.random.randn(4, 32).astype("float32")
-    zs_ref, za_ref = pair.project(states, states)
-    with torch.no_grad():
-        zs = heads.project_states(torch.from_numpy(states)).numpy()
-    assert np.allclose(zs, zs_ref, atol=1e-5)
-    assert math.isclose(pair.scale, heads.scale.item(), rel_tol=1e-6)
+        hidden_size=cfg["hidden_size"],
+        width=cfg["width"],
+        depth=cfg["depth"],
+        projection_dim=cfg["projection_dim"],
+        activation=cfg["activation"],
+        layer_norm=cfg["layernorm"],
+        residual=cfg["residual"],
+    ).build(initial_temperature=math.exp(-fixture["logit_scale"]))
+    for name in ("state_head", "action_head"):
+        getattr(heads, name).load_state_dict({key: torch.tensor(value) for key, value in fixture[name].items()})
+    states = torch.tensor(fixture["state_embeddings"], requires_grad=True)
+    actions = torch.tensor(fixture["action_embeddings"], requires_grad=True)
+    torch.testing.assert_close(
+        heads.project_states(states), torch.tensor(fixture["state_projections"]), atol=1e-6, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        heads.project_actions(actions), torch.tensor(fixture["action_projections"]), atol=1e-6, rtol=1e-5
+    )
+    logits = heads(states, actions)
+    torch.testing.assert_close(logits, torch.tensor(fixture["logits"]), atol=2e-6, rtol=1e-5)
+    (logits * torch.tensor(fixture["upstream_gradient"])).sum().backward()
+    torch.testing.assert_close(states.grad, torch.tensor(fixture["state_gradients"]), atol=2e-6, rtol=1e-5)
+    torch.testing.assert_close(actions.grad, torch.tensor(fixture["action_gradients"]), atol=2e-6, rtol=1e-5)
 
 
 def test_embedding_table_and_clm_batch():

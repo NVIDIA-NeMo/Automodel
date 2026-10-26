@@ -44,7 +44,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +54,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete, read_checkpoint_pointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.decision.metrics import DecisionEvaluator, save_summary
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -68,6 +69,7 @@ from nemo_automodel.components.models.clef.joint_schema_head import (
     encode_record,
     load_joint_head,
 )
+from nemo_automodel.components.models.clef.stage import ClefStageManifest
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
@@ -88,7 +90,7 @@ MODES = ("eval", "train")
 class TrainClefDecisionRecipe(BaseRecipe):
     """LoRA + joint-schema-head post-training for Clef decision models (see module docstring)."""
 
-    def __init__(self, cfg: Any):
+    def __init__(self, cfg: RecipeConfig | ConfigNode) -> None:
         """Store the recipe configuration (a ``ConfigNode`` parsed from YAML)."""
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
@@ -192,7 +194,7 @@ class TrainClefDecisionRecipe(BaseRecipe):
             )
             self.head_optimizer = self.cfg.head_optimizer.build(self.head)[0]
 
-    def _dp_group(self):
+    def _dp_group(self) -> dist.ProcessGroup | None:
         return self._get_dp_group()
 
     # ------------------------------------------------------------------ stage I/O
@@ -210,16 +212,11 @@ class TrainClefDecisionRecipe(BaseRecipe):
         if has_adapter:
             self.checkpointer.save_model(self.model, str(path), peft_config=self.peft_config)
         self.checkpointer.save_distributed_state(self.head, "head", str(path))
-        manifest = {
-            "format": "clef-native-stage-v1",
-            "backbone_adapter": has_adapter,
-            "head_config": asdict(self.head.config),
-            "stage": self.tag,
-        }
+        manifest = ClefStageManifest(has_adapter, self.head.config, self.tag)
         metric_key = f"negative_{self.cfg.get('train.eval_metric', 'accuracy')}"
 
         def write_metadata() -> None:
-            (path / "stage.json").write_text(json.dumps(manifest, indent=2))
+            manifest.write(path)
             if selection_score is not None:
                 (path / "losses.json").write_text(json.dumps({metric_key: -selection_score}))
 
@@ -248,10 +245,8 @@ class TrainClefDecisionRecipe(BaseRecipe):
         self.checkpointer.lifecycle.validate_checkpoint_dir_exists(str(path), str(path))
         if is_checkpoint_incomplete(path):
             raise ValueError(f"cannot initialize from incomplete checkpoint {path}")
-        manifest = json.loads((path / "stage.json").read_text())
-        if manifest.get("format") != "clef-native-stage-v1":
-            raise ValueError("init_from requires a native CLEF stage checkpoint")
-        if manifest["backbone_adapter"]:
+        manifest = ClefStageManifest.load(path)
+        if manifest.backbone_adapter:
             if self.peft_config is None:
                 raise ValueError("initializing a backbone adapter requires the matching peft configuration")
             self.checkpointer.load_model(self.model, str(path / "model"))
@@ -305,7 +300,7 @@ class TrainClefDecisionRecipe(BaseRecipe):
             batch = shard[b : b + batch_size]
             for (record, _), logits in zip(batch, self._forward(batch), strict=True):
                 local[str(record["id"])] = [q.float().log_softmax(-1).tolist() for q in logits]
-        gathered: list[dict] = [None] * self._get_dp_group_size()  # type: ignore[list-item]
+        gathered: list[dict[str, list[list[float]]]] = [{} for _ in range(self._get_dp_group_size())]
         if dist.is_initialized() and self._get_dp_group_size() > 1:
             dist.all_gather_object(gathered, local, group=self._dp_group())
         else:

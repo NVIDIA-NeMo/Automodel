@@ -35,6 +35,8 @@ Data records use the SystemOne request format plus supervision:
 
 The CLM feature cache requires immutable encoder and tokenizer commit IDs. Its identity includes truncation,
 pooling, normalization, precision and library settings, so changing those settings generates a new cache.
+CLM embeds across data-parallel ranks, then trains its projection heads on rank zero. Its `encode.cache_dir`
+must be shared by all ranks, including across nodes, for shard assembly and cache reuse.
 CLM/CLEF example configurations pin the public model versions whose prompt and checkpoint contracts they use.
 The CLEF frozen-backbone configuration installs no adapters and optimizes only the external joint head.
 CLEF stages use native AutoModel PEFT checkpoints under `model/` and DCP joint-head state under `head/`.
@@ -44,6 +46,7 @@ Set `init_from: runs/clef/sft/LOWEST_VAL` to initialize the next stage with fres
 This is weights-only stage continuation; full optimizer/scheduler resume is not provided. Keep the base revision,
 PEFT configuration, and joint-head architecture consistent. Use `head_optimizer.lr` for the external head,
 `optimizer.lr` for the backbone adapters, and `lr_scheduler.lr_warmup_steps` for integer optimizer-step warmup.
+The decision recipe does not prune these `step_*` stage directories automatically; manage their retention explicitly.
 Publisher-layout merged export remains the explicit `examples/decision/export_clef_release.py` operation.
 
 D1 examples are experimental. Tiny configuration tests exercise causal/readout/gradient contracts. The

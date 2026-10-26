@@ -133,6 +133,20 @@ def validate_record(record: dict[str, Any]) -> None:
             raise ValueError(f"answer for unknown question {qid!r}")
         if str(answer) not in canonical_option_ids(questions[qid]):
             raise ValueError(f"{qid}: answer {answer!r} is not an allowed option")
+    for qid, rewards in (record.get("rewards") or {}).items():
+        if qid not in questions:
+            raise ValueError(f"record {record.get('id')!r}: rewards for unknown question {qid!r}")
+        options = set(canonical_option_ids(questions[qid]))
+        if not isinstance(rewards, dict) or set(rewards) != options:
+            raise ValueError(
+                f"record {record.get('id')!r}, question {qid!r}: rewards must cover exactly {sorted(options)}"
+            )
+        try:
+            finite = all(math.isfinite(float(value)) for value in rewards.values())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"record {record.get('id')!r}, question {qid!r}: rewards must be finite numbers") from exc
+        if not finite:
+            raise ValueError(f"record {record.get('id')!r}, question {qid!r}: rewards must be finite numbers")
 
 
 def canonical_option_ids(question: dict[str, Any]) -> list[str]:

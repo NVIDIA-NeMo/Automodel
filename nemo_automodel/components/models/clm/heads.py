@@ -33,6 +33,7 @@ import json
 import math
 import os
 import re
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -309,6 +310,12 @@ class CLMHeadPair(nn.Module):
         return model
 
     def _validate_embeddings(self, embeddings: torch.Tensor, *, name: str) -> None:
+        """Validate the encoder width without modifying its embeddings.
+
+        Args:
+            embeddings: Tensor of shape [rows, hidden], with hidden equal to config.hidden_size.
+            name: Input name used in validation errors.
+        """
         if embeddings.ndim != 2 or embeddings.shape[-1] != self.config.hidden_size:
             raise ValueError(f"{name} must have shape [rows, {self.config.hidden_size}], got {tuple(embeddings.shape)}")
 
@@ -382,15 +389,25 @@ class EmbeddingTable:
         return out.to(device) if device is not None else out
 
     def save(self, path: str | os.PathLike) -> None:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"texts": list(self.index), "embeddings": self.embeddings.cpu()}, path)
+        """Publish the cache atomically, preserving any prior cache on failure."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+        try:
+            torch.save({"texts": list(self.index), "embeddings": self.embeddings.cpu()}, temporary_path)
+            temporary_path.replace(path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     @classmethod
     def load(cls, path: str | os.PathLike) -> "EmbeddingTable":
+        """Load a previously published cache using restricted tensor deserialization."""
         ck = torch.load(path, map_location="cpu", weights_only=True)
         return cls(ck["texts"], ck["embeddings"])
 
     def missing(self, texts: Sequence[str]) -> list[str]:
+        """Return requested texts absent from the cached row index."""
         return [t for t in texts if t not in self.index]
 
 

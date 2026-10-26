@@ -42,7 +42,10 @@ These artifacts initialize readout weights and do not resume optimizer or schedu
 | Training scope | Single-device, frozen-backbone text decision readout adaptation |
 | Parallelism | TP, CP, PP, and EP support is undeclared for these native model classes |
 
-The native LFM2-VL class also retains Hugging Face's ordinary forward and generation interfaces.
+Ordinary LFM2-VL checkpoints retain Hugging Face's implementation. The publisher's explicit D1
+configuration mapping selects the D1-specific arithmetic. Omni construction resolves pinned
+publisher perception code and requires `trust_remote_code=True`; cache these dependencies
+before offline use.
 The D1 examples do not establish distributed adaptation or downstream task quality.
 Downloaded publisher code and checkpoints retain their own license terms.
 

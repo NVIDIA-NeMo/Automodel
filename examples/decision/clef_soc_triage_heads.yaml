@@ -22,7 +22,7 @@
 #       --output_dir runs/clef_heads/sft
 #   # RL from the SFT stage
 #   automodel examples/decision/clef_soc_triage_heads.yaml --nproc-per-node 8 --mode train --loss.mode rl \
-#       --init_from runs/clef_heads/sft/LOWEST_VAL --train.epochs 1 --optimizer.lr 2.0e-5 --head_optimizer.lr 1.0e-5 \
+#       --init_from runs/clef_heads/sft/LOWEST_VAL --train.epochs 1 --head_optimizer.lr 1.0e-5 \
 #       --train.eval_metric reward --output_dir runs/clef_heads/rl
 
 recipe: nemo_automodel.recipes.decision.train_clef.TrainClefDecisionRecipe

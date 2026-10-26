@@ -15,12 +15,13 @@
 """Bidirectional context and media-prefix isolation in the Omni encoder."""
 
 import torch
+from transformers import Lfm2Config
 
 from nemo_automodel.components.models.d1.encoder import D1OmniEncoder
 
 
-def tiny_config():
-    return dict(
+def tiny_config() -> Lfm2Config:
+    return Lfm2Config(
         vocab_size=32,
         hidden_size=64,
         intermediate_size=96,
@@ -76,3 +77,13 @@ def test_dtype_moves_preserve_exact_float32_rotary_frequencies():
     torch.testing.assert_close(encoder.rotary_emb.inv_freq, expected, atol=0, rtol=0)
     encoder.to(torch.float32)
     torch.testing.assert_close(encoder.rotary_emb.inv_freq, expected, atol=0, rtol=0)
+
+
+def test_encoder_keeps_a_private_typed_configuration() -> None:
+    config = tiny_config()
+    config._attn_implementation = "eager"
+    encoder = D1OmniEncoder(config)
+    assert isinstance(encoder.config, Lfm2Config)
+    assert encoder.config is not config
+    assert encoder.config._attn_implementation == "sdpa"
+    assert config._attn_implementation == "eager"

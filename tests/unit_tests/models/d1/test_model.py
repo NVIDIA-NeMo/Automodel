@@ -61,7 +61,7 @@ def config():
 @pytest.fixture
 def model(monkeypatch, config):
     monkeypatch.setattr(model_module, "get_class_from_dynamic_module", lambda *args, **kwargs: StubPerception)
-    return D1OmniModel(config).eval()
+    return D1OmniModel(config, trust_remote_code=True).eval()
 
 
 def test_config_roundtrip_and_native_registry(config, tmp_path):
@@ -122,6 +122,33 @@ def test_model_rejects_vocabulary_tying(config):
     config.tie_word_embeddings = True
     with pytest.raises(NotImplementedError, match="tie_word_embeddings=True"):
         D1OmniModel(config)
+
+
+def test_model_requires_consent_before_loading_publisher_code(config, monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden_download(*args: object, **kwargs: object) -> None:
+        pytest.fail("publisher code must not load without explicit consent")
+
+    monkeypatch.setattr("nemo_automodel.components.models.d1.model.get_class_from_dynamic_module", forbidden_download)
+    with pytest.raises(ValueError, match="trust_remote_code=True"):
+        D1OmniModel(config)
+
+
+def test_native_loader_forwards_publisher_code_consent(config, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nemo_automodel import NeMoAutoModelForImageTextToText
+    from nemo_automodel._transformers.model_init import _init_model
+
+    monkeypatch.setattr(model_module, "get_class_from_dynamic_module", lambda *args, **kwargs: StubPerception)
+    native, loaded = _init_model(
+        cls=NeMoAutoModelForImageTextToText,
+        pretrained_model_name_or_path_or_config=config,
+        attn_implementation="sdpa",
+        torch_dtype=torch.float32,
+        quantization_config=None,
+        force_hf=False,
+        trust_remote_code=True,
+    )
+    assert native
+    assert isinstance(loaded, D1OmniModel)
 
 
 def test_checkpoint_config_resolves_through_shared_automodel_path(config, tmp_path):

@@ -611,7 +611,7 @@ jobs:
           # 2-rank parallel), so the budget is roughly double a single smoke test.
           # A 30-minute timeout leaves more than 2x measured-runtime headroom.
           - test-name: L2_Distributed
-            test-folder: moe,parallelism
+            test-folder: moe,parallelism,decision_models/clef
             timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
@@ -694,7 +694,7 @@ jobs:
             timeout: 20
           # moe + parallelism merged (2.1 + 4.1 = 6.2 min median), mirroring cicd-e2e-tests.
           - test-name: L2_Distributed
-            test-folder: moe,parallelism
+            test-folder: moe,parallelism,decision_models/clef
             timeout: 30
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
     runs-on: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}

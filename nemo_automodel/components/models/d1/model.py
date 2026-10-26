@@ -64,13 +64,16 @@ class D1OmniModel(HFCheckpointingMixin, PreTrainedModel):
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: D1OmniConfig) -> None:
+    def __init__(self, config: D1OmniConfig, *, trust_remote_code: bool = False) -> None:
+        """Build Omni, requiring explicit consent for its pinned publisher perception code."""
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         if not config.vision_config or not config.audio_config:
             raise ValueError("Omni requires both released vision and audio configurations")
         width = config.text_config.hidden_size
-        self.encoder = D1OmniEncoder(config.text_config.to_dict())
+        if not trust_remote_code:
+            raise ValueError("D1 Omni perception modules require trust_remote_code=True for pinned publisher code")
+        self.encoder = D1OmniEncoder(config.text_config)
         self.head = D1OmniHeadConfig(width, config.head_layers).build()
         vision_class = get_class_from_dynamic_module(
             "vision.Vision", OMNI_REPOSITORY, revision=OMNI_REVISION, code_revision=OMNI_REVISION

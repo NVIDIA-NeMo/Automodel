@@ -56,6 +56,12 @@ class Lfm2VlForConditionalGeneration(HFCheckpointingMixin, HFLfm2VlForConditiona
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     _supports_sdpa = True
 
+    @classmethod
+    def supports_config(cls, config: Lfm2VlConfig) -> bool:
+        """Select D1 arithmetic only for the publisher's explicit D1 model mapping."""
+        auto_map = getattr(config, "auto_map", None)
+        return auto_map is not None and auto_map.get("AutoModel") == "modeling_d1.D1Model"
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Parallelism is undeclared until corresponding recipes are verified."""

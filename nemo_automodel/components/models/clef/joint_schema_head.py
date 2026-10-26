@@ -623,7 +623,8 @@ class LexicalTable(torch.nn.Module):
     """Frozen cache of the output-embedding rows the head needs, indexed by token id.
 
     The released head reads ``lm_head.weight[token_ids]`` for option tokens.  When the LM head is sharded we gather
-    just these rows once (they never change, the LM head is frozen) and serve them from this table.
+    the full weight once to select these rows (they never change, the LM head is frozen),
+    then retain only the selected rows in this table.
     """
 
     def __init__(self, token_ids: Sequence[int], rows: torch.Tensor):

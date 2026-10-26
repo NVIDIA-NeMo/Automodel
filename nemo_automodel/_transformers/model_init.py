@@ -1359,12 +1359,15 @@ def __init_model(
             if pretrained_model_name_or_path:
                 _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=process_group, **kwargs)
             logger.info(f"Using custom model implementation for {architectures[0]}")
-            kwargs.pop("trust_remote_code", None)
+            init_param_names = _get_init_param_names(model_cls)
+            # Explicit constructor parameters let model-owned remote components
+            # retain the caller's consent; **kwargs alone does not opt in.
+            if "trust_remote_code" not in init_param_names:
+                kwargs.pop("trust_remote_code", None)
             # Keep the hub loading options before the constructor-argument filter drops
             # them: the generation-config restore below has to read from the same
             # subfolder/revision the weights came from.
             loading_kwargs = {key: kwargs[key] for key in HUB_LOADING_KWARGS if key in kwargs}
-            init_param_names = _get_init_param_names(model_cls)
             for key in (*HUB_LOADING_KWARGS, "code_revision", "use_auth_token"):
                 # A model-owned tokenizer or adapter can explicitly request the
                 # resolved revision; **kwargs alone does not opt a model in.

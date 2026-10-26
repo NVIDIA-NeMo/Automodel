@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -112,9 +114,9 @@ class D1OmniEncoder(nn.Module):
     media positions see only media. There is no autoregressive cache.
     """
 
-    def __init__(self, text_config: dict) -> None:
+    def __init__(self, text_config: Lfm2Config) -> None:
         super().__init__()
-        self.config = Lfm2Config(**text_config)
+        self.config = deepcopy(text_config)
         config = self.config
         if len(config.layer_types) != config.num_hidden_layers:
             raise ValueError("layer_types must contain one entry per encoder layer")

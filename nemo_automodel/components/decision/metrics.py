@@ -32,6 +32,7 @@ class DecisionEvaluator:
     """
 
     def __init__(self, slice_keys: Sequence[str] = (), num_bins: int = 10) -> None:
+        """Set metadata slices and the number of confidence calibration bins."""
         self.slice_keys = tuple(slice_keys)
         self.num_bins = num_bins
         self.rows: list[dict[str, Any]] = []
@@ -46,6 +47,17 @@ class DecisionEvaluator:
         rewards: Sequence[float] | None = None,
         meta: dict[str, Any] | None = None,
     ) -> None:
+        """Add one identified decision with probabilities in option_ids order.
+
+        Args:
+            record_id: Input record identity, shared by its questions.
+            question_id: Question identity within that record.
+            option_ids: Allowed options in model-output order.
+            probabilities: Probability for each allowed option, in the same order.
+            label: Correct option index, or a negative value for unlabelled data.
+            rewards: Optional utility for each option in the same order.
+            meta: Optional record metadata used to group evaluation slices.
+        """
         probs = [float(p) for p in probabilities]
         pred = max(range(len(probs)), key=probs.__getitem__)
         self.rows.append(
@@ -138,6 +150,7 @@ class DecisionEvaluator:
         return {"overall": overall, "questions": questions, "slices": slices}
 
     def predictions(self) -> list[dict[str, Any]]:
+        """Return the accumulated identified decisions and their aligned probabilities."""
         return list(self.rows)
 
 
