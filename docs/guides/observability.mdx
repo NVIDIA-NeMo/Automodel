@@ -96,7 +96,7 @@ otherwise reuse the same ID.
 
 Every span belongs to a span group. `span_groups` selects which groups are recorded.
 
-| Group | Spans | How often |
+| Group | Spans | How Often |
 |-------|-------|-----------|
 | `model_init` | `automodel.model.from_pretrained`, `automodel.model.from_config`, `automodel.model.download`, `automodel.model.infrastructure` | Once per model |
 | `load_checkpoint` | `automodel.checkpoint.load`, `automodel.checkpoint.load.model`, `automodel.checkpoint.load.optimizer` | Once per resume, plus base-model weight loading |
@@ -154,7 +154,7 @@ Every span and metric carries attributes that are fixed for the life of the proc
 | `service.instance.id` | `<run id>-rank<rank>` |
 | `dl.data_parallel.size`, `dl.tensor_parallel.size`, `dl.pipeline_parallel.size`, `dl.context_parallel.size`, `dl.expert_parallel.size` | Parallel layout |
 | `nemo.automodel.recipe` | Recipe class |
-| `nemo.automodel.model` | Hugging Face model ID. A local model path is never recorded |
+| `nemo.automodel.model` | Hugging Face model ID. A local model path is never recorded. |
 
 nemo-lens adds host, Slurm, and Kubernetes attributes when they apply.
 
@@ -169,7 +169,7 @@ Every rank exports its own spans and metrics. To narrow the data to some ranks, 
 `nv.dl.rank` in the collector. With the `console` exporter, all ranks write to the same standard
 output, so lines from different ranks can interleave. Use the `otlp` exporter for multi-rank jobs.
 
-To count the spans each rank recorded in a single-process run with the `console` exporter:
+To count the spans each rank recorded in a single-process run with the `console` exporter, run the following commands:
 
 ```bash
 uv run automodel <config.yaml> --telemetry.enabled true --telemetry.exporter console > run.log
