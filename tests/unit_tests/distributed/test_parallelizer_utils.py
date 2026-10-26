@@ -365,6 +365,25 @@ def test_patch_fsdp_restore_unused_param_grads_is_idempotent(monkeypatch):
     assert state_cls._root_post_backward_final_callback is final_callback
 
 
+def test_patch_fsdp_unused_param_reduction_refuses_to_wrap_outside_the_probe(monkeypatch):
+    param_group_cls, _ = _install_restore_patch(monkeypatch)  # public-API build: no legacy fill underneath
+    probe = param_group_cls.post_backward
+
+    with pytest.raises(RuntimeError, match="must be installed before patch_fsdp_restore_unused_param_grads"):
+        patch_fsdp_unused_param_reduction()
+
+    assert param_group_cls.post_backward is probe
+
+
+def test_patch_fsdp_unused_param_reduction_stays_idempotent_under_the_probe(monkeypatch):
+    param_group_cls, _ = _install_restore_patch(monkeypatch, legacy_fill=True)
+    probe = param_group_cls.post_backward
+
+    patch_fsdp_unused_param_reduction()
+
+    assert param_group_cls.post_backward is probe
+
+
 def test_patch_fsdp_restore_unused_param_grads_requires_fsdp2_internals(monkeypatch):
     import sys
 

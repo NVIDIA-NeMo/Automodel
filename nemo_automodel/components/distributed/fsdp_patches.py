@@ -130,6 +130,11 @@ def patch_fsdp_unused_param_reduction() -> None:
     original_post_backward = FSDPParamGroup.post_backward
     if getattr(original_post_backward, "_automodel_reduce_scatter_unused_params", False):
         return
+    if getattr(original_post_backward, "_automodel_unused_param_probe", False):
+        raise RuntimeError(
+            "patch_fsdp_unused_param_reduction must be installed before patch_fsdp_restore_unused_param_grads: "
+            "a zero fill wrapped outside the usage probe would make every parameter look used."
+        )
 
     def _post_backward_with_unused_param_reduction(self, *args, **kwargs):
         if self.reduce_grads and self._training_state == TrainingState.PRE_BACKWARD:
@@ -211,7 +216,10 @@ def patch_fsdp_restore_unused_param_grads() -> None:
     domain and resets the sharded gradients this reduction created for parameters
     no rank used. Usage comes from gradient presence, never from a zero value.
     Install it after the fill so the probe runs before the zero fill; the patch is
-    process-global and idempotent.
+    process-global and idempotent. Under HSDP with a deferred all-reduce, a reduction
+    that folds into a pending partial reduce is not treated as creating the gradient,
+    so a window in which no rank used the parameter in any micro-batch keeps the
+    reduced zero there.
 
     Raises:
         RuntimeError: If the installed PyTorch lacks the FSDP2 internals the patch wraps.
@@ -270,8 +278,10 @@ def patch_fsdp_restore_unused_param_grads() -> None:
                 ]
             )
 
-    # Keep the fill's marker visible so a repeated fill install stays a no-op under this wrapper.
+    # Keep the fill's marker visible so a repeated fill install stays a no-op under this wrapper, and mark
+    # the probe so a fill installed only now refuses to wrap outside it.
     _post_backward_recording_param_usage._automodel_reduce_scatter_unused_params = legacy_fill
+    _post_backward_recording_param_usage._automodel_unused_param_probe = True
     _root_post_backward_final_callback_restoring_unused_grads._automodel_restore_unused_param_grads = True
     FSDPParamGroup.post_backward = _post_backward_recording_param_usage
     FSDPState._root_post_backward_final_callback = _root_post_backward_final_callback_restoring_unused_grads
