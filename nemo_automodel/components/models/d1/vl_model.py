@@ -60,7 +60,8 @@ class Lfm2VlForConditionalGeneration(HFCheckpointingMixin, HFLfm2VlForConditiona
     def supports_config(cls, config: Lfm2VlConfig) -> bool:
         """Select D1 arithmetic only for the publisher's explicit D1 model mapping."""
         auto_map = getattr(config, "auto_map", None)
-        return auto_map is not None and auto_map.get("AutoModel") == "modeling_d1.D1Model"
+        model_reference = auto_map.get("AutoModel", "") if auto_map is not None else ""
+        return model_reference.rsplit("--", 1)[-1] == "modeling_d1.D1Model"
 
     @dataclass(frozen=True)
     class ModelCapabilities:

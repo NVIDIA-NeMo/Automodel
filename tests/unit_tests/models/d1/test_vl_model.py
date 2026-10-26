@@ -79,10 +79,11 @@ def test_tie_identity_and_native_registry():
     assert model.model.language_model.rotary_emb.inv_freq.dtype == torch.float32
 
 
-def test_loader_selects_native_d1_only_for_explicit_publisher_mapping() -> None:
+@pytest.mark.parametrize("model_reference", ["modeling_d1.D1Model", "LiquidAI/d1-3B--modeling_d1.D1Model"])
+def test_loader_selects_native_d1_only_for_explicit_publisher_mapping(model_reference: str) -> None:
     ordinary = tiny_config()
     assert ModelRegistry.resolve_custom_model_cls("Lfm2VlForConditionalGeneration", ordinary) is None
-    publisher = Lfm2VlConfig(**ordinary.to_dict(), auto_map={"AutoModel": "modeling_d1.D1Model"})
+    publisher = Lfm2VlConfig(**ordinary.to_dict(), auto_map={"AutoModel": model_reference})
     assert (
         ModelRegistry.resolve_custom_model_cls("Lfm2VlForConditionalGeneration", publisher)
         is Lfm2VlForConditionalGeneration
