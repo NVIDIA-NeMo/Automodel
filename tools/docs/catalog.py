@@ -96,7 +96,12 @@ MODEL_CARD_PATH_ALIASES = {
         "docs/model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base.mdx"
     ),
     "docs/model-coverage/llm/flint/flint.mdx": "docs/model-coverage/llm/recursivesi/flint.mdx",
-    "docs/model-coverage/vlm/muse/muse_spark_open.mdx": "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx",
+    "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx": (
+        "docs/model-coverage/vlm/meta-models/muse-spark-open-816b-a42b.mdx"
+    ),
+    "docs/model-coverage/vlm/muse/muse_spark_open.mdx": (
+        "docs/model-coverage/vlm/meta-models/muse-spark-open-816b-a42b.mdx"
+    ),
     "docs/model-coverage/vlm/stepfun-ai/step-5-preview.mdx": (
         "docs/model-coverage/vlm/stepfun-ai/step-5-preview-bf16.mdx"
     ),
@@ -191,6 +196,7 @@ PROVIDER_ORGS = {
     "MiniMaxAI": "MiniMaxAI",
     "mistralai": "mistralai",
     "moonshotai": "moonshotai",
+    "nanbeige": "Nanbeige",
     "meta-models": "meta-models",
     "nvidia": "nvidia",
     "openai": "openai",

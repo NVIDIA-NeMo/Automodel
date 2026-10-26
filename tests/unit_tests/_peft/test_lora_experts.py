@@ -264,6 +264,7 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
         dispatcher_hybridep_num_blocks_unpermute=112,
         dispatcher_capacity_factor=1.5,
         dispatcher_equal_token_counts=True,
+        dispatcher_recompute_cache="combine",
     )
     orig_experts = GroupedExpertsDeepEP(
         moe_config,
@@ -289,6 +290,7 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     assert lora_experts.dispatcher_capacity_factor == 1.5
     assert lora_experts.dispatcher_equal_token_counts is True
     assert lora_experts.dispatch_rows_never_empty is True
+    assert lora_experts.dispatcher_recompute_cache == "combine"
     assert lora_experts.use_mxfp8 is True
 
 

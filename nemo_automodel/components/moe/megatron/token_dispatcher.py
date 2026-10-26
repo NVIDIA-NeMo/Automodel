@@ -499,6 +499,7 @@ class _HybridEPManager(_DispatchManager):
         benchmark_static_routing: bool = False,
         moe_hybridep_capacity_factor: float | None = None,
         moe_hybridep_equal_token_counts: bool = False,
+        moe_hybridep_recompute_cache: str = "none",
     ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
@@ -522,6 +523,9 @@ class _HybridEPManager(_DispatchManager):
         self._hybridep_capacity: int | None = None
         # Equal row counts across the EP group: the pad size is the aligned local count, no collective.
         self.equal_token_counts = moe_hybridep_equal_token_counts
+        # BackendConfig.dispatcher_recompute_cache: serve the combine output of the checkpoint forward in the
+        # recompute ("combine" / "moe_tail"); the block's MoERecomputeCache holds it.
+        self.moe_hybridep_recompute_cache = moe_hybridep_recompute_cache
         # Benchmark-only (TokenDispatcherConfig.moe_benchmark_static_routing):
         # persist num_permuted_tokens across dispatches, see dispatch()/reset.
         self.benchmark_static_routing = benchmark_static_routing
@@ -744,6 +748,7 @@ class _HybridEPManager(_DispatchManager):
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
             fuse_permute=self.moe_hybridep_permute_fusion,
+            cache_output=self.moe_hybridep_recompute_cache != "none",
         )
         if self.num_unpadded_tokens is not None:
             hidden_states = hidden_states[: self.num_unpadded_tokens]
@@ -1026,6 +1031,10 @@ class TokenDispatcherConfig:
 
     moe_hybridep_num_blocks_unpermute: int | None = None
     """Optional number of HybridEP combine unpermutation blocks."""
+    moe_hybridep_recompute_cache: str = "none"
+    """HybridEP (mirrors BackendConfig.dispatcher_recompute_cache): under block activation checkpointing serve
+    each MoE layer's combine output of the checkpoint forward in the recompute ("combine"), and with
+    "moe_tail" also skip the down projection's GEMM there. "none" recomputes the whole layer."""
 
     moe_share_token_dispatcher: bool = True
     """Share one communication manager instance across MoE layers for the configured backend."""
@@ -1148,6 +1157,7 @@ class MoEFlexTokenDispatcher:
                         benchmark_static_routing=self.config.moe_benchmark_static_routing,
                         moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                         moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
+                        moe_hybridep_recompute_cache=self.config.moe_hybridep_recompute_cache,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
                 if (
@@ -1158,6 +1168,7 @@ class MoEFlexTokenDispatcher:
                     self._comm_manager.moe_hybridep_num_blocks_unpermute,
                     self._comm_manager.hybridep_capacity_factor,
                     self._comm_manager.equal_token_counts,
+                    self._comm_manager.moe_hybridep_recompute_cache,
                 ) != (
                     self.config.moe_hybridep_compact_routing,
                     self.config.moe_hybridep_permute_fusion,
@@ -1166,10 +1177,11 @@ class MoEFlexTokenDispatcher:
                     self.config.moe_hybridep_num_blocks_unpermute,
                     self.config.moe_hybridep_capacity_factor,
                     self.config.moe_hybridep_equal_token_counts,
+                    self.config.moe_hybridep_recompute_cache,
                 ):
                     raise ValueError(
                         "Shared HybridEP dispatchers must use identical routing, fusion, kernel tuning, and sync-free "
-                        "dispatch settings"
+                        "dispatch settings (and the same recompute-cache setting)"
                     )
             else:
                 self._comm_manager = _HybridEPManager(
@@ -1187,6 +1199,7 @@ class MoEFlexTokenDispatcher:
                     benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                     moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
+                    moe_hybridep_recompute_cache=self.config.moe_hybridep_recompute_cache,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,

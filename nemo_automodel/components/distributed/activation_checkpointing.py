@@ -381,6 +381,20 @@ def ensure_fsdp_ops_sac_ignored() -> None:
     )
 
 
+def ensure_moe_recompute_cache_ops_sac_ignored() -> None:
+    """Keep the deferred expert down projection's placeholder out of SAC's op-stream replay.
+
+    ``BackendConfig.dispatcher_recompute_cache="moe_tail"`` skips the down-projection GEMM in a checkpoint
+    recompute whose HybridEP combine is served from the forward's cache: ``moe/experts._DownProjGroupedMM``
+    then only allocates its output (``aten.new_empty``). That allocation exists in the recompute alone, and
+    selective checkpointing — including the router-saving context ``apply_ac`` installs under
+    ``ignore_router_for_ac`` — indexes every recompute op against the forward's stream
+    (``aten.new_empty.default encountered during backward but not found in storage``). The placeholder
+    carries no activation; it executes outside the accounting like FSDP's recompute-only allocations above.
+    """
+    ignore_sac_ops([getattr(getattr(torch.ops.aten, "new_empty", None), "default", None)])
+
+
 def make_selective_checkpoint_context_fn():
     """Build a TorchTitan-style selective activation checkpointing context."""
     ensure_profiler_ops_sac_ignored()

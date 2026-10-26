@@ -48,6 +48,7 @@ model:
     rms_norm: torch_fp32
     experts: torch_mm
     dispatcher: hybridep
+    compile_router_weight: true
     gate_precision: float32
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

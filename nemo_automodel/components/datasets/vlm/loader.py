@@ -17,15 +17,19 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Sized
 from contextlib import AbstractContextManager, nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
+import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
+from torchdata.stateful_dataloader.stateful import Stateful
 from transformers import AutoProcessor, ProcessorMixin
 
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
@@ -48,6 +52,114 @@ from nemo_automodel.components.datasets.vlm.pp_media import wrap_vlm_collate_for
 logger = logging.getLogger(__name__)
 
 VlmCollateFn = Callable[[list[object]], object]
+_VLM_PARENT_DATASET_STATE = "_vlm_parent_dataset_state"
+
+
+class _VlmStatefulDataloader(StatefulDataLoader):
+    """Restore VLM checkpoints across synchronous and worker-based loaders."""
+
+    _parent_dataset: Stateful | None = None
+
+    def _worker_states(self, dataset_state: Any) -> dict[str, Any]:
+        """Give each worker an independently owned copy of common map-style state."""
+        return {
+            f"worker_{worker_id}": {
+                "worker_id": worker_id,
+                "dataset_state": deepcopy(dataset_state),
+                "fetcher_state": None,
+            }
+            for worker_id in range(self.num_workers)
+        }
+
+    def _restore_parent_dataset_state(self, dataset_state: Any) -> Stateful | None:
+        """Restore parent state only when it originated from synchronous loading."""
+        if dataset_state is not None and isinstance(self.dataset, Stateful):
+            self.dataset.load_state_dict(deepcopy(dataset_state))
+            return self.dataset
+        return None
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return native worker snapshots and any migrated synchronous parent state."""
+        state = dict(super().state_dict())
+        if self._parent_dataset is not None:
+            state[_VLM_PARENT_DATASET_STATE] = deepcopy(self._parent_dataset.state_dict())
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore native worker state or migrate legacy map-style synchronous state.
+
+        Worker-count changes require stateless map-style worker snapshots.
+        Legacy synchronous snapshots carry sampler/dataset state at the top
+        level; give each worker that state and continue the sampler.
+        Worker-side random transforms cannot reproduce the old main-process RNG.
+        """
+        if not state_dict:
+            super().load_state_dict(state_dict)
+            return
+        parent_dataset = None
+        if "_snapshot" in state_dict:
+            snapshot = state_dict["_snapshot"]
+            saved_workers = snapshot["_main_snapshot"]["_num_workers"]
+            worker_states = list(snapshot["_worker_snapshots"].values())
+            stateless_workers = (
+                bool(worker_states)
+                and len(worker_states) == saved_workers
+                and all(worker["fetcher_state"] is None and worker["dataset_state"] is None for worker in worker_states)
+            )
+            if saved_workers != self.num_workers:
+                if not stateless_workers:
+                    raise ValueError(
+                        f"Cannot change VLM checkpoint num_workers from {saved_workers} to {self.num_workers}: "
+                        "worker snapshots must contain stateless map-style datasets. "
+                        f"Restore with num_workers={saved_workers}."
+                    )
+                state_dict = dict(state_dict)
+                snapshot = state_dict["_snapshot"] = dict(snapshot)
+                snapshot["_main_snapshot"] = deepcopy(snapshot["_main_snapshot"])
+                snapshot["_main_snapshot"]["_num_workers"] = self.num_workers
+                snapshot["_last_yielded_worker_id"] = (snapshot["_snapshot_step"] - 1) % self.num_workers
+                snapshot["_worker_snapshots"] = self._worker_states(None)
+                logger.warning(
+                    "Migrating VLM dataloader checkpoint from num_workers=%d to num_workers=%d.",
+                    saved_workers,
+                    self.num_workers,
+                )
+            if _VLM_PARENT_DATASET_STATE in state_dict:
+                parent_dataset = self._restore_parent_dataset_state(state_dict[_VLM_PARENT_DATASET_STATE])
+        elif "_num_yielded" in state_dict:
+            if state_dict["fetcher_state"] is not None:
+                raise ValueError("VLM workers can migrate only map-style synchronous dataloader checkpoints")
+            legacy = deepcopy(state_dict)
+            parent_dataset = self._restore_parent_dataset_state(legacy["dataset_state"])
+            main_state = {
+                key: legacy[key]
+                for key in (
+                    "_index_sampler_state",
+                    "_sampler_iter_state",
+                    "_sampler_iter_yielded",
+                    "_IterableDataset_len_called",
+                    "_shared_seed",
+                )
+            }
+            # Choose a worker seed without advancing the training RNG. Recipes
+            # restore training RNG after the dataloader, so a fresh seed may differ.
+            generator = torch.Generator()
+            generator.set_state(self.generator.get_state() if self.generator is not None else torch.get_rng_state())
+            main_state["_base_seed"] = torch.empty((), dtype=torch.int64).random_(generator=generator).item()
+            main_state["_num_workers"] = self.num_workers
+            state_dict = {
+                "_snapshot": {
+                    "_snapshot_step": legacy["_num_yielded"],
+                    "_last_yielded_worker_id": (legacy["_num_yielded"] - 1) % self.num_workers,
+                    "_main_snapshot": main_state,
+                    "_worker_snapshots": self._worker_states(legacy["dataset_state"]),
+                },
+                "_steps_since_snapshot": 0,
+                "_iterator_finished": legacy["_iterator_finished"],
+            }
+            logger.warning("Migrating a synchronous VLM dataloader checkpoint to num_workers=%d.", self.num_workers)
+        super().load_state_dict(state_dict)
+        self._parent_dataset = parent_dataset
 
 
 @runtime_checkable
@@ -167,6 +279,7 @@ class VlmDataloaderConfig:
     chat_template: str | None = None
     shuffle: bool = True
     num_workers: int = 0
+    """Worker processes per dataloader; zero selects the available CPU count with a warning."""
     pin_memory: bool = False
     persistent_workers: bool = False
     prefetch_factor: int | None = None
@@ -241,6 +354,8 @@ class VlmDataloaderConfig:
         Returns:
             Named result containing the stateful dataloader and runtime processor.
         """
+        if self.num_workers < 0:
+            raise ValueError("VLM num_workers must be zero (automatic workers) or a positive worker count.")
         dataset, processor = self._build_source(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             dp_rank=dp_rank,
@@ -315,12 +430,26 @@ class VlmDataloaderConfig:
             rank=dp_rank,
             shuffle=self.shuffle,
         )
-        dataloader = StatefulDataLoader(
+        num_workers = self.num_workers
+        if num_workers == 0:
+            try:
+                available_cpus = len(os.sched_getaffinity(0))
+            except (AttributeError, OSError, NotImplementedError):
+                available_cpus = None
+            num_workers = available_cpus or os.cpu_count() or 1
+            logger.warning(
+                "VLM dataloader num_workers=0 disables background preprocessing and prefetching; "
+                "using num_workers=%d based on the CPUs available to this process. "
+                "This count is per dataloader; set an explicit positive num_workers "
+                "to limit workers when training ranks share CPUs.",
+                num_workers,
+            )
+        dataloader = _VlmStatefulDataloader(
             dataset=dataset,
             sampler=sampler,
             collate_fn=collate_fn,
             batch_size=batch_size,
-            num_workers=self.num_workers,
+            num_workers=num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             prefetch_factor=self.prefetch_factor,
