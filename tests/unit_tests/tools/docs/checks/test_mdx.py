@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -24,6 +25,8 @@ pytestmark = pytest.mark.timeout(70)
 
 @pytest.fixture(scope="module")
 def mdx_dependencies(tmp_path_factory) -> Path:
+    if shutil.which("node") is None or shutil.which("npm") is None:
+        pytest.skip("MDX CLI tests require Node.js and npm; the docs CI job provides both")
     prefix = tmp_path_factory.mktemp("mdx-dependencies")
     (prefix / "package.json").write_text('{"private":true,"type":"module"}')
     subprocess.run(

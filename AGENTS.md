@@ -9,6 +9,14 @@ This document is the top-level reference for any AI agent working in this
 repository. Read it first, then consult the relevant skill file for the task at
 hand.
 
+Follow the shared [coding guidelines](CODING_GUIDELINES.md) alongside these
+instructions. Existing code may not yet comply as refactoring proceeds.
+
+For reuse discovery, combine repository text search with available code-graph
+tools. Verify the graph's repository, indexed revision, and freshness before
+relying on it. Empty or incomplete graph results do not establish that reusable
+code is absent; confirm candidates and callers directly in source.
+
 ---
 
 ## Skills
@@ -130,6 +138,18 @@ the source directory. A previously shared file may stay anywhere under `docs/`
 while navigation places it in the correct section. Existing files sharing a slug
 are compatibility copies: select exactly one in nightly navigation and keep all
 copies byte-identical; no path alias entry in `catalog.py` is required.
+
+---
+
+## Code provenance
+
+- Implement changes independently and make every effort to avoid copying code
+  from external repositories.
+- When external code must be copied or adapted, record the source URL, immutable
+  revision, original file paths, and applicable licenses in each affected file's
+  header and complete the PR description's "Code provenance" section.
+- Preserve all required license and copyright notices and attribution. Follow
+  the shared [code provenance guidelines](CODING_GUIDELINES.md#code-provenance).
 
 ---
 
