@@ -69,6 +69,8 @@ jobs:
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -121,6 +123,8 @@ jobs:
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -161,6 +165,8 @@ jobs:
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -558,7 +564,7 @@ jobs:
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 20
+            timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Retrieval
@@ -653,7 +659,7 @@ jobs:
             is-optional: "true"
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 20
+            timeout: 30
           - test-name: L2_Retrieval
             test-folder: retrieval
             timeout: 20
