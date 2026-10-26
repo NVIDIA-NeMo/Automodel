@@ -408,8 +408,6 @@ class TestPipelineHooks:
                 _maybe_downgrade_loss_fn(loss_fn, model, True)
         else:
             assert _maybe_downgrade_loss_fn(loss_fn, model, True) is loss_fn
-            # PP linear CE must then reproduce the FP32 head's BF16 logit cast.
-            assert model.pp_logits_follow_hidden_dtype
 
 
 if __name__ == "__main__":

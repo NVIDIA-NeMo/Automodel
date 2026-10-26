@@ -1159,9 +1159,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _pp_return_hidden_states_supported: bool = True
     _pp_return_hidden_states: bool = False
-    # The FP32 head casts logits back to the hidden dtype; the PP linear loss
-    # must reproduce that rounding when it owns the projection.
-    pp_logits_follow_hidden_dtype: bool = True
     _keep_in_fp32_modules_strict = [
         "attn_hc.fn",
         "attn_hc.base",
