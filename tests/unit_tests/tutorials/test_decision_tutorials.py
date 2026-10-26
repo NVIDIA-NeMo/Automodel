@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import copy
 import hashlib
 import json
@@ -23,12 +24,31 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from decision_tutorial.data import make_records, validate_splits, validate_summary, write_dataset
-from decision_tutorial.reporting import summarize_run
+from tutorials.decision_models.decision_tutorial.data import (
+    make_records,
+    validate_splits,
+    validate_summary,
+    write_dataset,
+)
+from tutorials.decision_models.decision_tutorial.reporting import summarize_run
 
 
 class TutorialContractTests(unittest.TestCase):
     """Test public fixture behavior without framework imports or downloads."""
+
+    def test_notebook_code_matches_paired_scripts(self) -> None:
+        """Notebook and script readers execute the same Python workflow."""
+        root = Path(__file__).resolve().parents[3] / "tutorials" / "decision_models"
+        notebooks = sorted(root.glob("*.ipynb"))
+        self.assertEqual(len(notebooks), 7)
+        for notebook in notebooks:
+            with self.subTest(notebook=notebook.name):
+                cells = json.loads(notebook.read_text())["cells"]
+                code = "\n".join("".join(cell["source"]) for cell in cells if cell["cell_type"] == "code")
+                self.assertEqual(
+                    ast.dump(ast.parse(code)),
+                    ast.dump(ast.parse(notebook.with_suffix(".py").read_text())),
+                )
 
     def test_deterministic_disjoint_reserved_fixture(self) -> None:
         """Identical seeds reproduce bytes and every split has distinct states."""

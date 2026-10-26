@@ -19,7 +19,7 @@ Paired `.py` files contain the same workflow in percent-cell format. Default `RU
 From the repository root, use an isolated CPU interpreter; these helpers require only the standard library:
 
 ```bash
-PYTHONPATH=tutorials/decision_models uv run --no-project python -m unittest discover   -s tutorials/decision_models -p 'test_tutorial_contracts.py' -v
+uv run --no-project python -m unittest discover -s tests/unit_tests/tutorials -p 'test_decision_tutorials.py' -v
 PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data   --output-dir tutorials/decision_models/runs/my-fixture --seed 7
 uv run --no-project --with jupyterlab --with matplotlib jupyter lab tutorials/decision_models
 ```
