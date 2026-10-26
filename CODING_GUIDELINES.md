@@ -20,6 +20,8 @@ Draft for humans and coding agents. Existing repository policies remain authorit
 ## Types and contracts
 
 - **Prefer explicit types.** Annotate public inputs and returns with concrete, meaningful types.
+- **Type annotations still apply to excluded files.** Add types to new and modified
+  signatures even when `pyproject.toml` excludes the file or relaxes its type checks.
 - **Avoid `Any`.** It effectively bypasses type checking for affected values and hides errors.
 - **Use contracts where applicable.** Define interfaces with typed signatures, dataclasses, or `Protocol`;
   document assumptions, ownership, and failure modes.
