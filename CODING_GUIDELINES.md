@@ -27,6 +27,9 @@
 - Preserve copyright and license headers. Include the NVIDIA header with the
   current year in new Python files.
 - Annotate new public APIs and modified public signatures, including return types.
+- Prefer explicit, concrete types that describe the values callers can pass and receive.
+- Avoid `Any`: it effectively bypasses type checking for the values it covers,
+  allowing incompatible operations and hiding errors that explicit types would catch.
 - Use `list[T]`, `dict[K, V]`, `X | Y`, and `T | None`.
 - Use dataclasses, `TypedDict`, or `Protocol` for structured contracts where appropriate.
 - **Avoid long argument lists.** Pass only what the operation needs; group related
