@@ -211,7 +211,7 @@ def _image_then_text_updates(model, image_batch, text_batch, backward):
     Returns ``(vision_changed, text_changed, vision_steps)``: whether the text step changed any vision embedder
     weight, whether it changed any other weight, and each vision weight's AdamW step count.
     """
-    from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtensor
+    from torch.distributed.tensor import DTensor
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
     params = dict(model.named_parameters())
@@ -221,7 +221,8 @@ def _image_then_text_updates(model, image_batch, text_batch, backward):
         optimizer.step()
 
     def _snapshot():
-        return {n: to_local_if_dtensor(p).clone() for n, p in params.items()}
+        # Full tensors, not local shards: a shard can be empty on a rank, where ``torch.equal`` holds vacuously.
+        return {n: (p.full_tensor() if isinstance(p, DTensor) else p).detach().clone() for n, p in params.items()}
 
     _step(image_batch)
     before = _snapshot()
@@ -243,14 +244,13 @@ def _compare(reference, result, loss_tol, grad_tol):
     missing = sorted(set(ref_grads) ^ set(cp_grads))
     tensors = [("ref_loss", ref_loss), ("cp_loss", cp_loss), *ref_grads.items(), *cp_grads.items()]
     nonfinite = sorted({n for n, t in tensors if not torch.isfinite(t).all()})
-    worst_name, worst = max(
-        (
-            (n, ((cp_grads[n].float() - g.float()).norm() / g.float().norm().clamp_min(1e-12)).item())
-            for n, g in ref_grads.items()
-            if n in cp_grads
-        ),
-        key=lambda item: item[1],
-    )
+    rel_errors = [
+        (n, ((cp_grads[n].float() - g.float()).norm() / g.float().norm().clamp_min(1e-12)).item())
+        for n, g in ref_grads.items()
+        if n in cp_grads
+    ]
+    # No shared gradient name is a failure to report, not a ``max()`` of nothing to crash on.
+    worst_name, worst = max(rel_errors, key=lambda item: item[1]) if rel_errors else ("<no shared grads>", float("inf"))
     dloss = abs(ref_loss.item() - cp_loss.item())
     ok = not missing and not nonfinite and dloss < loss_tol and worst < grad_tol
     summary = (
