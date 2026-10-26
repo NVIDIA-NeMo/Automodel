@@ -18,7 +18,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import httpx
 import pytest
 import yaml
 from huggingface_hub import hf_hub_download
@@ -35,16 +34,16 @@ REPO = "test/config-race"
 
 
 @pytest.fixture
-def config_hub_without_revision_api(hf_config_hub, monkeypatch):
+def config_hub_without_revision_api(hf_config_hub, monkeypatch, hub_http_transport):
     """Keep config-file HTTP working while native revision resolution fails."""
-    respond = httpx.Client.send
+    respond = hub_http_transport.Client.send
 
     def deny_revision_api(client, request, *args, **kwargs):
         if request.url.path.startswith("/api/models/"):
-            return httpx.Response(403, request=request)
+            return hub_http_transport.Response(403, request=request)
         return respond(client, request, *args, **kwargs)
 
-    monkeypatch.setattr(httpx.Client, "send", deny_revision_api)
+    monkeypatch.setattr(hub_http_transport.Client, "send", deny_revision_api)
     return hf_config_hub
 
 
@@ -270,13 +269,13 @@ def test_cold_cache_downloads_current_config(hf_config_hub):
     assert any(request.method == "GET" for request in requests)
 
 
-def test_authentication_failure_is_propagated(hf_config_hub, monkeypatch):
+def test_authentication_failure_is_propagated(hf_config_hub, monkeypatch, hub_http_transport):
     root, _, _, _ = hf_config_hub
 
     def denied(client, request, *args, **kwargs):
-        return httpx.Response(401, request=request, headers={"X-Error-Code": "RepoNotFound"})
+        return hub_http_transport.Response(401, request=request, headers={"X-Error-Code": "RepoNotFound"})
 
-    monkeypatch.setattr(httpx.Client, "send", denied)
+    monkeypatch.setattr(hub_http_transport.Client, "send", denied)
     with pytest.raises(RepositoryNotFoundError):
         NeMoAutoConfig.from_pretrained(REPO, cache_dir=root / "empty")
 
