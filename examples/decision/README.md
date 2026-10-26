@@ -36,7 +36,9 @@ Data records use the SystemOne request format plus supervision:
 The CLM feature cache requires immutable encoder and tokenizer commit IDs. Its identity includes truncation,
 pooling, normalization, precision and library settings, so changing those settings generates a new cache.
 CLM embeds across data-parallel ranks, then trains its projection heads on rank zero. Its `encode.cache_dir`
-must be shared by all ranks, including across nodes, for shard assembly and cache reuse.
+must be shared by all ranks, including across nodes, for shard assembly and cache reuse. Inconsistent cache
+visibility fails on every rank. The encoding process group is released before rank-zero head training so
+idle ranks do not wait in a collective for the duration of training.
 CLM/CLEF example configurations pin the public model versions whose prompt and checkpoint contracts they use.
 The CLEF frozen-backbone configuration installs no adapters and optimizes only the external joint head.
 CLEF stages use native AutoModel PEFT checkpoints under `model/` and DCP joint-head state under `head/`.

@@ -150,7 +150,13 @@ class TrainCLMHeadsRecipe(BaseRecipe):
     def _embed_all(self, texts: list[str]) -> EmbeddingTable:
         """Embed ``texts`` with the frozen encoder, sharded over all ranks, and cache the result."""
         cache = self._cache_path(texts)
-        if cache.exists():
+        cache_exists = cache.exists()
+        if dist.is_initialized():
+            cache_hits = torch.tensor(int(cache_exists), device=self.device)
+            dist.all_reduce(cache_hits)
+            if int(cache_hits.item()) not in (0, self.dist_env.world_size):
+                raise ValueError("CLM feature cache must be visible to all ranks; use a shared encode.cache_dir")
+        if cache_exists:
             if self.dist_env.is_main:
                 logger.info("Loading %d cached embeddings from %s", len(texts), cache)
             return EmbeddingTable.load(cache)
@@ -267,9 +273,12 @@ class TrainCLMHeadsRecipe(BaseRecipe):
     # ------------------------------------------------------------------ main loop
     def run_train_validation_loop(self) -> None:
         """Evaluate (``eval``) or train (``sft``/``rl``) the heads, then report before/after metrics."""
+        # Encoding is the only distributed phase. Release its group together before
+        # rank-zero head training, which can exceed the collective timeout.
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
         if not self.dist_env.is_main:
-            if dist.is_initialized():
-                dist.barrier()
             return
         torch.manual_seed(self.seed)
         random.seed(self.seed)
@@ -286,8 +295,6 @@ class TrainCLMHeadsRecipe(BaseRecipe):
             logger.info("Saved post-trained heads to %s", self.output_dir / "heads.pt")
             for split in eval_splits:
                 self._report(best, split)
-        if dist.is_initialized():
-            dist.barrier()
 
     def _report(self, heads: CLMHeadPair, split: str) -> dict:
         summary, predictions = self.evaluate(heads, self.splits[split])
