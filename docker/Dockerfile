@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.08-py3
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.10-cuda13.4-devel-ubuntu24.04
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -120,7 +120,7 @@ FROM update_base_container AS automodel_dep
 
 # Install TE
 ARG INSTALL_TE=True
-ARG TE_COMMIT=v2.19.0
+ARG TE_COMMIT=v2.20.2
 # TE 2.19 expands the 100 family target to 107a when CUDA 13.4+ is used.
 ARG TE_CUDA_ARCHS="80;90;100;120"
 ARG TE_BUILD_MAX_JOBS=8
@@ -129,7 +129,7 @@ ARG TE_BUILD_THREADS_PER_JOB=8
 # binding is already compatible. Otherwise rebuild it against the exact
 # PyTorch/CUDA stack in this image to avoid carrying a stale native extension.
 RUN if [ "$INSTALL_TE" = "True" ] || \
-        ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.19.0'); import transformer_engine.pytorch"; then \
+        ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.20.2'); import transformer_engine.pytorch"; then \
     pip uninstall -y transformer-engine transformer-engine-cu12 transformer-engine-cu13 transformer-engine-torch && \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \

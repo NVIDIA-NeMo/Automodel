@@ -52,8 +52,8 @@ def main() -> None:
             raise RuntimeError("The PyTorch extension was not compiled with C++20 or later")
 
     installed_te_version = Version(version("transformer-engine"))
-    if installed_te_version < Version("2.19.0"):
-        raise RuntimeError(f"Transformer Engine 2.19.0 or later is required, found {installed_te_version}")
+    if installed_te_version < Version("2.20.2"):
+        raise RuntimeError(f"Transformer Engine 2.20.2 or later is required, found {installed_te_version}")
 
     # Importing the framework binding eagerly catches stale extensions whose
     # PyTorch or CUDA symbols cannot be resolved by the final image runtime.
