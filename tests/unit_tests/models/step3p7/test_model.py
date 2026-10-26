@@ -329,6 +329,18 @@ def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
     assert ins[0].shape == (1, 6, hidden)
     assert len(ins) == 1 + mtp_depth
 
+    packed_ins, packed_outs = wrapper.get_pipeline_stage_metas(
+        is_first=True,
+        microbatch_size=1,
+        seq_len=6,
+        dtype=torch.float32,
+        packed_sequence=True,
+    )
+    assert packed_ins[0].shape == (6,)
+    primary_width = wrapper.config.text_config.vocab_size if wrapper.lm_head is not None else hidden
+    assert packed_outs[0].shape == (6, primary_width)
+    assert len(packed_outs) == 1 + mtp_depth
+
     # cp_size == 2: first-stage input full (6) ids, hidden states local (pad 6->8, //2 = 4).
     wrapper.cp_mesh = _FakeCPMesh(2)
     ins, outs = wrapper.get_pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
