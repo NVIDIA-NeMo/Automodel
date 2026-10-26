@@ -17,6 +17,7 @@
 import pytest
 import torch
 from transformers import Lfm2VlConfig
+from transformers.models.lfm2.modeling_lfm2 import Lfm2RotaryEmbedding
 from transformers.models.lfm2_vl.modeling_lfm2_vl import (
     Lfm2VlForConditionalGeneration as HFLfm2VlForConditionalGeneration,
 )
@@ -73,6 +74,35 @@ def test_tie_identity_and_native_registry():
     model.to(torch.bfloat16)
     assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
     assert model.model.language_model.rotary_emb.inv_freq.dtype == torch.float32
+
+
+@pytest.mark.parametrize("rope_type", ["linear", "yarn"])
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"))],
+)
+def test_ordinary_scaled_rotary_preserves_hf_factors_after_dtype_moves(rope_type: str, device: str) -> None:
+    config = tiny_config()
+    config.text_config.rope_parameters = {
+        "rope_type": rope_type,
+        "rope_theta": 1000000.0,
+        "factor": 4.0,
+        **({"attention_factor": 1.5} if rope_type == "yarn" else {}),
+    }
+    model = Lfm2VlForConditionalGeneration(config).eval()
+    rotary = model.model.language_model.rotary_emb
+    reference = Lfm2RotaryEmbedding(config.text_config, device=device)
+    positions = torch.tensor([[0, 17, 4095]], device=device)
+    expected = reference(torch.empty(1, 3, config.text_config.hidden_size, device=device), positions)
+    for dtype in (torch.float32, torch.bfloat16, torch.float32):
+        model.to(device=device, dtype=dtype)
+        assert rotary.inv_freq.dtype == torch.float32
+        assert rotary.attention_scaling == reference.attention_scaling
+        torch.testing.assert_close(rotary.inv_freq, reference.inv_freq, rtol=0, atol=0)
+        torch.testing.assert_close(rotary.original_inv_freq, reference.original_inv_freq, rtol=0, atol=0)
+        actual = rotary(torch.empty(1, 3, config.text_config.hidden_size, device=device, dtype=dtype), positions)
+        for factors, expected_factors in zip(actual, expected, strict=True):
+            torch.testing.assert_close(factors, expected_factors, rtol=0, atol=0)
 
 
 def test_checkpoint_conversion_preserves_released_parameter_names():

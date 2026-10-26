@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers.cache_utils import Cache
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.lfm2.modeling_lfm2 import (
     Lfm2Attention,
@@ -93,8 +94,11 @@ class D1CausalRotaryEmbedding(Lfm2RotaryEmbedding):
         super()._apply(fn, recurse=recurse)
         # The publisher builds frequencies on the execution device. CPU power
         # rounding can change a later bfloat16 rotation at the released width.
+        initializer = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            initializer = ROPE_INIT_FUNCTIONS[self.rope_type]
         with torch.device(self.inv_freq.device):
-            frequencies, scaling = self.compute_default_rope_parameters(self.config)
+            frequencies, scaling = initializer(self.config, device=self.inv_freq.device)
         self.inv_freq = frequencies.to(self.inv_freq.device)
         self.original_inv_freq = self.inv_freq.clone()
         self.attention_scaling = scaling

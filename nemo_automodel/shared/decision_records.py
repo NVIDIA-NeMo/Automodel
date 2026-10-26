@@ -79,14 +79,37 @@ def pad_and_shard_records(
 
 
 def load_records(path: str | Path, limit: int | None = None) -> list[dict[str, Any]]:
-    """Read a JSONL file of SystemOne records."""
+    """Read a JSONL split, requiring unique nonempty stringified record IDs.
+
+    Validate before distributed padding, which may intentionally repeat records.
+    Numeric IDs are preserved but share an identity with their string equivalent.
+
+    Args:
+        path: JSONL file containing one unpadded input split.
+        limit: Optional maximum number of records to read and validate.
+
+    Returns:
+        Loaded records in file order, preserving their original ID values.
+
+    Raises:
+        ValueError: If a loaded record has a missing, empty, or duplicate ID.
+    """
     records = []
+    seen_ids: set[str] = set()
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            records.append(json.loads(line))
+            record = json.loads(line)
+            record_id = record.get("id")
+            if record_id is None or not str(record_id).strip():
+                raise ValueError(f"{path}: each record must have a nonempty record ID")
+            canonical_id = str(record_id)
+            if canonical_id in seen_ids:
+                raise ValueError(f"{path}: duplicate record ID {canonical_id!r}")
+            seen_ids.add(canonical_id)
+            records.append(record)
             if limit is not None and len(records) >= limit:
                 break
     return records

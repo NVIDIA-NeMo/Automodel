@@ -14,11 +14,40 @@
 
 """Record sharding invariants required by collective-bearing model forwards."""
 
+import json
 import math
+from pathlib import Path
 
 import pytest
 
-from nemo_automodel.shared.decision_records import pad_and_shard_records
+from nemo_automodel.shared.decision_records import load_records, pad_and_shard_records
+
+
+@pytest.mark.parametrize("record_ids", [["same", "same"], [1, "1"]])
+def test_loading_rejects_duplicate_canonical_record_ids(tmp_path: Path, record_ids: list[str | int]) -> None:
+    path = tmp_path / "records.jsonl"
+    records = [{"id": record_id, "state": str(index)} for index, record_id in enumerate(record_ids)]
+    path.write_text("\n".join(json.dumps(record) for record in records))
+    with pytest.raises(ValueError, match="duplicate record ID"):
+        load_records(path)
+
+
+@pytest.mark.parametrize("record", [{}, {"id": None}, {"id": ""}, {"id": "   "}])
+def test_loading_rejects_missing_or_empty_record_ids(tmp_path: Path, record: dict[str, object]) -> None:
+    path = tmp_path / "records.jsonl"
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="nonempty record ID"):
+        load_records(path)
+
+
+def test_valid_loaded_records_can_still_be_padded_across_ranks(tmp_path: Path) -> None:
+    path = tmp_path / "records.jsonl"
+    path.write_text('{"id": 0}\n{"id": "other"}\n')
+    records = load_records(path)
+    assert records == [{"id": 0}, {"id": "other"}]
+    shards = [pad_and_shard_records(records, rank=rank, world_size=4) for rank in range(4)]
+    assert shards == [[records[0]], [records[1]], [records[0]], [records[1]]]
+    assert load_records(path, limit=1) == records[:1]
 
 
 @pytest.mark.parametrize("world_size", [1, 2, 4, 8])
