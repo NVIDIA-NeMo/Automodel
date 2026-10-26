@@ -375,3 +375,36 @@ def test_pipeline_loss_rounded_logits_match_model_projection_gradients():
     expected_grads = torch.autograd.grad(expected, (hidden, model.lm_head.weight))
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("follow_hidden_dtype", [False, True])
+def test_pipeline_loss_infers_logits_dtype_from_hf_output(follow_hidden_dtype):
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    model = torch.nn.Module()
+    model.lm_head = torch.nn.Linear(1, 2, bias=False)
+    model.pp_logits_follow_hidden_dtype = follow_hidden_dtype
+    with torch.no_grad():
+        # 1.00390625 is FP32-exact but rounds to 1.0 in BF16.
+        model.lm_head.weight.copy_(torch.tensor([[1.00390625], [0.0]]))
+    hidden = torch.ones(1, 1, 1, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.zeros(1, 1, dtype=torch.long)
+    logits = F.linear(hidden.float(), model.lm_head.weight).to(torch.bfloat16)
+    output = CausalLMOutputWithPast(logits=logits, hidden_states=(hidden,))
+
+    loss = PipelineCausalLMLoss(ChunkedCrossEntropy(compile=False), model)(output, labels)
+
+    expected = F.cross_entropy(
+        F.linear(hidden.float(), model.lm_head.weight).to(torch.bfloat16).float().flatten(0, 1),
+        labels.flatten(),
+        reduction="sum",
+    )
+    unrounded = F.cross_entropy(torch.tensor([[1.00390625, 0.0]]), labels.flatten(), reduction="sum")
+    assert expected != unrounded
+    torch.testing.assert_close(loss, expected, rtol=0, atol=0)
+    actual_grads = torch.autograd.grad(loss, (hidden, model.lm_head.weight), retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (hidden, model.lm_head.weight))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
