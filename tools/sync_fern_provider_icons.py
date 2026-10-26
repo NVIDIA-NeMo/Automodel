@@ -60,6 +60,7 @@ PROVIDER_ORGS = {
     "MiniMaxAI": "MiniMaxAI",
     "mistralai": "mistralai",
     "moonshotai": "moonshotai",
+    "nanbeige": "Nanbeige",
     "meta-models": "meta-models",
     "nvidia": "nvidia",
     "openai": "openai",

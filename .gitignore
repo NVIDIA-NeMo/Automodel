@@ -194,5 +194,6 @@ docs/fern/product-docs/
 # as untracked. Add a line per archived GA train as new versions are cut.
 docs/fern/versions/v0.4/pages/
 docs/fern/versions/v0.5/pages/
+docs/fern/versions/v0.7/pages/
 
 training_logs/

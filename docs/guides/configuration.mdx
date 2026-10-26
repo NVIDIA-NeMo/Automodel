@@ -236,6 +236,38 @@ and structured-sparse runs must provide the appropriate peak explicitly. An
 unknown device emits a warning and reports 0% MFU until you configure a
 supported `device` value or an explicit `peak_tflops` value.
 
+## Profile VLM Training with NVTX
+
+Set the top-level `nvtx` option to annotate VLM model forwards with module names:
+
+```yaml
+nvtx: true
+```
+
+The option defaults to `false`. It annotates each local model part, including
+pipeline stages and activation-checkpoint recomputation. VLM profiling uses
+forward hooks only; it does not add module-level backward ranges. Nsight Systems
+still captures the CUDA kernels launched during backward.
+
+With the NeMo AutoModel environment activated in a checkout, run the following
+command on a single GPU with [Nsight Systems](https://developer.nvidia.com/nsight-systems)
+available on `PATH`:
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt --output=vlm-profile \
+  python -m nemo_automodel.recipes.vlm.finetune \
+  --config examples/vlm_finetune/qwen3_5/qwen3_5_4b_neat_packing.yaml \
+  --nvtx true --step_scheduler.max_steps 10 \
+  --checkpoint.enabled false --step_scheduler.validate_on_checkpoint false
+```
+
+Use the generated `vlm-profile.nsys-rep` timeline to correlate module ranges with
+CUDA kernels and gaps between steps. Separate setup and compilation from later
+training steps when investigating steady-state throughput. Profiling adds
+overhead; measure throughput separately with `nvtx: false` and the same checkpoint
+and validation overrides. These overrides disable checkpoint auto-resume, saves,
+and checkpoint-triggered validation so repeated runs execute the training steps.
+
 ## Repair Near-Zero Input Embeddings
 
 The LLM training and fine-tuning recipe can repair a small number of damaged input-embedding rows after loading the base checkpoint and before creating the optimizer.
