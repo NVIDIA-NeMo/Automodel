@@ -29,6 +29,7 @@ import os
 import pathlib
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -53,6 +54,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.dspark_cache import (
     DTYPE_MAP,
     build_cached_dspark_dataloader,
+    manifest_value_identity,
     read_manifest,
     read_target_weight_modules,
     tokenizer_chat_template_sha256,
@@ -131,6 +133,7 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
     build_glm_5_2_target,
     build_kimi_k3_target,
+    chat_template_kwargs_from,
     distributed_section_dict,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
@@ -350,11 +353,15 @@ def _validate_cached_dspark_manifest(
     seq_length: int,
     compute_dtype: torch.dtype,
     chat_template_sha256: str | None,
+    chat_template_kwargs: dict[str, Any] | None,
 ) -> None:
     """Validate that a DSpark offline cache matches the configured target/draft run.
 
     ``chat_template_sha256`` is the hash of the template the run configured, or ``None`` when it
-    configured none and so has no framing to compare against the cache's.
+    configured none and so has no framing to compare against the cache's; a mismatch only warns,
+    since an edit to a template comment changes the hash too. ``chat_template_kwargs`` are the
+    template arguments the run configured (``None`` means none, i.e. ``{}``); like the mask
+    options they shape the cached supervision, so a mismatch raises.
     """
     if str(manifest["target_model"]) != str(target_model):
         logger.warning(
@@ -375,6 +382,16 @@ def _validate_cached_dspark_manifest(
             cache_dir,
             recorded_template_sha256,
             chat_template_sha256,
+        )
+    # read_manifest fills in {} for caches written before the manifest recorded the kwargs.
+    recorded_template_kwargs = manifest.get("chat_template_kwargs", {})
+    run_template_kwargs = {} if chat_template_kwargs is None else chat_template_kwargs
+    if manifest_value_identity(recorded_template_kwargs) != manifest_value_identity(run_template_kwargs):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was tokenized with chat_template_kwargs={recorded_template_kwargs!r}, "
+            f"but this run sets {run_template_kwargs!r}. The cached samples keep the framing they were built "
+            "with, so rebuild the cache with precompute_dspark under the recipe's chat_template_kwargs or match "
+            "them in the recipe."
         )
     if str(manifest["target_model_type"]) != str(target_model_type):
         raise ValueError(
@@ -729,6 +746,7 @@ class TrainDSparkRecipe(BaseRecipe):
         # explicit override so saved checkpoints carry the requested tokenizer state.
         if self.cached_target_path is None or chat_template is not None:
             _apply_target_chat_template(self.tokenizer, chat_template)
+        chat_template_kwargs = chat_template_kwargs_from(recipe_cfg)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         load_metadata_with_gloo = read_load_metadata_with_gloo(self.cfg.get("checkpoint", None))
 
@@ -1039,6 +1057,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                     mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
                     mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
+                    chat_template_kwargs=chat_template_kwargs,
                     packed_sequence_size=self.packed_sequence_size,
                     dp_mesh=self.dp_mesh,
                 )
@@ -1056,6 +1075,7 @@ class TrainDSparkRecipe(BaseRecipe):
                         shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                         mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
                         mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
+                        chat_template_kwargs=chat_template_kwargs,
                         packed_sequence_size=self.packed_sequence_size,
                     )
         else:
@@ -1071,6 +1091,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 compute_dtype=self.compute_dtype,
                 # Without a configured template the tokenizer keeps the checkpoint's, which this run never renders.
                 chat_template_sha256=None if chat_template is None else tokenizer_chat_template_sha256(self.tokenizer),
+                chat_template_kwargs=chat_template_kwargs,
             )
             # The cached loss masks are used as stored, so the options that shaped them must match.
             ensure_supervision_options_match(
