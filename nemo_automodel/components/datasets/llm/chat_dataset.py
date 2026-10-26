@@ -591,15 +591,14 @@ def vlm_chat_collater(
 ):
     """Batch pre-tokenized chat samples for the VLM training recipe.
 
-    The VLM trainer expects labels to be shifted by the collator, while
-    ``ChatDataset`` emits unshifted causal-LM labels. ``processor`` is accepted
-    because the typed VLM loader injects it into configured collators.
+    ``ChatDataset`` (``unshifted=False``, the default) already applies the
+    next-token shift in ``_package_tokenized_example``: it returns
+    ``input_ids[:-1]`` with ``labels[1:]``. This collator must therefore only
+    batch — shifting again would supervise token t+2. Raw VLM samples entering
+    the packed pipeline keep their existing single shift in
+    ``PackedDatasetWrapper._shift_sample``; this path skips it by emitting
+    already-shifted pairs. ``processor`` is accepted because the typed VLM
+    loader injects it into configured collators.
     """
     del processor
-    batch = default_collater(examples, pad_seq_len_divisible=pad_seq_len_divisible)
-    batch["labels"] = batch["labels"][:, 1:]
-    input_shape = batch["input_ids"].shape
-    for key, value in list(batch.items()):
-        if key != "labels" and getattr(value, "shape", None) == input_shape:
-            batch[key] = value[:, :-1]
-    return batch
+    return default_collater(examples, pad_seq_len_divisible=pad_seq_len_divisible)
